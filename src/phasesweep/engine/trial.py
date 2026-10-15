@@ -40,15 +40,22 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
-from phasesweep.evidence.models import Gate, JsonEnvelopeExtractor, compose_wandb_environment
+from phasesweep.evidence.models import (
+    Gate,
+    JsonEnvelopeExtractor,
+    ObjectiveExtractor,
+    compose_wandb_environment,
+)
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
+    encode_overrides_json,
     merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import ProcessResult, run_supervised
 
 log = logging.getLogger("phasesweep.engine.trial")
@@ -60,7 +67,6 @@ class ExecutedTrial:
 
     ctx: TrialContext
     process: ProcessResult
-    trainer_input: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -534,7 +540,7 @@ def _resolved_execution_cwd(experiment: Experiment) -> Path | None:
     :param Experiment experiment: Parsed experiment supplying ``execution.cwd``.
     :raises TrialExecutionError: The configured directory does not exist.
     :return Path | None: Resolved absolute directory, or ``None`` when the
-        contract leaves the cwd unbound (invocation cwd, historical behavior).
+        trainer inherits the invocation working directory.
     """
     configured = experiment.execution.cwd
     if configured is None:
@@ -654,12 +660,17 @@ def prepare_trainer_input(
             overrides, trainer_config=experiment.trainer_config, substitutions=substitutions
         )
     else:
-        text = _json_dump_overrides(
-            merged_cli_overrides(experiment.trainer_config, overrides, substitutions=substitutions)
+        text = (
+            encode_overrides_json(
+                merged_cli_overrides(
+                    experiment.trainer_config, overrides, substitutions=substitutions
+                )
+            )
+            + "\n"
         )
 
     resolved_text = (
-        _json_dump_overrides(overrides)
+        encode_overrides_json(overrides) + "\n"
         if experiment.override_format in ("yaml_file", "json_file")
         else text
     )
@@ -687,7 +698,7 @@ def launch_trial(
     wallclock_deadline: float | None = None,
     gpu_id: int | str | None = None,
     gpu_lease_fds: tuple[int, ...] = (),
-    prepared_input: PreparedTrainerInput | None = None,
+    prepared_input: PreparedTrainerInput,
 ) -> ExecutedTrial:
     """Launch the trial subprocess. Call this while holding the GPU lease.
 
@@ -718,9 +729,7 @@ def launch_trial(
             supervisor guardian (not trainer code) so exclusion lasts until
             the whole trainer process group exits, even if the orchestrator
             exits abruptly.
-        prepared_input: Exact input already materialized and persisted by the
-            Optuna objective. Direct callers may omit it; launch then prepares
-            the input itself before starting the subprocess.
+        prepared_input: Exact input materialized and persisted before the GPU lease.
 
     Returns:
         :class:`ExecutedTrial` bundling the trial context, the supervised
@@ -748,14 +757,7 @@ def launch_trial(
     # into logs and resolved overrides. See docs/runtime.md's trust-boundary
     # section.
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
-    trainer_input = prepared_input or prepare_trainer_input(
-        experiment=experiment,
-        phase_name=phase_name,
-        trial_id=trial_id,
-        attempt_id=attempt_id,
-        trial_dir=workdir,
-        overrides=overrides,
-    )
+    trainer_input = prepared_input
     cmd = render_command(
         experiment.trial_command,
         overrides,
@@ -865,11 +867,7 @@ def launch_trial(
         mlflow_environment=env if experiment.mlflow is not None else None,
     )
 
-    return ExecutedTrial(
-        ctx=ctx,
-        process=proc_result,
-        trainer_input=trainer_input.record(),
-    )
+    return ExecutedTrial(ctx=ctx, process=proc_result)
 
 
 def extract_trial_result(
@@ -982,50 +980,67 @@ def extract_trial_result(
     if expired is not None:
         return expired
 
-    objective_provenance: dict[str, Any] = {}
-    try:
-        metric_value = run_extractor(
-            executed.ctx,
-            experiment.metric.extractor,
-            deadline=deadline,
-            provenance=objective_provenance,
-        )
-    except DeadlineExceededError as exc:
-        log.warning(
-            "[%s/trial_%d] metric extraction exceeded deadline: %s",
-            executed.ctx.phase,
-            executed.ctx.trial_id,
-            exc,
-        )
-        return _failed_trial(
-            rc=rc,
-            duration=duration,
-            failure_reason=f"metric extractor: {exc}",
-            deadline_exhausted=True,
-        )
-    except ExtractorError as exc:
-        log.warning(
-            "[%s/trial_%d] metric extraction failed: %s",
-            executed.ctx.phase,
-            executed.ctx.trial_id,
-            exc,
-        )
-        return _failed_trial(rc=rc, duration=duration, failure_reason=f"metric extractor: {exc}")
-
-    if not math.isfinite(metric_value):
-        log.warning(
-            "[%s/trial_%d] metric extractor returned non-finite value: %r",
-            executed.ctx.phase,
-            executed.ctx.trial_id,
-            metric_value,
-        )
-        return _failed_trial(
-            rc=rc,
-            duration=duration,
-            failure_reason=f"metric extractor returned non-finite value: {metric_value!r}",
-        )
-
+    objective_provenance: JsonObject = {}
     constraint_values: dict[str, float] = {}
+
+    def extract_required(
+        extractor: ObjectiveExtractor,
+        *,
+        label: str,
+        log_label: str,
+        provenance: JsonObject | None = None,
+    ) -> float | TrialResult:
+        """Read one required scalar, retaining prior constraints on failure.
+
+        :param ObjectiveExtractor extractor: Configured scalar extractor.
+        :param str label: Extractor label used in the persisted failure reason.
+        :param str log_label: Metric or constraint label used in warning messages.
+        :param JsonObject | None provenance: Objective-only frozen evidence sink.
+        :return float | TrialResult: Finite scalar or the failed trial result.
+        """
+        try:
+            value = run_extractor(executed.ctx, extractor, deadline=deadline, provenance=provenance)
+        except ExtractorError as exc:
+            exhausted = isinstance(exc, DeadlineExceededError)
+            log.warning(
+                "[%s/trial_%d] %s extraction %s: %s",
+                executed.ctx.phase,
+                executed.ctx.trial_id,
+                log_label,
+                "exceeded deadline" if exhausted else "failed",
+                exc,
+            )
+            return _failed_trial(
+                rc=rc,
+                duration=duration,
+                failure_reason=f"{label}: {exc}",
+                constraints=constraint_values,
+                deadline_exhausted=exhausted,
+            )
+        if not math.isfinite(value):
+            log.warning(
+                "[%s/trial_%d] %s returned non-finite value: %r",
+                executed.ctx.phase,
+                executed.ctx.trial_id,
+                label if provenance is not None else log_label,
+                value,
+            )
+            return _failed_trial(
+                rc=rc,
+                duration=duration,
+                failure_reason=f"{label} returned non-finite value: {value!r}",
+                constraints=constraint_values,
+            )
+        return value
+
+    metric_value = extract_required(
+        experiment.metric.extractor,
+        label="metric extractor",
+        log_label="metric",
+        provenance=objective_provenance,
+    )
+    if isinstance(metric_value, TrialResult):
+        return metric_value
     feasible = check_bounds(
         metric_value, min_value=experiment.metric.min, max_value=experiment.metric.max
     )
@@ -1034,53 +1049,11 @@ def extract_trial_result(
         if expired is not None:
             expired.constraints.update(constraint_values)
             return expired
-        try:
-            v = run_extractor(executed.ctx, c.extractor, deadline=deadline)
-        except DeadlineExceededError as exc:
-            log.warning(
-                "[%s/trial_%d] constraint %s extraction exceeded deadline: %s",
-                executed.ctx.phase,
-                executed.ctx.trial_id,
-                c.name,
-                exc,
-            )
-            return _failed_trial(
-                rc=rc,
-                duration=duration,
-                failure_reason=f"constraint extractor {c.name!r}: {exc}",
-                constraints=constraint_values,
-                deadline_exhausted=True,
-            )
-        except ExtractorError as exc:
-            log.warning(
-                "[%s/trial_%d] constraint %s extraction failed: %s",
-                executed.ctx.phase,
-                executed.ctx.trial_id,
-                c.name,
-                exc,
-            )
-            return _failed_trial(
-                rc=rc,
-                duration=duration,
-                failure_reason=f"constraint extractor {c.name!r}: {exc}",
-                constraints=constraint_values,
-            )
-        if not math.isfinite(v):
-            log.warning(
-                "[%s/trial_%d] constraint %s returned non-finite value: %r",
-                executed.ctx.phase,
-                executed.ctx.trial_id,
-                c.name,
-                v,
-            )
-            return _failed_trial(
-                rc=rc,
-                duration=duration,
-                failure_reason=(
-                    f"constraint extractor {c.name!r} returned non-finite value: {v!r}"
-                ),
-                constraints=constraint_values,
-            )
+        v = extract_required(
+            c.extractor, label=f"constraint extractor {c.name!r}", log_label=f"constraint {c.name}"
+        )
+        if isinstance(v, TrialResult):
+            return v
         constraint_values[c.name] = v
         if not check_bounds(v, min_value=c.min, max_value=c.max):
             feasible = False
@@ -1175,17 +1148,3 @@ def _observe(
             continue
         observed[observation.name] = value
     return observed
-
-
-def _json_dump_overrides(overrides: dict[str, Any]) -> str:
-    """Serialize a flat override mapping to indented JSON for ``overrides_resolved.json``.
-
-    Args:
-        overrides: The composed (inherited + fixed + sampled) overrides dict,
-            or for argparse and hydra that dict merged into the base trainer config.
-
-    Returns:
-        Trailing-newline-terminated, sorted, two-space-indented JSON.
-
-    """
-    return json.dumps(overrides, indent=2, sort_keys=True, allow_nan=False) + "\n"

@@ -133,6 +133,17 @@ def dump_overrides_json(payload: Any) -> str:
     :raises ValueError: A value is non-finite or recursive.
     """
     _validate_trainer_config_value(payload, position="JSON overrides")
+    return encode_overrides_json(payload)
+
+
+def encode_overrides_json(payload: object) -> str:
+    """Encode override metadata, including CLI tuples, as deterministic JSON.
+
+    :param object payload: Values accepted by the JSON encoder.
+    :return str: Sorted, two-space-indented JSON without a trailing newline.
+    :raises TypeError: A value cannot be JSON-encoded.
+    :raises ValueError: A value is non-finite or recursive.
+    """
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 

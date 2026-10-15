@@ -1325,7 +1325,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
     :param str | None storage: Configured Optuna storage URL.
     :return str | None: Operationally equivalent locator with file paths made
         absolute, or ``None`` for in-memory storage.
-    :raises ValueError: ``storage`` does not select a retained local backend.
+    :raises ValueError: ``storage`` does not name a journal file.
     """
     if storage is None:
         return None
@@ -1343,7 +1343,7 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     :return str | None: The canonical identity string used to derive the
         same-host storage lock path, or ``None`` for in-memory storage (no
         shared backend to collide on).
-    :raises ValueError: ``storage`` does not select a retained local backend.
+    :raises ValueError: ``storage`` does not name a journal file.
     """
     if storage is None:
         return None

@@ -928,9 +928,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       verdict -- conditional on that verdict. Published results that no longer
       validate are reported as corrupt rather than as an experiment that never
       published. After printing this payload, the CLI turns ``"failed"`` into
-      :class:`~phasesweep.engine.PublicationIntegrityError` and
+      :class:`~phasesweep.engine.errors.PublicationIntegrityError` and
       ``"permission_denied"`` into
-      :class:`~phasesweep.engine.PublicationAccessError`; both exit non-zero.
+      :class:`~phasesweep.engine.errors.PublicationAccessError`; both exit non-zero.
     * ``phases``: one payload per phase in declaration order, each with
       ``trials``, ``running``, ``n_trials``, ``completed``,
       ``generation_trials`` (scoped to ``current_generation_id``), ``name``,

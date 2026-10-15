@@ -121,7 +121,7 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
     """Run a post-commit best-effort action, logging instead of raising on failure.
 
     Exists for the post-commit best-effort steps of the publication
-    transaction (record write, pointer refresh, compatibility projection):
+    transaction (record write, pointer refresh, root artifact projection):
     once the authoritative pointer has committed, nothing after it may fail
     the run, so each such step must log its own failure and never propagate
     it. Catching ``BaseException`` is intentional: a

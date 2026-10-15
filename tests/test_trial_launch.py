@@ -34,6 +34,7 @@ from phasesweep.engine.trial import (
     _stderr_last_line,
     extract_trial_result,
     launch_trial,
+    prepare_trainer_input,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
@@ -89,24 +90,35 @@ def _capture_launch_env(
         )
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
-    executed = launch_trial(
-        experiment=make_experiment(
-            env=experiment_env,
-            execution=execution,
-            metric=metric,
-            **(experiment_kwargs or {}),
-        ),
+    experiment = make_experiment(
+        env=experiment_env,
+        execution=execution,
+        metric=metric,
+        **(experiment_kwargs or {}),
+    )
+    trial_overrides = {} if overrides is None else overrides
+    prepared = prepare_trainer_input(
+        experiment=experiment,
+        phase_name="p",
+        trial_id=0,
+        attempt_id="attempt-test",
+        trial_dir=tmp_path / "trial_0",
+        overrides=trial_overrides,
+    )
+    launch_trial(
+        experiment=experiment,
         phase_name="p",
         trial_id=0,
         generation_id="generation-test",
         attempt_id="attempt-test",
         trial_dir=tmp_path / "trial_0",
-        overrides={} if overrides is None else overrides,
+        overrides=trial_overrides,
         timeout_seconds=None,
         gpu_id=gpu_id,
         gpu_lease_fds=gpu_lease_fds,
+        prepared_input=prepared,
     )
-    captured["trainer_input"] = executed.trainer_input
+    captured["trainer_input"] = prepared.record()
     return captured
 
 
@@ -348,6 +360,26 @@ def test_launch_trial_cli_input_without_trainer_config_is_the_overrides_alone(
         "--alpha=1",
         "--zeta.width=2",
     ]
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_cli_tuple_input_keeps_rendered_values_and_recorded_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override_format: str
+) -> None:
+    """Supported CLI tuples serialize as JSON arrays without changing command values."""
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={"override_format": override_format, "fixed_overrides": {"dims": (1, 2)}},
+        overrides={"dims": (1, 2)},
+    )
+    expected = '{\n  "dims": [\n    1,\n    2\n  ]\n}\n'
+    assert (tmp_path / "trial_0" / "overrides_resolved.json").read_text() == expected
+    assert captured["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(expected.encode()).hexdigest()
+    assert shlex.split(captured["command"])[-1] == (
+        "--dims=[1,2]" if override_format == "argparse" else "dims=[1,2]"
+    )
 
 
 def test_launch_trial_inherit_env_all_passes_ambient(

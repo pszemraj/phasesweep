@@ -69,9 +69,8 @@ def identity_from_earlier_boot(boot_id: str | None, current_boot_id: str | None)
     unrelated process. A recorded boot id that differs from the current one
     settles the question in the safe direction - nothing launched under the
     earlier boot survived it, so the process and every descendant it ever had
-    are conclusively gone and cleanup needs no signal. An unknown boot id on
-    either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
+    are conclusively gone and cleanup needs no signal. An unknown recorded
+    or current boot id yields ``False``. Callers
     performing cleanup must separately refuse to signal when either boot id
     is unknown, using the same ``current_boot_id`` read they pass here.
 
@@ -748,30 +747,19 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     proc_root = Path("/proc")
     if not proc_root.exists():
         return True
-    if member_pids is None:
-        scan = _group_member_pids(pgid)
-        if _member_pids_alive(pgid, scan.pids):
-            return True
-        if not scan.complete:
-            return True
-        if scan.all_members_terminal:
-            return False
-        # killpg proved the group existed, but a complete scan found no stable
-        # inspectable member. Re-check the kernel verdict; continued existence
-        # is uncertainty, not proof of death.
-        return _process_group_exists(pgid)
-    if _member_pids_alive(pgid, member_pids):
+    if member_pids is not None and _member_pids_alive(pgid, member_pids):
         return True
     scan = _group_member_pids(pgid)
-    refreshed = set(scan.pids)
-    member_pids.clear()
-    member_pids.update(refreshed)
-    if _member_pids_alive(pgid, member_pids):
+    if member_pids is not None:
+        member_pids.clear()
+        member_pids.update(scan.pids)
+    if _member_pids_alive(pgid, scan.pids if member_pids is None else member_pids):
         return True
     if not scan.complete:
         return True
     if scan.all_members_terminal:
         return False
+    # A kernel-visible group without inspectable members remains uncertain.
     return _process_group_exists(pgid)
 
 

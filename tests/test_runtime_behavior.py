@@ -70,7 +70,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
-from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError, TrialContext
 from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
@@ -1917,3 +1917,47 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
     )
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(always_out)
+
+
+@pytest.mark.parametrize("failure", ["extractor", "deadline", "nonfinite"])
+def test_required_constraint_failure_preserves_prior_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Required extraction retains prior constraints and objective-only provenance."""
+    experiment = make_experiment(
+        constraints=[
+            Constraint(
+                name=name, max=3, extractor=JsonExtractor(type="json", path="r.json", key=name)
+            )
+            for name in ("first", "second")
+        ]
+    )
+    provenance_calls: list[bool] = []
+
+    def extract(_ctx, _cfg, *, provenance=None, **_kwargs):
+        provenance_calls.append(provenance is not None)
+        if len(provenance_calls) < 3:
+            return float(len(provenance_calls))
+        if failure == "extractor":
+            raise ExtractorError("stopped")
+        if failure == "deadline":
+            raise DeadlineExceededError("stopped")
+        return float("inf")
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", extract)
+    executed = ExecutedTrial(
+        ctx=make_trial_context(tmp_path),
+        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    )
+    result = extract_trial_result(experiment=experiment, executed=executed)
+
+    assert result.metric is None
+    assert result.feasible is False
+    assert result.constraints == {"first": 2.0}
+    assert result.deadline_exhausted is (failure == "deadline")
+    assert provenance_calls == [True, False, False]
+    assert result.failure_reason == (
+        "constraint extractor 'second' returned non-finite value: inf"
+        if failure == "nonfinite"
+        else "constraint extractor 'second': stopped"
+    )

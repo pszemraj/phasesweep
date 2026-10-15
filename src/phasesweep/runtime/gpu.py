@@ -819,27 +819,23 @@ class GpuPool:
             # that left it set (or leaked partial leases) would deadlock every
             # later acquisition, so failures must roll both back.
             leases: list[_HostGpuLease] = []
-            all_leased = True
+            all_leased = False
             try:
                 for device in self._devices:
                     lease = _try_host_gpu_lease(device)
                     if lease is None:
-                        all_leased = False
                         break
                     leases.append(lease)
-            except BaseException:
-                for lease in leases:
-                    _release_host_gpu_lease(lease)
-                with self._condition:
-                    self._whole_node_in_use = False
-                    self._condition.notify_all()
-                raise
+                else:
+                    all_leased = True
+            finally:
+                if not all_leased:
+                    for lease in leases:
+                        _release_host_gpu_lease(lease)
+                    with self._condition:
+                        self._whole_node_in_use = False
+                        self._condition.notify_all()
             if not all_leased:
-                for lease in leases:
-                    _release_host_gpu_lease(lease)
-                with self._condition:
-                    self._whole_node_in_use = False
-                    self._condition.notify_all()
                 self._wait_for_retry(deadline)
                 continue
 
