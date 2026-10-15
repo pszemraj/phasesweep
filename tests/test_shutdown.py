@@ -58,33 +58,26 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
         current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
         assert set(runtime_shutdown._SHUTDOWN_SIGNALS) <= current_mask
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            signal.signal(sig, host_handler)
-        signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS))
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        signal.signal(sig, host_handler)
+    signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS))
 
-        trainer = write_constant_trainer(tmp_path)
-        experiment = make_experiment(workdir=tmp_path / "runs", trainer=trainer, n_trials=1)
-        run_experiment(experiment)
-        assert_host_state_active()
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(workdir=tmp_path / "runs", trainer=trainer, n_trials=1)
+    run_experiment(experiment)
+    assert_host_state_active()
 
-        failing_trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
-        failing_experiment = make_experiment(
-            experiment="fails",
-            workdir=tmp_path / "runs",
-            trainer=failing_trainer,
-            n_trials=1,
-            max_consecutive_failures=1,
-        )
-        with pytest.raises(NoFeasibleTrialError):
-            run_experiment(failing_experiment)
-        assert_host_state_active()
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    failing_trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
+    failing_experiment = make_experiment(
+        experiment="fails",
+        workdir=tmp_path / "runs",
+        trainer=failing_trainer,
+        n_trials=1,
+        max_consecutive_failures=1,
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(failing_experiment)
+    assert_host_state_active()
 
 
 @pytest.mark.integration
@@ -107,34 +100,28 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
     def host_handler(signum: int, _frame: object) -> None:
         received.append(signum)
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            signal.signal(sig, host_handler)
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        signal.signal(sig, host_handler)
 
-        with signal_handler_scope():
-            # Block SIGTERM ourselves so the kill below queues instead of
-            # firing immediately (the scope's own entry unblocks it).
-            signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
-            os.kill(os.getpid(), signal.SIGTERM)
-            assert received == [], "signal fired before scope exit"
+    with signal_handler_scope():
+        # Block SIGTERM ourselves so the kill below queues instead of
+        # firing immediately (the scope's own entry unblocks it).
+        signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert received == [], "signal fired before scope exit"
 
-        # Scope exit order: block -> restore handlers -> restore mask. The pending
-        # SIGTERM is delivered on the final unblock, by which point the HOST handler
-        # (not phasesweep's) is installed. CPython only invokes the Python-level handler
-        # at the next eval-breaker check, not necessarily synchronously with the
-        # unblocking call, so poll briefly instead of asserting immediately.
-        deadline = time.monotonic() + 2.0
-        while not received and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert received == [signal.SIGTERM]
-        assert signal.getsignal(signal.SIGTERM) is host_handler
-        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    # Scope exit order: block -> restore handlers -> restore mask. The pending
+    # SIGTERM is delivered on the final unblock, by which point the HOST handler
+    # (not phasesweep's) is installed. CPython only invokes the Python-level handler
+    # at the next eval-breaker check, not necessarily synchronously with the
+    # unblocking call, so poll briefly instead of asserting immediately.
+    deadline = time.monotonic() + 2.0
+    while not received and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert received == [signal.SIGTERM]
+    assert signal.getsignal(signal.SIGTERM) is host_handler
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == prior_mask
 
 
 def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failure(
@@ -146,49 +133,44 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
     restoration error surfaces once the scope body itself did not already
     raise.
     """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    try:
 
-        def make_sentinel(tag: int):
-            def handler(signum: int, _frame: object) -> None:
-                return None
+    def make_sentinel(tag: int):
+        def handler(signum: int, _frame: object) -> None:
+            return None
 
-            handler.__name__ = f"sentinel_{tag}"
-            return handler
+        handler.__name__ = f"sentinel_{tag}"
+        return handler
 
-        sentinel_handlers = {sig: make_sentinel(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-        for sig, handler in sentinel_handlers.items():
-            signal.signal(sig, handler)
+    sentinel_handlers = {sig: make_sentinel(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
+    for sig, handler in sentinel_handlers.items():
+        signal.signal(sig, handler)
 
-        first_signal = runtime_shutdown._SHUTDOWN_SIGNALS[0]
-        real_signal = signal.signal
-        failed_once: set[int] = set()
+    first_signal = runtime_shutdown._SHUTDOWN_SIGNALS[0]
+    real_signal = signal.signal
+    failed_once: set[int] = set()
 
-        def flaky_signal(signalnum: int, handler: object) -> object:
-            if signalnum == first_signal and signalnum not in failed_once:
-                failed_once.add(signalnum)
-                raise OSError("simulated restore failure")
-            return real_signal(signalnum, handler)
+    def flaky_signal(signalnum: int, handler: object) -> object:
+        if signalnum == first_signal and signalnum not in failed_once:
+            failed_once.add(signalnum)
+            raise OSError("simulated restore failure")
+        return real_signal(signalnum, handler)
 
-        with (
-            pytest.raises(OSError, match="simulated restore failure"),
-            monkeypatch.context() as scoped,
-            signal_handler_scope(),
-        ):
-            # Patch only after the scope's entry-time installation used the real
-            # signal.signal; the patch ends with this block, before the restore below.
-            scoped.setattr(signal, "signal", flaky_signal)
+    with (
+        pytest.raises(OSError, match="simulated restore failure"),
+        monkeypatch.context() as scoped,
+        signal_handler_scope(),
+    ):
+        # Patch only after the scope's entry-time installation used the real
+        # signal.signal; the patch ends before the handler assertions.
+        scoped.setattr(signal, "signal", flaky_signal)
 
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            if sig == first_signal:
-                # Restoration failed for this one; phasesweep's handler is
-                # still installed until manual cleanup below.
-                assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
-                continue
-            assert signal.getsignal(sig) is sentinel_handlers[sig]
-    finally:
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        if sig == first_signal:
+            # Restoration failed for this one; phasesweep's handler is
+            # still installed until fixture cleanup.
+            assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
+            continue
+        assert signal.getsignal(sig) is sentinel_handlers[sig]
 
 
 def _worker_errors(operation: Callable[[], None]) -> list[BaseException]:
@@ -220,19 +202,14 @@ def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> 
     worker thread with no enclosing install cannot safely take ownership; it
     must raise a typed error instead of silently running unprotected.
     """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    try:
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            if signal.getsignal(sig) is runtime_shutdown._shutdown_handler:
-                signal.signal(sig, signal.SIG_DFL)
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        if signal.getsignal(sig) is runtime_shutdown._shutdown_handler:
+            signal.signal(sig, signal.SIG_DFL)
 
-        errors = _worker_errors(_enter_signal_handler_scope)
+    errors = _worker_errors(_enter_signal_handler_scope)
 
-        assert len(errors) == 1
-        assert isinstance(errors[0], SignalOwnershipUnavailableError)
-    finally:
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    assert len(errors) == 1
+    assert isinstance(errors[0], SignalOwnershipUnavailableError)
 
 
 def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals() -> None:
@@ -244,63 +221,42 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
     see that ownership is already established and do nothing, on entry or
     exit.
     """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    try:
-        install_signal_handlers()
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
+    install_signal_handlers()
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
 
-        errors = _worker_errors(_enter_signal_handler_scope)
+    errors = _worker_errors(_enter_signal_handler_scope)
 
-        assert errors == []
-        # Entry-point ownership persists: the nested scope did not tear it down.
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
-    finally:
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    assert errors == []
+    # Entry-point ownership persists: the nested scope did not tear it down.
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
 
 
 def test_install_signal_handlers_inside_open_scope_survives_that_scope_exit() -> None:
-    """An ``install_signal_handlers()`` call inside an open scope must outlive the scope.
-
-    ``install_signal_handlers()`` recognizes an already-installed handler set
-    as its own idempotent path, so calling it while a
-    ``signal_handler_scope()`` is open took process-lifetime ownership on the
-    strength of the *scope's* installation. The scope then restored the host's
-    handlers on exit while ownership stayed claimed, so every later scope
-    no-opped with nothing installed and child process groups leaked on
-    shutdown. The scope now hands its installation over instead of restoring.
-    """
+    """Process-lifetime ownership taken inside a temporary scope survives scope exit."""
 
     def host_handler(_signum: int, _frame: object) -> None:
         raise AssertionError("host handler should never fire during this test")
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            signal.signal(sig, host_handler)
-        signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS))
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        signal.signal(sig, host_handler)
+    signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS))
 
-        with signal_handler_scope():
-            install_signal_handlers()
+    with signal_handler_scope():
+        install_signal_handlers()
 
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
-        assert not set(runtime_shutdown._SHUTDOWN_SIGNALS) & signal.pthread_sigmask(
-            signal.SIG_BLOCK, set()
-        )
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
+    assert not set(runtime_shutdown._SHUTDOWN_SIGNALS) & signal.pthread_sigmask(
+        signal.SIG_BLOCK, set()
+    )
 
-        # The ownership claim is now truthful, so a later no-op scope is safe.
-        with signal_handler_scope():
-            pass
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    # A later scope preserves the installed process-lifetime handlers.
+    with signal_handler_scope():
+        pass
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
 
 
 def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
@@ -318,25 +274,20 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
     def host_handler(_signum: int, _frame: object) -> None:
         raise AssertionError("host handler should never fire during this test")
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    try:
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            signal.signal(sig, host_handler)
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        signal.signal(sig, host_handler)
 
-        with signal_handler_scope():
-            errors = _worker_errors(install_signal_handlers)
-            assert not runtime_shutdown._process_lifetime_owner
-
-        assert len(errors) == 1
-        assert isinstance(errors[0], SignalOwnershipUnavailableError)
+    with signal_handler_scope():
+        errors = _worker_errors(install_signal_handlers)
         assert not runtime_shutdown._process_lifetime_owner
-        # The scope's exit restored the host's handlers because no legitimate
-        # process-lifetime handover happened.
-        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
-            assert signal.getsignal(sig) is host_handler
-    finally:
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], SignalOwnershipUnavailableError)
+    assert not runtime_shutdown._process_lifetime_owner
+    # The scope's exit restored the host's handlers because no legitimate
+    # process-lifetime handover happened.
+    for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
+        assert signal.getsignal(sig) is host_handler
 
 
 @pytest.mark.integration
@@ -349,7 +300,6 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
     instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the next trial
     launch) still delivers the shutdown before new work starts.
     """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:
         install_signal_handlers()
 
@@ -372,8 +322,6 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
         assert exc_info.value.signum == signal.SIGTERM
     finally:
         runtime_shutdown._deferred_shutdown_signum = None
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
 
 
 def test_service_pending_shutdown_is_noop_without_absorbed_signal() -> None:
@@ -389,17 +337,12 @@ def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
     main-thread scope must notice the divergence and reinstall phasesweep's
     handler so the run does not silently execute without child-group cleanup.
     """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
-    try:
-        install_signal_handlers()
-        interloper_sig = runtime_shutdown._SHUTDOWN_SIGNALS[0]
-        signal.signal(interloper_sig, signal.SIG_IGN)
+    install_signal_handlers()
+    interloper_sig = runtime_shutdown._SHUTDOWN_SIGNALS[0]
+    signal.signal(interloper_sig, signal.SIG_IGN)
 
-        with signal_handler_scope():
-            assert signal.getsignal(interloper_sig) is runtime_shutdown._shutdown_handler
-    finally:
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
+    with signal_handler_scope():
+        assert signal.getsignal(interloper_sig) is runtime_shutdown._shutdown_handler
 
 
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:

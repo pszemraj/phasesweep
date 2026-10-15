@@ -58,8 +58,6 @@ def deterministic_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
     """n_jobs > 1 with no GPUs and allow_no_gpu=False must raise, not silently degrade."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    # Force nvidia-smi to fail
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     with pytest.raises(RuntimeError, match="no GPUs detected"):
         GpuPool.create(n_jobs=4, allow_no_gpu=False)
 
@@ -67,7 +65,6 @@ def test_gpu_pool_fails_on_missing_gpus_parallel(monkeypatch):
 def test_gpu_pool_allows_no_gpu_when_opted_in(monkeypatch):
     """n_jobs > 1 with allow_no_gpu=True should warn but not crash."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     pool = GpuPool.create(n_jobs=4, allow_no_gpu=True)
     with pool.acquire() as gid:
         assert gid.visible_devices is None
@@ -264,7 +261,6 @@ def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
 def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
     """CPU-only single-job work does not need an explicit no-GPU opt-in."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
 
     pool = GpuPool.create(n_jobs=1)
 
@@ -276,7 +272,6 @@ def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
     with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
@@ -307,7 +302,6 @@ def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
@@ -641,7 +635,7 @@ def test_unreadable_uuid_map_rejects_unverified_tokens(
 
     with pytest.raises(RuntimeError, match=error_match):
         GpuPool.create(
-            # whole_node is a single-job policy; the other cases keep their original job counts.
+            # Whole-node acquisition requires a single-job phase.
             n_jobs=2 if explicit_ids is not None and policy == "single_per_trial" else 1,
             explicit_ids=explicit_ids,
             explicit_devices=explicit_devices,

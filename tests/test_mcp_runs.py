@@ -23,7 +23,13 @@ from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
-from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
+from tests.conftest import (
+    file_mode,
+    is_pid_zombie,
+    patch_directory_fsync_failure,
+    reaped_pid,
+    requires_nonroot,
+)
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     earlier_boot_id,
@@ -376,14 +382,7 @@ def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
 ) -> None:
     """A post-link directory-fsync failure removes the newly created status file."""
     status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
-    real_fsync = os.fsync
-
-    def fail_directory_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("injected directory fsync failure")
-        real_fsync(fd)
-
-    monkeypatch.setattr(mcp_runs.os, "fsync", fail_directory_fsync)
+    patch_directory_fsync_failure(monkeypatch, "injected directory fsync failure")
 
     with pytest.raises(OSError, match="directory fsync"):
         mcp_runs.write_status_file_if_absent(status_path, {"run_id": "exp-1"})

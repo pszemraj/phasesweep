@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -938,12 +939,7 @@ def _assert_descendant_dies(
 
 
 def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) -> None:
-    """Root shell exits cleanly on SIGTERM, but child ignores it.
-
-    The previous code path (proc.wait() only) returned as soon as the shell
-    died, leaving the child running with a GPU lease released. This must now
-    poll the whole process group and escalate to SIGKILL.
-    """
+    """Timeout cleanup kills a SIGTERM-ignoring child after its root shell exits."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     marker = tmp_path / "child_pid.txt"
@@ -978,11 +974,19 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     )
 
 
-@pytest.mark.parametrize("timeout", [None, 30.0], ids=["unbounded-read", "deadline-read"])
-def test_unexpected_status_read_failure_cleans_group_before_reraising(
+@pytest.mark.parametrize(
+    ("timeout", "cleanup_confirmed"),
+    [
+        pytest.param(None, True, id="unbounded-cleanup-confirmed"),
+        pytest.param(30.0, True, id="deadline-cleanup-confirmed"),
+        pytest.param(30.0, False, id="deadline-cleanup-uncertain"),
+    ],
+)
+def test_unexpected_status_read_failure_preserves_cleanup_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     timeout: float | None,
+    cleanup_confirmed: bool,
 ) -> None:
     """A post-launch wait failure cannot leave an untracked trainer running."""
     import phasesweep.runtime.process as process
@@ -997,7 +1001,7 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
     def fail_execution_status_read(_fd: int, _size: int) -> bytes:
         raise OSError("injected execution status read failure")
 
-    def read_ready_then_arm_failure(fd: int, size: int, *, deadline: float):
+    def read_ready_then_arm_failure(fd: int, size: int, *, deadline: float) -> bytes | None:
         nonlocal frame_reads
         frame_reads += 1
         if frame_reads == 2:
@@ -1007,8 +1011,16 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
         return frame
 
     monkeypatch.setattr(process, "_read_pipe_frame", read_ready_then_arm_failure)
+    if not cleanup_confirmed:
+        _report_uncertain_after_real_terminate(monkeypatch)
 
-    with pytest.raises(OSError, match="injected execution status read failure"):
+    error_type = OSError if cleanup_confirmed else UnsafeProcessCleanupError
+    message = (
+        "injected execution status read failure"
+        if cleanup_confirmed
+        else "cleanup could not be confirmed"
+    )
+    with pytest.raises(error_type, match=message) as excinfo:
         _run_supervised(
             trial_dir,
             "exec sleep 30",
@@ -1016,6 +1028,8 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
             attempt_id="status-read-failure",
         )
 
+    if not cleanup_confirmed:
+        assert isinstance(excinfo.value.__cause__, OSError)
     identity = read_stale_process_identity(
         trial_dir,
         expected_attempt_id="status-read-failure",
@@ -1028,75 +1042,13 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
         expected_attempt_id="status-read-failure",
     )
     assert lifecycle is not None
-    assert lifecycle.state == "exited"
-    assert lifecycle.cleanup_confirmed is True
-
-
-def test_unexpected_status_read_failure_reports_uncertain_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed cleanup attempt replaces an ordinary wait error with the typed stop."""
-    import phasesweep.runtime.process as process
-    import phasesweep.runtime.reaper as reaper
-    import phasesweep.runtime.shutdown as shutdown
-
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    real_read_frame = process._read_pipe_frame
-    frame_reads = 0
-
-    def fail_execution_status_read(_fd: int, _size: int) -> bytes:
-        raise OSError("injected execution status read failure")
-
-    def read_ready_then_arm_failure(fd: int, size: int, *, deadline: float):
-        nonlocal frame_reads
-        frame_reads += 1
-        if frame_reads == 2:
-            raise OSError("injected execution status read failure")
-        frame = real_read_frame(fd, size, deadline=deadline)
-        monkeypatch.setattr(process.os, "read", fail_execution_status_read)
-        return frame
-
-    monkeypatch.setattr(process, "_read_pipe_frame", read_ready_then_arm_failure)
-    _report_uncertain_after_real_terminate(monkeypatch)
-
-    with pytest.raises(
-        UnsafeProcessCleanupError, match="cleanup could not be confirmed"
-    ) as excinfo:
-        _run_supervised(
-            trial_dir,
-            "exec sleep 30",
-            timeout=30.0,
-            attempt_id="uncertain-status-read-failure",
-        )
-
-    assert isinstance(excinfo.value.__cause__, OSError)
-    identity = read_stale_process_identity(
-        trial_dir,
-        expected_attempt_id="uncertain-status-read-failure",
-    )
-    assert not reaper._process_group_alive(identity.pgid)
-    with shutdown._lock:
-        assert identity.pgid not in shutdown._active_children
-    lifecycle = read_attempt_lifecycle(
-        trial_dir,
-        expected_attempt_id="uncertain-status-read-failure",
-    )
-    assert lifecycle is not None
-    assert lifecycle.state == "launching"
+    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+    if cleanup_confirmed:
+        assert lifecycle.cleanup_confirmed is True
 
 
 def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
-    """The exec'd trainer must not inherit the launcher's blocked signal mask.
-
-    ``run_supervised`` spawns the supervisor from inside its shutdown-signal
-    deferral window, and a blocked mask survives both fork and exec. Without
-    the supervisor's explicit mask reset, every trainer ran with
-    SIGTERM/SIGINT/SIGHUP blocked: graceful trainer shutdown was impossible
-    and the SIGTERM -> grace -> SIGKILL escalation always burned the full
-    grace period.
-    """
+    """The exec'd trainer receives unblocked shutdown signals despite launch-time deferral."""
     if not Path("/proc/self/status").exists():
         pytest.skip("Linux-only test")
 
@@ -1380,69 +1332,44 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
     assert not marker.exists()
 
 
-def test_phase_deadline_expiring_during_launch_fails_as_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param(
+            "phasesweep.runtime.process._write_process_identity",
+            id="identity-persisted-before-payload",
+        ),
+        pytest.param(
+            "phasesweep.engine.phase.prepare_trainer_input",
+            id="input-prepared-before-lease",
+        ),
+    ],
+)
+def test_phase_deadline_expiring_before_payload_prevents_trainer_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
-    """A one-trial phase whose budget dies mid-launch must not publish success.
-
-    With startup delay injected into the launch path and a tiny phase budget,
-    the trainer must not start after the deadline has expired and the phase
-    must not publish success with ``incomplete: false``. The launch aborts
-    pre-payload, the trial fails, and the phase surfaces a TimeoutError — no
-    winner, no publication.
-    """
-    trial_dir_marker = tmp_path / "trainer_ran.txt"
+    """A phase deadline consumed at either launch boundary prevents trainer execution."""
+    marker = tmp_path / "trainer_ran.txt"
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
+        trial_command=f"touch {marker} && echo x=1.0 {{overrides}}",
         n_trials=1,
         timeout_seconds_per_phase=0.2,
     )
+    module_name, name = target.rsplit(".", 1)
+    module = import_module(module_name)
+    original = getattr(module, name)
 
-    import phasesweep.runtime.process as _process
-
-    real_write_identity = _process._write_process_identity
-
-    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
-        real_write_identity(path, identity)
+    def delayed_call(*args: object, **kwargs: object) -> object:
+        result = original(*args, **kwargs)
         time.sleep(0.5)
+        return result
 
-    monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
+    monkeypatch.setattr(module, name, delayed_call)
 
     with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
-
-    assert not trial_dir_marker.exists(), "trainer started after the phase deadline expired"
-
-
-def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Input preparation cannot start a trainer after the phase budget expires."""
-    trial_dir_marker = tmp_path / "trainer_ran.txt"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
-        n_trials=1,
-        timeout_seconds_per_phase=0.2,
-    )
-
-    import phasesweep.engine.phase as phase_mod
-
-    real_prepare = phase_mod.prepare_trainer_input
-
-    def slow_prepare(**kwargs):  # noqa: ANN003, ANN202
-        prepared = real_prepare(**kwargs)
-        time.sleep(0.5)
-        return prepared
-
-    monkeypatch.setattr(phase_mod, "prepare_trainer_input", slow_prepare)
-
-    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
-        run_experiment(experiment)
-
-    assert not trial_dir_marker.exists(), "trainer started after input preparation used the budget"
+    assert not marker.exists(), "trainer started after the phase deadline expired"
 
 
 @pytest.mark.parametrize("scope", ["phase", "run"])
@@ -1830,41 +1757,32 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
     assert member_sets == [{11}, {22}]
 
 
-def test_existing_group_with_no_inspectable_members_is_uncertain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A kernel-visible group cannot be declared dead from an empty procfs view."""
-    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper._group_member_pids",
-        lambda pgid: _GroupMemberScan(pids=(), complete=True, all_members_terminal=False),
-    )
-
-    assert _process_group_alive_with_members(1234, None) is True
-
-
 @pytest.mark.parametrize(
-    ("scan_complete", "expected_alive"),
+    ("scan", "expected_alive"),
     [
-        pytest.param(False, True, id="incomplete-scan-is-uncertain"),
-        pytest.param(True, False, id="complete-zombie-only-group-is-dead"),
+        pytest.param(
+            _GroupMemberScan(pids=(), complete=True, all_members_terminal=False),
+            True,
+            id="empty-kernel-visible-group-is-uncertain",
+        ),
+        pytest.param(
+            _GroupMemberScan(pids=(22,), complete=False, all_members_terminal=True),
+            True,
+            id="incomplete-zombie-scan-is-uncertain",
+        ),
+        pytest.param(
+            _GroupMemberScan(pids=(22,), complete=True, all_members_terminal=True),
+            False,
+            id="complete-zombie-only-group-is-dead",
+        ),
     ],
 )
-def test_terminal_only_group_uses_procfs_scan_completeness(
-    monkeypatch: pytest.MonkeyPatch,
-    scan_complete: bool,
-    expected_alive: bool,
+def test_process_group_absence_requires_complete_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch, scan: _GroupMemberScan, expected_alive: bool
 ) -> None:
-    """Terminal members prove cleanup only when the procfs scan was complete."""
+    """A kernel-visible group is dead only with complete evidence of terminal members."""
     monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper._group_member_pids",
-        lambda pgid: _GroupMemberScan(
-            pids=(22,),
-            complete=scan_complete,
-            all_members_terminal=True,
-        ),
-    )
+    monkeypatch.setattr("phasesweep.runtime.reaper._group_member_pids", lambda pgid: scan)
     monkeypatch.setattr("phasesweep.runtime.reaper._member_pids_alive", lambda pgid, pids: False)
 
     assert _process_group_alive_with_members(1234, None) is expected_alive
@@ -1907,11 +1825,7 @@ def test_reaper_raises_when_cleanup_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When kill_stale_group returns False the reaper must refuse to advance.
-
-    The previous behavior logged the survivor and still called ``study.tell``,
-    which let new trials launch onto a potentially-leaked GPU.
-    """
+    """Uncertain cleanup prevents the reaper from advancing the trial."""
 
     def fake_identity(*_args: object, **_kwargs: object) -> StaleProcessIdentity:
         return StaleProcessIdentity(

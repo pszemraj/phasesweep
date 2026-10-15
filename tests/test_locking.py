@@ -652,14 +652,9 @@ def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
 ) -> None:
     """A SIGTERM during the walk is deferred and no descriptor leaks.
 
-    Without ``defer_shutdown_signals`` around the walk, the handler's
-    ``PhaseSweepShutdown`` could land on the bytecode boundary between the
-    descriptor-handoff store and the close of the previous descriptor,
-    stranding an open fd until process exit — invisible in one-shot
-    processes, an accumulating leak for a long-running embedder now that
-    ``open_directory_fd`` is public API. The signal must queue until the
-    walk finishes and the completed final descriptor must be closed before
-    the shutdown propagates to the caller.
+    Shutdown must not interrupt between storing the next descriptor and closing
+    the previous one. It queues until the walk finishes, and the completed
+    directory descriptor closes before shutdown propagates to the caller.
     """
     from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 
