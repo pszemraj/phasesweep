@@ -493,25 +493,14 @@ def _validate_winner_source_generation(
 ) -> None:
     """Validate a carried winner against its source in this tree.
 
-    A winner's own ``generation_id`` may legitimately name an earlier
-    generation - a top-up that reselects an existing trial, or a ``--from-phase``
-    resume that reuses a validated parent winner - and the manifest deliberately
-    checks that field for well-formedness only. That left the whole
-    cross-generation claim unverified: a published winner could cite a
-    generation that exists only in some *other* artifact tree, or no tree at
-    all, and the publication still validated as ``ok``. The cited namespace
-    is where the evidence behind that number lives, so it has to resolve here.
+    A carried winner may name an earlier generation, including a top-up or
+    ``--from-phase`` resume. Its cited generation must resolve inside this
+    artifact tree, where the evidence behind its metric lives.
 
-    Deviating deliberately from a blanket "the source must also hold a winner
-    record for this phase": a crash between trial completion and publication
-    leaves a claim-time namespace - provenance files, no summary - whose trials
-    a later top-up legitimately publishes first, citing that crashed
-    generation. Requiring a winner record there would make ordinary crash
-    recovery permanently unpublishable. So the record is required exactly when
-    the source generation itself published (it has a summary); an unpublished
-    source needs only to exist. Directory existence alone already enforces the
-    same-tree invariant, and the summary carve-out still catches a published
-    source that lost its winner record.
+    A source generation with a summary must contain a validated winner record
+    for this phase. An unpublished source needs to exist: a crash after trial
+    completion can leave provenance without a summary, and a later top-up can
+    publish those trials.
 
     A published source is validated once per top-level call and its cited
     winner is taken from that validation, so the bytes compared are the bytes
