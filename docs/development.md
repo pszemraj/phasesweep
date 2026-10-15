@@ -146,7 +146,7 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
+Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are defined in `phasesweep.config.models` and `phasesweep.config.search`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
 
 Within `phasesweep.engine`, module ownership is intentionally direct:
 
@@ -163,7 +163,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
-The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md). `tests/test_invariants_doc.py` holds that file to the code: every `Held by` symbol must import, every cited test must exist, and every numbered reference to an invariant in `src/`, `tests/`, or `docs/` must carry the rule's title in quotes, as in `invariant 2 ("Validation writes nothing")`, or link to its heading, so a renumbering cannot silently repoint it. It cannot notice a missing rule: a new ordering rule or ledger entry point needs its own entry, citing the code and the test that hold it.
+The storage, publication and process-ordering rules are documented in [durability invariants](invariants.md), alongside the code and behavioral tests that implement them.
 
 The ordinary control flow is:
 
