@@ -476,7 +476,6 @@ def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
     value = trial.value
     assert value is not None  # callers screen for a recorded value first
     return value
-    return value
 
 
 def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:

@@ -773,29 +773,6 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         )
 
 
-def _load_existing_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
-    """Load a phase study only if it already exists.
-
-    Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
-    that can create an empty study and make missing evidence look safe. The study is opened
-    the way every existing journal study is (:func:`_open_existing_journal_study`), so an
-    absent study is ``None`` and nothing is created.
-
-    :param ValidatedLedger ledger: Handle naming the ledger the study lives in.
-    :param Phase | str phase: Phase or historical phase name whose study is loaded.
-    :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
-    :raises StudyStorageUnavailableError: Persistent storage exists but
-        could not be read, so whether the study exists cannot be determined;
-        callers on mutating paths must abort rather than treat this as absence.
-    """
-    if ledger.backend == "memory":
-        return None
-    assert ledger.storage_url is not None
-    return _open_existing_journal_study(
-        ledger.storage_url, _phase_study_name(ledger.experiment, phase)
-    )
-
-
 def _unavailable_phase_trial_stats(
     ledger: ValidatedLedger, phase: Phase, exc: BaseException
 ) -> _PhaseTrialStats:
@@ -816,52 +793,6 @@ def _unavailable_phase_trial_stats(
         cause,
     )
     return _PhaseTrialStats({}, False, {}, None)
-
-
-def _trial_stats(
-    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
-) -> dict[str, _PhaseTrialStats]:
-    """Read every phase's counts and RUNNING identities from one journal capture.
-
-    Every phase is answered from the same snapshot, so the phases describe one
-    moment and a status read replays the journal once whatever the phase
-    count. Confirmed absence reports available zero counts; read failures
-    report unavailable counts, for every phase when the capture itself fails.
-
-    :param ValidatedLedger ledger: Handle naming the ledger the studies live in.
-    :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
-        verify in the snapshot, by phase name.
-    :return dict[str, _PhaseTrialStats]: One permissive result per configured
-        phase, by phase name, with explicit availability.
-    :raises StudySchemaMismatchError: A phase's study is populated under an
-        unsupported schema.
-    """
-    phases = ledger.experiment.phases
-    if ledger.backend == "memory":
-        return {phase.name: _PhaseTrialStats({}, False, {}, None) for phase in phases}
-    assert ledger.storage_url is not None
-    try:
-        snapshot = _journal_snapshot_storage(
-            ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
-    stats: dict[str, _PhaseTrialStats] = {}
-    for phase in phases:
-        if snapshot is None:
-            stats[phase.name] = _PhaseTrialStats({}, True, {}, [])
-            continue
-        try:
-            stats[phase.name] = _phase_trial_stats(
-                snapshot,
-                _phase_study_name(ledger.experiment, phase),
-                published_trials.get(phase.name),
-            )
-        except StudySchemaMismatchError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
-    return stats
 
 
 def _phase_trial_stats(
@@ -1016,7 +947,7 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
 
     Taking the handle rather than a bare config is the point: reaching this
     opener at all proves the binding check and the format scan already ran, in
-    order, so no caller can load a study out of a ledger this release refuses.
+    order, so no caller can load a study out of a ledger whose format validation failed.
     A handle whose scan did not complete is refused for the same reason: the
     study it would open sits in a ledger nothing has format-checked.
 
@@ -1042,7 +973,12 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
         # Same type and remedy as the scan's refusal: an interrupted
         # transaction must not read as a ledger to restore.
         raise type(failure).rewrap(failure, str(failure)) from failure
-    return _load_existing_phase_study(ledger, phase)
+    if ledger.backend == "memory":
+        return None
+    assert ledger.storage_url is not None
+    return _open_existing_journal_study(
+        ledger.storage_url, _phase_study_name(ledger.experiment, phase)
+    )
 
 
 def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
@@ -1099,7 +1035,32 @@ def read_trial_stats(
             phase.name: _unavailable_phase_trial_stats(ledger, phase, ledger.format_scan_failure)
             for phase in ledger.experiment.phases
         }
-    return _trial_stats(ledger, published_trials)
+    phases = ledger.experiment.phases
+    if ledger.backend == "memory":
+        return {phase.name: _PhaseTrialStats({}, False, {}, None) for phase in phases}
+    assert ledger.storage_url is not None
+    try:
+        snapshot = _journal_snapshot_storage(
+            ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
+    stats: dict[str, _PhaseTrialStats] = {}
+    for phase in phases:
+        if snapshot is None:
+            stats[phase.name] = _PhaseTrialStats({}, True, {}, [])
+            continue
+        try:
+            stats[phase.name] = _phase_trial_stats(
+                snapshot,
+                _phase_study_name(ledger.experiment, phase),
+                published_trials.get(phase.name),
+            )
+        except StudySchemaMismatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
+    return stats
 
 
 @dataclass(frozen=True, slots=True)
@@ -1400,7 +1361,7 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
     created it before binding the tree. Requiring a :class:`ClaimedLedger` is what makes the fixed order
     checkable: that handle exists only once :func:`validate_ledger` and
     :func:`claim_ledger` have run, so no caller can create a study in a ledger
-    this release refuses or in a tree that does not yet name this ledger. The
+    whose format validation failed or in a tree that does not yet name this ledger. The
     type is enforced at runtime as well, because an untyped caller could
     otherwise pass a bare :class:`ValidatedLedger`, which carries every field
     this function reads.
@@ -1522,10 +1483,8 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     orchestrator - so this is the one opener that takes a bare locator instead
     of a validated handle, and it does the validation itself, first: the
     locator's whole ledger is scanned for unsupported state before any study in
-    it is opened. This release wrote the registry entry, so the ledger it names
-    was current-format when the attempt registered; unsupported state there now
-    means the locator no longer names that ledger, and reaping through it would
-    write into state this release refuses. Every caller holds the experiment
+    it is opened. Unsupported state anywhere in the locator's ledger prevents
+    opening or modifying its studies. Every caller holds the experiment
     lock and is about to write through the study, so a journal whose final
     record a crashed writer left partial is then repaired, as
     :func:`claim_ledger` repairs its own (:func:`_repair_incomplete_journal_record`).
@@ -1550,9 +1509,6 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         read completely, or a journal changed while the study was being opened.
     :raises ValueError: ``locator`` selects an unsupported local storage backend.
     """
-    if locator is None:
-        # An in-memory study died with the orchestrator that held it.
-        return None
     _scan_ledger_format(locator)
     _repair_incomplete_journal_record(locator)
     return _open_existing_journal_study(locator, study_name)

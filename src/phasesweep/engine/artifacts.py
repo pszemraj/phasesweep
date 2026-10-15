@@ -7,6 +7,7 @@ import csv
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +229,8 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
     :param Winner winner: Winner whose common fields should be serialized.
     :return dict[str, Any]: Shared trial, parameter, evidence, identity, and source fields.
     """
+    source = winner.source
+    assert source is not None, "only the never-persisted dry-run placeholder has no source"
     payload = {
         "trial_number": winner.trial_number,
         "params": winner.params,
@@ -237,29 +240,10 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
-        "winner_source": _winner_source_payload(winner),
+        "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
     }
     return payload
-
-
-def _winner_source_payload(winner: Winner) -> dict[str, Any]:
-    """Serialize the concrete source trial for an exposed winner.
-
-    :param Winner winner: Winner whose recorded ``source`` is serialized.
-    :return dict[str, Any]: JSON-serializable winner-source payload with
-        ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
-        keys.
-    """
-    source = winner.source
-    assert source is not None, "only the never-persisted dry-run placeholder has no source"
-    return {
-        "kind": source.kind,
-        "phase": source.phase,
-        "trial_number": source.trial_number,
-        "generation_id": source.generation_id,
-        "attempt_id": source.attempt_id,
-    }
 
 
 # Warn-once keys for :func:`_warn_environment_drift`. A resume can load the

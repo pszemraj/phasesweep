@@ -51,8 +51,8 @@ class _TrialRef:
 
     Reconciles a row against published evidence or external cleanup evidence:
     which trial it is, and which generation/attempt claimed it.
-    Values are ``None`` when the trial never recorded that attribute (e.g. a
-    row written by an older PhaseSweep). Published references additionally
+    Values are ``None`` for an allocation interrupted before its identity
+    attributes were written. Published references additionally
     carry their terminal and complete count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
@@ -584,7 +584,7 @@ def _build_sampler(
     Args:
         cfg: Parsed sampler config (type, seed, startup-trials, etc.).
         search_space: The phase's validated sampler search space
-            (:func:`phasesweep.config.sampler_search_space`), used to build the
+            (:func:`phasesweep.config.search.sampler_search_space`), used to build the
             ``GridSampler`` grid; it includes the repeat axis.
         n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
             when ``n_jobs > 1``.

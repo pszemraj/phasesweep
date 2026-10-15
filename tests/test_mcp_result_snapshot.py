@@ -387,7 +387,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
     capture_reads = 0
-    original_stats = engine_ledger._trial_stats
+    original_stats = engine_ledger.read_trial_stats
 
     def transient_capture_failure(
         ledger: engine_ledger.ValidatedLedger,
@@ -406,7 +406,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
         return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(engine_ledger, "_trial_stats", transient_capture_failure)
+    monkeypatch.setattr("phasesweep.engine.read.read_trial_stats", transient_capture_failure)
     if not pointer_commits:
         pointer_path = _last_successful_generation_path(experiment)
         original_write = generation_ops.artifact_io._write_yaml_atomic

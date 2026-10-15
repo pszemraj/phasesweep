@@ -152,7 +152,7 @@ class Winner:
     objective_provenance: dict[str, Any] | None = None
     # Versioned identity of the generated input consumed by the source trial.
     # Persisted with the winner so --from-phase can verify carried evidence
-    # even if the older Optuna ledger is no longer available.
+    # even if the source study is no longer available.
     trainer_input: dict[str, Any] | None = None
     # Identity of the semantic environment the winning trial ran under: the
     # SHA-256 of its tracked trainer environment (the pass-through values,
@@ -333,6 +333,37 @@ def _valid_abort_record(value: object, *, sequence: int) -> bool:
         and isinstance(cause, str)
         and bool(cause)
     )
+
+
+def _trial_outcome_payload(
+    sequence: int,
+    outcome: str,
+    *,
+    cause: str | None = None,
+    policy: str | None = None,
+    abort: JsonObject | None = None,
+) -> JsonObject:
+    """Serialize one ordered outcome and its optional diagnostics and abort.
+
+    :param int sequence: Completion sequence assigned under the outcome lock.
+    :param str outcome: Terminal outcome category.
+    :param str | None cause: Failure explanation when present.
+    :param str | None policy: Fatal policy when present.
+    :param JsonObject | None abort: Phase abort tripped by this outcome.
+    :return JsonObject: Current-format outcome ready for the trial user attribute.
+    """
+    payload: JsonObject = {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+    }
+    if cause is not None:
+        payload["cause"] = cause
+    if policy is not None:
+        payload["policy"] = policy
+    if abort is not None:
+        payload[TRIAL_OUTCOME_ABORT_KEY] = abort
+    return payload
 
 
 def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:

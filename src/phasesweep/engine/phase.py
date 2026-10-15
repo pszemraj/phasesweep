@@ -60,11 +60,10 @@ from phasesweep.engine.state import (
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
-    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
+    _trial_outcome_payload,
     constraint_attr,
     observed_attr,
 )
@@ -99,6 +98,7 @@ from phasesweep.engine.trial import (
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -352,7 +352,7 @@ def _failure_policy_abort_record(
     consecutive_failures: int,
     completion_sequence: int,
     trial_target: int,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Build a durable consecutive-failure abort record.
 
     :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
@@ -363,40 +363,41 @@ def _failure_policy_abort_record(
         the trip was observed.
     :param int trial_target: Durable accepted ``n_trials`` target to attach
         to the record.
-    :return dict[str, Any]: A ``schema_version=1`` abort record ready to
+    :return JsonObject: A ``schema_version=1`` abort record ready to
         record with the tripping outcome.
     """
     return {
-        "schema_version": 1,
-        "policy": "max_consecutive_failures",
+        **_abort_record(
+            policy="max_consecutive_failures",
+            completion_sequence=completion_sequence,
+            trial_target=trial_target,
+            cause=(
+                f"{consecutive_failures} consecutive failed/infeasible trials reached "
+                f"max_consecutive_failures={phase.max_consecutive_failures}."
+            ),
+        ),
         "threshold": phase.max_consecutive_failures,
         "consecutive_failures": consecutive_failures,
-        "completion_sequence": completion_sequence,
-        "trial_target": trial_target,
-        "cause": (
-            f"{consecutive_failures} consecutive failed/infeasible trials reached "
-            f"max_consecutive_failures={phase.max_consecutive_failures}."
-        ),
     }
 
 
-def _fatal_abort_record(
+def _abort_record(
     *,
     policy: str,
     completion_sequence: int,
     trial_target: int,
     cause: str,
-) -> dict[str, Any]:
-    """Build a durable fatal-outcome abort record.
+) -> JsonObject:
+    """Build the common fields of a durable phase abort record.
 
-    :param str policy: Fatal policy that stopped the phase, such as
+    :param str policy: Policy that stopped the phase, such as
         ``"unsafe_process_cleanup"``.
-    :param int completion_sequence: Completion sequence of the fatal outcome.
+    :param int completion_sequence: Completion sequence of the tripping outcome.
     :param int trial_target: Durable accepted ``n_trials`` target to attach
         to the record.
     :param str cause: Explanation the operator reads.
-    :return dict[str, Any]: A ``schema_version=1`` abort record ready to
-        record with the fatal outcome.
+    :return JsonObject: A ``schema_version=1`` abort record ready to
+        record with the tripping outcome.
     """
     return {
         "schema_version": 1,
@@ -722,7 +723,7 @@ class _PhaseExecution:
         *,
         cause: str | None,
         fatal_policy: str | None,
-    ) -> dict[str, Any] | None:
+    ) -> JsonObject | None:
         """Return the abort record that recording ``outcome`` next would trip.
 
         Changes nothing: the caller holds ``outcome_lock`` and writes the
@@ -734,14 +735,14 @@ class _PhaseExecution:
         :param str outcome: The terminal outcome about to be recorded.
         :param str | None cause: The outcome's recorded cause, if any.
         :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
-        :return dict[str, Any] | None: The abort record for the outcome's
+        :return JsonObject | None: The abort record for the outcome's
             completion sequence, or ``None`` when it trips nothing new.
         """
         if self.abort_recorded:
             return None
         sequence = self.completion_sequence + 1
         if outcome == "fatal":
-            return _fatal_abort_record(
+            return _abort_record(
                 policy=fatal_policy or "fatal_trial_exception",
                 completion_sequence=sequence,
                 trial_target=self.phase.n_trials,
@@ -909,7 +910,7 @@ def _record_outcome(
     # Because a peer may advance the completion sequence during that wait,
     # every retry rebuilds its payload from the then-current sequence.
     write_error: Exception | None = None
-    abort_record: dict[str, Any] | None = None
+    abort_record: JsonObject | None = None
     for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
         if attempt_index:
             time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
@@ -919,17 +920,13 @@ def _record_outcome(
             abort_record = run.abort_decision(
                 trial.number, outcome, cause=cause, fatal_policy=fatal_policy
             )
-            payload: dict[str, Any] = {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": run.completion_sequence + 1,
-                "outcome": outcome,
-            }
-            if cause is not None:
-                payload["cause"] = cause
-            if fatal_policy is not None:
-                payload["policy"] = fatal_policy
-            if abort_record is not None:
-                payload[TRIAL_OUTCOME_ABORT_KEY] = abort_record
+            payload = _trial_outcome_payload(
+                run.completion_sequence + 1,
+                outcome,
+                cause=cause,
+                policy=fatal_policy,
+                abort=abort_record,
+            )
             try:
                 trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
             except Exception as exc:
@@ -1233,17 +1230,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     return result.metric
 
 
-def _tracked_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
-    """Run :func:`_objective` while the phase's worker tracker counts it.
-
-    :param _PhaseExecution run: The phase execution the trial belongs to.
-    :param optuna.Trial trial: The active Optuna trial being evaluated.
-    :return float: The metric :func:`_objective` returns.
-    """
-    with run.workers.track(trial.number):
-        return _objective(run, trial)
-
-
 def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     """Classify and durably order every terminal objective outcome.
 
@@ -1261,83 +1247,84 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         without raising.
 
     """
-    try:
-        return _execute_objective(run, trial)
-    except _TrialOutcomeUnrecordedAbort:
-        # Must stay first. Every handler below answers by calling
-        # ``_record_outcome``, which is exactly what just failed, and the
-        # catch-all would additionally relabel this as an unexpected
-        # objective exception. Re-raising it untouched is what keeps the
-        # trial RUNNING for stale-attempt recovery. Only the direct call path
-        # from ``_execute_objective`` needs the guard: the same abort raised
-        # from inside a sibling handler already bypasses the rest.
-        raise
-    except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
-        _record_outcome(run, trial, "interrupted", cause=str(exc))
-        raise
-    except TrialExecutionError as exc:
-        signum = servicing_shutdown_signal()
-        if signum is None:
-            _record_outcome(run, trial, "failure", cause=str(exc))
-        else:
-            # Under n_jobs > 1 the shutdown handler runs in the main thread and
-            # kills this worker's trainer, which ends here as a trainer error.
+    with run.workers.track(trial.number):
+        try:
+            return _execute_objective(run, trial)
+        except _TrialOutcomeUnrecordedAbort:
+            # Must stay first. Every handler below answers by calling
+            # ``_record_outcome``, which is exactly what just failed, and the
+            # catch-all would additionally relabel this as an unexpected
+            # objective exception. Re-raising it untouched is what keeps the
+            # trial RUNNING for stale-attempt recovery. Only the direct call path
+            # from ``_execute_objective`` needs the guard: the same abort raised
+            # from inside a sibling handler already bypasses the rest.
+            raise
+        except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
+            _record_outcome(run, trial, "interrupted", cause=str(exc))
+            raise
+        except TrialExecutionError as exc:
+            signum = servicing_shutdown_signal()
+            if signum is None:
+                _record_outcome(run, trial, "failure", cause=str(exc))
+            else:
+                # Under n_jobs > 1 the shutdown handler runs in the main thread and
+                # kills this worker's trainer, which ends here as a trainer error.
+                _record_outcome(
+                    run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
+                )
+            raise
+        except UnsafeProcessCleanupError as exc:
+            run.record_fatal(exc)
+            # Both trainer and evidence-worker cleanup failures retain this
+            # diagnostic; the fatal policy below remains the recovery authority.
+            with contextlib.suppress(Exception):
+                trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
             _record_outcome(
-                run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
+                run,
+                trial,
+                "fatal",
+                cause=str(exc),
+                fatal_policy="unsafe_process_cleanup",
             )
-        raise
-    except UnsafeProcessCleanupError as exc:
-        run.record_fatal(exc)
-        # Both trainer and evidence-worker cleanup failures retain this
-        # diagnostic; the fatal policy below remains the recovery authority.
-        with contextlib.suppress(Exception):
-            trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=str(exc),
-            fatal_policy="unsafe_process_cleanup",
-        )
-        raise
-    except ActiveAttemptPersistenceError as exc:
-        # Named rather than left to the catch-all below: the durable abort
-        # record is the operator's only account of why the phase stopped,
-        # and "unexpected_objective_exception" would point them at a
-        # PhaseSweep bug instead of at their unwritable workdir.
-        run.record_fatal(exc)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=str(exc),
-            fatal_policy="active_attempt_persistence",
-        )
-        raise
-    except PhaseSweepShutdown as exc:
-        # A host shutdown cancels the orchestration attempt; it is not a
-        # trainer failure or an internal objective bug. Optuna propagates
-        # SystemExit without promising a terminal trial transition, so the
-        # durable outcome is the recovery authority: a later stale-attempt
-        # pass may close the row, but must not turn the interruption into a
-        # failure streak or durable phase abort.
-        _record_outcome(
-            run,
-            trial,
-            "interrupted",
-            cause=f"orchestrator interrupted by signal {exc.signum}",
-        )
-        raise
-    except BaseException as exc:
-        run.record_fatal(exc)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=f"{type(exc).__name__}: {exc}",
-            fatal_policy="unexpected_objective_exception",
-        )
-        raise
+            raise
+        except ActiveAttemptPersistenceError as exc:
+            # Named rather than left to the catch-all below: the durable abort
+            # record is the operator's only account of why the phase stopped,
+            # and "unexpected_objective_exception" would point them at a
+            # PhaseSweep bug instead of at their unwritable workdir.
+            run.record_fatal(exc)
+            _record_outcome(
+                run,
+                trial,
+                "fatal",
+                cause=str(exc),
+                fatal_policy="active_attempt_persistence",
+            )
+            raise
+        except PhaseSweepShutdown as exc:
+            # A host shutdown cancels the orchestration attempt; it is not a
+            # trainer failure or an internal objective bug. Optuna propagates
+            # SystemExit without promising a terminal trial transition, so the
+            # durable outcome is the recovery authority: a later stale-attempt
+            # pass may close the row, but must not turn the interruption into a
+            # failure streak or durable phase abort.
+            _record_outcome(
+                run,
+                trial,
+                "interrupted",
+                cause=f"orchestrator interrupted by signal {exc.signum}",
+            )
+            raise
+        except BaseException as exc:
+            run.record_fatal(exc)
+            _record_outcome(
+                run,
+                trial,
+                "fatal",
+                cause=f"{type(exc).__name__}: {exc}",
+                fatal_policy="unexpected_objective_exception",
+            )
+            raise
 
 
 def _after_trial(
@@ -1682,7 +1669,7 @@ def _run_phase(
     # prerequisite above (environment, tracking target, GPU discovery, and the
     # wallclock budget) has passed. Recording it earlier would strand the
     # study at a target no invocation ever launched work toward, making the
-    # previously working config a rejected regression.
+    # original target unusable even though the larger target launched no work.
     if resume.recovery_abort is not None:
         # The recovery record accepts the raised target in the same write that
         # retires the abort and starts a new streak, so this execution's own
@@ -1713,7 +1700,7 @@ def _run_phase(
             _log_reruns(phase, study, _record_reruns(study))
             try:
                 study.optimize(
-                    functools.partial(_tracked_objective, run),
+                    functools.partial(_objective, run),
                     n_trials=remaining,
                     n_jobs=phase.n_jobs,
                     timeout=budget.timeout,

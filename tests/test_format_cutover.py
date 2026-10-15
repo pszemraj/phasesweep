@@ -498,7 +498,7 @@ def test_startup_scans_the_ledger_format_once(
     storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     real_validate = ledger._scan_ledger_format
-    real_load = ledger._load_existing_phase_study
+    real_load = ledger.open_existing_study
     calls = 0
 
     def counted_validate(candidate: str | None) -> None:
@@ -511,7 +511,7 @@ def test_startup_scans_the_ledger_format_once(
         return real_load(candidate, phase)
 
     monkeypatch.setattr(ledger, "_scan_ledger_format", counted_validate)
-    monkeypatch.setattr(ledger, "_load_existing_phase_study", checked_load)
+    monkeypatch.setattr(ledger, "open_existing_study", checked_load)
 
     run_experiment(experiment)
 

@@ -1468,7 +1468,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
     experiment = load_experiment(config_path)
-    original_stats = engine_ledger._trial_stats
+    original_stats = engine_ledger.read_trial_stats
 
     def unavailable_during_prepared_capture(
         ledger: engine_ledger.ValidatedLedger,
@@ -1485,7 +1485,9 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
 
         return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(engine_ledger, "_trial_stats", unavailable_during_prepared_capture)
+    monkeypatch.setattr(
+        "phasesweep.engine.read.read_trial_stats", unavailable_during_prepared_capture
+    )
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare

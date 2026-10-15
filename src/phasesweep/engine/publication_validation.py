@@ -300,7 +300,7 @@ def _validate_generation_manifest(
     raw_artifacts = summary.get("artifacts")
     if not isinstance(raw_artifacts, list):
         raise _fail("summary has no artifact manifest")
-    listed: dict[tuple[str, str], Mapping[str, Any]] = {}
+    listed: dict[str, Mapping[str, object]] = {}
     listed_files: dict[str, Mapping[str, Any]] = {}
     for entry in raw_artifacts:
         if not isinstance(entry, Mapping) or not isinstance(entry.get("sha256"), str):
@@ -315,10 +315,10 @@ def _validate_generation_manifest(
             continue
         if kind != "winner" or not isinstance(entry.get("phase"), str):
             raise _fail("summary artifact entry is malformed")
-        key = (str(kind), str(entry["phase"]))
-        if key in listed:
-            raise _fail(f"duplicate artifact entry for {key}")
-        listed[key] = entry
+        name = str(entry["phase"])
+        if name in listed:
+            raise _fail(f"duplicate artifact entry for {('winner', name)}")
+        listed[name] = entry
     snapshot_phases = _validate_generation_provenance_files(
         generation_dir,
         summary,
@@ -341,142 +341,131 @@ def _validate_generation_manifest(
         if name in phase_items:
             raise _fail(f"duplicate phase winner entry {name!r}")
         phase_items[name] = item
-        if ("winner", name) not in listed:
+        if name not in listed:
             raise _fail(f"phase {name!r} winner is not listed in the artifact manifest")
 
-    for kind, name in listed:
-        if kind == "winner" and name not in phase_items:
+    for name in listed:
+        if name not in phase_items:
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
 
     winners: dict[str, ValidatedWinner] = {}
-    for (kind, name), entry in listed.items():
+    for name, entry in listed.items():
         artifact_path = generation_dir / "phases" / name / WINNER_FILENAME
         try:
             content = _read_unlinked_bytes(artifact_path, root=generation_dir.parent)
         except PermissionError as exc:
             raise _permission_fail(
-                _unreadable_artifact_permission_detail(f"{kind} artifact for phase {name!r}")
+                _unreadable_artifact_permission_detail(f"winner artifact for phase {name!r}")
             ) from exc
         except OSError as exc:
-            raise _fail(f"{kind} artifact for phase {name!r} is missing or unreadable") from exc
+            raise _fail(f"winner artifact for phase {name!r} is missing or unreadable") from exc
         if hashlib.sha256(content).hexdigest() != entry["sha256"]:
-            raise _fail(f"{kind} artifact for phase {name!r} does not match its recorded hash")
+            raise _fail(f"winner artifact for phase {name!r} does not match its recorded hash")
         try:
             payload = yaml.safe_load(content)
         except yaml.YAMLError as exc:
-            raise _fail(f"{kind} artifact for phase {name!r} is not parseable") from exc
+            raise _fail(f"winner artifact for phase {name!r} is not parseable") from exc
         if not isinstance(payload, Mapping):
-            raise _fail(f"{kind} artifact for phase {name!r} is not a mapping")
+            raise _fail(f"winner artifact for phase {name!r} is not a mapping")
         if payload.get("phase") != name:
-            raise _fail(f"{kind} artifact for phase {name!r} names a different phase")
-        if kind == "winner":
-            item = phase_items[name]
-            if payload.get("trial_number") != item.get("trial_number"):
-                raise _fail(f"winner for phase {name!r} disagrees with the summary trial number")
-            metric_block = payload.get("metric")
-            if not isinstance(metric_block, Mapping) or metric_block.get("goal") != metric["goal"]:
-                raise _fail(f"winner for phase {name!r} has a mismatched metric goal")
-            value = metric_block.get(metric["name"])
-            if not isinstance(value, (int, float)) or float(value) != item.get("metric"):
-                raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
-            for field in (
-                "params",
-                "effective_overrides",
-                "constraints",
-                "gates",
-                "completion",
-                "generation_id",
-                "attempt_id",
-                "winner_source",
-                "trainer_input",
-            ):
-                if (field in payload) != (field in item) or payload.get(field) != item.get(field):
-                    raise _fail(f"winner for phase {name!r} disagrees with the summary {field}")
-            # A winner is legitimately carried forward from an earlier
-            # generation, so its own generation_id may name that earlier
-            # generation — the check is well-formedness, not equality.
-            for id_field in ("generation_id", "attempt_id"):
-                recorded = payload.get(id_field)
-                if not isinstance(recorded, str) or not recorded:
-                    raise _fail(f"winner for phase {name!r} has no valid {id_field}")
-            fingerprint = payload.get("phase_fingerprint")
-            if not is_sha256_hex(fingerprint):
-                raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
-            source = payload.get("winner_source")
-            if not isinstance(source, Mapping):
-                raise _fail(f"winner for phase {name!r} has no valid winner_source")
-            # _parse_winner_source owns kind, key set, and phase equality. The
-            # safe-name and exact-int checks stay here because it checks
-            # neither: it only requires a nonempty phase and coerces with int().
-            source_phase = source.get("phase")
-            if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
-                raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
-            source_trial = source.get("trial_number")
-            if (
-                not isinstance(source_trial, int)
-                or isinstance(source_trial, bool)
-                or source_trial != payload.get("trial_number")
-            ):
-                raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
-            try:
-                parsed_source = _parse_winner_source(source, expected_phase=name)
-            except ValueError as exc:
+            raise _fail(f"winner artifact for phase {name!r} names a different phase")
+        item = phase_items[name]
+        if payload.get("trial_number") != item.get("trial_number"):
+            raise _fail(f"winner for phase {name!r} disagrees with the summary trial number")
+        metric_block = payload.get("metric")
+        if not isinstance(metric_block, Mapping) or metric_block.get("goal") != metric["goal"]:
+            raise _fail(f"winner for phase {name!r} has a mismatched metric goal")
+        value = metric_block.get(metric["name"])
+        if not isinstance(value, (int, float)) or float(value) != item.get("metric"):
+            raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
+        for field in (
+            "params",
+            "effective_overrides",
+            "constraints",
+            "gates",
+            "completion",
+            "generation_id",
+            "attempt_id",
+            "winner_source",
+            "trainer_input",
+        ):
+            if (field in payload) != (field in item) or payload.get(field) != item.get(field):
+                raise _fail(f"winner for phase {name!r} disagrees with the summary {field}")
+        # A winner is legitimately carried forward from an earlier
+        # generation, so its own generation_id may name that earlier
+        # generation — the check is well-formedness, not equality.
+        for id_field in ("generation_id", "attempt_id"):
+            recorded = payload.get(id_field)
+            if not isinstance(recorded, str) or not recorded:
+                raise _fail(f"winner for phase {name!r} has no valid {id_field}")
+        fingerprint = payload.get("phase_fingerprint")
+        if not is_sha256_hex(fingerprint):
+            raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
+        source = payload.get("winner_source")
+        if not isinstance(source, Mapping):
+            raise _fail(f"winner for phase {name!r} has no valid winner_source")
+        # _parse_winner_source owns kind, key set, and phase equality. The
+        # safe-name and exact-int checks stay here because it checks
+        # neither: it only requires a nonempty phase and coerces with int().
+        source_phase = source.get("phase")
+        if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
+            raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
+        source_trial = source.get("trial_number")
+        if (
+            not isinstance(source_trial, int)
+            or isinstance(source_trial, bool)
+            or source_trial != payload.get("trial_number")
+        ):
+            raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
+        try:
+            parsed_source = _parse_winner_source(source, expected_phase=name)
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has no valid winner_source ({exc})") from exc
+        for id_field, parsed_value in (
+            ("generation_id", parsed_source.generation_id),
+            ("attempt_id", parsed_source.attempt_id),
+        ):
+            if parsed_value != payload.get(id_field):
                 raise _fail(
-                    f"winner for phase {name!r} has no valid winner_source ({exc})"
-                ) from exc
-            for id_field, parsed_value in (
-                ("generation_id", parsed_source.generation_id),
-                ("attempt_id", parsed_source.attempt_id),
-            ):
-                if parsed_value != payload.get(id_field):
-                    raise _fail(
-                        f"winner for phase {name!r} has a winner_source "
-                        f"that disagrees with its {id_field}"
-                    )
-            _validate_winner_source_generation(
-                generation_dir,
-                generation_id,
-                name,
-                summary.get("experiment"),
-                payload,
-                _fail,
-                _permission_fail,
-                validated,
+                    f"winner for phase {name!r} has a winner_source "
+                    f"that disagrees with its {id_field}"
+                )
+        _validate_winner_source_generation(
+            generation_dir,
+            generation_id,
+            name,
+            summary.get("experiment"),
+            payload,
+            _fail,
+            _permission_fail,
+            validated,
+        )
+        if not isinstance(payload.get("completion"), Mapping):
+            raise _fail(f"winner for phase {name!r} has no completion metadata")
+        try:
+            confound = _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has no valid confound block ({exc})") from exc
+        try:
+            _validate_observed_block(payload.get("observed"))
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has no valid observed block ({exc})") from exc
+        try:
+            repeats = _validate_repeats_block(
+                payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
             )
-            if not isinstance(payload.get("completion"), Mapping):
-                raise _fail(f"winner for phase {name!r} has no completion metadata")
-            try:
-                confound = _validate_confound_block(
-                    payload.get("confound"), winner_trial=source_trial
-                )
-            except ValueError as exc:
-                raise _fail(
-                    f"winner for phase {name!r} has no valid confound block ({exc})"
-                ) from exc
-            try:
-                _validate_observed_block(payload.get("observed"))
-            except ValueError as exc:
-                raise _fail(
-                    f"winner for phase {name!r} has no valid observed block ({exc})"
-                ) from exc
-            try:
-                repeats = _validate_repeats_block(
-                    payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
-                )
-                if name not in snapshot_phases.repeats:
-                    raise ValueError("the config snapshot plans no such phase")
-                _check_repeats_axis(repeats, snapshot_phases.repeats[name])
-            except ValueError as exc:
-                raise _fail(
-                    f"winner for phase {name!r} has no valid repeats block ({exc})"
-                ) from exc
-            winners[name] = ValidatedWinner(content=content, payload=payload)
+            if name not in snapshot_phases.repeats:
+                raise ValueError("the config snapshot plans no such phase")
+            _check_repeats_axis(repeats, snapshot_phases.repeats[name])
+        except ValueError as exc:
+            raise _fail(f"winner for phase {name!r} has no valid repeats block ({exc})") from exc
+        winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
         for phase_dir in phases_dir.iterdir():
             if not phase_dir.is_dir():
                 continue
-            if (phase_dir / WINNER_FILENAME).is_file() and ("winner", phase_dir.name) not in listed:
+            if (phase_dir / WINNER_FILENAME).is_file() and phase_dir.name not in listed:
                 raise _fail(
                     f"namespace contains an unlisted winner artifact for phase {phase_dir.name!r}"
                 )

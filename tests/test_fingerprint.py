@@ -1257,14 +1257,14 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
             study_name=f"t::{phase.name}", storage=_resolve_storage(storage), direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    real_loader = ledger._load_existing_phase_study
+    real_loader = ledger.open_existing_study
 
     def _fail_for_lr(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
         return real_loader(handle, phase)
 
-    monkeypatch.setattr(ledger, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr(ledger, "open_existing_study", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1505,7 +1505,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = ledger._load_existing_phase_study
+    real_loader = ledger.open_existing_study
     calls = {"count": 0}
 
     def _fail_first_read(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
@@ -1515,7 +1515,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         return real_loader(handle, phase)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(ledger, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr(ledger, "open_existing_study", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 

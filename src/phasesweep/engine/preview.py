@@ -278,53 +278,6 @@ def _preview_ledger(
     return recorded
 
 
-def _preview_resume_phase(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-    study: optuna.Study,
-) -> _PhaseResume | Winner:
-    """Judge a phase's recorded state as a launch would, without recovering or writing anything.
-
-    This is the live resume applied to a read-only snapshot: the same target,
-    partial-decision and abort rules, minus the steps that change the study
-    (recovering stale trials, stamping the schema, binding the fingerprint) and
-    minus the fingerprint comparison, whose inherited winners a preview may
-    only have stood in for. A replayed winner is selected from the recorded
-    trials but not evidence-verified: that proof reads the trial directories,
-    may query W&B or MLflow, and records the environment-drift warning once per
-    process, so a preview leaves it, and that warning, to the launch.
-
-    :param Experiment experiment: Parsed experiment config.
-    :param Phase phase: The phase being previewed.
-    :param dict[str, Winner] inherited_winners: Winners, or stand-ins for them,
-        for phases earlier in the chain.
-    :param optuna.Study study: The phase's read-only snapshot study.
-    :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
-        target, or a fixed configuration asks for more attempts than it may retry.
-    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
-        current limit with work remaining, at an accepted target its current
-        ``n_trials`` does not exceed.
-    :raises WinnerIntegrityError: An accepted partial-timeout decision would
-        replay while the current config disables ``allow_incomplete_on_timeout``.
-    :raises TimeoutError: An accepted partial-timeout decision replays with no
-        feasible trial.
-    :raises StudySchemaMismatchError: Durable phase state is malformed or
-        contradicts the study's trials.
-    :return _PhaseResume | Winner: The validated state, or the winner an
-        accepted partial-timeout decision replays.
-    """
-    return _judge_recorded_phase(
-        experiment,
-        phase,
-        inherited_winners,
-        study,
-        policy_state=_load_phase_policy_state(study),
-        phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
-        verify_evidence=False,
-    )
-
-
 def _preview_phase(
     experiment: Experiment,
     phase: Phase,
@@ -334,7 +287,7 @@ def _preview_phase(
     """Log what a launch would do with the phase's recorded trials, and return the verdict.
 
     The recorded trials are judged by the rules a launch applies
-    (:func:`_preview_resume_phase`), so the preview refuses what a launch
+    (:func:`_judge_recorded_phase`), so the preview refuses what a launch
     refuses. A phase that would replay carries the winner a launch would
     republish, which its children inherit, and launches no trials. A phase with
     trials still to run carries a placeholder (:func:`_dry_run_phase`) and the
@@ -361,7 +314,17 @@ def _preview_phase(
     resume: _PhaseResume | None = None
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
-        resumed = _preview_resume_phase(experiment, phase, inherited_winners, study)
+        # Snapshots never recover or stamp state; placeholder ancestry also
+        # prevents fingerprint comparison or evidence verification here.
+        resumed = _judge_recorded_phase(
+            experiment,
+            phase,
+            inherited_winners,
+            study,
+            policy_state=_load_phase_policy_state(study),
+            phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+            verify_evidence=False,
+        )
         if isinstance(resumed, Winner):
             # A run replays an accepted partial result before it logs a header.
             log.info(

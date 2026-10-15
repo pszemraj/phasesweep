@@ -6,7 +6,6 @@ import contextlib
 import json
 import logging
 import os
-from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,12 +28,11 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
-    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     _outcome_sequence_counts,
     _parsed_trial_outcome,
     _stale_recovery_outcome,
+    _trial_outcome_payload,
     _unduplicated_outcome,
 )
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction, ProcessCleanupUncertainError
@@ -44,6 +42,7 @@ from phasesweep.runtime.files import (
     canonical_storage_identity,
     open_directory_fd,
     private_atomic_write_text,
+    read_private_text,
     read_private_text_at,
     storage_recovery_locator,
 )
@@ -290,13 +289,7 @@ def _tracking_cleanup_receipts(experiment: Experiment) -> dict[str, str]:
     receipts: dict[str, str] = {}
     for path in sorted(tracking_root(experiment).glob("*/cleanup-receipts/*.json")):
         try:
-            directory_fd = open_directory_fd(path.parent, create=False, private_final=False)
-            try:
-                payload: object = strict_json_loads(
-                    read_private_text_at(directory_fd, path.name, path)
-                )
-            finally:
-                os.close(directory_fd)
+            payload: object = strict_json_loads(read_private_text(path, require_private_dir=False))
         except (OSError, UnsafePrivatePathError, ValueError) as exc:
             log.warning("Ignoring unreadable tracking cleanup receipt %s: %s", path, exc)
             continue
@@ -647,17 +640,7 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
         sequence = existing.sequence
         cause = "orchestrator stopped before Optuna committed the terminal trial state"
 
-    payload: JsonObject = {
-        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-        "sequence": sequence,
-        "outcome": outcome,
-    }
-    if cause is not None:
-        payload["cause"] = cause
-    if policy is not None:
-        payload["policy"] = policy
-    if abort is not None:
-        payload[TRIAL_OUTCOME_ABORT_KEY] = abort
+    payload = _trial_outcome_payload(sequence, outcome, cause=cause, policy=policy, abort=abort)
     try:
         active_trial = optuna.Trial(study, trial._trial_id)
         active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
@@ -915,69 +898,15 @@ class _AttemptRecord:
     trial_number: int | None
 
 
-class _Discovery(ABC):
-    """How one discovery source words the resolution of its attempts.
-
-    A source chooses only the wording and operator action of each refusal,
-    its log lines, and whether a durable lifecycle record may settle its
-    attempts without a process identity; the rule itself is
-    :func:`_resolve_attempt`.
-    """
-
-    lifecycle_settles: ClassVar[bool] = True
-
-    @abstractmethod
-    def lifecycle_malformed(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse an attempt whose lifecycle record is malformed or another attempt's.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-
-    @abstractmethod
-    def identity_unreadable(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse an attempt whose durable process identity cannot be validated.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-
-    @abstractmethod
-    def cleanup_unconfirmed(
-        self, record: _AttemptRecord, identity: StaleProcessIdentity
-    ) -> ProcessCleanupUncertainError:
-        """Refuse an attempt whose process group could not be proven gone.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :param StaleProcessIdentity identity: The validated identity that was signalled.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-
-    @abstractmethod
-    def settled(self, record: _AttemptRecord, lifecycle: AttemptLifecycle) -> None:
-        """Report an attempt its lifecycle settled without signalling anything.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param AttemptLifecycle lifecycle: The ``exited`` or ``allocated`` record.
-        """
-
-    @abstractmethod
-    def cleaned(self, record: _AttemptRecord, identity: StaleProcessIdentity) -> None:
-        """Report an attempt whose process group was confirmed gone.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param StaleProcessIdentity identity: The identity that was cleaned.
-        """
-
-
 @dataclass(frozen=True)
-class _RegistryEntryDiscovery(_Discovery):
+class _RegistryEntryDiscovery:
     """An attempt discovered through its entry in the attempt registry.
 
     Every refusal names the entry file, which is what the operator repairs
     or removes.
     """
 
+    lifecycle_settles: ClassVar[bool] = True
     entry_path: Path
 
     def lifecycle_malformed(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
@@ -1045,13 +974,14 @@ class _RegistryEntryDiscovery(_Discovery):
 
 
 @dataclass(frozen=True)
-class _TrialDiscovery(_Discovery):
+class _TrialDiscovery:
     """An attempt discovered through its stale RUNNING trial in a phase study.
 
     ``mcp recover-run`` resolves trials this way too, so no refusal here
     sends the operator back to recover-run.
     """
 
+    lifecycle_settles: ClassVar[bool] = True
     study_name: str
 
     def lifecycle_malformed(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
@@ -1184,7 +1114,9 @@ class _CleanupUncertainTrialDiscovery(_TrialDiscovery):
         )
 
 
-def _resolve_attempt(record: _AttemptRecord, discovery: _Discovery, *, confirm: bool) -> None:
+def _resolve_attempt(
+    record: _AttemptRecord, discovery: _RegistryEntryDiscovery | _TrialDiscovery, *, confirm: bool
+) -> None:
     """Prove that no live process can remain from one discovered attempt.
 
     Every discovered attempt resolves here, and this is the only place
@@ -1204,7 +1136,7 @@ def _resolve_attempt(record: _AttemptRecord, discovery: _Discovery, *, confirm: 
     A source whose lifecycle cannot settle its attempts goes straight to step 3.
 
     :param _AttemptRecord record: Normalized attempt to resolve.
-    :param _Discovery discovery: The discovering source's wording.
+    :param _RegistryEntryDiscovery | _TrialDiscovery discovery: The discovering source's wording.
     :param bool confirm: Signal and clean a validated identity's group when
         true. When false, stop after validating it, as ``mcp recover-run``
         preflight does; a later confirmed call resolves the attempt again.
