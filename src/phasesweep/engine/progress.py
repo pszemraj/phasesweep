@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import optuna
 
-from phasesweep.config import Phase
+from phasesweep.config.models import Phase
 from phasesweep.engine.optuna import _trial_state_label
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome

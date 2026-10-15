@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from phasesweep import load_experiment
-from phasesweep.config import ArtifactSizeGate, JsonEqualsGate, Sha256Gate
 from phasesweep.evidence.evaluation import evaluate_gates
+from phasesweep.evidence.models import ArtifactSizeGate, JsonEqualsGate, Sha256Gate
 from tests.conftest import (
     make_trial_context,
     patch_path_method_failure,

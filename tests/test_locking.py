@@ -14,17 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from phasesweep.config import (
-    IntParam,
-    Phase,
-    Sampler,
-)
-from phasesweep.engine import run_experiment
+from phasesweep.config.models import Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
 )
+from phasesweep.engine.run import run_experiment
 from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
@@ -800,7 +797,7 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
                 "-c",
                 """
 import sys
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.errors import ExperimentLockBusyError
 try:

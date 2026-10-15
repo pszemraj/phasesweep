@@ -13,22 +13,21 @@ import yaml
 
 import phasesweep.engine.artifacts as artifact_io
 from phasesweep import run_experiment
-from phasesweep.config import (
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import (
     CategoricalParam,
-    Experiment,
     IntParam,
-    Phase,
     Repeats,
     Sampler,
     sampler_search_space,
 )
-from phasesweep.engine import WinnerIntegrityError, read_status, read_trial_tables, read_winner
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.engine.paths import _generation_summary_path, _generation_winner_path, _phase_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner
-from phasesweep.engine.read import _winner_view
+from phasesweep.engine.read import _winner_view, read_result, read_status, read_trial_tables
 from phasesweep.engine.repeats import ReduceName, reduce_values, spread
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
@@ -395,7 +394,7 @@ def test_manifest_binds_the_repeats_block_to_the_snapshot_axis(
     assert "winner for phase 'p' has no valid repeats block" in pointer.error
     assert reason in pointer.error
     assert read_status(experiment)["publication_integrity"] == "failed"
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 @pytest.mark.parametrize(("tamper", "reason"), _AXIS_MISMATCHES)
@@ -423,7 +422,7 @@ def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
 
-    view = read_winner(experiment, "p")
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.repeats is not None
     assert view.repeats["reduce"] == "mean"
@@ -439,7 +438,7 @@ def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
 def test_trial_tables_label_repeat_groups_and_star_every_winning_member(tmp_path: Path) -> None:
     """A repeats phase's table groups trials as trials.csv does and stars the whole winning group."""
     experiment, _ = _repeats_publication(tmp_path)
-    view = read_winner(experiment, "p")
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None and view.repeats is not None
 
     (table,) = read_trial_tables(experiment).phases

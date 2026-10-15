@@ -12,8 +12,8 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import ExecutionContext, Experiment
 from phasesweep.config.io import load_experiment_bytes
+from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import file_url_path

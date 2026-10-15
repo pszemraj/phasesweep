@@ -19,22 +19,15 @@ import pytest
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runs as mcp_runs
-from phasesweep.config import (
-    Experiment,
-    FloatParam,
-    IntParam,
-    Phase,
-    Sampler,
-    load_experiment,
-)
-from phasesweep.engine import (
-    run_experiment,
-)
+from phasesweep.config.io import load_experiment
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import FloatParam, IntParam, Sampler
 from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _phase_dir,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
+from phasesweep.engine.run import run_experiment
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,

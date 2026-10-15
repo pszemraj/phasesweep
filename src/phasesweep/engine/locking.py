@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ExperimentLockBusyError,
 )

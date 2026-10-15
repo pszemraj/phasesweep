@@ -26,24 +26,22 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import (
+from phasesweep.config.models import (
     Constraint,
     ExecutionContext,
     Experiment,
-    IntParam,
-    JsonEnvelopeExtractor,
-    LogRegexExtractor,
     Metric,
     Observation,
     Phase,
-    Sampler,
 )
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.evidence import TrialContext
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.reaper import _read_proc_stat
 from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked

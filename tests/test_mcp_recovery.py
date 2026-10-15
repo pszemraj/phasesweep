@@ -17,11 +17,8 @@ from click.testing import Result
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.runs as mcp_runs
-from phasesweep.config import (
-    Experiment,
-    load_experiment,
-)
-from phasesweep.engine import run_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
@@ -44,6 +41,7 @@ from phasesweep.engine.paths import (
     _generation_record_path,
     _trial_dir_for,
 )
+from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,

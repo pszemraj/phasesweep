@@ -5,7 +5,7 @@ import json
 import optuna
 import pytest
 
-from phasesweep.config import Constraint, JsonExtractor, Phase
+from phasesweep.config.models import Constraint, Phase
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
@@ -23,6 +23,7 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
+from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment
 
 # Allocation writes both attrs on every trial before its trainer runs.

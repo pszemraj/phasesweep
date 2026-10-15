@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from phasesweep.config import Experiment, MlflowSettings
+from phasesweep.config.models import Experiment
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor
@@ -26,6 +26,7 @@ from phasesweep.tracking.mlflow import (
     _create,
     _find,
 )
+from phasesweep.tracking.models import MlflowSettings
 
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
@@ -107,7 +108,7 @@ def test_timing_values_must_be_finite(tmp_path, field, value):
 
     import yaml
 
-    from phasesweep.config import load_experiment
+    from phasesweep.config.io import load_experiment
 
     config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
     config.update(workdir=str(tmp_path / "runs"))
@@ -1251,7 +1252,7 @@ def test_cache_uses_home_and_xdg(tmp_path, monkeypatch):
 
 
 def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
-    from phasesweep.engine import run_experiment
+    from phasesweep.engine.run import run_experiment
     from phasesweep.errors import PhaseSweepError
     from phasesweep.tracking.publication import sync_tracking
 
@@ -1422,7 +1423,8 @@ def test_worker_outcomes_reach_the_controller_as_distinct_exceptions(
 @pytest.mark.parametrize("failure", ["target", "attempt"])
 def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failure):
     """An unready target stops once before any trial; an attempt failure fails only its trial."""
-    from phasesweep.engine import NoFeasibleTrialError, run_experiment
+    from phasesweep.engine.run import run_experiment
+    from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.errors import PhaseSweepError
     from phasesweep.runtime.gpu import GpuPool
 

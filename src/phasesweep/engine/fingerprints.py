@@ -10,9 +10,10 @@ from typing import Any
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
-from phasesweep.engine.errors import OperatorAction, StudyFingerprintMismatchError
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)

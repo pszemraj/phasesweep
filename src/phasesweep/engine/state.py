@@ -66,7 +66,7 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
     phase the caller is reading a winner *for* — a mismatch means the winner
     was copied or misattributed across phases). Shared by
     :func:`phasesweep.engine.artifacts._load_winner`,
-    :func:`phasesweep.engine.read.read_winner`, and
+    :func:`phasesweep.engine.read.read_result`, and
     :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
     which differ only in what they do when this raises: the first two wrap it
     as :class:`phasesweep.engine.errors.WinnerIntegrityError` or treat the

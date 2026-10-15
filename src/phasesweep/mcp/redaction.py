@@ -10,8 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypeAlias
 
-from phasesweep.engine import PhaseWinnerView
-from phasesweep.engine.read import ResultContext
+from phasesweep.engine.read import PhaseWinnerView, ResultContext
 from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState

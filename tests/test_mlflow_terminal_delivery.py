@@ -17,8 +17,7 @@ from optuna.trial import TrialState, create_trial
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.engine.cleanup as cleanup_module
 import phasesweep.engine.phase as phase_module
-from phasesweep.config import Experiment
-from phasesweep.engine import NoFeasibleTrialError, run_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.generation import _recorded_generation_state
 from phasesweep.engine.ledger import (
     claim_ledger,
@@ -28,6 +27,8 @@ from phasesweep.engine.ledger import (
 )
 from phasesweep.engine.paths import _experiment_dir, _generation_record_path, _trial_dir_for
 from phasesweep.engine.read import read_status
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,

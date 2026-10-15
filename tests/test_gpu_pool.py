@@ -16,11 +16,8 @@ from contextlib import suppress
 
 import pytest
 
-from phasesweep.config import (
-    IntParam,
-    Phase,
-)
-from phasesweep.config.models import GpuPolicy
+from phasesweep.config.models import GpuPolicy, Phase
+from phasesweep.config.search import IntParam
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (

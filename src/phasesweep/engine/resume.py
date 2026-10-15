@@ -12,7 +12,7 @@ import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationIntegrityError,

@@ -15,26 +15,9 @@ import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
-from phasesweep.config import (
-    Experiment,
-    FloatParam,
-    IntParam,
-    JsonEnvelopeExtractor,
-    JsonExtractor,
-    LogRegexExtractor,
-    Metric,
-    Observation,
-    Phase,
-    Sampler,
-    WandbExtractor,
-)
-from phasesweep.engine import (
-    PublishedStudyMissingError,
-    read_status,
-    read_trial_tables,
-    read_winner,
-    read_winners,
-)
+from phasesweep.config.models import Experiment, Metric, Observation, Phase
+from phasesweep.config.search import FloatParam, IntParam, Sampler
+from phasesweep.engine.errors import PublishedStudyMissingError
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -44,8 +27,15 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, TRIAL_OUTCOME_SCHEMA_VERSION
+from phasesweep.evidence.models import (
+    JsonEnvelopeExtractor,
+    JsonExtractor,
+    LogRegexExtractor,
+    WandbExtractor,
+)
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -215,7 +205,8 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     tmp_path: Path, published: bool, keep_prefix: bool, damage: str
 ) -> None:
     """A record Optuna cannot replay, or a bad line another line follows, is refused everywhere."""
-    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
+    from phasesweep.engine.errors import StudyStorageUnavailableError
+    from phasesweep.errors import ProcessCleanupUncertainError
 
     experiment, ledger, root = _journal_experiment(tmp_path, published=published)
     original = ledger.read_bytes()
@@ -265,7 +256,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
     this study, the truncation still leaves that publication's evidence gone
     -- a real, later, unrelated refusal the repair cannot paper over.
     """
-    from phasesweep.engine import PublishedStudyMissingError
+    from phasesweep.engine.errors import PublishedStudyMissingError
 
     experiment, ledger, root = _journal_experiment(tmp_path, published=published)
     original = ledger.read_bytes()
@@ -454,7 +445,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     tmp_path: Path, damage: str
 ) -> None:
     """The same status flags select the same remedy whatever damaged the ledger."""
-    from phasesweep.engine import ProcessCleanupUncertainError
+    from phasesweep.errors import ProcessCleanupUncertainError
     from phasesweep.mcp.redaction import status_payload
     from phasesweep.mcp.snapshots import capture_result_snapshot
 
@@ -786,7 +777,7 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
     assert status["published_config_matches_current"] is False
     assert status["phases"][0]["winner_present"] is True
 
-    winners = read_winners(drifted)
+    winners = read_result(drifted, phase_names=[phase.name for phase in drifted.phases])[1]
     assert len(winners) == 1
     assert winners[0].metric_name == "objective"
     assert winners[0].metric_goal == "minimize"
@@ -831,20 +822,25 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     assert status["phases"][0]["winner_present"] is False
 
     generation_id = status["represented_generation_id"]
-    # The declared-phase default is unchanged: the CLI resume/progress readers
-    # that depend on it keep asking about the phases configured today.
-    assert read_winners(renamed, generation_id=generation_id) == []
-
-    (winner,) = read_winners(
-        renamed,
-        generation_id=generation_id,
-        phase_names=status["result_phase_plan"],
+    # Progress readers explicitly select the phases configured today;
+    # result readers default to the historical generation's recorded plan.
+    assert (
+        read_result(
+            renamed,
+            generation_id=generation_id,
+            phase_names=[phase.name for phase in renamed.phases],
+        )[1]
+        == []
     )
+
+    (winner,) = read_result(
+        renamed, generation_id=generation_id, phase_names=status["result_phase_plan"]
+    )[1]
     assert winner.phase == "p"
     assert (winner.metric_name, winner.metric_goal) == ("objective", "minimize")
 
 
-def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
+def test_read_result_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
     """A winner_source citing another phase reads as absent, not as that phase's winner.
 
     Reads of a generation that is not the validated publication (here, one
@@ -863,7 +859,7 @@ def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path
     winner["winner_source"]["phase"] = "other"
     winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
 
-    assert read_winner(experiment, "p", generation_id=generation_id) is None
+    assert read_result(experiment, generation_id=generation_id, phase_names=["p"])[1] == []
 
 
 @pytest.mark.parametrize(
@@ -885,7 +881,7 @@ def test_pinned_reads_treat_malformed_winner_as_absent(
     _generation_winner_path(experiment, generation_id, "p").write_bytes(contents)
 
     if reader == "winner":
-        assert read_winner(experiment, "p", generation_id=generation_id) is None
+        assert read_result(experiment, generation_id=generation_id, phase_names=["p"])[1] == []
     else:
         snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
         assert snapshot["winners"] == []
@@ -959,8 +955,8 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
 
 
 @pytest.mark.parametrize("unsafe_name", ["../escape", "", "phases/p"])
-def test_read_winners_refuses_phase_names_that_are_not_path_components(
-    tmp_path: Path, unsafe_name: str
+def test_read_result_refuses_phase_names_that_are_not_path_components(
+    tmp_path: Path, unsafe_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Explicit plans become path segments, so they are validated like config names.
 
@@ -969,8 +965,26 @@ def test_read_winners_refuses_phase_names_that_are_not_path_components(
     """
     exp = _experiment(tmp_path)
 
+    def unexpected_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unsafe phase names must fail before storage reads")
+
+    monkeypatch.setattr(engine_read, "_read_status", unexpected_read)
     with pytest.raises(ValueError, match="phase name"):
-        read_winners(exp, phase_names=[unsafe_name])
+        read_result(exp, phase_names=[unsafe_name])
+
+
+@pytest.mark.parametrize("phase_names", [[], ["missing"], ["p"], ["missing", "p", "p"]])
+def test_read_result_phase_filter_preserves_status_and_requested_order(
+    tmp_path: Path, phase_names: list[str]
+) -> None:
+    """A winner selection does not rewrite status; requested order is retained."""
+    experiment = _published(tmp_path)
+    expected_status, default_winners = read_result(experiment)
+    status, winners = read_result(experiment, phase_names=phase_names)
+
+    assert status == expected_status
+    assert [winner.phase for winner in default_winners] == ["p"]
+    assert [winner.phase for winner in winners] == [name for name in phase_names if name == "p"]
 
 
 def test_read_trial_tables_has_no_rows_without_a_persisted_study(tmp_path: Path) -> None:

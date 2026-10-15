@@ -18,9 +18,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-import phasesweep.config as config_models
-from phasesweep.config import Experiment, load_experiment
-from phasesweep.config.io import describe_validation_error, load_experiment_bytes
+import phasesweep.config.models as config_models
+import phasesweep.config.search as search_models
+import phasesweep.evidence.models as evidence_models
+import phasesweep.tracking.models as tracking_models
+from phasesweep.config.io import describe_validation_error, load_experiment, load_experiment_bytes
+from phasesweep.config.models import Experiment
 from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
@@ -111,7 +114,11 @@ def _schema_inventory() -> dict[str, str]:
         :param str prefix: Inventory path of the model, with its variant tag if any.
         """
         name = node["title"]
-        model_type = getattr(config_models, name)
+        model_type = next(
+            getattr(module, name)
+            for module in (config_models, search_models, evidence_models, tracking_models)
+            if hasattr(module, name)
+        )
         tag = node["properties"].get("type", {}).get("const")
         if tag is not None:
             prefix += f"[type={tag}]"

@@ -8,7 +8,7 @@ import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_SUMMARY_SCHEMA_VERSION,

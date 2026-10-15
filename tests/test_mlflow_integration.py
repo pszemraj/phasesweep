@@ -19,10 +19,10 @@ from urllib.parse import urlsplit
 import pytest
 import yaml
 
-from phasesweep.config import Experiment
-from phasesweep.engine import run_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.read import read_status, read_winners
+from phasesweep.engine.read import read_result, read_status
+from phasesweep.engine.run import run_experiment
 from phasesweep.tracking.publication import delivery_status, sync_tracking
 
 pytestmark = pytest.mark.integration
@@ -362,7 +362,10 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     assert all(point["step"] == 1 for point in rate_capture["observations"].values())
     process.terminate()
     process.wait(timeout=15)
-    before = [(w.phase, w.metric, w.params) for w in read_winners(experiment)]
+    before = [
+        (w.phase, w.metric, w.params)
+        for w in read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1]
+    ]
     original_import = builtins.__import__
 
     def no_sdk(name, *args, **kwargs):
@@ -379,7 +382,10 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     monkeypatch.setattr(transport, "request_operation", no_network)
     replay = run_experiment(experiment)
     assert {k: w.metric for k, w in replay.items()} == {k: w.metric for k, w in winners.items()}
-    assert [(w.phase, w.metric, w.params) for w in read_winners(experiment)] == before
+    assert [
+        (w.phase, w.metric, w.params)
+        for w in read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1]
+    ] == before
     assert all(p["trials"]["COMPLETE"] == 2 for p in read_status(experiment)["phases"])
 
 
@@ -413,8 +419,8 @@ def test_blocked_tracking_worker_is_cleaned(tmp_path, monkeypatch):
 @pytest.mark.parametrize("outage", ["none", "before_upload", "lost_ack"])
 def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, monkeypatch, outage):
     """A real failed trainer leaves no score and a retryable failed summary projection."""
-    from phasesweep.engine import NoFeasibleTrialError
     from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.tracking import publication
     from phasesweep.tracking.session import read_record, tracking_root
 

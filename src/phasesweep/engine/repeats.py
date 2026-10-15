@@ -23,7 +23,8 @@ from phasesweep.engine.state import _validate_observed_block
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
-    from phasesweep.config import Phase, Repeats
+    from phasesweep.config.models import Phase
+    from phasesweep.config.search import Repeats
 
 ReduceName = Literal["mean", "median"]
 """How a group's member metrics combine into the value that ranks it."""

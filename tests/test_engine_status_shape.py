@@ -11,9 +11,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from phasesweep import experiment_status
-from phasesweep.config import Experiment
-from phasesweep.engine import read_status
+from phasesweep.config.models import Experiment
 from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.read import read_status
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import ledger_file, materialize, published_generation_id
 

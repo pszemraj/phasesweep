@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from phasesweep.config import LogRegexExtractor, Metric, Observation, Phase, Repeats, Sampler
+from phasesweep.config.models import Metric, Observation, Phase
+from phasesweep.config.search import Repeats, Sampler
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment
 
 

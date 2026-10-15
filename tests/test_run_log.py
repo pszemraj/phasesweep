@@ -10,18 +10,12 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Repeats,
-    Sampler,
-)
+from phasesweep.config.models import Metric, Phase
+from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment, write_trainer
 
 

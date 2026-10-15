@@ -29,9 +29,8 @@ from typing import Any, Literal, TypeAlias
 import optuna
 import yaml
 
-from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
-from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.confound import _confound_summary, _validate_confound_block
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -309,88 +308,6 @@ def _represented_winners(
     return [view for view in views if view is not None]
 
 
-def read_winner(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    generation_id: str | None = None,
-) -> PhaseWinnerView | None:
-    """Read a single phase's persisted winner, or ``None`` if not yet written.
-
-    Args:
-        experiment: Parsed experiment config; supplies the artifact roots.
-            The metric value is extracted under the name the winner file
-            itself recorded, so a historical winner is never reinterpreted
-            through the currently configured metric.
-        phase_name: Phase whose ``winner.yaml`` to read.
-        generation_id: Optional generation whose immutable winner should be read.
-
-    Returns:
-        A :class:`PhaseWinnerView`, or ``None`` when the phase has no usable
-        winner on disk: never run, still running, selection failed, or the file
-        is malformed. A malformed read is treated as "not yet written" -
-            consistent with this module's permissive contract and with
-            ``read_trial_stats`` swallowing transient backend errors. The
-        strict, fingerprint-verifying read used for ``--from-phase`` resume
-        lives in ``engine.artifacts._load_winner`` and is intentionally not
-        relaxed here.
-
-    Raises:
-        ValueError: If ``phase_name`` or ``generation_id`` is not a safe path
-            component.
-
-    """
-    views = read_winners(experiment, generation_id=generation_id, phase_names=[phase_name])
-    return views[0] if views else None
-
-
-def read_winners(
-    experiment: Experiment,
-    *,
-    generation_id: str | None = None,
-    phase_names: Sequence[str] | None = None,
-) -> list[PhaseWinnerView]:
-    """Read every persisted phase winner, in declared (or supplied) phase order.
-
-    Phases without a winner yet are skipped, so the list length tells the
-    caller how far the chain has progressed.
-
-    Args:
-        experiment: Parsed experiment config whose phases are read in order.
-        generation_id: Optional generation whose immutable winners should be read.
-        phase_names: Optional explicit phase plan to enumerate instead of the
-            currently configured phases, in the order given. A caller reading a
-            *historical* generation passes that generation's own recorded plan
-            (see :func:`_summary_phase_plan`), so a phase renamed in the config
-            since publication neither hides the published winner nor reports
-            the new name as missing. Names are path components, so each is
-            validated; the default keeps the declared-phase behavior every
-            existing caller relies on.
-
-    Returns:
-        One :class:`PhaseWinnerView` per named phase that has a winner on disk.
-
-    Raises:
-        ValueError: If ``generation_id`` or a name in ``phase_names`` is not a
-            safe path component. Plans parsed off disk are filtered before
-            they reach here, so this only fires on a programming error.
-
-    """
-    validate_ledger(experiment)
-    if generation_id is not None:
-        _validate_safe_name("generation", generation_id)
-    names = (
-        [phase.name for phase in experiment.phases]
-        if phase_names is None
-        else [_validate_safe_name("phase", name) for name in phase_names]
-    )
-    publication = _resolve_publication_pointer(experiment)
-    represented_generation_id = (
-        generation_id if generation_id is not None else _published_generation_id(publication)
-    )
-    return _represented_winners(experiment, publication, represented_generation_id, names)
-
-
 def _published_generation_id(publication: PublicationPointer) -> str | None:
     """Return the generation a pointer resolution may report as published.
 
@@ -630,13 +547,13 @@ def read_result(
     *,
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
+    phase_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
     """Read status and the represented generation's winners from one pointer resolution.
 
-    A caller that reports both must not pair :func:`read_status` with a
-    separate :func:`read_winners`: two pointer resolutions could describe two
-    different publications. Winners are enumerated under the status payload's
-    ``result_phase_plan``, so a phase renamed since publication neither hides
+    A caller that reports both must use this single read: separate pointer
+    resolutions could describe different publications. Winners default to the
+    status payload's ``result_phase_plan``, so a phase renamed since publication neither hides
     its published winner nor reports the new name as missing. A published
     generation's winners are the bytes publication validation read; any other
     represented generation is read permissively.
@@ -646,13 +563,21 @@ def read_result(
         :func:`read_status`.
     :param Experiment | None comparison_experiment: Optional current config
         for drift comparison, as for :func:`read_status`.
+    :param Sequence[str] | None phase_names: Optional safe phase names to select
+        winners in the supplied order; an empty sequence selects none. This
+        filters only winners, leaving status and its recorded phase plan intact.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
-    :raises ValueError: If ``generation_id`` is not a safe generation name.
+    :raises ValueError: If ``generation_id`` or an explicit phase name is not safe.
     :return tuple[dict[str, Any], list[PhaseWinnerView]]: The path-free
         :func:`read_status` payload and one winner view per recorded phase
         that has a usable winner.
     """
+    names = (
+        None
+        if phase_names is None
+        else [_validate_safe_name("phase", name) for name in phase_names]
+    )
     status, publication = _read_status(
         experiment,
         generation_id=generation_id,
@@ -662,7 +587,7 @@ def read_result(
         experiment,
         publication,
         status["represented_generation_id"],
-        status["result_phase_plan"],
+        status["result_phase_plan"] if names is None else names,
     )
     return status, winners
 

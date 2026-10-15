@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
     _check_study_artifact_root,

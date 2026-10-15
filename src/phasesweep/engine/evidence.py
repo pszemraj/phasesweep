@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import is_sha256_hex
-from phasesweep.config.models import _wandb_query
+from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )

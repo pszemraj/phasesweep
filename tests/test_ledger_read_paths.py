@@ -31,7 +31,7 @@ from phasesweep import run_experiment
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
-from phasesweep.engine.read import read_status, read_trial_tables, read_winners
+from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
@@ -57,7 +57,7 @@ REQUIRED_FIXTURES = ("current-journal",)
 #: Read paths that must not construct file-backed storage at all.
 PURE_READ_PATHS = (
     "engine-read_status",
-    "engine-read_winners",
+    "engine-read_result",
     "engine-read_trial_tables",
     "ledger-read_phase_trials",
     "cli-status",
@@ -221,8 +221,13 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         )
         if read_path == "engine-read_status":
             verdict = _engine_verdict(lambda: read_status(materialized.experiment))
-        elif read_path == "engine-read_winners":
-            verdict = _engine_verdict(lambda: read_winners(materialized.experiment))
+        elif read_path == "engine-read_result":
+            verdict = _engine_verdict(
+                lambda: read_result(
+                    materialized.experiment,
+                    phase_names=[phase.name for phase in materialized.experiment.phases],
+                )[1]
+            )
         elif read_path == "engine-read_trial_tables":
             verdict = _engine_verdict(lambda: read_trial_tables(materialized.experiment))
         elif read_path == "ledger-read_phase_trials":

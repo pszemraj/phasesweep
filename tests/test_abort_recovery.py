@@ -9,8 +9,8 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment
-from phasesweep.engine import StudySchemaMismatchError, TrialTargetRefusedError
+from phasesweep.config.models import Experiment
+from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError

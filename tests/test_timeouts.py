@@ -10,18 +10,20 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Metric, Phase, Repeats, Sampler
-from phasesweep.engine import PhaseSweepError, read_status
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.read import read_status
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
-from phasesweep.evidence import TrialContext
+from phasesweep.errors import PhaseSweepError
+from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -726,8 +728,8 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     from types import SimpleNamespace
 
     public = pytest.importorskip("wandb.apis.public")
-    from phasesweep.config import WandbExtractor
     from phasesweep.evidence import wandb as wandb_evidence
+    from phasesweep.evidence.models import WandbExtractor
 
     clock = [100.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])

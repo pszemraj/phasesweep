@@ -8,10 +8,9 @@ from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
-from phasesweep.config import Phase
+from phasesweep.config.models import Phase
 from phasesweep.config.search import fixed_configuration_target_refusal
 from phasesweep.engine.errors import (
-    OperatorAction,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialTargetRefusedError,
@@ -42,6 +41,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
+from phasesweep.errors import OperatorAction
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1

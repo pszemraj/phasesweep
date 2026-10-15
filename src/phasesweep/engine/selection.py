@@ -12,10 +12,11 @@ from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config import Experiment, check_bounds
+from phasesweep.config.common import check_bounds
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
-from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.repeats import (
@@ -38,6 +39,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
+from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.engine.selection")
 

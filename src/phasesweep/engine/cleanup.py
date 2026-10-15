@@ -7,7 +7,7 @@ from pathlib import Path
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _cleanup_recovered_trial_numbers,
@@ -21,14 +21,13 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
     _TrialDiscovery,
 )
-from phasesweep.engine.errors import OperatorAction
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
 )
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 
 log = logging.getLogger(__name__)
 

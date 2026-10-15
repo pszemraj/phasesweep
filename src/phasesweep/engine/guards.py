@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -18,8 +18,6 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
-    OperatorAction,
-    PhaseSweepError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -34,7 +32,8 @@ from phasesweep.engine.study_policy import (
     _validate_study_schema,
     _validate_trial_target,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 
 
 def _reconcile_existing_studies(

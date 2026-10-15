@@ -15,13 +15,9 @@ import yaml
 
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.confound import _validate_confound_block
-from phasesweep.engine.errors import (
-    OperatorAction,
-    StudyFingerprintMismatchError,
-    WinnerIntegrityError,
-)
+from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
 from phasesweep.engine.optuna import _draw_positions, _trial_state_label
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
@@ -37,6 +33,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
 )
 from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 
 log = logging.getLogger(__name__)

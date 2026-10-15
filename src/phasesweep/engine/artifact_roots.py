@@ -10,10 +10,9 @@ from typing import Any, Literal
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    OperatorAction,
     PublicationAccessError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
@@ -29,6 +28,7 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,

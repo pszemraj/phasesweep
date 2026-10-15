@@ -12,12 +12,8 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    FloatParam,
-    Phase,
-    Sampler,
-)
+from phasesweep.config.models import Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, Sampler
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     compose_trainer_config,
@@ -569,13 +565,9 @@ def test_json_file_rejects_non_json_values(value):
 @pytest.mark.parametrize("selector", ["hydra", "json_file"])
 @pytest.mark.integration
 def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
-    from phasesweep.config import (
-        CategoricalParam,
-        ExecutionContext,
-        LogRegexExtractor,
-        Metric,
-        Sampler,
-    )
+    from phasesweep.config.models import ExecutionContext, Metric
+    from phasesweep.config.search import CategoricalParam, Sampler
+    from phasesweep.evidence.models import LogRegexExtractor
 
     trainer = tmp_path / "trainer.py"
     if selector == "hydra":

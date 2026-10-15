@@ -13,7 +13,13 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from phasesweep.config import (
+from phasesweep.evidence.evaluation import (
+    ExtractorError,
+    evaluate_gates,
+    extractor_config_fingerprint,
+    run_extractor,
+)
+from phasesweep.evidence.models import (
     ArtifactSizeGate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
@@ -22,8 +28,6 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
-from phasesweep.evidence.evaluation import extractor_config_fingerprint
 from tests.conftest import make_trial_context
 
 

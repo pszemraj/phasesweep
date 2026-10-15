@@ -9,7 +9,7 @@ import statistics
 import pytest
 import yaml
 
-from phasesweep.config import Repeats
+from phasesweep.config.search import Repeats
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,

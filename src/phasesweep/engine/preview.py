@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import optuna
 
 import phasesweep.engine.resume as resume_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_applies,

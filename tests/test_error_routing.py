@@ -29,28 +29,9 @@ import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    IntParam,
-    Phase,
-    WandbSummaryRequiredGate,
-)
-from phasesweep.engine import (
-    ArtifactRootConflictError,
-    IncompleteJournalRecordError,
-    NoFeasibleTrialError,
-    ProcessCleanupUncertainError,
-    StudyFingerprintMismatchError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    WinnerIntegrityError,
-    fingerprints,
-    guards,
-    run_experiment,
-    study_policy,
-    trial,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.search import IntParam
+from phasesweep.engine import fingerprints, guards, study_policy, trial
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.attempts import (
@@ -59,6 +40,14 @@ from phasesweep.engine.attempts import (
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncertain_trials
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    IncompleteJournalRecordError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    WinnerIntegrityError,
+)
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -67,6 +56,8 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.phase import _failure_policy_abort_record
 from phasesweep.engine.resume import _published_for_resume
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -83,7 +74,13 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    ForeignPidNamespaceError,
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+)
+from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (

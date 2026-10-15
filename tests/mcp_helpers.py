@@ -16,15 +16,9 @@ from typing import Any, Required, TypedDict, Unpack
 import pytest
 import yaml
 
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Sampler,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
+from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.run_control import _runner_protocol_argv

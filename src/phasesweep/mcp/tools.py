@@ -17,7 +17,7 @@ from typing import Any, NoReturn
 
 from pydantic import ValidationError
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.config.reference import (
     ReferenceEntry,
     closest,
@@ -27,14 +27,13 @@ from phasesweep.config.reference import (
     reference_notes,
     top_level_entries,
 )
-from phasesweep.engine import (
+from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    PhaseWinnerView,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    read_result,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.read import PhaseWinnerView, read_result
 from phasesweep.mcp.errors import (
     McpToolError,
     RunPersistentStateUnavailableError,

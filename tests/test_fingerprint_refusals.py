@@ -9,8 +9,9 @@ import optuna
 import pytest
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import ExecutionContext, Experiment, IntParam
-from phasesweep.engine import StudyFingerprintMismatchError
+from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.search import IntParam
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.fingerprints import (
     _phase_fingerprint,
     _phase_fingerprint_payload,

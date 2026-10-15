@@ -8,7 +8,7 @@ from pathlib import Path
 
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.state import PublicationState
 

@@ -14,30 +14,11 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    Constraint,
-    ExecutionContext,
-    Experiment,
-    FloatParam,
-    IntParam,
-    JsonExtractor,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Sampler,
-    WandbSummaryRequiredGate,
-)
-from phasesweep.engine import (
-    PhaseSweepError,
-    ProcessCleanupUncertainError,
-    StudyStorageUnavailableError,
-    TerminalReport,
-    read_status,
-    read_winner,
-)
+from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import _fail_stale_running_trial
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.ledger import (
     _resolve_storage,
     claim_ledger,
@@ -53,6 +34,8 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
+from phasesweep.engine.read import read_result, read_status
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -82,8 +65,13 @@ from phasesweep.engine.trial import (
     _environment_identity,
     extract_trial_result,
 )
-from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.evidence import TrialContext
+from phasesweep.errors import (
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from tests.conftest import (
@@ -141,7 +129,7 @@ def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     value,
     state,
 ):
-    from phasesweep.config import WandbExtractor
+    from phasesweep.evidence.models import WandbExtractor
 
     wandb_worker_sdk(f"""
         class Api:
@@ -496,7 +484,7 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(second)
 
-    published_winner = read_winner(second, "p")
+    _, (published_winner,) = read_result(second, phase_names=["p"])
     status = read_status(second)
     assert published_winner is not None
     # The failed rerun (second) claimed a new current generation, but the

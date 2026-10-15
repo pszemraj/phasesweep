@@ -16,19 +16,17 @@ import pytest
 from optuna.storages.journal import JournalFileSymlinkLock
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment
-from phasesweep.engine import (
-    ArtifactRootConflictError,
-    IncompleteJournalRecordError,
-    ProcessCleanupUncertainError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    read_status,
-)
+from phasesweep.config.models import Experiment
 from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
+)
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    IncompleteJournalRecordError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
 )
 from phasesweep.engine.ledger import (
     ClaimedLedger,
@@ -43,8 +41,9 @@ from phasesweep.engine.ledger import (
 )
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
+from phasesweep.engine.read import read_status
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import (
     _load_recovery_studies,
 )

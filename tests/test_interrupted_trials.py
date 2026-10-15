@@ -15,9 +15,8 @@ import pytest
 from optuna.distributions import IntDistribution
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
-from phasesweep.engine import read_trial_tables
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
@@ -28,6 +27,7 @@ from phasesweep.engine.optuna import (
     _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,

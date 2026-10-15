@@ -17,7 +17,7 @@ import phasesweep.engine.paths as path_ops
 import phasesweep.engine.provenance as provenance_ops
 import phasesweep.engine.publication_validation as validation_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationCommitError, RunRequestError
 from phasesweep.engine.state import PUBLICATION_POINTER_SCHEMA_VERSION, Winner
 from phasesweep.runtime.shutdown import absorb_shutdown_signals

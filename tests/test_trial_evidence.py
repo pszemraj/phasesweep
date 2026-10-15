@@ -27,24 +27,9 @@ import yaml
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import run_experiment
-from phasesweep.config import (
-    Constraint,
-    ExecutionContext,
-    Experiment,
-    IntParam,
-    JsonExtractor,
-    Metric,
-    Phase,
-    Repeats,
-    Sampler,
-    WandbExtractor,
-    WandbSummaryRequiredGate,
-)
-from phasesweep.engine import (
-    NoFeasibleTrialError,
-    TrialEvidenceMissingError,
-    read_status,
-)
+from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Repeats, Sampler
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
@@ -60,11 +45,13 @@ from phasesweep.engine.paths import (
     _trial_dir_for,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.selection import select_winner
+from phasesweep.engine.read import read_status
+from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
+from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
     assert_published_winner_evidence_local,
     make_experiment,
@@ -153,7 +140,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 ):
     import sys
 
-    from phasesweep.engine import read_winners
+    from phasesweep.engine.read import read_result
 
     calls_path = tmp_path / "remote-reads"
     wandb_worker_sdk(f"""
@@ -303,7 +290,10 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     monkeypatch.setitem(sys.modules, "wandb", None)
     monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
-    assert len(read_winners(experiment)) == 2
+    assert (
+        len(read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1])
+        == 2
+    )
     with monkeypatch.context() as replay_env:
         replay_env.setenv("WANDB_MODE", "offline")
         assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id

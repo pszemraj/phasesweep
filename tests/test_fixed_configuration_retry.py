@@ -18,13 +18,15 @@ from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
-from phasesweep.config.search import fixed_configuration_target_refusal
-from phasesweep.engine import NoFeasibleTrialError, TrialTargetRefusedError
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
+from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
+from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import invoke_cli_boundary, make_experiment, write_trainer, write_yaml

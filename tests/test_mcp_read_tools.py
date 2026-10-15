@@ -16,17 +16,9 @@ from typing import Any
 import optuna
 import pytest
 
-from phasesweep.config import (
-    Experiment,
-    JsonEnvelopeExtractor,
-    load_experiment,
-)
+from phasesweep.config.io import load_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.config.reference import reference_notes
-from phasesweep.engine import (
-    PhaseWinnerView,
-    read_winners,
-    run_experiment,
-)
 from phasesweep.engine.generation import (
     _write_generation_state,
 )
@@ -37,11 +29,13 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
 )
+from phasesweep.engine.read import PhaseWinnerView, read_result
+from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.evidence.models import objective_evidence_assurance
+from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
 from phasesweep.mcp.errors import (
     ConfigChangedError,
     McpToolError,
@@ -376,7 +370,7 @@ def test_mcp_winners_hide_unusable_live_publications(
 def test_restored_reader_frozen_mcp_results_need_no_remote_access(
     tmp_path, monkeypatch, wandb_worker_sdk, kind
 ):
-    from phasesweep.config import JsonExtractor, WandbExtractor
+    from phasesweep.evidence.models import JsonExtractor, WandbExtractor
 
     wandb_worker_sdk("""
         class Api:
@@ -942,7 +936,9 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     run_id = "srv-historical"
     stage_live_run(store, run_id, config, reg.id, visible_params_at_launch=reg.visible_params)
     run_experiment(experiment, generation_id=run_id)
-    (published,) = read_winners(experiment)
+    (published,) = read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[
+        1
+    ]
     expected = published.params["lr"] if visible else "<redacted>"
 
     _catalog(tmp_path, config, visible_params=current_policy)

@@ -15,9 +15,8 @@ import click
 import optuna
 import yaml
 
-from phasesweep.config import ConfigError, Experiment, load_experiment
-from phasesweep.config.io import describe_validation_error
-from phasesweep.config.models import experiment_contract_lines, experiment_warnings
+from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
+from phasesweep.config.models import Experiment, experiment_contract_lines, experiment_warnings
 from phasesweep.config.reference import (
     closest,
     first_sentence,
@@ -28,21 +27,14 @@ from phasesweep.config.reference import (
     top_level_entries,
 )
 from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
-from phasesweep.engine import (
-    PhaseSweepError,
-    PublicationAccessError,
-    PublicationIntegrityError,
-    TrialTable,
-    TrialTables,
-    UnsafeProcessCleanupError,
-    experiment_status,
-    read_trial_tables,
-    run_experiment,
-)
+from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.read import TrialTable, TrialTables, read_trial_tables
+from phasesweep.engine.run import experiment_status, run_experiment
+from phasesweep.errors import PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (

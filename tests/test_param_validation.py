@@ -10,21 +10,20 @@ import pytest
 from optuna.exceptions import ExperimentalWarning
 from pydantic import ValidationError
 
-from phasesweep.config import (
+from phasesweep.config.common import _find_prefix_collisions, check_bounds, is_sha256_hex
+from phasesweep.config.models import Constraint, Phase
+from phasesweep.config.search import (
     CategoricalParam,
-    Constraint,
     FloatParam,
     IntParam,
-    JsonExtractor,
-    Phase,
     Repeats,
     Sampler,
-    check_bounds,
+    _placeholder_value_for,
+    grid_search_space,
     sampler_search_space,
 )
-from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
-from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler, _suggest
+from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment
 
 

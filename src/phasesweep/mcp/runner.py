@@ -27,20 +27,11 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict
 
-from phasesweep.config import Experiment
-from phasesweep.engine import (
-    NoFeasibleTrialError,
-    PublicationHook,
-    TerminalReport,
-    Winner,
-    run_experiment,
-)
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    OperatorAction,
-    PhaseSweepError,
     PublishedStudyMissingError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -49,7 +40,10 @@ from phasesweep.engine.errors import (
     TrackingTargetUnavailableError,
     TrialTargetRefusedError,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.engine.run import PublicationHook, TerminalReport, run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import Winner
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,

@@ -9,7 +9,8 @@ import optuna
 from click.testing import CliRunner, Result
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, load_experiment
+from phasesweep.config.io import load_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _trial_dir_for

@@ -14,9 +14,9 @@ from typing import Any, NamedTuple
 import yaml
 
 import phasesweep.engine.paths as path_ops
-from phasesweep.config import Experiment, Metric, Repeats
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.config.models import Experiment, Metric, _metric_semantics_payload
+from phasesweep.config.search import Repeats
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME

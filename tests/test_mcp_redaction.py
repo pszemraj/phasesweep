@@ -9,11 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
-from phasesweep.engine import NoFeasibleTrialError, PhaseWinnerView, read_status, run_experiment
+from phasesweep.config.models import Metric
+from phasesweep.config.search import FloatParam
 from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.read import PhaseWinnerView, read_status
 from phasesweep.engine.repeats import RepeatsSummary
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import WinnerSource
+from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.conftest import make_experiment, write_trainer

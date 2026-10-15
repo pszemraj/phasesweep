@@ -8,13 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.engine import run_experiment
 from phasesweep.engine.paths import (
     _experiment_dir,
     _phase_dir,
     _summary_path,
 )
-from phasesweep.engine.run import experiment_status
+from phasesweep.engine.run import experiment_status, run_experiment
 from phasesweep.runtime.files import (
     atomic_text_writer,
     atomic_write_text,

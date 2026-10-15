@@ -17,12 +17,7 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    MlflowSettings,
-    WandbSummaryRequiredGate,
-)
+from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.ledger import _resolve_storage
@@ -35,6 +30,8 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     _environment_identity,
 )
+from phasesweep.evidence.models import WandbSummaryRequiredGate
+from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import make_experiment, write_constant_trainer
 
 _AMBIENT = {

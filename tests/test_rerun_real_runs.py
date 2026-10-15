@@ -25,10 +25,11 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import CategoricalParam, Experiment, FloatParam, Phase, Repeats, Sampler
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_state_label
-from phasesweep.engine.read import read_winner
+from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ATTR,
@@ -244,7 +245,8 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
     storage = _resolve_storage(experiment.resolved_storage)
     study = optuna.load_study(study_name="t::p", storage=storage)
     assert _load_phase_policy_state(study).consecutive_failures == 0
-    winner, expected = read_winner(experiment, "p"), read_winner(control, "p")
+    _, (winner,) = read_result(experiment, phase_names=["p"])
+    _, (expected,) = read_result(control, phase_names=["p"])
     assert winner is not None and expected is not None
     repeat_key = None if phase.repeats is None else phase.repeats.key
     assert {k: v for k, v in winner.params.items() if k != repeat_key} == {
@@ -385,7 +387,7 @@ def test_fixed_configuration_killed_mid_trial_reruns_its_one_attempt(harness: _H
     harness.complete(config)
 
     assert _assert_matches_control(experiment, control) == [0]
-    winner = read_winner(experiment, "p")
+    _, (winner,) = read_result(experiment, phase_names=["p"])
     assert winner is not None and winner.trial_number == 1
 
 

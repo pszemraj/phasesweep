@@ -18,9 +18,9 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
-from phasesweep.engine import (
-    NoFeasibleTrialError,
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyContextConflictError,
@@ -33,6 +33,7 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.phase import _placeholder_winner
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -46,6 +47,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment, mark_current_format, write_trainer
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
 from tests.recovery_helpers import stamp_artifact_root

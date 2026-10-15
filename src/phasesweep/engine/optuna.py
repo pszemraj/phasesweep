@@ -19,12 +19,11 @@ import optuna
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config import (
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import (
     CategoricalParam,
-    Experiment,
     FloatParam,
     IntParam,
-    Phase,
     Repeats,
     Sampler,
     SearchParam,

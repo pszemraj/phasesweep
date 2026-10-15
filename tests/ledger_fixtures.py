@@ -24,7 +24,7 @@ import pytest
 import yaml
 
 from phasesweep import load_experiment
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_payload,
     _artifact_root_identity,

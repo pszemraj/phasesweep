@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_REPRODUCIBILITY_FILENAME,

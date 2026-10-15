@@ -17,8 +17,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Experiment, Gate, Observation, check_bounds
-from phasesweep.config.models import _wandb_query
+from phasesweep.config.common import check_bounds
+from phasesweep.config.models import Experiment, Observation, _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
     OperatorAction,
@@ -40,7 +40,7 @@ from phasesweep.evidence.evaluation import (
     run_extractor,
 )
 from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
-from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
+from phasesweep.evidence.models import Gate, JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,

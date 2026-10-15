@@ -15,38 +15,23 @@ import yaml
 
 import phasesweep.engine.artifacts as artifacts_module
 from phasesweep import __version__, run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    ExecutionContext,
-    Experiment,
-    FloatParam,
-    IntParam,
-    JsonEqualsGate,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Sampler,
-    WandbExtractor,
-)
-from phasesweep.engine import (
-    ArtifactRootConflictError,
-    NoFeasibleTrialError,
-    PublishedStudyMissingError,
-    RunRequestError,
-    StudyFingerprintMismatchError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    TrialTargetRefusedError,
-    read_status,
-    read_winner,
-    read_winners,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _check_artifact_root_binding,
 )
 from phasesweep.engine.artifacts import _load_winner, _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    PublishedStudyMissingError,
+    RunRequestError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrialTargetRefusedError,
+)
 from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
@@ -65,7 +50,9 @@ from phasesweep.engine.paths import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.resume import _published_for_resume, _reject_bound_descendant_topups
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -77,7 +64,9 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import ProcessCleanupUncertainError
+from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
     file_url_path,
@@ -317,7 +306,12 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     # The first (arch) convenience copy completed before the injected failure; the
     # second one (lr, or the summary) did not. Either way, reads resolve via
     # the generation-scoped artifact once any generation has published.
-    assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
+    assert {
+        view.phase
+        for view in read_result(
+            experiment, phase_names=[phase.name for phase in experiment.phases]
+        )[1]
+    } == {"arch", "lr"}
     assert (
         _load_winner(
             experiment,
@@ -1068,11 +1062,11 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winner(foreign, "p")
+        read_result(foreign, phase_names=["p"])
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winner(foreign, "p", generation_id=published)
+        read_result(foreign, generation_id=published, phase_names=["p"])
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winners(foreign)
+        read_result(foreign, phase_names=[phase.name for phase in foreign.phases])[1]
 
     assert not (tmp_path / "foreign.journal").exists()
     assert published_generation_id(owner) == published

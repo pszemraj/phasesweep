@@ -13,8 +13,8 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import IntParam, Phase, Sampler
-from phasesweep.engine import TrialEvidenceMissingError, read_status
+from phasesweep.config.models import Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
@@ -24,10 +24,12 @@ from phasesweep.engine.confound import (
     _flagged_checks,
     _validate_confound_block,
 )
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.read import read_status
 from phasesweep.engine.repeats import ReduceName, ranked_group
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (

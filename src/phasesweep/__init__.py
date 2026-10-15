@@ -6,15 +6,12 @@ from phasesweep._metadata import __version__
 
 # Public API exports follow the ``__version__`` assignment by design. Keep the
 # order stable so metadata is available before importing heavier subpackages.
-from phasesweep.config import Experiment, load_experiment  # noqa: E402
-from phasesweep.engine import (  # noqa: E402
-    NoFeasibleTrialError,
-    ProcessCleanupUncertainError,
-    UnsafeProcessCleanupError,
-    Winner,
-    experiment_status,
-    run_experiment,
-)
+from phasesweep.config.io import load_experiment  # noqa: E402
+from phasesweep.config.models import Experiment  # noqa: E402
+from phasesweep.engine.run import experiment_status, run_experiment  # noqa: E402
+from phasesweep.engine.selection import NoFeasibleTrialError  # noqa: E402
+from phasesweep.engine.state import Winner  # noqa: E402
+from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError  # noqa: E402
 from phasesweep.reporting import report_objective  # noqa: E402
 
 __all__ = [

@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import IO, Literal, TypeAlias, TypeGuard, cast
 from uuid import UUID, uuid4
 
-from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.io import load_experiment_bytes
+from phasesweep.config.models import Experiment
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,

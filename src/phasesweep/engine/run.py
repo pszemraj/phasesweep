@@ -22,20 +22,16 @@ import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import (
+    Experiment,
     _metric_semantics_payload,
     experiment_contract_lines,
     experiment_warnings,
 )
 from phasesweep.config.search import sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
-from phasesweep.engine.errors import (
-    IncompleteJournalRecordError,
-    OperatorAction,
-    StudyStorageUnavailableError,
-)
+from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
@@ -48,12 +44,8 @@ from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import (
-    ProcessCleanupUncertainError,
-    _preflight_trainer_environments,
-    _trainer_environment,
-)
-from phasesweep.errors import RERUN_CLEANUP_RECOVERY
+from phasesweep.engine.trial import _preflight_trainer_environments, _trainer_environment
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,

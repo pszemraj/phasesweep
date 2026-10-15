@@ -32,17 +32,12 @@ import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import run_experiment
 from phasesweep.cli import _show_experiment_winners
-from phasesweep.config import Experiment, IntParam, Phase, Sampler
-from phasesweep.engine import (
-    NoFeasibleTrialError,
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
-    TerminalReport,
-    Winner,
-    read_result,
-    read_status,
-    read_winner,
 )
 from phasesweep.engine.paths import (
     _generation_dir,
@@ -58,7 +53,11 @@ from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     _unresolvable_pointer,
 )
+from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.resume import _preflight_skipped_winners, _published_for_resume
+from phasesweep.engine.run import TerminalReport
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.json import JsonObject
@@ -258,7 +257,7 @@ def test_publication_commit_failure_keeps_prior_publication(
 
     # The prior publication is untouched: the pointer never advanced.
     assert published_generation_id(experiment) == first_generation
-    published = read_winner(experiment, "p")
+    _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
     assert published.generation_id == first_generation
 
@@ -415,7 +414,7 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     # rather than a stale root-level copy.
     published_winner_path = _generation_winner_path(experiment, second_generation, "p")
     assert published_winner_path.is_file()
-    published = read_winner(experiment, "p")
+    _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
     assert published.generation_id == first_generation
 
@@ -928,7 +927,7 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     assert pointer.error is not None
     assert error_match in pointer.error
     assert read_status(experiment)["publication_integrity"] == "failed"
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def _reseal_winner(
@@ -1034,7 +1033,7 @@ def test_published_reads_consume_the_bytes_validation_read(
 
     monkeypatch.setattr(validation_ops, "_validate_generation_manifest", validate_then_swap)
 
-    winner = read_winner(experiment, "p")
+    _, (winner,) = read_result(experiment, phase_names=["p"])
     assert winner is not None
     assert winner.metric == validated_metric
     _status, winners = read_result(experiment)
@@ -1071,7 +1070,7 @@ def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
     _last_successful_generation_path(experiment).write_text(tamper.format(gid=generation_id))
 
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
     # The pointer file itself is still there, so this is corruption of a
     # recorded publication -- never an experiment that has published nothing.
     assert _resolve_publication_pointer(experiment).state == "failed"
@@ -1099,7 +1098,7 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     assert pointer.error is not None
     assert "does not name experiment" in pointer.error
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path: Path) -> None:
@@ -1113,7 +1112,7 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
 
     # The tampered state has no effect: the record is not consulted.
     assert published_generation_id(experiment) == generation_id
-    assert read_winner(experiment, "p") is not None
+    assert read_result(experiment, phase_names=["p"])[1] != []
 
 
 # --------------------------------------------------------------------------
@@ -1281,7 +1280,7 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert status["phases"][0]["winner_present"] is False
     # The boolean-blind wrapper remains fail-closed for path callers.
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
     pointer_path = _last_successful_generation_path(experiment)
     pointer_bytes = pointer_path.read_bytes()
@@ -1311,7 +1310,7 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(
     assert status["publication_integrity"] == "absent"
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
@@ -1329,7 +1328,7 @@ def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path
     assert status["publication_integrity"] == "failed"
     assert status["publication_error"] == pointer.error
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
@@ -1510,12 +1509,12 @@ def test_surviving_pointer_prevents_root_projection_fallback_after_generation_lo
     assert status["publication_integrity"] == "failed"
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:
     experiment, _ = _golden_publication(tmp_path)
-    assert read_winner(experiment, "p") is not None
+    assert read_result(experiment, phase_names=["p"])[1] != []
     _last_successful_generation_path(experiment).unlink()
     _generation_path(experiment).unlink()
     generations = _generations_dir(experiment)
@@ -1528,7 +1527,7 @@ def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Pat
     assert status["publication_integrity"] == "absent"
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 # --------------------------------------------------------------------------
@@ -1774,15 +1773,15 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     assert status["publication_integrity"] == "failed"
     assert "does not match its recorded hash" in status["publication_error"]
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
     target.write_bytes(original)
     assert published_generation_id(experiment) == generation_id
-    assert read_winner(experiment, "p") is not None
+    assert read_result(experiment, phase_names=["p"])[1] != []
 
     target.unlink()
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 @requires_nonroot
@@ -1867,7 +1866,7 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
     assert pointer.error is not None
     assert "does not list the complete generation provenance record" in pointer.error
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 @pytest.mark.parametrize(
@@ -1930,7 +1929,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     assert pointer.error is not None
     assert error_match in pointer.error
     assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_experiment_state_write_failure_preserves_primary_error(

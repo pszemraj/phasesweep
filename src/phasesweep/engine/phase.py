@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
@@ -26,7 +26,6 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
-    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     WinnerIntegrityError,
@@ -90,7 +89,6 @@ from phasesweep.engine.study_policy import (
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
-    UnsafeProcessCleanupError,
     _environment_identity,
     _inherit_env_contract,
     extract_trial_result,
@@ -99,6 +97,7 @@ from phasesweep.engine.trial import (
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
+from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (

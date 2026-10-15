@@ -13,13 +13,13 @@ from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor, Observation
-from phasesweep.engine import read_winner
+from phasesweep.config.models import Observation
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import _winner_view
+from phasesweep.engine.read import _winner_view, read_result
 from phasesweep.engine.state import observed_attr
+from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
 from tests.conftest import make_experiment, write_trainer
 from tests.test_publication_transaction import _golden_publication, _reseal_winner
 from tests.test_trial_evidence import _tree_with_a_carried_winner
@@ -80,7 +80,7 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
     assert winners["p"].trial_number == 0
     assert winners["p"].observed == {"mem": 3.0}
     assert yaml.safe_load(_winner_path(experiment, "p").read_text())["observed"] == {"mem": 3.0}
-    published = read_winner(experiment, "p")
+    _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
     assert published.observed == {"mem": 3.0}
 
@@ -200,7 +200,7 @@ def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:
     _reseal_winner(experiment, generation_id, winner)
 
     assert _resolve_publication_pointer(experiment).state == "ok"
-    view = read_winner(experiment, "p")
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.observed == {"peak": 7.5, "steps": 3.0}
 

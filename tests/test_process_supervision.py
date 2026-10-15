@@ -21,10 +21,10 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import ExecutionContext
+from phasesweep.config.models import ExecutionContext
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
-from phasesweep.engine.trial import UnsafeProcessCleanupError
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,

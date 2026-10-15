@@ -18,21 +18,8 @@ import optuna
 import pytest
 
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import (
-    Experiment,
-    IntParam,
-    Phase,
-    Sampler,
-)
-from phasesweep.engine import (
-    ActiveAttemptPersistenceError,
-    ArtifactRootConflictError,
-    NoFeasibleTrialError,
-    PhaseSweepError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    run_experiment,
-)
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -41,10 +28,18 @@ from phasesweep.engine.attempts import (
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -61,7 +56,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.process import write_attempt_lifecycle

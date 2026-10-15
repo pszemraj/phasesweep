@@ -21,13 +21,7 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    JsonEnvelopeExtractor,
-    Metric,
-    WandbSummaryRequiredGate,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -41,6 +35,7 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
 )
+from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
 from tests.conftest import make_experiment, make_trial_context

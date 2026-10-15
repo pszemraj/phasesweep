@@ -9,20 +9,21 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import (
-    ConfigError,
+from phasesweep.config.io import ConfigError
+from phasesweep.config.models import (
     Constraint,
     ExecutionContext,
     Experiment,
-    JsonEnvelopeExtractor,
     Metric,
     Observation,
     Phase,
-    Sampler,
+)
+from phasesweep.config.search import Sampler, sampler_capability_line
+from phasesweep.evidence.models import (
+    JsonEnvelopeExtractor,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.config.search import sampler_capability_line
 from phasesweep.runtime.json import JsonObject, JsonValue
 from tests.conftest import make_experiment, write_yaml
 

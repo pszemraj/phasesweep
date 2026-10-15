@@ -9,14 +9,9 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep import NoFeasibleTrialError, run_experiment
-from phasesweep.config import (
-    Constraint,
-    Experiment,
-    LogRegexExtractor,
-    Phase,
-    RequiredFileGate,
-    Sampler,
-)
+from phasesweep.config.models import Constraint, Experiment, Phase
+from phasesweep.config.search import Sampler
+from phasesweep.evidence.models import LogRegexExtractor, RequiredFileGate
 from tests.conftest import make_experiment
 
 _ECHO_METRIC_COMMAND = "echo x=1 {overrides}"

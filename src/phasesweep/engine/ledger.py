@@ -75,7 +75,8 @@ import optuna
 from optuna.storages import JournalStorage
 from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
 
-from phasesweep.config import Experiment, Phase, sampler_search_space
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifact_roots import (
     BindingState,
     _artifact_root_binding_applies,
@@ -90,8 +91,6 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
-    OperatorAction,
-    PhaseSweepError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -111,6 +110,7 @@ from phasesweep.engine.state import (
     _outcome_sequence_counts,
     _recovered_trial_state,
 )
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [

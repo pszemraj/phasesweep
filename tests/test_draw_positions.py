@@ -11,7 +11,14 @@ import optuna
 import pytest
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config import CategoricalParam, FloatParam, IntParam, Repeats, Sampler, SearchParam
+from phasesweep.config.search import (
+    CategoricalParam,
+    FloatParam,
+    IntParam,
+    Repeats,
+    Sampler,
+    SearchParam,
+)
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.optuna import (
     _build_sampler,

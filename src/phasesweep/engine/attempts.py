@@ -14,11 +14,10 @@ from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
-    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -38,8 +37,7 @@ from phasesweep.engine.state import (
     _stale_recovery_outcome,
     _unduplicated_outcome,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.errors import RERUN_CLEANUP_RECOVERY
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,

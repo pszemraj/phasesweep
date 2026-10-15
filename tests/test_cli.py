@@ -20,31 +20,22 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import (
-    CategoricalParam,
+from phasesweep.config.models import (
     ExecutionContext,
     Experiment,
-    FloatParam,
-    JsonEnvelopeExtractor,
-    LogRegexExtractor,
     Metric,
     Phase,
-    Repeats,
-    Sampler,
+    _environment_contract_line,
 )
-from phasesweep.config.models import _environment_contract_line
-from phasesweep.engine import (
+from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
+from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    NoFeasibleTrialError,
-    PhaseSweepError,
-    ProcessCleanupUncertainError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRefusedError,
-    UnsafeProcessCleanupError,
 )
 from phasesweep.engine.paths import (
     _generation_dir,
@@ -52,8 +43,15 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import (
+    GpuConfigurationError,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
+from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -144,7 +142,7 @@ from tests.recovery_helpers import recover_run_cli
 def test_validate_and_dry_run_explain_scoring_without_sdk(
     tmp_path, monkeypatch, caplog, extractor, details
 ):
-    from phasesweep.config import Metric
+    from phasesweep.config.models import Metric
     from phasesweep.tracking.models import MlflowSettings
 
     monkeypatch.setitem(sys.modules, "wandb", None)
@@ -180,7 +178,8 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Validation remains useful from a shell reserved for offline W&B work."""
-    from phasesweep.config import Metric, WandbExtractor
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -1796,7 +1795,8 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from phasesweep.config import Metric, WandbExtractor
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",
