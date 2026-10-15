@@ -48,7 +48,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import make_experiment, mark_current_format, write_trainer
+from tests.conftest import make_experiment, mark_current_format, write_flaky_trainer
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
 from tests.recovery_helpers import stamp_artifact_root
 
@@ -238,32 +238,6 @@ def _refusals_match(
     assert str(dry.value) == str(real.value)
 
 
-def _flaky_trainer(tmp_path: Path, *, failures: int) -> tuple[Path, Path]:
-    """Write a trainer that fails its first ``failures`` calls, then logs ``x=1``.
-
-    :param Path tmp_path: Directory holding the trainer and its call log.
-    :param int failures: How many leading invocations exit nonzero.
-    :return tuple[Path, Path]: The trainer script and the log that gains one line per call.
-    """
-    calls = tmp_path / "calls.log"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import sys
-        from pathlib import Path
-
-        calls = Path({str(calls)!r})
-        seen = len(calls.read_text().splitlines()) if calls.exists() else 0
-        with calls.open("a") as log:
-            log.write("run\\n")
-        if seen < {failures}:
-            sys.exit(1)
-        print("x=1")
-        """,
-    )
-    return trainer, calls
-
-
 @pytest.mark.integration
 def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -316,7 +290,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failure abort at 2 of 4 refuses a rerun; a target raised to 6 previews the 4 it launches."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=2)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=2, value=1)
 
     def attempt(n_trials: int) -> Experiment:
         phase = _phase("a", n_trials, max_consecutive_failures=2)
@@ -555,10 +529,17 @@ def test_met_target_without_a_feasible_trial_is_refused_as_a_run_refuses(
     _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No feasible completed trials")
 
 
-def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
-    """A target below the one the study accepted gives the real run's refusal."""
-    experiment = _persistent(tmp_path, _phase("a", 2))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
+@pytest.mark.parametrize(
+    "case", ["populated-target", "first-refusal-before-fixed-phase", "target-only-empty-study"]
+)
+def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -> None:
+    """An accepted target binds empty and populated studies, before later phase refusals."""
+    phases = [_phase("a", 2)]
+    if case == "first-refusal-before-fixed-phase":
+        phases.append(_phase("b", 3, fixed=True))
+    experiment = _persistent(tmp_path, *phases)
+    states = () if case == "target-only-empty-study" else (_STATE.COMPLETE, _STATE.FAIL)
+    _record(experiment, "a", *states, target=4)
 
     _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
@@ -699,14 +680,6 @@ def test_publication_the_ledger_cannot_back_is_refused_as_a_run_refuses(
     _refusals_match(experiment, tmp_path, error, match)
 
 
-def test_first_refusal_is_the_one_a_run_gives(tmp_path: Path) -> None:
-    """A lowered target and a later oversized fixed configuration: the run names the lowered target."""
-    experiment = _persistent(tmp_path, _phase("a", 2), _phase("b", 3, fixed=True))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
-
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
-
-
 def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
     tmp_path: Path,
 ) -> None:
@@ -721,14 +694,6 @@ def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
         TrialTargetRefusedError,
         r"multiple unsafe studies: Phase 'a' .*; Phase 'b' ",
     )
-
-
-def test_study_holding_only_an_accepted_target_still_refuses_a_lowered_one(tmp_path: Path) -> None:
-    """A study that recorded its target before its first trial still binds the phase to it."""
-    experiment = _persistent(tmp_path, _phase("a", 2))
-    _record(experiment, "a", target=4)
-
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
 
 def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:

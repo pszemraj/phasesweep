@@ -29,7 +29,7 @@ from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import invoke_cli_boundary, make_experiment, write_trainer, write_yaml
+from tests.conftest import invoke_cli_boundary, make_experiment, write_flaky_trainer, write_yaml
 from tests.recovery_helpers import fabricate_stale_trial
 
 _FRESH_THREE = (
@@ -40,33 +40,6 @@ _WARNING = (
     "phase 'p' is a fixed configuration: n_trials above 1 only retries failed attempts, and a "
     "launch refuses more than one past the failed ones."
 )
-
-
-def _flaky_trainer(tmp_path: Path, *, failures: int, value: float = 1.0) -> tuple[Path, Path]:
-    """Write a trainer that fails its first ``failures`` calls, then logs ``x=<value>``.
-
-    :param Path tmp_path: Directory holding the trainer and its call log.
-    :param int failures: How many leading invocations exit nonzero.
-    :param float value: The objective value every later invocation logs.
-    :return tuple[Path, Path]: The trainer script and the log that gains one line per call.
-    """
-    calls = tmp_path / "calls.log"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import sys
-        from pathlib import Path
-
-        calls = Path({str(calls)!r})
-        seen = len(calls.read_text().splitlines()) if calls.exists() else 0
-        with calls.open("a") as log:
-            log.write("run\\n")
-        if seen < {failures}:
-            sys.exit(1)
-        print("x={value}")
-        """,
-    )
-    return trainer, calls
 
 
 def _call_count(calls: Path) -> int:
@@ -115,7 +88,7 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     tmp_path: Path, sampler: Sampler | None, max_failures: int
 ) -> None:
     """One failed attempt buys one retry under any sampler, and a result is final."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=1)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=1)
 
     def attempt(n_trials: int) -> Experiment:
         return _fixed(
@@ -160,7 +133,7 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
 
 def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -> None:
     """After F failures the target may reach F + 1, and a retry that fails again counts too."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=2)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=2)
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1))
@@ -178,7 +151,7 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
 
 def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
     """A COMPLETE trial out of the metric bounds still measured the configuration."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=0, value=5.0)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
     bounded = Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         max=1.0,
@@ -197,7 +170,7 @@ def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
     tmp_path: Path,
 ) -> None:
     """An attempt a kill or reboot left RUNNING recovers as interrupted and reruns without a raised target."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=0)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     exp = _fixed(tmp_path, trainer, 1)
     study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
@@ -216,7 +189,7 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
     tmp_path: Path,
 ) -> None:
     """Run and the dry run refuse it up front, so an earlier phase never launches first."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=0)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     searching = Phase(
         name="a",
         n_trials=1,
@@ -255,7 +228,7 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
     tmp_path: Path,
 ) -> None:
     """The preview agrees with a launch: a raised target passes after a failure, not after a result."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=1)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=1)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1))
 
@@ -311,7 +284,7 @@ def test_dry_run_logs_the_fixed_configuration_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The dry run prints the advisory validate does, once a retry target is plausible."""
-    trainer, _calls = _flaky_trainer(tmp_path, failures=1)
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1))
     caplog.set_level(logging.INFO)

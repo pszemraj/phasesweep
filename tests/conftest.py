@@ -276,14 +276,13 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
 
 
 def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
-    """Make hand-built test state look like this release wrote it.
+    """Stamp hand-built test studies and claim their artifact tree.
 
     A test that constructs studies through Optuna directly skips the engine's
     own create path, so nothing stamps the study schema and nothing records the
     tree's ownership. Every read path then correctly refuses the state as
-    unmarked. This is the one place that repairs both halves, so the
-    equivalence between "the engine wrote it" and "the test built it" is
-    asserted once instead of drifting across six copies.
+    unmarked. This helper stamps the current study schema and records tree
+    ownership before read paths inspect the state.
 
     The tree is only claimed when it has no owner yet, matching what the engine
     does: an already-bound tree is verified and left alone.
@@ -657,6 +656,33 @@ def write_trainer(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
     path.chmod(0o755)
     return path
+
+
+def write_flaky_trainer(tmp_path: Path, *, failures: int, value: float = 1.0) -> tuple[Path, Path]:
+    """Write a trainer that fails its first ``failures`` calls, then logs ``x=<value>``.
+
+    :param Path tmp_path: Directory holding the trainer and its call log.
+    :param int failures: How many leading invocations exit nonzero.
+    :param float value: The objective value every later invocation logs.
+    :return tuple[Path, Path]: The trainer script and the log that gains one line per call.
+    """
+    calls = tmp_path / "calls.log"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+
+        calls = Path({str(calls)!r})
+        seen = len(calls.read_text().splitlines()) if calls.exists() else 0
+        with calls.open("a") as log:
+            log.write("run\\n")
+        if seen < {failures}:
+            sys.exit(1)
+        print("x={value}")
+        """,
+    )
+    return trainer, calls
 
 
 def write_constant_trainer(tmp_path: Path, *, key: str = "x", value: float = 0.5) -> Path:

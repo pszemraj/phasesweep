@@ -335,26 +335,31 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
 
 
 @pytest.mark.integration
-def test_record_write_failure_after_commit_leaves_run_successful(
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param("_write_generation_record_once", id="immutable-record-write"),
+        pytest.param("_copy_yaml_projection", id="convenience-projection"),
+    ],
+)
+def test_postcommit_write_failure_leaves_run_successful(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    fault: str,
 ) -> None:
-    """A failure writing the immutable record after the pointer commit must not fail the run.
-
-    The pointer is validated against the generation's own summary artifact,
-    not the record, so publication is unaffected even though the record
-    itself never gets written.
-    """
+    """Postcommit bookkeeping cannot downgrade an authoritative publication."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     first_generation = published_generation_id(experiment)
     assert first_generation is not None
+    record_write = fault == "_write_generation_record_once"
+    failure = "record write" if record_write else "projection"
 
-    def fail_record_write(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated record write failure")
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError(f"simulated {failure} failure")
 
-    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
+    monkeypatch.setattr(generation_ops, fault, fail_write)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
@@ -363,60 +368,27 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     second_generation = published_generation_id(experiment)
     assert second_generation is not None
     assert second_generation != first_generation
-    assert any(
-        r.name == "phasesweep.engine.generation"
-        and "failed to write the immutable generation record" in r.message
-        for r in caplog.records
-    )
-    # The record itself never got created; publication still succeeded.
-    assert not _generation_record_path(experiment, second_generation).is_file()
-
-
-@pytest.mark.integration
-def test_cache_projection_failure_after_commit_leaves_run_successful(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A convenience root-projection failure must not fail the run.
-
-    Projections are a post-commit, best-effort cache: a projection failure
-    neither precedes nor blocks the pointer commit, and reads never depend on
-    them once any generation has published.
-    """
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
-
-    def fail_projection(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated projection failure")
-
-    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
-
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
-        winners = run_experiment(experiment)
-
-    assert set(winners) == {"p"}
-    second_generation = published_generation_id(experiment)
-    assert second_generation is not None
-    assert second_generation != first_generation
-    assert _record_state(experiment, second_generation) == "published"
-    assert any(
-        "failed to refresh the current-generation pointer or convenience projections" in r.message
-        for r in caplog.records
-    )
-    # Reads are unaffected: once a generation has published, they resolve the
-    # generation-scoped artifact directly rather than a stale root projection.
-    # The winning trial itself still belongs to the first generation (the
-    # target trial count was already satisfied, so no new trial ran); what
-    # matters is that the read resolves via the new last-success pointer
-    # rather than a stale root-level copy.
-    published_winner_path = _generation_winner_path(experiment, second_generation, "p")
-    assert published_winner_path.is_file()
-    _, (published,) = read_result(experiment, phase_names=["p"])
-    assert published is not None
-    assert published.generation_id == first_generation
+    if record_write:
+        assert any(
+            r.name == "phasesweep.engine.generation"
+            and "failed to write the immutable generation record" in r.message
+            for r in caplog.records
+        )
+        assert not _generation_record_path(experiment, second_generation).is_file()
+    else:
+        assert _record_state(experiment, second_generation) == "published"
+        assert any(
+            "failed to refresh the current-generation pointer or convenience projections"
+            in r.message
+            for r in caplog.records
+        )
+        # The new publication resolves immutable evidence from the first
+        # generation: replaying a met target creates no new trial.
+        published_winner_path = _generation_winner_path(experiment, second_generation, "p")
+        assert published_winner_path.is_file()
+        _, (published,) = read_result(experiment, phase_names=["p"])
+        assert published is not None
+        assert published.generation_id == first_generation
 
 
 @pytest.mark.integration
@@ -803,7 +775,7 @@ def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer
 
 
 # --------------------------------------------------------------------------
-# The generation manifest (summary schema v2) is validated as a complete
+# The generation manifest is validated as a complete
 # result graph before the pointer may commit, and again on reads.
 # --------------------------------------------------------------------------
 
