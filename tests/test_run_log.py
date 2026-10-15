@@ -140,7 +140,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One cause string reaches the outcome record, trials.csv and the TRIAL line; the hint is for imports."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_stderr_cause_trainer(tmp_path),

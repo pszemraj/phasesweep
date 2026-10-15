@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -21,7 +21,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.ledger import open_registry_study
-from phasesweep.engine.paths import _attempts_dir, _trial_dir_for
+from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -90,30 +90,31 @@ class _PreflightCleanupReport:
         )
 
 
-def _trial_dir_for_reaping(
+def _trial_dir_from_attr(
     trial: optuna.trial.FrozenTrial,
-    experiment: Experiment,
-    phase_name: str,
     study_name: str,
+    *,
+    fallback: Callable[[], Path] | None = None,
 ) -> Path:
-    """Return the trial directory to inspect during stale-trial reaping.
+    """Read the persisted directory containing a trial's process identity.
 
     Prefer the persisted ``phasesweep_trial_dir`` attr because it preserves the
     original workdir even if the operator resumes from a different cwd or edits
-    ``experiment.workdir``. If the attr is absent, the trial died before the
-    current launch path could persist the directory and before any subprocess
-    could be started, so the canonical directory is safe to use for recovery.
+    ``experiment.workdir``. A RUNNING trial with no attribute died before any
+    subprocess could start, so its caller may supply the canonical directory
+    as a fallback. Terminal cleanup recovery requires the persisted attribute
+    and supplies no fallback. An invalid stored value never uses the fallback.
 
-    :param optuna.trial.FrozenTrial trial: Running trial being reaped.
-    :param Experiment experiment: Parsed experiment.
-    :param str phase_name: Phase containing the trial.
+    :param optuna.trial.FrozenTrial trial: Trial whose process evidence is inspected.
     :param str study_name: Study name used in diagnostics.
+    :param Callable[[], Path] | None fallback: Resolve the canonical pre-launch
+        directory only when a RUNNING trial has no persisted directory attribute.
     :raises ProcessCleanupUncertainError: A persisted trial-directory value is
         invalid, so identity files cannot be located safely.
     :return Path: Persisted trial directory, or the canonical pre-launch directory.
     """
-    if TRIAL_DIR_ATTR not in trial.user_attrs:
-        trial_dir = _trial_dir_for(experiment, phase_name, trial.number)
+    if TRIAL_DIR_ATTR not in trial.user_attrs and fallback is not None:
+        trial_dir = fallback()
         log.warning(
             "RUNNING trial %d in study %s is missing %r; falling back to "
             "canonical trial_dir=%s. No subprocess can be launched by the "
@@ -125,17 +126,25 @@ def _trial_dir_for_reaping(
         )
         return trial_dir
 
-    stored = trial.user_attrs[TRIAL_DIR_ATTR]
+    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
     # recover-run reaps through here too, so it cannot repair the attribute;
     # only the ledger that recorded it can.
     if not isinstance(stored, str) or not stored:
-        raise ProcessCleanupUncertainError(
-            f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
-            f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
-            "tied to its identity files safely. Restore the original storage ledger "
-            "before retrying recovery.",
-            action=OperatorAction.RESTORE_LEDGER,
-        )
+        if fallback is None:
+            detail = (
+                f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
+                f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
+                f"{stored!r}. The leaked process group cannot be tied to identity files safely. "
+                "Restore the original storage ledger before retrying recovery."
+            )
+        else:
+            detail = (
+                f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
+                f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
+                "tied to its identity files safely. Restore the original storage ledger "
+                "before retrying recovery."
+            )
+        raise ProcessCleanupUncertainError(detail, action=OperatorAction.RESTORE_LEDGER)
     return Path(stored)
 
 

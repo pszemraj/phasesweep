@@ -133,30 +133,6 @@ def _save_intent(
     return path
 
 
-def _enqueue(
-    experiment: Experiment,
-    generation_id: str,
-    name: str,
-    binding: RunBinding,
-    projection: Projection,
-    environment: Mapping[str, str],
-    *,
-    finish: str | None = None,
-) -> None:
-    """Save delivery intent, then try the upload once.
-
-    :param Experiment experiment: Configured target.
-    :param str generation_id: Producing generation.
-    :param str name: Stable projection identity.
-    :param RunBinding binding: Verified target run.
-    :param Projection projection: Frozen upload payload.
-    :param Mapping[str, str] environment: Composed credentials and transport.
-    :param str | None finish: Terminal status for a still-running managed run.
-    """
-    path = _save_intent(experiment, generation_id, name, binding, projection, finish=finish)
-    _deliver(experiment, path, environment)
-
-
 def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
     """Freeze one accepted trial's result from its durable Optuna record.
 
@@ -240,62 +216,39 @@ def publish_trial(
     trial: FrozenTrial,
     environment: Mapping[str, str],
 ) -> None:
-    """Mirror an accepted Optuna trial to its native bound MLflow run.
+    """Mirror a terminal trial after the live controller confirms process cleanup.
+
+    COMPLETE trials require their native run binding and publish their accepted
+    evidence. Failed or interrupted trials finish only managed runs; attempts
+    without a binding and trainer-owned failed runs are left alone. The same
+    durable outcome decision and intent builder serves recovery and live calls.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal accepted trial.
+    :param FrozenTrial trial: Locally terminal trial with confirmed cleanup.
     :param Mapping[str, str] environment: Composed authentication environment.
     """
+    from optuna.trial import TrialState
+
     from phasesweep.engine.state import TRIAL_DIR_ATTR
 
-    directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    if trial.state == TrialState.COMPLETE:
+        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    else:
+        stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+        if not isinstance(stored, str) or not (Path(stored) / BINDING_FILE).is_file():
+            return
+        directory = Path(stored)
     binding = read_binding(directory)
-    _enqueue(
+    paths = _save_attempt_intents(
         experiment,
         generation_id,
-        f"attempt-{binding['attempt_id']}",
-        binding,
-        _accepted_projection(trial, read_inherits(directory)),
-        environment,
+        [(directory, binding)],
+        {binding["attempt_id"]: _AttemptTrial(trial, cleanup_confirmed=True)},
+        ended=None,
     )
-
-
-def publish_unaccepted_trial(
-    experiment: Experiment,
-    generation_id: str,
-    trial: FrozenTrial,
-    environment: Mapping[str, str],
-) -> None:
-    """Finish the managed run of a failed or interrupted trial after confirmed cleanup.
-
-    No evidence capture ran to finish that run, so it would otherwise stay
-    RUNNING. An interrupted trial's run finishes ``KILLED``, a failed one's
-    ``FAILED``. Trainer-owned runs and attempts that never created a run are
-    left alone.
-
-    :param Experiment experiment: Configured experiment.
-    :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal FAIL trial, interrupted or not.
-    :param Mapping[str, str] environment: Composed authentication environment.
-    """
-    from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_interrupted
-
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    if not isinstance(directory, str) or not (Path(directory) / BINDING_FILE).is_file():
-        return
-    binding = read_binding(Path(directory))
-    if binding["run_mode"] == "managed":
-        status = "KILLED" if _trial_interrupted(trial) else "FAILED"
-        _enqueue(
-            experiment,
-            generation_id,
-            f"attempt-{binding['attempt_id']}",
-            binding,
-            _unaccepted_projection(binding, status),
-            environment,
-            finish=status,
-        )
+    for path in paths:
+        _deliver(experiment, path, environment)
 
 
 def _unrecorded_attempts(
@@ -324,10 +277,10 @@ def _unrecorded_attempts(
 
 
 class _AttemptTrial(NamedTuple):
-    """An attempt's Optuna trial and whether its own study recorded the trial's cleanup recovery."""
+    """An attempt's trial and positive cleanup confirmation from its controller or study."""
 
     trial: FrozenTrial
-    cleanup_recovered: bool
+    cleanup_confirmed: bool
 
 
 def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, _AttemptTrial]:
@@ -381,17 +334,17 @@ def _save_attempt_intents(
     record: a COMPLETE trial whose callback saved nothing, because a write
     failed or the controller died after Optuna committed it, gets its accepted
     projection. A managed run of a trial that was not accepted is finished
-    once its cleanup is established, either by the trial's own positive
-    evidence or by a recovery its study recorded; cleanup recovery never
-    rewrites the trial's attributes, so the study's ledger is the only place
-    the second form is visible. An attempt without a readable trial stays
+    once its cleanup is established by the trial's own positive evidence,
+    its live controller's confirmation, or a recovery recorded by its study.
+    Recovery leaves trial attributes unchanged, so its confirmation comes
+    from the owning study's ledger. An attempt without a readable trial stays
     unresolved, as does one whose cleanup is still uncertain.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
     :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
     :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
-        its study's recovery.
+        its controller's cleanup confirmation or its study's recovery.
     :param str | None ended: Status for every unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
         finish only trials Optuna failed with confirmed cleanup.
@@ -416,7 +369,7 @@ def _save_attempt_intents(
         if binding["run_mode"] != "managed":
             continue
         settled = trial.state.is_finished() and (
-            found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
+            found.cleanup_confirmed or not _trial_requires_cleanup_recovery(trial)
         )
         if settled and _trial_interrupted(trial):
             status = "KILLED"

@@ -4,9 +4,9 @@ A phase with ``repeats`` runs every configuration once per repeat value, and
 selection ranks only complete groups by a reducer over their members. This
 module holds the pure parts of that contract: the group key, the statistics,
 the winner's ``repeats`` record and its validator, and the evidence members a
-winner stands on. It imports nothing beyond the config models, the JSON
-helpers, the winner state module, and the standard library, because read-only
-publication validation imports it.
+winner stands on. Recorded-trial labeling resolves draw positions lazily, so
+read-only publication validation can use the record helpers without importing
+Optuna's sampler machinery.
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from phasesweep.engine.state import _validate_observed_block
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
+    from optuna.trial import FrozenTrial
+
     from phasesweep.config.models import Phase
     from phasesweep.config.search import Repeats
 
@@ -255,6 +257,23 @@ def group_labels(
     for number, key in keyed.items():
         last[key] = max(last.get(key, number), number)
     return {number: last[key] for number, key in keyed.items()}
+
+
+def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> dict[int, int]:
+    """Label recorded trials by their repeat groups, keeping reruns in their source slots.
+
+    :param Sequence[FrozenTrial] trials: Trials from one phase study.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return dict[int, int]: Group label by trial number; empty without a repeat axis.
+    """
+    from phasesweep.engine.optuna import _draw_positions
+
+    positions = _draw_positions(trials)
+    return (
+        {}
+        if axis is None
+        else group_labels(((t.number, positions[t.number], t.params) for t in trials), axis)
+    )
 
 
 def reduce_values(values: Sequence[float], reduce: ReduceName) -> float:

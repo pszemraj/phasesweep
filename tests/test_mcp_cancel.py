@@ -17,7 +17,7 @@ from phasesweep.mcp.errors import (
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import RunHandle, RunnerView, RunState
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
 from phasesweep.runtime.reaper import (
     read_boot_id,
     read_pid_namespace,
@@ -75,18 +75,18 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         boot_id=read_boot_id(),
         pid_namespace=read_pid_namespace(),
     )
-    original_state = store.state
+    original_observe = store.observe
     first_read = True
 
-    def complete_launch_after_state_read(
+    def complete_launch_after_observation(
         saved: RunHandle, *, view: RunnerView | None = None
-    ) -> RunState:
+    ) -> RunObservation:
         nonlocal first_read
-        state = original_state(saved, view=view)
+        observation = original_observe(saved, view=view)
         if first_read:
             first_read = False
             store.update(spawned)
-        return state
+        return observation
 
     signalled: list[tuple[int | None, int | None, int | None]] = []
 
@@ -96,7 +96,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         signalled.append((pid, starttime, pgid))
         return True
 
-    monkeypatch.setattr(store, "state", complete_launch_after_state_read)
+    monkeypatch.setattr(store, "observe", complete_launch_after_observation)
     monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", kill_runner)
 
     cancelled = app.cancel(pending.run_id)
@@ -417,19 +417,21 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
 
     read_running = threading.Event()
     recovery_done = threading.Event()
-    original_state = store.state
+    original_observe = store.observe
     first_cancel_read = True
 
-    def pause_cancel_state(saved: RunHandle, *, view: RunnerView | None = None) -> RunState:
+    def pause_cancel_observation(
+        saved: RunHandle, *, view: RunnerView | None = None
+    ) -> RunObservation:
         nonlocal first_cancel_read
-        state = original_state(saved, view=view)
+        observation = original_observe(saved, view=view)
         if threading.current_thread() is not threading.main_thread() and first_cancel_read:
             first_cancel_read = False
             read_running.set()
             assert recovery_done.wait(timeout=10)
-        return state
+        return observation
 
-    monkeypatch.setattr(store, "state", pause_cancel_state)
+    monkeypatch.setattr(store, "observe", pause_cancel_observation)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         cancelling = pool.submit(app.cancel, run_id)
         assert read_running.wait(timeout=10)

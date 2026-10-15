@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from functools import partial
 
 import optuna
 
@@ -17,10 +17,11 @@ from phasesweep.engine.attempts import (
     _require_trial_attempt,
     _resolve_attempt,
     _trial_attempt_record,
-    _trial_dir_for_reaping,
+    _trial_dir_from_attr,
     _trial_requires_cleanup_recovery,
     _TrialDiscovery,
 )
+from phasesweep.engine.paths import _trial_dir_for
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -85,7 +86,11 @@ def _reap_stale_trials(
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         record: _AttemptRecord | None
         try:
-            trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
+            trial_dir = _trial_dir_from_attr(
+                trial,
+                study.study_name,
+                fallback=partial(_trial_dir_for, experiment, phase_name, trial.number),
+            )
             if TRIAL_DIR_ATTR in trial.user_attrs:
                 record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
                 _resolve_attempt(record, discovery, confirm=confirm)
@@ -169,31 +174,6 @@ def _previously_recovered_attempt_locations(
     return attempts
 
 
-def _trial_dir_for_cleanup_recovery(
-    trial: optuna.trial.FrozenTrial,
-    study_name: str,
-) -> Path:
-    """Return the persisted trial directory for terminal cleanup recovery.
-
-    :param optuna.trial.FrozenTrial trial: Terminal trial with uncertain cleanup.
-    :param str study_name: Study name for diagnostics.
-    :return Path: Persisted trial directory containing process identity files.
-    :raises ProcessCleanupUncertainError: The trial has no safe persisted trial directory.
-    """
-    stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    # A launch records the directory before its process can leak, so only a
-    # damaged ledger lacks it here, and recover-run reads the same attribute.
-    if not isinstance(stored, str) or not stored:
-        raise ProcessCleanupUncertainError(
-            f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
-            f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
-            f"{stored!r}. The leaked process group cannot be tied to identity files safely. "
-            "Restore the original storage ledger before retrying recovery.",
-            action=OperatorAction.RESTORE_LEDGER,
-        )
-    return Path(stored)
-
-
 def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
@@ -233,7 +213,7 @@ def _recover_cleanup_uncertain_trials(
             and _trial_requires_cleanup_recovery(trial)
         ):
             continue
-        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+        trial_dir = _trial_dir_from_attr(trial, study.study_name)
         record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
         _resolve_attempt(record, discovery, confirm=confirm)
         if confirm:

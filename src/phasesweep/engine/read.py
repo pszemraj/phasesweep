@@ -36,12 +36,18 @@ from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.confound import _confound_summary, _validate_confound_block
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.ledger import read_phase_trials, read_trial_stats, validate_ledger
+from phasesweep.engine.ledger import (
+    log_storage_read_failure,
+    read_phase_trials,
+    read_trial_stats,
+    validate_ledger,
+)
 from phasesweep.engine.optuna import (
-    _draw_positions,
+    _PhaseTrialStats,
     _published_phase_trial_refs,
     _published_trial_history_available,
     _trial_state_label,
+    _TrialRef,
 )
 from phasesweep.engine.paths import (
     _generation_path,
@@ -54,7 +60,7 @@ from phasesweep.engine.repeats import (
     RepeatsSummary,
     _repeats_summary,
     _validate_repeats_block,
-    group_labels,
+    group_labels_for,
     repeat_axis,
 )
 from phasesweep.engine.state import (
@@ -142,11 +148,9 @@ class PhaseWinnerView:
 def _phase_status_payloads(
     experiment: Experiment,
     *,
-    trial_counts: Mapping[str, dict[str, int]],
-    generation_trial_counts: Mapping[str, dict[str, int]],
-    trial_data_available: Mapping[str, bool],
-    running_attempts: Mapping[str, list[dict[str, Any]] | None],
-    unavailable_published_phases: set[str],
+    phase_stats: Mapping[str, _PhaseTrialStats],
+    trial_scope_generation_id: str | None,
+    published_trials: Mapping[str, _TrialRef | None],
     winners_present: set[str],
 ) -> list[dict[str, Any]]:
     """Build the path-free per-phase status payloads ``read_status`` returns.
@@ -160,37 +164,49 @@ def _phase_status_payloads(
     never mix identities from two different pointer resolutions.
 
     :param Experiment experiment: Parsed experiment whose phase study counts are reported.
-    :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
-    :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
-    :param Mapping[str, bool] trial_data_available: Storage-read
-        availability keyed by phase name. True includes confirmed absent studies
-        with known zero counts; false means counts could not be established.
-    :param Mapping[str, list[dict[str, Any]] | None] running_attempts:
-        RUNNING trial identities keyed by phase name, from the same
-        storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
-        trial data was unreadable. Included only in the path-free status view
-        consumed by MCP, whose terminal snapshot must not reread studies to
-        learn which rows the RUNNING count refers to.
-    :param set[str] unavailable_published_phases: Published phases whose local
-        trial identity could not be matched in the storage snapshot.
+    :param Mapping[str, _PhaseTrialStats] phase_stats: Counts, availability and
+        RUNNING identities from one trial-data capture, keyed by phase name.
+    :param str | None trial_scope_generation_id: Generation whose counts are reported.
+    :param Mapping[str, _TrialRef | None] published_trials: Published local trial
+        identities checked against that same capture.
     :param set[str] winners_present: Phases whose winner the represented
         generation holds.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
-        counts = trial_counts[phase.name]
+        stats = phase_stats[phase.name]
+        counts = stats.counts
         payload: dict[str, Any] = {
             "trials": counts,
             "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
-            "generation_trials": generation_trial_counts[phase.name],
-            "trial_data_available": trial_data_available[phase.name],
-            "published_study_unavailable": phase.name in unavailable_published_phases,
+            "generation_trials": (
+                stats.generation_counts.get(trial_scope_generation_id, {})
+                if trial_scope_generation_id
+                else {}
+            ),
+            "trial_data_available": stats.available,
+            "published_study_unavailable": (
+                phase.name in published_trials
+                and not _published_trial_history_available(stats, published_trials[phase.name])
+            ),
             "phase": phase.name,
             "winner_present": phase.name in winners_present,
-            "running_attempts": running_attempts[phase.name],
+            "running_attempts": (
+                None
+                if stats.running_attempts is None
+                else [
+                    {
+                        "trial_number": attempt.trial_number,
+                        "generation_id": attempt.generation_id,
+                        "attempt_id": attempt.attempt_id,
+                        "recovers_as": attempt.recovers_as,
+                    }
+                    for attempt in stats.running_attempts
+                ]
+            ),
         }
         phases.append(payload)
     return phases
@@ -745,38 +761,9 @@ def _read_status(
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
-            unavailable_published_phases={
-                name
-                for name, stats in phase_stats.items()
-                if name in published_trials
-                and not _published_trial_history_available(stats, published_trials[name])
-            },
-            trial_counts={name: stats.counts for name, stats in phase_stats.items()},
-            generation_trial_counts={
-                name: (
-                    stats.generation_counts.get(trial_scope_generation_id, {})
-                    if trial_scope_generation_id
-                    else {}
-                )
-                for name, stats in phase_stats.items()
-            },
-            trial_data_available={name: stats.available for name, stats in phase_stats.items()},
-            running_attempts={
-                name: (
-                    None
-                    if stats.running_attempts is None
-                    else [
-                        {
-                            "trial_number": attempt.trial_number,
-                            "generation_id": attempt.generation_id,
-                            "attempt_id": attempt.attempt_id,
-                            "recovers_as": attempt.recovers_as,
-                        }
-                        for attempt in stats.running_attempts
-                    ]
-                )
-                for name, stats in phase_stats.items()
-            },
+            phase_stats=phase_stats,
+            trial_scope_generation_id=trial_scope_generation_id,
+            published_trials=published_trials,
             winners_present=winners_present,
         ),
         "summary_present": summary_present,
@@ -881,12 +868,7 @@ def _trial_table(
     :return TrialTable: The rows and the columns they carry.
     """
     axis = repeat_axis(phase)
-    positions = _draw_positions(trials)
-    groups = (
-        {}
-        if axis is None
-        else group_labels(((t.number, positions[t.number], t.params) for t in trials), axis)
-    )
+    groups = group_labels_for(trials, axis)
     observed = sorted(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )
@@ -951,14 +933,7 @@ def read_trial_tables(experiment: Experiment) -> TrialTables:
         try:
             read = read_phase_trials(ledger, phase)
         except StudyStorageUnavailableError as exc:
-            cause = exc.__cause__ or exc
-            log.warning(
-                "could not read trial data from storage %s for phase %s: %s: %s",
-                ledger.storage_url,
-                phase.name,
-                type(cause).__name__,
-                cause,
-            )
+            log_storage_read_failure(ledger, phase, exc, logger=log)
             tables.append(_trial_table(phase, [], None, available=False))
             continue
         trials = [] if read is None else read.trials

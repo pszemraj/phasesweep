@@ -431,6 +431,40 @@ def merged_cli_overrides(
     return flatten_trainer_config(compose_trainer_config(base, overrides))
 
 
+def compose_trainer_input(
+    trainer_config: dict[str, JsonValue],
+    overrides: dict[str, JsonValue],
+    fmt: str,
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> str | dict[str, JsonValue]:
+    """Compose the selected trainer wire without writing any files.
+
+    File formats return their exact serialized text. CLI formats return the
+    flattened values, preserving their order and their renderer's validation
+    and diagnostic policy. Runtime placeholders expand before overrides apply.
+
+    :param dict[str, JsonValue] trainer_config: Base trainer configuration.
+    :param dict[str, JsonValue] overrides: Fully composed trial overrides.
+    :param str fmt: One of the four supported override formats.
+    :param dict[str, str] | None substitutions: Runtime placeholder replacements.
+    :raises ValueError: The format is unknown or configuration paths collide.
+    :raises TypeError: A file value cannot be serialized in its selected format.
+    :return str | dict[str, JsonValue]: File text or merged CLI values.
+    """
+    if fmt == "yaml_file":
+        return dump_trial_trainer_config_yaml(
+            trainer_config, overrides, substitutions=substitutions
+        )
+    if fmt == "json_file":
+        return dump_json_file_overrides(
+            overrides, trainer_config=trainer_config, substitutions=substitutions
+        )
+    if fmt in ("argparse", "hydra"):
+        return merged_cli_overrides(trainer_config, overrides, substitutions=substitutions)
+    raise ValueError(f"Unknown override_format: {fmt}")
+
+
 def render_command(
     template: str,
     overrides: dict[str, Any],
@@ -490,34 +524,19 @@ def render_command(
         "{phase}": phase,
         "{run_name}": run_name,
     }
-    if fmt == "yaml_file":
-        if materialized_input_path is not None:
+    if fmt in ("yaml_file", "json_file"):
+        if materialized_input_path is None:
+            compose_trainer_input(base, overrides, fmt, substitutions=config_substitutions)
+            materialized_input_path = trial_dir / TRAINER_INPUT_FILENAMES[fmt]
+        if fmt == "yaml_file":
             config_path = str(materialized_input_path)
         else:
-            # Dry-run and config validation remain filesystem-pure while still
-            # exercising the exact composition and serializer used at launch.
-            dump_trial_trainer_config_yaml(base, overrides, substitutions=config_substitutions)
-            config_path = str(trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"])
-        overrides_str = ""
-    elif fmt == "argparse":
-        overrides_str = format_argparse(
-            merged_cli_overrides(base, overrides, substitutions=config_substitutions)
-        )
-    elif fmt == "hydra":
-        overrides_str = format_hydra(
-            merged_cli_overrides(base, overrides, substitutions=config_substitutions)
-        )
-    elif fmt == "json_file":
-        if materialized_input_path is not None:
             overrides_path = str(materialized_input_path)
-        else:
-            dump_json_file_overrides(
-                overrides, trainer_config=base, substitutions=config_substitutions
-            )
-            overrides_path = str(trial_dir / TRAINER_INPUT_FILENAMES["json_file"])
         overrides_str = ""
     else:
-        raise ValueError(f"Unknown override_format: {fmt}")
+        values = compose_trainer_input(base, overrides, fmt, substitutions=config_substitutions)
+        assert isinstance(values, dict)
+        overrides_str = format_argparse(values) if fmt == "argparse" else format_hydra(values)
 
     return template.format(
         config_path=shlex.quote(config_path) if config_path else "",

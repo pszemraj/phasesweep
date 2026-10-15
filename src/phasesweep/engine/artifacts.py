@@ -19,13 +19,14 @@ import phasesweep.engine.paths as path_ops
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
-from phasesweep.engine.optuna import _draw_positions, _trial_state_label
+from phasesweep.engine.optuna import _trial_state_label
+from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
     _validate_repeats_block,
-    group_labels,
+    group_labels_for,
 )
 from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
@@ -138,12 +139,7 @@ def _write_trials_csv(
         return
     param_names = sorted({n for t in trials for n in t.params})
     attr_names = sorted({n for t in trials for n in t.user_attrs} - {TRAINER_ENV_ATTR})
-    positions = _draw_positions(trials)
-    labels = (
-        {}
-        if repeats is None
-        else group_labels(((t.number, positions[t.number], t.params) for t in trials), repeats)
-    )
+    labels = group_labels_for(trials, repeats)
     fieldnames = [
         "number",
         "state",
@@ -246,12 +242,8 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
     return payload
 
 
-# Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
-# same winner twice (preflight, then the run itself); the operator needs the
-# divergence once, not once per read.
-_ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
-
-
+# Resume preflight and execution can read the same winner; both use the same
+# warning identity so the environment divergence is reported once.
 def _warn_environment_drift(
     experiment: Experiment,
     phase_name: str,
@@ -277,11 +269,9 @@ def _warn_environment_drift(
     ).digest
     if stored_digest == current_digest:
         return
-    key = (experiment.experiment, phase_name, stored_digest)
-    if key in _ENVIRONMENT_DRIFT_WARNED:
-        return
-    _ENVIRONMENT_DRIFT_WARNED.add(key)
-    log.warning(
+    _warn_once(
+        log,
+        ("environment-drift", experiment.experiment, phase_name, stored_digest),
         "[%s] reused winner ran under trainer environment %s..., but this process "
         "composes %s... under execution.inherit_env=%r. The recorded result is being "
         "reused across an environment change; confirm the difference is irrelevant to "

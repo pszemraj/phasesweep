@@ -514,7 +514,7 @@ def test_launch_trial_warns_once_when_ambient_visibility_is_dropped(
 ) -> None:
     """Dropping ambient visibility with no device leased is reported, not silent."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
-    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         for _ in range(2):
@@ -535,7 +535,7 @@ def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
 ) -> None:
     """An assigned device already binds visibility and holds a lock."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
-    monkeypatch.setattr("phasesweep.engine.trial._DROPPED_CUDA_VISIBILITY_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         env = _capture_launch_env(
@@ -601,7 +601,7 @@ def test_nonzero_exit_under_narrowed_environment_warns_once_per_phase(
     execution: ExecutionContext,
 ) -> None:
     """The first nonzero exit in a phase names the environment contract and its three fixes."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     experiment = make_experiment(execution=execution)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
@@ -630,7 +630,7 @@ def test_nonzero_exit_hint_is_silent_for_full_inheritance_and_for_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """``inherit_env: all`` has no narrowed contract to blame, and a zero exit has no failure."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         _exit_code_result(
@@ -645,7 +645,7 @@ def test_nonzero_exit_reason_quotes_the_last_stderr_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A trainer's own last error names the cause, and an out-of-memory error gets no environment hint."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     stderr = f"Traceback (most recent call last):\n  File 'train.py', line 9\n{OOM_LINE}\n\n"
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
@@ -675,7 +675,7 @@ def test_stderr_naming_a_missing_environment_input_keeps_the_hint(
     line: str,
 ) -> None:
     """A last line that suggests a missing variable, tool or module logs the hint, quoting that line."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         result = _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
@@ -702,7 +702,7 @@ def test_stderr_naming_another_cause_gets_no_hint(
     line: str,
 ) -> None:
     """A last line that names its own cause is reported alone."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
@@ -714,7 +714,7 @@ def test_a_failure_without_an_environment_cause_does_not_use_up_the_phase_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The once-per-phase hint waits for the first failure that suggests the environment."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     lines = [
         OOM_LINE,
         "ModuleNotFoundError: No module named 'x'",
@@ -747,7 +747,7 @@ def test_nonzero_exit_without_a_stderr_line_keeps_the_reason_and_the_hint(
     stderr: bytes | None,
 ) -> None:
     """With no line to quote the reason is the bare exit code, and nothing rules the environment out."""
-    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         result = _exit_code_result(tmp_path, make_experiment(), "p", 2, stderr=stderr)

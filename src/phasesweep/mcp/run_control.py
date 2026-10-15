@@ -17,11 +17,10 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
-from phasesweep.engine.resume import _accept_skipped_winner, _published_for_resume
-from phasesweep.engine.state import Winner
+from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
@@ -424,8 +423,9 @@ class RunControl:
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
             view = self._runs.runner_view(handle)
-            before = self._runs.state(handle, view=view)
-            recovery_required = self._runs.recovery_required(handle, view=view)
+            observation = self._runs.observe(handle, view=view)
+            before = observation.state
+            recovery_required = observation.recovery_required
             state_before = {
                 "run_state": before,
                 "recovery_required": recovery_required,
@@ -442,8 +442,9 @@ class RunControl:
                         raise UnknownRunError(run_id)
                     handle = refreshed
                     view = self._runs.runner_view(handle)
-                    before = self._runs.state(handle, view=view)
-                    recovery_required = self._runs.recovery_required(handle, view=view)
+                    observation = self._runs.observe(handle, view=view)
+                    before = observation.state
+                    recovery_required = observation.recovery_required
                     state_before = {
                         "run_state": before,
                         "recovery_required": recovery_required,
@@ -513,8 +514,9 @@ class RunControl:
                         # Recovery owns any remaining marker after recording
                         # cleanup; it may still be repairing the frozen result.
                         self._runs.clear_cleanup_uncertain(handle)
-                    after = self._runs.state(handle, view=view)
-                    recovery_required = self._runs.recovery_required(handle, view=view)
+                    observation = self._runs.observe(handle, view=view)
+                    after = observation.state
+                    recovery_required = observation.recovery_required
             result = {
                 "run_id": run_id,
                 "state": after,
@@ -561,47 +563,44 @@ class RunControl:
         :raises ResumePublicationUnusableError: If the recorded publication no
             longer validates or this server cannot read it.
         """
-        skipped = reg.experiment.phases[: reg.phase_names.index(from_phase)]
-        if not skipped:
+        if reg.phase_names.index(from_phase) == 0:
             return
-        winners: dict[str, Winner] = {}
-        # A publication that does not resolve is reported against the first
-        # skipped phase, the one whose winner it withholds first.
-        phase = skipped[0]
-        try:
-            publication = _published_for_resume(reg.experiment)
-            for phase in skipped:
-                winners[phase.name] = _accept_skipped_winner(
-                    reg.experiment, phase, winners, publication
+
+        def refusal(phase_name: str, exc: Exception) -> Exception:
+            """Translate a resume refusal without exposing its internal diagnostic.
+
+            :param str phase_name: Earlier phase whose winner was being checked.
+            :param Exception exc: Engine refusal from publication or winner validation.
+            :return Exception: The MCP refusal, or an unexpected exception unchanged.
+            """
+            if isinstance(exc, (PublicationIntegrityError, PublicationAccessError)):
+                log.info("resume refused for experiment=%s: %s", reg.id, exc)
+                state: Literal["failed", "permission_denied"] = (
+                    "failed" if isinstance(exc, PublicationIntegrityError) else "permission_denied"
                 )
-        except PublicationIntegrityError as exc:
-            log.info("resume refused for experiment=%s: %s", reg.id, exc)
-            raise ResumePublicationUnusableError(reg.id, from_phase, "failed") from None
-        except PublicationAccessError as exc:
-            log.info("resume refused for experiment=%s: %s", reg.id, exc)
-            raise ResumePublicationUnusableError(reg.id, from_phase, "permission_denied") from None
-        except FileNotFoundError:
-            raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
-        except (
-            RuntimeError,
-            KeyError,
-            TypeError,
-            ValueError,
-            AttributeError,
-            OSError,
-        ) as exc:
-            log.info(
-                "resume preflight rejected winner for experiment=%s phase=%s: %s",
-                reg.id,
-                phase.name,
-                exc,
-            )
-            raise ResumeNotReadyError(
-                reg.id,
-                from_phase,
-                phase.name,
-                reason="has no compatible winner for the current config",
-            ) from None
+                return ResumePublicationUnusableError(reg.id, from_phase, state)
+            if isinstance(exc, FileNotFoundError):
+                return ResumeNotReadyError(reg.id, from_phase, phase_name)
+            if isinstance(
+                exc, (RuntimeError, KeyError, TypeError, ValueError, AttributeError, OSError)
+            ):
+                log.info(
+                    "resume preflight rejected winner for experiment=%s phase=%s: %s",
+                    reg.id,
+                    phase_name,
+                    exc,
+                )
+                return ResumeNotReadyError(
+                    reg.id,
+                    from_phase,
+                    phase_name,
+                    reason="has no compatible winner for the current config",
+                )
+            return exc
+
+        _preflight_skipped_winners(
+            reg.experiment, from_phase=from_phase, run_deadline=None, error_mapper=refusal
+        )
 
     @staticmethod
     def _current_config_bytes(reg: RegisteredExperiment) -> bytes:

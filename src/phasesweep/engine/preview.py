@@ -44,6 +44,7 @@ from phasesweep.engine.phase import (
     _placeholder_winner,
     _replay_met_target,
 )
+from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     Winner,
@@ -336,14 +337,13 @@ def _preview_phase(
             )
             return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
         resume = resumed
-    log.info(
-        "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
-        phase.name,
+    _log_phase_header(
+        phase,
         _phase_study_name(experiment, phase),
-        finished,
-        remaining,
-        reruns,
-        phase.n_jobs,
+        finished=finished,
+        remaining=remaining,
+        reruns=reruns,
+        logger=log,
     )
     if recorded is None:
         log.warning(

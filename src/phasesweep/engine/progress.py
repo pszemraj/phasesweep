@@ -1,9 +1,12 @@
-"""The run.log progress lines a phase writes: its header, one RERUN line per rerun, one TRIAL line per trial."""
+"""Engine progress lines and process-scoped warnings.
+
+A phase writes its header, one RERUN line per rerun and one TRIAL line per trial.
+"""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 
 import optuna
 
@@ -14,10 +17,33 @@ from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_t
 
 # The lines keep the phase channel that docs and run.log readers match on.
 log = logging.getLogger("phasesweep.engine.phase")
+_WARNED: set[Hashable] = set()
+
+
+def _warn_once(logger: logging.Logger, key: Hashable, message: str, *args: object) -> None:
+    """Log a warning once per process for its namespaced identity.
+
+    Callers include the warning kind in ``key`` so separate diagnostics never
+    suppress one another. The supplied logger retains each diagnostic's channel.
+
+    :param logging.Logger logger: Logger that emits the warning.
+    :param Hashable key: Warning kind and the identities defining its scope.
+    :param str message: Logging format string.
+    :param object args: Values substituted into the format string.
+    """
+    if key not in _WARNED:
+        _WARNED.add(key)
+        logger.warning(message, *args)
 
 
 def _log_phase_header(
-    phase: Phase, study_name: str, *, finished: int, remaining: int, reruns: int
+    phase: Phase,
+    study_name: str,
+    *,
+    finished: int,
+    remaining: int,
+    reruns: int,
+    logger: logging.Logger = log,
 ) -> None:
     """Log the line that opens a phase's work in run.log.
 
@@ -26,8 +52,9 @@ def _log_phase_header(
     :param int finished: Trials that count toward its target.
     :param int remaining: Trials still needed to reach ``phase.n_trials``.
     :param int reruns: Reruns it owes for interrupted trials.
+    :param logging.Logger logger: Progress channel for a live phase or its preview.
     """
-    log.info(
+    logger.info(
         "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
         phase.name,
         study_name,

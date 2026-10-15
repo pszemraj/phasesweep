@@ -26,10 +26,8 @@ from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import (
     Experiment,
     _metric_semantics_payload,
-    experiment_contract_lines,
-    experiment_warnings,
+    experiment_disclosures,
 )
-from phasesweep.config.search import sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
@@ -40,11 +38,10 @@ from phasesweep.engine.preview import (
     _preview_ledger,
     _preview_phase,
 )
-from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import _preflight_trainer_environments, _trainer_environment
+from phasesweep.engine.trial import _trainer_environment
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.shutdown import (
@@ -260,14 +257,16 @@ def run_experiment(
     # A fresh artifact tree cannot be a no-op replay, so validate its launch
     # environments before creating state. Existing current-format trees defer
     # the same check until recovery proves a phase has new work remaining.
-    if not path_ops._artifact_root_binding_path(experiment).exists():
-        _preflight_trainer_environments(experiment, from_phase=from_phase)
+    environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
+    if environments_preflighted:
+        _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
     winners = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
         terminal_callback=terminal_callback,
         publication_hook=publication_hook,
         generation_id=generation_id,
+        environments_preflighted=environments_preflighted,
     )
     # Publication and its terminal callback are already durable/successful at
     # this boundary. Deliver any shutdown absorbed by the one-way commit window
@@ -290,6 +289,7 @@ def _run_experiment_outcome(
     terminal_callback: Callable[[TerminalReport], None] | None = None,
     publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
+    environments_preflighted: bool = False,
 ) -> Mapping[str, Winner]:
     """Run all phases and return the winners while the experiment lock is held.
 
@@ -305,6 +305,8 @@ def _run_experiment_outcome(
     :param PublicationHook | None publication_hook: Optional required
         publication sidecar; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
+    :param bool environments_preflighted: Every reached launch environment was
+        checked before entering this core for a fresh artifact tree.
     :return Mapping[str, Winner]: Winners produced by this invocation's generation.
     :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
         to win whose recorded evidence is no longer in this tree, or selection
@@ -362,11 +364,12 @@ def _run_experiment_outcome(
                 "before retrying. For an MCP run, then run phasesweep mcp recover-run.",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
-        _preflight_missing_reached_phase_environments(
-            experiment,
-            claimed.studies,
-            from_phase=from_phase,
-        )
+        if not environments_preflighted:
+            _preflight_missing_reached_phase_environments(
+                experiment,
+                claimed.studies,
+                from_phase=from_phase,
+            )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
         generation_id = generation_ops._claim_generation(experiment, requested_generation_id)
@@ -693,14 +696,12 @@ def _run_experiment_inner(
         # Capability disclosure: restate the same per-phase resume/reproduce
         # contract `phasesweep validate` prints, in the preview an operator
         # reads immediately before committing to a run.
-        for line in experiment_contract_lines(experiment):
-            log.info("DRY RUN %s", line)
-        for warning in experiment_warnings(experiment):
-            log.warning("DRY RUN warning: %s", warning)
-        for previewed in experiment.phases:
-            log.info("DRY RUN %s", sampler_capability_line(previewed, experiment.resolved_storage))
-            for warning in sampler_warnings(previewed):
-                log.warning("DRY RUN warning: %s", warning)
+        for _phase, lines in experiment_disclosures(experiment):
+            for warning, line in lines:
+                if warning:
+                    log.warning("DRY RUN warning: %s", line)
+                else:
+                    log.info("DRY RUN %s", line)
         recorded = _preview_ledger(experiment, from_phase=from_phase)
 
     # Only a dry run resumes without preloaded winners; it resolves the
@@ -884,8 +885,8 @@ def _cli_phase_payloads(
     cli_phases: list[dict[str, Any]] = []
     for phase in phases:
         winner_path = (
-            _published_winner_path_for(experiment, published_generation_id, phase["phase"])
-            if phase["winner_present"]
+            path_ops._generation_winner_path(experiment, published_generation_id, phase["phase"])
+            if phase["winner_present"] and published_generation_id is not None
             else None
         )
         cli_phases.append(

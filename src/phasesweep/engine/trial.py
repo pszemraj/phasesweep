@@ -2,7 +2,7 @@
 
 Split into two phases:
   launch_trial  — needs GPU lease, runs subprocess
-  extract_trial — no GPU needed, reads result files
+  extract_trial_result — no GPU needed, reads result files
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Observation, _wandb_query
+from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
     OperatorAction,
@@ -48,10 +49,8 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
-    dump_json_file_overrides,
-    dump_trial_trainer_config_yaml,
+    compose_trainer_input,
     encode_overrides_json,
-    merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
@@ -127,14 +126,6 @@ _TRIAL_BOUND_ENV = (
     "PHASESWEEP_OVERRIDES_SHA256",
     "PHASESWEEP_OBJECTIVE_PATH",
 )
-
-# Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
-# contract reports the divergence once per phase instead of once per trial.
-_DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
-
-# Warn-once keys for :func:`_warn_narrowed_environment_exit`, with the same
-# once-per-phase-per-process scope.
-_NARROWED_ENV_EXIT_WARNED: set[tuple[str, str]] = set()
 
 # How far back from the end of ``stderr.log`` a failed trial's reason reads.
 _STDERR_TAIL_BYTES = 4096
@@ -226,24 +217,6 @@ def _trainer_environment(
             env.pop("MLFLOW_EXPERIMENT_ID", None)
             env["MLFLOW_EXPERIMENT_NAME"] = str(experiment.mlflow.experiment_name)
     return env
-
-
-def _preflight_trainer_environments(
-    experiment: Experiment, *, from_phase: str | None = None
-) -> None:
-    """Validate environments for phases that a fresh artifact tree would launch.
-
-    Existing current-format trees defer this check until recovered study state
-    proves that a phase has new work. A fresh tree has no trials to replay, so
-    every reached phase can be checked before any execution artifact is created.
-
-    :param Experiment experiment: Parsed experiment supplying phase contracts.
-    :param str | None from_phase: Optional first phase to execute.
-    :raises PhaseSweepError: A composed runtime environment disables required
-        remote evidence or conflicts with its managed identity.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        _trainer_environment(experiment, phase.name)
 
 
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
@@ -421,11 +394,9 @@ def _warn_dropped_cuda_visibility(
     ambient = os.environ.get("CUDA_VISIBLE_DEVICES")
     if ambient is None:
         return
-    key = (experiment.experiment, phase_name, ambient)
-    if key in _DROPPED_CUDA_VISIBILITY_WARNED:
-        return
-    _DROPPED_CUDA_VISIBILITY_WARNED.add(key)
-    log.warning(
+    _warn_once(
+        log,
+        ("dropped-cuda-visibility", experiment.experiment, phase_name, ambient),
         "[%s] ambient CUDA_VISIBLE_DEVICES=%r is outside the "
         "execution.inherit_env=%r contract and this phase leases no device, so trials "
         "will see every host GPU and hold no GPU host lock. Set a top-level "
@@ -514,11 +485,9 @@ def _warn_narrowed_environment_exit(
         return
     if stderr_line is not None and _MISSING_ENVIRONMENT_STDERR.search(stderr_line) is None:
         return
-    key = (experiment.experiment, phase_name)
-    if key in _NARROWED_ENV_EXIT_WARNED:
-        return
-    _NARROWED_ENV_EXIT_WARNED.add(key)
-    log.warning(
+    _warn_once(
+        log,
+        ("narrowed-environment-exit", experiment.experiment, phase_name),
         "[%s/trial_%d] the trainer exited with code %d under execution.inherit_env=%r, "
         "so it received only %s plus env and passthrough_env values. If it needs another "
         "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
@@ -651,23 +620,13 @@ def prepare_trainer_input(
         "{run_name}": run_name,
     }
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
-    if experiment.override_format == "yaml_file":
-        text = dump_trial_trainer_config_yaml(
-            experiment.trainer_config, overrides, substitutions=substitutions
-        )
-    elif experiment.override_format == "json_file":
-        text = dump_json_file_overrides(
-            overrides, trainer_config=experiment.trainer_config, substitutions=substitutions
-        )
-    else:
-        text = (
-            encode_overrides_json(
-                merged_cli_overrides(
-                    experiment.trainer_config, overrides, substitutions=substitutions
-                )
-            )
-            + "\n"
-        )
+    composed = compose_trainer_input(
+        experiment.trainer_config,
+        overrides,
+        experiment.override_format,
+        substitutions=substitutions,
+    )
+    text = composed if isinstance(composed, str) else encode_overrides_json(composed) + "\n"
 
     resolved_text = (
         encode_overrides_json(overrides) + "\n"

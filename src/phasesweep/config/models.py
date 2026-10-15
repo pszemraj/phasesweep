@@ -31,7 +31,9 @@ from phasesweep.config.search import (
     _validate_sampler_search_space,
     fixed_configuration_target_refusal,
     phase_draws,
+    sampler_capability_line,
     sampler_search_space,
+    sampler_warnings,
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
@@ -51,11 +53,9 @@ from phasesweep.evidence.models import (
 from phasesweep.runtime.commands import (
     _OverrideValueError,
     _render_override_value,
-    dump_json_file_overrides,
+    compose_trainer_input,
     dump_overrides_json,
-    dump_trial_trainer_config_yaml,
     flatten_trainer_config,
-    merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import (
@@ -175,6 +175,36 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "execution.passthrough_env, which is inherited without being recorded or compared."
         )
     return warnings
+
+
+def experiment_disclosures(
+    experiment: Experiment,
+) -> Iterator[tuple[Phase | None, list[tuple[bool, str]]]]:
+    """Yield shared contract and warning lines in their display order.
+
+    The experiment block comes first, followed by one block per configured
+    phase. The phase context lets callers insert their own phase headings;
+    each line's boolean marks advisory warnings without prescribing a sink.
+
+    :param Experiment experiment: Loaded experiment to describe.
+    :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
+        ordered warning/content pairs; ``None`` identifies the experiment block.
+    """
+    yield (
+        None,
+        [
+            *((False, line) for line in experiment_contract_lines(experiment)),
+            *((True, line) for line in experiment_warnings(experiment)),
+        ],
+    )
+    for phase in experiment.phases:
+        yield (
+            phase,
+            [
+                (False, sampler_capability_line(phase, experiment.resolved_storage)),
+                *((True, line) for line in sampler_warnings(phase)),
+            ],
+        )
 
 
 _CREDENTIAL_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
@@ -1683,12 +1713,7 @@ def _validate_trial_command_template(
 
     placeholder_dir = Path("__phasesweep_validate_trial_dir__")
     try:
-        if experiment.override_format == "yaml_file":
-            dump_trial_trainer_config_yaml(experiment.trainer_config, overrides)
-        elif experiment.override_format == "json_file":
-            dump_json_file_overrides(overrides, trainer_config=experiment.trainer_config)
-        else:
-            merged_cli_overrides(experiment.trainer_config, overrides)
+        compose_trainer_input(experiment.trainer_config, overrides, experiment.override_format)
     except (ValueError, TypeError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "

@@ -513,6 +513,19 @@ def _resume_phase(
     )
 
 
+def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> TimeoutError:
+    """Describe a deadline that prevented the phase from producing a feasible winner.
+
+    :param str phase_name: Phase whose winner cannot be selected.
+    :param str timeout_scope: Deadline responsible for exhausting feasible work.
+    :return TimeoutError: Refusal shared by live completion and recorded-result replay.
+    """
+    return TimeoutError(
+        f"Phase {phase_name!r} hit its {timeout_scope} deadline "
+        "before any feasible trial could complete; no winner can be selected."
+    )
+
+
 def _judge_recorded_phase(
     experiment: Experiment,
     phase: Phase,
@@ -590,10 +603,7 @@ def _judge_recorded_phase(
                 verify_evidence=verify_evidence,
             )
         except NoFeasibleTrialError as exc:
-            raise TimeoutError(
-                f"Phase {phase.name!r} hit its {partial_decision.timeout_scope} deadline "
-                "before any feasible trial could complete; no winner can be selected."
-            ) from exc
+            raise _no_feasible_before_deadline(phase.name, partial_decision.timeout_scope) from exc
     # An abort is the decision recorded with the outcome that tripped it, so a
     # later success resetting the streak, or a changed max_consecutive_failures,
     # never undoes it.
@@ -1393,16 +1403,13 @@ def _settle_finished_trial(
         and not _trial_requires_cleanup_recovery(trial)
     ):
         _retire_active_attempt(run.experiment, finished_attempt)
-    if run.experiment.mlflow is not None and trial.state == optuna.trial.TrialState.COMPLETE:
+    if run.experiment.mlflow is not None and (
+        trial.state == optuna.trial.TrialState.COMPLETE
+        or not _trial_requires_cleanup_recovery(trial)
+    ):
         from phasesweep.tracking.publication import publish_trial
 
         publish_trial(run.experiment, run.generation_id, trial, run.environment_identity.values)
-    elif run.experiment.mlflow is not None and not _trial_requires_cleanup_recovery(trial):
-        from phasesweep.tracking.publication import publish_unaccepted_trial
-
-        publish_unaccepted_trial(
-            run.experiment, run.generation_id, trial, run.environment_identity.values
-        )
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):
         with contextlib.suppress(Exception):
@@ -1531,9 +1538,8 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             # — e.g. every launch was refused or cut short after the budget
             # expired. Reporting this as "no feasible trial" would misdirect
             # operators at trainer logs.
-            raise TimeoutError(
-                f"Phase {phase.name!r} hit its {run.timeout_source or 'wallclock'} deadline "
-                "before any feasible trial could complete; no winner can be selected."
+            raise _no_feasible_before_deadline(
+                phase.name, run.timeout_source or "wallclock"
             ) from exc
         raise
 
@@ -1821,8 +1827,8 @@ def _select_phase_winner(
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
     :param bool verify_evidence: Whether to re-prove the selected trial and warn about
         environment drift. The proof reads the trial directories and may query W&B or
-        MLflow, and the drift warning consumes a process-global warn-once key
-        (``_ENVIRONMENT_DRIFT_WARNED``), so a dry run turns both off and leaves them
+        MLflow, and the drift warning consumes a process-global warning identity
+        through :func:`phasesweep.engine.progress._warn_once`, so a dry run turns both off and leaves them
         to the launch.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.

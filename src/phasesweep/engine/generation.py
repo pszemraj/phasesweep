@@ -422,7 +422,7 @@ def _publish_generation(
        caches for humans only -- no reader derives publication authority
        from them, and once any generation has published, reads resolve the
        generation-scoped artifacts directly (see
-       :func:`phasesweep.engine.publication._published_winner_path_for`), so a
+       :func:`phasesweep.engine.paths._generation_winner_path`), so a
        failure projecting them never affects what callers actually see.
 
     Steps 6 through 8 each independently log and swallow their own failure so one

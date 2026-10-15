@@ -368,10 +368,11 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 
 
 @pytest.mark.parametrize("phase_count", [1, 3])
-def test_read_status_captures_trial_data_once_whatever_the_phase_count(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase_count: int
+@pytest.mark.parametrize("reader", ["status", "phase-studies"])
+def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase_count: int, reader: str
 ) -> None:
-    """A status read captures the journal for its format scan and once for all phases."""
+    """Status and preview studies each capture the format boundary and one shared trial snapshot."""
     ledger = tmp_path / "study.journal"
     phases = [
         Phase(
@@ -405,10 +406,18 @@ def test_read_status_captures_trial_data_once_whatever_the_phase_count(
 
     monkeypatch.setattr(engine_ledger, "_capture_journal", counted_capture)
 
-    status = read_status(experiment)
+    if reader == "status":
+        counts = [phase["trials"] for phase in read_status(experiment)["phases"]]
+    else:
+        snapshots = engine_ledger.read_phase_studies(engine_ledger.validate_ledger(experiment))
+        counts = []
+        for snapshot in snapshots.values():
+            assert snapshot is not None
+            (trial,) = snapshot.get_trials(deepcopy=False)
+            counts.append({trial.state.name: 1})
 
     assert len(captures) == 2
-    assert [phase["trials"] for phase in status["phases"]] == [{"COMPLETE": 1}] * phase_count
+    assert counts == [{"COMPLETE": 1}] * phase_count
 
 
 def test_read_status_captures_trial_data_after_resolving_the_publication_pointer(

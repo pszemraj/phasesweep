@@ -184,21 +184,3 @@ def _resolve_publication_pointer(
     return PublicationPointer(
         state="ok", generation_id=generation_id, error=None, validated=validated
     )
-
-
-def _published_winner_path_for(
-    experiment: Experiment,
-    published_generation_id: str | None,
-    phase_name: str,
-) -> Path | None:
-    """Resolve one authoritative current-format winner path.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str | None published_generation_id: Already-resolved last-success id.
-    :param str phase_name: Phase name whose published winner path is requested.
-    :return Path | None: The immutable generation-scoped winner path, or
-        ``None`` when no last-success generation was resolved.
-    """
-    if published_generation_id is None:
-        return None
-    return path_ops._generation_winner_path(experiment, published_generation_id, phase_name)

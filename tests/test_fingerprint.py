@@ -13,7 +13,6 @@ import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.artifacts as artifacts_module
 from phasesweep import __version__, run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
@@ -629,7 +628,7 @@ def test_replay_under_changed_environment_warns_about_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A no-op replay allocates nothing, so only the drift warning names the change."""
-    monkeypatch.setattr(artifacts_module, "_ENVIRONMENT_DRIFT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     caplog.set_level(logging.WARNING, logger="phasesweep")
     trainer = write_constant_trainer(tmp_path)
     experiment = _environment_cohort_experiment(

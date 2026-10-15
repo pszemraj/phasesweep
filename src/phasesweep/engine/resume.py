@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import optuna
 
@@ -28,12 +28,18 @@ def _preflight_skipped_winners(
     *,
     from_phase: str | None,
     run_deadline: float | None,
+    error_mapper: Callable[[str, Exception], Exception] | None = None,
 ) -> dict[str, Winner]:
     """Validate skipped winners before committing a new generation.
 
     :param Experiment experiment: Experiment whose resume prefix is checked.
     :param str | None from_phase: First phase that the new generation will execute.
     :param float | None run_deadline: Whole-run monotonic deadline, when configured.
+    :param Callable[[str, Exception], Exception] | None error_mapper: Optional
+        frontend adapter receiving the phase whose winner was being checked
+        and its refusal. Publication-resolution failures name the first skipped
+        phase. Adapted refusals suppress the internal cause; without an adapter
+        every exception is re-raised unchanged.
     :return dict[str, Winner]: Compatible skipped winners in declaration order.
     :raises TimeoutError: The whole-run wallclock deadline expired before a
         skipped phase could be validated.
@@ -53,23 +59,30 @@ def _preflight_skipped_winners(
     if from_phase is None:
         return {}
 
-    # One manifest validation covers every skipped phase. Resolving once is
-    # safe here, unlike in status reads: this preflight runs under
-    # _experiment_lock, and this experiment's pointer only advances at this
-    # run's final publish.
-    publication = _published_for_resume(experiment)
+    # One validated immutable generation supplies every skipped winner. The
+    # engine holds _experiment_lock; the MCP gate retains the same publication
+    # snapshot while checking the full prefix before spawning its runner.
+    phase = experiment.phases[0]
+    try:
+        publication = _published_for_resume(experiment)
+        winners: dict[str, Winner] = {}
+        for phase in experiment.phases:
+            if run_deadline is not None and time.monotonic() >= run_deadline:
+                raise TimeoutError(
+                    f"Run wallclock deadline reached before phase {phase.name!r} could start."
+                )
+            if phase.name == from_phase:
+                return winners
+            winners[phase.name] = _accept_skipped_winner(experiment, phase, winners, publication)
 
-    winners: dict[str, Winner] = {}
-    for phase in experiment.phases:
-        if run_deadline is not None and time.monotonic() >= run_deadline:
-            raise TimeoutError(
-                f"Run wallclock deadline reached before phase {phase.name!r} could start."
-            )
-        if phase.name == from_phase:
-            return winners
-        winners[phase.name] = _accept_skipped_winner(experiment, phase, winners, publication)
-
-    raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
+        raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
+    except Exception as exc:
+        if error_mapper is None:
+            raise
+        mapped = error_mapper(phase.name, exc)
+        if mapped is exc:
+            raise
+        raise mapped from None
 
 
 def _published_for_resume(experiment: Experiment) -> ValidatedPublication | None:

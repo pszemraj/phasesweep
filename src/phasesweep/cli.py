@@ -16,7 +16,7 @@ import optuna
 import yaml
 
 from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
-from phasesweep.config.models import Experiment, experiment_contract_lines, experiment_warnings
+from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
     closest,
     first_sentence,
@@ -26,7 +26,7 @@ from phasesweep.config.reference import (
     sub_key_count,
     top_level_entries,
 )
-from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
+from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
@@ -459,19 +459,19 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
     """
-    for line in experiment_contract_lines(experiment):
-        click.echo(f"{indent}{line}")
-    for warning in experiment_warnings(experiment):
-        click.echo(f"{indent}warning: {warning}")
-    for p in experiment.phases:
-        deps = f" inherits={p.inherits}" if p.inherits else ""
-        sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
-        click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
-        # Capability disclosure: state the resume/reproduce contract before a trial runs.
-        click.echo(f"{indent}    {sampler_capability_line(p, experiment.resolved_storage)}")
-        for warning in sampler_warnings(p):
-            click.echo(f"{indent}    warning: {warning}")
-        _render_phase_comment(p.comment, prefix=f"{indent}    # ")
+    for phase, lines in experiment_disclosures(experiment):
+        prefix = indent
+        if phase is not None:
+            deps = f" inherits={phase.inherits}" if phase.inherits else ""
+            sampling = (
+                f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
+            )
+            click.echo(f"{indent}- {phase.name}: n_trials={phase.n_trials} {sampling}{deps}")
+            prefix += "    "
+        for warning, line in lines:
+            click.echo(f"{prefix}{'warning: ' if warning else ''}{line}")
+        if phase is not None:
+            _render_phase_comment(phase.comment, prefix=f"{indent}    # ")
 
 
 def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
@@ -563,6 +563,16 @@ def _render_reference_index() -> None:
     )
 
 
+def _terminate_sentence(detail: str) -> str:
+    """Trim trailing whitespace and supply terminal punctuation when absent.
+
+    :param str detail: Diagnostic clause or sentence.
+    :return str: The trimmed text ending in a period, question mark or exclamation mark.
+    """
+    detail = detail.rstrip()
+    return detail if detail.endswith((".", "!", "?")) else f"{detail}."
+
+
 def _publication_integrity_error(
     subject: str,
     detail: str,
@@ -584,9 +594,7 @@ def _publication_integrity_error(
         the operator must inspect.
     :return PublicationIntegrityError: Complete single-line operator diagnostic.
     """
-    detail = detail.rstrip()
-    if not detail.endswith((".", "!", "?")):
-        detail = f"{detail}."
+    detail = _terminate_sentence(detail)
     return PublicationIntegrityError(
         f"{subject} records a publication that no longer validates: {detail} "
         f"Do not run anything over this tree until you have inspected or restored the "
@@ -602,9 +610,7 @@ def _publication_access_error(subject: str, detail: str) -> PublicationAccessErr
     :param str detail: Path-free permission diagnostic from the validator.
     :return PublicationAccessError: Complete single-line operator diagnostic.
     """
-    detail = detail.rstrip()
-    if not detail.endswith((".", "!", "?")):
-        detail = f"{detail}."
+    detail = _terminate_sentence(detail)
     return PublicationAccessError(
         f"{subject} records a publication that cannot be validated as the current user: "
         f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "

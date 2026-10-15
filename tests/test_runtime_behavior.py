@@ -27,6 +27,7 @@ from phasesweep.engine.ledger import (
 )
 from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_state_label
 from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
     _attempts_dir,
     _generation_path,
     _last_successful_generation_path,
@@ -555,6 +556,14 @@ def test_terminal_callback_reports_success_evidence(
 ) -> None:
     experiment = make_experiment(workdir=tmp_path / "runs")
     captured: list[TerminalReport] = []
+    validated_environments: list[str] = []
+
+    def validate_environment(_experiment: Experiment, phase_name: str) -> dict[str, str]:
+        assert not _artifact_root_binding_path(experiment).exists()
+        validated_environments.append(phase_name)
+        return {}
+
+    monkeypatch.setattr("phasesweep.engine.run._trainer_environment", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase
@@ -568,6 +577,7 @@ def test_terminal_callback_reports_success_evidence(
     )
 
     assert run_experiment(experiment, terminal_callback=captured.append) == {}
+    assert validated_environments == [phase.name for phase in experiment.phases]
     assert len(captured) == 1
     report = captured[0]
     assert report.primary_error is None
