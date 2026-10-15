@@ -144,7 +144,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     whenever storage is persistent. In-memory storage has no shared backend,
     so the output lock alone suffices.
 
-    Both locks are *same-host advisory only*; multi-host coordination would need durable per-trial leases and heartbeats rather than just host-local flock files.
+    Both locks are *same-host advisory only*.
 
     :param Experiment experiment: Experiment whose complete lock set is acquired.
     :raises ExperimentLockBusyError: Another process holds the output or storage lock.
@@ -166,8 +166,5 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
             handles.append(handle)
         yield
     finally:
-        # Reverse-order release isn't required by flock semantics, but it
-        # keeps the "stack" mental model intact and parallels typical
-        # acquire-A-then-B / release-B-then-A discipline.
         for handle in reversed(handles):
             unlock_file(handle)

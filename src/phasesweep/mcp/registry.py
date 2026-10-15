@@ -487,9 +487,8 @@ def _load_catalog_entries(
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """Validate every catalog entry, collecting per-entry verdicts.
 
-    Runs the same validation as :meth:`Registry.load` (shared per-entry code
-    path) but does not stop at the first failure, so ``phasesweep mcp check``
-    can report a full ok/FAIL table. Once every entry passes, it also runs the
+    Runs the same validation as :meth:`Registry.load` but does not stop at the
+    first failure, so ``phasesweep mcp check`` can report a full ok/FAIL table. Once every entry passes, it also runs the
     exact state-directory provisioning and write probe used at server startup.
     Catalog-level problems (unreadable file, schema errors, or unusable state)
     still raise :class:`CatalogError`.
@@ -531,9 +530,8 @@ class Registry:
 
         Every problem is reported as ``CatalogError`` so the server refuses to
         start with a bad catalog. Per entry: the config path exists,
-        ``load_experiment_bytes`` accepts it, it is an :class:`Experiment` (suites
-        are out of scope for v1), and its storage is a persistent local journal
-        file (the MCP layer is local-node only in this version).
+        ``load_experiment_bytes`` accepts it, it is an :class:`Experiment`,
+        and its storage is a persistent local journal file.
 
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :return Registry: Immutable registry of validated catalog entries.

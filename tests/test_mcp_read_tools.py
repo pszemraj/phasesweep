@@ -125,7 +125,6 @@ def test_run_results_carry_path_free_confound_verdicts(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "method_name",
-    # Only the winners read needs a published run, and a real run is slow.
     ["status", pytest.param("winners", marks=pytest.mark.integration)],
 )
 def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
@@ -877,12 +876,7 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
 
 @pytest.mark.integration
 def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:
-    """Renaming a phase must not delete the published result from the payload.
-
-    Enumerating winners under the *current* phase names returned an "ok"
-    publication with zero winners and the new name listed as missing: an
-    agent's cue to launch a run over evidence that was there all along.
-    """
+    """Renaming a phase must not delete the published result from the payload."""
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="q"))
     app, _registry, _store = make_mcp_app(catalog)

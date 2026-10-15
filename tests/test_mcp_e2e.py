@@ -50,10 +50,6 @@ from tests.mcp_helpers import (
     write_mcp_config_catalog,
 )
 
-# Hard ceilings for the monitoring loops below. Both are far above the real
-# cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
-# tool dispatch), so they only trip on a regression that would otherwise hang
-# pytest indefinitely instead of failing.
 MONITOR_DEADLINE_SECONDS = 300.0
 DISPATCH_DEADLINE_SECONDS = 30.0
 
@@ -99,17 +95,7 @@ phases:
 
 
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
-    """Exercise the real list -> validate -> launch -> poll -> winners pipeline.
-
-    Exact payload shapes are pinned by cheaper unit tests, not here: the
-    ``metric.objective_evidence`` dict shape by
-    tests/test_engine_read.py::test_objective_evidence_assurance_json_envelope_checkpoint_binding,
-    and the ``all_phases_have_winners``/``missing_phases``/``winner_generation``
-    computation by
-    tests/test_mcp_redaction.py::test_winners_payload_computes_phase_completeness_and_provenance.
-    This test only asserts structural wiring: winners are non-empty, phases are
-    complete and in order, expected keys are present, and redaction is applied.
-    """
+    """Exercise the real list -> validate -> launch -> poll -> winners pipeline."""
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"e2e_lm": _chained_config(tmp_path)},
@@ -134,8 +120,6 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        # Bounded: a run that never reaches a terminal state must fail this
-        # test with the last state it reported, not hang pytest forever.
         deadline = time.monotonic() + MONITOR_DEADLINE_SECONDS
         state = "unobserved"
         while state not in {"succeeded", "failed", "cancelled"}:
@@ -261,9 +245,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
 def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     # Holding the launch lock stands in for a concurrent launch mid-decision.
     # The cap check and spawn are serialized under it, so a second launch is
-    # told to retry rather than racing past the cap. The refused path spawns
-    # nothing (it raises before _spawn), so no real sweep is needed and the
-    # test stays deterministic. White-box: reach for the store's lock directly.
+    # told to retry rather than racing past the cap.
     from phasesweep.runtime.files import try_lock_file, unlock_file
 
     trainer = copy_fake_train(tmp_path)
@@ -358,7 +340,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
-    # could not call the tools. Lock the shapes in.
+    # could not call the tools.
     schemas = {t.name: t.inputSchema for t in tools}
     assert all(schema.get("additionalProperties") is False for schema in schemas.values())
     assert sorted(schemas[TOOL_LAUNCH_RUN]["properties"]) == ["experiment_id", "from_phase"]
@@ -540,8 +522,6 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
         del timeout_seconds
-        # Bounded: if the blocking tool never reaches its blocking section the
-        # regression must surface as a failure, not as a pytest hang.
         deadline = time.monotonic() + DISPATCH_DEADLINE_SECONDS
         while not clock.blocking_started.is_set():
             if time.monotonic() > deadline:

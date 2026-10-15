@@ -1073,8 +1073,6 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
 
     other = JsonExtractor(type="json", path="result.json", key="eval.acc")
     assert extractor_config_fingerprint(other) != extractor_config_fingerprint(cfg)
-    # Unchanged JSON provenance keeps its old identity; changed log-regex
-    # interpretation must be distinguishable even under identical YAML.
     legacy_json = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     assert extractor_config_fingerprint(cfg) == hashlib.sha256(legacy_json.encode()).hexdigest()
     log = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)")

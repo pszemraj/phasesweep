@@ -205,9 +205,6 @@ def lock_dir() -> Path:
 
     # Shells and services for one account must contend even when HOME or XDG
     # settings differ. Only the explicit lock override may move this namespace.
-    # Without a usable home, the operator provisions a lock directory and
-    # points the override at it, since the override never creates what it
-    # names. Both are setting up the environment PhaseSweep runs in: one step.
     try:
         home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
     except KeyError as exc:

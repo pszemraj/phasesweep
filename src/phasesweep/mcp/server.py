@@ -1,7 +1,7 @@
 """FastMCP adapter: the only module that imports the MCP SDK.
 
-PhaseSweepMCP (in :mod:`phasesweep.mcp.tools`) holds all logic and is SDK-free
-and unit-testable. build_server wraps each method as a FastMCP tool; _safe_tool
+PhaseSweepMCP (in :mod:`phasesweep.mcp.tools`) holds all logic and is SDK-free.
+build_server wraps each method as a FastMCP tool; _safe_tool
 guarantees tool errors are redacted. serve() loads the catalog, builds the
 store, and serves over stdio; call() runs one tool through the same server.
 """
@@ -808,7 +808,7 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
 def build_server(app: PhaseSweepMCP) -> Any:
     """Construct the FastMCP server.
 
-    The SDK is imported lazily so non-server code paths (and most tests) do not
+    The SDK is imported lazily so non-server code paths do not
     require the ``mcp`` package.
 
     :param PhaseSweepMCP app: SDK-free tool implementation to expose.
@@ -919,7 +919,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
         # for a process group, so isolate it from concurrent await/status calls.
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
-    # Keep schema-bearing adapters explicit; register their common SDK policy once.
     registrations: tuple[tuple[Callable[..., object], str, str, ToolAnnotations], ...] = (
         (
             list_experiments,

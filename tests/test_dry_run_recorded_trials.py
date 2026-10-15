@@ -3,9 +3,7 @@
 A real run judges a phase by the trials its study holds: it refuses what its rules refuse, replays
 a phase whose target is met, and launches what the target still lacks. The preview has to say the
 same, so it reads the ledger through the write-nothing door and applies the run's own rules to
-what it read, in the run's order. The integration tests compare its claims with what a real run
-then launches; the fast ones build the recorded studies by hand and compare its refusals with a
-real run's, message for message.
+what it read, in the run's order.
 """
 
 from __future__ import annotations

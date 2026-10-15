@@ -378,8 +378,7 @@ def _warn_dropped_cuda_visibility(
     phase deliberately assigns nothing: the child then has no visibility
     binding and can use host GPUs the parent had hidden, holding no GPU host
     lock. That is a real hazard, but it is a *configuration* hazard: the fix is
-    a fingerprinted ``env`` entry, not a silent ambient read. Say so once
-    rather than papering over it.
+    a fingerprinted ``env`` entry, not a silent ambient read.
 
     Args:
         experiment: Parsed experiment supplying the inherit contract.
@@ -543,10 +542,8 @@ def _failed_trial(
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
 
-    Centralizes the ``metric=None / feasible=False`` shape that the five
-    failure exits in :func:`extract_trial_result` were repeating. ``constraints``
-    is empty for failures that occur before constraint extraction starts; it
-    carries the partial dict for failures that surface mid-loop.
+    ``constraints`` is empty for failures that occur before constraint extraction
+    starts; it carries the partial dict for failures that surface mid-loop.
 
     Args:
         rc: Subprocess return code.

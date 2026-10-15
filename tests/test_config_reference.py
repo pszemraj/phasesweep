@@ -1,9 +1,7 @@
 """Guard documented config paths/signatures and load the starting configurations.
 
-These checks detect inventory, type and default drift. They do not prove the
-reference's behavioral comments, bounds, precedence or cross-field rules. The
-one comment check is structural: every ``Conflicts with`` and ``Overrides``
-line must have its counterpart on the key it names.
+Every ``Conflicts with`` and ``Overrides`` line must have its counterpart on
+the key it names.
 """
 
 from __future__ import annotations

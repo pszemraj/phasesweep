@@ -215,8 +215,7 @@ def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
     A test that resumes a fixture study and allocates new trials passes the environment
     cohort check only from that environment, since each recorded trial holds its tracked
-    values. Without this the test follows the shell that runs it, and fails under the commit
-    hook, whose ``PATH`` differs from the developer's.
+    values.
 
     :param pytest.MonkeyPatch monkeypatch: The test's monkeypatch, which undoes the pin.
     """

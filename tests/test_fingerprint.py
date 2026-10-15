@@ -83,9 +83,6 @@ from tests.conftest import (
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
 
-#: Optuna journal op code for ``SET_TRIAL_USER_ATTR``. Mirrors
-#: ``optuna.storages.journal._storage.JournalOperation`` and
-#: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
 _JOURNAL_SET_TRIAL_USER_ATTR = 8
 
 
@@ -93,8 +90,7 @@ def _drop_trial_user_attr_records(storage: str, key: str) -> None:
     """Rewrite a journal ledger, dropping every trial user-attribute record for ``key``.
 
     The journal equivalent of ``DELETE FROM trial_user_attributes WHERE key = ?``:
-    every trial in the ledger loses the attribute, not just one study's. Mirrors
-    ``tests/fixtures/make_ledger_fixtures.py``'s journal-record-editing approach.
+    every trial in the ledger loses the attribute, not just one study's.
 
     :param str storage: ``journal:///`` storage URL for the ledger.
     :param str key: Trial user-attribute key to drop everywhere it is set.

@@ -1666,7 +1666,7 @@ def _validate_trial_command_template(
 
     Render ``trial_command`` once per phase with placeholder overrides.
 
-    Catches at config-load (not at trial-launch, three minutes into a sweep):
+    Catches at config-load:
 
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
     * Attribute or index access on a placeholder (``{trial_dir.name}``,

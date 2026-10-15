@@ -802,9 +802,6 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     # Count actual subprocess launches (each launch creates a stdout.log).
     # With the post-acquire recheck, the first failure aborts queued threads
     # before they launch their subprocess. Without it, all 4 would launch.
-    # Derive the directory from the experiment to track the
-    # ``<workdir>/<experiment>/<phase>/`` layout; a hard-coded
-    # ``<workdir>/<phase>/`` path would match nothing and make the assertion vacuous.
     runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
     trial_dirs = sorted(runs_dir.glob("trial_*"))
     launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
@@ -1189,7 +1186,6 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         "cause": "stale RUNNING trial recovered after its orchestrator stopped",
     }
     assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
-    # The whole point: the ledger still validates, so the study is reusable.
     assert _load_phase_policy_state(study).max_sequence == 3
 
 
@@ -1847,13 +1843,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
 def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
     tmp_path: Path, sampler: Sampler
 ) -> None:
-    """Every sampler's suggestion survives Optuna persistence with its type intact.
-
-    The end-to-end fidelity test above pins grid, the only sampler that visits
-    every choice deterministically. This narrower check runs the real
-    ``_suggest`` under random and TPE too and compares the value the objective
-    received against the value persistent storage hands back.
-    """
+    """Every sampler's suggestion survives Optuna persistence with its type intact."""
     param = CategoricalParam(type="categorical", choices=list(_FIDELITY_CHOICES))
     storage_url = _resolve_storage(f"journal:///{tmp_path / 'round-trip.journal'}")
     study_name = f"round-trip::{sampler.type}"

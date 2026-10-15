@@ -202,10 +202,6 @@ def _phase_fingerprint(
 ) -> str:
     """Hash the semantic execution context for resume-compatibility checks.
 
-    Uses the full SHA-256 hex digest. Truncating to 16 hex chars (64 bits)
-    would be defensible against accidental collision but is no reason to
-    leave the door open in scientific-workflow metadata.
-
     :param Experiment experiment: Experiment forwarded to
         :func:`_phase_fingerprint_payload`.
     :param Phase phase: Phase being fingerprinted.

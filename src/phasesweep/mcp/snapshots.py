@@ -509,13 +509,7 @@ def capture_result_snapshot(
     Exactly one storage read backs that agreement. Every trial fact frozen
     here -- counts, generation counts, and the RUNNING identities later used
     to reconcile cleanup evidence -- comes from the single tolerant
-    :func:`phasesweep.engine.read.read_status` call below. Reloading each
-    phase study afterwards to collect those identities would be an intolerant
-    read with no retry: one transient "database is locked" in that window
-    would fail the capture of an otherwise successful multi-hour run, and a
-    terminal snapshot that was never captured is unrecoverable by design
-    (see docs/mcp.md). Freezing a valid terminal result must not depend on a
-    second storage round trip.
+    :func:`phasesweep.engine.read.read_status` call below.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.

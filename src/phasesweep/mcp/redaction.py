@@ -1,4 +1,4 @@
-"""Outbound payload construction. Whitelist, do not blacklist.
+"""Outbound payload construction.
 
 Payloads are built only from typed, path-free views (PhaseWinnerView, the
 read_status dict, catalog summaries). There is no path to interpolate a

@@ -5,10 +5,6 @@ No other module in ``phasesweep`` may construct storage. It may not name
 backend, and it may not call ``optuna.Study``. No module, this one included,
 names ``RDBStorage``, ``sqlalchemy.create_engine``, or ``sqlite3.connect``:
 the only durable backend is an Optuna journal file.
-``tests/test_ledger_contract.py`` enforces that statically and holds the full
-list. Concentrating the constructors here is what makes the durability
-invariants checkable: every path that touches a ledger goes through this
-module's handles, in one fixed order.
 
 1. Only mutating callers take the experiment lock, and they take it first.
    There are three: a run (:func:`phasesweep.engine.run.run_experiment`, from
@@ -253,9 +249,6 @@ def _resolve_storage(url: str | None) -> Any:
 
 def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
     """Create or load a phase's Optuna study in already-resolved storage.
-
-    The one ``create_study`` call both openers share, so a live study and its
-    dry-run preview can never disagree on sampler, pruner, or direction.
 
     :param Experiment experiment: Parsed experiment config supplying the metric direction.
     :param Phase phase: Phase whose sampler, search space, and study name are used.
@@ -1059,8 +1052,7 @@ def read_trial_stats(
 
     The read is permissive by design -- an unreadable ledger reports
     ``available=False`` rather than raising -- because the ledger's *format* was
-    already settled by :func:`validate_ledger` before this handle existed. That
-    is why no format argument appears here: the scan is not this read's job.
+    already settled by :func:`validate_ledger` before this handle existed.
     When the scan did not complete, every phase is reported unavailable without
     being read, since counts read around that gap would present the ledger as
     current-format when nothing verified it. Each phase's own study still

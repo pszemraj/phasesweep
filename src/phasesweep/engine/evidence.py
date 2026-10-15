@@ -448,11 +448,6 @@ def _verify_trial_evidence_dir(
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
-    The single per-trial check shared by the launch preflight
-    (:func:`_validate_selection_evidence`) and the selection-time winner check
-    (:func:`_verify_winner_objective_evidence`), so the two can never drift
-    apart on what "this trial's evidence is intact" means.
-
     ``trial_dir`` is always the structurally translated directory: the current
     config's phase directory plus the trial's own directory name. A lifecycle
     record is required, but its ``state`` is deliberately not constrained: the
@@ -624,9 +619,7 @@ def _validate_selection_evidence(
     (:func:`_selection_candidate_identity`); the rest can never win, so passing
     over them cannot bias the result. Every candidate's small generated trainer
     input is content-verified. The potentially unbounded objective source is
-    checked for existence and recorded size only, because re-hashing every
-    candidate's ``stdout.log`` on every top-up would cost the whole study's log
-    volume per resume. The winning objective source is digest-verified at
+    checked for existence and recorded size only. The winning objective source is digest-verified at
     selection time instead (:func:`_verify_winner_objective_evidence`).
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
@@ -709,12 +702,7 @@ def _verify_winner_objective_evidence(
     The launch preflight content-verifies every candidate's small generated
     trainer input and proves its objective source still exists; this additionally
     proves the winning objective source is byte-for-byte the evidence its frozen
-    provenance recorded. The split is deliberate: the default objective source
-    is an uncapped trainer log, so hashing every candidate on every top-up is
-    O(total trainer log bytes) per resume - potentially tens of gigabytes -
-    while hashing only the published winner is bounded by one trial's log and
-    still catches every deletion and every result-affecting edit, including a
-    tamper that preserves byte length.
+    provenance recorded.
 
     It runs on every selection, so a deadline-truncated partial publication is
     covered on the same terms as a complete one. A repeats winner stands on

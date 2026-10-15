@@ -62,7 +62,7 @@ RunLaunchState = Literal["launching", "spawned"]
 #: dead.
 RunnerVisibility: TypeAlias = Literal["observable", "absent", "gone", "unobservable"]
 
-# Single source of truth for the launch handshake: phasesweep.mcp.runner writes
+# phasesweep.mcp.runner writes
 # LAUNCH_READY_BYTE once its process identity is durable, and
 # phasesweep.mcp.run_control writes LAUNCH_ACK_BYTE once it has recorded that
 # receipt, settling ownership of the spawned process.
@@ -1307,8 +1307,7 @@ class RunStore:
         """Return the newest persisted handle for an experiment deterministically.
 
         The result is computed from validated durable launch timestamps, with
-        ``run_id`` as a stable tie-breaker. This intentionally returns one
-        semantic answer rather than a list an agent would need to scan.
+        ``run_id`` as a stable tie-breaker.
 
         :param str experiment_id: Catalog id whose latest run should be found.
         :return RunHandle | None: Newest persisted handle, or ``None`` when the

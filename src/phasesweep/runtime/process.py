@@ -16,8 +16,7 @@ the parent acknowledges, the supervisor is a stdlib-only helper script
 (``phasesweep.runtime.supervisor``) run directly (never ``-m``) under
 ``python -I -S`` with a minimal sanitized environment — just ``PATH``. It
 cannot import the phasesweep package, a poisoned/shadowed package from the
-trainer's ``PYTHONPATH``, or a trainer-composed ``sitecustomize``, and it
-starts in ~30ms instead of paying phasesweep's package-import cost. Only
+trainer's ``PYTHONPATH``, or a trainer-composed ``sitecustomize``. Only
 after this process durably persists ``process_identity.json`` does it send the
 trainer's shell command and full environment to the supervisor as a framed
 JSON payload. The supervisor stays outside the trainer's process group as a
@@ -72,9 +71,6 @@ _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
 _GUARDIAN_EXIT_TIMEOUT_SECONDS = (
     _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
 )
-# With the -I -S stdlib-only launch, supervisor startup does not pay
-# phasesweep's package-import cost, so real-world readiness lands in ~30ms.
-# 10s stays generous headroom for a loaded host, not a tight bound.
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
 # trial timeout may be longer.
@@ -1025,9 +1021,6 @@ def run_supervised(
             raise
         control_flow_exception = not isinstance(exc, Exception)
         target_pgid = pgid if pgid is not None else proc.pid
-        # Covers both a failed identity write and a failed payload delivery;
-        # the substring "failed to persist process identity" is kept stable
-        # because it is asserted on by existing tests.
         launch_failure_reason = (
             f"failed to persist process identity or deliver launch payload: {exc}"
         )

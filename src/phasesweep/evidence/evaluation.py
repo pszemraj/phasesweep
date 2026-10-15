@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time.
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
-# Bump when log-regex selection semantics change. The revision is frozen into
+# The revision is frozen into
 # each trial's extractor contract, so selection and replay reject readings
 # made under an older interpretation even when the package version is absent.
 LOG_REGEX_EVALUATION_REVISION = 2

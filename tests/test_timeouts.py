@@ -605,10 +605,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     Phase attribution narrows on the dedicated subclass. A plain
     ``TimeoutError`` escaping the lock layer is an infrastructure failure: it
     must surface as a fatal abort, never let ``allow_incomplete_on_timeout``
-    publish a partial winner off broken infrastructure. This pins the
-    ``except GpuLeaseTimeoutError`` contract in ``engine/phase.py`` — widening
-    it to ``TimeoutError`` or raising the plain superclass from the pool fails
-    one side of this parametrization.
+    publish a partial winner off broken infrastructure.
     """
     import contextlib
 

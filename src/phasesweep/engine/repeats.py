@@ -4,9 +4,7 @@ A phase with ``repeats`` runs every configuration once per repeat value, and
 selection ranks only complete groups by a reducer over their members. This
 module holds the pure parts of that contract: the group key, the statistics,
 the winner's ``repeats`` record and its validator, and the evidence members a
-winner stands on. Recorded-trial labeling resolves draw positions lazily, so
-read-only publication validation can use the record helpers without importing
-Optuna's sampler machinery.
+winner stands on.
 """
 
 from __future__ import annotations

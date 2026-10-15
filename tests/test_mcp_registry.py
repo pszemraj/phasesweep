@@ -328,12 +328,6 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("storage", "error_match"),
     [
-        # Config load itself refuses any non-journal backend now, so the
-        # registry's own MCP-specific storage checks never run for these; an
-        # external DB, an old SQLite URL, and the bare ``:memory:`` shorthand
-        # all surface as the same config-load refusal, wrapped as a
-        # CatalogError (they don't need one case each -- the wire text is
-        # identical up to the echoed value).
         pytest.param(
             '"postgresql://host/db"',
             "storage must be null, auto, or a journal",

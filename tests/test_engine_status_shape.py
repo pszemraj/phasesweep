@@ -2,8 +2,7 @@
 
 ``experiment_status`` is a documented package-root API (docs/development.md)
 and ``phasesweep status`` renders its payload verbatim, so its key set is a
-contract for downstream consumers. These tests pin the experiment payload so
-that changes to the public CLI shape do not drift unnoticed.
+contract for downstream consumers.
 """
 
 from __future__ import annotations

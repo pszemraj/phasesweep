@@ -505,13 +505,6 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
 ) -> None:
     """A successful run's result is frozen even if studies became unloadable.
 
-    The capture collects RUNNING rows from the tolerant ``read_status`` read
-    instead of rereading every phase study afterwards. A reread would have no
-    tolerance for failure: one transient lock in that millisecond-wide window
-    would fail the capture, and a terminal snapshot that was never captured is
-    unrecoverable by design -- so a completed run's frozen result would be
-    lost to storage flakiness that the tolerant status read itself shrugs off.
-
     The one tolerant read replays a journal snapshot through ``optuna.load_study``,
     so exactly one load succeeds and any reload after it fails.
     """

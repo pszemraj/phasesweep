@@ -18,10 +18,6 @@ completed are counted as ``incomplete_group``, apart from infeasible ones.
 The block is computed once per selection and frozen onto the winner. A
 carried winner keeps it verbatim, and it never joins a fingerprint, so an
 observation can never invalidate a study or block a top-up.
-
-This module stays free of the extraction stack: read-only publication
-validation imports it, so the selection caller decodes each ranked trial's
-objective provenance and passes the records in.
 """
 
 from __future__ import annotations

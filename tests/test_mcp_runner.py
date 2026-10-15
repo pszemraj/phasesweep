@@ -477,9 +477,6 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         assert status["failure"]["retryable"] is False
         assert status["failure"]["cause"]["code"] == "storage_unavailable"
         assert status["failure"]["cause"]["stage"] == "preflight"
-        # The cause routes a ledger restore, which only the operator can do;
-        # test_error_routing.py's routing sweep is the one owner of the
-        # composed remediation text for cleanup_uncertain + storage_unavailable.
         assert status["failure"]["cause"]["retryable"] is False
         assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
         assert str(ledger) not in json.dumps(status["failure"])

@@ -85,9 +85,6 @@ def _fail_terminal_generation_state(original: Callable, error: BaseException):
 
 
 # Provenance files frozen into every generation namespace at claim time.
-# Referenced by literal name on purpose: these names are the documented on-disk
-# interface in docs/runtime.md, so renaming them must fail here rather than
-# silently move an operator's evidence.
 _CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
 _REPRODUCIBILITY_NAME = "reproducibility.json"
 _SENTINEL_SECRET = "s3cr3t-sentinel-must-not-be-published"
@@ -1229,7 +1226,6 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
 
 
 def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
-    """The F4 reproduction: a tampered winner must not read as "nothing published"."""
     experiment, generation_id = _golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
@@ -1244,13 +1240,10 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
     assert "does not match its recorded hash" in status["publication_error"]
-    # Nothing is fabricated: the no-publication facts stay exactly as they read
-    # today, only the integrity verdict is new.
     assert status["published_generation_id"] is None
     assert status["represented_generation_id"] is None
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
-    # The boolean-blind wrapper remains fail-closed for path callers.
     assert published_generation_id(experiment) is None
     assert read_result(experiment, phase_names=["p"])[1] == []
 
@@ -1613,7 +1606,6 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
     expected_snapshot["execution"]["cwd"] = str(Path.cwd().resolve())
     assert snapshot == expected_snapshot
 
-    # Spot-check the values an operator actually needs to reproduce the run.
     assert snapshot["trial_command"] == experiment.trial_command
     assert snapshot["env"] == {"TRAINER_TOKEN": _SENTINEL_SECRET}
     phase = snapshot["phases"][0]

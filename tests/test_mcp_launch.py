@@ -1136,12 +1136,8 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Control for the test above: the poison is genuinely executable.
-
-    Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
-    inherited environment - must import the shadow package, so a passing
-    hardened case is evidence about the hardening rather than about an inert
-    fixture.
+    """Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
+    inherited environment - must import the shadow package.
     """
     _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
     # PYTHONHOME alone would break the interpreter before it could import

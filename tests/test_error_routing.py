@@ -1,10 +1,7 @@
 """Contract tests for the operator action every PhaseSweepError carries.
 
 ``action`` routes a failure to the remediation an operator should carry out, without parsing
-prose; the message stays authoritative about what went wrong, and routing never edits it. The class
-walk imports the whole package, so a subclass is covered the moment it exists. The routing table
-drives real raise and wrap sites and pins the action each routes, and the MCP runner's failure
-payload, where routing reaches an agent, must say exactly those steps.
+prose; the message stays authoritative about what went wrong, and routing never edits it.
 """
 
 from __future__ import annotations
@@ -119,8 +116,6 @@ from tests.ledger_fixtures import (
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
 from tests.recovery_helpers import load_only_recovery_needs
 
-# Classes proving the module sweep reached past the error modules themselves.
-# If an import ever stops happening, these vanish from the walk and say so.
 _SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError"})
 
 
@@ -286,13 +281,6 @@ class RoutingCase:
     #: Exact ``__cause__`` type, pinned only where the runner routes by it.
     cause: type[BaseException] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
-
-
-# A wrap translates one failure into another at a layer boundary. Each row below drives a real wrap
-# site through its real entry point, faulting only the call beneath it, and pins what the operator
-# receives: the raised type, the action it routes to, and a stable piece of today's message. A row
-# whose action differs from its raised class default is the evidence that the site preserves or
-# composes the remediation rather than replacing it.
 
 
 def _raiser(error: BaseException) -> Callable[..., object]:
@@ -502,11 +490,7 @@ def _unwritable_directory(tmp_path: Path) -> Path:
 
 
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Fail a run, then lose the root before reconciliation can confirm cleanup.
-
-    Mirrors
-    ``tests/test_mcp_runner.py::test_terminal_report_marks_failed_root_discovery_uncertain``.
-    """
+    """Fail a run, then lose the root before reconciliation can confirm cleanup."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
     def fail_run(*_args: object, **_kwargs: object) -> None:
@@ -985,11 +969,6 @@ WRAP_CASES = (
 )
 
 
-# An origin raise states its remedy in its own message, so its action has to
-# name that same remedy rather than whatever its class defaults to. Each row
-# drives the real code path to one such raise and pins the pair together.
-
-
 def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Claim a ledger whose tree another process bound after it was validated."""
     experiment = make_experiment(workdir=tmp_path / "runs")
@@ -1017,11 +996,7 @@ def _reconcile_prepared_over_damaged_publication(
 def _preflight_registered_trial_without_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
-    """Scan a registry entry whose terminal trial lost its durable attempt id.
-
-    Mirrors the ``missing-attempt`` case of
-    ``tests/test_stale_reaper.py::test_registry_terminal_cleanup_requires_matching_attempt_identity``.
-    """
+    """Scan a registry entry whose terminal trial lost its durable attempt id."""
     experiment = make_experiment(
         workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}"
     )
@@ -1746,10 +1721,6 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
     assert not isinstance(excinfo.value, PhaseSweepError)
 
 
-# The MCP runner is where routing reaches an agent: a run's failure payload
-# says what to do next, and may say only what the raise routes. Each marker
-# belongs to one step's text alone, so a payload that names a step the raise
-# did not route fails as surely as one that omits a step.
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
         OperatorAction.FRESH_NAMESPACE: "new experiment name",
@@ -1818,9 +1789,6 @@ _UNCONFIRMED_CLEANUPS = (
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:
-    # The payload depends only on an error's type and action, and the tables
-    # above prove each trigger raises exactly its row's, so each row's
-    # declared routing stands in for driving its trigger again.
     errors = [cls("boom") for cls in _operator_error_classes()]
     errors += [case.raised("boom", action=case.action) for case in CASES]
     for error in errors:

@@ -206,7 +206,6 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     (relative paths, ``..`` segments) produce one stable lock identity. None
     in returns None out (in-memory has no shared backend to collide on).
 
-    This test pins only the path-resolution and None-handling contract.
     """
     # Journal path with `..` must be resolved away.
     journal_id = canonical_storage_identity(f"journal:///{tmp_path}/sub/../study.journal")

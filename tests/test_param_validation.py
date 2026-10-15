@@ -493,7 +493,6 @@ def test_categorical_rejects_equal_but_distinct_choices(
 
 
 def test_categorical_config_error_uses_only_the_selected_union_branch() -> None:
-    """The ``type`` discriminator keeps upgrade errors focused on categorical choices."""
     with pytest.raises(ValidationError) as exc_info:
         make_experiment(
             n_trials=2,

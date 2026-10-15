@@ -473,7 +473,7 @@ def test_claim_rescans_an_unverified_ledger_before_discovery(
 def test_verified_handle_reads_and_claims_after_one_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A completed scan is trusted as before: counts are real and claim scans no more."""
+    """A completed scan is trusted: counts are real and claim scans no more."""
     experiment = _bound_tree_with_foreign_study(tmp_path, foreign=False)
     scans = _scan_fails(monkeypatch, times=0)
 

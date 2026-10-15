@@ -29,8 +29,6 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 # must not hold every trial for the whole timeout. Reading history that has
 # caught up may use the rest of the read's deadline.
 _HISTORY_SETTLE_SECONDS = 30.0
-# Longest wait between history reads, however slowly the summary is polled:
-# the partial reads just after a run finishes cleared within about a second.
 _HISTORY_RETRY_SECONDS = 2.0
 # The server's silent cap on the rows of one history request, both a sampled
 # request and, until the run's history is exported, a scan page: a longer

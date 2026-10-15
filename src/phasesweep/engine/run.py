@@ -725,8 +725,7 @@ def _run_experiment_inner(
             )
         # Inherited winners must be resolved before either the skip-path winner
         # load (so we can verify its fingerprint against the *current* parent
-        # context) or the actual run path. Keeping the construction in one
-        # place makes the two paths symmetric.
+        # context) or the actual run path.
         inherited = {p: winners[p] for p in phase.inherits}
 
         if skip_until and phase.name != from_phase:
@@ -945,11 +944,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
 
     ``read_status``'s summary-derived fields (``metric``, ``result_context``,
     ``published_config_matches_current``, ``summary_present``) are deliberately
-    *not* part of this payload: they are the MCP read view's contract, and the
-    per-study cost of computing them here is one small YAML read plus a config
-    fingerprint, negligible beside the per-phase Optuna storage reads this call
-    already performs. ``tests/test_engine_status_shape.py`` pins both key sets
-    so neither can drift silently.
+    *not* part of this payload: they are the MCP read view's contract.
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload with generation identity plus per-phase

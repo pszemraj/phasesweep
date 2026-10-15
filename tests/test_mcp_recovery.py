@@ -704,9 +704,6 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     run_id = "srv-registry-only-recovery"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
 
-    # A real run binds the tree in preflight, long before it registers an
-    # attempt into it. Fabricating the registry entry without the binding would
-    # leave a tree this release correctly reads as unmarked PhaseSweep state.
     mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
     trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
@@ -1178,12 +1175,6 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         generation_id=later_generation_id,
     )
     if changed_storage:
-        # The stale trial was written against the later ledger, which also
-        # bound the tree to it. Recovery loads the original config, and this
-        # release refuses to operate a tree bound to a different ledger. The
-        # realistic shape is therefore a tree owned by the config being
-        # recovered, with only the registry entry still naming the old
-        # locator -- which is exactly the reconciliation under test.
         recovery_experiment = load_experiment(config)
         assert isinstance(recovery_experiment, Experiment)
         _write_artifact_root_binding(recovery_experiment)
@@ -1336,13 +1327,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     expected_cleanup_uncertain_terminal: int,
     expect_running_before_confirm: bool,
 ) -> None:
-    """Recovery clears cleanup uncertainty from two distinct evidence branches that
-    share the same launch-refusal -> dry-run -> --confirm -> relaunch scaffold: a
-    terminal trial already recorded as cleanup-uncertain
-    (``write_uncertain_failed_trial``, pinned via
-    ``cleanup_uncertain_terminal_trials``) and a stale RUNNING trial reaped by the
-    recovery pass itself (``write_launched_stale_trial``, pinned via
-    ``reaped_running_trials``).
+    """Recovery clears cleanup uncertainty from a terminal cleanup-uncertain
+    trial and a stale RUNNING trial reaped by recovery.
     """
     config = _config(tmp_path)
     run_id = "srv-cleanup-uncertainty-recover"
@@ -1453,7 +1439,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     monkeypatch: pytest.MonkeyPatch,
     earlier_boot: bool,
 ) -> None:
-    """Pins that a --confirm retry after an interrupted
+    """A --confirm retry after an interrupted
     ``finalize_result_snapshot`` call reuses the cleanup-recovery evidence
     persisted by the first (failed) attempt instead of re-running runner/trial
     cleanup or re-reaping the stale trial.
@@ -1685,7 +1671,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pins that a --confirm retry after an interrupted
+    """A --confirm retry after an interrupted
     ``RunStore.clear_cleanup_uncertain`` call still counts the reaped-attempt
     evidence persisted by the first attempt, rather than treating the retry as
     having found no cleanup evidence.
@@ -1842,8 +1828,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     evidence was a cleanup-uncertain terminal trial must not wedge the run:
     the retry finds nothing fresh to recover but must not refuse while the
     recovery record is already on disk. The study ledger supplies the
-    evidence (the reaped-RUNNING-trial variant is pinned separately, and its
-    attempt ids persist in status)."""
+    evidence."""
     run_id = "srv-terminal-marker-retry"
     store, handle, _trial_number, _config_path, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True

@@ -119,9 +119,6 @@ def _accept_skipped_winner(
 ) -> Winner:
     """Load one skipped phase's published winner and prove the resume may build on it.
 
-    This is the one rule for accepting a skipped winner. The run preflight and
-    the MCP launch gate both apply it, each reporting a refusal its own way.
-
     :param Experiment experiment: Experiment being resumed.
     :param Phase phase: Skipped phase whose winner is accepted.
     :param Mapping[str, Winner] winners: Winners already accepted for earlier

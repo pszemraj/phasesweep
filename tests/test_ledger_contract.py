@@ -27,11 +27,6 @@ the chokepoint itself; only the journal/Optuna entry points in
 Each detector also runs over synthetic source that must trip it, so a detector
 that stops finding anything fails here instead of passing every real module.
 
-Out of scope on purpose, because no static reader can follow them: dynamic
-attribute access such as ``getattr(optuna, "create_study")``, and anything
-reached through :mod:`importlib`. Both are absent from ``src/phasesweep``
-today, and no automated gate keeps them out: ``tests/tiers.py`` scans only test
-modules, so review is the only guard.
 """
 
 from __future__ import annotations

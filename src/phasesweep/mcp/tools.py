@@ -68,7 +68,6 @@ from phasesweep.mcp.snapshots import (
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.time import parse_utc_iso
 
-# The tools log on the server's channel, so one logger name covers everything served.
 log = logging.getLogger("phasesweep.mcp.server")
 
 DEFAULT_LIST_LIMIT = 50
@@ -124,13 +123,6 @@ def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int 
 
     Terminal runs use the runner-stamped ``ended_at`` in status.json. A
     terminal run with no readable endpoint reports ``None`` rather than a guess.
-
-    ``RunStore`` refuses to load a handle whose ``started_at`` does not parse,
-    so the start endpoint is established for every handle that reaches here.
-    It is still re-checked rather than asserted: an assertion would be
-    compiled out under ``python -O`` and the unparsed ``None`` would surface
-    as a ``TypeError`` from the subtraction below instead of the documented
-    "endpoints unknown" answer.
 
     :param RunStore store: Run store used to read the terminal status.
     :param RunHandle handle: Persisted run whose duration is measured.

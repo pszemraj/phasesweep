@@ -3,8 +3,6 @@
 
 The fixture is one real PhaseSweep run -- two trials of one phase, seeded
 random sampler, no GPU -- captured verbatim on the journal backend.
-PhaseSweep keeps no backward compatibility, so this generator produces only
-the current-format shape.
 
 Run it from the repository root, in the environment under test::
 

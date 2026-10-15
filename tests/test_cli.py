@@ -970,9 +970,7 @@ def test_dry_run_warns_when_one_configuration_can_exhaust_the_failure_budget(
 
 
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
-    """``show-winners`` prints comment before the winner block so the reader
-    frames numerical results against intent. Also covers the no-winner-yet
-    branch — the comment is still surfaced even before a phase has run."""
+    """``show-winners`` prints phase comments before results and for phases without a winner."""
 
     def make_cfg(workdir: Path) -> Path:
         cfg = tmp_path / "exp.yaml"
@@ -1651,8 +1649,7 @@ def test_cli_boundary_reports_config_error_without_traceback(
 ) -> None:
     """A bad config is bad input: exit 2, the file named, no traceback.
 
-    Bad indentation is one of the two most common YAML mistakes, and PyYAML
-    labels it ``in "<unicode string>"``; without the config loader's own source
+    PyYAML labels bad indentation ``in "<unicode string>"``; without the config loader's own source
     label the operator cannot tell which file failed. A schema validation error
     must name the file the same way.
     """

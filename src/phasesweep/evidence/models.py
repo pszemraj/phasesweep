@@ -319,9 +319,6 @@ measured. ``json`` and ``log_regex`` objectives record no position, so selection
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
     """Describe which objective-evidence identities the extractor genuinely enforces.
 
-    Grounded in what ``phasesweep.evidence.evaluation._extract_json_envelope``
-    actually checks, not in the extractor's coarse type alone:
-
     - ``objective_name``, ``split``, ``policy`` are required
       :class:`JsonEnvelopeExtractor` fields (``min_length=1``) and are
       unconditionally checked against the envelope's own reported
@@ -331,31 +328,25 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
       The envelope must always structurally report a non-empty checkpoint and
       a non-negative step (or extraction fails), but that value is compared
       against the configured value only when the config declares one
-      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``). Reporting
-      a coarse ``True`` regardless of whether either was declared overstates
-      what is actually enforced when they are left unset.
+      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``).
     - ``log_regex`` extractors have no objective_name/split/
       policy/checkpoint/expected_step concept at all, so every one of those
       flags is ``False`` for them.
-    - Attempt binding is reported as three precise flags rather than one
-      coarse ``attempt_bound`` claim, which would overstate weak extractors:
-
-      - ``attempt_location_scoped`` is ``True`` for local extractors:
-        each reads evidence from a trial directory uniquely scoped to this
-        generation+attempt. Scoping alone is weak: nothing in a ``log_regex``
-        file's *contents* identifies the
-        attempt that produced it, so a file misplaced or symlinked into the
-        wrong trial directory would be read as gospel.
-      - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
-        the envelope structurally echoes ``generation_id``/``attempt_id``/
-        ``overrides_sha256`` in its own body, and
-        ``_extract_json_envelope`` cross-checks those reported values
-        against the runtime's own identity before accepting the result.
-        Other readers have no reported identity fields to check, so it is
-        ``False``.
-      - ``source_identity_keyed`` is ``True`` for W&B and MLflow: the target
-        and bound run ID identify their finished evidence. Local readers use
-        location-addressed files. W&B makes no envelope metadata assurances.
+    - ``attempt_location_scoped`` is ``True`` for local extractors:
+      each reads evidence from a trial directory uniquely scoped to this
+      generation+attempt. Nothing in a ``log_regex`` file's contents identifies
+      the producing attempt, so a file misplaced or symlinked into the wrong
+      trial directory is accepted.
+    - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
+      the envelope structurally echoes ``generation_id``/``attempt_id``/
+      ``overrides_sha256`` in its own body, and
+      ``_extract_json_envelope`` cross-checks those reported values
+      against the runtime's own identity before accepting the result.
+      Other readers have no reported identity fields to check, so it is
+      ``False``.
+    - ``source_identity_keyed`` is ``True`` for W&B and MLflow: the target
+      and bound run ID identify their finished evidence. Local readers use
+      location-addressed files. W&B makes no envelope metadata assurances.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
     :return dict[str, str | bool]: Assurance payload with the extractor ``kind``

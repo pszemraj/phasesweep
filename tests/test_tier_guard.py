@@ -5,9 +5,6 @@ here imports or executes it. Keeping the probes as module-level constants also
 keeps this module out of its own scanner's results: the rule (b) string probe
 would otherwise match the literal embedded in a test body.
 
-Every rule has a probe that only that rule flags, so a rule that stops firing
-fails a named case here instead of silently letting a slow test into the fast
-tier.
 """
 
 from __future__ import annotations

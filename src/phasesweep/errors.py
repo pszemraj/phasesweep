@@ -65,8 +65,7 @@ class PhaseSweepError(RuntimeError):
 
     # The base declares a fallback solely because the base class is itself
     # raised directly at a few sites. It is not an inheritable default: every
-    # concrete subclass declares its own, and tests/test_error_routing.py fails
-    # when one silently inherits this one.
+    # concrete subclass declares its own.
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
     def __init__(self, *args: object, action: OperatorAction | None = None) -> None:

@@ -196,8 +196,6 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     t = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     # Don't call study.tell — leave it RUNNING.
 
-    # The reaper is replaced below; the directory only makes the historical
-    # workdir shape explicit for the fingerprint-order assertion.
     trial_dir = tmp_path / "runs" / "a" / f"trial_{t.number:05d}"
     trial_dir.mkdir(parents=True)
 
@@ -584,7 +582,6 @@ def test_kill_stale_group_escalates_to_sigkill():
         st = read_proc_starttime(proc.pid)
         assert st is not None
 
-        # Use a short grace window so the test runs fast.
         sent = kill_stale_group(proc.pid, st, grace_seconds=1.5)
         assert sent is True
 
@@ -649,7 +646,7 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
         try:
             os.kill(child_pid, 0)
         except ProcessLookupError:
-            return  # PASS
+            return
         time.sleep(0.05)
     pytest.fail(f"Descendant child {child_pid} survived pgid-based kill")
 
@@ -1830,8 +1827,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     Losing the registry makes a trainer undiscoverable after a phase rename;
     losing the allocated lifecycle marker makes a queued pre-launch crash
     indistinguishable from a torn process-identity write. Both failures must
-    stop before the GPU lease and subprocess. The successful discovery path is
-    covered by ``test_renamed_phase_cannot_hide_stale_trainer_from_recovery``.
+    stop before the GPU lease and subprocess.
     """
     launched = tmp_path / "trainer_ran"
     trainer = write_trainer(

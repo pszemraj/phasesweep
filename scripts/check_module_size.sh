@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Refuse any source or test module longer than the line limit. A module past it
 # is too large to read and review whole, so it must be split before it changes.
-# The test modules listed in `ceilings` already exceeded the limit when it
-# reached tests/; each may shrink but never grow past its ceiling. Lower a
+# Each listed module may shrink but never grow past its ceiling. Lower a
 # ceiling when its file shrinks, and drop the entry once the file fits the limit.
 # With file arguments (the pre-commit hook) it checks those files; without
 # any (CI) it checks every tracked module under src/ and tests/.

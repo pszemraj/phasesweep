@@ -66,7 +66,7 @@ def write_trial_identity(
 
 
 def _new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
-    """Create one phase's minimizing study, stamped as this release's format."""
+    """Create one phase's minimizing study."""
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase_name}",
         storage=_resolve_storage(experiment.resolved_storage),

@@ -148,9 +148,7 @@ def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
 
 # A generation's summary is written only as the last step of a successful run,
 # so its presence is what separates a published generation from a claim-time
-# namespace whose run never got that far. Named once because manifest
-# validation reasons about that distinction for *another* generation's
-# namespace, where the helper below cannot be used.
+# namespace whose run never got that far.
 GENERATION_SUMMARY_FILENAME = "summary.yaml"
 
 

@@ -962,8 +962,7 @@ def _tree_with_two_carried_winners_from_one_source(tmp_path: Path) -> tuple[Expe
 
     The second (top-up) generation reselects both phases' already-completed
     trials without launching new ones, so both of its winners cite the same
-    earlier, published source generation -- the shared-ancestor shape that
-    made per-path revalidation exponential in top-up history.
+    earlier, published source generation.
 
     :return tuple[Experiment, str, str]: The experiment plus the source and
         carrying generation ids.

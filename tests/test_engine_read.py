@@ -288,9 +288,6 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
     assert (loaded is not None) is keep_prefix
 
     if published and not keep_prefix:
-        # claim_ledger reaches the same published-evidence check run_experiment
-        # would, without needing a runnable trainer or GPU isolation to get
-        # there, and it raises after the repair already ran.
         with pytest.raises(PublishedStudyMissingError):
             engine_ledger.claim_ledger(engine_ledger.validate_ledger(experiment))
         assert tree_snapshot(root) == before
@@ -539,9 +536,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
 def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
     """A retained winner row alone cannot authorize replacement trials.
 
-    The matrix above damages a whole journal ledger; this restores one that is
-    internally consistent but short -- as an older backup of the journal would
-    be. Trial 0 (the published winner) keeps its complete record, but every
+    Trial 0 (the published winner) keeps its complete record, but every
     record from trial 1's own creation onward is gone, so the study is neither
     missing nor empty, just below the completion boundary the publication
     recorded.

@@ -556,7 +556,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
-    """Without a marker or run handles, the path names some other directory, not old state."""
+    """Without a marker or run handles, the path names some other directory."""
     state_dir = tmp_path / "state"
     RunStore(state_dir)
     (state_dir / ".phasesweep-format.json").unlink()
@@ -646,7 +646,6 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
         (_symlink_to_state_dir, "is not a real directory"),
-        # A readable marker naming another format is another release's state.
         (_marker_text('{"schema_version": 0}\n'), "declares unsupported format 0"),
         # No marker and no run handles: the path names some other directory,
         # whatever its layout or permissions, and no chmod turns it into state.
@@ -1671,8 +1670,7 @@ def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path
         pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
     # Kill a child that is paused until signalled. As its unreaping parent, the
-    # PID lingers as a zombie that os.kill(pid, 0) still reports as alive -
-    # exactly the SIGKILL/OOM case that must report failed, not running.
+    # PID lingers as a zombie that os.kill(pid, 0) still reports as alive.
     proc = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
     try:
         starttime = read_proc_starttime(proc.pid)

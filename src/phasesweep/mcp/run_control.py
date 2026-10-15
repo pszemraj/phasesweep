@@ -59,7 +59,6 @@ from phasesweep.runtime.reaper import (
 )
 from phasesweep.runtime.time import utc_now_iso
 
-# The tools log on the server's channel, so one logger name covers everything served.
 log = logging.getLogger("phasesweep.mcp.server")
 
 _RUNNER_READY_TIMEOUT_SECONDS = 10.0

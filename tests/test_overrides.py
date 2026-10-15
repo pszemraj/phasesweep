@@ -746,7 +746,6 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
     """With the value contract enforced, distinct Python values always produce
     distinct JSON-mode dumps — so no two configs that render different commands
     can share a study identity."""
-    # Import only: the fingerprint code itself is deliberately untouched.
     from phasesweep.engine.fingerprints import _phase_fingerprint
 
     fingerprints: dict[str, str] = {}

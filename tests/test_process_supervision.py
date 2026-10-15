@@ -1,4 +1,4 @@
-"""Supervised subprocess lifecycle: Popen registration, signal handler installation and forwarding, descendant cleanup, cleanup_confirmed propagation, and the launch-window deadlock guard. Some tests run as real subprocesses because the behavior is POSIX signal delivery, not Python state we can mock."""
+"""Supervised subprocess lifecycle: Popen registration, signal handler installation and forwarding, descendant cleanup, cleanup_confirmed propagation, and the launch-window deadlock guard."""
 
 from __future__ import annotations
 
@@ -56,9 +56,6 @@ from phasesweep.runtime.shutdown import (
 )
 from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
 
-# This module exists to observe POSIX signal delivery and descendant cleanup on
-# real process groups, so the whole file is an integration tier module: even the
-# cases that patch a spawn still assert against real signal and /proc semantics.
 pytestmark = pytest.mark.integration
 
 
@@ -87,11 +84,7 @@ def _run_supervised(
     attempt_id: str,
     cwd: str | None = None,
 ):
-    """Open ``trial_dir``'s out/err logs and delegate to ``run_supervised``.
-
-    Collapses the repeated "open two log files, call run_supervised"
-    boilerplate shared by most call sites in this module.
-    """
+    """Open ``trial_dir``'s out/err logs and delegate to ``run_supervised``."""
     with (trial_dir / "out.log").open("w") as fout, (trial_dir / "err.log").open("w") as ferr:
         return run_supervised(
             cmd,
@@ -219,15 +212,7 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A metadata write failure after Popen must not leave the child running.
-
-    Looped ~30 times: ``_kill_group`` must not reap the direct child only when
-    a single nonblocking ``poll()`` already observed it exited, since a child
-    that died right after ``poll()`` returned ``None`` could remain an unreaped
-    zombie despite ``cleanup_confirmed`` being reported ``True``. The bounded,
-    unconditional ``wait()`` reaps deterministically; the loop guards against a
-    single lucky run masking a reintroduced race.
-    """
+    """A metadata write failure after Popen must not leave the child running."""
     _patch_process_identity_write_failure(monkeypatch)
 
     for i in range(30):
@@ -907,9 +892,6 @@ def test_reap_child_is_strictly_nonblocking_and_reports_whether_it_reaped(
     assert calls == [(12345, os.WNOHANG)]
 
 
-# Both duplicate-victim tests below spawn a background child that ignores
-# SIGTERM, so ``run_supervised`` must escalate to SIGKILL against the whole
-# process group rather than stopping once the root process is gone.
 _SIGTERM_IGNORING_CHILD_SCRIPT = (
     "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
 )
@@ -957,9 +939,6 @@ def test_timeout_kills_descendant_when_root_exits_after_sigterm(tmp_path: Path) 
     )
     cmd = f"python -c {parent_script!r}"
 
-    # Wait for child PID file before timeout fires.
-    # Use a thread to write the marker check; simpler: just timeout=2.0
-    # and confirm the marker was written (child started).
     result = _run_supervised(trial_dir, cmd, timeout=2.0, attempt_id="timeout-attempt")
 
     assert result.timed_out, "trial should have hit the configured timeout"
@@ -1412,13 +1391,7 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
 
 
 def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
-    """Root exits 0 while a child ignores SIGTERM.
-
-    Previous code treated root-exit-zero as clean and deleted identity files,
-    leaking the child with no forensic trail for the reaper. Now this is a
-    lifecycle failure: descendants are killed, identity files are preserved,
-    and failure_reason is set.
-    """
+    """Root exits 0 while a child ignores SIGTERM."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     marker = tmp_path / "child_pid.txt"

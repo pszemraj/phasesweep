@@ -693,8 +693,6 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         winner = None if validated is None else validated.winners.get(name)
         if winner is not None:
             click.echo(f"=== {name} ===")
-            # Show design-intent before numerical results so the reader frames
-            # them against the original hypothesis instead of the other way around.
             _render_phase_comment(comment, prefix="# ")
             click.echo(winner.content.decode("utf-8"))
         else:

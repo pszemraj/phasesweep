@@ -1,8 +1,4 @@
-"""Shared test fixtures and helpers for phasesweep tests.
-
-One experiment factory to replace the 5+ near-identical _minimal_experiment /
-_exp / _make_exp helpers scattered across test files. Tests that need specialized construction can pass explicit phases or phase keyword overrides.
-"""
+"""Shared test fixtures and helpers for phasesweep tests."""
 
 from __future__ import annotations
 
@@ -244,8 +240,7 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
     id assignment the same way Optuna's journal replay does -- sequentially,
     in ``CREATE_STUDY`` record order -- then rewrites the ledger without the
     ``SET_STUDY_USER_ATTR`` record(s) that set ``ARTIFACT_ROOT_ATTR`` for that
-    study id. Mirrors ``tests/fixtures/make_ledger_fixtures.py``'s
-    ``_drop_journal_schema_attr``.
+    study id.
 
     :param str storage: ``journal:///`` storage URL for the study's ledger.
     :param str study_name: Study whose artifact-root user attribute is dropped.

@@ -136,8 +136,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
     as a change to the fixture's bytes; it is snapshotted on its own once
     built, because preflight must leave it untouched too. The handle names a
     long-dead PID with a mismatched start time and is marked cleanup-uncertain,
-    which is the state that makes preflight load the phase studies (mirrors
-    ``tests/test_mcp_recovery.py::test_operator_recovery_clears_no_status_cleanup_uncertainty``).
+    which is the state that makes preflight load the phase studies.
 
     :param Materialized materialized: Copied fixture and its config.
     :param Path tmp_path: Per-test temporary directory.
@@ -268,11 +267,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
 def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dry run replays the fixture's finished phase and hands out its real winner.
-
-    The matrix above asserts only the verdict, which a placeholder winner satisfies as well, so
-    this pins the replay itself: a stand-in winner has trial number -1.
-    """
+    """The dry run replays the fixture's finished phase and hands out its real winner."""
     materialized = materialize("current-journal", tmp_path, mode=mode)
     attempts = forbid_file_backed_storage(monkeypatch, allow_memory_studies=True)
 
@@ -287,12 +282,7 @@ def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
 def test_recovery_inspect_never_writes_to_a_golden_ledger(
     fixture_name: str, mode: str, tmp_path: Path
 ) -> None:
-    """Recovery preflight leaves a golden ledger and its run store untouched, whatever it decides.
-
-    The matrix above owns the verdict. This isolates the bytes half so it is
-    asserted on its own, for every cell, by a test that can only fail for that
-    one reason.
-    """
+    """Recovery preflight leaves a golden ledger and its run store untouched, whatever it decides."""
     materialized = materialize(fixture_name, tmp_path, mode=mode)
     _, state_changes = _recover_inspect(materialized, tmp_path)
     assert materialized.unchanged(), (

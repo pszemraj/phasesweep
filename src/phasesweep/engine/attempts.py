@@ -334,15 +334,7 @@ def _register_active_attempt(
     and a frozen storage locator, so preflight can find and resolve it even
     after the phase was renamed or removed, or the storage URL changed.
 
-    Creation is fail-closed. Swallowing a failed write on the theory that
-    "the per-phase reaper still recovers it under the same config" would be
-    exactly wrong for the case this registry exists to cover: the reaper
-    walks only the phases the *current* config declares, so a rename, a
-    removal, or a changed storage URL is precisely when the lost entry would
-    be the sole record of a trainer that may still be alive. Refusing to
-    launch an attempt PhaseSweep could not record keeps that unreachable
-    state from ever existing, and costs nothing to undo because this runs
-    before the GPU lease and the trainer.
+    Creation is fail-closed.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Immutable attempt identity and entry filename.
@@ -715,9 +707,6 @@ def _registry_attempt_fail_stale_trial(
             return "terminal"
         trials = study.get_trials(deepcopy=False)
     except StudySchemaMismatchError:
-        # The entry was written by this release, so its ledger was current
-        # when the attempt registered. Unsupported state there now is not
-        # something to reap through; it stops the run with the entry intact.
         raise
     except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
         log.warning(
