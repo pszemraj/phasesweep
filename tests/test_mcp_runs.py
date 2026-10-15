@@ -145,7 +145,7 @@ def test_prepare_launch_rolls_back_each_create_boundary(
     """Lease, snapshot, and handle create failures leave no capacity reservation."""
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id=f"exp-create-{failing_create}", launch_state="launching")
-    real_create = mcp_runs._strict_atomic_create_text
+    real_create = mcp_runs.private_atomic_create_text
     calls = 0
 
     def fail_one_create(path: Path, text: str) -> None:
@@ -155,7 +155,7 @@ def test_prepare_launch_rolls_back_each_create_boundary(
             raise OSError(f"injected create {failing_create} failure")
         real_create(path, text)
 
-    monkeypatch.setattr(mcp_runs, "_strict_atomic_create_text", fail_one_create)
+    monkeypatch.setattr(mcp_runs, "private_atomic_create_text", fail_one_create)
 
     with pytest.raises(OSError, match=f"create {failing_create}"):
         store.prepare_launch(handle, b"experiment: exp\n")
@@ -374,13 +374,7 @@ def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A directory-fsync failure after the link unlinks the just-created status file.
-
-    ``write_status_file_if_absent`` now delegates to ``_strict_atomic_create_text``,
-    so it shares that helper's rollback: a durability failure discovered after the
-    file is already linked into place removes it again rather than leaving an
-    unsynced status file behind (accepted consolidation behavior change).
-    """
+    """A post-link directory-fsync failure removes the newly created status file."""
     status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
     real_fsync = os.fsync
 
@@ -397,6 +391,28 @@ def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
     assert not status_path.exists()
     assert list(status_path.parent.glob("*.tmp")) == []
     assert list(status_path.parent.glob(".*.tmp")) == []
+
+
+def test_private_create_rolls_back_when_staging_unlink_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure removing the published staging link releases the new reservation."""
+    target = tmp_path / "state" / "identity.json"
+    real_unlink = os.unlink
+    failed = False
+
+    def fail_staging_unlink(path: str | Path, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and str(path).endswith(".tmp") and target.exists():
+            failed = True
+            raise OSError("injected staging unlink failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", fail_staging_unlink)
+    with pytest.raises(OSError, match="staging unlink failure"):
+        mcp_runs.private_atomic_create_text(target, "new")
+    assert failed
+    assert list(target.parent.iterdir()) == []
 
 
 def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> None:
@@ -1057,14 +1073,14 @@ def test_status_read_failures_do_not_break_state_scans(
     assert live_runs(store) == [handle]
 
     private_atomic_write_text(store.status_path("exp-1"), '{"returncode": 0}')
-    real_read_text = mcp_runs.read_private_text_at
+    real_read_text = mcp_runs.read_private_text
 
-    def fail_status_read(parent_fd: int, leaf: str, path: Path) -> str:
+    def fail_status_read(path: Path, *, require_private_dir: bool = True) -> str:
         if path == store.status_path("exp-1"):
             raise OSError("status file temporarily unreadable")
-        return real_read_text(parent_fd, leaf, path)
+        return real_read_text(path, require_private_dir=require_private_dir)
 
-    monkeypatch.setattr(mcp_runs, "read_private_text_at", fail_status_read)
+    monkeypatch.setattr(mcp_runs, "read_private_text", fail_status_read)
 
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"

@@ -462,9 +462,11 @@ def test_private_atomic_write_rejects_intermediate_directory_swap(
     assert not (moved / "status.json").exists()
 
 
+@pytest.mark.parametrize("writer_name", ["private_atomic_write_text", "private_atomic_create_text"])
 def test_private_atomic_write_keeps_opened_parent_during_path_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
 ) -> None:
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -476,26 +478,38 @@ def test_private_atomic_write_keeps_opened_parent_during_path_swap(
     outside_status = outside / "status.json"
     outside_status.write_text("outside")
     outside_status.chmod(0o600)
-    original_new_temp = runtime_files._new_private_temp_fd
+    original_new_temp = runtime_files._new_exclusive_temp_fd
 
-    def swap_parent(parent_fd: int, leaf: str) -> tuple[int, str]:
+    def swap_parent(path: Path, mode: int, *, directory_fd: int | None = None) -> tuple[int, Path]:
         state.rename(moved)
         state.symlink_to(outside, target_is_directory=True)
-        return original_new_temp(parent_fd, leaf)
+        return original_new_temp(path, mode, directory_fd=directory_fd)
 
-    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", swap_parent)
+    monkeypatch.setattr(runtime_files, "_new_exclusive_temp_fd", swap_parent)
 
-    runtime_files.private_atomic_write_text(state / "status.json", "inside")
+    getattr(runtime_files, writer_name)(state / "status.json", "inside")
 
     assert (moved / "status.json").read_text() == "inside"
     assert outside_status.read_text() == "outside"
 
 
+@pytest.mark.parametrize(
+    "writer_name",
+    [
+        "atomic_write_text",
+        "atomic_create_text",
+        "private_atomic_write_text",
+        "private_atomic_create_text",
+    ],
+)
+@pytest.mark.parametrize("failure_boundary", ["fdopen", "file_fsync"])
 def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+    failure_boundary: str,
 ) -> None:
-    """A shutdown after the stream is created must leave one descriptor owner."""
+    """Shutdown during staging closes its raw descriptor once and removes partial bytes."""
 
     class InjectedShutdown(BaseException):
         """Stand in for ``PhaseSweepShutdown`` at the fd-to-stream boundary."""
@@ -503,15 +517,17 @@ def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     state.chmod(0o700)
-    real_new_temp = runtime_files._new_private_temp_fd
+    real_new_temp = runtime_files._new_exclusive_temp_fd
     real_fdopen = os.fdopen
     real_close = os.close
     temporary_fd: int | None = None
     temporary_close_count = 0
 
-    def capture_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
+    def capture_temp_fd(
+        path: Path, mode: int, *, directory_fd: int | None = None
+    ) -> tuple[int, Path]:
         nonlocal temporary_fd
-        temporary_fd, temporary = real_new_temp(parent_fd, leaf)
+        temporary_fd, temporary = real_new_temp(path, mode, directory_fd=directory_fd)
         return temporary_fd, temporary
 
     def shutdown_after_wrap(fd: int, *args: object, **kwargs: object) -> None:
@@ -525,12 +541,18 @@ def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
             temporary_close_count += 1
         real_close(fd)
 
-    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", capture_temp_fd)
-    monkeypatch.setattr(os, "fdopen", shutdown_after_wrap)
+    def shutdown_during_fsync(_fd: int) -> None:
+        raise InjectedShutdown
+
+    monkeypatch.setattr(runtime_files, "_new_exclusive_temp_fd", capture_temp_fd)
+    if failure_boundary == "fdopen":
+        monkeypatch.setattr(os, "fdopen", shutdown_after_wrap)
+    else:
+        monkeypatch.setattr(os, "fsync", shutdown_during_fsync)
     monkeypatch.setattr(os, "close", count_temp_close)
 
     with pytest.raises(InjectedShutdown):
-        runtime_files.private_atomic_write_text(state / "status.json", "replacement")
+        getattr(runtime_files, writer_name)(state / "status.json", "replacement")
 
     assert temporary_close_count == 1
     assert list(state.iterdir()) == []

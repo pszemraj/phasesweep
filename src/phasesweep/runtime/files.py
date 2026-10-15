@@ -818,6 +818,20 @@ def read_private_text_at(parent_fd: int, leaf: str, path: Path) -> str:
         os.close(fd)
 
 
+def read_private_text(path: Path, *, require_private_dir: bool = True) -> str:
+    """Read a private UTF-8 file through its validated parent directory.
+
+    :param Path path: Private file to read.
+    :param bool require_private_dir: Require owner-only parent permissions too.
+    :return str: Complete file contents.
+    """
+    directory_fd = open_directory_fd(path.parent, create=False, private_final=require_private_dir)
+    try:
+        return read_private_text_at(directory_fd, path.name, path)
+    finally:
+        os.close(directory_fd)
+
+
 def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     """Open a UTF-8 text file with owner-only permissions.
 
@@ -896,38 +910,77 @@ def _open_private_text(path: Path, mode: str) -> IO[str]:
         os.close(parent_fd)
 
 
-def _new_exclusive_temp_fd(parent_fd: int, leaf: str, mode: int) -> tuple[int, str]:
-    """Create a uniquely named temporary file relative to an open directory.
+def _new_exclusive_temp_fd(
+    path: Path, mode: int, *, directory_fd: int | None = None
+) -> tuple[int, Path]:
+    """Create a random exclusive staging file beside a destination.
 
-    Uses ``O_CREAT | O_EXCL`` with ``O_NOFOLLOW`` relative to ``parent_fd``
-    and retries with a fresh random suffix on a name collision.
-
-    :param int parent_fd: Open destination-directory descriptor.
-    :param str leaf: Destination leaf used in the temporary name.
+    :param Path path: Destination used to name the staging file.
     :param int mode: Requested creation mode, subject to the process umask.
-    :return tuple[int, str]: Open descriptor and parent-relative temporary name.
+    :param int | None directory_fd: Validated parent descriptor for private paths.
+    :return tuple[int, Path]: Open descriptor and staging path.
     :raises FileExistsError: If 10 consecutive random names all collide.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow_flag()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    leaf = path.name if directory_fd is None else leaf_name(path)
+    if directory_fd is not None:
+        flags |= nofollow_flag()
     for _ in range(10):
-        temporary = f".{leaf}.{secrets.token_hex(8)}.tmp"
+        temporary = path.with_name(f".{leaf}.{secrets.token_hex(8)}.tmp")
         try:
-            return os.open(temporary, flags, mode, dir_fd=parent_fd), temporary
+            target = temporary if directory_fd is None else temporary.name
+            return os.open(target, flags, mode, dir_fd=directory_fd), temporary
         except FileExistsError:
             continue
     raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
 
 
-def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
-    """Create an owner-only temporary file next to a destination leaf.
+@contextlib.contextmanager
+def _staged_text(
+    path: Path,
+    *,
+    directory_fd: int | None = None,
+    mode: int = 0o666,
+    file_mode: int | None = None,
+    newline: str | None = None,
+    collision_message: str | None = None,
+) -> Iterator[tuple[IO[str], Path]]:
+    """Write and fsync staging bytes, retaining the file only on success.
 
-    :param int parent_fd: Open destination-directory descriptor.
-    :param str leaf: Destination leaf used in the temporary name.
-    :return tuple[int, str]: Open descriptor and parent-relative temporary name.
+    :param Path path: Destination used to name the staging file.
+    :param int | None directory_fd: Validated parent descriptor for private paths.
+    :param int mode: Requested creation mode, subject to the process umask.
+    :param int | None file_mode: Exact staging mode applied before writing.
+    :param str | None newline: Text stream newline handling.
+    :param str | None collision_message: Caller diagnostic for exhausted staging names.
+    :return Iterator[tuple[IO[str], Path]]: Writable stream and its staging path.
     """
-    fd, temporary = _new_exclusive_temp_fd(parent_fd, leaf, PRIVATE_FILE_MODE)
-    os.fchmod(fd, PRIVATE_FILE_MODE)
-    return fd, temporary
+    fd = -1
+    temporary: Path | None = None
+    try:
+        try:
+            try:
+                fd, temporary = _new_exclusive_temp_fd(path, mode, directory_fd=directory_fd)
+            except FileExistsError as exc:
+                if collision_message is not None:
+                    raise FileExistsError(collision_message) from exc
+                raise
+            if file_mode is not None:
+                os.fchmod(fd, file_mode)
+            # The raw descriptor is the sole owner even if shutdown interrupts fdopen.
+            with os.fdopen(fd, "w", encoding="utf-8", newline=newline, closefd=False) as handle:
+                yield handle, temporary
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    except BaseException:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                target = temporary if directory_fd is None else temporary.name
+                os.unlink(target, dir_fd=directory_fd)
+        raise
 
 
 @contextlib.contextmanager
@@ -969,21 +1022,15 @@ def _private_atomic_writer(
         umask_created_dirs=not require_private_dir,
     )
     leaf = leaf_name(path)
-    fd = -1
-    temporary: str | None = None
+    temporary: Path | None = None
     replaced = False
     try:
-        fd, temporary = _new_private_temp_fd(parent_fd, leaf)
-        # Keep the raw descriptor as the sole owner until the outer ``finally``.
-        # A shutdown between wrapping it and invalidating ``fd`` would otherwise
-        # leave both the stream and cleanup path closing the same descriptor.
-        stream = os.fdopen(fd, "w", encoding="utf-8", closefd=False)
-        with stream as handle:
+        with _staged_text(
+            path, directory_fd=parent_fd, mode=PRIVATE_FILE_MODE, file_mode=PRIVATE_FILE_MODE
+        ) as (handle, temporary):
             yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
         _validate_private_destination(parent_fd, leaf, path)
-        os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.replace(temporary.name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         replaced = True
         try:
             os.fsync(parent_fd)
@@ -995,11 +1042,9 @@ def _private_atomic_writer(
                 exc_info=True,
             )
     finally:
-        if fd >= 0:
-            os.close(fd)
         if temporary is not None and not replaced:
             with contextlib.suppress(OSError):
-                os.unlink(temporary, dir_fd=parent_fd)
+                os.unlink(temporary.name, dir_fd=parent_fd)
         os.close(parent_fd)
 
 
@@ -1016,33 +1061,6 @@ def private_atomic_write_text(path: Path, text: str, *, require_private_dir: boo
         handle.write(text)
 
 
-def _new_shared_temp_fd(directory: Path, leaf: str) -> tuple[int, Path]:
-    """Create a uniquely-named, umask-governed temporary file next to a destination leaf.
-
-    Opens with ``O_CREAT | O_EXCL`` and a requested mode of ``0o666`` so the
-    kernel applies the process umask at creation time. That is the only
-    race-free way to honor the umask here: ``os.umask`` has no getter, so a
-    read-modify-restore around the create would be visible to every other
-    thread in the ``n_jobs > 1`` trial pool.
-
-    :param Path directory: Existing directory the temporary file is created in.
-    :param str leaf: Final path component of the eventual destination, used
-        only to build a recognizable temporary filename.
-    :return tuple[int, Path]: The open file descriptor (ownership transfers to
-        the caller, who must close it) and the temporary file's path.
-    :raises FileExistsError: If 10 consecutive random names all collide.
-    :raises OSError: If the temporary file cannot be created.
-    """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    for _ in range(10):
-        temporary = directory / f".{leaf}.{secrets.token_hex(8)}.tmp"
-        try:
-            return os.open(temporary, flags, 0o666), temporary
-        except FileExistsError:
-            continue
-    raise FileExistsError(f"Unable to create a temporary file for {leaf!r}.")
-
-
 @contextlib.contextmanager
 def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
     """Write text through a same-directory temp file and atomically replace ``path``.
@@ -1056,14 +1074,6 @@ def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO
     summaries, and evidence. A fresh destination is therefore created ``0o666``
     masked by the process umask (``0o644`` under the usual ``0o022``), and a
     rewrite keeps whatever mode the destination already carried.
-
-    ``tempfile.NamedTemporaryFile`` is deliberately not used for the staging
-    file: it hardcodes ``0o600`` as a security primitive, and ``os.replace``
-    would carry that mode onto every published artifact — leaving ``winner.yaml``
-    and ``process_identity.json`` unreadable to a second operator or to the
-    stale reaper running as another user, while sibling files written by plain
-    ``open`` stayed ``0o644``. The private, genuinely owner-only counterpart is
-    :func:`_private_atomic_writer`.
 
     :param Path path: Destination path that should be replaced atomically.
     :param str | None newline: Newline handling passed to the text-mode wrapper.
@@ -1080,30 +1090,15 @@ def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO
         target_mode = (
             stat.S_IMODE(target_info.st_mode) if stat.S_ISREG(target_info.st_mode) else None
         )
-    fd = -1
     tmp_path: Path | None = None
     replaced = False
     try:
-        fd, tmp_path = _new_shared_temp_fd(path.parent, path.name)
-        if target_mode is not None:
-            # Preserve the destination's mode before the rename; a chmod after
-            # os.replace would leave a window where the artifact is published
-            # with the wrong permissions.
-            os.fchmod(fd, target_mode)
-        # Keep the raw descriptor as the sole owner until the outer ``finally``
-        # so a shutdown between wrapping it and invalidating ``fd`` cannot leave
-        # both the stream and the cleanup path closing the same descriptor.
-        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline, closefd=False)
-        with stream as handle:
+        with _staged_text(path, file_mode=target_mode, newline=newline) as (handle, tmp_path):
             yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
         replaced = True
         fsync_directory(path.parent)
     finally:
-        if fd >= 0:
-            os.close(fd)
         if tmp_path is not None and not replaced:
             tmp_path.unlink(missing_ok=True)
 
@@ -1147,21 +1142,10 @@ def atomic_create_text(
     path.parent.mkdir(parents=True, exist_ok=True)
     staged: Path | None = None
     try:
-        handle: IO[str] | None = None
-        for _ in range(10):
-            candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                handle = candidate.open("x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {path}")
-        with handle:
+        with _staged_text(
+            path, collision_message=f"cannot create a staging file beside {path}"
+        ) as (handle, staged):
             handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
         if validate is not None:
             validate(staged)
         try:
@@ -1174,6 +1158,46 @@ def atomic_create_text(
             with contextlib.suppress(OSError):
                 staged.unlink()
     return True
+
+
+def private_atomic_create_text(path: Path, text: str) -> None:
+    """Exclusively publish a private file, rolling back any durability failure.
+
+    :param Path path: Destination inside a validated private directory.
+    :param str text: Complete UTF-8 contents to publish.
+    :raises FileExistsError: The destination already exists.
+    :raises OSError: Staging, publication, or directory fsync fails.
+    """
+    parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
+    temporary: Path | None = None
+    published = False
+    try:
+        with _staged_text(
+            path, directory_fd=parent_fd, mode=PRIVATE_FILE_MODE, file_mode=PRIVATE_FILE_MODE
+        ) as (handle, temporary):
+            handle.write(text)
+        os.link(
+            temporary.name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        published = True
+        os.unlink(temporary.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        if published:
+            with contextlib.suppress(OSError):
+                os.unlink(path.name, dir_fd=parent_fd)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary.name, dir_fd=parent_fd)
+        with contextlib.suppress(OSError):
+            os.fsync(parent_fd)
+        raise
+    finally:
+        os.close(parent_fd)
 
 
 def local_storage_url(path: Path) -> str:
@@ -1252,12 +1276,16 @@ def file_url_path(storage: str) -> str:
 
     path = path.split("?", 1)[0]
     path = path.split("#", 1)[0]
+    query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
+    options = {
+        key.lower(): value.lower() for key, value in parse_qsl(query, keep_blank_values=True)
+    }
     # Auto journal storage uses an escaped file: URI convention. Ordinary
     # explicit journal paths keep their literal spelling.
     if (
         storage_backend(storage) == "journal"
         and path.startswith("file:")
-        and _truthy_url_option(storage_url_query_options(storage).get("uri"))
+        and options.get("uri") in {"1", "true", "yes", "on"}
     ):
         return unquote(urlsplit(path).path)
     return path
@@ -1285,34 +1313,6 @@ def journal_file_path(storage: str) -> Path:
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     return Path(file_url_path(storage)).expanduser().resolve()
-
-
-def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
-    """Return URL query pairs from a storage URL.
-
-    :param str storage: Storage URL whose query string should be parsed.
-    :return list[tuple[str, str]]: Ordered query key/value pairs, preserving blank values.
-    """
-    query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
-    return parse_qsl(query, keep_blank_values=True)
-
-
-def storage_url_query_options(storage: str) -> dict[str, str]:
-    """Return lower-cased URL query options for storage policy checks.
-
-    :param str storage: Storage URL whose query string should be inspected.
-    :return dict[str, str]: Query parameters with lower-cased keys and values.
-    """
-    return {key.lower(): value.lower() for key, value in _url_query_pairs(storage)}
-
-
-def _truthy_url_option(value: str | None) -> bool:
-    """Return whether a URL query value opts into a boolean behavior.
-
-    :param str | None value: Query value to interpret as a boolean opt-in.
-    :return bool: True when the value is a recognized truthy token.
-    """
-    return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
 def storage_recovery_locator(storage: str | None) -> str | None:

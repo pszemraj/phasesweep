@@ -30,9 +30,9 @@ from phasesweep.runtime.files import (
     ensure_private_dir,
     open_directory_fd,
     open_lock_file,
-    open_private_text,
+    private_atomic_create_text,
     private_atomic_write_text,
-    read_private_text_at,
+    read_private_text,
     try_lock_file,
     unlock_file,
     validate_private_dir,
@@ -109,10 +109,9 @@ _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
 
 class UnsupportedStateFormatError(ValueError):
-    """An MCP state directory holds run-store state this release does not operate.
+    """An MCP state directory holds an unsupported run-store format.
 
-    Still a ``ValueError`` for every caller that refuses a bad state directory
-    that way. The subclass lets operator recovery tell this refusal, whose
+    The subclass lets operator recovery tell this refusal, whose
     remedy is a fresh MCP state directory, apart from a state directory that is
     simply missing.
     """
@@ -128,50 +127,6 @@ def _strict_fsync_directory(path: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-
-
-def _strict_atomic_create_text(path: Path, text: str) -> None:
-    """Atomically create one private file without replacing an existing identity.
-
-    :param Path path: Destination path to create exclusively.
-    :param str text: Complete UTF-8 contents to publish.
-    :raises FileExistsError: If ``path`` already exists.
-    """
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    parent_fd = -1
-    published = False
-    try:
-        with open_private_text(temporary, "x") as output:
-            output.write(text)
-            output.flush()
-            os.fsync(output.fileno())
-        parent_fd = open_directory_fd(path.parent, create=False, private_final=True)
-        os.link(
-            temporary.name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        published = True
-        os.unlink(temporary.name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-    except BaseException:
-        if parent_fd >= 0:
-            if published:
-                with contextlib.suppress(OSError):
-                    os.unlink(path.name, dir_fd=parent_fd)
-            with contextlib.suppress(OSError):
-                os.unlink(temporary.name, dir_fd=parent_fd)
-            with contextlib.suppress(OSError):
-                os.fsync(parent_fd)
-        else:
-            with contextlib.suppress(OSError):
-                temporary.unlink()
-        raise
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
 
 
 def _strict_unlink(path: Path) -> None:
@@ -193,16 +148,10 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
     :param Path path: JSON file to read.
     :return dict[str, object] | None: Parsed object, or ``None`` when unavailable or invalid.
     """
-    directory_fd = -1
     try:
-        directory_fd = open_directory_fd(path.parent, create=False, private_final=True)
-        raw = read_private_text_at(directory_fd, path.name, path)
-        payload = json.loads(raw)
+        payload = json.loads(read_private_text(path))
     except (OSError, UnsafePrivatePathError, UnicodeError, ValueError):
         return None
-    finally:
-        if directory_fd >= 0:
-            os.close(directory_fd)
     return payload if isinstance(payload, dict) else None
 
 
@@ -218,18 +167,14 @@ def write_status_file(status_path: Path, payload: dict[str, object]) -> None:
 def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -> bool:
     """Atomically create a server failure only while no runner status exists.
 
-    Thin wrapper over :func:`_strict_atomic_create_text`, so it shares every
-    durability step of a runner-written status file (temp file, fsync,
-    link, directory fsync) -- including that a post-link directory-fsync
-    failure unlinks the just-created status file rather than leaving an
-    unsynced one behind.
+    A post-link durability failure removes the newly created status file.
 
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict[str, object] payload: JSON-serializable server failure payload.
     :return bool: Whether this call created the status; ``False`` if one already exists.
     """
     try:
-        _strict_atomic_create_text(status_path, json.dumps(payload, indent=2) + "\n")
+        private_atomic_create_text(status_path, json.dumps(payload, indent=2) + "\n")
     except FileExistsError:
         return False
     return True
@@ -433,26 +378,23 @@ class RunStore:
             return False
 
     def _require_current_marker_for_recovery(self) -> None:
-        """Require a readable marker naming this release's format, telling damage apart.
+        """Require a readable marker naming the supported format, telling damage apart.
 
-        A marker that reads and names another format is state for another
-        release. One that cannot be read, or reads as anything but a format
+        A marker that reads and names another format is unsupported state.
+        One that cannot be read, or reads as anything but a format
         record, is this state directory's own damage.
 
         :raises UnsupportedStateFormatError: The marker names another format.
         :raises UnsafePrivatePathError: The marker is unreadable, unsafe, or malformed.
         """
         marker = self._format_marker_path
-        directory_fd = open_directory_fd(marker.parent, create=False, private_final=True)
         try:
-            raw = read_private_text_at(directory_fd, marker.name, marker)
+            raw = read_private_text(marker)
         except (OSError, UnicodeError) as exc:
             raise UnsafePrivatePathError(
                 f"MCP state directory {marker.parent} format marker {marker} cannot be "
                 f"read: {exc}. Restore it and access to it before retrying recovery."
             ) from exc
-        finally:
-            os.close(directory_fd)
         try:
             payload = json.loads(raw)
         except ValueError:
@@ -480,9 +422,8 @@ class RunStore:
         """Inspect an existing namespace before initialization can mutate it.
 
         A marker is written only for a namespace with no durable run-store
-        evidence. A pre-marker state that already contains handles, logs,
-        leases, or audit records is unmarked PhaseSweep state and is refused
-        by this release.
+        evidence. A namespace that already contains handles, logs, leases,
+        or audit records without a marker is refused as unmarked PhaseSweep state.
 
         :return bool: Whether this fresh namespace needs its first marker.
         :raises ValueError: The namespace contains unsupported or unmarked
@@ -524,7 +465,7 @@ class RunStore:
         writes and unfamiliar records must fail closed rather than be
         treated as an empty namespace.
 
-        :return bool: Whether durable pre-marker run-store evidence is present.
+        :return bool: Whether durable unmarked run-store evidence is present.
         :raises UnsafePrivatePathError: A present run-store directory is unsafe.
         """
         if self._path_entry_exists(self._format_marker_path.parent / "audit.jsonl"):
@@ -563,7 +504,7 @@ class RunStore:
         """
         payload = json.dumps(_STATE_FORMAT_MARKER_PAYLOAD) + "\n"
         try:
-            _strict_atomic_create_text(self._format_marker_path, payload)
+            private_atomic_create_text(self._format_marker_path, payload)
         except FileExistsError:
             self._require_supported_format_marker()
 
@@ -694,12 +635,12 @@ class RunStore:
         created: list[Path] = []
         lease: IO[str] | None = None
         try:
-            _strict_atomic_create_text(lease_path, "")
+            private_atomic_create_text(lease_path, "")
             created.append(lease_path)
             lease = try_lock_file(lease_path)
             if lease is None:
                 raise RuntimeError(f"new launch lease for run {handle.run_id!r} is already held")
-            _strict_atomic_create_text(snapshot_path, config_text)
+            private_atomic_create_text(snapshot_path, config_text)
             created.append(snapshot_path)
             self.create(handle)
             created.append(self._runs_dir / f"{handle.run_id}.json")
@@ -778,7 +719,7 @@ class RunStore:
         """
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2) + "\n"
-        _strict_atomic_create_text(target, payload)
+        private_atomic_create_text(target, payload)
 
     def update(self, handle: RunHandle) -> None:
         """Persist the one legal launching-to-spawned identity transition.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -15,6 +16,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.run import experiment_status, run_experiment
 from phasesweep.runtime.files import (
+    atomic_create_text,
     atomic_text_writer,
     atomic_write_text,
     ensure_artifact_dir,
@@ -145,13 +147,7 @@ def test_experiment_name_accepts_valid() -> None:
 def test_atomic_write_text_applies_process_umask_to_new_artifacts(
     tmp_path: Path, mask: int, expected_mode: int
 ) -> None:
-    """Durable artifacts (``winner.yaml``, ``summary.yaml``, ``trials.csv``, ...)
-    must land with the ordinary umask-governed mode the ``workdir`` trust
-    boundary in ``docs/runtime.md`` promises, not the owner-only mode a
-    ``NamedTemporaryFile`` staging file would carry across ``os.replace``.
-    Parametrizing the umask proves the mode is masked by the kernel rather
-    than hardcoded.
-    """
+    """Fresh shared artifacts use the kernel-masked ordinary file mode."""
     path = tmp_path / "winner.yaml"
 
     with temporary_umask(mask):
@@ -176,14 +172,11 @@ def test_atomic_write_text_preserves_existing_artifact_mode(tmp_path: Path) -> N
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
-@pytest.mark.parametrize("mask", [0o000, 0o022])
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o777])
 def test_private_atomic_write_text_stays_owner_only_under_any_umask(
     tmp_path: Path, mask: int
 ) -> None:
-    """The private writer serves the lock namespace and MCP ``state_dir``, which
-    are deliberately hardened. It must stay ``0600`` regardless of umask — the
-    artifact-tree fix above must never be generalized onto it.
-    """
+    """Private artifacts remain exactly ``0600`` regardless of process umask."""
     path = tmp_path / "state.json"
 
     with temporary_umask(mask):
@@ -238,6 +231,46 @@ def test_atomic_text_writer_leaves_no_temporary_files(tmp_path: Path) -> None:
 
     assert not failed.exists()
     assert sorted(p.name for p in artifacts.iterdir()) == ["trials.csv"]
+
+
+def test_atomic_create_validation_receives_closed_fsynced_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exclusive-create validation runs after durable staging closes its descriptor."""
+    target = tmp_path / "artifacts" / "config.yaml"
+    fsynced: list[int] = []
+    real_fsync = os.fsync
+
+    def remember_fsync(fd: int) -> None:
+        real_fsync(fd)
+        fsynced.append(fd)
+
+    def validate(staged: Path) -> None:
+        assert staged.read_text() == "complete\n"
+        assert len(fsynced) == 1
+        with pytest.raises(OSError):
+            os.fstat(fsynced[0])
+        assert not target.exists()
+
+    monkeypatch.setattr(os, "fsync", remember_fsync)
+    assert atomic_create_text(target, "complete\n", validate=validate)
+    assert list(target.parent.iterdir()) == [target]
+
+
+def test_atomic_create_preserves_exhausted_staging_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ten staging collisions preserve the exclusive creator's diagnostic."""
+    from phasesweep.runtime import files as runtime_files
+
+    target = tmp_path / "config.yaml"
+    (tmp_path / ".config.yaml.collision.tmp").write_text("reserved")
+    monkeypatch.setattr(runtime_files.secrets, "token_hex", lambda _size: "collision")
+
+    with pytest.raises(FileExistsError, match=f"cannot create a staging file beside {target}"):
+        atomic_create_text(target, "new")
+    assert not target.exists()
+    assert (tmp_path / ".config.yaml.collision.tmp").read_text() == "reserved"
 
 
 @pytest.mark.parametrize("generation_id", ["../escape", "/tmp/escape", ""])
