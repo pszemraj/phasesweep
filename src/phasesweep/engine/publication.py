@@ -21,10 +21,10 @@ class PublicationPointer:
 
     "Nothing was ever published" and "the recorded publication no longer
     validates" are different operational facts with opposite remedies, and
-    collapsing both into ``None`` made a corrupt result tree indistinguishable
-    from a fresh one (review v0.5.18 / finding F4). Every non-``ok`` state
-    means the same thing to a consumer of published results: nothing may be
-    read as published, so ``validated`` is ``None``.
+    collapsing both into ``None`` would make a corrupt result tree
+    indistinguishable from a fresh one. Every non-``ok`` state means the same
+    thing to a consumer of published results: nothing may be read as
+    published, so ``validated`` is ``None``.
 
     ``error`` is deliberately path-free: it names artifacts by role rather than
     location, so any reporting surface could quote it safely -- though the MCP
@@ -89,21 +89,19 @@ def _resolve_publication_pointer(
     """Resolve the last-success pointer to its four-state validation verdict.
 
     The pointer is authoritative only when its target's own immutable summary
-    parses and names this exact experiment and generation (review v0.5.15 /
-    blocker 3) -- not when the per-generation lifecycle record says so, since
-    that record is now written *after* this pointer commits and would
-    otherwise create a crash window where a committed publication reads as
-    nothing-published.
+    parses and names this exact experiment and generation -- not when the
+    per-generation lifecycle record says so, since that record is written
+    *after* this pointer commits and would otherwise create a crash window
+    where a committed publication reads as nothing-published.
 
     The target's current-format complete artifact manifest is always
     validated -- every listed winner artifact plus the
     claim-time provenance files must exist, hash to their recorded content,
-    and cross-check against the summary (review v0.5.16 / blocker 3, review
-    v0.5.18 / finding F6). Validation runs on every authoritative read:
-    generation directories are write-once by PhaseSweep convention, but the
-    filesystem does not enforce immutability and a long-lived reader must
-    notice later corruption or operator edits. Older summary formats are
-    rejected at this breaking-release boundary.
+    and cross-check against the summary. Validation runs on every
+    authoritative read: generation directories are write-once by PhaseSweep
+    convention, but the filesystem does not enforce immutability and a
+    long-lived reader must notice later corruption or operator edits. A
+    summary in any format other than the current one is rejected.
 
     Every validation refusal resolves to an unusable state, never ``absent``:
     structural or content failures become ``failed``, while an actual
@@ -114,14 +112,20 @@ def _resolve_publication_pointer(
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a publication's
-        manifest error for an actionable resume failure instead of reporting
-        it as an unusable verdict, as read-only status APIs require. Only the
-        manifest branch raises; every other failure resolves to ``failed`` or
+        manifest error or summary-anchor mismatch for an actionable resume
+        failure instead of reporting it as an unusable verdict, as read-only
+        status APIs require. Only those two raise: a manifest artifact that
+        cannot be read or fails validation, and a summary whose byte length or
+        SHA-256 disagrees with the pointer. Every other failure resolves to a
+        verdict: an unreadable or malformed pointer, a dangling target, and a
+        missing, unparsable, or misnamed summary are ``failed``, and a
+        permission denial on the pointer or the summary is
         ``permission_denied``.
     :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
         manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
-        the target's artifact manifest does not validate.
+        the target's summary disagrees with the pointer's byte length or
+        SHA-256, or its artifact manifest does not validate.
     :return PublicationPointer: The publication verdict for this experiment.
     """
     pointer_path = path_ops._last_successful_generation_path(experiment)

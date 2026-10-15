@@ -23,11 +23,18 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
     WandbExtractor,
 )
-from phasesweep.engine import PublishedStudyMissingError, read_status, read_winner, read_winners
+from phasesweep.engine import (
+    PublishedStudyMissingError,
+    read_status,
+    read_trial_tables,
+    read_winner,
+    read_winners,
+)
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -38,7 +45,13 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
-from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
+from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, TRIAL_OUTCOME_SCHEMA_VERSION
+from tests.conftest import (
+    make_experiment,
+    mark_current_format,
+    write_constant_trainer,
+    write_trainer,
+)
 from tests.ledger_fixtures import ledger_file, materialize, published_generation_id, tree_snapshot
 
 
@@ -88,8 +101,8 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     """Status reports RUNNING identities beside the counts they explain.
 
     The MCP terminal snapshot reconciles RUNNING rows against cleanup evidence
-    and must not reread a study to learn which rows those are (PR #5 review /
-    reviewer 2, blocker 6), so this comes from the same tolerant read.
+    and must not reread a study to learn which rows those are, so this comes
+    from the same tolerant read.
     """
     path = tmp_path / "phases.journal"
     exp = _experiment(tmp_path, storage=f"journal:///{path}")
@@ -101,6 +114,10 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
+    running.set_user_attr(
+        TRIAL_OUTCOME_ATTR,
+        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+    )
     study.ask()
     mark_current_format(exp, study)
 
@@ -109,8 +126,18 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     assert phase["trial_data_available"] is True
     assert phase["trials"] == {"COMPLETE": 1, "RUNNING": 2}
     assert phase["running_attempts"] == [
-        {"trial_number": 1, "generation_id": "gen-1", "attempt_id": "attempt-1"},
-        {"trial_number": 2, "generation_id": None, "attempt_id": None},
+        {
+            "trial_number": 1,
+            "generation_id": "gen-1",
+            "attempt_id": "attempt-1",
+            "recovers_as": "FAIL",
+        },
+        {
+            "trial_number": 2,
+            "generation_id": None,
+            "attempt_id": None,
+            "recovers_as": "INTERRUPTED",
+        },
     ]
 
 
@@ -231,7 +258,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
 
     Optuna's reader skips a final line that lacks its newline or does not
     decode, so status reports the complete records a live load would see. A
-    write no longer refuses on sight: under Optuna's own journal lock it
+    write does not refuse on sight: under Optuna's own journal lock it
     backs the damaged bytes up beside the journal, cuts the journal back to
     its last complete record, and continues. When nothing survives the cut
     (``keep_prefix=False``) and a generation already published a winner from
@@ -713,9 +740,9 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
 
 # --------------------------------------------------------------------------
 # Published results are rendered under their own historical semantics, never
-# reinterpreted through whatever config is loaded today (review v0.5.16 /
-# blocker 4). The golden fixture publishes phase ``p`` under the metric
-# ``objective`` (minimize); each test edits the config that reads it.
+# reinterpreted through whatever config is loaded today. The golden fixture
+# publishes phase ``p`` under the metric ``objective`` (minimize); each test
+# edits the config that reads it.
 # --------------------------------------------------------------------------
 
 
@@ -733,11 +760,11 @@ def _edited(experiment: Experiment, metric: Metric | None = None, **phase: objec
 
 
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
-    """Review v0.5.16 / blocker 4 reproduction: publish objective/minimize, reload as y/maximize.
+    """Publish objective/minimize, reload as y/maximize: the result keeps its own semantics.
 
-    Pre-fix, status labeled the official generation with the *current*
-    metric name and inverted goal, and winner parsing silently dropped the
-    actual winner because the current metric key was absent from the
+    Status must not label the official generation with the *current* metric
+    name and inverted goal, and winner parsing must not silently drop the
+    actual winner because the current metric key is absent from the
     historical file.
     """
     drifted = _edited(
@@ -792,7 +819,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     ``phases`` stays the *current* config's progress view -- a run would have
     to produce a winner for ``q`` -- while ``result_phase_plan`` reports the
     plan the publication actually used, so a reader can enumerate it instead
-    of concluding the publication is empty (review v0.5.16 / blocker 4).
+    of concluding the publication is empty.
     """
     renamed = _edited(_published(tmp_path), name="q", comment="renamed phase")
 
@@ -944,3 +971,109 @@ def test_read_winners_refuses_phase_names_that_are_not_path_components(
 
     with pytest.raises(ValueError, match="phase name"):
         read_winners(exp, phase_names=[unsafe_name])
+
+
+def test_read_trial_tables_has_no_rows_without_a_persisted_study(tmp_path: Path) -> None:
+    """A phase that never ran, and an in-memory ledger, read as empty tables and create nothing."""
+    path = tmp_path / "missing.journal"
+    persistent = read_trial_tables(_experiment(tmp_path, storage=f"journal:///{path}"))
+    in_memory = read_trial_tables(_experiment(tmp_path))
+
+    assert not path.exists()
+    for tables in (persistent, in_memory):
+        (table,) = tables.phases
+        assert (table.phase, table.available, table.rows) == ("p", True, ())
+        assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+        assert tables.publication_integrity == "absent"
+        assert tables.published_generation_id is None
+
+
+def _trial_id_trainer(tmp_path: Path, *, mem: dict[str, str] | None = None) -> Path:
+    """Write a trainer by trial: 0 logs x=0.5, 1 logs x=2.0, and 2 exits nonzero.
+
+    :param Path tmp_path: Directory to write the trainer into.
+    :param dict[str, str] | None mem: Trial id to the ``mem=`` value it also logs, if any.
+    :return Path: The trainer script.
+    """
+    logged = mem or {}
+    return write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os
+        import sys
+
+        trial = os.environ["PHASESWEEP_TRIAL_ID"]
+        if trial == "2":
+            sys.exit(1)
+        print("x=" + {{"0": "0.5", "1": "2.0"}}[trial])
+        mem = {logged!r}.get(trial)
+        if mem is not None:
+            print("mem=" + mem)
+        """,
+    )
+
+
+_X_METRIC = LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+
+
+def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
+    """Each trial reads under its real state, and only the published winner is starred."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_trial_id_trainer(tmp_path),
+        metric=Metric(extractor=_X_METRIC, max=1.5),
+        n_trials=3,
+    )
+    run_experiment(experiment)
+
+    tables = read_trial_tables(experiment)
+
+    assert tables.experiment == "t"
+    assert tables.publication_integrity == "ok" and tables.publication_error is None
+    assert tables.published_generation_id == published_generation_id(experiment)
+    (table,) = tables.phases
+    assert table.available
+    assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+    rows = table.rows
+    assert [row["trial"] for row in rows] == [0, 1, 2]
+    # Trial 1 completed but breached the metric's max, so it never ranked; trial 2 failed.
+    assert [row["state"] for row in rows] == ["COMPLETE", "INFEASIBLE", "FAIL"]
+    assert [row["value"] for row in rows] == [0.5, 2.0, None]
+    assert [row["winner"] for row in rows] == ["*", "", ""]
+    for row in rows:
+        assert isinstance(row["params"], dict) and set(row["params"]) == {"x"}
+    duration = rows[0]["duration_s"]
+    assert isinstance(duration, float) and duration > 0
+
+
+def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
+    """Every ``observed:<name>`` any trial recorded is a column, empty where a trial lacked it."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_trial_id_trainer(tmp_path, mem={"0": "3.0", "1": "4.0"}),
+        metric=Metric(extractor=_X_METRIC),
+        observe=[
+            Observation(
+                name="mem",
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"mem=(?P<value>[0-9.]+)"),
+            ),
+            Observation(
+                name="absent", extractor=JsonExtractor(type="json", path="never.json", key="v")
+            ),
+        ],
+        n_trials=3,
+    )
+    run_experiment(experiment)
+
+    (table,) = read_trial_tables(experiment).phases
+
+    assert table.columns == (
+        "trial",
+        "state",
+        "value",
+        "params",
+        "duration_s",
+        "observed:mem",
+        "winner",
+    )
+    assert [row["observed:mem"] for row in table.rows] == [3.0, 4.0, None]

@@ -34,15 +34,14 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
     The claim is only complete once the namespace records the configuration
     that is about to run: :func:`phasesweep.engine.provenance._write_generation_provenance`
     freezes ``config.snapshot.yaml`` and ``reproducibility.json`` before this
-    returns (review v0.5.18 / finding F6), so a generation that later fails
-    preflight, execution, or publication still says what search spaces, fixed
-    overrides, execution context, env, and trial command produced it. A failure
-    writing them fails the claim rather than starting a run whose
-    configuration would be unrecoverable. The record also freezes whether the
-    id was caller-supplied, so a generation launched under an external
-    authority grant (a detached MCP run) stays recognizable as such even if
-    the launcher's own state is later lost (PR #5 review / P2 missing-handle
-    authority).
+    returns, so a generation that later fails preflight, execution, or
+    publication still says what search spaces, fixed overrides, execution
+    context, env, and trial command produced it. A failure writing them fails
+    the claim rather than starting a run whose configuration would be
+    unrecoverable. The record also freezes whether the id was caller-supplied,
+    so a generation launched under an external authority grant (a detached MCP
+    run) stays recognizable as such even if the launcher's own state is later
+    lost.
 
     :param Experiment experiment: Experiment whose generations root is created if missing.
     :param str | None requested_id: Caller-supplied generation id to claim, or
@@ -87,11 +86,10 @@ def _persist_terminal_failure(write_state: Callable[[], None]) -> None:
     Bookkeeping is never more authoritative than the failure it records: the
     original exception carries safety-critical semantics (signal exit codes,
     cleanup uncertainty, trainer failure identity) that a secondary filesystem
-    error must not overwrite (review v0.5.14 / blocker 5). Catching
-    ``BaseException`` is intentional in this narrow helper — even a second
-    control-flow exception (another SIGINT/SIGTERM, a nested ``SystemExit``)
-    delivered during persistence must not supersede the primary failure that
-    is already propagating.
+    error must not overwrite. Catching ``BaseException`` is intentional in
+    this narrow helper — even a second control-flow exception (another
+    SIGINT/SIGTERM, a nested ``SystemExit``) delivered during persistence must
+    not supersede the primary failure that is already propagating.
 
     :param Callable[[], None] write_state: Zero-argument persistence action.
     """
@@ -126,10 +124,10 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
     transaction (record write, pointer refresh, compatibility projection):
     once the authoritative pointer has committed, nothing after it may fail
     the run, so each such step must log its own failure and never propagate
-    it. Catching ``BaseException`` is intentional (review v0.5.16 / blocker
-    1): a ``KeyboardInterrupt``/``SystemExit`` escaping one of these steps
-    would propagate into the caller's terminal-failure handler and reclassify
-    an already-committed publication as failed. Real shutdown *signals* are
+    it. Catching ``BaseException`` is intentional: a
+    ``KeyboardInterrupt``/``SystemExit`` escaping one of these steps would
+    propagate into the caller's terminal-failure handler and reclassify an
+    already-committed publication as failed. Real shutdown *signals* are
     additionally kept out of these steps entirely by the enclosing
     :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window.
 
@@ -212,9 +210,9 @@ def _write_generation_state(
     every state (``preflighting``, ``running``, ``published``,
     ``publication_failed``, ``failed``) may be written to it, with no
     monotonic guard: a new invocation legitimately overwrites it starting from
-    ``preflighting`` (review v0.5.15 / blocker 3). The per-generation record
-    under ``generations/<id>/generation.yaml`` is truly immutable: it is only
-    ever written for a terminal state, and only once (see
+    ``preflighting``. The per-generation record under
+    ``generations/<id>/generation.yaml`` is truly immutable: it is only ever
+    written for a terminal state, and only once (see
     :func:`_write_generation_record_once`); progress states never touch it.
 
     :param Experiment experiment: Experiment whose generation state is written.
@@ -313,16 +311,15 @@ def _validate_generation_publishable(
 
     Checks the generation's immutable summary names this exact experiment and
     generation id, then validates the versioned artifact manifest end to end
-    (:func:`phasesweep.engine.publication_validation._validate_generation_manifest`, review
-    v0.5.16 / blocker 3): every winner artifact the summary
-    claims must exist, hash to its recorded content, parse, and cross-check
-    against the summary's own winner facts (trial number, metric name, value,
-    goal, source identity fields, completion metadata) — and the namespace
-    must hold nothing the manifest does not list. A winner's own
-    ``generation_id`` is deliberately *not* required to equal
-    ``generation_id``: a winner is legitimately carried forward from
-    whichever generation actually produced the best trial, so the field is
-    checked for well-formedness only.
+    (:func:`phasesweep.engine.publication_validation._validate_generation_manifest`):
+    every winner artifact the summary claims must exist, hash to its recorded
+    content, parse, and cross-check against the summary's own winner facts
+    (trial number, metric name, value, goal, source identity fields,
+    completion metadata) — and the namespace must hold nothing the manifest
+    does not list. A winner's own ``generation_id`` is deliberately *not*
+    required to equal ``generation_id``: a winner is legitimately carried
+    forward from whichever generation actually produced the best trial, so the
+    field is checked for well-formedness only.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to validate.
@@ -390,13 +387,12 @@ def _publish_generation(
 ) -> None:
     """Publish a generation as the experiment's last successful result.
 
-    This is the publication transaction (review v0.5.15 / blocker 3), in
-    strict order:
+    This is the publication transaction, in strict order:
 
     1. Immutable generation-scoped artifacts (winners/summary) are
        already written by the time this runs.
-    2. Pre-commit validation (:func:`_validate_generation_publishable`, item
-       A): parse this generation's own summary and winner files back and
+    2. Pre-commit validation (:func:`_validate_generation_publishable`):
+       parse this generation's own summary and winner files back and
        confirm they name themselves correctly.
     3. Write the lifecycle record of the generation the last-success pointer
        currently names when it has none (:func:`_record_superseded_publication`):
@@ -422,10 +418,10 @@ def _publish_generation(
     7. Write the immutable per-generation record once, state ``"published"``.
     8. Best-effort, diagnostic-only: drive the current pointer to
        ``"published"``, then refresh the convenience projections
-       (root ``winner.yaml`` / ``summary.yaml``; review
-       v0.5.15 / item D). These are post-commit caches for humans only -- no
-       reader derives publication authority from them, and once any generation has
-       published, reads resolve the generation-scoped artifacts directly (see
+       (root ``winner.yaml`` / ``summary.yaml``). These are post-commit
+       caches for humans only -- no reader derives publication authority
+       from them, and once any generation has published, reads resolve the
+       generation-scoped artifacts directly (see
        :func:`phasesweep.engine.publication._published_winner_path_for`), so a
        failure projecting them never affects what callers actually see.
 
@@ -433,15 +429,14 @@ def _publish_generation(
     cannot prevent the other from running.
 
     The whole transaction runs inside an
-    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window (review
-    v0.5.16 / blocker 1): a shutdown signal that arrives after the pointer
-    commit must not reclassify the committed publication as failed or
-    cancelled. The race has a deterministic winner — a shutdown delivered
-    before this window opens cancels the run with nothing published; one
-    delivered inside it is absorbed until the publication is durably
-    classified and then honored at the next checkpoint (the
-    next trial launch, or the MCP runner's terminal status write) before any
-    new work starts.
+    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window: a
+    shutdown signal that arrives after the pointer commit must not reclassify
+    the committed publication as failed or cancelled. The race has a
+    deterministic winner — a shutdown delivered before this window opens
+    cancels the run with nothing published; one delivered inside it is
+    absorbed until the publication is durably classified and then honored at
+    the next checkpoint (the next trial launch, or the MCP runner's terminal
+    status write) before any new work starts.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.

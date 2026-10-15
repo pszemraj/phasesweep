@@ -14,15 +14,13 @@ from phasesweep.mcp.registry import Registry, check_catalog
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_config_catalog
 
 
-def _relative_workdir_config(tmp_path: Path, name: str) -> str:
-    return mcp_experiment_config_text(tmp_path, name=name).replace(
-        f"workdir: {tmp_path}/runs/{name}", "workdir: runs/relative"
-    )
+def _in_memory_config(tmp_path: Path, name: str) -> str:
+    return mcp_experiment_config_text(tmp_path, name=name, with_storage=False)
 
 
-def _relative_storage_config(tmp_path: Path, name: str) -> str:
+def _empty_workdir_config(tmp_path: Path, name: str) -> str:
     return mcp_experiment_config_text(tmp_path, name=name).replace(
-        f"storage: journal:///{tmp_path}/{name}.journal", "storage: journal:///relative.journal"
+        f"workdir: {tmp_path}/runs/{name}", "workdir: ''"
     )
 
 
@@ -77,22 +75,21 @@ def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
         {
-            "bad-workdir": _relative_workdir_config(tmp_path, "w"),
+            "bad-workdir": _empty_workdir_config(tmp_path, "w"),
             "good": mcp_experiment_config_text(tmp_path, name="good"),
-            "bad-storage": _relative_storage_config(tmp_path, "s"),
+            "bad-storage": _in_memory_config(tmp_path, "s"),
         },
     )
     report = check_catalog(catalog)
     verdicts = {entry.experiment_id: entry for entry in report.entries}
     assert not report.ok
     assert verdicts["good"].ok
-    assert "absolute workdir" in (verdicts["bad-workdir"].error or "")
-    assert "set workdir to an absolute path" in (verdicts["bad-workdir"].suggestion or "")
-    assert "absolute journal storage path" in (verdicts["bad-storage"].error or "")
-    assert "use an absolute path" in (verdicts["bad-storage"].suggestion or "")
+    assert "workdir must be a nonempty path" in (verdicts["bad-workdir"].error or "")
+    assert "storage must be persistent" in (verdicts["bad-storage"].error or "")
+    assert "storage: auto" in (verdicts["bad-storage"].suggestion or "")
     assert not (tmp_path / "state").exists()
     # Registry.load stays fail-fast on the same catalog.
-    with pytest.raises(CatalogError, match="absolute workdir"):
+    with pytest.raises(CatalogError, match="workdir must be a nonempty path"):
         Registry.load(catalog)
 
 
@@ -137,7 +134,7 @@ def test_check_catalog_matches_server_cross_entry_identity_rejections(
 
     The MCP busy guard keys on the id string while the engine locks key on
     the output namespace and storage identity; two ids over one resource
-    would race launches and split run history (review v0.5.17 gap hunt).
+    would race launches and split run history.
     """
     shared = mcp_experiment_config_text(tmp_path, name="shared")
     second = shared
@@ -323,7 +320,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
         tmp_path,
         {
             "tiny2": mcp_experiment_config_text(tmp_path, name="tiny2"),
-            "rel": _relative_workdir_config(tmp_path, "rel"),
+            "mem": _in_memory_config(tmp_path, "mem"),
         },
         filename="bad.yaml",
     )

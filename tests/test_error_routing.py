@@ -29,7 +29,13 @@ import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredGate
+from phasesweep.config import (
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    Phase,
+    WandbSummaryRequiredGate,
+)
 from phasesweep.engine import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
@@ -76,7 +82,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.engine.trial import EnvironmentIdentity
+from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
@@ -87,7 +94,7 @@ from phasesweep.mcp.recovery import (
     _publication_recovery_action,
     recover_run,
 )
-from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunStore
+from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -97,12 +104,18 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.reaper import (
+    PROCESS_IDENTITY_SCHEMA_VERSION,
+    StaleProcessIdentity,
+    cleanup_stale_trial_process,
+)
 from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
     Materialized,
     ledger_file,
     materialize,
+    pin_fixture_environment,
     published_generation_id,
     republish_as_incomplete,
 )
@@ -143,6 +156,11 @@ def _populated_study(name: str = "routing") -> optuna.Study:
     study = optuna.create_study(study_name=name)
     study.add_trial(optuna.trial.create_trial(value=1.0, params={}, distributions={}))
     return study
+
+
+def _digest_only_identity(digest: str) -> EnvironmentIdentity:
+    """Return an environment identity that carries a digest and nothing else."""
+    return EnvironmentIdentity(digest=digest, tracked={}, values={})
 
 
 def test_every_operator_error_declares_its_action():
@@ -209,7 +227,9 @@ _UNMARKED_STUDY_REMEDY_MARKERS = {
         ("trial target", lambda: study_policy._accepted_trial_target(_populated_study())),
         (
             "environment cohort",
-            lambda: study_policy._validate_environment_cohort(_populated_study(), "d" * 64),
+            lambda: study_policy._validate_environment_cohort(
+                _populated_study(), _digest_only_identity("d" * 64)
+            ),
         ),
         (
             "phase fingerprint",
@@ -235,11 +255,12 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     experiment = make_experiment(
+        execution=ExecutionContext(inherit_env=["WANDB_MODE"]),
         gates=[
             WandbSummaryRequiredGate(
                 type="wandb_summary_required", entity="e", project="p", keys=["eval/loss"]
             )
-        ]
+        ],
     )
     monkeypatch.setenv("WANDB_MODE", "offline")
 
@@ -1198,9 +1219,22 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
         store.cleanup_identity(handle),
         load_only_recovery_needs(),
         confirm=True,
-        earlier_boot=False,
+        view=RunnerView("observable"),
         cleanup_recorded=False,
     )
+
+
+def _recover_run_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover a run whose runner was recorded in a PID namespace this process cannot observe."""
+    state_dir = tmp_path / "mcp-state"
+    store = RunStore(state_dir)
+    handle = make_run_handle(run_id="wrap-recover", pid_namespace="pid:[4026539001]@100")
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr(
+        "phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]@100"
+    )
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
 def _append_failure_outcomes(
@@ -1257,15 +1291,15 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
 def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
 
-    The fixture's trials carry the environment digest of the shell that generated
-    it, so preflight's cohort check (routed by ``environment_cohort_changed``) is
-    stubbed to keep this case independent of the ambient environment.
+    The fixture's trials record the pinned environment they were generated under, so the
+    cohort check that allocation needs (routed by ``environment_cohort_changed``) passes
+    only from that environment, whatever shell runs the test.
     """
+    pin_fixture_environment(monkeypatch)
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     study = _fixture_study(experiment)
     _append_failure_outcomes(study, 2)
     study.set_user_attr(TRIAL_TARGET_ATTR, 5)
-    monkeypatch.setattr(guards, "_validate_environment_cohort", lambda study, digest: None)
     phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
@@ -1358,10 +1392,36 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
             user_attrs={TRAINER_ENV_DIGEST_ATTR: "e" * 64},
         )
     )
-    return study_policy._validate_environment_cohort(study, "d" * 64)
+    return study_policy._validate_environment_cohort(study, _digest_only_identity("d" * 64))
+
+
+def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Clean a stale trial group whose identity was recorded in another PID namespace."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "boot")
+    monkeypatch.setattr(
+        "phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]@100"
+    )
+    return cleanup_stale_trial_process(
+        StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id="foreign-attempt",
+            pid=4242,
+            pgid=4242,
+            proc_starttime=111,
+            boot_id="boot",
+            pid_namespace="pid:[4026539001]@100",
+        )
+    )
 
 
 ORIGIN_CASES = (
+    RoutingCase(
+        id="stale_trial_in_foreign_pid_namespace",
+        trigger=_clean_trial_from_foreign_namespace,
+        raised=ForeignPidNamespaceError,
+        action=OperatorAction.FIX_CONFIG,
+        message="only the host's initial PID namespace can see another namespace's processes",
+    ),
     RoutingCase(
         id="claim_ledger_tree_changed",
         trigger=_claim_after_unlocked_bind,
@@ -1538,6 +1598,13 @@ ORIGIN_CASES = (
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="runner still appears live; use cancel_run first",
+    ),
+    RoutingCase(
+        id="recover_runner_in_foreign_pid_namespace",
+        trigger=_recover_run_from_foreign_namespace,
+        raised=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        message="only the host's initial PID namespace can see another namespace's processes",
     ),
     RoutingCase(
         id="prior_phase_abort",

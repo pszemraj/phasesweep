@@ -50,8 +50,7 @@ def _write_generation_provenance(
 
     Written at claim time, immediately after the namespace is created and
     before any lifecycle state exists, so a generation that later fails still
-    records what configuration ran (review v0.5.18 / finding F6). Two files
-    land side by side:
+    records what configuration ran. Two files land side by side:
 
     * ``config.snapshot.yaml`` -- the canonicalized effective config rendered
       as YAML. It is the engine's execution view, *not* a copy of the
@@ -75,10 +74,10 @@ def _write_generation_provenance(
     generation's identity was supplied by an external launcher (``"caller"``)
     or minted by the engine (``"engine"``). A launcher that grants an identity
     also freezes that run's authority (e.g. the MCP server's winner-visibility
-    grant) in its own state; recording the grant's *existence* here, in the
-    artifact tree the results live in, lets readers detect that frozen
-    authority is unaccounted for even after the launcher's state directory is
-    deleted or replaced (PR #5 review / P2 missing-handle authority).
+    grant) in its own state; the field records that such a grant existed, in
+    the artifact tree the results live in, so the evidence survives the
+    launcher's state directory being deleted or replaced. No reader acts on
+    it; it is provenance for an operator.
 
     :param Experiment experiment: Experiment whose configuration is frozen.
     :param str generation_id: Freshly claimed generation namespace to write into.

@@ -107,8 +107,7 @@ class TrialEvidenceMissingError(PhaseSweepError):
     Fails the run closed rather than either silently selecting such a trial
     or silently skipping it: skipping is not the safe fallback here, because
     dropping the trials whose evidence happens to be missing changes which
-    trial wins and therefore biases the published result (PR #5 review /
-    reviewer 2, blocker 7).
+    trial wins and therefore biases the published result.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
@@ -167,14 +166,15 @@ class ExperimentLockBusyError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
 
 
-class SamplerContinuationUnsupportedError(PhaseSweepError):
-    """Raised when a stateful sampler cannot safely continue across invocations."""
+class TrialTargetRefusedError(PhaseSweepError):
+    """Raised when a phase's trial target contradicts the trials its study already holds.
 
-    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
-
-
-class TrialTargetRegressionError(PhaseSweepError):
-    """Raised when a persistent study requests less than its accepted trial target."""
+    The target is refused in either direction. It is too low when it falls below
+    the target the study already accepted. It is too high when it is a fixed
+    configuration's target past what that configuration may retry: one attempt
+    more than its failures while none has completed, and none more once one
+    has. Both are fixed by correcting ``n_trials``.
+    """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 

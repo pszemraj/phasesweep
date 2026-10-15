@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import threading
@@ -16,6 +17,7 @@ from phasesweep import run_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
+    ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
@@ -34,13 +36,15 @@ from phasesweep.engine import (
     read_status,
     read_winner,
 )
+from phasesweep.engine import phase as phase_module
+from phasesweep.engine.attempts import _fail_stale_running_trial
 from phasesweep.engine.ledger import (
     _resolve_storage,
     claim_ledger,
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest
+from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_state_label
 from phasesweep.engine.paths import (
     _attempts_dir,
     _generation_path,
@@ -54,15 +58,18 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    FEASIBLE_ATTR,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
+    _parsed_trial_outcome,
 )
 from phasesweep.engine.study_policy import (
     _consecutive_failure_threshold_tripped,
@@ -75,6 +82,7 @@ from phasesweep.engine.trial import (
     _environment_identity,
     extract_trial_result,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
@@ -90,6 +98,7 @@ from tests.conftest import (
     write_param_echo_trainer,
     write_trainer,
 )
+from tests.recovery_helpers import fabricate_stale_trial
 
 
 @pytest.mark.parametrize(
@@ -236,6 +245,72 @@ def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
     assert {trial.params["x"] for trial in loaded.trials} == {1, 2, 3, 4}
 
 
+def test_grid_top_up_never_reruns_a_failed_point(tmp_path: Path) -> None:
+    """A failed grid point counts as visited, so a top-up reaches only points never tried."""
+    choices = [1, 2, 3]
+    search_space = {"x": CategoricalParam(type="categorical", choices=choices)}
+    sampler = Sampler(type="grid", seed=0)
+    storage = _resolve_storage(f"journal:///{tmp_path / 'grid.journal'}")
+
+    def objective(trial: optuna.Trial) -> float:
+        value = trial.suggest_categorical("x", choices)
+        if trial.number == 0:
+            raise RuntimeError("interrupted")
+        return float(value)
+
+    for target in (2, 3):
+        study = optuna.create_study(
+            study_name="failed-grid::p",
+            storage=storage,
+            sampler=_build_sampler(sampler, search_space),
+            load_if_exists=True,
+        )
+        study.optimize(objective, n_trials=target - len(study.trials), catch=(RuntimeError,))
+
+    loaded = optuna.load_study(study_name="failed-grid::p", storage=storage)
+    assert [trial.state for trial in loaded.trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert sorted(trial.params["x"] for trial in loaded.trials) == choices
+
+
+def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
+    """Failing a stale trial that holds a grid's last unfinished point commits FAIL.
+
+    The phase's grid sampler never stops the study, so committing the last
+    point outside ``optimize`` raises nothing and recovery reports no storage
+    failure.
+    """
+    search_space = {"x": CategoricalParam(type="categorical", choices=[1])}
+    exp = make_experiment(
+        experiment="gridstale",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'g.journal'}",
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="grid"), search_space=search_space)
+        ],
+    )
+    _, _trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt")
+    # Recovery reopens the phase study with its configured GridSampler, as the
+    # engine does; the stale trial must also hold a grid point, so give it the
+    # attrs GridSampler.before_trial would have written at ask time.
+    study = optuna.load_study(
+        study_name="gridstale::p",
+        storage=_resolve_storage(exp.resolved_storage),
+        sampler=_build_sampler(Sampler(type="grid"), search_space),
+    )
+    stale = study.get_trials(deepcopy=False)[stale_number]
+    study._storage.set_trial_system_attr(stale._trial_id, "search_space", {"x": [1]})
+    study._storage.set_trial_system_attr(stale._trial_id, "grid_id", 0)
+    stale = study.get_trials(deepcopy=False)[stale_number]
+
+    _fail_stale_running_trial(study, stale, failure_message="stale grid trial")
+
+    assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+
+
 @pytest.mark.parametrize(
     ("sampler", "search_space", "n_trials", "expected_type"),
     [
@@ -243,30 +318,28 @@ def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
             Sampler(type="random", seed=0),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             1,
-            "_TrialNumberRandomSampler",
+            "_PositionRandomSampler",
             id="random",
         ),
         pytest.param(
             Sampler(type="grid", seed=0),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             2,
-            "GridSampler",
+            "_PositionGridSampler",
             id="grid",
         ),
-        # tpe/cmaes are the point of these two cases, so they carry the
-        # acknowledgement persistent storage requires for a non-resumable sampler.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=3, acknowledge_nonresumable=True),
+            Sampler(type="tpe", seed=0, n_startup_trials=3),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             1,
-            "TPESampler",
+            "_PositionTPESampler",
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
+            Sampler(type="cmaes", seed=0),
             {"x": IntParam(type="int", low=1, high=2)},
             1,
-            "CmaEsSampler",
+            "_PositionCmaEsSampler",
             id="cmaes",
         ),
     ],
@@ -325,12 +398,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
 
 @pytest.mark.integration
 def test_parallel_trials_e2e(tmp_path):
-    """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
-    - JournalFileStorage via explicit journal:/// URL (review v0.5.2 / blocker 6)
-    - constant_liar on TPE
-    - concurrent subprocess execution
-    - no database-locked errors
-    """
+    """n_jobs=4 on an explicit ``journal:///`` URL runs every trial and creates the journal file."""
     trainer = copy_fake_train(tmp_path)
 
     journal_path = tmp_path / "phases.journal"
@@ -344,7 +412,7 @@ def test_parallel_trials_e2e(tmp_path):
         n_trials=8,
         n_jobs=4,
         allow_no_gpu_isolation=True,
-        sampler=Sampler(type="tpe", seed=42, acknowledge_nonresumable=True),
+        sampler=Sampler(type="tpe", seed=42),
         search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-2, log=True)},
     )
     winners = run_experiment(exp)
@@ -353,7 +421,7 @@ def test_parallel_trials_e2e(tmp_path):
     assert 1e-5 <= winners["lr_sweep"].params["lr"] <= 1e-2
 
     # Verify all 8 trials actually ran (trial directories exist).
-    # v0.5.7: outputs are now namespaced as <workdir>/<experiment>/<phase>/.
+    # Outputs are namespaced as <workdir>/<experiment>/<phase>/.
     runs_dir = tmp_path / "runs" / "parallel_test" / "lr_sweep"
     trial_dirs = sorted(runs_dir.glob("trial_*"))
     assert len(trial_dirs) == 8
@@ -452,8 +520,18 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
 ) -> None:
     """A newly reached W&B phase must validate before an existing phase can top up."""
     trainer = write_constant_trainer(tmp_path)
-    local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
-    initial = make_experiment(persistent=tmp_path, trainer=trainer, phases=[local])
+    local = Phase(
+        name="local",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    initial = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[local],
+        execution=ExecutionContext(inherit_env=["WANDB_MODE"]),
+    )
     run_experiment(initial)
     generation_before = _generation_path(initial).read_bytes()
 
@@ -557,7 +635,7 @@ def test_terminal_callback_failure_cannot_fail_published_run(
 
     By the time the callback runs, a successful generation is already
     published as the last successful result; raising would present that
-    committed success as a caller-visible failure (review v0.5.14 / item C).
+    committed success as a caller-visible failure.
     """
     experiment = make_experiment(workdir=tmp_path / "runs")
 
@@ -727,9 +805,8 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     # With the post-acquire recheck, the first failure aborts queued threads
     # before they launch their subprocess. Without it, all 4 would launch.
     # Derive the directory from the experiment to track the
-    # ``<workdir>/<experiment>/<phase>/`` layout (review v0.5.12 caught the
-    # earlier hard-coded ``<workdir>/<phase>/`` path silently matching nothing
-    # and rendering the assertion vacuous).
+    # ``<workdir>/<experiment>/<phase>/`` layout; a hard-coded
+    # ``<workdir>/<phase>/`` path would match nothing and make the assertion vacuous.
     runs_dir = Path(exp.workdir).expanduser().resolve() / exp.experiment / exp.phases[0].name
     trial_dirs = sorted(runs_dir.glob("trial_*"))
     launched = [d for d in trial_dirs if (d / "stdout.log").exists()]
@@ -836,8 +913,8 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     assert n < 30, f"expected early abort, got {n} trials"
 
 
-def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):
-    """A scheduled worker entering after a peer abort still permits a later top-up."""
+def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_path, monkeypatch):
+    """A worker entering after a peer abort stops interrupted, and the raised target reruns it."""
     experiment = make_experiment(
         workdir=tmp_path / "work",
         storage=f"journal:///{tmp_path / 'study.journal'}",
@@ -880,19 +957,22 @@ def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch)
         study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
     )
     previous = study.trials
-    assert [trial.state.name for trial in previous] == ["FAIL", "PRUNED"]
+    assert [_trial_state_label(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
+    stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
+    assert stopped is not None and "before this trial's trainer launched" in stopped.cause
     for trial in previous:
         assert trial.user_attrs[TRAINER_ENV_DIGEST_ATTR]
-        assert TRAINER_ENV_NAMES_ATTR in trial.user_attrs
+        assert TRAINER_ENV_ATTR in trial.user_attrs
 
     updated = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}
     )
-    # The supported retry must reach new work, without a schema/migration error.
+    # The raised target reruns the stopped trial before any new draw, without a
+    # schema/migration error. Under two workers the new draw may launch too.
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(updated)
-    assert launched == [0, 2]
-    assert len(study.trials) == 3
+    assert launched[0] == 0 and 2 in launched and 1 not in launched
+    assert study.trials[2].user_attrs[RERUN_OF_ATTR] == 1
     assert [trial.user_attrs for trial in study.trials[:2]] == [
         trial.user_attrs for trial in previous
     ]
@@ -930,8 +1010,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
     """One flaky outcome write must not cost the phase a trial.
 
     The bounded retry is what keeps the fail-closed reaction to an *unwritable*
-    ledger from firing on a momentarily busy one (PR #5 review / reviewer 2
-    pass 2, blocker 4).
+    ledger from firing on a momentarily busy one.
     """
     db = tmp_path / "retry.journal"
     exp = _outcome_write_experiment(
@@ -1057,8 +1136,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     therefore aborts outside Optuna's catch set, leaving the trial RUNNING with
     its registry entry intact, and the phase reports a retryable storage
     outage. The next run recovers it through the ordinary stale-attempt
-    protocol, which writes the outcome *before* the terminal transition
-    (PR #5 review / reviewer 2 pass 2, blocker 4).
+    protocol, which writes the outcome *before* the terminal transition.
     """
     db = tmp_path / "outcome.journal"
     exp = _outcome_write_experiment(
@@ -1094,18 +1172,22 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     trials = study.get_trials(deepcopy=False)
+    # Recovery cannot prove what the unrecorded trial measured, so it is
+    # interrupted and reruns (trial 1) before the second draw (trial 2).
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
     ]
     assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
-        "schema_version": 1,
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
         "sequence": 1,
-        "outcome": "failure",
+        "outcome": "interrupted",
         "cause": "stale RUNNING trial recovered after its orchestrator stopped",
     }
+    assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
     # The whole point: the ledger still validates, so the study is reusable.
-    assert _load_phase_policy_state(study).max_sequence == 2
+    assert _load_phase_policy_state(study).max_sequence == 3
 
 
 @pytest.mark.integration
@@ -1117,7 +1199,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
     Optuna's threaded loop never calls ``result()`` on the last submitted
     futures, so a worker's abort is silently dropped there; only the
     orchestrator-owned fatal slot re-raised after ``study.optimize`` makes it
-    visible (PR #5 review / reviewer 2 pass 2, blocker 4).
+    visible.
     """
     journal = tmp_path / "outcome.journal"
     exp = _outcome_write_experiment(
@@ -1265,18 +1347,49 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
 
 
+def test_unsafe_cleanup_is_never_an_ordinary_trial_failure() -> None:
+    """``UnsafeProcessCleanupError`` escapes the trial-failure handler and Optuna's ``catch``.
+
+    As a ``TrialExecutionError``, or under a ``catch`` entry that covers it, an
+    evidence or tracking worker's unconfirmed cleanup would be committed as an
+    ordinary failure while the phase kept launching past the leaked group.
+    """
+    assert not issubclass(UnsafeProcessCleanupError, TrialExecutionError)
+
+    tree = ast.parse(Path(str(phase_module.__file__)).read_text(encoding="utf-8"))
+    run_phase = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_phase"
+    )
+    catches = [
+        keyword.value
+        for node in ast.walk(run_phase)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "catch"
+    ]
+    assert len(catches) == 1
+    assert isinstance(catches[0], ast.Tuple)
+    caught = []
+    for element in catches[0].elts:
+        assert isinstance(element, ast.Name), ast.unparse(element)
+        caught.append(vars(phase_module)[element.id])
+    assert caught
+    assert not any(issubclass(UnsafeProcessCleanupError, base) for base in caught)
+
+
 @pytest.mark.integration
 def test_recovered_abort_is_retired_before_selection_survives_selection_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A top-up's recovery boundary retires the recorded abort before selection.
 
-    A top-up that died mid-selection used to leave the durable abort behind;
-    the next identical invocation then reported "previously aborted" and — for
-    stateful samplers — rejected the advised raise-n_trials remedy too,
-    wedging the phase (review v0.5.17 gap hunt). The boundary is durable
-    before any new trial runs, and selection is deterministic from durable
-    trial data, so the replay re-derives the same winner.
+    A top-up that dies mid-selection must not leave the durable abort behind,
+    or the next identical invocation would report "previously aborted" and
+    wedge the phase. The boundary is durable before any new trial runs, and
+    selection is deterministic from durable trial data, so the replay
+    re-derives the same winner.
     """
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
@@ -1322,11 +1435,11 @@ def test_recovered_abort_is_retired_before_selection_survives_selection_crash(
 def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> None:
     """Two fast failures trip the abort before a slow later success can reset it.
 
-    Before review v0.5.17 / blocker 7, the threshold was evaluated by a
-    post-trial callback reading a mutable aggregate counter, so a success
-    finishing between two failures' callbacks could erase them. The decision
-    now happens in the objective's completion-order critical section: with the
-    success still sleeping, the abort must be tripped at completion sequence 2.
+    The threshold is decided in the objective's completion-order critical
+    section, not by a post-trial callback reading a mutable aggregate counter
+    (a success finishing between two failures' callbacks could erase them).
+    With the success still sleeping, the abort must be tripped at completion
+    sequence 2.
     The abort is recorded with that outcome, so the success recorded after it
     resets the replayed streak but not the decision, and an identical retry
     stays refused instead of publishing the success.
@@ -1383,7 +1496,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     "outcomes",
     [
         ["failure", "failure", "success", "failure", "failure"],
-        ["success", "pruned", "failure", "cancelled", "failure"],
+        ["success", "failure", "interrupted", "failure"],
         ["fatal", "success", "failure"],
     ],
 )
@@ -1507,8 +1620,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
     """A completed phase republishes from a host that cannot launch work.
 
     Reading or republishing a finished GPU experiment from a CPU-only login
-    node must not require GPU discovery or mutate the durable accepted target
-    (review v0.5.14 / blocker 4).
+    node must not require GPU discovery or mutate the durable accepted target.
     """
     trainer = write_param_echo_trainer(tmp_path)
     experiment = make_experiment(
@@ -1537,8 +1649,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
 
     The larger target must only be durably accepted after launch prerequisites
     (GPU discovery, wallclock budget) pass; otherwise a transient local GPU
-    problem permanently strands the study above its last working config
-    (review v0.5.14 / blocker 4).
+    problem permanently strands the study above its last working config.
     """
     trainer = write_param_echo_trainer(tmp_path)
     phase = Phase(
@@ -1569,9 +1680,8 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
 # A pairwise-unequal mixed-type choice set. `True` is not equal to 0, 1.5, or
 # "one", so config validation accepts it and Optuna's `choices.index(value)`
 # lookup resolves each sampled value to its own index. That is the property
-# `CategoricalParam` now enforces (PR #5 review / reviewer 2, blocker 1): a
-# choice set containing 1 alongside True would collapse both onto one index the
-# moment Optuna recorded `FrozenTrial.params`.
+# `CategoricalParam` enforces: a choice set containing 1 alongside True would
+# collapse both onto one index the moment Optuna recorded `FrozenTrial.params`.
 _FIDELITY_CHOICES: list[Any] = [0, 1.5, "one", True]
 
 # Trainer losses keyed by the rendered argparse token for each choice, chosen so
@@ -1615,11 +1725,11 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
 ) -> None:
     """A sampled categorical must be byte-identical from trainer input to child phase.
 
-    Differential regression for PR #5 review / reviewer 2, blocker 1. Optuna
-    records a sampled categorical as ``choices.index(value)``, an ``==`` lookup,
-    so a choice set holding Python-equal-but-distinct values published a winner
-    naming a value the trial never ran. The validator now rejects such sets;
-    this proves the surviving guarantee holds end to end for an accepted set:
+    Optuna records a sampled categorical as ``choices.index(value)``, an ``==``
+    lookup, so a choice set holding Python-equal-but-distinct values would
+    publish a winner naming a value the trial never ran. The validator rejects
+    such sets; this proves the surviving guarantee holds end to end for an
+    accepted set:
     the live suggestion, ``FrozenTrial.params``, ``overrides_resolved.json``,
     ``winner.yaml``, and the dependent phase's inherited overrides all carry the
     same value *and* the same type.
@@ -1728,10 +1838,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     [
         pytest.param(Sampler(type="grid", seed=0), id="grid"),
         pytest.param(Sampler(type="random", seed=0), id="random"),
-        pytest.param(
-            Sampler(type="tpe", seed=0, acknowledge_nonresumable=True),
-            id="tpe",
-        ),
+        pytest.param(Sampler(type="tpe", seed=0), id="tpe"),
     ],
 )
 def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
@@ -1742,8 +1849,7 @@ def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
     The end-to-end fidelity test above pins grid, the only sampler that visits
     every choice deterministically. This narrower check runs the real
     ``_suggest`` under random and TPE too and compares the value the objective
-    received against the value persistent storage hands back
-    (PR #5 review / reviewer 2, blocker 1).
+    received against the value persistent storage hands back.
     """
     param = CategoricalParam(type="categorical", choices=list(_FIDELITY_CHOICES))
     storage_url = _resolve_storage(f"journal:///{tmp_path / 'round-trip.journal'}")
@@ -1769,3 +1875,57 @@ def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
             live[trial.number],
             surface=f"{sampler.type} FrozenTrial.params[{trial.number}]",
         )
+
+
+def _bounded_metric(**bounds: float) -> Metric:
+    """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
+    return Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        **bounds,
+    )
+
+
+def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> None:
+    """A metric outside min/max completes with its real value, cannot win, and counts as a failure."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        print("x=" + {"0": "0.5", "1": "20.0", "2": "5.0"}[os.environ["PHASESWEEP_TRIAL_ID"]])
+        """,
+    )
+    storage = f"journal:///{tmp_path / 'bounds.journal'}"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trainer=trainer,
+        metric=_bounded_metric(min=1.0, max=10.0),
+        n_trials=3,
+        max_consecutive_failures=5,
+    )
+
+    winners = run_experiment(exp)
+
+    assert (winners["p"].trial_number, winners["p"].metric) == (2, 5.0)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    trials = study.get_trials(deepcopy=False)
+    assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
+    assert [t.value for t in trials] == [0.5, 20.0, 5.0]
+    assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
+    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == [
+        "failure",
+        "failure",
+        "success",
+    ]
+
+    always_out = make_experiment(
+        experiment="aborts",
+        workdir=tmp_path / "aborts-runs",
+        storage=f"journal:///{tmp_path / 'aborts.journal'}",
+        trainer=write_trainer(tmp_path / "high.py", 'print("x=20.0")'),
+        metric=_bounded_metric(max=10.0),
+        n_trials=6,
+        max_consecutive_failures=2,
+    )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(always_out)

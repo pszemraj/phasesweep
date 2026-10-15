@@ -80,11 +80,18 @@ def _trial_dir_for(
 def _attempts_dir(experiment: Experiment) -> Path:
     """Return the experiment-level active-attempt registry directory.
 
-    One JSON entry per nonterminal attempt, written at allocation and
-    retired once the attempt's Optuna trial is durably terminal. Recovery
-    scans this registry *independently of the current phase graph*, so a
-    renamed or removed phase cannot hide a stale attempt from preflight
-    (review v0.5.17 / blocker 3).
+    One JSON entry per attempt that may still own a live process, written at
+    allocation: a trial attempt, or a tracking operation that owns no trial.
+    A trial's entry is retired once its Optuna trial is durably terminal,
+    except that a trial with unconfirmed or unsafe cleanup keeps it past
+    terminal state until the study's cleanup-recovery ledger records that
+    cleanup (``engine.phase._settle_finished_trial``). A tracking operation's
+    entry is retired by ``tracking.session.tracking_operation`` once its
+    lifecycle record shows the worker never launched or its cleanup was
+    confirmed. Preflight resolves and retires whatever a crashed run left
+    behind. Recovery scans this registry *independently of the current phase
+    graph*, so a renamed or removed phase cannot hide a stale attempt from
+    preflight.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return Path: Directory containing active-attempt registry entries.
@@ -143,8 +150,7 @@ def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
 # so its presence is what separates a published generation from a claim-time
 # namespace whose run never got that far. Named once because manifest
 # validation reasons about that distinction for *another* generation's
-# namespace, where the helper below cannot be used (PR #5 review / reviewer 2,
-# blocker 7).
+# namespace, where the helper below cannot be used.
 GENERATION_SUMMARY_FILENAME = "summary.yaml"
 
 

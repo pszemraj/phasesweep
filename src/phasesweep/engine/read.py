@@ -20,23 +20,28 @@ validated publication (pinned, unfinished, or failed) is read from its files.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import logging
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
+import optuna
 import yaml
 
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.confound import _confound_summary, _validate_confound_block
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.ledger import read_trial_stats, validate_ledger
+from phasesweep.engine.ledger import read_phase_trials, read_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
+    _draw_positions,
     _published_phase_trial_refs,
     _published_trial_history_available,
+    _trial_state_label,
 )
 from phasesweep.engine.paths import (
     _generation_path,
@@ -45,13 +50,28 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import _parse_phase_plan
+from phasesweep.engine.repeats import (
+    RepeatsSummary,
+    _repeats_summary,
+    _validate_repeats_block,
+    group_labels,
+    repeat_axis,
+)
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    DURATION_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
+    OBSERVED_PREFIX,
+    RERUN_OF_ATTR,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
+    _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
+from phasesweep.runtime.json import JsonObject, JsonValue
+
+log = logging.getLogger(__name__)
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
 """Which config's semantics a result payload's labels were read under.
@@ -83,15 +103,21 @@ class PhaseWinnerView:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
-    # The metric semantics the winner itself recorded (review v0.5.16 /
-    # blocker 4): a persisted winner is historical evidence, so its value is
-    # reported under the name and goal it was optimized for, never relabeled
-    # by whatever metric the current config declares.
+    # The metric semantics the winner itself recorded: a persisted winner is
+    # historical evidence, so its value is reported under the name and goal it
+    # was optimized for, never relabeled by whatever metric the current config
+    # declares.
     metric_name: str | None = None
     metric_goal: str | None = None
     # Path-free projection of the winner's confound block: verdicts, check
     # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
     confound: dict[str, Any] | None = None
+    # Report-only values the winning trial recorded, by observation name.
+    observed: dict[str, float] = field(default_factory=dict)
+    # String-free projection of the winner's repeats block: reducer, spread
+    # and member trial numbers, never the repeat key or values
+    # (:func:`phasesweep.engine.repeats._repeats_summary`).
+    repeats: RepeatsSummary | None = None
 
 
 def _phase_status_payloads(
@@ -112,8 +138,7 @@ def _phase_status_payloads(
 
     ``winners_present`` must come from the caller's single resolution of the
     represented generation, so one status object spanning several phases can
-    never mix identities from two different pointer resolutions (review
-    v0.5.15 / blocker 3).
+    never mix identities from two different pointer resolutions.
 
     :param Experiment experiment: Parsed experiment whose phase study counts are reported.
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
@@ -126,8 +151,7 @@ def _phase_status_payloads(
         storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
         trial data was unreadable. Included only in the path-free status view
         consumed by MCP, whose terminal snapshot must not reread studies to
-        learn which rows the RUNNING count refers to (PR #5 review /
-        reviewer 2, blocker 6).
+        learn which rows the RUNNING count refers to.
     :param set[str] unavailable_published_phases: Published phases whose local
         trial identity could not be matched in the storage snapshot.
     :param set[str] winners_present: Phases whose winner the represented
@@ -165,8 +189,8 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         # winner.yaml stores metric as {<metric_name>: value, "goal": ...}. The
         # winner is historical evidence: pull the value by the name the file
         # itself recorded, NOT the currently configured metric name — reading
-        # a published x/minimize result through a config renamed to y used to
-        # silently drop the winner entirely (review v0.5.16 / blocker 4).
+        # a published x/minimize result through a config renamed to y would
+        # silently drop the winner entirely.
         metric_block = data.get("metric") or {}
         if not isinstance(metric_block, Mapping):
             return None
@@ -187,14 +211,16 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             return None
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         trial_number = int(data["trial_number"])
-        confound = _confound_summary(
-            _validate_confound_block(data.get("confound"), winner_trial=trial_number),
-            winner_trial=trial_number,
+        confound_block = _validate_confound_block(data.get("confound"), winner_trial=trial_number)
+        confound = _confound_summary(confound_block, winner_trial=trial_number)
+        metric = float(metric_block[stored_metric_name])
+        repeats = _validate_repeats_block(
+            data, metric_value=metric, ranked_groups=confound_block["ranked_groups"]
         )
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=trial_number,
-            metric=float(metric_block[stored_metric_name]),
+            metric=metric,
             metric_name=stored_metric_name,
             metric_goal=str(stored_goal) if isinstance(stored_goal, str) else None,
             params=dict(params),
@@ -213,6 +239,8 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             ),
             source=source,
             confound=confound,
+            observed=_validate_observed_block(data.get("observed")),
+            repeats=None if repeats is None else _repeats_summary(repeats),
         )
     except (KeyError, ValueError, TypeError):
         return None
@@ -293,8 +321,7 @@ def read_winner(
         experiment: Parsed experiment config; supplies the artifact roots.
             The metric value is extracted under the name the winner file
             itself recorded, so a historical winner is never reinterpreted
-            through the currently configured metric (review v0.5.16 /
-            blocker 4).
+            through the currently configured metric.
         phase_name: Phase whose ``winner.yaml`` to read.
         generation_id: Optional generation whose immutable winner should be read.
 
@@ -336,9 +363,9 @@ def read_winners(
             *historical* generation passes that generation's own recorded plan
             (see :func:`_summary_phase_plan`), so a phase renamed in the config
             since publication neither hides the published winner nor reports
-            the new name as missing (review v0.5.16 / blocker 4). Names are
-            path components, so each is validated; the default keeps the
-            declared-phase behavior every existing caller relies on.
+            the new name as missing. Names are path components, so each is
+            validated; the default keeps the declared-phase behavior every
+            existing caller relies on.
 
     Returns:
         One :class:`PhaseWinnerView` per named phase that has a winner on disk.
@@ -482,15 +509,14 @@ def read_status(
     identities of the RUNNING trials those same counts describe, from the same
     snapshot, or ``None`` when ``trial_data_available`` is ``False``. It exists
     so a caller that must reconcile RUNNING rows -- the MCP terminal snapshot
-    -- never needs a second, intolerant storage read after this one (PR #5
-    review / reviewer 2, blocker 6).
+    -- never needs a second, intolerant storage read after this one.
 
     This resolves the current pointer and the last-success pointer *exactly
     once each* and reuses those two captured ids for every downstream fact in
     this call -- no helper reached from here re-resolves either pointer, so
     one status object can never mix identities from two different pointer
-    reads (review v0.5.15 / blocker 3). Four identities are always reported,
-    and each is truthful independent of ``generation_id``:
+    reads. Four identities are always reported, and each is truthful
+    independent of ``generation_id``:
 
     - ``current_generation_id``: always the actual mutable current pointer
       (the most recent invocation's own claim, whether failed, in-progress,
@@ -510,18 +536,18 @@ def read_status(
       generation identity, status is unpublished.
     - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"`` --
-      *why* ``published_generation_id`` is what it is (review v0.5.18 /
-      finding F4). ``"absent"`` means nothing was ever published, a healthy
-      state for a fresh tree; ``"failed"`` means a last-success pointer exists
-      but its target no longer validates; ``"permission_denied"`` means this
-      user cannot complete validation without implying corruption. Both are
-      accompanied by a short, path-free ``publication_error``. These states
-      used to be indistinguishable,
-      which invited a re-run over corrupt evidence. A ``"failed"`` payload
-      reports exactly the no-publication facts it always did -- nothing is
-      fabricated from an unvalidated generation -- so ``published_generation_id``
-      is ``None``, ``is_published`` is ``False``, and no winner reads as
-      present.
+      *why* ``published_generation_id`` is what it is. ``"absent"`` means
+      nothing was ever published, a healthy state for a fresh tree;
+      ``"failed"`` means a last-success pointer exists but its target no
+      longer validates; ``"permission_denied"`` means this user cannot
+      complete validation without implying corruption. Both are accompanied by
+      a short, path-free ``publication_error``. Keeping the states distinct
+      stops a fresh tree and corrupt evidence from both reading as nothing
+      published, which would invite a re-run over the corrupt evidence. A
+      ``"failed"`` payload reports exactly the no-publication facts --
+      nothing is fabricated from an unvalidated generation -- so
+      ``published_generation_id`` is ``None``, ``is_published`` is ``False``,
+      and no winner reads as present.
 
     Two views coexist in this payload and must not be confused. The
     *config-progress* view -- the ``phases`` list, with its trial counts,
@@ -532,7 +558,7 @@ def read_status(
     own terms. Under a config edited since publication the two legitimately
     disagree, and ``result_context`` / ``published_config_matches_current``
     say so explicitly rather than leaving a reader to conclude the publication
-    is empty (review v0.5.16 / blocker 4).
+    is empty.
 
     Winner/summary facts (``winner_present``, top-level ``summary_present``)
     scope to ``represented_generation_id``. ``generation_trials`` scopes to
@@ -581,13 +607,12 @@ def read_status(
         (``result_context: "represented_generation"``), falling back to the
         current config only when no summary semantics exist
         (``result_context: "current_config"``) — a published x/minimize
-        result is never relabeled by a config edited to y/maximize (review
-        v0.5.16 / blocker 4). ``result_phase_plan`` is likewise the represented
-        generation's own recorded phase plan, falling back to the current
-        config's phase names when no represented summary exists — it is the
-        plan the publication's winners must be enumerated under, and equals
-        the ``phases`` list's names whenever the config has not been edited
-        since.
+        result is never relabeled by a config edited to y/maximize.
+        ``result_phase_plan`` is likewise the represented generation's own
+        recorded phase plan, falling back to the current config's phase names
+        when no represented summary exists — it is the plan the publication's
+        winners must be enumerated under, and equals the ``phases`` list's
+        names whenever the config has not been edited since.
         ``published_config_matches_current`` compares the summary's recorded
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
@@ -612,9 +637,9 @@ def read_result(
     separate :func:`read_winners`: two pointer resolutions could describe two
     different publications. Winners are enumerated under the status payload's
     ``result_phase_plan``, so a phase renamed since publication neither hides
-    its published winner nor reports the new name as missing (review v0.5.16 /
-    blocker 4). A published generation's winners are the bytes publication
-    validation read; any other represented generation is read permissively.
+    its published winner nor reports the new name as missing. A published
+    generation's winners are the bytes publication validation read; any other
+    represented generation is read permissively.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional generation to represent, as for
@@ -696,9 +721,9 @@ def _read_status(
     # The represented generation's winner/summary facts are historical
     # evidence, so the metric they are reported under must be the one that
     # generation actually optimized — never the metric the config supplied
-    # today (review v0.5.16 / blocker 4). The generation's own summary is the
-    # source of that interpretation; only when it records none does the
-    # current config describe the result.
+    # today. The generation's own summary is the source of that
+    # interpretation; only when it records none does the current config
+    # describe the result.
     comparison = comparison_experiment or experiment
     metric_payload = _metric_semantics_payload(comparison.metric)
     result_phase_plan = [phase.name for phase in experiment.phases]
@@ -805,6 +830,7 @@ def _read_status(
                             "trial_number": attempt.trial_number,
                             "generation_id": attempt.generation_id,
                             "attempt_id": attempt.attempt_id,
+                            "recovers_as": attempt.recovers_as,
                         }
                         for attempt in stats.running_attempts
                     ]
@@ -816,3 +842,189 @@ def _read_status(
         "summary_present": summary_present,
     }
     return status, publication
+
+
+@dataclass(frozen=True)
+class TrialTable:
+    """One phase's trials as table rows, in trial-number order.
+
+    ``columns`` lists the keys every row carries, in display order: ``trial``,
+    ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
+    repeats phase, one ``observed:<name>`` per report-only value any trial
+    recorded, and ``winner``. ``state`` is the Optuna state, except that a
+    COMPLETE trial that violated a constraint or a metric bound reads
+    ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
+    winner stands on and empty elsewhere.
+    """
+
+    phase: str
+    #: ``False`` when the phase's trials could not be read; the rows are then empty.
+    available: bool
+    columns: tuple[str, ...]
+    rows: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
+class TrialTables:
+    """Every configured phase's trial table, from one publication resolution."""
+
+    experiment: str
+    #: The generation whose winners are marked, or ``None`` when nothing validates as published.
+    published_generation_id: str | None
+    publication_integrity: PublicationState
+    #: Validation diagnostic beside a ``failed`` or ``permission_denied`` integrity.
+    publication_error: str | None
+    phases: tuple[TrialTable, ...]
+
+
+def _recorded_number(value: object) -> float | None:
+    """Return a recorded user-attr number, or ``None`` when it is not one.
+
+    :param object value: A trial user-attr value.
+    :return float | None: The value as a float, or ``None`` for anything but a real number.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+#: Columns every trial table starts with, as ``(header, getter)`` pairs.
+_CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
+    ("trial", lambda trial: trial.number),
+    ("state", _trial_state_label),
+    ("value", lambda trial: trial.value),
+    ("params", lambda trial: dict(trial.params)),
+    ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
+)
+_REPEAT_GROUP_COLUMN = "repeat_group"
+_RERUN_OF_COLUMN = "rerun_of"
+_WINNER_COLUMN = "winner"
+
+
+def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
+    """Map the trial numbers a published winner stands on to the attempt each must carry.
+
+    A repeats winner stands on every member of its group; its scalar fields
+    name the highest-numbered member, so only that member's attempt is known
+    from the path-free view and the others are matched by number alone.
+
+    :param PhaseWinnerView | None winner: The phase's published winner, if any.
+    :return dict[int, str | None]: Attempt id to require by trial number, ``None`` where unchecked.
+    """
+    if winner is None:
+        return {}
+    standing: dict[int, str | None] = {winner.trial_number: winner.attempt_id}
+    if winner.repeats is not None:
+        for number in winner.repeats["member_trials"]:
+            standing.setdefault(number, None)
+    return standing
+
+
+def _trial_table(
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    winner: PhaseWinnerView | None,
+    *,
+    available: bool = True,
+) -> TrialTable:
+    """Build one phase's table from its trials and the winner the publication holds for it.
+
+    A ``rerun_of`` column, naming the interrupted trial each rerun reran, appears
+    once the phase holds a rerun.
+
+    :param Phase phase: The configured phase the trials belong to.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
+    :param PhaseWinnerView | None winner: The published winner for the phase, if any.
+    :param bool available: ``False`` when the trials could not be read, so ``trials`` is empty.
+    :return TrialTable: The rows and the columns they carry.
+    """
+    axis = repeat_axis(phase)
+    positions = _draw_positions(trials)
+    groups = (
+        {}
+        if axis is None
+        else group_labels(((t.number, positions[t.number], t.params) for t in trials), axis)
+    )
+    observed = sorted(
+        {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
+    )
+    reruns = any(RERUN_OF_ATTR in t.user_attrs for t in trials)
+    columns = (
+        *(header for header, _ in _CORE_TRIAL_COLUMNS),
+        *([] if axis is None else [_REPEAT_GROUP_COLUMN]),
+        *([_RERUN_OF_COLUMN] if reruns else []),
+        *observed,
+        _WINNER_COLUMN,
+    )
+    standing = _winning_trials(winner)
+    rows: list[JsonObject] = []
+    for trial in trials:
+        row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}
+        if axis is not None:
+            row[_REPEAT_GROUP_COLUMN] = groups.get(trial.number)
+        if reruns:
+            row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
+        for name in observed:
+            row[name] = _recorded_number(trial.user_attrs.get(name))
+        attempt = standing.get(trial.number)
+        marked = trial.number in standing and (
+            attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
+        )
+        row[_WINNER_COLUMN] = "*" if marked else ""
+        rows.append(row)
+    return TrialTable(phase=phase.name, available=available, columns=columns, rows=tuple(rows))
+
+
+def read_trial_tables(experiment: Experiment) -> TrialTables:
+    """Read every configured phase's trials as table rows, writing nothing.
+
+    Built on :func:`phasesweep.engine.ledger.validate_ledger` and
+    :func:`phasesweep.engine.ledger.read_phase_trials`, so it creates no study,
+    constructs no file-backed storage, and writes no byte. The publication
+    pointer is resolved once, before the trials are read, and the winner marks
+    come from that resolution. They therefore name the published generation's
+    winners, which is not the winner of a rerun that has not published yet. A
+    phase with no study, and every phase of an in-memory ledger, has no rows. A
+    phase whose trials cannot be read is reported unavailable instead of empty.
+
+    :param Experiment experiment: Parsed experiment config whose phases are read.
+    :raises ArtifactRootConflictError: The artifact root cannot be read or is bound to another ledger.
+    :raises StudySchemaMismatchError: A phase's study is populated under an unsupported schema.
+    :return TrialTables: One table per configured phase, in declaration order.
+    """
+    ledger = validate_ledger(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    published_generation_id = _published_generation_id(publication)
+    winners = {
+        view.phase: view
+        for view in _represented_winners(
+            experiment,
+            publication,
+            published_generation_id,
+            [phase.name for phase in experiment.phases],
+        )
+    }
+    tables: list[TrialTable] = []
+    for phase in experiment.phases:
+        try:
+            read = read_phase_trials(ledger, phase)
+        except StudyStorageUnavailableError as exc:
+            cause = exc.__cause__ or exc
+            log.warning(
+                "could not read trial data from storage %s for phase %s: %s: %s",
+                ledger.storage_url,
+                phase.name,
+                type(cause).__name__,
+                cause,
+            )
+            tables.append(_trial_table(phase, [], None, available=False))
+            continue
+        trials = [] if read is None else read.trials
+        tables.append(_trial_table(phase, trials, winners.get(phase.name)))
+    return TrialTables(
+        experiment=experiment.experiment,
+        published_generation_id=published_generation_id,
+        publication_integrity=publication.state,
+        publication_error=publication.error,
+        phases=tuple(tables),
+    )

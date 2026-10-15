@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -37,8 +38,15 @@ from phasesweep.engine.paths import (
     _summary_path,
     _winner_path,
 )
-from phasesweep.engine.state import Winner, WinnerSource
+from phasesweep.engine.repeats import RepeatMember, spread
+from phasesweep.engine.state import (
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+    Winner,
+    WinnerSource,
+)
 from phasesweep.mcp import runner as mcp_runner
+from phasesweep.mcp.snapshots import RunResultSnapshot
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -272,8 +280,8 @@ def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) ->
     """A missing per-generation record must not fail the snapshot capture.
 
     The engine writes that record as an optional post-commit diagnostic; a
-    capture that hard-required it contradicted engine-defined success
-    whenever the best-effort write had failed (review v0.5.16 / blocker 2).
+    capture that hard-required it would contradict engine-defined success
+    whenever the best-effort write had failed.
     """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     mark_current_format(experiment)
@@ -321,7 +329,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
 
     phase = finalized["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert phase["generation_trials"] == {}
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
@@ -335,8 +343,7 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     """Unavailable trial storage freezes explicit flags without a redundant study read.
 
     ``running_attempts`` is ``None`` rather than ``[]`` here: nothing was read,
-    so an empty list would claim there are no RUNNING rows (PR #5 review /
-    reviewer 2, blocker 6).
+    so an empty list would claim there are no RUNNING rows.
     """
     storage = None
     if storage_kind == "corrupt-journal":
@@ -500,13 +507,12 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
 ) -> None:
     """A successful run's result is frozen even if studies became unloadable.
 
-    PR #5 review / reviewer 2, blocker 6: the capture used to reread every
-    phase study after ``read_status`` to collect RUNNING rows, with no
-    tolerance for failure. One transient lock in that millisecond-wide window
-    failed the capture, and a terminal snapshot that was never captured is
-    unrecoverable by design -- so a completed run's frozen result was lost to
-    storage flakiness that the tolerant status read itself shrugs off. The
-    fatal read simply no longer happens.
+    The capture collects RUNNING rows from the tolerant ``read_status`` read
+    instead of rereading every phase study afterwards. A reread would have no
+    tolerance for failure: one transient lock in that millisecond-wide window
+    would fail the capture, and a terminal snapshot that was never captured is
+    unrecoverable by design -- so a completed run's frozen result would be
+    lost to storage flakiness that the tolerant status read itself shrugs off.
 
     The one tolerant read replays a journal snapshot through ``optuna.load_study``,
     so exactly one load succeeds and any reload after it fails.
@@ -571,7 +577,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'studies.journal'}",
-        phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                sampler=SEEDED_RANDOM,
+                search_space={"x": {"type": "int", "low": 0, "high": 9}},
+            )
+        ],
     )
     journal = _resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
@@ -579,8 +592,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
+    # Its objective recorded a failure before the orchestrator died, so recovery keeps it.
+    identified.set_user_attr(
+        TRIAL_OUTCOME_ATTR,
+        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+    )
     # A RUNNING row written before attempt identity existed: reported with
-    # null identity, never dropped, so the counts and the list agree.
+    # null identity, never dropped, so the counts and the list agree. It
+    # recorded nothing, so recovery records it as interrupted.
     study.ask()
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -596,8 +615,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
             "trial_number": 0,
             "generation_id": "current-generation",
             "attempt_id": "current-attempt",
+            "recovers_as": "FAIL",
         },
-        {"trial_number": 1, "generation_id": None, "attempt_id": None},
+        {
+            "trial_number": 1,
+            "generation_id": None,
+            "attempt_id": None,
+            "recovers_as": "INTERRUPTED",
+        },
     ]
 
     finalized = mcp_runner.finalize_result_snapshot(
@@ -609,7 +634,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     assert finalized_phase["trials"] == {"RUNNING": 1, "FAIL": 1}
     assert finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
     assert finalized_phase["running_attempts"] == [
-        {"trial_number": 1, "generation_id": None, "attempt_id": None}
+        {"trial_number": 1, "generation_id": None, "attempt_id": None, "recovers_as": "INTERRUPTED"}
     ]
 
     fully_finalized = mcp_runner.finalize_result_snapshot(
@@ -621,7 +646,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     )
 
     fully_finalized_phase = fully_finalized["status"]["phases"][0]
-    assert fully_finalized_phase["trials"] == {"RUNNING": 0, "FAIL": 2}
+    assert fully_finalized_phase["trials"] == {"RUNNING": 0, "FAIL": 1, "INTERRUPTED": 1}
     assert fully_finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
     assert fully_finalized_phase["running_attempts"] == []
 
@@ -672,6 +697,104 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     }
 
 
+def test_snapshot_freezes_observed_values(tmp_path: Path) -> None:
+    """A winner's report-only values are frozen with it and come back out of the stored view."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = Winner(
+        trial_number=0,
+        params={"x": 3},
+        effective_overrides={"x": 3},
+        metric=0.25,
+        completion={"incomplete": False},
+        generation_id="engine-generation",
+        attempt_id="engine-attempt",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=0,
+            generation_id="engine-generation",
+            attempt_id="engine-attempt",
+        ),
+        confound=single_trial_confound(0),
+        observed={"peak": 7.5, "steps": 3.0},
+    )
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="engine-generation",
+        engine_winners={"p": winner},
+    )
+
+    (frozen,) = snapshot["winners"]
+    assert frozen["observed"] == {"peak": 7.5, "steps": 3.0}
+    assert frozen["repeats"] is None
+    stored = RunResultSnapshot.model_validate(snapshot)
+    assert [view.observed for view in stored.winner_views()] == [{"peak": 7.5, "steps": 3.0}]
+
+
+def test_snapshot_freezes_the_repeats_summary_without_config_strings(tmp_path: Path) -> None:
+    """A group winner's spread is frozen; the repeat key and member identities are not."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+
+    def member(number: int, seed: int, metric: float) -> RepeatMember:
+        return {
+            "trial_number": number,
+            "repeat": seed,
+            "metric": metric,
+            "generation_id": "engine-generation",
+            "attempt_id": f"attempt-{number}",
+            "objective_provenance": {"schema_version": 1},
+            "trainer_input": {"schema_version": 1},
+            "constraints": {},
+            "observed": {},
+        }
+
+    winner = Winner(
+        trial_number=5,
+        params={"x": 3},
+        effective_overrides={"x": 3},
+        metric=0.3,
+        completion={"incomplete": False},
+        generation_id="engine-generation",
+        attempt_id="attempt-5",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=5,
+            generation_id="engine-generation",
+            attempt_id="attempt-5",
+        ),
+        confound=single_trial_confound(5),
+        repeats={
+            "key": "trainer.secret_seed_name",
+            "reduce": "median",
+            "spread": spread([0.2, 0.3, 0.7]),
+            "members": [member(3, 0, 0.2), member(4, 1, 0.3), member(5, 2, 0.7)],
+        },
+    )
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="engine-generation",
+        engine_winners={"p": winner},
+    )
+
+    (frozen,) = snapshot["winners"]
+    expected = {
+        "reduce": "median",
+        "n": 3,
+        "mean": pytest.approx(0.4),
+        "sd": pytest.approx(statistics.stdev([0.2, 0.3, 0.7])),
+        "min": 0.2,
+        "max": 0.7,
+        "member_trials": [3, 4, 5],
+    }
+    assert frozen["repeats"] == expected
+    assert "secret_seed_name" not in json.dumps(snapshot)
+    (view,) = RunResultSnapshot.model_validate(snapshot).winner_views()
+    assert view.repeats == expected
+
+
 @pytest.mark.parametrize("from_phase", [None, "b"])
 @pytest.mark.integration
 def test_failed_fingerprint_preflight_preserves_published_results(
@@ -683,9 +806,8 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     The current-generation pointer legitimately moves to this new (failed)
     invocation -- a new invocation always overwrites it starting from
     "preflighting", and every outcome path must drive it to a terminal state
-    (review v0.5.15 / blocker 3) -- but the convenience root projections and,
-    critically, the last-success pointer stay exactly as the prior successful
-    publication left them.
+    -- but the convenience root projections and, critically, the last-success
+    pointer stay exactly as the prior successful publication left them.
     """
     phases = [
         Phase(
@@ -745,8 +867,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     # will succeed). published_generation_id is always the actual validated
     # last-success pointer -- the *first* (successful) run here -- never
     # forced to equal the pinned generation_id, even though this pinned
-    # capture's own represented_generation_id is that failed generation
-    # (review v0.5.15 / blocker 3, defect 2: "pinned reads lie").
+    # capture's own represented_generation_id is that failed generation.
     assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
     assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
     assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]

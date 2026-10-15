@@ -28,6 +28,7 @@ from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.repeats import ReduceName, ranked_group
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -39,11 +40,11 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
+from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_constant_trainer
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
 _FAIL = optuna.trial.TrialState.FAIL
-_PRUNED = optuna.trial.TrialState.PRUNED
 _RUNNING = optuna.trial.TrialState.RUNNING
 
 
@@ -137,6 +138,11 @@ def _log_regex() -> dict[str, Any]:
         "recorded_at": "2026-01-01T00:00:00+00:00",
         "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},
     }
+
+
+def _json() -> JsonObject:
+    """Return a current-format ``json`` objective provenance record."""
+    return {**_log_regex(), "extractor": {"kind": "json", "config_sha256": "0" * 64}}
 
 
 def _trials(*specs: tuple[optuna.trial.TrialState, float | None, int]) -> list[Any]:
@@ -248,10 +254,25 @@ def test_evaluation_point_disagreement_is_heterogeneous(
     assert f"2 distinct {axis} values ({values})" in _describe_flagged(block)[0]
 
 
+_BINDING_TEXT = (
+    "json_envelope (report_objective), wandb (evaluation_axis) or mlflow (selected step) "
+    "would bind one"
+)
+
+
 @pytest.mark.parametrize(
     ("records", "reason"),
     [
-        pytest.param(None, "log_regex objectives report no evaluation position", id="log_regex"),
+        pytest.param(
+            None,
+            f"log_regex objectives report no evaluation position; {_BINDING_TEXT}",
+            id="log_regex",
+        ),
+        pytest.param(
+            {number: _json() for number in range(3)},
+            f"json objectives report no evaluation position; {_BINDING_TEXT}",
+            id="json",
+        ),
         pytest.param(
             {0: _wandb(1000), 1: _wandb(None), 2: _wandb(None)},
             "trial(s) 1, 2 recorded no eval/step position",
@@ -270,24 +291,37 @@ def test_evaluation_point_is_not_checked_without_every_position(
     assert reason in check["reason"]
 
 
+def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
+    """A flagged position is expected when the search space changes training length."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
+    block = _assess(trials, trials, provenance={0: _envelope(step=400), 1: _envelope(step=1000)})
+
+    (line,) = _describe_flagged(block)
+
+    assert "2 distinct step values (400, 1000)" in line
+    assert line.endswith(
+        "Expected when this phase's search space changes training length "
+        "(for example epochs or max_steps); otherwise the trials were not trained to one budget"
+    )
+
+
 @pytest.mark.parametrize(
-    ("ranked", "infeasible", "failed", "pruned", "verdict"),
+    ("ranked", "infeasible", "failed", "verdict"),
     [
-        pytest.param(1, 0, 1, 0, "heterogeneous", id="last-standing"),
-        pytest.param(2, 0, 1, 1, "heterogeneous", id="half-failed-or-pruned"),
-        pytest.param(3, 0, 1, 1, "ok", id="majority-ranked"),
+        pytest.param(1, 0, 1, "heterogeneous", id="last-standing"),
+        pytest.param(2, 0, 2, "heterogeneous", id="half-failed"),
+        pytest.param(3, 0, 2, "ok", id="majority-ranked"),
         # Constraints define what may win; excluding by them is no bias.
-        pytest.param(2, 5, 1, 0, "ok", id="minority-feasible"),
-        pytest.param(1, 0, 0, 0, "ok", id="single-trial"),
+        pytest.param(2, 5, 1, "ok", id="minority-feasible"),
+        pytest.param(1, 0, 0, "ok", id="single-trial"),
     ],
 )
 def test_survivorship_flags_failures_at_least_matching_the_ranked(
-    ranked: int, infeasible: int, failed: int, pruned: int, verdict: str
+    ranked: int, infeasible: int, failed: int, verdict: str
 ) -> None:
     specs = (
         [(_COMPLETE, 0.5 + index, index) for index in range(ranked + infeasible)]
         + [(_FAIL, None, 50 + index) for index in range(failed)]
-        + [(_PRUNED, None, 70 + index) for index in range(pruned)]
         + [(_RUNNING, None, 99)]
     )
     trials = _trials(*specs)
@@ -295,16 +329,25 @@ def test_survivorship_flags_failures_at_least_matching_the_ranked(
 
     assert block["checks"]["survivorship"] == {
         "verdict": verdict,
-        "detail": {"ranked": ranked, "infeasible": infeasible, "failed": failed, "pruned": pruned},
+        "detail": {
+            "ranked": ranked,
+            "infeasible": infeasible,
+            "incomplete_group": 0,
+            "failed": failed,
+        },
     }
     assert block["ranked_trials"] == list(range(ranked))
+    assert block["ranked_groups"] is None
 
 
 def test_tie_between_distinct_params_is_heterogeneous() -> None:
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_COMPLETE, 0.9, 3))
     block = _assess(trials, trials)
 
-    assert block["checks"]["tie"] == {"verdict": "heterogeneous", "detail": {"tied_trials": [1]}}
+    assert block["checks"]["tie"] == {
+        "verdict": "heterogeneous",
+        "detail": {"tied_trials": [1], "within_noise": None},
+    }
     assert "trial(s) 1 matched" in _describe_flagged(block)[0]
 
 
@@ -312,7 +355,235 @@ def test_tie_between_repeats_of_one_config_is_ok() -> None:
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 1))
     block = _assess(trials, trials)
 
-    assert block["checks"]["tie"] == {"verdict": "ok", "detail": {"tied_trials": []}}
+    assert block["checks"]["tie"] == {
+        "verdict": "ok",
+        "detail": {"tied_trials": [], "within_noise": None},
+    }
+
+
+def _seeded_trials(
+    *specs: tuple[optuna.trial.TrialState, float | None, int, int],
+) -> list[optuna.trial.FrozenTrial]:
+    """Build numbered frozen trials from ``(state, value, x, seed)`` specs."""
+    study = optuna.create_study()
+    for state, value, x, seed in specs:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=state,
+                value=value,
+                params={"x": x, "seed": seed},
+                distributions={
+                    "x": optuna.distributions.IntDistribution(0, 100),
+                    "seed": optuna.distributions.CategoricalDistribution([0, 1, 2]),
+                },
+            )
+        )
+    return study.get_trials(deepcopy=False)
+
+
+def _assess_groups(
+    trials: list[optuna.trial.FrozenTrial],
+    groups: list[list[int]],
+    *,
+    incomplete: tuple[int, ...] = (),
+    reduce: ReduceName = "mean",
+) -> dict[str, object]:
+    """Assess complete repeat groups by ``reduce``, the lowest aggregate winning as minimize does."""
+    by_number = {trial.number: trial for trial in trials}
+    ranked_groups = [
+        ranked_group(
+            [(number, float(by_number[number].value or 0.0)) for number in members],
+            {"x": by_number[members[0]].params["x"]},
+            reduce,
+        )
+        for members in groups
+    ]
+    best = min(ranked_groups, key=lambda group: (group.aggregate, group.numbers[0]))
+    ranked = [by_number[number] for members in groups for number in members]
+    return _assess_population(
+        trials,
+        ranked,
+        by_number[best.representative],
+        provenance={trial.number: _log_regex() for trial in ranked},
+        groups=ranked_groups,
+        incomplete_group=incomplete,
+    )
+
+
+def test_repeats_tie_flags_groups_within_noise() -> None:
+    """A group whose mean sits within two standard errors of the winner's is flagged."""
+    trials = _seeded_trials(
+        (_COMPLETE, 0.50, 1, 0),
+        (_COMPLETE, 0.60, 1, 1),
+        (_COMPLETE, 0.52, 2, 0),
+        (_COMPLETE, 0.62, 2, 1),
+        (_COMPLETE, 0.90, 3, 0),
+        (_COMPLETE, 0.91, 3, 1),
+    )
+    block = _assess_groups(trials, [[0, 1], [2, 3], [4, 5]])
+
+    assert block["ranked_groups"] == [[0, 1], [2, 3], [4, 5]]
+    assert block["checks"]["tie"] == {
+        "verdict": "heterogeneous",
+        "detail": {"tied_trials": [], "within_noise": [3]},
+    }
+    assert _validate_confound_block(block, winner_trial=1) == block
+    (line,) = _describe_flagged(block)
+    assert "repeat group(s) ending at trial(s) 3 are within two standard errors" in line
+    assert _confound_summary(block, winner_trial=1)["tie"] == {
+        "verdict": "heterogeneous",
+        "tied_trials": 0,
+        "within_noise": 1,
+    }
+
+
+def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> None:
+    trials = _seeded_trials(
+        (_COMPLETE, 0.5, 1, 0),
+        (_COMPLETE, 0.5, 1, 1),
+        (_COMPLETE, 0.5, 2, 0),
+        (_COMPLETE, 0.5, 2, 1),
+    )
+    tied = _assess_groups(trials, [[0, 1], [2, 3]])
+    assert tied["checks"]["tie"]["detail"] == {"tied_trials": [3], "within_noise": [3]}
+    assert "lowest draw position won" in _describe_flagged(tied)[0]
+
+    clear = _seeded_trials(
+        (_COMPLETE, 0.50, 1, 0),
+        (_COMPLETE, 0.51, 1, 1),
+        (_COMPLETE, 0.90, 2, 0),
+        (_COMPLETE, 0.91, 2, 1),
+    )
+    block = _assess_groups(clear, [[0, 1], [2, 3]])
+    assert block["checks"]["tie"] == {
+        "verdict": "ok",
+        "detail": {"tied_trials": [], "within_noise": []},
+    }
+
+
+def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_error() -> None:
+    """Equal medians are an exact tie under the median reducer, and the SD still sets within_noise."""
+    trials = _seeded_trials(
+        (_COMPLETE, 1.0, 1, 0),
+        (_COMPLETE, 1.0, 1, 1),
+        (_COMPLETE, 1.0, 1, 2),
+        (_COMPLETE, 1.0, 2, 0),
+        (_COMPLETE, 1.0, 2, 1),
+        (_COMPLETE, 3.0, 2, 2),
+    )
+    groups = [[0, 1, 2], [3, 4, 5]]
+
+    median = _assess_groups(trials, groups, reduce="median")
+    assert median["checks"]["tie"]["detail"] == {"tied_trials": [5], "within_noise": [5]}
+    assert _validate_confound_block(median, winner_trial=2) == median
+    mean = _assess_groups(trials, groups)
+    assert mean["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": [5]}
+
+
+def test_repeats_single_group_leaves_tie_unchecked() -> None:
+    """One group is one unit: there is nothing to tie with, though its members compare."""
+    trials = _seeded_trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
+    block = _assess_groups(trials, [[0, 1]])
+
+    assert block["checks"]["tie"] == {
+        "verdict": "n/a",
+        "reason": "only one repeat group was ranked",
+    }
+    assert _validate_confound_block(block, winner_trial=1) == block
+    assert _confound_summary(block, winner_trial=1)["tie"] == {
+        "verdict": "n/a",
+        "tied_trials": None,
+        "within_noise": None,
+    }
+
+
+def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
+    """A feasible trial whose group never completed is not an infeasible one."""
+    trials = _seeded_trials(
+        (_COMPLETE, 0.5, 1, 0),
+        (_COMPLETE, 0.6, 1, 1),
+        (_COMPLETE, 0.4, 2, 0),
+        (_FAIL, None, 2, 1),
+        (_COMPLETE, 0.9, 3, 0),
+        (_COMPLETE, 9.9, 3, 1),
+    )
+    # Trial 5 broke a bound, so trial 4 is a feasible member of an incomplete group.
+    block = _assess_groups(trials, [[0, 1]], incomplete=(2, 4))
+
+    assert block["checks"]["survivorship"] == {
+        "verdict": "ok",
+        "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1},
+    }
+    assert _validate_confound_block(block, winner_trial=1) == block
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "error"),
+    [
+        pytest.param(("ranked_groups",), [[0, 1, 2], [3, 4]], "one size", id="uneven-groups"),
+        pytest.param(("ranked_groups",), [[4, 5], [0, 1], [2, 3]], "ordered", id="group-order"),
+        pytest.param(("ranked_groups",), [[0, 1], [2, 3]], "cover each ranked", id="lost-group"),
+        pytest.param(("ranked_groups",), [[0], [1]], "at least two", id="singleton-groups"),
+        pytest.param(("ranked_groups",), [], "neither null", id="empty-groups"),
+        pytest.param(
+            ("checks", "tie"),
+            {"verdict": "ok", "detail": {"tied_trials": [], "within_noise": None}},
+            "no within_noise",
+            id="noise-null",
+        ),
+        pytest.param(
+            ("checks", "tie", "detail", "within_noise"), [2], "last member", id="noise-first"
+        ),
+        pytest.param(
+            ("checks", "tie", "detail", "within_noise"), [1], "tying with itself", id="noise-self"
+        ),
+        pytest.param(
+            ("checks", "tie"),
+            {"verdict": "heterogeneous", "detail": {"tied_trials": [3], "within_noise": []}},
+            "within_noise omits",
+            id="tie-outside-noise",
+        ),
+    ],
+)
+def test_validator_rejects_malformed_repeat_groups(
+    path: tuple[str, ...], value: object, error: str
+) -> None:
+    trials = _seeded_trials(
+        (_COMPLETE, 0.50, 1, 0),
+        (_COMPLETE, 0.60, 1, 1),
+        (_COMPLETE, 0.52, 2, 0),
+        (_COMPLETE, 0.62, 2, 1),
+        (_COMPLETE, 0.90, 3, 0),
+        (_COMPLETE, 0.91, 3, 1),
+    )
+    block = _assess_groups(trials, [[0, 1], [2, 3], [4, 5]])
+    assert _validate_confound_block(block, winner_trial=1) == block
+    with pytest.raises(ValueError, match=error):
+        _validate_confound_block(_mutated(path, value, block), winner_trial=1)
+
+
+def test_validator_requires_the_winner_to_name_its_group() -> None:
+    """The highest-numbered member names a group; a lower member is not a winner."""
+    trials = _seeded_trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
+    block = _assess_groups(trials, [[0, 1]])
+    with pytest.raises(ValueError, match="no group whose last member is the winner, trial 0"):
+        _validate_confound_block(block, winner_trial=0)
+
+
+def test_validator_refuses_group_evidence_without_repeat_groups() -> None:
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
+    noisy = _mutated(
+        ("checks", "tie"),
+        {"verdict": "heterogeneous", "detail": {"tied_trials": [], "within_noise": [0]}},
+        _assess(trials, trials),
+    )
+    with pytest.raises(ValueError, match="within_noise groups without repeat groups"):
+        _validate_confound_block(noisy, winner_trial=1)
+    counted = _mutated(
+        ("checks", "survivorship", "detail", "incomplete_group"), 1, _assess(trials, trials)
+    )
+    with pytest.raises(ValueError, match="incomplete_group trials without repeats"):
+        _validate_confound_block(counted, winner_trial=1)
 
 
 def test_assessed_block_survives_yaml_and_validation_unchanged() -> None:
@@ -342,7 +613,9 @@ def _mutated(
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        pytest.param(("schema_version",), 2, id="schema-version"),
+        pytest.param(("schema_version",), 1, id="schema-version"),
+        pytest.param(("ranked_groups",), ..., id="missing-ranked-groups"),
+        pytest.param(("checks", "tie", "detail", "within_noise"), ..., id="tie-without-noise"),
         pytest.param(("schema_version",), True, id="schema-version-bool"),
         pytest.param(("ranked_trials",), [1, 0], id="ranked-unsorted"),
         pytest.param(("ranked_trials",), [], id="ranked-empty"),
@@ -480,10 +753,10 @@ def test_summary_keeps_only_verdicts_and_numbers() -> None:
             "verdict": "ok",
             "ranked": 2,
             "infeasible": 0,
+            "incomplete_group": 0,
             "failed": 1,
-            "pruned": 0,
         },
-        "tie": {"verdict": "heterogeneous", "tied_trials": 1},
+        "tie": {"verdict": "heterogeneous", "tied_trials": 1, "within_noise": None},
     }
     rendered = json.dumps(summary)
     assert "/abs/ckpt.pt" not in rendered
@@ -499,7 +772,7 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
         "distinct_values": None,
         "winner_value": None,
     }
-    assert summary["tie"] == {"verdict": "n/a", "tied_trials": None}
+    assert summary["tie"] == {"verdict": "n/a", "tied_trials": None, "within_noise": None}
 
 
 def test_validator_rejects_an_absent_block() -> None:
@@ -552,10 +825,20 @@ def _candidate_attrs(number: int, provenance: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _seeded_phase(*, n_trials: int) -> Phase:
+    """Return phase ``p`` sampling the ``x`` the hand-built trials record."""
+    return Phase(
+        name="p",
+        n_trials=n_trials,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+
+
 def test_selection_records_the_block_and_logs_each_flagged_check(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    experiment = make_experiment(phases=[Phase(name="p", n_trials=3)])
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=3)])
     study = optuna.create_study(direction="minimize")
     for number, (value, step) in enumerate([(0.2, 1000), (0.3, 400)]):
         study.add_trial(
@@ -583,12 +866,12 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
-    assert "2 failed and 0 pruned trials against 2 ranked" in warnings[0]
+    assert "2 failed trials against 2 ranked" in warnings[0]
 
 
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
     """Confound verdicts are advisory: a losing trial's bad record cannot fail selection."""
-    experiment = make_experiment(phases=[Phase(name="p", n_trials=2)])
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=2)])
     study = optuna.create_study(direction="minimize")
     for number, value in enumerate([0.2, 0.9]):
         attrs = _candidate_attrs(number, _envelope())
@@ -633,7 +916,10 @@ def test_published_block_is_manifest_covered(tmp_path: Path) -> None:
     block = _validate_confound_block(payload["confound"], winner_trial=payload["trial_number"])
     assert _flagged_checks(block) == ["tie"]
 
-    payload["confound"]["checks"]["tie"] = {"verdict": "ok", "detail": {"tied_trials": []}}
+    payload["confound"]["checks"]["tie"] = {
+        "verdict": "ok",
+        "detail": {"tied_trials": [], "within_noise": None},
+    }
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
     assert _resolve_publication_pointer(experiment).state == "failed"
@@ -656,7 +942,10 @@ def test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population(
     assert second["winner_source"] == first["winner_source"]
     assert first["confound"]["ranked_trials"] == [0, 1]
     assert second["confound"]["ranked_trials"] == [0, 1, 2]
-    assert second["confound"]["checks"]["tie"]["detail"] == {"tied_trials": [1, 2]}
+    assert second["confound"]["checks"]["tie"]["detail"] == {
+        "tied_trials": [1, 2],
+        "within_noise": None,
+    }
 
 
 def _inheritance_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

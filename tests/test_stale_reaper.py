@@ -20,6 +20,7 @@ import pytest
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import (
     Experiment,
+    IntParam,
     Phase,
     Sampler,
 )
@@ -36,7 +37,7 @@ from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
     _PreflightCleanupReport,
-    _record_stale_trial_failure,
+    _record_stale_trial_outcome,
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
@@ -50,10 +51,11 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
@@ -90,6 +92,9 @@ from tests.recovery_helpers import (
     stamp_artifact_root,
     write_trial_identity,
 )
+
+#: A PID namespace recorded with a fabricated identity whose cleanup is stubbed or settled by boot.
+_RECORDED_NAMESPACE = "pid:[4026539001]@100"
 
 
 def test_read_proc_starttime_self():
@@ -179,8 +184,8 @@ def _claimed_over(
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
-    Previously, _verify_fingerprint raised before _reap_stale_trials could run,
-    leaving the prior orchestrator's training process holding the GPU.
+    If _verify_fingerprint raised before _reap_stale_trials could run, the
+    prior orchestrator's training process would keep holding the GPU.
     """
     storage = f"journal:///{tmp_path / 'p.journal'}"
 
@@ -212,7 +217,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         # Don't actually call the real reaper; just mark FAIL.
         for t_ in args[0].get_trials(deepcopy=False):
             if t_.state == optuna.trial.TrialState.RUNNING:
-                _record_stale_trial_failure(args[0], t_)
+                _record_stale_trial_outcome(args[0], t_)
                 args[0].tell(t_.number, state=optuna.trial.TrialState.FAIL)
         return 1
 
@@ -239,7 +244,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     stamp_artifact_root(study, exp)
     identity = _environment_identity(exp, "a")
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-    t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    t.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
     claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
 
     # Will raise on fingerprint mismatch, but reap must have run first.
@@ -284,7 +289,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
                 name="b",
                 n_trials=2,
                 sampler=Sampler(type="random", seed=0),
-                search_space={},
+                search_space={"x": IntParam(type="int", low=0, high=10)},
             ),
         ],
     )
@@ -700,6 +705,7 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         pgid=12345,
         proc_starttime=111,
         boot_id="old-boot",
+        pid_namespace=_RECORDED_NAMESPACE,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
@@ -722,8 +728,10 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         pgid=12345,
         proc_starttime=None,
         boot_id=None,
+        pid_namespace=_RECORDED_NAMESPACE,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: None)
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: _RECORDED_NAMESPACE)
 
     assert cleanup_stale_trial_process(identity) is False
 
@@ -958,11 +966,16 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
         study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
     )
     trials = study.get_trials(deepcopy=False)
+    # Each interrupted allocation reruns: the second run popped the first's
+    # rerun before dying, and the last run reruns that one before two new draws.
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
     ]
+    assert [trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials] == [None, 0, 1, None, None]
     identity = _environment_identity(exp, "p")
     assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
 
@@ -1033,7 +1046,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
 @pytest.mark.parametrize(
     ("failure_site", "match"),
     [
-        pytest.param("outcome", "durable failure outcome could not be recorded", id="outcome"),
+        pytest.param("outcome", "durable interrupted outcome could not be recorded", id="outcome"),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
         pytest.param("tell", "Optuna state could not be updated", id="tell"),
     ],
@@ -1059,6 +1072,7 @@ def test_reaper_reports_storage_failures_after_cleanup(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
+            pid_namespace=_RECORDED_NAMESPACE,
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
@@ -1094,10 +1108,10 @@ def test_reaper_reports_storage_failures_after_cleanup(
 def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
     """A worker killed while queued for a GPU leaves 'allocated' and no identity.
 
-    Recovery used to treat the missing process identity as unverifiable
-    cleanup and fail closed forever (review v0.5.17 / blocker 2 gap A). The
-    durable 'allocated' marker proves no process was ever created, so the
-    stale trial is failed safely and the study unwedges.
+    Recovery must not treat the missing process identity as unverifiable
+    cleanup and fail closed forever. The durable 'allocated' marker proves no
+    process was ever created, so the stale trial is failed safely and the
+    study unwedges.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
@@ -1127,8 +1141,7 @@ def test_exited_attempt_recovers_without_signalling(
     """A crash between process exit and the Optuna commit recovers via 'exited'.
 
     The retained identity plus the durable 'exited' transition prove the group
-    is gone; recovery must fail the trial without sending any signal (review
-    v0.5.17 / blocker 2 gap B).
+    is gone; recovery must fail the trial without sending any signal.
     """
     exp = make_experiment(
         experiment="exited",
@@ -1672,10 +1685,10 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
     """The attempt registry finds stale work whose phase left the config.
 
-    Reviewer repro (review v0.5.17 / blocker 3): kill the orchestrator while a
-    trainer is alive, rename the phase in the YAML, run again. Recovery used to
-    walk only the *current* phase list, so the old trainer stayed alive and
-    overlapped the new sweep. The registry scan is phase-graph-independent.
+    Kill the orchestrator while a trainer is alive, rename the phase in the
+    YAML, run again. Recovery must not walk only the *current* phase list, or
+    the old trainer would stay alive and overlap the new sweep. The registry
+    scan is phase-graph-independent.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     storage = f"journal:///{tmp_path / 'r.journal'}"
@@ -1784,8 +1797,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     """A registered attempt is repaired through its *recorded* storage URL.
 
     The current config points at a different storage; the registry entry keeps
-    the producing study reachable so its RUNNING trial is still failed
-    (review v0.5.17 / blocker 3).
+    the producing study reachable so its RUNNING trial is still failed.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
 

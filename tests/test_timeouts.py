@@ -10,8 +10,8 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Metric, Phase, Sampler
-from phasesweep.engine import PhaseSweepError
+from phasesweep.config import Experiment, IntParam, Metric, Phase, Repeats, Sampler
+from phasesweep.engine import PhaseSweepError, read_status
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
@@ -62,7 +62,7 @@ def _sleeping_score_experiment(
         n_trials=n_trials,
         timeout_seconds_per_phase=timeout_seconds_per_phase,
         allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
@@ -204,11 +204,11 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
 @pytest.mark.integration
-def test_timeout_after_all_terminal_trials_is_complete_enough(
+def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     tmp_path: Path,
     allow_incomplete_on_timeout: bool,
 ) -> None:
-    """A timeout guard should not reject a phase once every requested trial is terminal."""
+    """A trial the phase deadline cancels is interrupted, not finished, so the phase is short of its target."""
     trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
     exp = make_experiment(
         experiment="phase_timeout_all_terminal",
@@ -217,31 +217,18 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         n_trials=2,
         timeout_seconds_per_phase=8.0,
         allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     )
 
-    winners = run_experiment(exp)
-
-    completion = winners["p"].completion
+    if not allow_incomplete_on_timeout:
+        with pytest.raises(TimeoutError, match=r"after 1/2 completed evaluations \(1 terminal"):
+            run_experiment(exp)
+        return
+    completion = run_experiment(exp)["p"].completion
     assert completion["requested_trials"] == 2
     assert completion["completed_trials"] == 1
-    assert completion["finished_trials"] == 2
-    assert completion["incomplete"] is False
-
-    current = exp.model_copy(
-        update={
-            "phases": [
-                exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False}),
-            ],
-        }
-    )
-    loaded = _load_winner(
-        current,
-        current.phases[0],
-        {},
-        publication=_published_for_resume(current),
-    )
-    assert loaded.completion["incomplete"] is False
+    assert completion["finished_trials"] == 1
+    assert completion["incomplete"] is True
 
 
 @pytest.mark.integration
@@ -257,7 +244,6 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         timeout_seconds_per_phase=8.0,
         allow_incomplete_on_timeout=True,
         sampler=Sampler(type="random", seed=7),
-        search_space={},
     )
 
     winners = run_experiment(exp)
@@ -281,7 +267,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     deadline_trials = [
         trial
         for trial in study.trials
-        if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "cancelled"
+        if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "interrupted"
     ]
     assert len(deadline_trials) == 1
     assert _load_phase_policy_state(study).abort is None
@@ -322,12 +308,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
                 allow_incomplete_on_timeout=True,
                 gpu_policy="none",
                 allow_no_gpu_isolation=True,
-                sampler=Sampler(
-                    type="tpe",
-                    seed=7,
-                    n_startup_trials=10,
-                    acknowledge_nonresumable=True,
-                ),
+                sampler=Sampler(type="tpe", seed=7, n_startup_trials=10),
                 search_space={"x": IntParam(type="int", low=1, high=3)},
             ),
             Phase(
@@ -411,13 +392,96 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
 
     # The child study now binds the parent's published winner. A third
     # identical run must still replay both studies without treating the
-    # parent's accepted partial target as a top-up, and without asking TPE to
-    # reconstruct continuation state for suggestions that will never launch.
+    # parent's accepted partial target as a top-up, and without launching a
+    # trial.
     launch_count = len(launched_trials)
     replayed = run_experiment(exp)
     assert replayed["p"].trial_number == winners["p"].trial_number
     assert replayed["child"].trial_number == winners["child"].trial_number
     assert len(launched_trials) == launch_count
+
+
+@pytest.mark.integration
+def test_group_completed_after_partial_timeout_publishes_from_completing_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group split across generations names the generation that ran its last member.
+
+    The first run stops on its phase deadline after trial 4, so it publishes the
+    only complete group, [0, 1, 2], while [3, 4, 5] still lacks trial 5. The
+    enlarged rerun runs trial 5 in a new generation, and that group wins. Its
+    winner cites trial 5, whose generation published this same winner, so the
+    carried-winner check passes although two of its members ran a generation
+    earlier.
+    """
+    import types
+
+    import phasesweep.engine.phase as phase_mod
+
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        trial = int(os.environ["PHASESWEEP_TRIAL_ID"])
+        print(f"x={1.0 if trial < 3 else 0.5 if trial < 6 else 2.0}")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=6,
+        timeout_seconds_per_phase=600.0,
+        allow_incomplete_on_timeout=True,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=9)},
+        repeats=Repeats(key="seed", values=[0, 1, 2]),
+    )
+    exp = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+
+    offset = {"seconds": 0.0}
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        phase_mod,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: real_monotonic() + offset["seconds"],
+            sleep=lambda _seconds: None,
+        ),
+    )
+    real_after_trial = phase_mod._after_trial
+
+    def deadline_between_trials_four_and_five(
+        run: phase_mod._PhaseExecution, study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        real_after_trial(run, study, trial)
+        if trial.number == 4 and not offset["seconds"]:
+            # The deadline passes before Optuna creates trial 5, which is where
+            # its own timeout check stops the loop.
+            offset["seconds"] = 10_000.0
+            study.stop()
+
+    monkeypatch.setattr(phase_mod, "_after_trial", deadline_between_trials_four_and_five)
+
+    first = run_experiment(exp)["p"]
+    assert first.completion["incomplete"] is True
+    assert first.completion["finished_trials"] == 5
+    assert first.trial_number == 2
+    assert first.confound["ranked_groups"] == [[0, 1, 2]]
+
+    enlarged = exp.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 9})]})
+    second = run_experiment(enlarged)["p"]
+
+    assert second.trial_number == 5
+    assert second.metric == 0.5
+    assert second.completion["incomplete"] is False
+    assert second.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    assert second.repeats is not None
+    members = second.repeats["members"]
+    assert [member["trial_number"] for member in members] == [3, 4, 5]
+    assert members[0]["generation_id"] == members[1]["generation_id"] == first.generation_id
+    assert members[2]["generation_id"] == second.generation_id != first.generation_id
+    assert read_status(enlarged)["publication_integrity"] == "ok"
+    assert run_experiment(enlarged)["p"].repeats == second.repeats
 
 
 @pytest.mark.integration
@@ -441,7 +505,6 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         gpu_policy="none",
         allow_no_gpu_isolation=True,
         sampler=Sampler(type="random", seed=7),
-        search_space={},
     )
 
     offset = {"seconds": 0.0}
@@ -523,7 +586,7 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
     assert _load_phase_policy_state(study).abort is None
-    assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
+    assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
@@ -559,7 +622,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
         max_consecutive_failures=1,
         timeout_seconds_per_phase=600.0,
         allow_incomplete_on_timeout=True,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     )
 
     exc_type = GpuLeaseTimeoutError if lease_timeout else TimeoutError
@@ -611,9 +674,8 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """A successful trainer whose evidence lands past the deadline cannot count.
 
     ``timeout_seconds_per_phase``/``timeout_seconds_per_run`` bound the whole
-    trial; before review v0.5.17 / blocker 8 extraction ran with no deadline
-    at all, so a run could exceed both configured limits and still publish a
-    complete winner.
+    trial, extraction included, so a run cannot exceed both configured limits
+    and still publish a complete winner.
     """
     experiment = make_experiment(workdir=tmp_path)
     (tmp_path / "r.json").write_text('{"x": 1.0}')
@@ -850,11 +912,11 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
 def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reviewer repro (review v0.5.17 / blocker 8): quick trainer, slow extraction.
+    """A quick trainer with slow extraction times out and publishes nothing.
 
     The trainer finishes inside the 0.5s budget but extraction takes 3s. The
-    run used to publish ``incomplete: false`` more than 2x past both limits;
-    it must now report a timeout and publish nothing.
+    run must report a timeout rather than publish ``incomplete: false`` more
+    than 2x past both limits.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(

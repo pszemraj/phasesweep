@@ -160,8 +160,9 @@ def _enqueue(
 def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
     """Freeze one accepted trial's result from its durable Optuna record.
 
-    Constraints come from the trial's own attributes rather than the current
-    config, so the projection can be rebuilt for any accepted trial later.
+    Constraints and observed values come from the trial's own attributes rather
+    than the current config, so the projection can be rebuilt for any accepted
+    trial later.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
@@ -171,6 +172,7 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
         CONSTRAINT_PREFIX,
         DURATION_ATTR,
         FEASIBLE_ATTR,
+        OBSERVED_PREFIX,
         OVERRIDES_ATTR,
     )
 
@@ -181,12 +183,18 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
         for key in sorted(trial.user_attrs)
         if key.startswith(CONSTRAINT_PREFIX)
     }
+    observed = {
+        key.removeprefix(OBSERVED_PREFIX): json_number(trial.user_attrs, key)
+        for key in sorted(trial.user_attrs)
+        if key.startswith(OBSERVED_PREFIX)
+    }
     return _projection(
         metrics={
             "phasesweep.objective": float(trial.value),
             "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
             "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
             **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
+            **{f"phasesweep.observed.{k}": v for k, v in observed.items()},
         },
         params={
             f"phasesweep.override.{k}": json.dumps(v, sort_keys=True) for k, v in overrides.items()
@@ -200,6 +208,7 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
                 "trial_number": trial.number,
                 "metric": trial.value,
                 "constraints": constraints,
+                "observed": observed,
                 "effective_overrides": overrides,
             }
         ),
@@ -284,27 +293,26 @@ def publish_unaccepted_trial(
     trial: FrozenTrial,
     environment: Mapping[str, str],
 ) -> None:
-    """Finish the managed run of a failed or pruned trial after confirmed cleanup.
+    """Finish the managed run of a failed or interrupted trial after confirmed cleanup.
 
     No evidence capture ran to finish that run, so it would otherwise stay
-    RUNNING. Trainer-owned runs and attempts that never created a run are
+    RUNNING. An interrupted trial's run finishes ``KILLED``, a failed one's
+    ``FAILED``. Trainer-owned runs and attempts that never created a run are
     left alone.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal FAIL or PRUNED trial.
+    :param FrozenTrial trial: Locally terminal FAIL trial, interrupted or not.
     :param Mapping[str, str] environment: Composed authentication environment.
     """
-    from optuna.trial import TrialState
-
-    from phasesweep.engine.state import TRIAL_DIR_ATTR
+    from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_interrupted
 
     directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
     if not isinstance(directory, str) or not (Path(directory) / BINDING_FILE).is_file():
         return
     binding = read_binding(Path(directory))
     if binding["run_mode"] == "managed":
-        status = "KILLED" if trial.state == TrialState.PRUNED else "FAILED"
+        status = "KILLED" if _trial_interrupted(trial) else "FAILED"
         _finish_attempt(experiment, generation_id, binding, status, environment)
 
 
@@ -404,12 +412,13 @@ def _save_attempt_intents(
         its study's recovery.
     :param str | None ended: Status for every unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
-        finish only trials Optuna failed or pruned with confirmed cleanup.
+        finish only trials Optuna failed with confirmed cleanup.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
 
     from phasesweep.engine.attempts import _trial_requires_cleanup_recovery
+    from phasesweep.engine.state import _trial_interrupted
 
     paths: list[Path] = []
     for directory, binding in attempts:
@@ -427,7 +436,7 @@ def _save_attempt_intents(
         settled = trial.state.is_finished() and (
             found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
         )
-        if settled and trial.state == TrialState.PRUNED:
+        if settled and _trial_interrupted(trial):
             status = "KILLED"
         elif ended is not None:
             status = ended

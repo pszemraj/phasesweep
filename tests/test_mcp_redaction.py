@@ -10,18 +10,22 @@ from pathlib import Path
 import pytest
 
 from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
-from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine import NoFeasibleTrialError, PhaseWinnerView, read_status, run_experiment
+from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.repeats import RepeatsSummary
 from phasesweep.engine.state import WinnerSource
-from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
+from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, write_trainer
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _write_experiment_config,
     assert_no_sensitive,
     make_mcp_app,
+    mcp_experiment_config_text,
     patch_popen_capture,
     write_mcp_catalog,
+    write_mcp_config_catalog,
     write_run_status,
 )
 
@@ -296,7 +300,7 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     assert payload["result_source"] == "frozen_run_snapshot"
     assert payload["represented_generation_id"] == "generation-new"
     # Completeness is measured against the plan the caller supplied, which for
-    # a published result is that generation's own (review v0.5.16 / blocker 4).
+    # a published result is that generation's own.
     assert payload["declared_phase_count"] == 2
     assert payload["winner_count"] == 1
     assert payload["missing_phases"] == ["p2"]
@@ -304,6 +308,137 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     assert payload["phases"][0]["winner_generation"] == "prior_generation"
     assert payload["result_context"] == "represented_generation"
     assert payload["published_config_matches_current"] is False
+
+
+def test_winners_payload_exposes_observed_values() -> None:
+    """Report-only values reach the agent-visible phase payload and default to none."""
+    source = WinnerSource(
+        kind="phase_trial",
+        phase="p1",
+        trial_number=2,
+        generation_id="generation-1",
+        attempt_id="attempt-1",
+    )
+    payload = winners_payload(
+        "exp",
+        [
+            PhaseWinnerView(
+                "p1", 2, 0.1, {}, {}, None, False, source=source, observed={"peak": 7.5}
+            ),
+            PhaseWinnerView("p2", 3, 0.2, {}, {}, None, False, source=source),
+        ],
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p1", "p2"],
+        result_source="frozen_run_snapshot",
+        publication_integrity="ok",
+        run_id="exp-run",
+        represented_generation_id="generation-1",
+    )
+
+    assert [phase["observed"] for phase in payload["phases"]] == [{"peak": 7.5}, {}]
+    assert [phase["repeats"] for phase in payload["phases"]] == [None, None]
+
+
+def test_winner_payload_exposes_repeats_spread_but_not_repeat_key() -> None:
+    """An agent sees that metric is a reduction over members, never the repeat key or values."""
+    source = WinnerSource(
+        kind="phase_trial",
+        phase="p1",
+        trial_number=5,
+        generation_id="generation-1",
+        attempt_id="attempt-5",
+    )
+    summary: RepeatsSummary = {
+        "reduce": "mean",
+        "n": 3,
+        "mean": 0.3,
+        "sd": 0.1,
+        "min": 0.2,
+        "max": 0.4,
+        "member_trials": [3, 4, 5],
+    }
+    payload = winners_payload(
+        "exp",
+        [
+            PhaseWinnerView(
+                "p1", 5, 0.3, {"lr": 0.1}, {"lr": 0.1}, None, False, source=source, repeats=summary
+            )
+        ],
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p1"],
+        result_source="frozen_run_snapshot",
+        publication_integrity="ok",
+        run_id="exp-run",
+        represented_generation_id="generation-1",
+    )
+
+    (phase,) = payload["phases"]
+    assert phase["repeats"] == summary
+    assert phase["metric"] == summary["mean"]
+    assert set(phase["params"]) == {"lr"}
+    assert "key" not in phase["repeats"]
+
+
+def test_validate_reports_the_repeat_count_but_not_the_repeat_key(tmp_path: Path) -> None:
+    phases = """\
+  - name: p
+    n_trials: 6
+    sampler: { type: random, seed: 0 }
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+    repeats: { key: trainer.secret_repeat_key, values: [rv_alpha, rv_beta, rv_gamma] }
+"""
+    catalog = write_mcp_config_catalog(
+        tmp_path, {"srv": mcp_experiment_config_text(tmp_path, phases=phases)}
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+
+    structure = app.validate("srv")
+
+    assert [phase["repeats"] for phase in structure["phases"]] == [3]
+    assert structure["phases"][0]["search_space"] == ["lr"]
+    assert_no_sensitive(structure, ["secret_repeat_key", "rv_beta"])
+
+
+def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snapshots(
+    tmp_path: Path,
+) -> None:
+    """A failed trial's reason quotes trainer stderr, and no MCP status surface carries any reason.
+
+    The reason stays in ``run.log``, ``trials.csv`` and the ledger the operator owns. The
+    status payloads are built from trial counts and winner facts alone.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+
+        print("RuntimeError: STDERR_SENTINEL leaked-credential-123", file=sys.stderr)
+        sys.exit(1)
+        """,
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=2)
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    run_log = (_experiment_dir(experiment) / "run.log").read_text()
+    assert "reason=non-zero exit code 1; stderr: RuntimeError: STDERR_SENTINEL" in run_log
+    status = read_status(experiment)
+    payloads = [
+        status,
+        status_payload(
+            "srv",
+            status,
+            {"run_id": "run-1"},
+            result_source="current_shared_study",
+            elapsed_seconds=None,
+        ),
+        capture_result_snapshot(experiment),
+    ]
+    assert status["phases"][0]["trials"]["FAIL"] == 2
+    for payload in payloads:
+        assert_no_sensitive(payload, ["STDERR_SENTINEL", "leaked-credential-123", "non-zero exit"])
 
 
 def test_winners_payload_defaults_claim_no_historical_provenance() -> None:

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import string
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from phasesweep.config.common import (
     ConfigFloat,
@@ -18,20 +19,27 @@ from phasesweep.config.common import (
     _validate_optional_bounds,
     _validate_override_key,
     _validate_safe_name,
+    anchor_relative_path,
 )
 from phasesweep.config.search import (
-    NON_RESUMABLE_SAMPLERS,
     STOCHASTIC_SAMPLERS,
     CategoricalParam,
+    Repeats,
     Sampler,
     SearchParam,
     _placeholder_values_for,
     _validate_sampler_search_space,
+    fixed_configuration_target_refusal,
+    phase_draws,
+    sampler_search_space,
 )
 from phasesweep.evidence.models import (
+    POSITIONED_EXTRACTOR_KINDS,
     Extractor,
     Gate,
     JsonEnvelopeExtractor,
+    JsonExtractor,
+    LocalExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -40,6 +48,16 @@ from phasesweep.evidence.models import (
     compose_wandb_environment,
     objective_evidence_assurance,
     wandb_gate_identity,
+)
+from phasesweep.runtime.commands import (
+    _OverrideValueError,
+    _render_override_value,
+    dump_json_file_overrides,
+    dump_overrides_json,
+    dump_trial_trainer_config_yaml,
+    flatten_trainer_config,
+    merged_cli_overrides,
+    render_command,
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
@@ -52,11 +70,27 @@ OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
 
 
 class Metric(_Frozen):
-    """Primary optimization objective: name, direction, and how to extract it."""
+    """Primary optimization objective: name, direction, how to extract it, and viability bounds."""
 
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
+    max: ConfigFloat | None = None
+    min: ConfigFloat | None = None
+
+    @model_validator(mode="after")
+    def _validate_viability_bounds(self) -> Metric:
+        """Reject non-finite or inverted viability bounds when any is set.
+
+        :return Metric: Self, unchanged.
+        """
+        if self.min is not None or self.max is not None:
+            _validate_optional_bounds(
+                label=f"Metric {self.name!r}",
+                min_value=self.min,
+                max_value=self.max,
+            )
+        return self
 
     @field_validator("name")
     @classmethod
@@ -89,19 +123,270 @@ def _metric_scoring_line(metric: Metric) -> str:
     """Describe the scalar source, within-trial selection, and between-trial goal.
 
     :param Metric metric: Configured optimization metric.
-    :return str: One line naming the metric, its goal, and its extractor config.
+    :return str: One line naming the metric, its goal, its viability bounds when set, and
+        its extractor config.
     """
+    bounds = metric.model_dump(mode="json", include={"min", "max"}, exclude_none=True)
     return (
         f"metric={metric.name!r} goal={metric.goal} "
-        f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
+        + (f"bounds={bounds} " if bounds else "")
+        + f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
     )
 
 
-class Constraint(_Frozen):
-    """A scalar bound that trials must satisfy to be considered feasible."""
+def experiment_contract_lines(experiment: Experiment) -> list[str]:
+    """List the experiment-level contract lines that ``validate`` and ``run --dry-run`` print.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One line per experiment-wide contract, in print order.
+    """
+    return [
+        _metric_scoring_line(experiment.metric),
+        _evaluation_point_line(experiment.metric),
+        *(_observation_line(observation) for observation in experiment.observe),
+        _environment_contract_line(experiment),
+        _trainer_cwd_line(experiment),
+    ]
+
+
+def experiment_warnings(experiment: Experiment) -> list[str]:
+    """List the advisory warnings about the experiment as a whole.
+
+    Shared by ``validate`` and ``run --dry-run`` beside
+    :func:`phasesweep.config.search.sampler_warnings`, which covers one phase. A
+    warning never blocks a run.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One sentence per warning, empty when nothing is amiss.
+    """
+    warnings: list[str] = []
+    flags = _argparse_boolean_flags(experiment)
+    if flags:
+        warnings.append(
+            "argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
+            "value, so set such flags in trial_command or have the trainer accept a value. "
+            f"Rendered that way: {', '.join(flags)}."
+        )
+    credentials = _credential_like_inherited_names(experiment)
+    if credentials:
+        warnings.append(
+            f"execution.inherit_env lists names that look like credentials: {', '.join(credentials)}. "
+            "Each trial records the value of every listed name in plain text in the study "
+            "ledger, and rotating one refuses a resume. Credentials belong in "
+            "execution.passthrough_env, which is inherited without being recorded or compared."
+        )
+    return warnings
+
+
+_CREDENTIAL_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+
+def _credential_like_inherited_names(experiment: Experiment) -> list[str]:
+    """Name each ``inherit_env`` list entry whose name suggests a credential.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: The listed names containing ``TOKEN``, ``KEY``, ``SECRET``, ``PASSWORD``
+        or ``CREDENTIAL`` in any case, sorted, empty under ``none`` and ``all``.
+    """
+    contract = experiment.execution.inherit_env
+    if not isinstance(contract, list):
+        return []
+    return sorted(name for name in contract if _CREDENTIAL_NAME.search(name))
+
+
+def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
+    """Name each flag ``override_format: argparse`` would render as a boolean value.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One ``--key (where)`` entry per boolean ``trainer_config`` leaf, fixed
+        override or categorical choice, empty under any other override format.
+    """
+    if experiment.override_format != "argparse":
+        return []
+    flags = [
+        f"--{key} (trainer_config)"
+        for key, value in flatten_trainer_config(experiment.trainer_config).items()
+        if isinstance(value, bool)
+    ]
+    for phase in experiment.phases:
+        flags.extend(
+            f"--{key} (phase {phase.name!r} fixed_overrides)"
+            for key, value in phase.fixed_overrides.items()
+            if isinstance(value, bool)
+        )
+        flags.extend(
+            f"--{key} (phase {phase.name!r} search_space)"
+            for key, param in sampler_search_space(phase).items()
+            if isinstance(param, CategoricalParam)
+            and any(isinstance(choice, bool) for choice in param.choices)
+        )
+    return flags
+
+
+def _observation_line(observation: Observation) -> str:
+    """Name one report-only observation and what its extractor reads.
+
+    The line lets a mistyped path or key show before a run, since a value the
+    trainer never wrote is only logged as a warning once a trial finishes.
+
+    :param Observation observation: One configured ``observe`` entry.
+    :return str: One line with the observation's name, its source and a report-only marker.
+    """
+    extractor = observation.extractor
+    if isinstance(extractor, JsonExtractor):
+        source = f"json {extractor.path} key {extractor.key}"
+    elif isinstance(extractor, JsonEnvelopeExtractor):
+        source = (
+            f"json_envelope {extractor.path} objective {extractor.objective_name} "
+            f"split {extractor.split} policy {extractor.policy}"
+        )
+    else:
+        source = (
+            f"log_regex {extractor.file} pattern {extractor.pattern!r} select {extractor.select}"
+        )
+    return f"observe {observation.name}: {source} (report-only)"
+
+
+def _evaluation_point_line(metric: Metric) -> str:
+    """Say whether selection can check that ranked objectives share an evaluation position.
+
+    The check runs only for extractors whose evidence names a position, so the
+    other kinds would otherwise report ``n/a`` on every winner without saying why.
+
+    :param Metric metric: Configured optimization metric.
+    :return str: One line naming the support, the axis and what binds the position.
+    """
+    extractor = metric.extractor
+    prefix = "evaluation_point check:"
+    if extractor.type not in POSITIONED_EXTRACTOR_KINDS:
+        return (
+            f"{prefix} n/a ({extractor.type} objectives record no evaluation position; "
+            "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)"
+        )
+    if isinstance(extractor, JsonEnvelopeExtractor):
+        source = (
+            "the envelope; any other axis from evaluation.progress"
+            if extractor.evaluation_axis == "step"
+            else "the envelope's evaluation.progress"
+        )
+        return f"{prefix} supported (axis {extractor.evaluation_axis!r} from {source})"
+    if isinstance(extractor, WandbExtractor):
+        return (
+            f"{prefix} supported (axis {extractor.evaluation_axis!r} located in W&B run history; "
+            "advisory, n/a when no position is found)"
+        )
+    return f"{prefix} supported (position is the step of the selected observation)"
+
+
+def _environment_contract_line(experiment: Experiment) -> str:
+    """Describe the trainer environment contract and which of its values pin a study.
+
+    The line is static: it reads the config and never ``os.environ``, so ``validate``
+    prints the same text from any shell.
+
+    :param Experiment experiment: Loaded experiment.
+    :return str: One line naming the digested inherited names, the ``env`` keys and the
+        pass-through names, each name in exactly one group.
+    """
+    execution = experiment.execution
+    contract = execution.inherit_env
+    configured = set(experiment.env)
+    passed_through = set(execution.effective_passthrough_env())
+    # A configured value is never inherited and always digested, even under a passthrough name.
+    excluded = passed_through - configured
+    digested = (
+        ", ".join(
+            name
+            for name in execution.tracked_env_names()
+            if name not in passed_through | configured
+        )
+        or "none"
+    )
+    if contract == "all":
+        inherited = (
+            f"inherit_env=all (inherited whole, and digested: {digested}; "
+            "other ambient variables are not compared)"
+        )
+    else:
+        label = f"[{', '.join(contract)}]" if isinstance(contract, list) else contract
+        inherited = f"inherit_env={label} (inherited when set, and digested: {digested})"
+    built_in = sorted(excluded & set(BUILTIN_PASSTHROUGH_ENV))
+    listed = sorted(excluded - set(BUILTIN_PASSTHROUGH_ENV))
+    if not excluded:
+        passthrough = "passthrough_env: none"
+    elif not listed:
+        passthrough = (
+            f"passthrough_env: {', '.join(built_in)} (built in; inherited when set, "
+            "excluded from the digest)"
+        )
+    else:
+        names = ", ".join(listed) + (f" and built-in {', '.join(built_in)}" if built_in else "")
+        passthrough = f"passthrough_env: {names} (inherited when set, excluded from the digest)"
+    shadowed = sorted(passed_through & configured)
+    if shadowed:
+        passthrough += (
+            f" ({', '.join(shadowed)} set under env, so the configured value is digested)"
+        )
+    parts = [inherited, f"env keys: {', '.join(sorted(configured)) or 'none'}", passthrough]
+    if experiment.storage is not None:
+        parts.append("a persistent study refuses to resume when any digested value changes")
+    return "environment: " + "; ".join(parts)
+
+
+def _trainer_cwd_line(experiment: Experiment) -> str:
+    """Describe the trainer's working directory, which is part of every study's identity.
+
+    An unset ``execution.cwd`` is the one input the config file does not pin:
+    the line says what it follows instead of printing a directory that
+    depends on the shell ``validate`` happened to run from.
+
+    :param Experiment experiment: Loaded experiment.
+    :return str: One line naming the resolved ``execution.cwd``, or what an unset one follows.
+    """
+    configured = experiment.execution.cwd
+    if configured is None:
+        return (
+            "trainer cwd: follows the directory phasesweep runs from (the catalog cwd under "
+            "MCP) and is part of the study identity; set execution.cwd to pin it"
+        )
+    resolved = Path(configured).expanduser().resolve()
+    return f"trainer cwd: {resolved} (execution.cwd; part of the study identity)"
+
+
+class _NamedExtractor(_Frozen):
+    """A named scalar read from a trial by an extractor, besides the metric."""
+
+    _label: ClassVar[str]
 
     name: str
     extractor: Extractor = Field(discriminator="type")
+
+    @model_validator(mode="after")
+    def _validate_evaluation_axis_unused(self) -> Self:
+        """Reject a non-default ``evaluation_axis`` that nothing would read.
+
+        Only the metric extractor's axis feeds selection's ``evaluation_point``
+        check, so a named extractor that sets one is a misplaced setting.
+
+        :raises ValueError: The extractor sets ``evaluation_axis``.
+        :return Self: Self, unchanged.
+        """
+        extractor = self.extractor
+        if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
+            return self
+        if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+            raise ValueError(
+                f"{self._label} {self.name!r} sets evaluation_axis, which only the metric "
+                "extractor's evaluation_point check reads; remove it."
+            )
+        return self
+
+
+class Constraint(_NamedExtractor):
+    """A scalar bound that trials must satisfy to be considered feasible."""
+
+    _label: ClassVar[str] = "Constraint"
+
     max: ConfigFloat | None = None
     min: ConfigFloat | None = None
 
@@ -120,25 +405,33 @@ class Constraint(_Frozen):
         )
         return self
 
-    @model_validator(mode="after")
-    def _validate_evaluation_axis_unused(self) -> Constraint:
-        """Reject a non-default ``evaluation_axis`` that nothing would read.
 
-        Only the metric extractor's axis feeds selection's ``evaluation_point``
-        check, so a constraint that sets one is a misplaced setting.
+class Observation(_NamedExtractor):
+    """A scalar recorded beside the metric that never affects selection or identity."""
 
-        :raises ValueError: The constraint extractor sets ``evaluation_axis``.
-        :return Constraint: Self, unchanged.
+    _label: ClassVar[str] = "Observation"
+
+    extractor: LocalExtractor = Field(discriminator="type")
+
+    @field_validator("extractor", mode="before")
+    @classmethod
+    def _refuse_remote_extractor(cls, value: object, info: ValidationInfo) -> object:
+        """Refuse a W&B or MLflow extractor with the reason and the local alternative.
+
+        :param object value: Raw or already built extractor.
+        :param ValidationInfo info: Validation info carrying the observation's name.
+        :raises ValueError: The extractor is a remote kind.
+        :return object: The value, unchanged.
         """
-        extractor = self.extractor
-        if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
-            return self
-        if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+        kind = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
+        if kind in ("wandb", "mlflow"):
             raise ValueError(
-                f"Constraint {self.name!r} sets evaluation_axis, which only the metric "
-                "extractor's evaluation_point check reads; remove it."
+                f"Observation {info.data.get('name')!r} cannot use a {kind} extractor: "
+                "remote extractors wait for every requested key, so a value the trainer "
+                "never wrote would stall the trial until the poll timeout. Write the value "
+                "with report_objective(..., extra=...) and read it with a local json extractor."
             )
-        return self
+        return value
 
 
 GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
@@ -169,6 +462,13 @@ class Phase(_Frozen):
     search_space: dict[str, SearchParam] = Field(
         default_factory=dict,
         description="Map of override-key -> sampling spec. Supports dotted keys.",
+    )
+    repeats: Repeats | None = Field(
+        default=None,
+        description=(
+            "Run every configuration once per repeat value (typically seeds) and rank "
+            "configurations by a reducer over their complete groups."
+        ),
     )
     n_trials: ConfigInt = Field(ge=1)
     n_jobs: ConfigInt = Field(
@@ -289,11 +589,10 @@ class Phase(_Frozen):
             # The phase fingerprint records the DECLARED token count as the
             # trainer's world size, but the runtime pool normalizes and dedupes
             # tokens before leasing. A repeated token therefore promises a
-            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity
-            # (PR #5 review / reviewer 2, blocker 2). Tokens are stripped
-            # defensively: ``_gpu_devices_non_empty_tokens`` already strips
-            # ``gpu_devices``, but this validator must not depend on that to
-            # see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
+            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity.
+            # Tokens are stripped defensively: ``_gpu_devices_non_empty_tokens``
+            # already strips ``gpu_devices``, but this validator must not depend
+            # on that to see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
             declared = self.gpu_ids if self.gpu_ids is not None else self.gpu_devices
             tokens = [str(token).strip() for token in declared or []]
             duplicates = sorted({token for token in tokens if tokens.count(token) > 1})
@@ -356,7 +655,7 @@ class Phase(_Frozen):
             "By default, phase/run wallclock timeouts fail closed before winner "
             "selection if fewer than n_trials finished. Set true to allow a "
             "partial phase winner and persist completion metadata. Reusing a "
-            "stored partial result, by rerun or --from-phase, also requires it."
+            "stored partial result, by a later run or --from-phase, also requires it."
         ),
     )
     allow_partial_grid: bool = Field(
@@ -364,13 +663,6 @@ class Phase(_Frozen):
         description=(
             "Grid phases must run the full matrix by default. Set true to permit "
             "n_trials smaller than the grid cardinality. Valid only with sampler.type grid."
-        ),
-    )
-    allow_seed_search: bool = Field(
-        default=False,
-        description=(
-            "By default, search-space keys named seed or ending in .seed are rejected "
-            "so stochastic variance is not mistaken for a model/config improvement."
         ),
     )
     gates: list[Gate] = Field(default_factory=list)
@@ -409,8 +701,7 @@ class Phase(_Frozen):
         CLI override rendering quotes values shell-safely, but a malformed
         *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
         produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
-        treat surface noise (whitespace) as part of the key (review v0.5.6 /
-        non-blocking hardening item).
+        treat surface noise (whitespace) as part of the key.
 
         Permissible keys: dotted paths whose every segment is non-empty and
         matches ``[A-Za-z0-9_\-]+``. This covers ``lr``, ``model.depth``,
@@ -424,13 +715,37 @@ class Phase(_Frozen):
             _validate_override_key(key, label=f"phase {self.name!r} fixed_overrides")
         for key in self.search_space:
             _validate_override_key(key, label=f"phase {self.name!r} search_space")
+        if self.repeats is not None:
+            _validate_override_key(self.repeats.key, label=f"phase {self.name!r} repeats.key")
         return self
 
     @model_validator(mode="after")
-    def _validate_timeouts_and_seed_policy(self) -> Phase:
-        """Require bounded trials unless explicitly waived and reject seed sweeps.
+    def _validate_repeat_key_is_its_own(self) -> Phase:
+        """Keep the repeat key out of the keys the phase fixes or searches.
 
-        :raises ValueError: If timeout or seed-search policy validation fails.
+        :raises ValueError: ``repeats.key`` is also a ``search_space`` or ``fixed_overrides`` key.
+        :return Phase: Self, unchanged.
+        """
+        if self.repeats is None:
+            return self
+        key = self.repeats.key
+        for field, keys in (
+            ("search_space", self.search_space),
+            ("fixed_overrides", self.fixed_overrides),
+        ):
+            if key in keys:
+                raise ValueError(
+                    f"Phase {self.name!r}: repeats.key {key!r} is also a {field} key. The "
+                    "repeat axis supplies that key's value on every trial; remove it from "
+                    f"{field}."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_timeouts_and_seed_keys(self) -> Phase:
+        """Require bounded trials unless explicitly waived and refuse searched seeds.
+
+        :raises ValueError: If a timeout is invalid, or a search-space key is a seed.
         :return Phase: Self, unchanged.
         """
         if self.timeout_seconds_per_trial is None:
@@ -449,14 +764,15 @@ class Phase(_Frozen):
                 f"Phase {self.name!r}: timeout_seconds_per_phase",
                 self.timeout_seconds_per_phase,
             )
-        if not self.allow_seed_search:
-            seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
-            if seed_keys:
-                raise ValueError(
-                    f"Phase {self.name!r}: trainer seed keys cannot be in search_space "
-                    f"by default: {seed_keys}. Move seeds to fixed_overrides or set "
-                    "allow_seed_search: true for an explicit variance audit."
-                )
+        seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
+        if seed_keys:
+            example = seed_keys[0]
+            raise ValueError(
+                f"Phase {self.name!r}: seed keys cannot be searched: {seed_keys}. A searched "
+                "seed lets seed noise win as if it were a configuration. Fix the seed in "
+                "fixed_overrides or trainer_config. To compare finalists across seeds, use "
+                f"repeats: {{key: {example}, values: [0, 1, 2]}}."
+            )
         return self
 
 
@@ -473,52 +789,85 @@ def _is_environment_name(name: str) -> bool:
     return bool(name) and "=" not in name and "\x00" not in name
 
 
-class ExecutionContext(_Frozen):
-    """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
+# Minimal environment base used when the execution contract narrows
+# inheritance below "all": enough for a shell + interpreter to start and
+# write temp files, nothing that can carry semantic configuration.
+#
+# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
+# trains on CPU or GPU, so admitting the ambient value would let two operators
+# running the identical config from differently-exported shells write
+# CPU-trained and GPU-trained evaluations into one study under one semantic
+# fingerprint — exactly the unfingerprinted ambient input the narrowed
+# contracts exist to exclude (the fingerprint covers the contract's mode/names
+# and configured ``env``, never ambient values). Bind trainer visibility with
+# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
+# also drives GPU pool discovery, or name the variable in an ``inherit_env``
+# list to opt its ambient value in explicitly.
+BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
-    Without this block, the trainer inherits the orchestrator's *entire*
-    ambient environment and current working directory — two unbounded
+# Pass-through names every config has, listed or not: inherited when set and never
+# digested. TMPDIR is a scratch location, not a scientific input, and a sandboxed
+# shell sets its own. PATH stays digested: it decides which interpreter and tools
+# run. ``execution.passthrough_env`` adds names to this set.
+BUILTIN_PASSTHROUGH_ENV = ("TMPDIR",)
+
+
+class ExecutionContext(_Frozen):
+    """Explicit trainer execution-context contract.
+
+    The ambient environment and the current working directory are two unbounded
     implicit semantic inputs that never contribute to study identity, so one
-    persistent study can silently mix evaluations from different trainers,
-    datasets, or credentials. Declaring the contract makes both explicit,
-    passes them to the trainer deterministically, and binds them into the
-    semantic fingerprint.
+    persistent study could silently mix evaluations from different trainers,
+    datasets, or credentials. This contract makes both explicit: the default
+    passes the trainer only :data:`BASE_INHERITED_ENV` plus configured ``env``
+    values, ``inherit_env`` widens that on purpose, and the choices bind into
+    the semantic fingerprint.
     """
 
     cwd: str | None = Field(
         default=None,
         description=(
-            "Working directory for every trainer subprocess. Relative paths "
-            "resolve against the invocation cwd at launch (same rule as "
-            "workdir); prefer an absolute path so CLI and MCP invocations "
-            "agree. When set, the RESOLVED path joins the semantic "
+            "Working directory for every trainer subprocess. A relative path "
+            "resolves against the config file's directory (same rule as "
+            "workdir), or against the process cwd for an Experiment built in "
+            "Python. When set, the RESOLVED path joins the semantic "
             "fingerprint, so the same study can never mix trainers reached "
             "through different working directories. When unset, trainers run "
-            "in the invocation cwd and that effective resolved directory joins "
-            "the fingerprint."
+            "in the invocation cwd (the catalog entry's cwd under MCP) and that "
+            "effective resolved directory joins the fingerprint."
         ),
     )
     inherit_env: Literal["all", "none"] | list[str] = Field(
-        default="all",
+        default="none",
         description=(
-            "Which ambient environment variables the trainer inherits. 'all' "
-            "(default) preserves the historical full-inheritance behavior. "
-            "'none' starts from a minimal documented base (PATH, HOME, LANG, "
-            "LC_ALL, TMPDIR, USER, LOGNAME, TZ). A list inherits the base "
-            "plus exactly the named variables. Configured `env` values are "
-            "always applied on top and are always semantic. In persistent "
-            "studies, inherited values outside `passthrough_env` must match "
-            "the existing trial cohort before another trial is allocated."
+            "Which ambient environment variables the trainer inherits. 'none' "
+            "(default) passes a minimal documented base (PATH, HOME, LANG, "
+            "LC_ALL, TMPDIR, USER, LOGNAME, TZ) and drops everything else, "
+            "such as PYTHONPATH, virtualenv settings, cache paths and "
+            "credentials. A list inherits the base plus exactly the named "
+            "variables. 'all' opts in to the full ambient environment. "
+            "Configured `env` values are always applied on top and are always "
+            "semantic. In persistent studies, the base variables, the listed "
+            "names and `env`, except `passthrough_env` and the built-in "
+            "`TMPDIR`, must match the existing trial cohort before another "
+            "trial is allocated, so a different `PATH` is refused. Under 'all' "
+            "the cohort covers only the base variables, and every other "
+            "ambient variable is inherited without being compared. Each trial "
+            "records the compared values in plain text, so a credential "
+            "belongs in `passthrough_env`, not in a list."
         ),
     )
     passthrough_env: list[str] = Field(
         default_factory=list,
         description=(
-            "Ambient credential or transport variables that may rotate without "
-            "changing a persistent study's semantic environment cohort. These "
-            "names are inherited in addition to a narrowed `inherit_env` contract, "
-            "but their values are excluded from the cohort digest. Their sorted "
-            "names and classification remain part of the config fingerprint."
+            "Ambient variables that may change without changing a persistent "
+            "study's semantic environment cohort, such as rotating credentials "
+            "and proxies. These names are inherited in addition to a narrowed "
+            "`inherit_env` contract, but their values are excluded from the "
+            "cohort digest. They add to the built-in `TMPDIR`, a scratch "
+            "location that is always inherited when set and never digested, so "
+            "a sandboxed and an ordinary shell agree. The effective sorted "
+            "names remain part of the config fingerprint."
         ),
     )
     record_env: bool = Field(
@@ -526,38 +875,44 @@ class ExecutionContext(_Frozen):
         description=(
             "Write the trainer environment into each trial directory as "
             "`environment.json` (digest, inherit_env contract, and every "
-            "name-value pair). Off by default because those values are "
-            "secrets; the file is created owner-only (0600), unlike the rest "
-            "of the trial directory. Every trial always records the "
-            "environment's SHA-256 digest and its variable NAMES as study "
-            "attributes regardless of this flag. The digest covers semantic "
-            "values only; pass-through values are never persisted in study "
-            "attributes."
+            "name-value pair, pass-through values included). Off by default "
+            "because it holds the whole composed environment, credentials "
+            "among it; the file is created owner-only (0600), unlike the rest "
+            "of the trial directory. Regardless of this flag, every trial "
+            "records the environment's SHA-256 digest and the compared "
+            "name-value pairs in the study ledger, which leave out the "
+            "pass-through values."
         ),
     )
 
     @field_validator("cwd")
     @classmethod
-    def _cwd_is_nonempty(cls, value: str | None) -> str | None:
-        """Reject an empty trainer working directory.
+    def _anchor_cwd(cls, value: str | None, info: ValidationInfo) -> str | None:
+        """Reject an empty trainer working directory and anchor a relative one.
 
         :param str | None value: Configured trainer working directory.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The path is the empty string.
-        :return str | None: The validated path, unchanged.
+        :return str | None: The path, resolved against the config file's
+            directory when it is relative and the config came from a file.
         """
+        if value is None:
+            return None
         if value == "":
             raise ValueError(
-                "execution.cwd must be a nonempty path; omit it to run trainers in the "
-                "directory phasesweep is started from."
+                "execution.cwd must be a nonempty path; write '.' for the config file's "
+                "directory, or omit it to run trainers in the directory phasesweep is "
+                "started from."
             )
-        return value
+        return anchor_relative_path(value, info)
 
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:
         """Reject inherited-variable names that no environment variable can have.
 
         :raises ValueError: A listed variable name is empty, padded, or contains
-            ``=`` or NUL, or a name list repeats a name or the two lists overlap.
+            ``=`` or NUL, a name list repeats a name, the two lists overlap, or an
+            ``inherit_env`` list names a built-in pass-through variable.
         :return ExecutionContext: Self, unchanged.
         """
         named_contracts = {"passthrough_env": self.passthrough_env}
@@ -573,6 +928,12 @@ class ExecutionContext(_Frozen):
             if len(set(names)) != len(names):
                 raise ValueError(f"{label} names must be unique.")
         if isinstance(self.inherit_env, list):
+            built_in = sorted(set(self.inherit_env) & set(BUILTIN_PASSTHROUGH_ENV))
+            if built_in:
+                raise ValueError(
+                    f"inherit_env must not name {built_in!r}: it is always inherited when set "
+                    "and never digested, so remove it."
+                )
             overlap = sorted(set(self.inherit_env) & set(self.passthrough_env))
             if overlap:
                 raise ValueError(
@@ -580,6 +941,31 @@ class ExecutionContext(_Frozen):
                     f"ambient variable once: {overlap!r}"
                 )
         return self
+
+    def effective_passthrough_env(self) -> tuple[str, ...]:
+        """List every pass-through name: the built-in ones plus ``passthrough_env``.
+
+        :return tuple[str, ...]: Sorted unique names inherited when set and never digested.
+        """
+        return tuple(sorted({*BUILTIN_PASSTHROUGH_ENV, *self.passthrough_env}))
+
+    def tracked_env_names(self) -> tuple[str, ...]:
+        """List the ambient variable names the environment cohort covers.
+
+        :return tuple[str, ...]: The base set plus any listed names. ``inherit_env: all`` adds
+            none, so an ambient variable outside this set is inherited without being compared.
+        """
+        if isinstance(self.inherit_env, list):
+            return (*BASE_INHERITED_ENV, *self.inherit_env)
+        return BASE_INHERITED_ENV
+
+    def inherited_env_names(self) -> tuple[str, ...] | None:
+        """List the ambient variable names the ``inherit_env`` contract admits.
+
+        :return tuple[str, ...] | None: The base set plus any listed names, or None
+            when ``inherit_env`` is ``all`` and every ambient variable is admitted.
+        """
+        return None if self.inherit_env == "all" else self.tracked_env_names()
 
 
 class Experiment(_Frozen):
@@ -591,10 +977,20 @@ class Experiment(_Frozen):
         description=(
             "Local Optuna journal storage URL, auto for study.journal inside the "
             "experiment artifact namespace, or null for non-resumable in-memory runs. "
-            "Use journal:///path.journal for an explicit, resumable, parallel-safe study."
+            "Use journal:///path.journal for an explicit, resumable, parallel-safe study; "
+            "a relative journal path resolves like workdir."
         ),
     )
-    workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
+    workdir: str = Field(
+        default="./runs",
+        # The default is relative too, so it must be anchored like a written value.
+        validate_default=True,
+        description=(
+            "Where per-trial directories are created. A relative path resolves against "
+            "the config file's directory, or against the process cwd for an Experiment "
+            "built in Python."
+        ),
+    )
     trial_command: str = Field(
         description=(
             "Shell command template. Placeholders: {config_path}, {overrides}, {overrides_path}, "
@@ -621,13 +1017,20 @@ class Experiment(_Frozen):
     mlflow: MlflowSettings | None = None
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
+    observe: list[Observation] = Field(
+        default_factory=list,
+        description=(
+            "Report-only scalars read from each accepted trial with local extractors. They "
+            "are recorded and published, never ranked, never fingerprinted, and never fail a trial."
+        ),
+    )
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
     execution: ExecutionContext = Field(
         default_factory=ExecutionContext,
         description=(
             "Explicit trainer execution context: working directory and "
-            "environment-inheritance contract (review v0.5.17 / blocker 4)."
+            "environment-inheritance contract."
         ),
     )
     timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
@@ -658,16 +1061,38 @@ class Experiment(_Frozen):
             if reached:
                 yield index, phase
 
+    def sampled_locked_keys(self, phase_name: str) -> frozenset[str]:
+        """Return the inherited keys a phase may not search.
+
+        A key is locked when any inherited origin sampled it; a key every
+        inherited origin only fixed may be searched.
+
+        :param str phase_name: Name of a phase of this experiment.
+        :raises KeyError: ``phase_name`` names no phase.
+        :return frozenset[str]: Override keys that an inherited phase sampled.
+        """
+        origins_by_phase: dict[str, dict[str, str]] = {}
+        for phase in self.phases:
+            inherited = _inherited_origins(phase, origins_by_phase)
+            if phase.name == phase_name:
+                return frozenset(_sampled_locked_origins(inherited))
+            origins_by_phase[phase.name] = _resolved_origins(phase, inherited)
+        raise KeyError(phase_name)
+
     @field_validator("storage")
     @classmethod
-    def _storage_is_local(cls, value: str | None) -> str | None:
+    def _storage_is_local(cls, value: str | None, info: ValidationInfo) -> str | None:
         """Allow only null, auto, and local journal storage that names a plain file.
 
         :param str | None value: Configured Optuna storage locator.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The locator is not null, ``"auto"``, or a
             ``journal:///`` URL with the exact lowercase scheme, or the URL
-            carries a query or fragment, or its path is empty.
-        :return str | None: The validated locator, unchanged.
+            carries a query or fragment, or its path is empty, or a relative
+            path anchored to the config directory would contain ``?`` or ``#``.
+        :return str | None: The locator; a relative journal path in a config
+            loaded from a file becomes an absolute four-slash URL under the
+            config file's directory.
         """
         if value is None or value == "auto":
             return value
@@ -687,29 +1112,43 @@ class Experiment(_Frozen):
                 "Remove it. To keep the journal under a directory whose name contains ? or #, "
                 "use `storage: auto` with that workdir."
             )
-        if file_url_path(value) == "":
+        raw_path = file_url_path(value)
+        if raw_path == "":
             raise ValueError(
                 f"storage journal URL names no file; got {value!r}. Write "
                 "`storage: journal:///path/to/study.journal`."
             )
+        anchored_path = anchor_relative_path(raw_path, info)
+        if anchored_path != raw_path:
+            # The anchored path is absolute, so the URL takes the four-slash form.
+            value = f"journal:///{anchored_path}"
+            if "?" in value or "#" in value:
+                raise ValueError(
+                    "storage journal path is relative, and the config file's directory it "
+                    "resolves against contains ? or #, which a journal URL cannot carry; got "
+                    f"{anchored_path!r}. Use `storage: auto`, which keeps the journal under "
+                    "workdir whatever its directory names contain."
+                )
         canonical_storage_identity(value)
         return value
 
     @field_validator("workdir")
     @classmethod
-    def _workdir_is_nonempty(cls, value: str) -> str:
-        """Reject an empty artifact-root directory.
+    def _anchor_workdir(cls, value: str, info: ValidationInfo) -> str:
+        """Reject an empty artifact-root directory and anchor a relative one.
 
         :param str value: Configured per-trial directory root.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The path is the empty string.
-        :return str: The validated path, unchanged.
+        :return str: The path, resolved against the config file's directory when
+            it is relative and the config came from a file.
         """
         if value == "":
             raise ValueError(
-                "workdir must be a nonempty path; write '.' to use the directory "
-                "phasesweep is started from, or omit workdir for ./runs."
+                "workdir must be a nonempty path; write '.' for the config file's "
+                "directory, or omit workdir for ./runs."
             )
-        return value
+        return anchor_relative_path(value, info)
 
     @field_validator("env")
     @classmethod
@@ -767,18 +1206,40 @@ class Experiment(_Frozen):
         return self
 
     @model_validator(mode="after")
-    def _validate_trainer_config_mode(self) -> Experiment:
-        """Reject an embedded trainer config that the selected mode would ignore.
+    def _validate_trainer_config_wire(self) -> Experiment:
+        """Require the embedded trainer config to have a wire form in the selected format.
 
-        :raises ValueError: ``trainer_config`` is nonempty outside ``yaml_file`` mode.
+        ``yaml_file`` validates the base together with each phase's overrides.
+        The other formats carry the base too, so its keys and leaves must
+        render on their wire before any phase composes into it.
+
+        :raises ValueError: ``trainer_config`` holds a key or value that the
+            selected ``override_format`` cannot carry.
         :return Experiment: Self, unchanged.
         """
-        if self.override_format != "yaml_file" and self.trainer_config:
+        fmt = self.override_format
+        if fmt == "yaml_file" or not self.trainer_config:
+            return self
+        if fmt == "json_file":
+            try:
+                dump_overrides_json(self.trainer_config)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"trainer_config cannot be written as JSON for override_format='json_file': {exc}"
+                ) from exc
+            return self
+        cli_format: Literal["argparse", "hydra"] = "hydra" if fmt == "hydra" else "argparse"
+        try:
+            flat = flatten_trainer_config(self.trainer_config)
+        except (TypeError, ValueError) as exc:
             raise ValueError(
-                "trainer_config is consumed only by the default override_format='yaml_file'. "
-                f"The selected compatibility format {self.override_format!r} would ignore it; "
-                "remove trainer_config or use yaml_file with {config_path}."
-            )
+                f"trainer_config cannot be flattened for override_format={fmt!r}: {exc}"
+            ) from exc
+        for key, value in flat.items():
+            try:
+                _render_override_value(value, cli_format)
+            except _OverrideValueError as exc:
+                raise ValueError(f"trainer_config key {key!r}: {exc}") from exc
         return self
 
     @field_validator("experiment")
@@ -804,7 +1265,9 @@ class Experiment(_Frozen):
         Each exported override key carries its producing phase as its origin.
         Re-exporting preserves that origin, making a same-origin diamond valid.
         Different origins for one inherited key require a child fixed override;
-        a fixed child key deliberately establishes a new origin.
+        a fixed child key deliberately establishes a new origin. A key is locked
+        for a child only when some inherited origin sampled it; keys the
+        inherited phases only fixed may be searched.
 
         :raises ValueError: A phase graph, override composition, sampler,
             storage, value-wire contract, or trial command is invalid.
@@ -838,15 +1301,14 @@ class Experiment(_Frozen):
                     "fixed or sampled, not both."
                 )
 
-            inherited_origins: dict[str, set[str]] = {}
-            for parent in phase.inherits:
-                for key, origin in origins_by_phase[parent].items():
-                    inherited_origins.setdefault(key, set()).add(origin)
+            inherited_origins = _inherited_origins(phase, origins_by_phase)
+            repeat_keys = set() if phase.repeats is None else {phase.repeats.key}
 
+            # A repeat value replaces whatever the parents agreed or disagreed on.
             unresolved = {
                 key: origins
                 for key, origins in inherited_origins.items()
-                if len(origins) > 1 and key not in phase.fixed_overrides
+                if len(origins) > 1 and key not in phase.fixed_overrides and key not in repeat_keys
             }
             if unresolved:
                 details = ", ".join(
@@ -857,23 +1319,23 @@ class Experiment(_Frozen):
                     f"{details}. Resolve explicitly with phase.fixed_overrides or remove one inherit."
                 )
 
-            inherited_collisions = set(inherited_origins) & set(phase.search_space)
+            locked = _sampled_locked_origins(inherited_origins)
+            inherited_collisions = set(locked) & set(phase.search_space)
             if inherited_collisions:
+                details = ", ".join(
+                    f"{key} from {', '.join(repr(name) for name in sorted(locked[key]))}"
+                    for key in sorted(inherited_collisions)
+                )
                 raise ValueError(
                     f"Phase {phase.name!r} re-samples key(s) {sorted(inherited_collisions)} "
-                    f"that are locked by inherited phase(s) {phase.inherits!r} "
-                    f"(possibly transitively). Either remove the key from search_space, "
-                    "or drop the inherit."
+                    f"that an inherited phase already sampled ({details}, possibly "
+                    "transitively). A winner's sampled value cannot be searched again; "
+                    "remove the key from search_space or drop the inherit. Keys a parent "
+                    "only fixed may be searched."
                 )
 
-            resolved_origins = {
-                key: next(iter(origins))
-                for key, origins in inherited_origins.items()
-                if key not in phase.fixed_overrides
-            }
-            resolved_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
-            resolved_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
-            prefix_collisions = _find_prefix_collisions(set(resolved_origins))
+            resolved_origins = _resolved_origins(phase, inherited_origins)
+            prefix_collisions = _find_prefix_collisions(set(resolved_origins) | repeat_keys)
             if prefix_collisions:
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
                 raise ValueError(
@@ -883,7 +1345,8 @@ class Experiment(_Frozen):
                 )
 
             _validate_sampler_search_space(phase)
-            _validate_sampler_resumability(self.resolved_storage, phase)
+            _validate_persistent_sampler_seed(self.resolved_storage, phase)
+            _validate_in_memory_fixed_target(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
             from phasesweep.evidence.mlflow import compile_query
@@ -897,43 +1360,98 @@ class Experiment(_Frozen):
             seen[phase.name] = phase
             seen_casefolded[casefolded_name] = phase.name
 
-        names = {self.metric.name} | {c.name for c in self.constraints}
-        if len(names) != 1 + len(self.constraints):
-            raise ValueError("Metric and constraint names must all be distinct.")
+        names = [
+            self.metric.name,
+            *(c.name for c in self.constraints),
+            *(o.name for o in self.observe),
+        ]
+        if len(set(names)) != len(names):
+            raise ValueError("Metric, constraint and observe names must all be distinct.")
         return self
 
 
-def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
-    """Require an explicit seed, and a non-resumable acknowledgement, on persistent storage.
+def _inherited_origins(
+    phase: Phase, origins_by_phase: Mapping[str, Mapping[str, str]]
+) -> dict[str, set[str]]:
+    """Collect the origins of every override key a phase inherits.
 
-    A persistent study outlives the process that created it, which makes two
-    sampler properties operator decisions rather than defaults (review v0.5.18 /
-    finding F7):
+    :param Phase phase: Phase whose ``inherits`` list names the parents.
+    :param Mapping[str, Mapping[str, str]] origins_by_phase: Resolved key origins
+        (``<phase>:fixed`` or ``<phase>:sampled``) of each earlier phase.
+    :return dict[str, set[str]]: Origins per inherited key, one entry per
+        distinct producing phase.
+    """
+    inherited: dict[str, set[str]] = {}
+    for parent in phase.inherits:
+        for key, origin in origins_by_phase[parent].items():
+            inherited.setdefault(key, set()).add(origin)
+    return inherited
 
-    1. Reproducibility. An unseeded ``tpe``/``random``/``cmaes`` phase draws a
-       different sequence on every invocation, so the durable trials it
-       accumulates cannot be reproduced or explained afterwards.
-    2. Resumability. ``tpe`` and ``cmaes`` suggestions depend on process-local
-       RNG/optimizer state Optuna storage does not persist, so
-       :func:`phasesweep.engine.study_policy._validate_sampler_continuation` hard-rejects
-       resuming such a phase mid-target. That guard fires only *after* the
-       operator has been interrupted; requiring ``acknowledge_nonresumable``
-       here puts the run-the-target-in-one-invocation contract in front of them
-       at config load instead.
 
-    ``grid`` is exempt from both: it enumerates a fixed matrix and resumes from
-    stored grid assignments. In-memory storage (``storage: null``, the only
-    in-memory spelling) is exempt entirely — there is no durable study to
-    reproduce or resume, so the ``sampler`` block stays optional and the
-    ``tpe`` default remains fine.
+def _resolved_origins(phase: Phase, inherited: Mapping[str, set[str]]) -> dict[str, str]:
+    """Resolve the origin of every override key a phase exports.
+
+    A key the phase fixes or searches takes the phase as its new origin; any
+    other inherited key keeps its single origin. The repeat key is never
+    exported: its value differs across the members a winner stands on, so the
+    winner's overrides drop it, together with any inherited value it replaced.
+
+    :param Phase phase: Phase whose fixed, sampled and repeat keys apply.
+    :param Mapping[str, set[str]] inherited: Origins per inherited key.
+    :return dict[str, str]: Origin per exported key.
+    """
+    repeat_key = None if phase.repeats is None else phase.repeats.key
+    resolved = {
+        key: next(iter(origins))
+        for key, origins in inherited.items()
+        if key not in phase.fixed_overrides and key != repeat_key
+    }
+    resolved.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
+    resolved.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+    return resolved
+
+
+def _sampled_locked_origins(inherited: Mapping[str, set[str]]) -> dict[str, set[str]]:
+    """Pick the inherited keys that some origin sampled.
+
+    :param Mapping[str, set[str]] inherited: Origins per inherited key.
+    :return dict[str, set[str]]: For each locked key, the names of the phases
+        that sampled it.
+    """
+    locked: dict[str, set[str]] = {}
+    for key, origins in inherited.items():
+        sampled_by = {
+            origin.rpartition(":")[0] for origin in origins if origin.endswith(":sampled")
+        }
+        if sampled_by:
+            locked[key] = sampled_by
+    return locked
+
+
+def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None:
+    """Require an explicit seed for a stochastic sampler on persistent storage.
+
+    A persistent study outlives the process that created it. An unseeded
+    ``tpe``/``random``/``cmaes`` phase draws a different sequence on every
+    invocation, so the durable trials it accumulates cannot be reproduced or
+    explained afterwards, and a resumed or enlarged study could draw a
+    configuration it already ran. A seed keys every draw by its position in
+    the study, so an interruption repeats no draw: ``random`` then draws what
+    an uninterrupted run would at any ``n_jobs``, and ``tpe`` and ``cmaes`` do
+    at ``n_jobs`` 1 given the same trial values.
+
+    ``grid`` is exempt: it enumerates a fixed matrix. A phase with an empty
+    ``search_space`` is exempt too, whatever its sampler: it draws nothing.
+    In-memory storage (``storage: null``, the only in-memory spelling) is
+    exempt entirely — there is no durable study to reproduce or resume, so the
+    ``sampler`` block stays optional and the ``tpe`` default remains fine.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose sampler contract is checked.
-    :raises ValueError: ``storage`` is persistent and the phase's sampler is
-        stochastic without an explicit ``seed``, or is non-resumable without
-        ``acknowledge_nonresumable: true``.
+    :raises ValueError: ``storage`` is persistent and the phase draws from a
+        stochastic sampler without an explicit ``seed``.
     """
-    if storage is None:
+    if storage is None or not phase_draws(phase):
         return
 
     sampler = phase.sampler
@@ -945,17 +1463,28 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
             "can reproduce or explain. Add an integer 'seed' to this phase's sampler block, "
             "or use sampler.type: grid to enumerate a fixed matrix."
         )
-    if sampler.type in NON_RESUMABLE_SAMPLERS and not sampler.acknowledge_nonresumable:
-        raise ValueError(
-            f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
-            "requires sampler.acknowledge_nonresumable: true. This sampler's "
-            "suggestions depend on process-local state Optuna storage does not persist, so "
-            "PhaseSweep refuses to resume the phase mid-target: an interrupted run cannot be "
-            "continued and n_trials cannot be raised later — each target must run in one "
-            "invocation. Add 'acknowledge_nonresumable: true' to this phase's sampler block "
-            "to accept that contract, or use sampler.type: random with a seed (resumable and "
-            "reproducible) or sampler.type: grid."
-        )
+
+
+def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
+    """Require ``n_trials: 1`` for a fixed configuration that has no durable study.
+
+    Every invocation on in-memory storage (``storage: null``) starts a fresh
+    study, so a fixed configuration there has nothing to retry and
+    :func:`phasesweep.config.search.fixed_configuration_target_refusal` would
+    demand one trial at every launch; the config says so at load. A persistent
+    study may hold failed attempts for a larger ``n_trials`` to replace, which
+    only a launch can see, so persistent storage is checked there.
+
+    :param str | None storage: Experiment-level storage URL, or ``None``.
+    :param Phase phase: Phase whose trial target is checked.
+    :raises ValueError: ``storage`` is in-memory and the phase, a fixed
+        configuration, asks for more than one trial.
+    """
+    if storage is not None:
+        return
+    refusal = fixed_configuration_target_refusal(phase, finished=0, completed=0)
+    if refusal is not None:
+        raise ValueError(refusal)
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
@@ -973,22 +1502,18 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     :raises ValueError: A composed value is outside the selected CLI value contract.
     """
     if experiment.override_format == "json_file":
-        from phasesweep.runtime.commands import dump_overrides_json
-
         for key, value in phase.fixed_overrides.items():
             try:
                 dump_overrides_json(value)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Phase {phase.name!r}: fixed_overrides {key!r}: {exc}") from exc
-        for param in phase.search_space.values():
+        for param in sampler_search_space(phase).values():
             if isinstance(param, CategoricalParam):
                 for choice in param.choices:
                     dump_overrides_json(choice)
         return
     if experiment.override_format not in {"argparse", "hydra"}:
         return
-
-    from phasesweep.runtime.commands import _OverrideValueError, _render_override_value
 
     override_format: Literal["argparse", "hydra"] = (
         "hydra" if experiment.override_format == "hydra" else "argparse"
@@ -1042,22 +1567,24 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
             f"integers, finite floats, strings, and lists of those. {hint}"
         )
 
-    for key, param in phase.search_space.items():
+    repeat_key = None if phase.repeats is None else phase.repeats.key
+    for key, param in sampler_search_space(phase).items():
         if not isinstance(param, CategoricalParam):
             continue
+        axis = (
+            f"repeats.key {key!r}" if key == repeat_key else f"categorical search_space key {key!r}"
+        )
         rendered: dict[str, tuple[int, Any]] = {}
         for index, choice in enumerate(param.choices):
             try:
                 wire = _render_override_value(choice, override_format)
             except _OverrideValueError as exc:
-                raise validation_error(
-                    f"categorical search_space key {key!r} choice at index {index}", exc
-                ) from exc
+                raise validation_error(f"{axis} choice at index {index}", exc) from exc
             earlier = rendered.get(wire)
             if earlier is not None:
                 earlier_index, earlier_choice = earlier
                 raise ValueError(
-                    f"Phase {phase.name!r}: categorical search_space key {key!r} has "
+                    f"Phase {phase.name!r}: {axis} has "
                     f"choices {earlier_choice!r} at index {earlier_index} and {choice!r} "
                     f"at index {index}, which both render as {wire!r} under "
                     f"override_format={override_format!r}. Distinct search choices must "
@@ -1117,10 +1644,11 @@ def _validate_trial_command_template(
       ``{trial_dir[0]}``), which ``str.format`` would apply to the rendered string.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
-    * Phases using the explicit ``argparse`` compatibility format with
-      overrides but a template missing
-      ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
-      blocker 2).
+    * Phases using a non-YAML format with overrides or a ``trainer_config`` but
+      a template missing the format's placeholder, the same silent-no-op
+      failure mode.
+    * A ``trainer_config`` and composed overrides that cannot be merged for
+      the selected format.
 
     Both placeholder checks parse real ``str.format`` field names so that an
     escaped ``{{overrides}}`` (rendered as the literal string ``{overrides}``)
@@ -1140,34 +1668,33 @@ def _validate_trial_command_template(
             the chosen ``override_format``).
 
     """
-    # Lazy import to avoid a circular config <-> overrides cycle.
-    from phasesweep.runtime.commands import (
-        dump_json_file_overrides,
-        dump_trial_trainer_config_yaml,
-        render_command,
-    )
-
     # Build a synthetic override dict: one value per locked or sampled key.
     # Inherited keys are present in the real call too (they come from parent
     # winners), so the placeholder set must include them or render_command
     # could miss a key the trainer expects.
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
     overrides.update(phase.fixed_overrides)
-    overrides.update(_placeholder_values_for(phase.search_space))
+    overrides.update(_placeholder_values_for(sampler_search_space(phase)))
 
-    has_overrides = bool(overrides)
+    # Every format delivers the base trainer_config, so a nonempty one needs the
+    # format's placeholder just as an override does.
+    has_overrides = bool(overrides) or (
+        experiment.override_format != "yaml_file" and bool(experiment.trainer_config)
+    )
 
     placeholder_dir = Path("__phasesweep_validate_trial_dir__")
-    if experiment.override_format == "yaml_file":
-        try:
+    try:
+        if experiment.override_format == "yaml_file":
             dump_trial_trainer_config_yaml(experiment.trainer_config, overrides)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
-                f"{type(exc).__name__}: {exc}."
-            ) from exc
-    elif experiment.override_format == "json_file":
-        dump_json_file_overrides(overrides)
+        elif experiment.override_format == "json_file":
+            dump_json_file_overrides(overrides, trainer_config=experiment.trainer_config)
+        else:
+            merged_cli_overrides(experiment.trainer_config, overrides)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
+            f"{type(exc).__name__}: {exc}."
+        ) from exc
     # Parse the template once so we can both (a) preflight-render below and
     # (b) check that the documented placeholders are actually referenced.
     # Both arms surface the same "failed to render" wrapping for unbalanced
@@ -1247,18 +1774,21 @@ def _validate_trial_command_template(
             raise ValueError("{overrides_path} is only available with json_file.")
         required_placeholder = "overrides"
 
-    # When a phase has no overrides at all (no inherited, fixed, or sampled
-    # keys), a constant trial_command is legitimate — the user is sweeping
-    # the same configuration repeatedly, e.g. for variance estimation.
+    # When a phase has no overrides at all (no inherited, fixed, sampled, or
+    # repeat keys) and no trainer_config to deliver, a constant trial_command
+    # is legitimate: the phase is one fixed run of a trainer that takes no
+    # input. Only a failed attempt is run again; repeated runs that all count
+    # carry a repeat key.
     if not has_overrides:
         return
 
     if required_placeholder not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
-            f"{phase.name!r} has inherited, fixed, or sampled overrides "
-            f"and trial_command does not reference {{{required_placeholder}}}. All "
-            "sampled parameters would be ignored — the trainer would "
+            f"{phase.name!r} has inherited, fixed, or sampled overrides or a "
+            f"trainer_config and trial_command does not reference "
+            f"{{{required_placeholder}}}. All sampled parameters and the "
+            "trainer_config would be ignored — the trainer would "
             "run with the same hard-coded configuration every trial. "
             f"Add {{{required_placeholder}}} to trial_command, or use the default "
             "override_format='yaml_file' with trainer_config and {config_path}."

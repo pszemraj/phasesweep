@@ -22,9 +22,11 @@ from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
+from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
+    RecoveredTrialState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -67,6 +69,8 @@ class RunningAttemptSnapshot(_SnapshotModel):
     trial_number: NonNegativeInt
     generation_id: str | None = None
     attempt_id: str | None = None
+    recovers_as: RecoveredTrialState
+    """The state stale recovery records for this row, read from its outcome record at capture."""
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
@@ -168,7 +172,12 @@ class EvaluationPointSummary(_SnapshotModel):
     progress axis its sweep holds fixed, such as optimizer step or tokens.
     """
 
-    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} Always n/a for json and log_regex objectives, which "
+            "record no evaluation position; only json_envelope, wandb and mlflow bind one."
+        )
+    )
     distinct_values: NonNegativeInt | None = Field(
         description=(
             "Distinct positions on the configured evaluation axis the ranked objectives "
@@ -188,22 +197,39 @@ class SurvivorshipSummary(_SnapshotModel):
 
     verdict: ConfoundVerdict = Field(
         description=(
-            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed and pruned trials are at "
-            "least as numerous as ranked ones; infeasible trials never flag."
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed trials are at least as "
+            "numerous as ranked ones; infeasible and incomplete_group trials never flag."
         )
     )
     ranked: NonNegativeInt
     infeasible: NonNegativeInt
+    incomplete_group: NonNegativeInt = Field(
+        description=(
+            "Feasible trials of a repeats phase left unranked because another member of "
+            "their repeat group failed, was infeasible, or never ran; 0 without repeats."
+        )
+    )
     failed: NonNegativeInt
-    pruned: NonNegativeInt
 
 
 class TieSummary(_SnapshotModel):
-    """Whether the winner tied exactly with trials that used other params."""
+    """Whether the winner stands clear of ranked units that used other params.
+
+    A unit is a trial, or a complete repeat group in a repeats phase.
+    """
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
     tied_trials: NonNegativeInt | None = Field(
-        description="Trials tying the winner with other params; null when not checked."
+        description=(
+            "Units tying the winner's metric exactly with other params; null when not checked."
+        )
+    )
+    within_noise: NonNegativeInt | None = Field(
+        description=(
+            "Repeat groups whose aggregate is within two standard errors of the winning "
+            "group's, exact ties included: an advisory heuristic, not a significance test. "
+            "Null without repeats or when not checked."
+        )
     )
 
 
@@ -223,6 +249,40 @@ class ConfoundSummary(_SnapshotModel):
     tie: TieSummary
 
 
+class RepeatsSpread(_SnapshotModel):
+    """How a repeats winner's members spread around the value it ranked by.
+
+    The repeat key and its values are config-authored and never appear here.
+    """
+
+    reduce: Literal["mean", "median"] = Field(
+        description="Reducer that turned the member metrics into the winner's metric."
+    )
+    n: NonNegativeInt = Field(description="Members in the winning group, one per repeat value.")
+    mean: float
+    sd: float = Field(description="Sample standard deviation of the member metrics.")
+    min: float
+    max: float
+    member_trials: list[NonNegativeInt] = Field(
+        description="Trial numbers of the members, ascending; the last one is trial_number."
+    )
+
+    def view(self) -> RepeatsSummary:
+        """Return the summary in the engine's read-view shape.
+
+        :return RepeatsSummary: The same reducer, spread and member trial numbers.
+        """
+        return {
+            "reduce": self.reduce,
+            "n": self.n,
+            "mean": self.mean,
+            "sd": self.sd,
+            "min": self.min,
+            "max": self.max,
+            "member_trials": list(self.member_trials),
+        }
+
+
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
 
@@ -236,6 +296,8 @@ class WinnerSnapshot(_SnapshotModel):
     attempt_id: str | None = None
     source: WinnerSourceSnapshot
     confound: ConfoundSummary
+    observed: dict[str, float]
+    repeats: RepeatsSpread | None
 
 
 def _winner_source_snapshot(
@@ -281,12 +343,14 @@ def _winner_snapshot(
             _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
             winner_trial=winner.trial_number,
         )
+        repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
         if winner.confound is None:
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
+        repeats = winner.repeats
     return WinnerSnapshot(
         phase=phase,
         trial_number=winner.trial_number,
@@ -298,6 +362,8 @@ def _winner_snapshot(
         attempt_id=winner.attempt_id,
         source=_winner_source_snapshot(winner),
         confound=ConfoundSummary.model_validate(confound),
+        observed=dict(winner.observed),
+        repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
     )
 
 
@@ -350,6 +416,8 @@ class RunResultSnapshot(_SnapshotModel):
                     attempt_id=winner.source.attempt_id,
                 ),
                 confound=winner.confound.model_dump(mode="json"),
+                observed=dict(winner.observed),
+                repeats=None if winner.repeats is None else winner.repeats.view(),
             )
             for winner in self.winners
         ]
@@ -425,9 +493,9 @@ def capture_result_snapshot(
     (unpublished) partial results, correctly flagged ``is_published: False``.
 
     The engine and this capture must agree about what a valid terminal
-    result is (review v0.5.16 / blocker 2): the per-generation lifecycle
-    record is an optional post-commit diagnostic to the engine, so its
-    absence is logged, never fatal here; storage reads only *enrich* the
+    result is: the per-generation lifecycle record is an optional
+    post-commit diagnostic to the engine, so its absence is tolerated here
+    and only a mismatch is logged; storage reads only *enrich* the
     snapshot (a phase whose counts are unreadable is frozen with
     ``trial_data_available: false`` rather than failing the capture); and
     when the engine hands over its own authoritative ``engine_winners``, the
@@ -437,13 +505,13 @@ def capture_result_snapshot(
     Exactly one storage read backs that agreement. Every trial fact frozen
     here -- counts, generation counts, and the RUNNING identities later used
     to reconcile cleanup evidence -- comes from the single tolerant
-    :func:`phasesweep.engine.read.read_status` call below. This function used
-    to reload each phase study afterwards to collect those identities, an
-    intolerant read with no retry: one transient "database is locked" in that
-    window failed the capture of an otherwise successful multi-hour run, and
-    a terminal snapshot that was never captured is unrecoverable by design
+    :func:`phasesweep.engine.read.read_status` call below. Reloading each
+    phase study afterwards to collect those identities would be an intolerant
+    read with no retry: one transient "database is locked" in that window
+    would fail the capture of an otherwise successful multi-hour run, and a
+    terminal snapshot that was never captured is unrecoverable by design
     (see docs/mcp.md). Freezing a valid terminal result must not depend on a
-    second storage round trip (PR #5 review / reviewer 2, blocker 6).
+    second storage round trip.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
@@ -471,12 +539,12 @@ def capture_result_snapshot(
     # One tolerant read supplies every storage fact this snapshot freezes,
     # including the RUNNING identities in each phase's ``running_attempts``
     # (``None`` where ``trial_data_available`` is false). This capture must
-    # never reread a study afterwards (PR #5 review / reviewer 2, blocker 6).
+    # never reread a study afterwards.
     if engine_winners is not None:
         status = read_status(experiment, generation_id=generation_id)
         # The engine's terminal report is the authority on a successful
-        # outcome (review v0.5.16 / blocker 2); freeze exactly what it
-        # returned instead of re-reading the winner files.
+        # outcome; freeze exactly what it returned instead of re-reading the
+        # winner files.
         winner_snapshots = [
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
@@ -485,9 +553,8 @@ def capture_result_snapshot(
         # generation this snapshot *represents*, not the (possibly different)
         # true current pointer: a pinned capture wants exactly its own
         # generation's winners even when a newer generation has since become
-        # current (review v0.5.15 / blocker 3). A published generation's
-        # winners are the bytes its validation read, enumerated under its own
-        # recorded phase plan (review v0.5.16 / blocker 4).
+        # current. A published generation's winners are the bytes its
+        # validation read, enumerated under its own recorded phase plan.
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
@@ -570,10 +637,12 @@ def finalize_result_snapshot(
     A phase whose capture recorded no RUNNING identities (``running_attempts``
     is ``None``, which pairs with ``trial_data_available: false``) is left
     exactly as captured: there is nothing to reconcile the cleanup report
-    against, and its counts were never read either.
+    against, and its counts were never read either. Each reconciled attempt
+    moves from ``RUNNING`` to the state its capture recorded it recovers as,
+    ``INTERRUPTED`` or ``FAIL``.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
-    :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
+    :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled by recovery.
     :param Mapping[str, tuple[str, int, str]] | None confirmed_attempt_locations:
         Reconciled attempt ids mapped to phase, trial number, and generation;
         used when the frozen row was captured before its Optuna identity attrs
@@ -613,13 +682,13 @@ def finalize_result_snapshot(
         if len(recovered) > running:
             raise RuntimeError("cleanup report identifies more attempts than the snapshot records")
         phase.trials["RUNNING"] = running - len(recovered)
-        phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
+        for attempt, _generation_id in recovered:
+            phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
         phase.running = phase.trials["RUNNING"]
         # generation_trials was captured scoped to represented_generation_id
         # (the pinned id for a run snapshot), not current_generation_id, which
-        # is now always the actual mutable pointer and may be unrelated to --
-        # or absent for -- this snapshot's own generation (review v0.5.15 /
-        # blocker 3).
+        # is always the actual mutable pointer and may be unrelated to --
+        # or absent for -- this snapshot's own generation.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt
@@ -637,9 +706,10 @@ def finalize_result_snapshot(
                     "cleanup report identifies more generation attempts than the snapshot records"
                 )
             phase.generation_trials["RUNNING"] = generation_running - len(generation_recovered)
-            phase.generation_trials["FAIL"] = phase.generation_trials.get("FAIL", 0) + len(
-                generation_recovered
-            )
+            for attempt in generation_recovered:
+                phase.generation_trials[attempt.recovers_as] = (
+                    phase.generation_trials.get(attempt.recovers_as, 0) + 1
+                )
         recovered_trial_numbers = {attempt.trial_number for attempt, _generation_id in recovered}
         phase.running_attempts = [
             attempt

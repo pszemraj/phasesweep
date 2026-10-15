@@ -12,11 +12,12 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Experiment, Gate, check_bounds
+from phasesweep.config import Experiment, Gate, Observation, check_bounds
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
@@ -44,6 +45,7 @@ from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
+    merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
@@ -98,29 +100,16 @@ class TrialResult:
     gate_results: list[GateResult] | None = None
     # Frozen evidence provenance captured when the objective was extracted:
     # extractor config fingerprint plus source digest / remote summary subset
-    # (review v0.5.17 / finding F). None when metric extraction failed.
+    # None when metric extraction failed.
     objective_provenance: dict[str, Any] | None = None
     # True only when the phase/run deadline directly caused this result to
     # fail, rather than merely having elapsed by the time another failure was
     # observed.
     deadline_exhausted: bool = False
+    # Report-only values read after acceptance, by observation name. A name
+    # whose extraction failed or came out non-finite is absent.
+    observed: dict[str, float] = field(default_factory=dict)
 
-
-# Minimal environment base used when the execution contract narrows
-# inheritance below "all": enough for a shell + interpreter to start and
-# write temp files, nothing that can carry semantic configuration.
-#
-# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
-# trains on CPU or GPU, so admitting the ambient value would let two operators
-# running the identical config from differently-exported shells write
-# CPU-trained and GPU-trained evaluations into one study under one semantic
-# fingerprint — exactly the unfingerprinted ambient input the narrowed
-# contracts exist to exclude (the fingerprint covers the contract's mode/names
-# and configured ``env``, never ambient values). Bind trainer visibility with
-# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
-# also drives GPU pool discovery, or name the variable in an ``inherit_env``
-# list to opt its ambient value in explicitly.
-_BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
 _TRIAL_BOUND_ENV = (
     "PHASESWEEP_TRIAL_DIR",
@@ -137,19 +126,46 @@ _TRIAL_BOUND_ENV = (
 # contract reports the divergence once per phase instead of once per trial.
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
+# Warn-once keys for :func:`_warn_narrowed_environment_exit`, with the same
+# once-per-phase-per-process scope.
+_NARROWED_ENV_EXIT_WARNED: set[tuple[str, str]] = set()
+
+# How far back from the end of ``stderr.log`` a failed trial's reason reads.
+_STDERR_TAIL_BYTES = 4096
+
+# Longest stderr quote in a failure reason, the ``...`` that marks a cut included.
+_STDERR_QUOTE_CHARS = 200
+
+# A terminal color or cursor sequence, which would otherwise leave its ``[31m`` residue.
+_ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+# Last stderr lines that suggest the trainer lacked an environment input, so the
+# narrowed-environment hint applies: a failed import (``PYTHONPATH`` dropped), a
+# missing tool or file (``PATH`` dropped), an ``os.environ["NAME"]`` lookup, or
+# words naming an unset variable. Any other line names its own cause and the hint
+# stays out of its way.
+_MISSING_ENVIRONMENT_STDERR = re.compile(
+    r"ModuleNotFoundError|ImportError|No module named"
+    r"|command not found|No such file or directory"
+    r"|KeyError: ['\"][A-Z][A-Z0-9_]*['\"]"
+    r"|(?i:environment variable|is not set)"
+)
+
 
 def _trainer_environment(
     experiment: Experiment,
     phase_name: str,
     *,
     require_wandb_online: bool = True,
+    tracked_only: bool = False,
 ) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
-    ``inherit_env: all`` preserves the historical full-inheritance behavior.
-    ``none`` starts from the minimal base; a list adds exactly the named
-    semantic ambient variables on top of that base. ``passthrough_env`` adds
-    credential/transport variables to either narrowed contract. Configured
+    ``inherit_env: none`` (the default) starts from the minimal base; a list
+    adds exactly the named semantic ambient variables on top of that base, and
+    ``all`` copies the whole ambient environment. The pass-through names (the
+    built-in ``TMPDIR`` plus ``passthrough_env``) are inherited under either
+    narrowed contract. Configured
     ``experiment.env`` values apply last, except trial-bound keys that
     PhaseSweep assigns for each attempt.
 
@@ -157,18 +173,20 @@ def _trainer_environment(
     :param str phase_name: Phase whose remote consumers manage W&B identity.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
+    :param bool tracked_only: Start from the ambient names the environment cohort covers even
+        under ``inherit_env: all``, which gives the names :func:`_environment_identity` tracks.
     :raises PhaseSweepError: The W&B environment cannot be composed because explicit
         settings conflict or remote logging is disabled (``FIX_CONFIG``).
     :return dict[str, str]: The composed trainer environment.
     """
-    contract = experiment.execution.inherit_env
-    if contract == "all":
+    admitted = experiment.execution.inherited_env_names()
+    if admitted is None and not tracked_only:
         env = os.environ.copy()
     else:
-        names = list(_BASE_INHERITED_ENV)
-        if isinstance(contract, list):
-            names.extend(contract)
-        names.extend(experiment.execution.passthrough_env)
+        names = [
+            *experiment.execution.tracked_env_names(),
+            *experiment.execution.effective_passthrough_env(),
+        ]
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     # These values are assigned for each trial after the base environment is
@@ -240,15 +258,20 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
 class EnvironmentIdentity:
     """Semantic identity of the base environment a trainer receives.
 
-    ``digest`` excludes explicitly classified ``passthrough_env`` values so
-    credentials can rotate without contaminating a persistent study. ``values``
-    remains the full composed mapping used for launch and the opt-in
-    ``environment.json`` record; it can hold secrets and must never be persisted
-    or logged outside that owner-only record.
+    ``tracked`` is the name-to-value mapping the environment cohort covers: the base names,
+    the ``inherit_env`` list names, the ``env`` entries and the keys PhaseSweep composes from
+    config. It leaves out the pass-through names (the built-in ``TMPDIR`` and
+    ``passthrough_env``) so credentials can rotate without contaminating a persistent study.
+    Each trial records it in plain text, so the refusal for a different cohort can show both
+    values. ``digest`` is the SHA-256 of that mapping, the compact key the cohort check compares.
+
+    ``values`` is the full composed mapping used for launch and the opt-in ``environment.json``
+    record. It also holds the pass-through values and, under ``inherit_env: all``, every
+    ambient variable outside the cohort, so it is recorded nowhere but that owner-only file.
     """
 
     digest: str
-    names: tuple[str, ...]
+    tracked: dict[str, str]
     values: dict[str, str]
 
 
@@ -258,44 +281,61 @@ def _environment_identity(
     *,
     require_wandb_online: bool = True,
 ) -> EnvironmentIdentity:
-    """Fingerprint the semantic part of the composed trainer environment.
+    """Identify the semantic part of the composed trainer environment.
 
-    Values named by ``execution.passthrough_env`` are deliberately excluded:
-    they are credentials or transport inputs allowed to rotate between
-    invocations. Every other inherited value is semantic and must remain in
-    one cohort for persistent-study reuse. Configured ``experiment.env``
-    entries remain semantic even if they reuse a pass-through name, except
-    trial bindings assigned by PhaseSweep, which are removed first.
+    The cohort covers the names the narrowed contract composes: the base names, the
+    ``inherit_env`` list names, the ``experiment.env`` entries and the W&B and MLflow keys
+    PhaseSweep sets from config. Under ``inherit_env: all`` the trainer still inherits every
+    ambient variable, but one outside that set is inherited untracked, so shell state such as
+    ``SHLVL`` or ``OLDPWD`` cannot split a persistent study.
 
-    The digest is the SHA-256 of the compact JSON encoding of the
+    Values named by the effective pass-through set (the built-in ``TMPDIR`` plus
+    ``execution.passthrough_env``) are also excluded: they are scratch, credential or
+    transport inputs allowed to change between invocations. Configured ``experiment.env``
+    entries remain semantic even if they reuse a pass-through name, except trial bindings
+    assigned by PhaseSweep, which are removed first.
+
+    The digest is the SHA-256 of the compact JSON encoding of the tracked
     ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
     delimiter join because ``experiment.env`` keys are arbitrary config
     strings: encoding ``{"A": "B=1"}`` and ``{"A=B": "1"}`` as ``A=B=1``
     would collide, while JSON string quoting keeps the encoding injective.
-    Sorting makes the digest independent of mapping order.
+    Sorting makes the digest independent of mapping order. It is a checksum of the tracked
+    mapping, not a secrecy measure: each trial records both.
 
     The digest is stored on every allocated trial and checked against every
-    populated persistent study before another trial is allocated. The values
-    themselves never enter config metadata.
+    populated persistent study before another trial is allocated.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
-    :return EnvironmentIdentity: Digest, sorted variable names, and the
-        composed name-to-value mapping the digest covers.
+    :return EnvironmentIdentity: The digest, the tracked name-to-value mapping it covers, and
+        the full composed mapping the trainer receives.
     """
     env = _trainer_environment(
         experiment,
         phase_name,
         require_wandb_online=require_wandb_online,
     )
-    passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
-    items = sorted((name, value) for name, value in env.items() if name not in passthrough)
-    encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    cohort_names = set(
+        _trainer_environment(
+            experiment,
+            phase_name,
+            require_wandb_online=require_wandb_online,
+            tracked_only=True,
+        )
+    )
+    passthrough = frozenset(experiment.execution.effective_passthrough_env()) - set(experiment.env)
+    tracked = {
+        name: value
+        for name, value in sorted(env.items())
+        if name in cohort_names and name not in passthrough
+    }
+    encoded = json.dumps(list(tracked.items()), separators=(",", ":"), ensure_ascii=False)
     return EnvironmentIdentity(
-        digest=hashlib.sha256(encoded).hexdigest(),
-        names=tuple(sorted(env)),
+        digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        tracked=tracked,
         values=env,
     )
 
@@ -307,16 +347,18 @@ def _record_trainer_environment(
 ) -> None:
     """Write the opt-in raw environment record for one trial.
 
-    A no-op unless ``execution.record_env`` is set. The record holds ambient
-    *values*, so it is written owner-only (0600) through
+    A no-op unless ``execution.record_env`` is set. The record holds the whole
+    composed environment, pass-through values and every ambient variable under
+    ``inherit_env: all`` included, so it is written owner-only (0600) through
     :func:`phasesweep.runtime.files.private_atomic_write_text` rather than the
     umask-governed artifact writer the rest of the trial directory uses. Only
     the file is hardened: the trial directory itself stays operator-trusted, so
     logs and evidence remain readable by ordinary tooling.
 
     The recorded mapping is the full contract-composed environment before the
-    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` names the
-    values excluded from the accompanying semantic digest.
+    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` lists the
+    effective pass-through names, built-in ``TMPDIR`` included, whose values are
+    left out of the tracked mapping and its digest.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param EnvironmentIdentity identity: Identity of the composed environment.
@@ -330,7 +372,7 @@ def _record_trainer_environment(
     payload = {
         "digest": identity.digest,
         "inherit_env": _inherit_env_contract(experiment),
-        "passthrough_env": sorted(experiment.execution.passthrough_env),
+        "passthrough_env": list(experiment.execution.effective_passthrough_env()),
         "env": identity.values,
     }
     private_atomic_write_text(
@@ -350,7 +392,7 @@ def _warn_dropped_cuda_visibility(
     """Warn once when the trainer's GPU visibility diverges from the parent's.
 
     The narrowed ``inherit_env`` contracts drop the ambient
-    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`_BASE_INHERITED_ENV`). The
+    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`~phasesweep.config.models.BASE_INHERITED_ENV`). The
     GPU pool still reads that ambient value for discovery: it leases and
     re-binds device tokens, and pins a disable sentinel (``""``/``-1``) into
     every trial. The remaining unbound case is ``gpu_policy: none``, where the
@@ -386,6 +428,103 @@ def _warn_dropped_cuda_visibility(
         phase_name,
         ambient,
         experiment.execution.inherit_env,
+    )
+
+
+def _printable_line(raw: str) -> str:
+    """Reduce one line of trainer output to plain single-line text.
+
+    :param str raw: One line, without its terminator.
+    :return str: The line without terminal escape sequences, control characters or
+        decoding replacements, with every whitespace run collapsed to one space.
+    """
+    text = _ANSI_SEQUENCE.sub("", raw)
+    kept = (
+        " " if ch.isspace() else ch
+        for ch in text
+        if ch.isspace() or (ch.isprintable() and ch != "\N{REPLACEMENT CHARACTER}")
+    )
+    return " ".join("".join(kept).split())
+
+
+def _stderr_last_line(trial_dir: Path) -> str | None:
+    """Return the last non-empty line of a trial's ``stderr.log``, ready to quote.
+
+    Reads at most :data:`_STDERR_TAIL_BYTES` from the end of the file in the
+    operator-trusted trial directory. A line cut by that window is quoted from
+    where the window starts. A line longer than :data:`_STDERR_QUOTE_CHARS` is cut
+    and ends in ``...``. A line with nothing printable left, such as binary
+    output, does not count, so the line before it is quoted.
+
+    :param Path trial_dir: Trial directory holding ``stderr.log``.
+    :return str | None: The line, or ``None`` when the file is missing, unreadable
+        or has no printable line.
+    """
+    try:
+        with (trial_dir / "stderr.log").open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - _STDERR_TAIL_BYTES))
+            tail = handle.read(_STDERR_TAIL_BYTES)
+    except OSError:
+        return None
+    for raw in reversed(tail.decode("utf-8", errors="replace").splitlines()):
+        line = _printable_line(raw)
+        if not line:
+            continue
+        if len(line) > _STDERR_QUOTE_CHARS:
+            return line[: _STDERR_QUOTE_CHARS - 3].rstrip() + "..."
+        return line
+    return None
+
+
+def _warn_narrowed_environment_exit(
+    *,
+    experiment: Experiment,
+    phase_name: str,
+    trial_id: int,
+    return_code: int,
+    stderr_line: str | None,
+) -> None:
+    """Warn once per phase when a trainer exits nonzero under a narrowed environment.
+
+    A trainer that was started without a variable it needs, such as ``PYTHONPATH``
+    or a cache path, can fail with an error that never mentions the environment.
+    Name the contract and the three ways to widen it, once per phase for the
+    process, so the first such failure carries the hint without repeating it for
+    every later trial. A failure whose stderr line names another cause, such as an
+    out-of-memory error, gets no hint and does not use up the phase's one warning.
+    Without a stderr line there is nothing to rule the environment out, so the hint
+    applies.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str phase_name: Phase whose trial failed, used for the warn-once key.
+    :param int trial_id: Phase-local trial number of the failed trial.
+    :param int return_code: The nonzero exit code the trainer returned.
+    :param str | None stderr_line: The trial's last stderr line from
+        :func:`_stderr_last_line`, or ``None`` when it has none.
+    """
+    admitted = experiment.execution.inherited_env_names()
+    if admitted is None:
+        return
+    if stderr_line is not None and _MISSING_ENVIRONMENT_STDERR.search(stderr_line) is None:
+        return
+    key = (experiment.experiment, phase_name)
+    if key in _NARROWED_ENV_EXIT_WARNED:
+        return
+    _NARROWED_ENV_EXIT_WARNED.add(key)
+    log.warning(
+        "[%s/trial_%d] the trainer exited with code %d under execution.inherit_env=%r, "
+        "so it received only %s plus env and passthrough_env values. If it needs another "
+        "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
+        "credential), name it in execution.inherit_env: [NAME], set it under env:, or set "
+        "execution.inherit_env: all.%s The trainer's own error is in stderr.log in the "
+        "trial directory. This hint is shown once per phase.",
+        phase_name,
+        trial_id,
+        return_code,
+        experiment.execution.inherit_env,
+        ", ".join(admitted),
+        "" if stderr_line is None else f' Its last stderr line was "{stderr_line}".',
     )
 
 
@@ -484,8 +623,10 @@ def prepare_trainer_input(
     """Atomically write and identify the exact input one trainer will consume.
 
     One serialized byte string is used for the atomic write, environment
-    digest, and durable trial record. Argparse mode consumes the resolved-
-    overrides audit file; YAML mode consumes the generated trainer config.
+    digest, and durable trial record. Argparse and hydra consume the flat
+    ``overrides_resolved.json``, which holds the base trainer config merged
+    with the overrides; YAML and JSON modes consume their generated file and
+    leave ``overrides_resolved.json`` as the overrides-only audit record.
 
     :param Experiment experiment: Experiment supplying format and base config.
     :param str phase_name: Phase label used for runtime placeholders.
@@ -496,28 +637,34 @@ def prepare_trainer_input(
     :return PreparedTrainerInput: Materialized input bytes and historical identity.
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
-    resolved_text = _json_dump_overrides(overrides)
-    resolved_path = trial_dir / "overrides_resolved.json"
-    atomic_write_text(resolved_path, resolved_text)
-
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
+    substitutions = {
+        "{trial_dir}": str(trial_dir),
+        "{trial_id}": str(trial_id),
+        "{phase}": phase_name,
+        "{run_name}": run_name,
+    }
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
         text = dump_trial_trainer_config_yaml(
-            experiment.trainer_config,
-            overrides,
-            substitutions={
-                "{trial_dir}": str(trial_dir),
-                "{trial_id}": str(trial_id),
-                "{phase}": phase_name,
-                "{run_name}": run_name,
-            },
+            experiment.trainer_config, overrides, substitutions=substitutions
         )
     elif experiment.override_format == "json_file":
-        text = dump_json_file_overrides(overrides)
+        text = dump_json_file_overrides(
+            overrides, trainer_config=experiment.trainer_config, substitutions=substitutions
+        )
     else:
-        text = resolved_text
+        text = _json_dump_overrides(
+            merged_cli_overrides(experiment.trainer_config, overrides, substitutions=substitutions)
+        )
 
+    resolved_text = (
+        _json_dump_overrides(overrides)
+        if experiment.override_format in ("yaml_file", "json_file")
+        else text
+    )
+    resolved_path = trial_dir / "overrides_resolved.json"
+    atomic_write_text(resolved_path, resolved_text)
     if filename != resolved_path.name:
         atomic_write_text(trial_dir / filename, text)
     return PreparedTrainerInput(
@@ -548,7 +695,7 @@ def launch_trial(
     resolved absolute path as an Optuna user attribute *before* the subprocess
     starts. The stale-trial reaper then reads back that exact path on a later
     run, even if the user changed ``experiment.workdir`` or invoked phasesweep
-    from a different cwd (review v0.5.3 / blocker 4).
+    from a different cwd.
 
     Args:
         experiment: Parsed experiment config; provides ``trial_command``,
@@ -626,11 +773,10 @@ def launch_trial(
     (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
     # Environment and working directory follow the explicit execution
-    # contract instead of unbounded ambient inheritance (review v0.5.17 /
-    # blocker 4). The identity is computed from the same composition the
-    # subprocess receives, and the opt-in raw record is written before any
-    # per-trial binding is layered on, so the file stays the digest's exact
-    # preimage (review v0.5.18 / finding F3).
+    # contract instead of unbounded ambient inheritance. The identity is
+    # computed from the same composition the subprocess receives, and the
+    # opt-in raw record is written before any per-trial binding is layered
+    # on, so the file stays the digest's exact preimage.
     identity = _environment_identity(experiment, phase_name)
     _record_trainer_environment(experiment, identity, workdir)
     env = dict(identity.values)
@@ -737,19 +883,22 @@ def extract_trial_result(
 
     Failure modes that produce a `failure_reason` (and thus an Optuna FAIL via
     TrialExecutionError):
-      * non-zero return code from the subprocess
+      * non-zero return code from the subprocess; the reason quotes the last line
+        of the trial's ``stderr.log`` when it has one
       * metric extractor raised ExtractorError
       * metric extractor returned a non-finite value
-      * any constraint extractor raised ExtractorError (review v0.5.2 / item 2)
-      * any constraint extractor returned a non-finite value (review v0.5.2 / item 3)
+      * any constraint extractor raised ExtractorError
+      * any constraint extractor returned a non-finite value
       * the phase/run wallclock deadline expired before extraction completed
-        (review v0.5.17 / blocker 8)
 
     A trial that produced a finite metric and finite constraint values but violated
-    a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation
-    failure, and should still inform the sampler. Expected extraction and gate
+    a bound (a constraint's, or the metric's own ``min``/``max``) is COMPLETE+infeasible
+    — that's a valid evaluation, not an instrumentation failure, and should still
+    inform the sampler. Expected extraction and gate
     failures are returned in :class:`TrialResult`; this function has no domain
-    exception outcome for callers to catch.
+    exception outcome for callers to catch. Report-only observations are read last,
+    after acceptance; one that cannot be read warns and is left out of
+    ``TrialResult.observed`` without affecting the result.
 
     Args:
         experiment: Parsed config; supplies the metric and constraint extractors.
@@ -805,7 +954,19 @@ def extract_trial_result(
         )
 
     if rc != 0 and failure_reason is None:
+        # The one place a nonzero exit's cause is composed, so trials.csv, the
+        # TRIAL line and the outcome record all carry the same stderr quote.
+        stderr_line = _stderr_last_line(executed.ctx.trial_dir)
         failure_reason = f"non-zero exit code {rc}"
+        if stderr_line is not None:
+            failure_reason += f"; stderr: {stderr_line}"
+        _warn_narrowed_environment_exit(
+            experiment=experiment,
+            phase_name=executed.ctx.phase,
+            trial_id=executed.ctx.trial_id,
+            return_code=rc,
+            stderr_line=stderr_line,
+        )
 
     if failure_reason is not None:
         return _failed_trial(
@@ -865,7 +1026,9 @@ def extract_trial_result(
         )
 
     constraint_values: dict[str, float] = {}
-    feasible = True
+    feasible = check_bounds(
+        metric_value, min_value=experiment.metric.min, max_value=experiment.metric.max
+    )
     for c in experiment.constraints:
         expired = _deadline_failure(f"constraint extractor {c.name!r}")
         if expired is not None:
@@ -947,8 +1110,8 @@ def extract_trial_result(
         )
 
     # Final boundary check: a slow last stage must not let a trial publish a
-    # "complete" evaluation past the configured wallclock bound (review
-    # v0.5.17 / blocker 8 — the field names promise an end-to-end limit).
+    # "complete" evaluation past the configured wallclock bound — the field
+    # names promise an end-to-end limit.
     expired = _deadline_failure("the trial result could be accepted")
     if expired is not None:
         expired.constraints.update(constraint_values)
@@ -960,6 +1123,7 @@ def extract_trial_result(
     locate_objective_position(
         executed.ctx, experiment.metric.extractor, objective_provenance, deadline=deadline
     )
+    observed = _observe(executed.ctx, experiment.observe, deadline=deadline)
     return TrialResult(
         metric=metric_value,
         constraints=constraint_values,
@@ -969,14 +1133,56 @@ def extract_trial_result(
         failure_reason=None,
         gate_results=gate_results,
         objective_provenance=objective_provenance or None,
+        observed=observed,
     )
 
 
+def _observe(
+    ctx: TrialContext, observations: list[Observation], *, deadline: float | None
+) -> dict[str, float]:
+    """Read the report-only observations of an accepted trial.
+
+    An observation is advisory, so a failed or non-finite read warns and records
+    nothing for that name. It never changes the trial's result and, running after
+    acceptance, can never spend the budget acceptance needed.
+
+    :param TrialContext ctx: Trial context of the accepted attempt.
+    :param list[Observation] observations: Configured report-only observations.
+    :param float | None deadline: Optional absolute ``time.monotonic()`` deadline.
+    :return dict[str, float]: Finite value of each observation that was read.
+    """
+    observed: dict[str, float] = {}
+    for observation in observations:
+        try:
+            value = run_extractor(ctx, observation.extractor, deadline=deadline)
+        except ExtractorError as exc:
+            log.warning(
+                "[%s/trial_%d] observation %s not recorded: %s",
+                ctx.phase,
+                ctx.trial_id,
+                observation.name,
+                exc,
+            )
+            continue
+        if not math.isfinite(value):
+            log.warning(
+                "[%s/trial_%d] observation %s not recorded: extractor returned non-finite value %r",
+                ctx.phase,
+                ctx.trial_id,
+                observation.name,
+                value,
+            )
+            continue
+        observed[observation.name] = value
+    return observed
+
+
 def _json_dump_overrides(overrides: dict[str, Any]) -> str:
-    """Serialize resolved overrides to indented JSON for ``overrides_resolved.json``.
+    """Serialize a flat override mapping to indented JSON for ``overrides_resolved.json``.
 
     Args:
-        overrides: The composed (inherited + fixed + sampled) overrides dict.
+        overrides: The composed (inherited + fixed + sampled) overrides dict,
+            or for argparse and hydra that dict merged into the base trainer config.
 
     Returns:
         Trailing-newline-terminated, sorted, two-space-indented JSON.

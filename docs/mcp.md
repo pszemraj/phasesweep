@@ -2,7 +2,7 @@
 
 The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times to distinguish process reuse during cancellation and recovery.
+The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times and its own PID namespace, including the start time of that namespace's PID 1, to distinguish process reuse during cancellation and recovery. On a host whose `/proc` hides other users' processes (`hidepid`), exempt the operator through its `gid=` option, or the server and the trial launcher refuse to start.
 
 ## The catalog
 
@@ -34,7 +34,7 @@ These are all accepted catalog fields. Entry paths expand `~`; relative `state_d
 | `experiments` | Nonempty list of objects; required | Every entry must load successfully for server startup. Each engine output/study namespace must have one catalog entry; aliases are rejected. |
 | `experiments[].id` | String; required | Unique case-sensitive agent-visible identifier matching `[A-Za-z0-9_-]+`, such as `tiny_lm`. It need not equal the experiment YAML's `experiment` name. |
 | `experiments[].config` | Path; required | Existing experiment YAML file, kept operator-only. Its configuration must satisfy the detached-run storage/path rules below. |
-| `experiments[].cwd` | Path or `null`; `null` | Existing detached-run working directory. Unset/null uses the resolved experiment file's parent directory. It also supplies the trainer's working directory when experiment `execution.cwd` is unset; an explicit absolute `execution.cwd` takes precedence for the trainer. |
+| `experiments[].cwd` | Path or `null`; `null` | Existing detached-run working directory. Unset/null uses the resolved experiment file's parent directory. It also supplies the trainer's working directory when experiment `execution.cwd` is unset; an explicit `execution.cwd` takes precedence for the trainer, and a relative one resolves against the experiment file's directory, not this `cwd`. |
 | `experiments[].description` | String, at most 500 characters; `""` | Purpose shown to the agent during catalog discovery; paths and secrets do not belong here. |
 | `experiments[].allow` | Object; `{}` | Permission block with all child permissions false by default; omitting it leaves the entry read-only. |
 | `experiments[].allow.launch` | Boolean; `false` | Permit detached launches for this entry; concurrency and experiment-busy checks still apply. |
@@ -42,7 +42,7 @@ These are all accepted catalog fields. Entry paths expand `~`; relative `state_d
 | `experiments[].allow.from_phase` | Boolean; `false` | Permit a launch with `from_phase`; also requires `allow.launch` and compatible earlier phase winners. It does not waive resume checks. |
 | `experiments[].visible_params` | `none`, `all`, or list of strings; `none` | Control sampled winner parameter values returned to agents. An allowlist uses exact parameter names; surrounding whitespace is stripped, duplicate names removed and blank names rejected. Keep `none` unless exposing values is intended. |
 
-MCP experiments must use a persistent local journal or `auto` ledger, an absolute `workdir`, and an absolute storage path after `auto` is resolved. Set an absolute `execution.cwd` when it is present. In-memory and external-database storage are not durable detached-run targets.
+MCP experiments must use a persistent local journal or `auto` ledger; in-memory and external-database storage are not durable detached-run targets. Relative `workdir`, journal and `execution.cwd` paths resolve against the experiment file's directory, as they do for the CLI, so the server, the detached runner and a CLI operator address the same artifact tree. Each run records that directory at launch and resolves its configuration snapshot against it.
 
 Follow [MCP setup](mcp_setup.md) to create, review, and validate a catalog. To run the stdio server directly:
 
@@ -56,12 +56,13 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Tool workflow
 
-Catalog operations use an experiment ID:
+Catalog operations use an experiment ID, except `explain_config`:
 
 1. `list_experiments` discovers the reviewed catalog, using its cursor until there are no more pages.
 2. `inspect_experiment(experiment_id)` returns an approved experiment's phase shape, metric descriptor, and permissions. It never launches work.
 3. After explicit user authorization, `launch_run(experiment_id, from_phase?)` starts the detached run and returns its durable `run_id`.
 4. `get_latest_run(experiment_id)` is the reconnection lookup when a client lost a run ID. It returns the newest handle for that catalog experiment, or `found: false` when no matching run exists.
+5. `explain_config(key?)` is for config-authoring help and needs no catalog entry. It returns the configuration reference for a key and every key below it, the same entries as `phasesweep explain`, or the top-level keys when `key` is omitted, together with the general notes of `phasesweep explain --notes` in `notes` (empty when a key was given). When `found` is false it lists the `closest` documented keys. It describes the schema, never an approved experiment's config, and returns no paths or values.
 
 Run lifecycle reads use a run ID only:
 
@@ -83,18 +84,45 @@ Save the `run_id` returned by launch. To reconnect from another chat or after a 
     "state": "running",
     "started_at": "2026-01-01T00:00:00Z",
     "recovery_required": false,
+    "runner_observable": true,
     "failure": null
   }
 }
 ```
 
-If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. Never cancel a run or launch a replacement automatically.
+If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. One call accepts at most 600 seconds in `timeout_seconds`; to keep waiting, call it again with the same `run_id`. Never cancel a run or launch a replacement automatically.
 
-`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
+`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` (add `--trials` for one row per trial) and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
+
+### Calling a tool from a shell
+
+`phasesweep mcp call` runs one tool of a catalog in the calling process, without an MCP client, for scripting or debugging a tool call:
+
+```bash
+phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
+phasesweep mcp call inspect_experiment --catalog /absolute/path/to/catalog.yaml '{"experiment_id": "tiny_lm"}'
+```
+
+The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and [audit log](#audit-log) apply as for a connected client, except that its audit records read `transport: "cli"`, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the structured result as JSON on stdout. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
+
+A `launch_run` call from a shell outside the host's initial PID namespace, such as a sandboxed agent shell, prints a warning: the runner belongs to that namespace and ends when it does, so launch a run that must last from a shell outside any sandbox (see [PID namespaces](#pid-namespaces)).
+
+To wait on a run longer than one `await_run` call allows, repeat the call with the same `run_id` until the run stops running:
+
+```bash
+catalog=/absolute/path/to/catalog.yaml
+run_id=tiny_lm-0123456789abcdef0123456789abcdef
+while out=$(phasesweep mcp call await_run --catalog "$catalog" "{\"run_id\": \"$run_id\", \"timeout_seconds\": 600}"); do
+  echo "$out" | jq -e '.run.state == "running" and (.run.recovery_required | not)' > /dev/null || break
+done
+echo "$out" | jq '.run'
+```
+
+The loop ends when the run reaches a terminal state, requires recovery, or a call fails; in the last case the error is already on stderr and `$out` is empty.
 
 ## Reading status responses
 
-Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned.
+Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned. The phase counts include `INTERRUPTED`, trials a deadline, shutdown or orchestrator death cut short: they never count toward `n_trials`, and each [reruns](runtime.md#interrupted-trials-rerun) before any new draw, so `remaining_trials` includes those reruns.
 
 For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
@@ -121,11 +149,17 @@ Read provenance and labels together:
 
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and report the condition.
 
-Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose verdict is `heterogeneous`; report each with its counts before relying on the winner or proposing a run whose phases inherit it. `evaluation_point` exposes `distinct_values` and `winner_value`; `tie` exposes `tied_trials`. `n/a` means a check could not run and must never be read as clean. MCP exposes only enums and numbers from these checks; evidence strings such as the evaluation-axis config key stay private. The verdicts do not invalidate the result, and only the operator decides whether to re-run.
+Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose verdict is `heterogeneous`; report each with its counts before relying on the winner or proposing a run whose phases inherit it. `evaluation_point` exposes `distinct_values` and `winner_value`; `survivorship` exposes its counts, including `incomplete_group`, and leaves interrupted trials out; `tie` exposes `tied_trials` and `within_noise`. In a phase with [repeats](config.md#repeats) the tie counts are repeat groups, and `within_noise` counts groups whose reduced metric lies within two standard errors of the winner's, an advisory heuristic rather than a significance test; it is null without repeats. `n/a` means a check could not run and must never be read as clean; `evaluation_point` is always `n/a` for `json` and `log_regex` objectives, which record no position, and all-false `objective_evidence` flags mean those identities are not enforced, not that they failed. Distinct `evaluation_point` positions are expected when the phase searches training length such as epochs or max steps. MCP exposes only enums and numbers from these checks; evidence strings such as the evaluation-axis config key stay private. The verdicts do not invalidate the result, and only the operator decides whether to re-run.
 
 Also report a winner's `incomplete: true`: a wallclock timeout cut its phase short, so selection used a partial population. The confound checks do not cover this limitation.
 
+Each winner's `observed` maps the experiment's report-only observation names to the values its winning trial recorded. They never influenced selection, and a name is absent when its read failed on that trial.
+
+A winner from a phase with [repeats](config.md#repeats) has a non-null `repeats`: the reducer (`reduce`), the member count `n`, the `mean`, sample `sd`, `min` and `max` of the member metrics, and `member_trials`, whose last entry is the winner's `trial_number`. Its `metric` is the reduced value, not one trial's, and its `observed` values are means over the members that recorded them. Report the spread with the metric. The repeat key and its values never appear in results; `validate` reports each phase's repeat count as `repeats`, or null.
+
 `recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
+
+`runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.
 
 Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
@@ -137,7 +171,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir. That workdir also holds the engine's `run.log`, which gains one `TRIAL` line per trial that ends and one `RERUN` line per rerun of an interrupted trial, so an operator can `tail -f` it for per-trial progress without a tool call (see [following a run](runtime.md#following-a-run)), or print the trials as a table with `phasesweep status CONFIG --trials`. No tool returns it, and the agent instructions keep the agent from opening it.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
@@ -167,13 +201,27 @@ Without `--confirm`, the command only inspects the run and reports the actions i
 > [!WARNING]
 > Do not delete run-handle files individually: a run history consists of its handle and matching log/status/config sidecars. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
 
+### PID namespaces
+
+A PID and its start time identify a process only inside one PID namespace, so each saved process identity also records the namespace its numbers belong to, as `pid:[<inode>]@<start time of its PID 1>`: the kernel hands a freed namespace's inode to a new namespace within seconds, and the start time of the new namespace's PID 1 tells the two apart. The server records its own namespace when it launches a runner, and the trial launcher records it with every trial. This matters when a sandbox, container, or other isolation gives different processes different views of the same state directory: a sandboxed shell command can read the state of a runner that the host's MCP server launched, and when a whole session, MCP server included, runs inside one sandbox, its runners belong to that sandbox and end with it.
+
+A run whose runner was recorded in another namespace is neither alive nor dead from a reader in a third namespace. It stays `running`, holds its concurrency slot, and reports `runner_observable: false`; the server never waits on, probes, or signals the numbers it recorded, because they name unrelated processes in its own namespace. `cancel_run` refuses it with nothing signalled, and `recover-run` refuses it with a message naming both namespaces. While the launching sandbox still runs, cancel or recover the run from inside it.
+
+The host's initial PID namespace sees every process, so a server or `recover-run` there looks for the run's own processes instead: any process whose PID, or whose process group and session, matches a recorded one at any nesting level, from the `NSpid`, `NSpgid` and `NSsid` lines of `/proc/<pid>/status`, which are readable for every process. A match whose namespace link names another namespace is ruled out. A match in the recorded namespace, or one whose namespace link cannot be read, such as a sandboxed browser process that is not dumpable, could still be the run's, so it blocks the proof. When nothing blocks it, the runner is dead, and the run reads `running` with `recovery_required: true`, exactly like a dead runner in the server's own namespace: its trials may outlive it, so no read ever settles the run. When something blocks it, the run stays `runner_observable: false`. Nothing is ever signalled across namespaces.
+
+When the launching sandbox has already ended, run `recover-run` from a host shell outside any sandbox. It checks the runner and every stale trial of the run the same way, writes the terminal status, and clears the run. If it cannot rule a process out, it refuses and names every host process that blocked it; inspect them with the `ps` command the message gives, and retry once they have exited.
+
 ## Security boundary
 
 The server does not accept configuration YAML, paths, commands, storage URLs, environment values, search ranges, sampler settings, gates, or safety waivers as tool input. Only the operator-authored catalog maps an experiment ID to a config. A catalog permission is not a grant to alter its config.
 
-No tool returns raw trainer logs, result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
+No tool returns raw trainer logs, a failed trial's reason (which quotes the last line of its `stderr.log`), result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
 
 > [!NOTE]
 > Training still runs with the authority of the operator-authored command; MCP restricts agent inputs and outputs, not the trainer process itself.
 
 Clients that support resources can read `phasesweep://catalog` for the first catalog page. The packaged `phasesweep_run_and_monitor` prompt supplies the same run-safety guidance as [the installed agent instructions](../src/phasesweep/mcp/agent_prompt.md).
+
+### Audit log
+
+`launch_run` and `cancel_run`, refused or not, append one JSON line to `audit.jsonl` in `state_dir`. A record holds a timestamp, the tool, its outcome (`success` or `error`), the safe arguments and resolved identifiers, small state summaries before and after (live-run count, run state), and for an error its type and redacted message. It holds no paths, commands, environment values, logs or sampled parameters. `session_id` is one random ID per server or `phasesweep mcp call` process. `transport` records how the call arrived, with a matching `actor`: `stdio` and `local-stdio` for a connected client served by `phasesweep mcp serve` or `phasesweep-mcp`, `cli` and `local-cli` for `phasesweep mcp call`. Filter on `transport` to tell an operator's shell call from a client session.

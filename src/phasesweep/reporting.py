@@ -124,8 +124,9 @@ def report_objective(
 
     The destination and attempt identity come from environment variables injected
     for a ``json_envelope`` metric extractor. ``extra`` may add top-level JSON
-    fields for constraint extractors or evidence gates, but cannot replace the
-    envelope fields managed by this helper. Missing parent directories in a
+    fields for constraint extractors, report-only ``observe`` entries (read with a
+    ``json`` extractor) or evidence gates, but cannot replace the envelope fields
+    managed by this helper. Missing parent directories in a
     nested configured destination are created by the atomic artifact writer.
 
     :param float value: Finite objective value produced by the evaluation. Here
@@ -133,8 +134,8 @@ def report_objective(
         call ``.item()`` on a tensor.
     :param str name: Objective name declared by the metric extractor.
     :param str split: Evaluated data split.
-    :param str policy: Evaluation policy, such as ``best_checkpoint`` or
-        ``final_checkpoint``.
+    :param str policy: Evaluation policy, the exact string the metric extractor's
+        ``policy`` names, such as ``final`` or ``best``.
     :param str checkpoint: Nonempty checkpoint identity.
     :param int step: Non-negative evaluation step.
     :param Mapping[str, int | float] | None progress: Optional positions on other

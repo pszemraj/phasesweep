@@ -1,4 +1,4 @@
-"""Publication-transaction fault injection (review v0.5.15 / blocker 3).
+"""Publication-transaction fault injection.
 
 The last-success pointer is the single final authoritative commit: every
 injected failure must leave either the previous publication authoritative or
@@ -35,6 +35,7 @@ from phasesweep.cli import _show_experiment_winners
 from phasesweep.config import Experiment, IntParam, Phase, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
+    PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
     TerminalReport,
@@ -84,10 +85,10 @@ def _fail_terminal_generation_state(original: Callable, error: BaseException):
     return flaky_state
 
 
-# Provenance files frozen into every generation namespace at claim time
-# (review v0.5.18 / finding F6). Referenced by literal name on purpose: these
-# names are the documented on-disk interface in docs/runtime.md, so renaming
-# them must fail here rather than silently move an operator's evidence.
+# Provenance files frozen into every generation namespace at claim time.
+# Referenced by literal name on purpose: these names are the documented on-disk
+# interface in docs/runtime.md, so renaming them must fail here rather than
+# silently move an operator's evidence.
 _CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
 _REPRODUCIBILITY_NAME = "reproducibility.json"
 _SENTINEL_SECRET = "s3cr3t-sentinel-must-not-be-published"
@@ -380,9 +381,9 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
 ) -> None:
     """A convenience root-projection failure must not fail the run.
 
-    Flips the pre-v0.5.15 behavior (projection failures used to precede and
-    block the pointer commit): projections are now a post-commit, best-effort
-    cache, and reads never depend on them once any generation has published.
+    Projections are a post-commit, best-effort cache: a projection failure
+    neither precedes nor blocks the pointer commit, and reads never depend on
+    them once any generation has published.
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
@@ -427,9 +428,9 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     """A directory-fsync failure after the pointer rename cannot fail the publication.
 
     ``os.replace`` is the commit; the directory fsync after it is durability
-    bookkeeping. Pre-fix, an fsync error surfaced as an exception from the
-    pointer write and the already-committed publication was rewritten as
-    ``publication_failed`` (review v0.5.16 / blocker 1, window 1).
+    bookkeeping. An fsync error must not surface as an exception from the
+    pointer write, or the already-committed publication would be rewritten as
+    ``publication_failed``.
     """
     experiment = _stored_experiment(tmp_path)
 
@@ -451,10 +452,9 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
 ) -> None:
     """A KeyboardInterrupt escaping a post-commit step must not reclassify the publication.
 
-    ``_log_on_failure`` used to catch only ``Exception``; a control-flow
-    exception from the record write propagated into the outer terminal
-    handler and rewrote the committed publication as ``failed`` (review
-    v0.5.16 / blocker 1, window 2).
+    ``_log_on_failure`` catches ``BaseException``; a control-flow exception
+    from the record write would otherwise propagate into the outer terminal
+    handler and rewrite the committed publication as ``failed``.
     """
     experiment = _stored_experiment(tmp_path)
 
@@ -501,9 +501,8 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
     The signal lands mid-transaction (during pre-commit validation); the
     publication must still commit and the shutdown must be delivered at the
-    next checkpoint — never rewritten into
-    a ``failed``/``publication_failed`` state for the committed generation
-    (review v0.5.16 / blocker 1, window 2).
+    next checkpoint — never rewritten into a ``failed``/``publication_failed``
+    state for the committed generation.
     """
     experiment = _stored_experiment(tmp_path)
 
@@ -826,10 +825,10 @@ def test_publication_refuses_invalid_winner_artifact(
 ) -> None:
     """A missing or modified winner artifact must not publish.
 
-    Review v0.5.16 / blocker 3 reproduction: the old validator looped the
-    current config and silently ``continue``-d past an invalid winner file, so
-    deleting or modifying the artifact immediately before validation still
-    published an officially successful generation with no verified winner.
+    The validator must not loop the current config and silently ``continue``
+    past an invalid winner file: deleting or modifying the artifact immediately
+    before validation would otherwise publish an officially successful
+    generation with no verified winner.
     """
     experiment = _stored_experiment(tmp_path)
 
@@ -1054,7 +1053,7 @@ def test_published_reads_consume_the_bytes_validation_read(
 
 
 # --------------------------------------------------------------------------
-# Pointer validation moved from record state to artifact identity.
+# Pointer validation keys on artifact identity, not record state.
 # --------------------------------------------------------------------------
 
 
@@ -1074,18 +1073,16 @@ def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
     # The pointer file itself is still there, so this is corruption of a
-    # recorded publication -- never an experiment that has published nothing
-    # (review v0.5.18 / finding F4).
+    # recorded publication -- never an experiment that has published nothing.
     assert _resolve_publication_pointer(experiment).state == "failed"
 
 
 def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_path: Path) -> None:
     """A pointer whose target's own summary no longer names it fails closed.
 
-    Pointer validation now reads back the generation's immutable *summary*,
-    not the (post-commit, best-effort) lifecycle record -- so tampering the
-    record no longer has any effect on publication status; tampering the
-    summary does.
+    Pointer validation reads back the generation's immutable *summary*, not
+    the (post-commit, best-effort) lifecycle record -- so tampering the record
+    has no effect on publication status; tampering the summary does.
     """
     experiment, generation_id = _golden_publication(tmp_path)
 
@@ -1114,17 +1111,16 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
     record["state"] = "failed"
     record_path.write_text(yaml.safe_dump(record))
 
-    # Unlike the pre-v0.5.15 design, this has no effect: the record is not consulted.
+    # The tampered state has no effect: the record is not consulted.
     assert published_generation_id(experiment) == generation_id
     assert read_winner(experiment, "p") is not None
 
 
 # --------------------------------------------------------------------------
-# Publication integrity states (review v0.5.18 / finding F4). "Nothing
-# published" and "the recorded publication no longer validates" are different
-# facts and must never collapse into the same answer: reporting corruption as
-# a fresh tree invites a re-run, which advances the pointer and leaves the
-# corruption flagged nowhere.
+# Publication integrity states. "Nothing published" and "the recorded
+# publication no longer validates" are different facts and must never collapse
+# into the same answer: reporting corruption as a fresh tree invites a re-run,
+# which advances the pointer and leaves the corruption flagged nowhere.
 # --------------------------------------------------------------------------
 
 
@@ -1421,6 +1417,86 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Pat
     assert current_path.read_bytes() == current
 
 
+def _with_later_phase(experiment: Experiment) -> Experiment:
+    """Append a phase ``q`` after the published phase, so a resume can start from it."""
+    later = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+        search_space={"b": IntParam(type="int", low=0, high=10)},
+    )
+    return experiment.model_copy(update={"phases": [*experiment.phases, later]})
+
+
+@pytest.mark.parametrize(
+    ("tamper", "match"),
+    [("append", "byte length"), ("rewrite", "digest")],
+)
+def test_summary_anchor_mismatch_raises_under_the_resume_flag(
+    tmp_path: Path, tamper: str, match: str
+) -> None:
+    """A summary that disagrees with its pointer is a refusal, not a verdict, for a resume."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    summary_path = _generation_summary_path(experiment, generation_id)
+    content = summary_path.read_bytes()
+    summary_path.write_bytes(content + b"\n" if tamper == "append" else content[:-2] + b"#\n")
+
+    verdict = _resolve_publication_pointer(experiment)
+    assert verdict.state == "failed" and verdict.error is not None and match in verdict.error
+    with pytest.raises(PublicationIntegrityError, match=match):
+        _resolve_publication_pointer(experiment, raise_on_manifest_error=True)
+    with pytest.raises(PublicationIntegrityError, match=match):
+        _published_for_resume(experiment)
+
+
+@pytest.mark.parametrize("damage", ["dangling_pointer", "malformed_pointer", "missing_summary"])
+def test_unusable_publication_is_refused_for_resume_never_read_as_absent(
+    tmp_path: Path, damage: str
+) -> None:
+    """A recorded publication that cannot be used refuses a resume instead of answering "no winner yet"."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    pointer_path = _last_successful_generation_path(experiment)
+    if damage == "dangling_pointer":
+        pointer_path.unlink()
+        pointer_path.symlink_to("missing-target.yaml")
+    elif damage == "malformed_pointer":
+        pointer_path.write_text("not a pointer\n")
+    else:
+        _generation_summary_path(experiment, generation_id).unlink()
+    assert _resolve_publication_pointer(experiment, raise_on_manifest_error=True).state == "failed"
+
+    with pytest.raises(PublicationIntegrityError):
+        _published_for_resume(experiment)
+    with pytest.raises(PublicationIntegrityError):
+        run_experiment(_with_later_phase(experiment), from_phase="q", dry_run=True)
+
+
+def test_absent_publication_is_still_nothing_published_for_resume(tmp_path: Path) -> None:
+    """Only a tree that never published reads as absent."""
+    experiment, _ = _golden_publication(tmp_path)
+    _last_successful_generation_path(experiment).unlink()
+
+    assert _published_for_resume(experiment) is None
+
+
+@requires_nonroot
+def test_unreadable_pointer_is_an_access_refusal_for_resume(tmp_path: Path) -> None:
+    """A pointer this user may not read is a permission refusal, not an absent publication."""
+    experiment, _ = _golden_publication(tmp_path)
+    pointer_path = _last_successful_generation_path(experiment)
+    original_mode = stat.S_IMODE(pointer_path.stat().st_mode)
+    pointer_path.chmod(0o000)
+    try:
+        assert _resolve_publication_pointer(experiment).state == "permission_denied"
+        with pytest.raises(PublicationAccessError, match="permission denied"):
+            _published_for_resume(experiment)
+        with pytest.raises(PublicationAccessError):
+            run_experiment(_with_later_phase(experiment), from_phase="q", dry_run=True)
+    finally:
+        pointer_path.chmod(original_mode)
+
+
 def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(
     tmp_path: Path,
 ) -> None:
@@ -1537,7 +1613,7 @@ def test_read_status_single_captures_the_published_pointer(
 
 # --------------------------------------------------------------------------
 # Generation provenance: the configuration and identity that produced a
-# published result are frozen into its namespace (review v0.5.18 / finding F6).
+# published result are frozen into its namespace.
 # --------------------------------------------------------------------------
 
 
@@ -1545,10 +1621,10 @@ def test_read_status_single_captures_the_published_pointer(
 def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path) -> None:
     """A published generation keeps the canonical config that produced it, owner-only.
 
-    Before this, a generation kept only the config *fingerprint*: once the
-    operator edited or lost the YAML, the digest could prove a mismatch but
-    could not reconstruct the search spaces, fixed overrides, environment, or
-    or trial command behind a published winner.
+    The config *fingerprint* alone is not enough: once the operator edited or
+    lost the YAML, the digest could prove a mismatch but could not reconstruct
+    the search spaces, fixed overrides, environment, or trial command behind a
+    published winner.
     """
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
     with temporary_umask(0o022):
@@ -1609,7 +1685,7 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
     assert record["experiment"] == experiment.experiment
     assert record["generation_id"] == generation_id
     # A direct-caller run mints its own id; only a launcher-granted identity
-    # records "caller" (PR #5 review / P2 missing-handle authority).
+    # records "caller".
     assert record["generation_id_source"] == "engine"
     assert record["phasesweep_version"] == summary["phasesweep_version"]
     assert record["config_fingerprint"] == summary["config_fingerprint"]
@@ -1639,8 +1715,7 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
 
     The launcher (the MCP server) freezes the run's authority in its own state
     dir; this record is what lets readers detect that such frozen authority
-    exists even after that state dir is deleted or replaced (PR #5 review /
-    P2 missing-handle authority).
+    exists even after that state dir is deleted or replaced.
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment, generation_id="launcher-granted-1")
@@ -1718,12 +1793,12 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
 ) -> None:
     """A provenance file this user may not read fails closed with its own reason.
 
-    Re-review v0.5.19 / observation N1: ``config.snapshot.yaml`` is owner-only,
-    so a second operator reading a perfectly healthy tree got the generic
-    "missing or unreadable" verdict and the "inspect or restore the generation
-    namespace" remedy -- for a permission bit. The verdict is
-    ``permission_denied`` (an unvalidatable tree is still not exposed as a
-    published one), and the reason points at the publishing user.
+    ``config.snapshot.yaml`` is owner-only, so a second operator reading a
+    perfectly healthy tree must not get the generic "missing or unreadable"
+    verdict and the "inspect or restore the generation namespace" remedy --
+    for a permission bit. The verdict is ``permission_denied`` (an
+    unvalidatable tree is still not exposed as a published one), and the
+    reason points at the publishing user.
     """
     experiment, generation_id = _golden_publication(tmp_path)
 

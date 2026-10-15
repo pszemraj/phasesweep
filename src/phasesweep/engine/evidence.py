@@ -17,6 +17,7 @@ from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
+from phasesweep.engine.repeats import evidence_members
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -64,7 +65,7 @@ _TRIAL_EVIDENCE_REMEDY = (
 
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no
-# longer the one that attempt produced (PR #5 review / reviewer 2, blocker 7).
+# longer the one that attempt produced.
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 
 
@@ -614,11 +615,11 @@ def _validate_selection_evidence(
 
     Winner selection consults Optuna alone - state, value, feasibility,
     execution ids, constraint readings - and never touches the filesystem, so
-    an experiment whose winning trial directory was deleted happily reselects
-    that trial and republishes its number, metric, and provenance from a tree
-    holding nothing behind them (PR #5 review / reviewer 2, blocker 7). This
-    runs on the launch path before any generation claim or trial work, so a
-    tree that cannot honestly be ranked is refused before it is added to.
+    an experiment whose winning trial directory was deleted would reselect
+    that trial and republish its number, metric, and provenance from a tree
+    holding nothing behind them. This runs on the launch path before any
+    generation claim or trial work, so a tree that cannot honestly be ranked
+    is refused before it is added to.
 
     Only selection-eligible trials are candidates
     (:func:`_selection_candidate_identity`); the rest can never win, so passing
@@ -714,46 +715,48 @@ def _verify_winner_objective_evidence(
     O(total trainer log bytes) per resume - potentially tens of gigabytes -
     while hashing only the published winner is bounded by one trial's log and
     still catches every deletion and every result-affecting edit, including a
-    tamper that preserves byte length (PR #5 review / reviewer 2, blocker 7).
+    tamper that preserves byte length.
 
     It runs on every selection, so a deadline-truncated partial publication is
-    covered on the same terms as a complete one.
+    covered on the same terms as a complete one. A repeats winner stands on
+    every member of its group, so each member is verified against its own
+    metric and provenance (:func:`phasesweep.engine.repeats.evidence_members`).
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
     :param str phase_name: Phase whose winner was just selected.
     :param SelectedTrial selected: The winning trial and its frozen provenance.
-    :raises TrialEvidenceMissingError: The winner's evidence directory, audit
-        artifacts, generated trainer input, or objective source are missing,
-        foreign, or altered.
+    :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
+        generated trainer input, or objective source of the winner or of any
+        member of its group are missing, foreign, or altered.
     """
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase_name,
-        selected.trial_number,
-        generation_id=selected.generation_id,
-        attempt_id=selected.attempt_id,
-    )
-    _verify_trial_evidence_dir(
-        trial_dir,
-        subject=(
-            f"Phase {phase_name!r} winner trial {selected.trial_number} "
-            f"(generation {selected.generation_id!r}, attempt {selected.attempt_id!r})"
-        ),
-        attempt_id=selected.attempt_id,
-        provenance=selected.objective_provenance,
-        trainer_input=selected.trainer_input,
-        verify_objective_digest=True,
-        extractor=experiment.metric.extractor,
-        metric_value=selected.metric,
-        wandb_query=_wandb_query(
-            experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
-        ),
-        mlflow_query=compile_mlflow_query(
-            experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
-        ),
-        mlflow_target=None if experiment.mlflow is None else experiment.mlflow.evidence_identity(),
-        constraints=selected.constraints,
-    )
+    gates = next(phase.gates for phase in experiment.phases if phase.name == phase_name)
+    label = "winner trial" if selected.repeats is None else "winner group member trial"
+    for member in evidence_members(selected):
+        _verify_trial_evidence_dir(
+            _trial_dir_for(
+                experiment,
+                phase_name,
+                member.trial_number,
+                generation_id=member.generation_id,
+                attempt_id=member.attempt_id,
+            ),
+            subject=(
+                f"Phase {phase_name!r} {label} {member.trial_number} "
+                f"(generation {member.generation_id!r}, attempt {member.attempt_id!r})"
+            ),
+            attempt_id=member.attempt_id,
+            provenance=member.objective_provenance,
+            trainer_input=member.trainer_input,
+            verify_objective_digest=True,
+            extractor=experiment.metric.extractor,
+            metric_value=member.metric,
+            wandb_query=_wandb_query(experiment, gates),
+            mlflow_query=compile_mlflow_query(experiment, gates),
+            mlflow_target=(
+                None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
+            ),
+            constraints=member.constraints,
+        )
 
 
 def _verify_skipped_winner_evidence(
@@ -766,40 +769,44 @@ def _verify_skipped_winner_evidence(
     ``--from-phase`` has no reason to require the prior phase's Optuna study:
     the authenticated winner artifact contains the source phase, trial,
     generation, attempt, objective provenance, and generated-input identity
-    needed to inspect the source tree directly.
+    needed to inspect the source tree directly, and for a repeats winner the
+    same identity for every member of its group.
 
     :param Experiment experiment: Experiment owning the artifact tree.
     :param Phase phase: Exposed skipped phase whose winner is being carried.
     :param Winner winner: Authenticated winner loaded from the prior publication.
-    :raises TrialEvidenceMissingError: The source trial's evidence has been
-        removed or changed.
+    :raises TrialEvidenceMissingError: The evidence of the source trial, or of
+        any member of its group, has been removed or changed.
     """
     # Publication validation already bound the source to this phase and to the
-    # winner's own trial, generation, and attempt.
+    # winner's own trial, generation, and attempt, and the group's last member
+    # to that same source.
     source = winner.source
     assert source is not None
-    trial_dir = _trial_dir_for(
-        experiment,
-        source.phase,
-        source.trial_number,
-        generation_id=source.generation_id,
-        attempt_id=source.attempt_id,
-    )
-    _verify_trial_evidence_dir(
-        trial_dir,
-        subject=(
-            f"Skipped phase {phase.name!r} winner source phase {source.phase!r} trial "
-            f"{source.trial_number} (generation {source.generation_id!r}, attempt "
-            f"{source.attempt_id!r})"
-        ),
-        attempt_id=source.attempt_id,
-        provenance=winner.objective_provenance,
-        trainer_input=winner.trainer_input,
-        verify_objective_digest=True,
-        extractor=experiment.metric.extractor,
-        metric_value=winner.metric,
-        wandb_query=_wandb_query(experiment, phase.gates),
-        mlflow_query=compile_mlflow_query(experiment, phase.gates),
-        mlflow_target=None if experiment.mlflow is None else experiment.mlflow.evidence_identity(),
-        constraints=winner.constraints,
-    )
+    for member in evidence_members(winner):
+        _verify_trial_evidence_dir(
+            _trial_dir_for(
+                experiment,
+                source.phase,
+                member.trial_number,
+                generation_id=member.generation_id,
+                attempt_id=member.attempt_id,
+            ),
+            subject=(
+                f"Skipped phase {phase.name!r} winner source phase {source.phase!r} trial "
+                f"{member.trial_number} (generation {member.generation_id!r}, attempt "
+                f"{member.attempt_id!r})"
+            ),
+            attempt_id=member.attempt_id,
+            provenance=member.objective_provenance,
+            trainer_input=member.trainer_input,
+            verify_objective_digest=True,
+            extractor=experiment.metric.extractor,
+            metric_value=member.metric,
+            wandb_query=_wandb_query(experiment, phase.gates),
+            mlflow_query=compile_mlflow_query(experiment, phase.gates),
+            mlflow_target=(
+                None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
+            ),
+            constraints=member.constraints,
+        )

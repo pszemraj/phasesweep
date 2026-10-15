@@ -10,7 +10,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import StudySchemaMismatchError, TrialTargetRegressionError
+from phasesweep.engine import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -18,6 +18,7 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.study_policy import _ALLOCATION_CONTEXT_ATTR, _load_phase_policy_state
@@ -34,10 +35,9 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     """A durable abort survives restart: the identical no-op re-run stays failed.
 
     First invocation: one success, then failures reach the threshold with every
-    trial terminal. Before review v0.5.17 / blocker 1, a second identical
-    invocation saw ``remaining == 0`` and published the lone COMPLETE trial as
-    a completed phase — converting a recorded failure into a success with no
-    new work.
+    trial terminal. A second identical invocation sees ``remaining == 0`` but
+    must not publish the lone COMPLETE trial as a completed phase, which would
+    convert a recorded failure into a success with no new work.
     """
     marker = tmp_path / "succeeded_once"
     trainer = write_trainer(
@@ -107,7 +107,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
                 user_attrs={
                     TRAINER_ENV_DIGEST_ATTR: cohort_digest,
                     TRIAL_OUTCOME_ATTR: {
-                        "schema_version": 1,
+                        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
                         "sequence": sequence,
                         "outcome": "failure",
                         "cause": "simulated external terminal row",
@@ -126,7 +126,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     """Raising n_trials after an abort is the explicit resume path.
 
     The top-up schedules genuinely new attempts; reaching a successful winner
-    selection consumes the durable abort record (review v0.5.17 / blocker 1).
+    selection consumes the durable abort record.
     """
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
@@ -233,8 +233,8 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     ("failing_attr", "old_target_refusal"),
     [
         (PHASE_RECOVERY_ATTR, NoFeasibleTrialError),
-        (TRIAL_TARGET_ATTR, TrialTargetRegressionError),
-        (_ALLOCATION_CONTEXT_ATTR, TrialTargetRegressionError),
+        (TRIAL_TARGET_ATTR, TrialTargetRefusedError),
+        (_ALLOCATION_CONTEXT_ATTR, TrialTargetRefusedError),
     ],
 )
 @pytest.mark.integration

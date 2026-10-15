@@ -1,14 +1,14 @@
 """Selection may not rank or republish a trial whose evidence left the tree.
 
 Winner selection reads Optuna alone - state, value, feasibility, execution ids,
-constraint readings - so before this guard an experiment whose winning trial
-directory had been deleted happily reselected that trial and republished its
+constraint readings - so without this guard an experiment whose winning trial
+directory had been deleted would reselect that trial and republish its
 number, metric, and provenance from a tree holding nothing behind them, with
-``publication_integrity: ok`` (PR #5 review / reviewer 2, blocker 7). These
-tests cover the three places that now fail closed: the launch preflight over
-every selection-eligible candidate, the digest check on the trial that actually
-becomes the published winner, and the manifest rule that a winner carried from
-an earlier generation must find that generation in this same tree.
+``publication_integrity: ok``. These tests cover the three places that fail
+closed: the launch preflight over every selection-eligible candidate, the
+digest check on the trial that actually becomes the published winner, and the
+manifest rule that a winner carried from an earlier generation must find that
+generation in this same tree.
 """
 
 from __future__ import annotations
@@ -31,9 +31,11 @@ from phasesweep.config import (
     Constraint,
     ExecutionContext,
     Experiment,
+    IntParam,
     JsonExtractor,
     Metric,
     Phase,
+    Repeats,
     Sampler,
     WandbExtractor,
     WandbSummaryRequiredGate,
@@ -177,6 +179,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         from pathlib import Path
         parser = argparse.ArgumentParser()
         parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int, default=0)
         parser.add_argument("--receipt", required=True)
         args = parser.parse_args()
         Path(args.receipt).write_text(json.dumps({
@@ -241,6 +244,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                 inherits=["first"],
                 gates=gates,
                 sampler=Sampler(type="random", seed=0),
+                search_space={"y": IntParam(type="int", low=0, high=9)},
             ),
         ],
     )
@@ -248,7 +252,8 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.setenv("WANDB_RUN_ID", "ambient-old-run")
     monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
     winners = run_experiment(experiment)
-    assert winners["next"].effective_overrides == {"x": 7}
+    assert set(winners["next"].params) == {"y"}
+    assert winners["next"].effective_overrides == {"x": 7, "y": winners["next"].params["y"]}
     # One shared capture per trial, and one position read per accepted W&B objective.
     remote_reads = 4 if consumers in {"primary", "combined"} else 2
     assert len(calls_path.read_text().splitlines()) == remote_reads
@@ -350,23 +355,26 @@ def _evidence_experiment(
     max_consecutive_failures: int = 3,
     fixed_overrides: dict[str, object] | None = None,
     override_format: str = "argparse",
+    trainer_config: dict[str, object] | None = None,
 ) -> Experiment:
     """Build a one-phase experiment on journal storage with a seeded sampler.
 
     Persistent storage is what makes a top-up reselect an *existing* trial
-    rather than starting over, which is the whole subject here.
+    rather than starting over, which is the whole subject here. A
+    ``trainer_config`` base applies to every format; ``yaml_file`` gets a
+    default one.
     """
     # Every trial of the default constant trainer logs the same objective, so
-    # the tie break (lowest trial number) makes trial 0 the winner however many
+    # the tie break (lowest draw position) makes trial 0 the winner however many
     # top-ups run, whatever the sampler draws.
     if trainer_body is None:
         trainer = write_constant_trainer(tmp_path)
     else:
         trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
-    trainer_config = None
     if override_format == "yaml_file":
         trainer_input = "--config {config_path}"
-        trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
+        if trainer_config is None:
+            trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
     elif override_format == "json_file":
         trainer_input = "--input {overrides_path}"
     else:
@@ -444,6 +452,7 @@ def _from_phase_evidence_experiment(
                 n_trials=resumed_trials,
                 sampler=Sampler(type="random", seed=1),
                 fixed_overrides={"phase_marker": str(marker)},
+                search_space={"lr": IntParam(type="int", low=1, high=9)},
             ),
         ],
     )
@@ -486,6 +495,62 @@ def test_trial_records_the_exact_generated_trainer_input(
         "size_bytes": input_path.stat().st_size,
         "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
     }
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_cli_trainer_input_record_is_the_merged_trainer_config(
+    tmp_path: Path,
+    override_format: str,
+) -> None:
+    """The record for argparse and hydra binds the flat base-plus-overrides mapping."""
+    experiment = _evidence_experiment(
+        tmp_path,
+        override_format=override_format,
+        trainer_config={"model": {"depth": 4}, "output_dir": "{trial_dir}/out"},
+        fixed_overrides={"model.width": 64},
+    )
+    run_experiment(experiment)
+    trial_dir = _sole_trial_dir(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=_resolve_storage(experiment.storage),
+    )
+    trial = study.get_trials(deepcopy=False)[0]
+    resolved = trial_dir / "overrides_resolved.json"
+
+    assert json.loads(resolved.read_text()) == {
+        "model.depth": 4,
+        "model.width": 64,
+        "output_dir": f"{trial_dir}/out",
+        "x": trial.params["x"],
+    }
+    assert trial.user_attrs[TRAINER_INPUT_ATTR] == {
+        "schema_version": 1,
+        "format": override_format,
+        "filename": "overrides_resolved.json",
+        "size_bytes": resolved.stat().st_size,
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_cli_trainer_input_without_trainer_config_is_the_overrides_alone(
+    tmp_path: Path,
+    override_format: str,
+) -> None:
+    """An empty base leaves the recorded bytes as the sorted overrides JSON."""
+    experiment = _evidence_experiment(
+        tmp_path, override_format=override_format, fixed_overrides={"b.y": 2, "a": 1}
+    )
+    run_experiment(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=_resolve_storage(experiment.storage),
+    )
+    params = study.get_trials(deepcopy=False)[0].params
+
+    expected = json.dumps({"b.y": 2, "a": 1, **params}, indent=2, sort_keys=True) + "\n"
+    assert (_sole_trial_dir(experiment) / "overrides_resolved.json").read_text() == expected
 
 
 def _published_winner_payload(experiment: Experiment, generation_id: str) -> dict:
@@ -774,6 +839,61 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     assert _pointer_bytes(resumed) == pointer_before
 
 
+def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
+    """A repeat group's winner stands on every member, not only the one that names it."""
+    marker = tmp_path / "resumed-trainer-ran"
+    trainer = write_trainer(tmp_path / "from_phase_trainer.py", _MARKED_TRAINER)
+
+    def experiment(resumed_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=3,
+                    sampler=Sampler(type="grid"),
+                    repeats=Repeats(key="seed", values=[0, 1, 2]),
+                ),
+                Phase(
+                    name="q",
+                    n_trials=resumed_trials,
+                    inherits=["p"],
+                    sampler=Sampler(type="random", seed=1),
+                    fixed_overrides={"phase_marker": str(marker)},
+                    search_space={"lr": {"type": "int", "low": 1, "high": 9}},
+                ),
+            ],
+        )
+
+    original = experiment(1)
+    winner = run_experiment(original)["p"]
+    assert winner.trial_number == 2
+    marker.unlink()
+    first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
+    source = first_member / "stdout.log"
+    original_bytes = source.read_bytes()
+    source.write_bytes(b"y" + original_bytes[1:])
+    pointer_before = _pointer_bytes(original)
+
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
+    ):
+        run_experiment(experiment(2), from_phase="q")
+    assert _phase_trial_count(original, "q") == 1
+    assert not marker.exists()
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=r"Phase 'p' winner group member trial 0 .*bytes behind the published",
+    ):
+        run_experiment(original)
+    assert _pointer_bytes(original) == pointer_before
+
+    source.write_bytes(original_bytes)
+    assert run_experiment(experiment(2), from_phase="q")["p"].repeats == winner.repeats
+
+
 def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -954,9 +1074,8 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
 ) -> None:
     """The cited generation holds the evidence, so its absence is corruption.
 
-    This is the tree ``assert_published_winner_evidence_local`` rejects
-    (re-review v0.5.19 / blocker B1) and that the manifest used to report as
-    ``ok``.
+    This is the tree ``assert_published_winner_evidence_local`` rejects, and
+    the manifest must report it as ``failed`` rather than ``ok``.
     """
     experiment, source_generation, _carrying = _tree_with_a_carried_winner(tmp_path)
     shutil.rmtree(_generations_dir(experiment) / source_generation)
@@ -1079,8 +1198,8 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
     starts a new recovery streak for a random sampler), completes, and
     legitimately publishes trial 0, citing the crashed generation.
 
-    Requiring a winner record in every cited source generation - the reviewer's
-    blanket rule - would make this ordinary recovery permanently unpublishable.
+    Requiring a winner record in every cited source generation would make this
+    ordinary recovery permanently unpublishable.
     """
     recovery_marker = tmp_path / "recovered.txt"
     crashing = _evidence_experiment(

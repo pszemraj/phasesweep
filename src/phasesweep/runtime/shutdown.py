@@ -17,7 +17,7 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from types import FrameType
 from typing import Any
@@ -32,14 +32,13 @@ _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 
 # The launch lock guards the Popen() -> _register() critical section so the
 # shutdown handler cannot snapshot _active_children while a child has been
-# spawned but not yet registered (review v0.5.7 / blocker 3). The handler
-# acquires the same lock before snapshotting, which forces it to wait until
-# every in-flight launch has either registered its PGID or failed. Cost: if
-# _spawn_blocked_supervisor's except-block runs _kill_group while this lock is
-# still held (run_supervised's caller holds it across the whole spawn), that
-# one failing launch can delay the shutdown handler's snapshot — and thus
-# global shutdown response — by up to ~27s worst case: 10s awaiting supervisor
-# readiness plus ~17s in _kill_group.
+# spawned but not yet registered. The handler acquires the same lock before
+# snapshotting, which forces it to wait until every in-flight launch has
+# either registered its PGID or failed. Cost: if _spawn_blocked_supervisor's
+# except-block runs _kill_group while this lock is still held (run_supervised
+# holds it across the whole spawn), that one failing launch can delay the
+# shutdown handler's snapshot — and thus global shutdown response — by up to
+# ~27s worst case: 10s awaiting supervisor readiness plus ~17s in _kill_group.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
@@ -103,6 +102,50 @@ class PhaseSweepShutdown(SystemExit):
 _deferred_shutdown_signum: int | None = None
 _main_thread_defer_depth = 0
 
+# The shutdown signal the handler is servicing, or None. CPython runs the
+# handler only in the main thread, so a worker thread whose trainer the handler
+# kills never sees ``PhaseSweepShutdown``; it reads this to record the trial as
+# interrupted rather than failed, and every launch path reads it to refuse a new
+# trainer. Set before the handler takes ``_launch_lock`` to snapshot children,
+# so a launcher holding that lock either sees it or registers a child the
+# snapshot includes. Cleared when the next run enters ``signal_handler_scope``.
+_servicing_signum: int | None = None
+
+# Callables the handler runs once it has set ``_servicing_signum``, so waits
+# that would otherwise block a worker thread (a GPU lease queue) wake and see it.
+_shutdown_wakers: list[Callable[[], None]] = []
+
+
+class ShutdownLaunchRefusedError(RuntimeError):
+    """Raised by a launch that a shutdown being serviced refused before any process started."""
+
+    def __init__(self, signum: int) -> None:
+        """Name the signal that refused the launch.
+
+        :param int signum: The shutdown signal being serviced.
+        """
+        super().__init__(f"trainer launch refused: orchestrator interrupted by signal {signum}")
+        self.signum = signum
+
+
+def servicing_shutdown_signal() -> int | None:
+    """Return the shutdown signal the handler is servicing.
+
+    :return int | None: The signal number, or ``None`` when no shutdown is under way.
+    """
+    return _servicing_signum
+
+
+def register_shutdown_waker(waker: Callable[[], None]) -> None:
+    """Have the shutdown handler call ``waker`` once a shutdown is being serviced.
+
+    A waker runs in the main thread inside the signal handler, so it must only
+    notify waiting threads: no blocking, no I/O.
+
+    :param Callable[[], None] waker: Callable that wakes threads blocked in a wait.
+    """
+    _shutdown_wakers.append(waker)
+
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Kill all tracked child process groups, then exit.
@@ -116,16 +159,16 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     then raise SystemExit. The original wait() call unblocks when the child dies.
 
     We snapshot the PGID set once under the lock and use that snapshot for both
-    the SIGTERM and SIGKILL phases (review v0.5.5 / blocker 1). Without this,
-    a worker thread can unregister a PGID after the root process exits on
-    SIGTERM but before we escalate to SIGKILL — leaving descendants alive.
+    the SIGTERM and SIGKILL phases. Without this, a worker thread can
+    unregister a PGID after the root process exits on SIGTERM but before we
+    escalate to SIGKILL — leaving descendants alive.
 
-    The handler also acquires ``_launch_lock`` before snapshotting (review
-    v0.5.7 / blocker 3) so a child that was just ``Popen()``-ed but not yet
-    ``_register()``-ed cannot escape the snapshot. When the launcher is a
-    worker thread, this handler (main thread) blocks until the launch site
-    releases the lock, then sees the new PGID in ``_active_children``. When
-    the launcher IS the main thread, blocking on the lock would self-deadlock:
+    The handler also acquires ``_launch_lock`` before snapshotting so a child
+    that was just ``Popen()``-ed but not yet ``_register()``-ed cannot escape
+    the snapshot. When the launcher is a worker thread, this handler (main
+    thread) blocks until the launch site releases the lock, then sees the new
+    PGID in ``_active_children``. When the launcher IS the main thread,
+    blocking on the lock would self-deadlock:
     kernel masking cannot prevent that (a signal delivered to any unblocked
     library thread still runs this handler in the main thread), so if a
     main-thread ``defer_shutdown_signals()`` window is open the handler
@@ -148,7 +191,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             or ignored during an active handler invocation as described above.
 
     """
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum, _servicing_signum  # noqa: PLW0603
 
     # Python signal handlers can interrupt an earlier invocation of this
     # handler. Let the first signal finish the authoritative cleanup pass;
@@ -166,6 +209,12 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             return
         # Any recorded-but-unserviced signal is superseded by this invocation.
         _deferred_shutdown_signum = None
+        _servicing_signum = signum
+        for waker in _shutdown_wakers:
+            try:
+                waker()
+            except Exception:
+                log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
             pgids = tuple(_active_children)
@@ -215,18 +264,18 @@ def _unblock_shutdown_signals() -> None:
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
 
 
-# Explicit shutdown-signal ownership tokens (review v0.5.15 / blocker 2B),
-# replacing inference from ``signal.getsignal(sig) is _shutdown_handler``.
-# That inference could not distinguish "this call's own enclosing scope" from
-# "an unrelated concurrent top-level run in another thread" — both look like
-# "the shutdown handler is already installed" — so the first of two
-# concurrent top-level runs to finish would tear down handlers the second
-# run still depends on (false nesting). Both globals are mutated only from
-# the main thread (``install_signal_handlers`` and ``signal_handler_scope``'s
-# install/restore branch both run there; the main thread is where
-# ``signal.signal`` is even callable), so no lock is needed — CPython's GIL
-# already makes a single attribute assignment atomic, and there is never a
-# writer to race against a writer.
+# Explicit shutdown-signal ownership tokens, not inference from
+# ``signal.getsignal(sig) is _shutdown_handler``. That inference cannot
+# distinguish "this call's own enclosing scope" from "an unrelated concurrent
+# top-level run in another thread" — both look like "the shutdown handler is
+# already installed" — so the first of two concurrent top-level runs to
+# finish would tear down handlers the second run still depends on (false
+# nesting). Both globals are mutated only from the main thread
+# (``install_signal_handlers`` and ``signal_handler_scope``'s install/restore
+# branch both run there; the main thread is where ``signal.signal`` is even
+# callable), so no lock is needed — CPython's GIL already makes a single
+# attribute assignment atomic, and there is never a writer to race against a
+# writer.
 _process_lifetime_owner = False
 _scope_depth = 0
 
@@ -243,19 +292,18 @@ def install_signal_handlers() -> None:
     cannot prevent the handlers from running.
 
     Main-thread only, enforced BEFORE any ownership state is inspected or
-    mutated (review v0.5.16 / blocker 5). The old off-main-thread behavior
-    silently fell through to the idempotent check; during an open main-thread
-    :func:`signal_handler_scope` every handler already points at
-    ``_shutdown_handler``, so a worker thread could take the fast path and
-    convert the scope's *temporary* installation into *process-lifetime*
-    ownership — the scope's exit then skipped restoring the host's handlers,
-    permanently stealing them from a worker thread that could never legally
-    call ``signal.signal`` itself.
+    mutated. An off-main-thread call must not reach the idempotent check:
+    during an open main-thread :func:`signal_handler_scope` every handler
+    already points at ``_shutdown_handler``, so a worker thread could take the
+    fast path and convert the scope's *temporary* installation into
+    *process-lifetime* ownership — the scope's exit would then skip restoring
+    the host's handlers, permanently stealing them from a worker thread that
+    could never legally call ``signal.signal`` itself.
 
     On success — including the idempotent already-installed path — this
     takes process-lifetime ownership of the shutdown signals: every later
     :func:`signal_handler_scope` call, on any thread, becomes a no-op for the
-    rest of the process (review v0.5.15 / blocker 2B).
+    rest of the process.
 
     Calling this while a :func:`signal_handler_scope` is open is a valid
     handover, not a conflict: the scope's exit sees the ownership claim and
@@ -323,11 +371,11 @@ def _restore_host_signal_state(
 ) -> Exception | None:
     """Give the embedding process its shutdown handlers and signal mask back.
 
-    Ordering matters (review v0.5.15 / blocker 2A): block first, THEN restore
-    handlers, THEN restore the mask. Restoring the mask before the handlers
-    would deliver a pending shutdown signal while ``_shutdown_handler`` is
-    still installed for it, raising :class:`PhaseSweepShutdown` out of this
-    cleanup path and leaving the remaining handlers unrestored.
+    Ordering matters: block first, THEN restore handlers, THEN restore the
+    mask. Restoring the mask before the handlers would deliver a pending
+    shutdown signal while ``_shutdown_handler`` is still installed for it,
+    raising :class:`PhaseSweepShutdown` out of this cleanup path and leaving
+    the remaining handlers unrestored.
 
     Restoration continues past an individual ``signal.signal`` failure rather
     than aborting the loop, so one bad signal cannot strand the others.
@@ -370,10 +418,9 @@ def signal_handler_scope() -> Iterator[None]:
 
     A library must not leave its shutdown handlers and unblocked signal mask
     installed after it returns control — that permanently steals the
-    embedding process's own SIGTERM/SIGINT/SIGHUP handling (review v0.5.14 /
-    blocker 6). This context manager scopes ownership to one call tree,
-    tracked with explicit tokens rather than handler-identity inference
-    (review v0.5.15 / blocker 2B). Ownership contract:
+    embedding process's own SIGTERM/SIGINT/SIGHUP handling. This context
+    manager scopes ownership to one call tree, tracked with explicit tokens
+    rather than handler-identity inference. Ownership contract:
 
       1. A process-lifetime :func:`install_signal_handlers` call (CLI/MCP
          entry points) owns the shutdown signals for the rest of the
@@ -407,16 +454,18 @@ def signal_handler_scope() -> Iterator[None]:
         outermost run whose child processes must be cleaned up on shutdown.
 
     """
-    global _scope_depth  # noqa: PLW0603
+    global _scope_depth, _servicing_signum  # noqa: PLW0603
 
+    if _scope_depth == 0:
+        # A new outermost run starts with no shutdown under way.
+        _servicing_signum = None
     if _process_lifetime_owner:
         # An entry point (CLI/MCP) already owns shutdown signals for the
         # whole process. Nothing to install or restore, on any thread — but
         # the ownership claim is a Python-side boolean, and another library
         # may have replaced an OS handler since the install. Re-assert the
         # OS ground truth (main thread only) so a stale claim cannot make
-        # this run silently execute without child-group cleanup (review
-        # v0.5.16 / blocker 5 follow-up).
+        # this run silently execute without child-group cleanup.
         _reassert_process_lifetime_handlers()
         yield
         return
@@ -473,10 +522,10 @@ def defer_shutdown_signals() -> Iterator[None]:
     """Defer shutdown handling while the calling thread is in a critical section.
 
     Used to keep the ``Popen() -> _register()`` window atomic from the
-    perspective of the signal handler (review v0.5.7 / blocker 3). CPython
-    runs Python signal handlers in the main thread, so when the launcher is
-    the main thread, taking ``_launch_lock`` from the handler would deadlock
-    against the launcher's own lock acquisition. Two layers close that:
+    perspective of the signal handler. CPython runs Python signal handlers in
+    the main thread, so when the launcher is the main thread, taking
+    ``_launch_lock`` from the handler would deadlock against the launcher's own
+    lock acquisition. Two layers close that:
 
     1. Kernel mask: the calling thread blocks shutdown signals, so a signal
        aimed at it queues until the critical section ends.
@@ -566,13 +615,13 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
     window exit — correct for launch bookkeeping, but wrong for a publication
     transaction: once the last-success pointer has committed, a shutdown
     delivered at window exit would propagate as a failure for work that is
-    already durably successful (review v0.5.16 / blocker 1). This window
-    instead *absorbs* the signal: the transaction runs to completion, the
-    window exit reports the absorbed signal on the yielded
-    :class:`AbsorbedShutdown` instead of raising, and the signal stays
-    recorded in the module's deferred-shutdown marker so a later checkpoint
-    (:func:`service_pending_shutdown`, or any :func:`defer_shutdown_signals`
-    exit, e.g. the next trial launch) still honors it before new work starts.
+    already durably successful. This window instead *absorbs* the signal: the
+    transaction runs to completion, the window exit reports the absorbed signal
+    on the yielded :class:`AbsorbedShutdown` instead of raising, and the signal
+    stays recorded in the module's deferred-shutdown marker so a later
+    checkpoint (:func:`service_pending_shutdown`, or any
+    :func:`defer_shutdown_signals` exit, e.g. the next trial launch) still
+    honors it before new work starts.
 
     Deterministic race outcome: a shutdown that arrives before this window
     opens raises normally and no publication happens; one that arrives inside
@@ -651,7 +700,7 @@ def _unregister(pgid: int) -> None:
 
     Defers shutdown signals while holding ``_lock`` so the signal handler
     (which also acquires ``_lock``) cannot interrupt and deadlock against
-    the same thread (review v0.5.9 / blocker 2).
+    the same thread.
 
     Args:
         pgid: The process-group ID returned by :func:`_register`. A pgid not

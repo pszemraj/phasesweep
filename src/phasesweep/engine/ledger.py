@@ -11,12 +11,18 @@ invariants checkable: every path that touches a ledger goes through this
 module's handles, in one fixed order.
 
 1. Only mutating callers take the experiment lock, and they take it first.
-   There are two: a run (:func:`phasesweep.engine.run.run_experiment`, from
-   the CLI or the MCP runner, including its post-run reconciliation) and a
-   ``recover-run`` the operator confirms. ``status``, ``show-winners``, live
-   MCP reads, and ``recover-run`` inspection hold no lock, which is why
-   everything they reach writes nothing. A dry run reads no ledger at all: it
-   previews on an in-memory study (:func:`open_preview_study`).
+   There are three: a run (:func:`phasesweep.engine.run.run_experiment`, from
+   the CLI or the MCP runner, including its post-run reconciliation), a
+   ``recover-run`` the operator confirms, and
+   :func:`phasesweep.tracking.publication.sync_tracking`, which retires
+   tracking attempts and writes the tracking tree. ``sync_tracking`` never
+   claims the ledger: it reads it only through :func:`validate_ledger` and
+   :func:`read_phase_trials`. ``status``, ``show-winners``, live MCP reads,
+   and ``recover-run`` inspection hold no lock, which is why everything they
+   reach writes nothing. A dry run is the same kind of read: it reads every
+   phase's study from one capture (:func:`read_phase_studies`), applies a
+   launch's checks to those read-only studies, and renders its example
+   command on an in-memory study (:func:`open_preview_study`).
 2. :func:`validate_ledger` checks the artifact-root binding, then scans the
    ledger's format, writing nothing and constructing no file-backed storage.
    On a bound tree an unreadable scan is tolerated and recorded on the
@@ -69,7 +75,7 @@ import optuna
 from optuna.storages import JournalStorage
 from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
 
-from phasesweep.config import Experiment, Phase
+from phasesweep.config import Experiment, Phase, sampler_search_space
 from phasesweep.engine.artifact_roots import (
     BindingState,
     _artifact_root_binding_applies,
@@ -94,6 +100,7 @@ from phasesweep.engine.optuna import (
     _phase_study_name,
     _PhaseTrialStats,
     _published_trial_matches,
+    _trial_count_state,
     _TrialRef,
 )
 from phasesweep.engine.state import (
@@ -101,6 +108,8 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    _outcome_sequence_counts,
+    _recovered_trial_state,
 )
 from phasesweep.runtime.files import fsync_directory, journal_file_path
 
@@ -113,6 +122,8 @@ __all__ = [
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
+    "read_phase_studies",
+    "read_phase_study",
     "read_phase_trials",
     "read_trial_stats",
     "repair_incomplete_journal_record",
@@ -254,7 +265,12 @@ def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> op
     return optuna.create_study(
         study_name=_phase_study_name(experiment, phase),
         storage=storage,
-        sampler=_build_sampler(phase.sampler, phase.search_space, n_jobs=phase.n_jobs),
+        sampler=_build_sampler(
+            phase.sampler,
+            sampler_search_space(phase),
+            n_jobs=phase.n_jobs,
+            repeats=phase.repeats,
+        ),
         pruner=optuna.pruners.NopPruner(),
         direction=experiment.metric.goal,
         load_if_exists=True,
@@ -483,8 +499,8 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
 _JOURNAL_LOCK_WAIT_SECONDS = 30.0
 
 #: How often a repair refreshes the journal's modification time while it
-#: holds Optuna's journal lock. Optuna 4.2 and later force-release a lock
-#: whose journal a waiting writer has seen unchanged for 30 seconds.
+#: holds Optuna's journal lock. Optuna force-releases a lock whose journal a
+#: waiting writer has seen unchanged for 30 seconds.
 _JOURNAL_LOCK_REFRESH_SECONDS = 1.0
 
 
@@ -493,11 +509,10 @@ class _JournalLock:
 
     Optuna's lock is a ``<journal>.lock`` symlink to the journal that records
     no owner. Its ``acquire`` has no timeout, so a lock a killed writer left
-    behind can block it forever: Optuna 4.0 and 4.1 never release a stale
-    lock, and later releases retry forever when the symlink dangles. Those
-    later releases also remove a lock whose journal a waiting writer has seen
-    unchanged for 30 seconds, then take their own, and a repair can hold the
-    lock that long on a large journal.
+    behind can block it forever: Optuna retries forever when the symlink
+    dangles. Optuna also removes a lock whose journal a waiting writer has
+    seen unchanged for 30 seconds, then takes its own, and a repair can hold
+    the lock that long on a large journal.
 
     :meth:`acquire` therefore waits at most :data:`_JOURNAL_LOCK_WAIT_SECONDS`
     and never removes a lock it did not take. The journal's modification time
@@ -877,14 +892,16 @@ def _phase_trial_stats(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
+    sequence_counts = _outcome_sequence_counts(trials)
     for trial in trials:
         if published_trial is not None and _published_trial_matches(trial, published_trial):
             published_trial_available = True
-        counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
+        state = _trial_count_state(trial)
+        counts[state] = counts.get(state, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
             states = generation_counts.setdefault(generation_id, {})
-            states[trial.state.name] = states.get(trial.state.name, 0) + 1
+            states[state] = states.get(state, 0) + 1
         if trial.state.name != "RUNNING":
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
@@ -893,6 +910,7 @@ def _phase_trial_stats(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+                recovers_as=_recovered_trial_state(trial, sequence_counts),
             )
         )
     return _PhaseTrialStats(
@@ -1100,27 +1118,25 @@ class PhaseTrials:
     cleanup_recovered: frozenset[int]
 
 
-def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:
-    """Read one phase's trials from a validated ledger, writing nothing.
+def read_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
+    """Read one phase's study from a validated ledger as a read-only snapshot.
 
     A journal is read from one complete snapshot, as :func:`read_trial_stats`
     reads it, so no file-backed storage is constructed and no study is
-    created. A memory ledger holds trials only inside the invocation that
-    claimed it, so only that :class:`ClaimedLedger` can answer. The trials and
-    the study's cleanup recovery ledger come from the same snapshot, so they
-    describe the same moment.
+    created. Reading the study's trials and user attributes works as on a live
+    study, and any write to a journal's snapshot raises, so the checks a
+    launch applies to a study can be applied to what is recorded without
+    changing it. A memory ledger holds trials only inside the invocation that
+    claimed it, so only that :class:`ClaimedLedger` can answer.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is read.
-    :return PhaseTrials | None: The study's trials and confirmed cleanup
-        recoveries, or ``None`` when no such study exists or this handle cannot reach it.
+    :return optuna.Study | None: The snapshot study, or ``None`` when no such
+        study exists or this handle cannot reach it.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or the journal could not be completely read.
     :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
     """
-    # attempts imports this module at load time, so the recovery ledger's parser is reached late.
-    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
-
     failure = ledger.format_scan_failure
     if failure is not None:
         raise type(failure).rewrap(failure, str(failure)) from failure
@@ -1142,8 +1158,85 @@ def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrial
     _validate_storage_versions(
         [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
     )
+    return study
+
+
+def read_phase_studies(ledger: ValidatedLedger) -> dict[str, optuna.Study | None]:
+    """Read every configured phase's study from one capture of the ledger, writing nothing.
+
+    The journal is captured once and every study is loaded from that one
+    replay, so the studies describe a single moment however many phases
+    there are, and a caller that counts trials and applies a launch's checks
+    to them cannot see two different journals. Each study is the read-only
+    snapshot :func:`read_phase_study` returns. A study that exists but holds
+    no trials is returned too: its accepted target still binds a launch.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :return dict[str, optuna.Study | None]: One entry per configured phase, by
+        phase name; ``None`` for a phase with no such study, or one this
+        handle cannot reach.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or the journal could not be completely read or replayed.
+    :raises StudySchemaMismatchError: A study is populated under an unsupported schema.
+    """
+    failure = ledger.format_scan_failure
+    if failure is not None:
+        raise type(failure).rewrap(failure, str(failure)) from failure
+    phases = ledger.experiment.phases
+    if ledger.backend == "memory":
+        return {phase.name: read_phase_study(ledger, phase) for phase in phases}
+    assert ledger.storage_url is not None
+    snapshot = _journal_snapshot_storage(
+        ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
+    )
+    studies: dict[str, optuna.Study | None] = {}
+    for phase in phases:
+        study_name = _phase_study_name(ledger.experiment, phase)
+        if snapshot is None:
+            studies[phase.name] = None
+            continue
+        try:
+            study = optuna.load_study(study_name=study_name, storage=snapshot)
+        except KeyError:
+            studies[phase.name] = None
+            continue
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                f"Journal storage {ledger.storage_url} could not be replayed while reading "
+                f"study {study_name!r}."
+            ) from exc
+        trials = study.get_trials(deepcopy=False)
+        _validate_storage_versions(
+            [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+        )
+        studies[phase.name] = study
+    return studies
+
+
+def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:
+    """Read one phase's trials from a validated ledger, writing nothing.
+
+    The study comes from :func:`read_phase_study`, so the trials and the
+    study's cleanup recovery ledger come from the same snapshot and describe
+    the same moment.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :param Phase | str phase: Phase or historical phase name whose study is read.
+    :return PhaseTrials | None: The study's trials and confirmed cleanup
+        recoveries, or ``None`` when no such study exists or this handle cannot reach it.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or the journal could not be completely read.
+    :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
+    """
+    # attempts imports this module at load time, so the recovery ledger's parser is reached late.
+    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+
+    study = read_phase_study(ledger, phase)
+    if study is None:
+        return None
     return PhaseTrials(
-        trials=trials, cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study))
+        trials=study.get_trials(deepcopy=False),
+        cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study)),
     )
 
 
@@ -1184,26 +1277,26 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     """Discover every existing phase study once, then bind the tree and claim them.
 
     This performs the fixed order's writes, and only after both ownership
-    directions are known to agree. Discovery is strict and tri-state (PR #5
-    review / reviewer 2, issue 1): a phase's study is *absent* (storage read
-    fine, no such study), *present* (loaded and kept), or *unavailable* -- and
-    unavailable raises before any claim, reaping, or registry recovery runs.
-    Swallowing a read failure and letting preflight read again would be unsafe:
-    a transient failure (for example, a brief journal-ledger lock) could
-    succeed on the second read and hand stale-trial reaping a study whose artifact-root
-    binding was never checked. The returned handle's ``studies`` is therefore
-    the *only* discovery pass: the objects that passed the root check here are
-    the exact objects preflight goes on to reap and validate.
+    directions are known to agree. Discovery is strict and tri-state: a
+    phase's study is *absent* (storage read fine, no such study), *present*
+    (loaded and kept), or *unavailable* -- and unavailable raises before any
+    claim, reaping, or registry recovery runs. Swallowing a read failure and
+    letting preflight read again would be unsafe: a transient failure (for
+    example, a brief journal-ledger lock) could succeed on the second read and
+    hand stale-trial reaping a study whose artifact-root binding was never
+    checked. The returned handle's ``studies`` is therefore the *only*
+    discovery pass: the objects that passed the root check here are the exact
+    objects preflight goes on to reap and validate.
 
-    Every declared phase is checked before anything is written (re-review
-    v0.5.19 / blocker B3), so a refused multi-phase run leaves neither the tree
-    nor any study bound to the rejected root. Phases whose study does not exist
-    yet are bound by :func:`open_phase_study` when the phase creates them. The
-    exception is a phase with a winner in the current published generation:
-    that publication proves the phase previously had trial rows with a specific
-    generation and attempt identity, so missing or replaced published trials
-    mean durable evidence was lost rather than that the phase is new. Skipped
-    phases load their saved winners instead.
+    Every declared phase is checked before anything is written, so a refused
+    multi-phase run leaves neither the tree nor any study bound to the
+    rejected root. Phases whose study does not exist yet are bound by
+    :func:`open_phase_study` when the phase creates them. The exception is a
+    phase with a winner in the current published generation: that publication
+    proves the phase previously had trial rows with a specific generation and
+    attempt identity, so missing or replaced published trials mean durable
+    evidence was lost rather than that the phase is new. Skipped phases load
+    their saved winners instead.
 
     The caller holds :func:`phasesweep.engine.locking._experiment_lock` across
     :func:`validate_ledger` and this call, so no cooperating process can bind
@@ -1314,8 +1407,8 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
 
     A study this call creates was invisible to :func:`claim_ledger`'s
     discovery, so it claims its publication root here, before any inspection,
-    reaping, or trial work can run against it (review v0.5.19 / finding F5);
-    a study that already existed only re-confirms the root it was claimed for.
+    reaping, or trial work can run against it; a study that already existed
+    only re-confirms the root it was claimed for.
 
     :param ClaimedLedger ledger: Handle from :func:`claim_ledger`.
     :param Phase phase: Phase whose sampler, search space, and study name are used.

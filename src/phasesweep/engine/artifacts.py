@@ -22,11 +22,21 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.optuna import _draw_positions, _trial_state_label
 from phasesweep.engine.publication_validation import ValidatedPublication
+from phasesweep.engine.repeats import (
+    RepeatAxis,
+    _check_repeats_axis,
+    _validate_repeats_block,
+    group_labels,
+)
 from phasesweep.engine.state import (
+    TRAINER_ENV_ATTR,
     Winner,
     _parse_winner_source,
+    _validate_observed_block,
 )
+from phasesweep.engine.trial import _environment_identity
 from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 
 log = logging.getLogger(__name__)
@@ -60,11 +70,11 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
 
     Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
     pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records (review v0.5.15 / blocker 3): a second
-    call for an already-written path can never clobber the first write, even
-    a same-content rewrite. Delegates to :func:`atomic_create_text`, so
-    ``path`` is staged and fsynced beside itself and only hard-linked into
-    place once complete -- no reader can ever observe a partial write.
+    per-generation lifecycle records: a second call for an already-written
+    path can never clobber the first write, even a same-content rewrite.
+    Delegates to :func:`atomic_create_text`, so ``path`` is staged and fsynced
+    beside itself and only hard-linked into place once complete -- no reader
+    can ever observe a partial write.
 
     :param Path path: Destination path to create; the parent directory is
         created if missing.
@@ -106,17 +116,36 @@ def _file_log_handler(path: Path) -> Iterator[None]:
         logger.setLevel(old_level)
 
 
-def _write_trials_csv(study: optuna.Study, path: Path) -> None:
+def _write_trials_csv(
+    study: optuna.Study, path: Path, *, repeats: RepeatAxis | None = None
+) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
+
+    The ``state`` column is the label run logs and status tables use, so an
+    interrupted trial reads ``INTERRUPTED`` and an infeasible one ``INFEASIBLE``.
+    A repeats phase gets a ``repeat_group`` column: the highest trial number
+    in the trial's group so far, grouped by the same key selection uses. An
+    incomplete group's label moves as more members are allocated.
+
+    Every user attribute is a column except the tracked trainer environment, which is
+    ledger provenance: its ``PATH`` and ``HOME`` values are noise in a results table.
+    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``.
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
+    :param RepeatAxis | None repeats: The phase's repeat axis, or ``None`` without repeats.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
     param_names = sorted({n for t in trials for n in t.params})
-    attr_names = sorted({n for t in trials for n in t.user_attrs})
+    attr_names = sorted({n for t in trials for n in t.user_attrs} - {TRAINER_ENV_ATTR})
+    positions = _draw_positions(trials)
+    labels = (
+        {}
+        if repeats is None
+        else group_labels(((t.number, positions[t.number], t.params) for t in trials), repeats)
+    )
     fieldnames = [
         "number",
         "state",
@@ -124,6 +153,7 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         "datetime_start",
         "datetime_complete",
         "duration",
+        *(["repeat_group"] if repeats is not None else []),
         *[f"param:{n}" for n in param_names],
         *[f"user_attr:{n}" for n in attr_names],
     ]
@@ -134,12 +164,14 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": t.state.name,
+                "state": _trial_state_label(t),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,
                 "duration": t.duration,
             }
+            if repeats is not None:
+                row["repeat_group"] = labels.get(t.number)
             for n in param_names:
                 row[f"param:{n}"] = t.params.get(n)
             for n in attr_names:
@@ -157,15 +189,16 @@ def _save_winner(
     """Persist a phase winner into its immutable generation namespace.
 
     The phase fingerprint is included so ``_load_winner`` can refuse stale
-    winners on ``--from-phase`` resume (review v0.5.6 / blocker 3). Real
-    winners always carry a fingerprint by construction in ``_run_phase``;
-    placeholder winners (dry-run skip) are never saved.
+    winners on ``--from-phase`` resume. Real winners always carry a
+    fingerprint by construction in ``_run_phase``; placeholder winners
+    (dry-run skip) are never saved.
 
     ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
-    produced the winning trial (review v0.5.18 / finding F3). Neither ever
-    carries ambient variable values. ``confound`` records the advisory
-    verdicts on the population the source selection ranked; like the
-    provenance fields it is winner-only and never enters ``summary.yaml``.
+    produced the winning trial. Neither ever carries ambient variable values. ``confound`` records the advisory
+    verdicts on the population the source selection ranked, ``observed`` the
+    report-only values the winning trial recorded, and ``repeats`` the winning
+    repeat group; like the provenance fields they are winner-only and never
+    enter ``summary.yaml``.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -186,6 +219,8 @@ def _save_winner(
         "trainer_env_digest": winner.trainer_env_digest,
         "trainer_inherit_env": winner.trainer_inherit_env,
         "confound": winner.confound,
+        "observed": winner.observed,
+        "repeats": winner.repeats,
     }
     _write_yaml_atomic(path, payload)
 
@@ -254,10 +289,6 @@ def _warn_environment_drift(
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
     :param str stored_digest: Digest recorded on the reused winner or its trial.
     """
-    # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
-    # read-only paths that import this module never need.
-    from phasesweep.engine.trial import _environment_identity
-
     current_digest = _environment_identity(
         experiment,
         phase_name,
@@ -297,7 +328,7 @@ def _load_winner(
 
     We re-compute the fingerprint of the current parent ``phase`` against the
     currently-resolved ``inherited_winners`` and refuse the load if the
-    fingerprints disagree (review v0.5.6 / blocker 3).
+    fingerprints disagree.
 
     A recorded semantic environment digest that disagrees with this process is
     a warning on this explicit skipped-phase path; ordinary study top-ups are
@@ -323,8 +354,9 @@ def _load_winner(
 
     Raises:
         FileNotFoundError: The publication holds no winner for the phase.
-        WinnerIntegrityError: The winner is incomplete or incompatible with
-            the current partial-result policy.
+        WinnerIntegrityError: The winner is incomplete, incompatible with
+            the current partial-result policy, or carries a ``repeats`` block
+            that is not the phase's configured repeat axis.
         StudyFingerprintMismatchError: The stored fingerprint disagrees with
             the freshly computed one.
 
@@ -363,11 +395,19 @@ def _load_winner(
         source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
         stored_env_digest = data["trainer_env_digest"]
         stored_inherit_env = data["trainer_inherit_env"]
+        metric = float(data["metric"][experiment.metric.name])
+        confound = _validate_confound_block(
+            data["confound"], winner_trial=int(data["trial_number"])
+        )
+        repeats = _validate_repeats_block(
+            data, metric_value=metric, ranked_groups=confound["ranked_groups"]
+        )
+        _check_repeats_axis(repeats, phase.repeats)
         winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
             effective_overrides=dict(data["effective_overrides"]),
-            metric=float(data["metric"][experiment.metric.name]),
+            metric=metric,
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
@@ -383,9 +423,9 @@ def _load_winner(
                 if isinstance(stored_inherit_env, list)
                 else stored_inherit_env
             ),
-            confound=_validate_confound_block(
-                data["confound"], winner_trial=int(data["trial_number"])
-            ),
+            confound=confound,
+            observed=_validate_observed_block(data["observed"]),
+            repeats=repeats,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

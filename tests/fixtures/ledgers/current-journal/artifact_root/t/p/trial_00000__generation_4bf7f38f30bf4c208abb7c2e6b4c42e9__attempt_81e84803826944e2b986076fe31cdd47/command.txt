@@ -1,0 +1,1 @@
+printf 'PSWOBJ=0.5\n' --a=1

@@ -1,0 +1,74 @@
+# phasesweep template: one phase per architecture, none inheriting another, each with an lr grid
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+#
+# Every phase fixes one architecture in fixed_overrides and searches the same small learning-rate
+# grid, so each winner is the best learning rate for its own architecture. No phase has inherits,
+# so none sees another's result. Compare the winners with phasesweep show-winners.
+# To hand the best architecture to later phases, search it as one categorical key in a single phase that they inherit.
+#
+# It runs as written on the packaged toy trainer, where an architecture is the layer count. For
+# your own trainer, replace trial_command, the trainer_config keys, the metric extractor and the
+# architecture keys in fixed_overrides, for example a model name or a model config path.
+experiment: phasesweep_architectures
+storage: auto
+provenance:
+  revision: "phasesweep-architectures-v1"
+# Relative paths here resolve against this file's directory, not the shell's.
+workdir: ./runs
+execution:
+  # Pins the trainer's cwd to this file's directory: a run from another directory resumes
+  # the same study. Unset, the cwd follows the invocation directory and is fingerprinted.
+  cwd: .
+  # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
+  inherit_env: none
+
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+# What every architecture shares. A phase's fixed_overrides replace the keys they name.
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
+
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
+
+phases:
+  - name: shallow
+    comment: "Six layers, with the learning-rate grid."
+    n_trials: 3
+    sampler: { type: grid }
+    fixed_overrides:
+      model.n_layers: 6
+    search_space:
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003, 0.001] }
+
+  - name: medium
+    comment: "Eight layers, with the same grid."
+    n_trials: 3
+    sampler: { type: grid }
+    fixed_overrides:
+      model.n_layers: 8
+    search_space:
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003, 0.001] }
+
+  - name: deep
+    comment: "Twelve layers, with the same grid."
+    n_trials: 3
+    sampler: { type: grid }
+    fixed_overrides:
+      model.n_layers: 12
+    search_space:
+      optimizer.lr: { type: categorical, choices: [0.0001, 0.0003, 0.001] }

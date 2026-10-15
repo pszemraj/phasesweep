@@ -12,6 +12,7 @@ Two audiences, two trees:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 
@@ -252,6 +253,24 @@ class RunLaunchUnsettledError(McpToolError):
         )
 
 
+class RunNamespaceMismatchError(McpToolError):
+    """Raised when cancellation targets a runner recorded in another PID namespace."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create a PID-namespace cancellation error.
+
+        :param str run_id: Run id whose runner this server cannot signal.
+        """
+        super().__init__(
+            f"run {run_id!r} was launched in another PID namespace, where its recorded "
+            "process ids name unrelated processes for this server, so nothing was "
+            "signalled. Do not retry. Keep monitoring the run with await_run, and tell the "
+            "user this server cannot cancel it: the operator can cancel it from the "
+            "environment that launched it while that environment runs, or recover it with "
+            "phasesweep mcp recover-run from the host once that environment has ended."
+        )
+
+
 class ResumeNotReadyError(McpToolError):
     """Raised when ``from_phase`` resume is requested but an earlier winner is unusable."""
 
@@ -275,3 +294,34 @@ class ResumeNotReadyError(McpToolError):
             "first; if it finds a run, call get_run_results with its run_id. Resume only after "
             "every earlier phase has a winner."
         )
+
+
+class ResumePublicationUnusableError(McpToolError):
+    """Raised when ``from_phase`` resume is requested over a publication that cannot be used."""
+
+    def __init__(
+        self,
+        experiment_id: str,
+        from_phase: str,
+        publication_integrity: Literal["failed", "permission_denied"],
+    ) -> None:
+        """Create a resume-over-unusable-publication tool error.
+
+        :param str experiment_id: Catalog id being resumed.
+        :param str from_phase: Requested resume phase.
+        :param Literal["failed", "permission_denied"] publication_integrity: Whether
+            the recorded publication no longer validates or cannot be read by this server.
+        """
+        if publication_integrity == "failed":
+            detail = (
+                "the recorded publication no longer validates (publication_integrity: failed). "
+                "Do not retry and do not launch a replacement run; stop and report that the "
+                "published result needs operator inspection."
+            )
+        else:
+            detail = (
+                "this server cannot read the recorded publication to validate it "
+                "(publication_integrity: permission_denied). Do not retry; stop and ask the "
+                "operator to re-read it as the publishing user or restore read permission."
+            )
+        super().__init__(f"cannot resume {experiment_id!r} from phase {from_phase!r}: {detail}")

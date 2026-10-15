@@ -18,8 +18,8 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
 )
@@ -31,6 +31,7 @@ from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
     read_boot_id,
+    read_pid_namespace,
 )
 from tests.conftest import mark_current_format, reaped_pid
 
@@ -43,8 +44,12 @@ def write_trial_identity(
     starttime: int | None,
     pgid: int | None = None,
     boot_id: str | None = None,
+    pid_namespace: str | None = None,
 ) -> None:
-    """Leave the process identity file a launched trainer records, with pgid defaulting to pid and boot_id to this boot."""
+    """Leave the process identity file a launched trainer records.
+
+    ``pgid`` defaults to ``pid``, ``boot_id`` to this boot, and ``pid_namespace`` to this process's.
+    """
     _write_process_identity(
         trial_dir / PROCESS_IDENTITY_FILE,
         StaleProcessIdentity(
@@ -54,6 +59,7 @@ def write_trial_identity(
             pgid=pid if pgid is None else pgid,
             proc_starttime=starttime,
             boot_id=read_boot_id() if boot_id is None else boot_id,
+            pid_namespace=read_pid_namespace() if pid_namespace is None else pid_namespace,
         ),
     )
 
@@ -102,7 +108,7 @@ def fabricate_stale_trial(
     trial = study.ask()
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    trial.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
     trial_dir = _trial_dir_for(
         experiment,
         phase_name,

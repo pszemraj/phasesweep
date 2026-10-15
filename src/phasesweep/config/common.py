@@ -4,11 +4,49 @@ from __future__ import annotations
 
 import math
 import re
+from pathlib import Path
 from typing import Annotated, TypeAlias, TypeGuard
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationInfo,
+)
 
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+#: Validation-context key holding the absolute directory of the config file
+#: being loaded. Relative path fields resolve against it.
+CONFIG_DIR_CONTEXT = "config_dir"
+
+
+def anchor_relative_path(value: str, info: ValidationInfo) -> str:
+    """Resolve a relative config path against the loaded config file's directory.
+
+    Anchoring at load makes one config file name one set of paths from any
+    working directory. Without a config directory in the validation context
+    (an experiment built in Python, or a re-validation of already anchored
+    values) the value is returned unchanged and keeps working-directory
+    semantics. A leading ``~`` is left for consumers to expand, so it stays
+    home-relative.
+
+    :param str value: Nonempty configured path.
+    :param ValidationInfo info: Validation info whose context may carry
+        :data:`CONFIG_DIR_CONTEXT`.
+    :return str: ``value`` joined onto the config directory when it is relative,
+        otherwise ``value`` unchanged.
+    """
+    context = info.context
+    config_dir = context.get(CONFIG_DIR_CONTEXT) if isinstance(context, dict) else None
+    if not isinstance(config_dir, Path) or value.startswith("~") or Path(value).is_absolute():
+        return value
+    return str(config_dir / value)
+
 
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -37,6 +75,16 @@ def _reject_boolean_number(value: object) -> object:
 ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
 ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
 
+StrictJsonScalar: TypeAlias = StrictBool | StrictInt | StrictFloat | StrictStr | None
+"""The exact set of values a JSON document can hold at a leaf position.
+
+Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
+``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
+neighbouring type. Anything outside this union — a mapping, a sequence, a
+``datetime.date`` — is not representable in parsed JSON and is rejected at
+config load rather than normalized later.
+"""
+
 
 class _Frozen(BaseModel):
     """Base for all config models: frozen + reject unknown keys."""
@@ -55,9 +103,9 @@ class _Frozen(BaseModel):
 def _require_finite(label: str, value: float) -> None:
     """Raise ``ValueError`` if ``value`` is NaN or +/-inf.
 
-    Used at config-load to keep silently-broken bounds out of the runtime
-    (review v0.5.2 / blocker 3): a constraint with ``max: .nan`` would otherwise
-    be vacuous because ``x > nan`` is always ``False``.
+    Used at config-load to keep silently-broken bounds out of the runtime: a
+    constraint with ``max: .nan`` would otherwise be vacuous because
+    ``x > nan`` is always ``False``.
 
     Args:
         label: Human-readable name of the field (e.g. ``"constraint.max"``);
@@ -176,7 +224,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
           siblings, same depth).
         * ``a.b.c`` and ``a.b.c.d`` do collide.
 
-    Used in ``Experiment._validate_phase_graph`` (review v0.5.3 / blocker 5).
+    Used in ``Experiment._validate_phase_graph``.
 
     Args:
         keys: The combined fixed-overrides / search-space / inherited key set

@@ -23,7 +23,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
-from phasesweep.config.io import _load_yaml_mapping_from_text, load_experiment_bytes
+from phasesweep.config.io import (
+    _load_yaml_mapping_from_text,
+    describe_validation_error,
+    load_experiment_bytes,
+)
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
@@ -31,9 +35,8 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
-    file_url_path,
 )
-from phasesweep.runtime.reaper import read_proc_starttime
+from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
@@ -42,8 +45,8 @@ def require_linux_mcp_host() -> None:
     """Require Linux process identity semantics for autonomous MCP control.
 
     :raises CatalogError: If the host cannot provide Linux ``/proc`` process
-        start times used to prevent PID-reuse mistakes during cancellation and
-        crash recovery.
+        start times and this process's own PID namespace, both used to prevent
+        PID-reuse mistakes during cancellation and crash recovery.
     """
     if not sys.platform.startswith("linux"):
         raise CatalogError(
@@ -56,6 +59,12 @@ def require_linux_mcp_host() -> None:
             "the phasesweep MCP server cannot read this process's Linux /proc start time, "
             "which is required for PID-reuse-safe cancellation and crash recovery",
             suggestion="mount /proc with process stat access for the MCP server process",
+        )
+    if read_pid_namespace() is None:
+        raise CatalogError(
+            "the phasesweep MCP server cannot read its own PID namespace, which is required "
+            "to tell its runners' process ids from those of another namespace",
+            suggestion="run the MCP server where /proc is the procfs of its own PID namespace",
         )
 
 
@@ -263,69 +272,26 @@ def _state_dir_remediation(state_dir: Path) -> str:
     return "set state_dir to a writable directory path (owner-only; not a file or symlink)"
 
 
-def _require_mcp_stable_paths(
-    experiment_id: str, experiment: Experiment, *, config_dir: Path
-) -> None:
-    """Reject MCP configs whose filesystem targets depend on server CWD.
+def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> None:
+    """Reject MCP configs whose study cannot outlive the process that runs it.
+
+    Relative paths need no check here: config load already resolved them
+    against the config file's directory, so they name the same targets for
+    the server, the detached runner and a CLI operator.
 
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
-    :param Path config_dir: Directory of the experiment config, used to compute
-        concrete fix suggestions for ``phasesweep mcp check``.
-    :raises CatalogError: If storage is absent or in-memory, ``workdir`` or
-        ``execution.cwd`` is relative, or the journal storage path is relative.
+    :raises CatalogError: If storage is absent or in-memory.
     """
-    storage = experiment.resolved_storage
-    if storage is None:
+    if experiment.resolved_storage is None:
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
             "in-memory storage cannot be monitored or resumed across processes",
-            suggestion=_suggest_storage(config_dir),
-        )
-
-    workdir = Path(experiment.workdir).expanduser()
-    if not workdir.is_absolute():
-        raise CatalogError(
-            f"{experiment_id!r}: MCP experiments must use an absolute workdir; "
-            "relative workdir values depend on the server launch directory and "
-            "break restart/recovery semantics",
-            suggestion=f"set workdir to an absolute path, e.g. {(config_dir / workdir).resolve()}",
-        )
-
-    execution_cwd = experiment.execution.cwd
-    if execution_cwd is not None and not Path(execution_cwd).expanduser().is_absolute():
-        # Same stability rule as workdir (review v0.5.17 / blocker 4): a
-        # relative trainer cwd would resolve differently for a CLI operator
-        # and the detached MCP runner, splitting one config into two
-        # execution contexts.
-        raise CatalogError(
-            f"{experiment_id!r}: MCP experiments must use an absolute execution.cwd; "
-            "relative values depend on the invoking process's directory and would "
-            "give CLI and MCP invocations different trainer working directories",
             suggestion=(
-                "set execution.cwd to an absolute path, e.g. "
-                f"{(config_dir / Path(execution_cwd).expanduser()).resolve()}"
+                "use a persistent local ledger, e.g. storage: auto for "
+                "<workdir>/<experiment>/study.journal"
             ),
         )
-
-    raw_path = file_url_path(storage)
-    storage_path = Path(raw_path).expanduser()
-    if not storage_path.is_absolute():
-        raise CatalogError(
-            f"{experiment_id!r}: MCP experiments must use an absolute journal "
-            "storage path; relative storage URLs depend on the server launch "
-            "directory and can point at a different Optuna study after restart",
-            suggestion=f"use an absolute path, e.g. {(config_dir / raw_path).resolve()}",
-        )
-
-
-def _suggest_storage(config_dir: Path) -> str:
-    """Suggest a valid MCP storage URL near the config.
-
-    :param Path config_dir: Directory of the experiment config.
-    :return str: Operator-facing suggestion for ``phasesweep mcp check``.
-    """
-    return f"use a persistent local URL, e.g. storage: journal:///{config_dir / 'optuna.journal'}"
 
 
 def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
@@ -355,7 +321,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
-        config cannot be parsed or fails the MCP path-stability rules.
+        config cannot be parsed, or its storage is not persistent.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -367,10 +333,13 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     )
     try:
         config_bytes = cfg_path.read_bytes()
-        config = load_experiment_bytes(config_bytes, source=cfg_path)
+        config = load_experiment_bytes(config_bytes, source=cfg_path, config_dir=cfg_path.parent)
+    except ValidationError as exc:
+        detail = describe_validation_error(exc)
+        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {detail}") from exc
     except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
-    _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
+    _require_persistent_storage(entry.id, config)
     if config.execution.cwd is None:
         # The detached runner enters the catalog entry's cwd before invoking
         # the engine. Materialize that effective trainer cwd in the in-memory

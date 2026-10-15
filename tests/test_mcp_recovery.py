@@ -481,7 +481,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
 ) -> None:
     """A PID recycled after a reboot must not fake runner liveness or absorb
     the recovery group signal: a recorded boot id from an earlier boot proves
-    the runner and its descendants are gone (review v0.5.17 / finding E).
+    the runner and its descendants are gone.
 
     The handle deliberately records this test process's own live PID and start
     time — the strongest possible "looks live" collision — under a foreign
@@ -642,8 +642,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     assert terminal["result_snapshot_state"] == "failed"
     assert terminal["result_snapshot_error"] == "InterruptedFinalization"
     # The engine exit status stays authoritative: an unavailable frozen
-    # snapshot degrades result reads (below), never the run outcome itself
-    # (review v0.5.16 / blocker 2).
+    # snapshot degrades result reads (below), never the run outcome itself.
     assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
     assert live_runs(store) == []
@@ -1249,7 +1248,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
             terminal = json.loads(store.status_path(earlier_run_id).read_text())
             frozen_phase = terminal["result_snapshot"]["status"]["phases"][0]
             assert frozen_phase["trials"]["RUNNING"] == 0
-            assert frozen_phase["trials"]["FAIL"] == 1
+            assert frozen_phase["trials"]["INTERRUPTED"] == 1
             assert frozen_phase["running_attempts"] == []
         assert store.state(handle) == "failed"
     else:
@@ -1422,8 +1421,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "WAITING": 0,
             "RUNNING": 0,
             "COMPLETE": 0,
-            "PRUNED": 0,
-            "FAIL": 1,
+            "FAIL": 0,
+            "INTERRUPTED": 1,
         }
         assert recovered_status["phases"][0]["running_trials_total"] == 0
 
@@ -1531,12 +1530,13 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert terminal["result_snapshot_state"] == "complete"
     phase = terminal["result_snapshot"]["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert phase["generation_trials"]["RUNNING"] == 0
-    assert phase["generation_trials"]["FAIL"] == 1
+    assert phase["generation_trials"]["INTERRUPTED"] == 1
     assert not store.recovery_required(handle)
     recovered_status = app.status(run_id=run_id)["phases"][0]
-    assert recovered_status["terminal_trials_this_run"] == 1
+    # An interrupted trial is not terminal for the budget: it reruns.
+    assert recovered_status["terminal_trials_this_run"] == 0
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
 
@@ -1615,7 +1615,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     assert not store.recovery_required(handle)
     phase = app.status(run_id=run_id)["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
 
 
 def test_operator_recovery_uses_runner_reconciliation_evidence(
@@ -1734,7 +1734,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     terminal = json.loads(store.status_path(run_id).read_text())
     phase = terminal["result_snapshot"]["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert store.state(handle) == "cancelled"
     assert live_runs(store) == []
 
@@ -1786,7 +1786,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     """A crash after the study-ledger write but before the run-level recovery
     record must not wedge the run forever: the --confirm retry counts the
     durable ledger evidence for this run's own generation instead of refusing
-    with "no trial-level cleanup evidence" (review v0.5.17 gap hunt)."""
+    with "no trial-level cleanup evidence"."""
     from phasesweep.runtime.files import private_atomic_write_text as real_write
 
     run_id = "srv-ledger-retry"
@@ -1841,11 +1841,11 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Interrupting ``clear_cleanup_uncertain`` after a recovery whose only
-    evidence was a cleanup-uncertain terminal trial used to wedge the run:
-    the retry found nothing fresh to recover and refused even though the
-    recovery record was already on disk. The study ledger now supplies the
-    evidence (review v0.5.17 gap hunt; the existing retry pin covered only
-    the reaped-RUNNING-trial variant, whose attempt ids persist in status)."""
+    evidence was a cleanup-uncertain terminal trial must not wedge the run:
+    the retry finds nothing fresh to recover but must not refuse while the
+    recovery record is already on disk. The study ledger supplies the
+    evidence (the reaped-RUNNING-trial variant is pinned separately, and its
+    attempt ids persist in status)."""
     run_id = "srv-terminal-marker-retry"
     store, handle, _trial_number, _config_path, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True

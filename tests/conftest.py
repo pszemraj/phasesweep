@@ -34,6 +34,7 @@ from phasesweep.config import (
     JsonEnvelopeExtractor,
     LogRegexExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
 )
@@ -342,7 +343,8 @@ def restored_signal_ownership() -> Iterator[None]:
 
     Restores, in order: the shutdown signals blocked, so none is delivered to
     a half-restored handler set; the prior OS handlers; the prior kernel mask;
-    and ``phasesweep.runtime.shutdown``'s ownership tokens.
+    and ``phasesweep.runtime.shutdown``'s ownership tokens and the signal its
+    handler is servicing.
 
     :return Iterator[None]: Context in which PhaseSweep may take signal ownership.
     """
@@ -353,6 +355,7 @@ def restored_signal_ownership() -> Iterator[None]:
     restore_mask = getattr(signal, "pthread_sigmask", None)
     prior_owner = shutdown._process_lifetime_owner
     prior_depth = shutdown._scope_depth
+    prior_servicing = shutdown._servicing_signum
     prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
     prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
     try:
@@ -366,6 +369,7 @@ def restored_signal_ownership() -> Iterator[None]:
             restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
+        shutdown._servicing_signum = prior_servicing
 
 
 @pytest.fixture(autouse=True)
@@ -373,8 +377,8 @@ def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore PhaseSweep's process-level signal state per test.
 
     ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
-    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
-    re-derived from OS ground truth the way the actual signal handlers are.
+    are plain module globals, deliberately not re-derived from OS ground truth
+    the way the actual signal handlers are.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
     in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
     SIGHUP handlers and unblock those signals, as well as flipping the private
@@ -496,6 +500,7 @@ def make_experiment(
     trainer_config: dict[str, Any] | None = None,
     metric: Metric | None = None,
     constraints: list[Constraint] | None = None,
+    observe: list[Observation] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
     execution: ExecutionContext | None = None,
@@ -545,11 +550,8 @@ def make_experiment(
         )
         base.update(phase_overrides)
         if storage is not None and "sampler" not in base:
-            # Persistent storage rejects an unseeded stochastic sampler and
-            # requires acknowledge_nonresumable for tpe/cmaes, so the default
-            # tpe sampler cannot be the fixture default here. Seeded random is
-            # stochastic, reproducible, and resumable: it satisfies the policy
-            # without asking every caller to acknowledge anything.
+            # Persistent storage rejects an unseeded stochastic sampler, so the
+            # default unseeded tpe sampler cannot be the fixture default here.
             base["sampler"] = Sampler(type="random", seed=0)
         phases = [Phase(**base)]  # type: ignore[arg-type]
 
@@ -577,6 +579,8 @@ def make_experiment(
         kwargs["provenance"] = provenance
     if constraints is not None:
         kwargs["constraints"] = constraints
+    if observe is not None:
+        kwargs["observe"] = observe
     if env is not None:
         kwargs["env"] = env
     if execution is not None:
@@ -624,13 +628,19 @@ def invoke_cli_boundary(
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
     """Return the confound block selection records for a one-trial population."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "ranked_trials": [trial_number],
+        "ranked_groups": None,
         "checks": {
             "evaluation_point": {"verdict": "n/a", "reason": "only one trial was ranked"},
             "survivorship": {
                 "verdict": "ok",
-                "detail": {"ranked": 1, "infeasible": 0, "failed": 0, "pruned": 0},
+                "detail": {
+                    "ranked": 1,
+                    "infeasible": 0,
+                    "incomplete_group": 0,
+                    "failed": 0,
+                },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
         },
@@ -725,8 +735,7 @@ def assert_published_winner_evidence_local(experiment_dir: Path) -> None:
     namespace holding the evidence behind that number, so it must resolve
     *inside the tree the reader is reading*. When one study is allowed to back
     two roots, both report ``publication_integrity: ok`` while the winner in
-    one of them cites a generation that only exists in the other (re-review
-    v0.5.19 / blocker B1).
+    one of them cites a generation that only exists in the other.
 
     :param Path experiment_dir: Experiment artifact namespace to check, i.e.
         ``<workdir>/<experiment>``.

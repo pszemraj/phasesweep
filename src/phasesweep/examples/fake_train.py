@@ -1,9 +1,18 @@
-"""Toy training script used by phasesweep examples and tests."""
+"""Toy training script used by phasesweep examples and tests.
+
+The loss is a deterministic formula of the model, optimizer and regularization values. An
+optional integer ``seed`` (a top-level ``seed`` in the config YAML, or a ``seed=N`` /
+``--seed=N`` token) adds a Gaussian term of scale ``SEED_NOISE_SCALE``, drawn deterministically
+from that seed and the trial's hyperparameters, so one seed gives different configurations
+different noise: neighboring learning rates scatter around the trend, and repeats over seeds
+spread, the way a noisy objective does. Without a seed there is no noise.
+"""
 
 from __future__ import annotations
 
 import argparse
 import math
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -11,6 +20,10 @@ from typing import Any
 import yaml
 
 from phasesweep import report_objective
+
+#: Standard deviation of the loss noise a ``seed`` adds, comparable to the loss gap between
+#: neighboring learning rates, so close configurations scatter about the trend.
+SEED_NOISE_SCALE = 0.02
 
 
 def _parse_kv(tokens: list[str]) -> dict[str, Any]:
@@ -20,7 +33,7 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
     :raises ValueError: A token or key is unsupported by this trainer.
     :return dict[str, Any]: Parsed numeric values keyed by trainer config path.
     """
-    integer_keys = {"n_layers", "model.n_layers"}
+    integer_keys = {"n_layers", "model.n_layers", "seed"}
     float_keys = {
         "lr",
         "optimizer.lr",
@@ -139,6 +152,10 @@ def main() -> None:
         + 1.5 * (dropout - 0.10) ** 2
         + 0.30
     )
+    seed = overrides.get("seed", _get(config, "seed", None))
+    if seed is not None:
+        noise = random.Random(f"{int(seed)}/{n_layers}/{lr!r}/{weight_decay!r}/{dropout!r}")
+        loss += noise.gauss(0.0, SEED_NOISE_SCALE)
 
     param_bytes = n_layers * 1_100_000
 

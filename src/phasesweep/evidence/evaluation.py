@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
 
 # Version of the objective evidence provenance payload frozen alongside a
-# metric at extraction time (review v0.5.17 / finding F).
+# metric at extraction time.
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
 # Bump when log-regex selection semantics change. The revision is frozen into
 # each trial's extractor contract, so selection and replay reject readings
@@ -60,7 +60,7 @@ def extractor_config_fingerprint(cfg: Extractor) -> str:
 
     Frozen into evidence provenance so a forensic review can prove which
     extractor contract produced a published scalar even after the experiment
-    config changes (review v0.5.17 / finding F).
+    config changes.
 
     :param Extractor cfg: Concrete extractor config to fingerprint.
     :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
@@ -96,7 +96,7 @@ def load_json_value(
     :param str key: Dot-separated key path to read from the JSON object.
     :param dict[str, Any] | None digest: Optional sink that receives the
         ``sha256``/``size_bytes`` of the exact bytes parsed, for evidence
-        provenance (review v0.5.17 / finding F).
+        provenance.
     :raises FileNotFoundError: If ``relative_path`` does not resolve to a regular
         file under ``trial_dir``.
     :raises KeyError: If a segment of the dotted ``key`` path is missing, with the
@@ -186,7 +186,7 @@ def _extract_json(
         cfg: ``JsonExtractor`` config naming the relative file path and the
             dotted lookup key inside it.
         provenance: Optional sink that receives the frozen evidence ``source``
-            payload on success (review v0.5.17 / finding F).
+            payload on success.
         deadline: Unused; accepted for parity with the shared extractor
             dispatch signature.
 
@@ -240,7 +240,7 @@ def _extract_json_envelope(
     :param JsonEnvelopeExtractor cfg: Expected objective and evaluation policy.
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
-        validated evaluation metadata — on success (review v0.5.17 / finding F).
+        validated evaluation metadata — on success.
     :param float | None deadline: Unused; accepted for parity with the shared
         extractor dispatch signature.
     :raises ExtractorError: If the envelope is missing, malformed, or belongs to
@@ -362,9 +362,9 @@ def _extract_log_regex(
         provenance: Optional sink that receives the frozen evidence ``source``
             payload on success: whole-file digest, the 1-based line number
             that supplied the selected value, and how many numeric matches
-            were examined (review v0.5.17 / finding F). ``select: "first"``
-            stops *matching* at the first hit but still reads the remaining
-            bytes so the digest always covers the full file.
+            were examined. ``select: "first"`` stops *matching* at the first
+            hit but still reads the remaining bytes so the digest always
+            covers the full file.
         deadline: Unused; accepted for parity with the shared extractor
             dispatch signature.
 

@@ -132,7 +132,7 @@ def _previously_recovered_attempt_locations(
     cleanup-uncertainty marker. A crash in that window must not erase the
     evidence: the retry skips these trials as already recovered, and without
     this mapping the trial-level-evidence guard would refuse to clear cleanup
-    uncertainty forever (review v0.5.17 gap hunt).
+    uncertainty forever.
 
     The mapping is scoped to ``generation_id`` — detached MCP runs use their run
     id as the generation id — so a *different* run's already-consumed evidence

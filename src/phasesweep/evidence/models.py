@@ -14,10 +14,6 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import (
     BaseModel,
     Field,
-    StrictBool,
-    StrictFloat,
-    StrictInt,
-    StrictStr,
     field_validator,
     model_validator,
 )
@@ -25,20 +21,11 @@ from pydantic import (
 from phasesweep.config.common import (
     ConfigFloat,
     ConfigInt,
+    StrictJsonScalar,
     _Frozen,
     _require_finite,
     _validate_optional_bounds,
 )
-
-StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
-"""The exact set of values a JSON document can hold at a leaf position.
-
-Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
-``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
-neighbouring type. Anything outside this union — a mapping, a sequence, a
-``datetime.date`` — is not representable in parsed JSON and is rejected at
-config load rather than normalized later.
-"""
 
 
 def _validate_trial_path(value: str) -> str:
@@ -313,12 +300,21 @@ ObjectiveExtractor = (
     JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
 )
 Extractor = ObjectiveExtractor
+LocalExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor
+"""The extractors that read a trial's own files. The remote kinds wait for every requested key."""
 
 ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb", "mlflow"]
 """The ``type`` of every objective extractor, as recorded evidence names it."""
 
 EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(get_args(ExtractorKind))
 """:data:`ExtractorKind` as a set, for checking a ``kind`` read back from disk."""
+
+POSITIONED_EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(
+    {"json_envelope", "wandb", "mlflow"}
+)
+"""The kinds whose recorded evidence names where on the evaluation axis the objective was
+measured. ``json`` and ``log_regex`` objectives record no position, so selection's
+``evaluation_point`` check cannot run on them."""
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
@@ -342,8 +338,8 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
     - ``log_regex`` extractors have no objective_name/split/
       policy/checkpoint/expected_step concept at all, so every one of those
       flags is ``False`` for them.
-    - A single coarse ``attempt_bound`` claim overstated weak extractors, so
-      it is split into three precise flags (review v0.5.15 / item C):
+    - Attempt binding is reported as three precise flags rather than one
+      coarse ``attempt_bound`` claim, which would overstate weak extractors:
 
       - ``attempt_location_scoped`` is ``True`` for local extractors:
         each reads evidence from a trial directory uniquely scoped to this
@@ -445,15 +441,14 @@ class JsonEqualsGate(_TrialFilePathModel, _JsonKeyModel):
     another, so no member of the union coerces.
 
     Non-scalars (mappings, sequences, YAML dates) are rejected outright rather
-    than merely never matching (PR #5 review / reviewer 2, blocker 4). The
-    study fingerprint hashes ``model_dump(mode="json")`` through
-    ``json.dumps(..., default=str)``, which normalizes exactly the values that
-    strict JSON cannot hold: ``{1: "x"}`` and ``{"1": "x"}`` collapse to one
-    digest, as do ``date(2024, 1, 1)`` and ``"2024-01-01"``. Since parsed JSON
-    never yields an int-keyed mapping or a ``date``, those variants could never
-    pass while their surviving twins could — two configs that judge feasibility
-    in mutually exclusive ways would share one phase fingerprint and be allowed
-    to reuse each other's study. Rejecting them at load keeps the fingerprint
+    than merely never matching. The study fingerprint hashes
+    ``model_dump(mode="json")`` through ``json.dumps(..., default=str)``, which
+    normalizes exactly the values that strict JSON cannot hold: ``{1: "x"}``
+    and ``{"1": "x"}`` collapse to one digest, as do ``date(2024, 1, 1)`` and
+    ``"2024-01-01"``. Since parsed JSON never yields an int-keyed mapping or a
+    ``date``, those variants could never pass while their surviving twins
+    could — two configs that judge feasibility in mutually exclusive ways would
+    share one phase fingerprint and be allowed to reuse each other's study. Rejecting them at load keeps the fingerprint
     faithful to runtime behaviour. Non-finite floats (``.nan``, ``.inf``) are
     rejected for the same reason: JSON has no encoding for them.
     """

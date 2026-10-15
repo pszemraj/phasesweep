@@ -24,8 +24,10 @@ from phasesweep.runtime.commands import (
     dump_json_file_overrides,
     dump_trainer_config_yaml,
     dump_trial_trainer_config_yaml,
+    flatten_trainer_config,
     format_argparse,
     format_hydra,
+    merged_cli_overrides,
     render_command,
 )
 from tests.conftest import (
@@ -89,7 +91,7 @@ def test_argparse_renders_the_documented_wire_forms():
 def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
     """Defense in depth behind the config validator: str()-ing a mapping or a
     date into a command line is how two different commands end up sharing one
-    fingerprint (PR #5 review / reviewer 2, blocker 3)."""
+    fingerprint."""
     with pytest.raises(TypeError, match="yaml_file"):
         format_argparse({"model": value})
 
@@ -248,12 +250,168 @@ def test_yaml_file_rejects_invalid_trainer_config(
     assert_invalid_experiment_yaml(tmp_path, body, error_match)
 
 
-def test_compatibility_format_rejects_ignored_trainer_config() -> None:
-    with pytest.raises(ValueError, match="would ignore it"):
+_CLI_BASE = {
+    "model": {"name": "tiny", "depth": 4},
+    "optimizer": {"lr": 3e-4},
+    "layers": [1, 2],
+    "output_dir": "{trial_dir}/out/{phase}-{trial_id}",
+}
+_CLI_OVERRIDES = {"model.depth": 8, "trainer.seed": 17}
+
+
+def test_trainer_config_is_the_base_for_every_format(tmp_path: Path) -> None:
+    """Every format renders the base with the overrides applied and expands its placeholders."""
+    trial_dir = tmp_path / "trial"
+    render = {
+        "trial_dir": trial_dir,
+        "trial_id": 3,
+        "phase": "depth",
+        "run_name": "x-depth-3",
+        "trainer_config": _CLI_BASE,
+    }
+    output_dir = f"{trial_dir}/out/depth-3"
+
+    argparse_command = render_command("train {overrides}", _CLI_OVERRIDES, "argparse", **render)
+    assert sorted(shlex.split(argparse_command)[1:]) == sorted(
+        [
+            "--model.name=tiny",
+            "--model.depth=8",
+            "--optimizer.lr=0.0003",
+            "--layers=[1,2]",
+            f"--output_dir={output_dir}",
+            "--trainer.seed=17",
+        ]
+    )
+
+    hydra_command = render_command("train {overrides}", _CLI_OVERRIDES, "hydra", **render)
+    assert sorted(shlex.split(hydra_command)[1:]) == sorted(
+        [
+            'model.name="tiny"',
+            "model.depth=8",
+            "optimizer.lr=0.0003",
+            "layers=[1,2]",
+            f'output_dir="{output_dir}"',
+            "trainer.seed=17",
+        ]
+    )
+
+    assert json.loads(
+        dump_json_file_overrides(
+            _CLI_OVERRIDES,
+            trainer_config=_CLI_BASE,
+            substitutions={
+                "{trial_dir}": str(trial_dir),
+                "{trial_id}": "3",
+                "{phase}": "depth",
+                "{run_name}": "x-depth-3",
+            },
+        )
+    ) == {
+        "model": {"name": "tiny", "depth": 8},
+        "optimizer": {"lr": 3e-4},
+        "layers": [1, 2],
+        "output_dir": output_dir,
+        "trainer": {"seed": 17},
+    }
+    json_command = render_command("train {overrides_path}", _CLI_OVERRIDES, "json_file", **render)
+    assert shlex.split(json_command) == ["train", str(trial_dir / "overrides.json")]
+
+
+def test_empty_trainer_config_leaves_overrides_untouched() -> None:
+    """Without a base the overrides pass through in their own order, as a json_file base-less dump."""
+    overrides = {"a.x": 1, "b": 2, "a.y": 3}
+
+    assert list(merged_cli_overrides({}, overrides)) == ["a.x", "b", "a.y"]
+    assert json.loads(dump_json_file_overrides(overrides)) == {"a": {"x": 1, "y": 3}, "b": 2}
+
+
+@pytest.mark.parametrize(
+    ("trainer_config", "overrides"),
+    [
+        pytest.param(_CLI_BASE, _CLI_OVERRIDES, id="nested-base-with-new-and-replaced-leaves"),
+        pytest.param(_CLI_BASE, {"model": "pretrained/tiny"}, id="override-replaces-subtree"),
+        pytest.param({"a": {"b": {"c": 1}}}, {"a.b.d": 2, "a.e": [1, 2]}, id="deep-merge"),
+    ],
+)
+def test_flattened_merge_agrees_with_the_nested_json_composition(
+    trainer_config: dict, overrides: dict
+) -> None:
+    """argparse and hydra see the same values json_file nests, only dotted."""
+    nested = json.loads(dump_json_file_overrides(overrides, trainer_config=trainer_config))
+
+    assert merged_cli_overrides(trainer_config, overrides) == flatten_trainer_config(nested)
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        pytest.param({"a.b": 1, "a": {"b": 2}}, id="literal-key-first"),
+        pytest.param({"a": {"b": 2}, "a.b": 1}, id="nested-first"),
+    ],
+)
+def test_flatten_trainer_config_rejects_duplicate_flat_keys(mapping: dict) -> None:
+    with pytest.raises(ValueError, match=r"dotted key 'a\.b' twice"):
+        flatten_trainer_config(mapping)
+
+
+def test_flatten_trainer_config_keeps_lists_and_empty_mappings_as_leaves() -> None:
+    assert flatten_trainer_config({"a": {"b": [{"c": 1}], "d": {}}, "e": None}) == {
+        "a.b": [{"c": 1}],
+        "a.d": {},
+        "e": None,
+    }
+    with pytest.raises(TypeError, match="non-string mapping key 1"):
+        flatten_trainer_config({"a": {1: "x"}})
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        pytest.param([{"x": 1}], id="list-of-mappings"),
+        pytest.param({}, id="empty-mapping"),
+    ],
+)
+def test_cli_format_rejects_unrenderable_trainer_config_leaf(
+    override_format: str, leaf: object
+) -> None:
+    with pytest.raises(
+        ValidationError,
+        match=rf"trainer_config key 'opt\.leaf': override_format='{override_format}' supports",
+    ):
+        make_experiment(
+            override_format=override_format,
+            trial_command="echo {overrides}",
+            trainer_config={"opt": {"leaf": leaf}},
+        )
+
+
+@pytest.mark.parametrize(
+    ("override_format", "placeholder"),
+    [("argparse", "overrides"), ("hydra", "overrides"), ("json_file", "overrides_path")],
+)
+def test_cli_format_requires_overrides_placeholder_when_trainer_config_is_set(
+    override_format: str, placeholder: str
+) -> None:
+    constant = {"override_format": override_format, "n_trials": 1, "search_space": {}}
+
+    make_experiment(trial_command="echo constant", **constant)
+    with pytest.raises(ValidationError, match=rf"does not reference \{{{placeholder}\}}"):
+        make_experiment(
+            trial_command="echo constant", trainer_config={"model": {"depth": 4}}, **constant
+        )
+    make_experiment(
+        trial_command=f"echo {{{placeholder}}}", trainer_config={"model": {"depth": 4}}, **constant
+    )
+
+
+def test_cli_format_reports_a_base_the_overrides_cannot_descend_through() -> None:
+    with pytest.raises(ValidationError, match=r"trainer_config and composed overrides are invalid"):
         make_experiment(
             override_format="argparse",
             trial_command="echo {overrides}",
-            trainer_config={"model": {"depth": 4}},
+            trainer_config={"model": "pretrained/tiny"},
+            search_space={"model.depth": CategoricalParam(type="categorical", choices=[4, 8])},
         )
 
 
@@ -552,7 +710,7 @@ def _override_yaml(tmp_path, override_format: str, body: str):
 # ``knob`` holds a value with no faithful argparse wire form in every case:
 # a mapping renders through str() while the fingerprint dumps JSON-normalized
 # keys, and a YAML-native date/non-finite float has no canonical rendering at
-# all (PR #5 review / reviewer 2, blocker 3).
+# all.
 _UNRENDERABLE_ARGPARSE_VALUES = [
     pytest.param("{1: x}", r"Phase 't'.*'knob'.*type dict", id="int-keyed-mapping"),
     pytest.param('{1: x, "1": y}', r"Phase 't'.*'knob'.*type dict", id="mixed-key-mapping"),
@@ -662,7 +820,15 @@ def test_effective_overrides_include_fixed(tmp_path, override_format):
 
 def test_transitive_inherited_search_key_cannot_be_resampled() -> None:
     """A grandchild may not re-sample a key locked two levels up."""
-    with pytest.raises(ValidationError, match="re-samples key"):
+    with pytest.raises(
+        ValidationError,
+        match=(
+            r"Phase 'reg' re-samples key\(s\) \['n_layers'\] that an inherited phase already "
+            r"sampled \(n_layers from 'arch', possibly transitively\)\..*"
+            r"remove the key from search_space or drop the inherit\..*"
+            r"Keys a parent only fixed may be searched\."
+        ),
+    ):
         make_experiment(
             phases=[
                 Phase(
@@ -696,7 +862,11 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     experiment = make_experiment(
         trial_command="echo {overrides}",
         phases=[
-            Phase(name="base", n_trials=1),
+            Phase(
+                name="base",
+                n_trials=1,
+                search_space={"depth": CategoricalParam(type="categorical", choices=[8, 16])},
+            ),
             Phase(name="child", n_trials=1, inherits=["base"]),
         ],
     )
@@ -710,5 +880,91 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
         )
     }
 
-    with pytest.raises(ValueError, match="re-samples inherited winner key"):
-        _composed_overrides(stale_child, {"depth": 16}, inherited)
+    with pytest.raises(
+        ValueError, match="re-samples inherited winner key.*that an ancestor sampled"
+    ):
+        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
+
+
+def test_runtime_allows_resampling_a_key_the_parent_only_fixed() -> None:
+    """A sampled value replaces an inherited value the parent only fixed."""
+    from phasesweep.engine.phase import _composed_overrides
+    from phasesweep.engine.state import Winner
+
+    experiment = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"epochs": 1}),
+            Phase(
+                name="child",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"epochs": CategoricalParam(type="categorical", choices=[2, 4])},
+            ),
+        ],
+    )
+    inherited = {
+        "base": Winner(
+            trial_number=0,
+            params={},
+            effective_overrides={"epochs": 1},
+            metric=1.0,
+        )
+    }
+
+    composed = _composed_overrides(experiment, experiment.phases[1], {"epochs": 4}, inherited)
+
+    assert composed == {"epochs": 4}
+
+
+def test_grandparent_sampled_then_parent_fixed_key_may_be_searched() -> None:
+    """A parent that re-fixes a key takes over its origin, which unlocks the key."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=1,
+                search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+            ),
+            Phase(name="pin", n_trials=1, inherits=["arch"], fixed_overrides={"n_layers": 6}),
+            Phase(
+                name="reg",
+                n_trials=1,
+                inherits=["pin"],
+                search_space={"n_layers": CategoricalParam(type="categorical", choices=[12, 16])},
+            ),
+            Phase(name="final", n_trials=1, inherits=["reg"]),
+        ]
+    )
+
+    assert experiment.sampled_locked_keys("pin") == {"n_layers"}
+    assert experiment.sampled_locked_keys("reg") == frozenset()
+    assert experiment.sampled_locked_keys("final") == {"n_layers"}
+
+
+def test_diamond_after_resample_requires_explicit_fix() -> None:
+    """Two parents with different origins for a key need a child fix, which stays unsearchable."""
+    base = Phase(name="base", n_trials=1, fixed_overrides={"epochs": 1})
+    resampled = Phase(
+        name="resampled",
+        n_trials=1,
+        inherits=["base"],
+        search_space={"epochs": CategoricalParam(type="categorical", choices=[2, 4])},
+    )
+    join = Phase(name="join", n_trials=1, inherits=["base", "resampled"])
+
+    with pytest.raises(ValidationError, match=r"inherits conflicting key.*'epochs'"):
+        make_experiment(phases=[base, resampled, join])
+
+    fixed_join = join.model_copy(update={"fixed_overrides": {"epochs": 3}})
+    experiment = make_experiment(phases=[base, resampled, fixed_join])
+
+    assert experiment.sampled_locked_keys("join") == {"epochs"}
+    assert experiment.sampled_locked_keys("resampled") == frozenset()
+
+
+def test_sampled_locked_keys_rejects_an_unknown_phase() -> None:
+    experiment = make_experiment()
+
+    with pytest.raises(KeyError):
+        experiment.sampled_locked_keys("missing")

@@ -1,7 +1,7 @@
 # Minimal starting experiment: one packaged toy-trainer attempt, no remote logging.
 # Validate: phasesweep validate examples/example.yaml
 # Run from the checkout root: phasesweep run examples/example.yaml
-# Every accepted key and default is in docs/config_reference.yaml.
+# Every accepted key and default is in src/phasesweep/config_reference.yaml.
 # This disposable study is sufficient to check the trainer boundary; choose
 # durable storage and meaningful provenance before planning resumable work.
 experiment: first_trial

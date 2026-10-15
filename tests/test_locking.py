@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from phasesweep.config import (
+    IntParam,
     Phase,
     Sampler,
 )
@@ -102,16 +103,15 @@ def test_default_lock_dir_requires_an_absolute_account_home(
     assert runtime_files.lock_dir() == override
 
 
-@pytest.mark.parametrize("invalid", ["missing", "mode", "symlink"])
-def test_home_override_requires_private_provisioned_root(
+@pytest.mark.parametrize("invalid", ["mode", "symlink"])
+def test_home_override_requires_private_existing_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
     root = tmp_path / "root"
-    if invalid in {"mode", "symlink"}:
-        root.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
     if invalid == "mode":
         root.chmod(0o755)
-    elif invalid == "symlink":
+    else:
         link = tmp_path / "link"
         link.symlink_to(root, target_is_directory=True)
         root = link
@@ -121,6 +121,49 @@ def test_home_override_requires_private_provisioned_root(
     assert not (root / "locks").exists()
     if invalid == "mode":
         assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
+def test_home_override_creates_missing_root_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing root and its missing parents are created 0700, whatever the umask."""
+    root = tmp_path / "state" / "phasesweep-home"
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    previous_umask = os.umask(0)
+    try:
+        assert runtime_files.phasesweep_home() == root
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(root.parent.stat().st_mode) == 0o700
+    assert runtime_files.phasesweep_home() == root
+
+
+def test_home_override_refuses_relative_path_without_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-home")
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError, match="must be an absolute path"):
+        runtime_files.phasesweep_home()
+
+    assert not (tmp_path / "relative-home").exists()
+
+
+def test_home_override_refuses_symlinked_ancestor_without_creating_the_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(link / "phasesweep-home"))
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.phasesweep_home()
+
+    assert list(target.iterdir()) == []
 
 
 def test_private_home_override_selects_state_root(
@@ -561,10 +604,10 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
 
     ``_shutdown_handler`` raises ``PhaseSweepShutdown`` from a Python signal
     handler, so an exception can land on any bytecode boundary in the
-    component walk. The descriptor swap used to close the old fd before
-    storing the new one, leaving ``current_fd`` naming a closed descriptor;
-    the cleanup path then closed it again and the real shutdown surfaced as
-    ``OSError: [Errno 9] Bad file descriptor``.
+    component walk. The descriptor swap must store the new fd before closing
+    the old one: closing first would leave ``current_fd`` naming a closed
+    descriptor, the cleanup path would close it again, and the real shutdown
+    would surface as ``OSError: [Errno 9] Bad file descriptor``.
     """
 
     class InjectedShutdown(BaseException):
@@ -630,17 +673,18 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
     collide on the run lock — because the lock is experiment-scoped, not
     phase-scoped.
 
-    This is the v0.5.5 reviewer's interleaving scenario: process A is on
-    phase ``lr`` while process B starts a top-up of phase ``arch``. The phase
-    lock would not catch this; the run lock does.
+    The interleaving scenario: process A is on phase ``lr`` while process B
+    starts a top-up of phase ``arch``. A phase lock would not catch this; the
+    run lock does.
     """
     storage = f"journal:///{tmp_path / 'shared.journal'}"
     seeded = Sampler(type="random", seed=0)
+    depth = {"depth": IntParam(type="int", low=1, high=9)}
     phases_a = [
-        Phase(name="arch", n_trials=1, sampler=seeded, search_space={}),
+        Phase(name="arch", n_trials=1, sampler=seeded, search_space=depth),
         Phase(name="lr", inherits=["arch"], n_trials=1, sampler=seeded, search_space={}),
     ]
-    phases_b = [Phase(name="arch", n_trials=2, sampler=seeded, search_space={})]  # top-up
+    phases_b = [Phase(name="arch", n_trials=2, sampler=seeded, search_space=depth)]  # top-up
 
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage, phases=phases_a)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage, phases=phases_b)
@@ -658,10 +702,9 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
 def test_run_lock_collides_for_different_storage_same_output_dir(
     tmp_path: Path,
 ) -> None:
-    """v0.5.6 missed this: two configs sharing workdir + experiment but pointing
-    at different storage backends *would* collide on filesystem outputs, but
-    not on the lock. v0.5.7 introduces an output-namespace lock that catches
-    this (review v0.5.6 / blocker 1).
+    """Two configs sharing workdir + experiment but pointing at different
+    storage backends collide on filesystem outputs, so the output-namespace
+    lock must catch them even though their storage locks differ.
     """
     exp_a = make_experiment(
         workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'a.journal'}"
@@ -731,10 +774,9 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
     """A symlinked experiment leaf must share the target's output lock.
 
     ``_experiment_dir`` resolves only the workdir prefix before appending the
-    experiment name, so ``runs/expA -> runs/expB`` previously minted a second
-    lock identity for one physical namespace — the second orchestrator's
-    preflight would then reap the first one's live trials (review v0.5.17 gap
-    hunt).
+    experiment name, so without resolving the leaf ``runs/expA -> runs/expB``
+    would mint a second lock identity for one physical namespace — the second
+    orchestrator's preflight would then reap the first one's live trials.
     """
     runs = tmp_path / "runs"
     runs.mkdir()

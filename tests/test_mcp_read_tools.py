@@ -21,6 +21,7 @@ from phasesweep.config import (
     JsonEnvelopeExtractor,
     load_experiment,
 )
+from phasesweep.config.reference import reference_notes
 from phasesweep.engine import (
     PhaseWinnerView,
     read_winners,
@@ -49,7 +50,7 @@ from phasesweep.mcp.errors import (
     UnknownRunError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     AwaitRunResult,
     GetRunResultsResult,
@@ -57,9 +58,11 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.json import JsonObject
 from tests.conftest import (
     write_constant_trainer,
 )
+from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _catalog,
@@ -259,7 +262,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
     experiment = registry.get("srv").experiment
     study = optuna.load_study(
@@ -306,7 +309,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
     # progress. The second branch must apply the same winner suppression to
     # the snapshot that replaced that temporary live view.
     write_run_status(store, **{**unusable, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     original_live_result = app._live_result
     finalized = False
 
@@ -343,7 +346,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
     store.status_path(run_id).unlink()
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     if integrity == "failed":
         _generation_summary_path(experiment, run_id).unlink()
     else:
@@ -575,6 +578,7 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert terminal is not None
     write_run_status(store, **{**terminal, "cleanup_confirmed": False})
     store.mark_cleanup_uncertain(handle)
+    logs_before = tree_snapshot(store.log_path(run_id).parent)
 
     payload: GetRunResultsResult | GetRunStatusResult | AwaitRunResult
     if read_tool == "winners":
@@ -594,6 +598,7 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert payload.result_source == "frozen_run_snapshot"
     assert payload.publication_integrity == "ok"
     assert payload.represented_generation_id == run_id
+    assert tree_snapshot(store.log_path(run_id).parent) == logs_before
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
@@ -609,13 +614,15 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     original_run_payload = app._run_payload
     finalized = False
 
-    def finish_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+    def finish_after_run_payload(
+        saved: RunHandle, view: RunnerView | None = None, **force: bool
+    ) -> JsonObject:
         nonlocal finalized
-        run = original_run_payload(saved)
+        run = original_run_payload(saved, view, **force)
         if not finalized:
             assert run["state"] == "running"
             finalized = True
@@ -655,14 +662,14 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
     store.config_snapshot_path(run_id).unlink()
     finalized = False
 
-    def finish_before_reporting_exit(_handle: RunHandle) -> bool:
+    def finish_before_reporting_exit(_handle: RunHandle, **_view: object) -> bool:
         nonlocal finalized
         assert not finalized
         finalized = True
         write_run_status(store, **complete)
         return False
 
-    monkeypatch.setattr(store, "_runner_is_live", finish_before_reporting_exit)
+    monkeypatch.setattr(store, "runner_may_be_alive", finish_before_reporting_exit)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
@@ -719,7 +726,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     else:
         write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     runner_live = True
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: runner_live)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: runner_live)
     monkeypatch.setattr(
         "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
     )
@@ -803,9 +810,11 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     original_run_payload = app._run_payload
     marked = False
 
-    def reserve_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+    def reserve_after_run_payload(
+        saved: RunHandle, view: RunnerView | None = None, **force: bool
+    ) -> JsonObject:
         nonlocal marked
-        run = original_run_payload(saved)
+        run = original_run_payload(saved, view, **force)
         if not marked:
             assert run["state"] == "succeeded"
             marked = True
@@ -964,6 +973,59 @@ def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
         app.list_experiments(limit=0)
 
 
+def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
+    """A known key returns its subtree, an unknown one the nearest keys, and neither touches the catalog."""
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, _config(tmp_path)))
+
+    sampler = app.explain_config("phases[].sampler")
+    assert sampler["found"] is True
+    assert sampler["closest"] == []
+    paths = [entry["path"] for entry in sampler["entries"]]
+    assert paths[0] == "phases[].sampler"
+    assert "phases[].sampler.type" in paths
+    assert app.explain_config("phases.0.sampler") == {**sampler, "key": "phases.0.sampler"}
+    first = sampler["entries"][0]
+    assert set(first) == {"path", "signature", "section", "description"}
+    assert first["section"] == "Required experiment fields"
+    assert "\n" in first["description"]
+
+    variants = app.explain_config("metric.extractor.path")
+    assert {"metric.extractor[type=json].path", "metric.extractor[type=json_envelope].path"} <= {
+        entry["path"] for entry in variants["entries"]
+    }
+
+    missing = app.explain_config("inherit_env")
+    assert missing == {
+        "key": "inherit_env",
+        "found": False,
+        "entries": [],
+        "closest": ["execution.inherit_env"],
+        "notes": "",
+    }
+    assert sampler["notes"] == ""
+    assert app.explain_config("zzzzzz")["closest"] == []
+    assert app.explain_config(".")["found"] is False
+
+    # No path or catalog value reaches the agent.
+    assert str(tmp_path) not in json.dumps([sampler, variants, missing])
+
+
+def test_explain_config_without_a_key_lists_top_level_keys_and_needs_no_catalog() -> None:
+    """The index returns each top-level key once with one sentence, from the class alone."""
+    index = PhaseSweepMCP.explain_config(None)
+    assert index["found"] is True
+    assert index["key"] is None
+    paths = [entry["path"] for entry in index["entries"]]
+    assert paths[:4] == ["experiment", "trial_command", "metric", "phases"]
+    assert len(paths) == len(set(paths))
+    assert all("." not in path for path in paths)
+    assert all("\n" not in entry["description"] for entry in index["entries"])
+    assert PhaseSweepMCP.explain_config("  ")["entries"] == index["entries"]
+    assert index["notes"] == "\n".join(reference_notes())
+    assert "Paths: a relative workdir" in index["notes"]
+    assert PhaseSweepMCP.explain_config("  ")["notes"] == index["notes"]
+
+
 def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
@@ -997,6 +1059,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
         "state": "running",
         "started_at": handle.started_at,
         "recovery_required": False,
+        "runner_observable": True,
         "failure": None,
     }
 

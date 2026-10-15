@@ -31,6 +31,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.paths import (
+    _last_successful_generation_path,
     _phase_dir,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
@@ -42,6 +43,7 @@ from phasesweep.mcp.errors import (
     InvalidPhaseError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    ResumePublicationUnusableError,
     RunCapacityUnknownError,
     UnknownExperimentError,
 )
@@ -56,10 +58,12 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.reaper import (
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from tests.conftest import (
     file_mode,
+    requires_nonroot,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import republish_as_incomplete
@@ -239,6 +243,41 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
 
     assert "get_latest_run('srv') first" in str(excinfo.value)
     assert "get_run_results with its run_id" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        pytest.param("dangling", "no longer validates", id="failed"),
+        pytest.param(
+            "unreadable",
+            "cannot read the recorded publication",
+            id="permission_denied",
+            marks=requires_nonroot,
+        ),
+    ],
+)
+def test_resume_refuses_an_unusable_publication_instead_of_reporting_no_winner(
+    tmp_path: Path, damage: str, message: str
+) -> None:
+    """A recorded publication that cannot be used refuses the resume, naming that state."""
+    _config_path, app, registry, store = side_effect_app(tmp_path, phases=RESUMABLE_PHASES)
+    pointer = _last_successful_generation_path(registry.get("srv").experiment)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    if damage == "dangling":
+        pointer.symlink_to("missing-target.yaml")
+    else:
+        pointer.write_text("schema_version: 1\n")
+        pointer.chmod(0o000)
+    try:
+        with pytest.raises(ResumePublicationUnusableError, match=message) as excinfo:
+            app.launch("srv", from_phase="q")
+    finally:
+        if damage == "unreadable":
+            pointer.chmod(0o600)
+
+    assert "no winner yet" not in str(excinfo.value)
+    assert store.list_handles() == []
 
 
 @pytest.mark.parametrize(
@@ -563,6 +602,7 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
                 pgid=proc.pid,
                 pid_starttime=read_proc_starttime(proc.pid),
                 boot_id=read_boot_id(),
+                pid_namespace=read_pid_namespace(),
                 launch_state="spawned",
             )
         )
@@ -965,9 +1005,9 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     """The child must not start inside the project it is about to run.
 
     Interpreter startup from the experiment's directory executes project-local
-    code before the server can name the process it created (review v0.5.17 /
-    blocker 9), so ``Popen`` uses the server-owned state directory and the
-    project directory travels as an explicit argument the runner applies later.
+    code before the server can name the process it created, so ``Popen`` uses
+    the server-owned state directory and the project directory travels as an
+    explicit argument the runner applies later.
     """
     config = _config(tmp_path)
     runner_cwd = tmp_path / "runner-cwd"
@@ -1105,9 +1145,10 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
 ) -> None:
     """Control for the test above: the poison is genuinely executable.
 
-    Reproducing the pre-fix contract - project cwd, no ``-P``/``-s``, inherited
-    environment - must import the shadow package, so a passing hardened case is
-    evidence about the fix rather than about an inert fixture.
+    Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
+    inherited environment - must import the shadow package, so a passing
+    hardened case is evidence about the hardening rather than about an inert
+    fixture.
     """
     _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
     # PYTHONHOME alone would break the interpreter before it could import

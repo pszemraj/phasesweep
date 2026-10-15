@@ -1,7 +1,8 @@
-"""Trial launch environment and pipe behavior."""
+"""Trial launch environment, pipe behavior, and the pre-launch barrier."""
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -15,19 +16,41 @@ import stat
 from pathlib import Path
 from typing import Any
 
+import optuna
 import pytest
 import yaml
 
+from phasesweep import run_experiment
 from phasesweep.config import (
     ExecutionContext,
+    Experiment,
     JsonEnvelopeExtractor,
     Metric,
     WandbSummaryRequiredGate,
 )
 from phasesweep.engine.artifacts import _warn_environment_drift
-from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
-from phasesweep.runtime.process import ProcessResult, fd_ready
-from tests.conftest import make_experiment
+from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import TRIAL_DIR_ATTR
+from phasesweep.engine.trial import (
+    ExecutedTrial,
+    TrialExecutionError,
+    TrialResult,
+    _environment_identity,
+    _stderr_last_line,
+    extract_trial_result,
+    launch_trial,
+)
+from phasesweep.runtime import supervisor
+from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
+from tests.conftest import make_experiment, make_trial_context
+
+#: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
+#: process identity exists, so anything else it loaded could start code that
+#: cleanup can never find.
+SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
+    {"__future__", "contextlib", "json", "os", "signal", "sys", "time"}
+)
 
 
 def _capture_launch_env(
@@ -257,26 +280,113 @@ def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
     }
 
 
+@pytest.mark.parametrize("override_format", ["argparse", "hydra", "json_file"])
+def test_launch_trial_delivers_trainer_config_in_every_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override_format: str,
+) -> None:
+    """The base reaches argparse, hydra and json_file, and the trainer-input record binds the bytes."""
+    trial_dir = tmp_path / "trial_0"
+    placeholder = "{overrides_path}" if override_format == "json_file" else "{overrides}"
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={
+            "trial_command": f"python train.py {placeholder}",
+            "override_format": override_format,
+            "trainer_config": {"model": {"depth": 4, "width": 128}, "out": "{trial_dir}/outputs"},
+        },
+        overrides={"model.depth": 8},
+    )
+
+    trainer_input = trial_dir / captured["trainer_input"]["filename"]
+    resolved = json.loads((trial_dir / "overrides_resolved.json").read_text())
+    if override_format == "json_file":
+        assert trainer_input.name == "overrides.json"
+        assert json.loads(trainer_input.read_text()) == {
+            "model": {"depth": 8, "width": 128},
+            "out": f"{trial_dir}/outputs",
+        }
+        assert resolved == {"model.depth": 8}
+        assert shlex.split(captured["command"]) == ["python", "train.py", str(trainer_input)]
+    else:
+        merged = {"model.depth": 8, "model.width": 128, "out": f"{trial_dir}/outputs"}
+        assert trainer_input.name == "overrides_resolved.json"
+        assert resolved == merged
+        quote = '"' if override_format == "hydra" else ""
+        separator = "" if override_format == "hydra" else "--"
+        assert sorted(shlex.split(captured["command"])[2:]) == sorted(
+            [
+                f"{separator}model.depth=8",
+                f"{separator}model.width=128",
+                f"{separator}out={quote}{trial_dir}/outputs{quote}",
+            ]
+        )
+    assert (
+        captured["trainer_input"]["sha256"]
+        == hashlib.sha256(trainer_input.read_bytes()).hexdigest()
+    )
+    assert captured["PHASESWEEP_OVERRIDES_SHA256"] == captured["trainer_input"]["sha256"]
+
+
+def test_launch_trial_cli_input_without_trainer_config_is_the_overrides_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty base leaves the argparse trainer input as the sorted overrides JSON."""
+    overrides = {"zeta.depth": 8, "alpha": 1, "zeta.width": 2}
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={"trial_command": "python train.py {overrides}"},
+        overrides=overrides,
+    )
+
+    expected = json.dumps(overrides, indent=2, sort_keys=True) + "\n"
+    assert (tmp_path / "trial_0" / "overrides_resolved.json").read_text() == expected
+    assert captured["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(expected.encode()).hexdigest()
+    assert shlex.split(captured["command"])[2:] == [
+        "--zeta.depth=8",
+        "--alpha=1",
+        "--zeta.width=2",
+    ]
+
+
 def test_launch_trial_inherit_env_all_passes_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default contract preserves historical full-environment inheritance."""
+    """``inherit_env: all`` is the explicit opt-in to full-environment inheritance."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
-    env = _capture_launch_env(tmp_path, monkeypatch)
+    env = _capture_launch_env(tmp_path, monkeypatch, execution=ExecutionContext(inherit_env="all"))
     assert env["PHASESWEEP_TEST_AMBIENT_SECRET"] == "leak"
+
+
+def test_launch_trial_default_contract_drops_ambient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without an execution block the trainer gets the base set and configured ``env`` only."""
+    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
+    monkeypatch.setenv("PYTHONPATH", "/ambient/src")
+    env = _capture_launch_env(tmp_path, monkeypatch, experiment_env={"KEEP_ME": "explicit"})
+    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
+    assert "PYTHONPATH" not in env
+    assert env["KEEP_ME"] == "explicit"
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def test_launch_trial_inherit_env_none_filters_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``inherit_env: none`` drops ambient vars while keeping the base set and
-    configured ``env`` entries (review v0.5.17 / blocker 4)."""
+    """The default ``inherit_env: none`` drops ambient vars while keeping the base set and
+    configured ``env`` entries."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
     env = _capture_launch_env(
         tmp_path,
         monkeypatch,
         experiment_env={"KEEP_ME": "explicit"},
-        execution=ExecutionContext(inherit_env="none"),
     )
     assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
     assert env["KEEP_ME"] == "explicit"
@@ -336,7 +446,7 @@ def test_launch_trial_pool_pinned_sentinel_binds_visibility_under_strict_contrac
 @pytest.mark.parametrize(
     ("ambient_visibility", "experiment_env", "execution"),
     [
-        pytest.param("-1", None, None, id="inherit-all"),
+        pytest.param("-1", None, ExecutionContext(inherit_env="all"), id="inherit-all"),
         pytest.param(
             "-1",
             None,
@@ -410,6 +520,260 @@ def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
 
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
+
+
+def _exit_code_result(
+    tmp_path: Path,
+    experiment: Experiment,
+    phase: str,
+    code: int,
+    *,
+    stderr: bytes | None = None,
+    trial_id: int = 0,
+) -> TrialResult:
+    """Extract the result of a trainer that exited with ``code`` after writing ``stderr``.
+
+    :param Path tmp_path: Directory standing in for the trial directory.
+    :param Experiment experiment: Experiment whose contract is under test.
+    :param str phase: Phase name recorded in the trial context.
+    :param int code: Trainer exit code.
+    :param bytes | None stderr: Content of ``stderr.log``, or ``None`` for no such file.
+    :param int trial_id: Trial number recorded in the trial context.
+    :return TrialResult: The extracted (failed) result.
+    """
+    if stderr is None:
+        (tmp_path / "stderr.log").unlink(missing_ok=True)
+    else:
+        (tmp_path / "stderr.log").write_bytes(stderr)
+    executed = ExecutedTrial(
+        ctx=make_trial_context(tmp_path, phase=phase, trial_id=trial_id),
+        process=ProcessResult(return_code=code, timed_out=False, pid=1, duration_seconds=0.1),
+    )
+    return extract_trial_result(experiment=experiment, executed=executed)
+
+
+def _environment_hints(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the narrowed-environment hints the captured log holds, in order."""
+    return [r.getMessage() for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+
+
+OOM_LINE = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0"
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        pytest.param(ExecutionContext(), id="default"),
+        pytest.param(ExecutionContext(inherit_env=["HF_HOME"]), id="named-list"),
+    ],
+)
+def test_nonzero_exit_under_narrowed_environment_warns_once_per_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    execution: ExecutionContext,
+) -> None:
+    """The first nonzero exit in a phase names the environment contract and its three fixes."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    experiment = make_experiment(execution=execution)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        results = [
+            _exit_code_result(tmp_path, experiment, "p", 3),
+            _exit_code_result(tmp_path, experiment, "p", 3),
+            _exit_code_result(tmp_path, experiment, "other", 4),
+        ]
+
+    assert [result.failure_reason for result in results] == [
+        "non-zero exit code 3",
+        "non-zero exit code 3",
+        "non-zero exit code 4",
+    ]
+    hints = [r.getMessage() for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+    assert len(hints) == 2
+    assert hints[0].startswith("[p/trial_0] the trainer exited with code 3 under ")
+    assert hints[1].startswith("[other/trial_0] the trainer exited with code 4 under ")
+    for fix in ("execution.inherit_env: [NAME]", "env:", "execution.inherit_env: all"):
+        assert fix in hints[0]
+    assert "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ" in hints[0]
+    assert ("HF_HOME" in hints[0]) == isinstance(execution.inherit_env, list)
+
+
+def test_nonzero_exit_hint_is_silent_for_full_inheritance_and_for_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``inherit_env: all`` has no narrowed contract to blame, and a zero exit has no failure."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        _exit_code_result(
+            tmp_path, make_experiment(execution=ExecutionContext(inherit_env="all")), "p", 2
+        )
+        _exit_code_result(tmp_path, make_experiment(), "p", 0)
+
+    assert not [r for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+
+
+def test_nonzero_exit_reason_quotes_the_last_stderr_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trainer's own last error names the cause, and an out-of-memory error gets no environment hint."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    stderr = f"Traceback (most recent call last):\n  File 'train.py', line 9\n{OOM_LINE}\n\n"
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=stderr.encode())
+
+    assert result.failure_reason == f"non-zero exit code 1; stderr: {OOM_LINE}"
+    assert _environment_hints(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ModuleNotFoundError: No module named 'x'",
+        "ImportError: cannot import name 'y' from 'x'",
+        "/usr/bin/python: No module named x",
+        "sh: 1: nvidia-smi: command not found",
+        "FileNotFoundError: [Errno 2] No such file or directory: 'data.csv'",
+        "KeyError: 'HF_HOME'",
+        "RuntimeError: the HF_HOME environment variable must be set",
+        "RuntimeError: WANDB_PROJECT is not set",
+    ],
+)
+def test_stderr_naming_a_missing_environment_input_keeps_the_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    line: str,
+) -> None:
+    """A last line that suggests a missing variable, tool or module logs the hint, quoting that line."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
+
+    assert result.failure_reason == f"non-zero exit code 1; stderr: {line}"
+    (hint,) = _environment_hints(caplog)
+    assert f'Its last stderr line was "{line}".' in hint
+    assert "execution.inherit_env: all" in hint
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        OOM_LINE,
+        "KeyError: 'loss'",
+        "AssertionError: loss is nan",
+        "RuntimeError: CUDA error: device-side assert triggered",
+    ],
+)
+def test_stderr_naming_another_cause_gets_no_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    line: str,
+) -> None:
+    """A last line that names its own cause is reported alone."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
+
+    assert _environment_hints(caplog) == []
+
+
+def test_a_failure_without_an_environment_cause_does_not_use_up_the_phase_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The once-per-phase hint waits for the first failure that suggests the environment."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    lines = [
+        OOM_LINE,
+        "ModuleNotFoundError: No module named 'x'",
+        "ModuleNotFoundError: No module named 'y'",
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        for trial_id, line in enumerate(lines):
+            _exit_code_result(
+                tmp_path, make_experiment(), "p", 1, stderr=line.encode(), trial_id=trial_id
+            )
+
+    (hint,) = _environment_hints(caplog)
+    assert hint.startswith("[p/trial_1] the trainer exited with code 1 under ")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(None, id="no-file"),
+        pytest.param(b"", id="empty"),
+        pytest.param(b"\n  \n\t\n", id="blank"),
+        pytest.param(b"\x00\x01\xff\xfe\n\x1b[0m\n", id="binary-only"),
+    ],
+)
+def test_nonzero_exit_without_a_stderr_line_keeps_the_reason_and_the_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stderr: bytes | None,
+) -> None:
+    """With no line to quote the reason is the bare exit code, and nothing rules the environment out."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 2, stderr=stderr)
+
+    assert result.failure_reason == "non-zero exit code 2"
+    (hint,) = _environment_hints(caplog)
+    assert "Its last stderr line" not in hint
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            b"warn\n\x1b[1;31mError:\x1b[0m\tbad\x07  value\x00\n",
+            "Error: bad value",
+            id="escapes-controls-and-whitespace",
+        ),
+        pytest.param(
+            b"50%|#####     |\r100%|##########|\n", "100%|##########|", id="carriage-return"
+        ),
+        pytest.param(b"real error\n\xff\xfe\x00\x01\n\n", "real error", id="binary-last-line"),
+        pytest.param("ünïcode ✗ error\n".encode(), "ünïcode ✗ error", id="unicode"),
+        pytest.param(b"E" * 500, "E" * 197 + "...", id="long-line-is-cut"),
+        pytest.param(b"E" * 200 + b"\n", "E" * 200, id="exactly-at-the-cap"),
+        pytest.param(b"E" * 201 + b"\n", "E" * 197 + "...", id="one-over-the-cap"),
+        pytest.param(b"first\n" + b"x\n" * 20_000 + b"last\n", "last", id="large-file"),
+    ],
+)
+def test_stderr_quote_is_one_capped_printable_line(
+    tmp_path: Path, content: bytes, expected: str
+) -> None:
+    """The quote has no control characters, no line break and at most 200 characters."""
+    (tmp_path / "stderr.log").write_bytes(content)
+
+    quoted = _stderr_last_line(tmp_path)
+
+    assert quoted == expected
+    assert quoted is not None and len(quoted) <= 200 and quoted.isprintable()
+
+
+def test_stderr_quote_reads_only_the_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A line longer than the read window is quoted from the window, never read whole."""
+    monkeypatch.setattr("phasesweep.engine.trial._STDERR_TAIL_BYTES", 16)
+    (tmp_path / "stderr.log").write_bytes(b"A" * 100)
+
+    assert _stderr_last_line(tmp_path) == "A" * 16
+
+
+def test_stderr_quote_is_none_when_the_file_cannot_be_read(tmp_path: Path) -> None:
+    """A missing log, and a path that is not a file, quote nothing instead of raising."""
+    assert _stderr_last_line(tmp_path) is None
+    (tmp_path / "stderr.log").mkdir()
+    assert _stderr_last_line(tmp_path) is None
 
 
 def test_launch_trial_inherit_env_list_adds_exactly_named(
@@ -495,22 +859,40 @@ def test_environment_identity_digest_tracks_values(
     assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
 
 
-def test_environment_identity_names_are_sorted_and_hold_no_values(
+def test_environment_identity_tracks_names_and_values_in_plain_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Names are the diagnostic surface; values stay inside the digest only."""
-    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    """The tracked mapping is sorted by name and holds each configured and listed value."""
+    monkeypatch.setenv("PHASESWEEP_TEST_LISTED", "ambient-value")
     identity = _environment_identity(
         make_experiment(
-            env={"ZULU": "z-secret", "ALPHA": "a-secret"},
-            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+            env={"ZULU": "z-value", "ALPHA": "a-value"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_LISTED"]),
         ),
         "p",
     )
 
-    assert list(identity.names) == sorted(identity.names)
-    assert {"ALPHA", "ZULU", "PHASESWEEP_TEST_TOKEN"} <= set(identity.names)
-    assert not {"a-secret", "z-secret", "ambient-secret"} & set(identity.names)
+    assert list(identity.tracked) == sorted(identity.tracked)
+    assert identity.tracked["ALPHA"] == "a-value"
+    assert identity.tracked["ZULU"] == "z-value"
+    assert identity.tracked["PHASESWEEP_TEST_LISTED"] == "ambient-value"
+
+
+def test_environment_digest_is_a_checksum_of_the_tracked_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The digest is the SHA-256 of the compact JSON of the tracked pairs, sorted by name."""
+    monkeypatch.setenv("PHASESWEEP_TEST_LISTED", "ambient-value")
+    identity = _environment_identity(
+        make_experiment(
+            env={"ALPHA": "a-value"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_LISTED"]),
+        ),
+        "p",
+    )
+
+    encoded = json.dumps(sorted(identity.tracked.items()), separators=(",", ":"))
+    assert identity.digest == hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def test_launch_trial_records_private_environment_json_when_opted_in(
@@ -535,10 +917,10 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert payload["digest"] == identity.digest
     assert payload["inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
-    assert payload["passthrough_env"] == []
+    assert payload["passthrough_env"] == ["TMPDIR"]
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
-    assert sorted(payload["env"]) == list(identity.names)
+    assert payload["env"] == identity.values
 
 
 def test_passthrough_value_rotation_preserves_semantic_environment_digest(
@@ -555,6 +937,49 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     assert first.digest == second.digest
     assert first.values["WANDB_API_KEY"] == "first-secret"
     assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        pytest.param(ExecutionContext(), id="default"),
+        pytest.param(ExecutionContext(inherit_env="all"), id="all"),
+        pytest.param(ExecutionContext(inherit_env=["HF_HOME"]), id="list"),
+        pytest.param(ExecutionContext(passthrough_env=["SOME_TOKEN"]), id="written-token"),
+        pytest.param(ExecutionContext(passthrough_env=["TMPDIR"]), id="written-tmpdir"),
+        pytest.param(
+            ExecutionContext(inherit_env=["HF_HOME"], passthrough_env=["SOME_TOKEN"]),
+            id="list-and-written-token",
+        ),
+    ],
+)
+def test_environment_digest_ignores_tmpdir_only(
+    monkeypatch: pytest.MonkeyPatch, execution: ExecutionContext
+) -> None:
+    """``TMPDIR`` is built-in pass-through, so a sandbox's scratch path never splits a cohort."""
+    experiment = make_experiment(execution=execution)
+
+    monkeypatch.setenv("TMPDIR", "/sandbox/tmp")
+    first = _environment_identity(experiment, "p")
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    second = _environment_identity(experiment, "p")
+    monkeypatch.setenv("PATH", "/another/bin")
+    third = _environment_identity(experiment, "p")
+
+    assert first.digest == second.digest
+    assert first.values["TMPDIR"] == "/sandbox/tmp"
+    assert second.values["TMPDIR"] == "/tmp"
+    assert "TMPDIR" in first.values
+    assert "TMPDIR" not in first.tracked
+    assert third.digest != second.digest
+
+
+def test_configured_tmpdir_stays_digested_beside_the_builtin_passthrough() -> None:
+    """An ``env`` value for ``TMPDIR`` is semantic even though ``TMPDIR`` is passed through."""
+    first = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/a"}), "p")
+    second = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/b"}), "p")
+
+    assert first.digest != second.digest
 
 
 def test_skipped_phase_drift_uses_that_phases_remote_bindings(
@@ -615,7 +1040,7 @@ def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:
 def test_launch_trial_writes_no_environment_json_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Values are secrets: nothing is written unless the operator opts in."""
+    """The full composed environment can hold credentials, so no file is written unless the operator opts in."""
     _capture_launch_env(tmp_path, monkeypatch)
 
     assert not (tmp_path / "trial_0" / "environment.json").exists()
@@ -670,3 +1095,59 @@ def test_launch_pipe_wait_outlasts_one_poll_call(monkeypatch: pytest.MonkeyPatch
     assert fd_ready(7, timeout=30 * 86400)
     assert len(waits) == 2
     assert max(waits) <= 2**31 - 1
+
+
+def test_supervisor_imports_only_its_stdlib_allowlist() -> None:
+    """The pre-identity supervisor imports nothing outside its stdlib allowlist.
+
+    It runs under ``python -I -S`` before the trial's process identity is
+    written, so a new import there, or a dynamic one, could execute code that
+    forks out of the process group cleanup later signals.
+    """
+    tree = ast.parse(Path(str(supervisor.__file__)).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, "the supervisor imports nothing relative to its package"
+            imported.add(str(node.module).split(".")[0])
+    dynamic = [
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "__import__"
+    ]
+
+    assert "os" in imported, "the parser found none of the supervisor's imports"
+    assert imported <= SUPERVISOR_IMPORT_ALLOWLIST, imported - SUPERVISOR_IMPORT_ALLOWLIST
+    assert dynamic == []
+
+
+def test_trial_directory_and_allocated_lifecycle_precede_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before ``launch_trial`` runs, the trial carries its directory and its lifecycle reads ``allocated``.
+
+    Recovery reads a ``RUNNING`` trial without the directory attribute, and an
+    ``allocated`` lifecycle without a process identity, as proof that nothing
+    launched, so both must be durable before any process can start.
+    """
+    experiment = make_experiment(persistent=tmp_path, trial_command="true {overrides}", n_trials=1)
+    observed: dict[str, str | None] = {}
+
+    def inspect_before_launch(**kwargs: object) -> ExecutedTrial:
+        trial_dir = Path(str(kwargs["trial_dir"]))
+        study = optuna.load_study(
+            study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+        )
+        trial = next(trial for trial in study.trials if trial.number == kwargs["trial_id"])
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=str(kwargs["attempt_id"]))
+        observed["trial_dir"] = str(trial_dir)
+        observed["trial_dir_attr"] = trial.user_attrs.get(TRIAL_DIR_ATTR)
+        observed["lifecycle"] = None if lifecycle is None else lifecycle.state
+        raise TrialExecutionError("inspected before launch; no process started")
+
+    monkeypatch.setattr("phasesweep.engine.phase.launch_trial", inspect_before_launch)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    assert observed["trial_dir_attr"] == observed["trial_dir"]
+    assert observed["lifecycle"] == "allocated"

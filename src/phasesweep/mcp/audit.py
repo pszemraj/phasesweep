@@ -2,7 +2,9 @@
 
 Audit records are operator-facing JSON lines written under ``state_dir``. They
 intentionally log identifiers, counts, outcomes, and state transitions instead
-of result payloads, paths, commands, env, logs, or sampled parameters.
+of result payloads, paths, commands, env, logs, or sampled parameters. Each
+record names the transport the call arrived on, so an operator can tell a
+connected client's call from one made by ``phasesweep mcp call``.
 """
 
 from __future__ import annotations
@@ -12,14 +14,16 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.time import utc_now_iso
 
 log = logging.getLogger("phasesweep.mcp.audit")
+AUDIT_LOG_NAME = "audit.jsonl"
 MAX_AUDIT_STRING_LENGTH = 256
+AuditTransport = Literal["stdio", "cli"]
 
 
 def _compact_value(value: Any) -> Any:
@@ -46,12 +50,24 @@ def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
 
 @dataclass
 class AuditLogger:
-    """Append-only JSONL audit sink for MCP side effects."""
+    """Append-only JSONL audit sink for MCP side effects.
+
+    ``transport`` is ``stdio`` for the served MCP server and ``cli`` for a call made
+    by ``phasesweep mcp call``; every record carries it, and the ``actor`` derived from it.
+    """
 
     path: Path
-    actor: str = "local-stdio"
+    transport: AuditTransport = "stdio"
     session_id: str = field(default_factory=lambda: uuid4().hex)
     _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    @property
+    def actor(self) -> str:
+        """Return the local actor that makes calls over this transport.
+
+        :return str: ``local-stdio`` or ``local-cli``.
+        """
+        return f"local-{self.transport}"
 
     def record(
         self,
@@ -87,7 +103,7 @@ class AuditLogger:
             "timestamp": utc_now_iso(),
             "actor": self.actor,
             "session_id": self.session_id,
-            "transport": "stdio",
+            "transport": self.transport,
             "tool": tool,
             "args": _compact_mapping(args),
             "outcome": outcome,

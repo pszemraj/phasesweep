@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
 from phasesweep.config import Phase
-from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
-from phasesweep.engine.attempts import _parsed_trial_outcome
+from phasesweep.config.search import fixed_configuration_target_refusal
 from phasesweep.engine.errors import (
     OperatorAction,
-    SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
-from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.fingerprints import (
+    _ABSENT,
+    _MAX_REPORTED_CHANGES,
+    _changed_payload_keys,
+    _render_changed_values,
+)
+from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -25,13 +30,18 @@ from phasesweep.engine.state import (
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _parsed_trial_outcome,
+    _trial_interrupted,
 )
+from phasesweep.engine.trial import EnvironmentIdentity
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -57,7 +67,7 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
     :param int consecutive_failures: Count observed before ``outcome``.
     :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
         increments the count, ``"success"`` resets it to zero, and any other
-        outcome (e.g. ``"pruned"``, ``"cancelled"``) leaves it unchanged.
+        outcome (``"interrupted"``) leaves it unchanged.
     :return int: The count after applying ``outcome``.
     """
     if outcome in {"failure", "fatal"}:
@@ -416,66 +426,52 @@ def _accepted_trial_target(study: optuna.Study) -> int:
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
-    """Reject a target lower than the study's durable accepted target.
+    """Reject a target the study's durable state does not allow.
+
+    A target lower than the accepted one is refused, and so is a fixed
+    configuration's target past what it may retry (see
+    :func:`_validate_fixed_configuration_target`).
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
-    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
-        study's durable accepted target.
+    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
+        study's durable accepted target, or a fixed configuration asks for more
+        attempts than it may retry.
     """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
-        raise TrialTargetRegressionError(
+        raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
             f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
             "target or a new experiment name."
         )
+    trials = study.get_trials(deepcopy=False)
+    _validate_fixed_configuration_target(
+        phase,
+        finished=_finished_trial_count(trials),
+        completed=_completed_trial_count(trials),
+    )
 
 
-def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
-    """Reject any cross-process continuation of a partially complete stateful study.
+def _validate_fixed_configuration_target(phase: Phase, *, finished: int, completed: int) -> None:
+    """Reject a fixed configuration's target that would repeat a measured configuration.
 
-    TPE and CMA-ES suggestions depend on process-local RNG/optimizer state that
-    Optuna storage does not persist. Recreating a seeded sampler in a fresh
-    process restarts that stream, so a mid-target resume can exactly repeat
-    already-evaluated startup suggestions and spend the remaining budget on
-    duplicates. Until PhaseSweep persists real sampler continuation state, a
-    stateful phase is restartable only before its first terminal trial or after
-    reaching its accepted target.
+    A fixed configuration draws nothing, so every attempt runs the same trial.
+    Raising ``n_trials`` retries it only while no attempt has completed: after
+    ``finished`` failed attempts the target may reach ``finished + 1``, and a
+    completed attempt, feasible or not, closes it. A phase that draws is not
+    checked here. A study that does not exist yet counts zero finished and
+    zero completed.
 
-    :param optuna.Study study: Existing study whose finished-trial count is checked.
-    :param Phase phase: Phase config supplying the sampler type and trial target.
-    :raises SamplerContinuationUnsupportedError: The phase uses a stateful sampler
-        (``tpe`` or ``cmaes``) and either raises its previously accepted trial
-        target or was interrupted before reaching it.
+    :param Phase phase: Phase config supplying the requested ``n_trials`` target.
+    :param int finished: Terminal attempts the phase's study holds.
+    :param int completed: How many of those are COMPLETE.
+    :raises TrialTargetRefusedError: The fixed configuration asks for more
+        attempts than it may retry; the message names the largest allowed target.
     """
-    finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or finished == 0:
-        return
-
-    accepted_target = _accepted_trial_target(study)
-    partial_decision = _load_accepted_partial_decision(study)
-    if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
-        # An accepted partial timeout is terminal at its frozen target.
-        # Identical replay launches no suggestions, so no process-local
-        # sampler state needs to be reconstructed.
-        return
-    if phase.n_trials > accepted_target:
-        raise SamplerContinuationUnsupportedError(
-            f"Phase {phase.name!r} uses {phase.sampler.type!r} and raises its accepted target "
-            f"from {accepted_target} to {phase.n_trials} terminal trial(s). PhaseSweep cannot "
-            "reproduce this sampler's process-local continuation state safely. Use a new "
-            "experiment name, or run the full target in one invocation."
-        )
-    if finished < accepted_target:
-        raise SamplerContinuationUnsupportedError(
-            f"Phase {phase.name!r} uses {phase.sampler.type!r} and was interrupted at "
-            f"{finished}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
-            "this sampler's exact process-local continuation state, so resuming could "
-            "re-evaluate identical suggestions and waste the remaining budget. Use a new "
-            "experiment name (optionally with a stateless random/grid sampler), or run the "
-            "full target in one uninterrupted invocation."
-        )
+    refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    if refusal is not None:
+        raise TrialTargetRefusedError(refusal)
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
@@ -483,7 +479,7 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
 
     :param optuna.Study study: Study whose accepted trial target is stored.
     :param Phase phase: Phase config supplying the new ``n_trials`` target.
-    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
         study's already-accepted target.
     """
     _validate_trial_target(study, phase)
@@ -561,6 +557,73 @@ def _record_allocation_context(
     )
 
 
+def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.trial.FrozenTrial]:
+    """Return the interrupted trials that still need a rerun, in trial-number order.
+
+    A source needs one exactly when it is interrupted and no trial names it
+    under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Both facts are fixed
+    once written, so the answer needs no "scheduled" flag and a crash between
+    two reruns loses or duplicates none.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.
+    """
+    named = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    return sorted(
+        (trial for trial in trials if _trial_interrupted(trial) and trial.number not in named),
+        key=lambda trial: trial.number,
+    )
+
+
+def _pending_rerun_count(trials: Sequence[optuna.trial.FrozenTrial]) -> int:
+    """Count the reruns a phase still owes: interrupted trials without one, and WAITING reruns.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return int: Reruns the next run that reaches the phase launches before any new draw.
+    """
+    waiting = sum(
+        1
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+    )
+    return len(_rerun_sources(trials)) + waiting
+
+
+def _record_reruns(study: optuna.Study) -> list[tuple[int, int]]:
+    """Schedule one WAITING rerun for every interrupted trial that has none.
+
+    Each rerun is created in one storage record carrying its source's params,
+    distributions and system attrs (a grid point, a CMA-ES generation) and
+    :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Optuna's ``ask`` pops
+    WAITING trials before it creates new ones and returns their stored params
+    without consulting the sampler, so the reruns run first with exactly their
+    sources' configurations, and each takes its source's draw position.
+
+    :param optuna.Study study: Study about to allocate work.
+    :return list[tuple[int, int]]: ``(source, rerun)`` trial numbers, one per
+        rerun created, in source order.
+    """
+    sources = _rerun_sources(study.get_trials(deepcopy=False))
+    for source in sources:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.WAITING,
+                params=source.params,
+                distributions=source.distributions,
+                system_attrs=dict(source.system_attrs),
+                user_attrs={RERUN_OF_ATTR: source.number},
+            )
+        )
+    if not sources:
+        return []
+    reruns = {
+        trial.user_attrs[RERUN_OF_ATTR]: trial.number
+        for trial in study.get_trials(deepcopy=False)
+        if RERUN_OF_ATTR in trial.user_attrs
+    }
+    return [(source.number, reruns[source.number]) for source in sources]
+
+
 def _prelaunch_trial_environment(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
@@ -607,44 +670,121 @@ def _restore_prelaunch_environment_identity(
     return True
 
 
-def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> None:
+_NO_RECORDED_ENVIRONMENT = (
+    "No trial from the other cohort recorded its environment, so the difference cannot be named."
+)
+
+
+def _recorded_environment(trial: optuna.trial.FrozenTrial) -> dict[str, str] | None:
+    """Read the tracked environment a trial recorded.
+
+    :param optuna.trial.FrozenTrial trial: Trial from another environment cohort.
+    :return dict[str, str] | None: The recorded name-to-value mapping, or ``None`` when the
+        trial recorded none (an allocation that died before it landed) or holds a malformed one.
+    """
+    recorded = trial.user_attrs.get(TRAINER_ENV_ATTR)
+    if not isinstance(recorded, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in recorded.items()
+    ):
+        return None
+    return dict(recorded)
+
+
+def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
+    """Render how a tracked environment differs, with the values on both sides.
+
+    The values are cut by the window :func:`~phasesweep.engine.fingerprints._render_changed_values`
+    applies to a phase fingerprint refusal, so a long ``PATH`` shows where the two differ.
+
+    :param dict[str, str] old: Mapping a trial of the other cohort recorded.
+    :param dict[str, str] new: Mapping this invocation composes.
+    :return str: Each differing variable as ``NAME old -> new``, then each added name with its
+        value and each removed name with its old value, up to :data:`_MAX_REPORTED_CHANGES`
+        entries and a count of the rest; empty when the mappings are equal.
+    """
+    changed: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    for name, before, after in _changed_payload_keys(old, new):
+        old_text, new_text = _render_changed_values(before, after)
+        if before is _ABSENT:
+            added.append(f"added {name}={new_text}")
+        elif after is _ABSENT:
+            removed.append(f"removed {name} (was {old_text})")
+        else:
+            changed.append(f"{name} {old_text} -> {new_text}")
+    entries = [*changed, *added, *removed]
+    shown = entries[:_MAX_REPORTED_CHANGES]
+    if len(entries) > _MAX_REPORTED_CHANGES:
+        shown.append(f"and {len(entries) - _MAX_REPORTED_CHANGES} more")
+    return "; ".join(shown)
+
+
+def _environment_difference(
+    current: EnvironmentIdentity, trials: Sequence[optuna.trial.FrozenTrial]
+) -> str:
+    """Show what differs between this invocation's environment and another cohort's trial.
+
+    Compares the tracked mapping against the latest of ``trials`` that recorded one. Pass-through
+    names are in neither mapping, since they cannot split a cohort.
+
+    :param EnvironmentIdentity current: Environment this invocation composes.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
+    :return str: A sentence showing each differing, added and removed variable with its values,
+        or one saying no trial of the other cohort recorded its environment.
+    """
+    for trial in reversed(trials):
+        recorded = _recorded_environment(trial)
+        if recorded is None:
+            continue
+        description = _describe_environment_changes(recorded, current.tracked)
+        if description:
+            return f"Compared with trial {trial.number}: {description}."
+    return _NO_RECORDED_ENVIRONMENT
+
+
+def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdentity) -> None:
     """Refuse to allocate into a different or unknown semantic environment cohort.
 
     :param optuna.Study study: Existing study whose trials define the cohort.
-    :param str current_digest: Semantic environment digest for this invocation.
+    :param EnvironmentIdentity current: Semantic environment this invocation composes.
     :raises StudySchemaMismatchError: A populated study has a trial with
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
-        semantic environment cohort.
+        semantic environment cohort. The message shows each variable that differs,
+        was added or was removed, with its old and new value.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
     missing: list[int] = []
     recorded: set[str] = set()
+    elsewhere: list[optuna.trial.FrozenTrial] = []
     for trial in trials:
         environment = trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
-        if isinstance(environment, str) and environment:
-            recorded.add(environment)
-            continue
-        environment = _prelaunch_trial_environment(study, trial)
+        if not (isinstance(environment, str) and environment):
+            environment = _prelaunch_trial_environment(study, trial)
         if environment is None:
             missing.append(trial.number)
-        else:
-            recorded.add(environment)
+            continue
+        recorded.add(environment)
+        if environment != current.digest:
+            elsewhere.append(trial)
     if missing:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
             "which environment cohort owns those results. Use a new experiment name.",
         )
-    if recorded != {current_digest}:
+    if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
-            f"{current_digest[:12]}. No trial was allocated. Restore the original "
-            "semantic environment, classify rotating credentials under "
-            "execution.passthrough_env, or use a new experiment name.",
+            f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
+            "No trial was allocated. Restore the original semantic environment, pin "
+            "the value under env, classify variables that may differ, such as "
+            "rotating credentials, under execution.passthrough_env, or use a new "
+            "experiment name.",
             action=OperatorAction.FIX_CONFIG,
         )

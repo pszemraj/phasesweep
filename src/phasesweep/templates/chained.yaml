@@ -1,0 +1,63 @@
+# phasesweep template: a random lr search, then a phase that searches a key the first only fixed
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+#
+# The first phase fixes model.n_layers at a cheap value and searches the learning rate. The second
+# inherits the winning learning rate and searches model.n_layers, the key the first phase only
+# fixed: the sampled value replaces the inherited one. A child cannot search a key its parent
+# sampled, only one its parent fixed. Details: phasesweep explain 'phases[].inherits'.
+#
+# It runs as written on the packaged toy trainer. For your own trainer, replace trial_command, the
+# trainer_config keys, the metric extractor and the keys the phases fix and search.
+experiment: phasesweep_chained
+storage: auto
+provenance:
+  revision: "phasesweep-chained-v1"
+# Relative paths here resolve against this file's directory, not the shell's.
+workdir: ./runs
+execution:
+  # Pins the trainer's cwd to this file's directory: a run from another directory resumes
+  # the same study. Unset, the cwd follows the invocation directory and is fingerprinted.
+  cwd: .
+  # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
+  inherit_env: none
+
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
+
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
+
+phases:
+  - name: learning_rate
+    comment: "Search the learning rate on a shallow model, which is cheap to train."
+    n_trials: 4
+    # Each draw derives from this seed and the draw position, so a resumed phase draws the same set as an uninterrupted one.
+    sampler: { type: random, seed: 0 }
+    fixed_overrides:
+      model.n_layers: 4
+    search_space:
+      optimizer.lr: { type: float, low: 0.0001, high: 0.001, log: true }
+
+  - name: depth
+    comment: "Keep the winning learning rate and search the depth the first phase held at four layers."
+    inherits: [learning_rate]
+    n_trials: 3
+    sampler: { type: grid }
+    search_space:
+      model.n_layers: { type: categorical, choices: [6, 8, 10] }

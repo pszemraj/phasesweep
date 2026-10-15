@@ -13,7 +13,11 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config import Experiment, Phase
-from phasesweep.engine.errors import StudyContextConflictError
+from phasesweep.engine.errors import (
+    PublicationAccessError,
+    PublicationIntegrityError,
+    StudyContextConflictError,
+)
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
@@ -41,9 +45,10 @@ def _preflight_skipped_winners(
         disagrees with the current config.
     :raises TrialEvidenceMissingError: A skipped winner's source trial evidence
         is missing or changed.
-    :raises PublicationAccessError: The published manifest cannot be read as
+    :raises PublicationAccessError: The recorded publication cannot be read as
         the current user.
-    :raises PublicationIntegrityError: The published manifest fails validation.
+    :raises PublicationIntegrityError: The recorded publication is unreadable,
+        malformed, or fails validation.
     """
     if from_phase is None:
         return {}
@@ -70,17 +75,27 @@ def _preflight_skipped_winners(
 def _published_for_resume(experiment: Experiment) -> ValidatedPublication | None:
     """Resolve the publication a resume builds on, refusing one that does not validate.
 
+    An unusable publication never reads as absent: a pointer, summary, or
+    manifest that cannot be read or fails validation is a refusal, so the
+    callers' "no winner yet" answers only a tree that published nothing.
+
     :param Experiment experiment: Experiment being resumed.
-    :raises PublicationAccessError: The published manifest cannot be read as
-        the current user.
-    :raises PublicationIntegrityError: The published manifest fails validation.
+    :raises PublicationAccessError: The pointer, summary, or published manifest
+        cannot be read as the current user.
+    :raises PublicationIntegrityError: The pointer, summary, or published
+        manifest is unreadable, malformed, or fails validation.
     :return ValidatedPublication | None: Everything the validation read, or
-        ``None`` when no usable publication exists.
+        ``None`` when nothing was ever published.
     """
-    return publication_ops._resolve_publication_pointer(
+    pointer = publication_ops._resolve_publication_pointer(
         experiment,
         raise_on_manifest_error=True,
-    ).validated
+    )
+    if pointer.state == "permission_denied":
+        raise PublicationAccessError(pointer.error or "Published result is unreadable.")
+    if pointer.state == "failed":
+        raise PublicationIntegrityError(pointer.error or "Published result is invalid.")
+    return pointer.validated
 
 
 def _accept_skipped_winner(
@@ -176,27 +191,33 @@ def _reject_bound_descendant_topups(
             )
 
 
-def _reject_unsupported_sampler_topups(
+def _reject_fixed_targets_without_study(
     experiment: Experiment,
     *,
     from_phase: str | None,
     existing_studies: dict[str, optuna.Study],
 ) -> None:
-    """Reject stateful sampler continuation after bound-descendant checks.
+    """Reject a fixed configuration's oversized target before any phase launches.
+
+    A reached phase with no durable study has no failed attempt to replace, so
+    it counts zero finished and zero completed trials. Reached phases that do
+    have a study were already checked against their trials by the recovery
+    preflight (:func:`phasesweep.engine.study_policy._validate_trial_target`).
+    Checking the missing ones here keeps a later phase's refusal from arriving
+    after an earlier phase has already run.
 
     :param Experiment experiment: Parsed experiment whose phase chain is scanned
         from ``from_phase`` (or the start) onward.
     :param str | None from_phase: Optional resume point; phases before it are skipped.
     :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises SamplerContinuationUnsupportedError: A reached phase's study cannot
-        safely continue with its configured stateful sampler; delegated to
-        :func:`phasesweep.engine.study_policy._validate_sampler_continuation`.
+    :raises TrialTargetRefusedError: A reached fixed configuration without a
+        study asks for more than one trial; delegated to
+        :func:`phasesweep.engine.study_policy._validate_fixed_configuration_target`.
     """
     for _index, phase in experiment.phases_from(from_phase):
-        study = existing_studies.get(phase.name)
-        if study is not None:
-            study_policy_ops._validate_sampler_continuation(study, phase)
+        if phase.name not in existing_studies:
+            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, completed=0)
 
 
 def _preflight_reached_fingerprint(

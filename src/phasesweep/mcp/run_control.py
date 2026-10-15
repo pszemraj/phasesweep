@@ -19,9 +19,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.resume import _accept_skipped_winner, _published_for_resume
 from phasesweep.engine.state import Winner
-from phasesweep.mcp.audit import AuditLogger
+from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
     ConfigChangedError,
@@ -31,8 +32,10 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    ResumePublicationUnusableError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
+    RunNamespaceMismatchError,
     UnknownExperimentError,
     UnknownRunError,
 )
@@ -50,9 +53,9 @@ from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
 from phasesweep.runtime.process import fd_ready
 from phasesweep.runtime.reaper import (
-    identity_from_earlier_boot,
     kill_stale_group,
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from phasesweep.runtime.time import utc_now_iso
@@ -79,8 +82,7 @@ class _SpawnBookkeepingError(Exception):
 
 # Environment variables that make the interpreter execute code before the
 # detached runner's first statement. They are dropped from the child's
-# environment (review v0.5.17 / blocker 9); PYTHONNOUSERSITE backs up the
-# ``-s`` flag for the same reason.
+# environment; PYTHONNOUSERSITE backs up the ``-s`` flag for the same reason.
 _PRE_IMPORT_CODE_ENV_VARS = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -173,11 +175,12 @@ class RunControl:
 
         :param Registry registry: Validated catalog registry.
         :param RunStore runs: Persistent detached-run store.
-        :param AuditLogger | None audit: Optional audit sink override; defaults to state_dir/audit.jsonl.
+        :param AuditLogger | None audit: Optional audit sink override; defaults to the
+            ``stdio`` log under ``state_dir``.
         """
         self._registry = registry
         self._runs = runs
-        self._audit = audit or AuditLogger(registry.state_dir / "audit.jsonl")
+        self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
 
     def _audit_success(
         self,
@@ -251,6 +254,8 @@ class RunControl:
             does not allow ``from_phase`` resumes.
         :raises InvalidPhaseError: If ``from_phase`` names no phase of this experiment.
         :raises ResumeNotReadyError: If an earlier phase has no compatible winner.
+        :raises ResumePublicationUnusableError: If the recorded publication no longer
+            validates or this server cannot read it.
         :raises LaunchInProgressError: If another launch currently holds the launch lock.
         :raises ExperimentBusyError: If this experiment already has a live run.
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
@@ -404,6 +409,8 @@ class RunControl:
         :raises PermissionDeniedError: If the run's entry did not allow cancel at launch time.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
             process identity, so there is nothing safe to signal.
+        :raises RunNamespaceMismatchError: If the runner was recorded in another
+            PID namespace, where its PID and process group cannot be signalled.
         """
         args = {"run_id": run_id}
         resolved: dict[str, Any] = {}
@@ -416,8 +423,9 @@ class RunControl:
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
-            before = self._runs.state(handle)
-            recovery_required = self._runs.recovery_required(handle)
+            view = self._runs.runner_view(handle)
+            before = self._runs.state(handle, view=view)
+            recovery_required = self._runs.recovery_required(handle, view=view)
             state_before = {
                 "run_state": before,
                 "recovery_required": recovery_required,
@@ -426,14 +434,16 @@ class RunControl:
                 with self._runs.transition_lock(handle):
                     # Launch may have durably replaced a pending handle with
                     # its runner identity, and recovery may have finalized the
-                    # run after the first read. Use the latest handle for both
-                    # the state decision and any subsequent signal.
+                    # run after the first read. Use the latest handle, and one
+                    # derivation of its runner, for both the state decision and
+                    # any subsequent signal.
                     refreshed = self._runs.get(run_id)
                     if refreshed is None:
                         raise UnknownRunError(run_id)
                     handle = refreshed
-                    before = self._runs.state(handle, transition_locked=True)
-                    recovery_required = self._runs.recovery_required(handle)
+                    view = self._runs.runner_view(handle)
+                    before = self._runs.state(handle, view=view)
+                    recovery_required = self._runs.recovery_required(handle, view=view)
                     state_before = {
                         "run_state": before,
                         "recovery_required": recovery_required,
@@ -442,6 +452,11 @@ class RunControl:
                         # No PID/PGID is durable yet. Signalling an empty identity
                         # could let launch continue after a false cancel response.
                         raise RunLaunchUnsettledError(run_id)
+                    if before == "running" and view.visibility == "unobservable":
+                        # The recorded PID and process group are numbered in
+                        # another PID namespace, where they name unrelated
+                        # processes. Refuse before reserving or signalling.
+                        raise RunNamespaceMismatchError(run_id)
                     if before == "running":
                         # Reserve capacity before signalling; recovery cannot
                         # clear this marker between the reread and its write.
@@ -462,25 +477,32 @@ class RunControl:
                 # uncertainty, child trial PGIDs may still live, so keep the run
                 # counted as live and fail closed.
                 identity = self._runs.cleanup_identity(handle)
-                current_boot = read_boot_id()
-                same_boot = identity.boot_id is not None and identity.boot_id == current_boot
-                earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
-                # A prior boot proves cleanup without a signal. An unknown boot
-                # cannot make saved PID/starttime safe to signal after reboot.
-                runner_group_gone = earlier_boot or (
-                    same_boot
-                    and kill_stale_group(
-                        identity.pid,
-                        identity.pid_starttime,
-                        pgid=identity.pgid,
-                        grace_seconds=30.0,
+                gone = view.visibility == "gone"
+                same_boot = identity.boot_id is not None and identity.boot_id == read_boot_id()
+                # A prior boot proves the runner and its trials gone without a
+                # signal; a runner proven absent from another PID namespace
+                # proves only its own group gone. An unknown boot cannot make
+                # saved PID/starttime safe to signal after reboot, and another
+                # PID namespace cannot be signalled from here at all.
+                runner_group_gone = (
+                    gone
+                    or view.visibility == "absent"
+                    or (
+                        same_boot
+                        and view.visibility == "observable"
+                        and kill_stale_group(
+                            identity.pid,
+                            identity.pid_starttime,
+                            pgid=identity.pgid,
+                            grace_seconds=30.0,
+                        )
                     )
                 )
                 with self._runs.transition_lock(handle):
                     terminal_status = self._runs.recorded_terminal_status(handle)
                     cleanup_recovered = self._runs._cleanup_recovered(handle)
                     confirmed = runner_group_gone and (
-                        earlier_boot
+                        gone
                         or (
                             terminal_status is not None
                             and terminal_status.get("cleanup_confirmed") is True
@@ -491,8 +513,8 @@ class RunControl:
                         # Recovery owns any remaining marker after recording
                         # cleanup; it may still be repairing the frozen result.
                         self._runs.clear_cleanup_uncertain(handle)
-                    after = self._runs.state(handle, transition_locked=True)
-                    recovery_required = self._runs.recovery_required(handle)
+                    after = self._runs.state(handle, view=view)
+                    recovery_required = self._runs.recovery_required(handle, view=view)
             result = {
                 "run_id": run_id,
                 "state": after,
@@ -536,6 +558,8 @@ class RunControl:
         :raises ResumeNotReadyError: If an earlier phase has no published
             winner, or its winner or source evidence is unusable or
             incompatible with the current config.
+        :raises ResumePublicationUnusableError: If the recorded publication no
+            longer validates or this server cannot read it.
         """
         skipped = reg.experiment.phases[: reg.phase_names.index(from_phase)]
         if not skipped:
@@ -550,6 +574,12 @@ class RunControl:
                 winners[phase.name] = _accept_skipped_winner(
                     reg.experiment, phase, winners, publication
                 )
+        except PublicationIntegrityError as exc:
+            log.info("resume refused for experiment=%s: %s", reg.id, exc)
+            raise ResumePublicationUnusableError(reg.id, from_phase, "failed") from None
+        except PublicationAccessError as exc:
+            log.info("resume refused for experiment=%s: %s", reg.id, exc)
+            raise ResumePublicationUnusableError(reg.id, from_phase, "permission_denied") from None
         except FileNotFoundError:
             raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
         except (
@@ -601,6 +631,7 @@ class RunControl:
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
+            config_dir=str(reg.config_path.parent),
             pid=None,
             pgid=None,
             pid_starttime=None,
@@ -738,12 +769,23 @@ class RunControl:
         :param str | None from_phase: Optional phase to resume from.
         :param PreparedRun preparation: Durable preparation and inherited launch lease.
         :raises OSError: The log or detached runner cannot be opened before spawn.
+        :raises RuntimeError: If this process's PID namespace is unreadable, so
+            the child's PID could not be tied to the namespace that numbers it.
         :raises _SpawnBookkeepingError: Post-spawn identity bookkeeping fails; the
             exception records whether cleanup of the spawned process group was confirmed.
         :return RunHandle: Runner-validated spawned handle.
         """
         pending = preparation.handle
         run_id = pending.run_id
+        # The child inherits this namespace, so it is read before any pipe or
+        # child exists: an unreadable namespace refuses the launch with nothing
+        # to clean up.
+        pid_namespace = read_pid_namespace()
+        if pid_namespace is None:
+            raise RuntimeError(
+                "cannot read this process's PID namespace; refused launch because later "
+                "cancellation could not tell whether the runner's PID is visible"
+            )
         config_snapshot_path = preparation.config_snapshot_path
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
@@ -779,18 +821,17 @@ class RunControl:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
-        # Pre-identity trust boundary (review v0.5.17 / blocker 9). Everything
-        # between exec and the runner's own durable handle write runs before
-        # this server can name the process it just created. Spawning with the
-        # experiment's project directory as cwd put that window inside the
-        # project's reach: interpreter startup would import a project-local
-        # `phasesweep/` shadow package or `sitecustomize.py`, and a
-        # PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected module would run
-        # earlier still. Any of it could fork+setsid out of the process group
-        # recorded below, after which "cleanup confirmed" would be a claim
-        # about an empty group. So the child starts in the server-owned state
-        # directory, with -P/-s and a sanitized environment, and receives the
-        # project directory as an explicit argument it applies only after its
+        # Pre-identity trust boundary. Everything between exec and the runner's
+        # own durable handle write runs before this server can name the process
+        # it just created. Spawning with the experiment's project directory as
+        # cwd would put that window inside the project's reach: interpreter
+        # startup would import a project-local `phasesweep/` shadow package or
+        # `sitecustomize.py`, and a PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected
+        # module would run earlier still. Any of it could fork+setsid out of the
+        # process group recorded below, after which "cleanup confirmed" would be
+        # a claim about an empty group. So the child starts in the server-owned
+        # state directory, with -P/-s and a sanitized environment, and receives
+        # the project directory as an explicit argument it applies only after its
         # identity is on disk.
         spawn_cwd = self._neutral_spawn_cwd()
         # Open the log here, hand the fd to the child, then close our copy. The
@@ -827,6 +868,7 @@ class RunControl:
                     run_id=run_id,
                     experiment_id=reg.id,
                     config_sha256=reg.config_sha256,
+                    config_dir=pending.config_dir,
                     pid=proc.pid,
                     pgid=proc.pid,
                     pid_starttime=None,
@@ -835,6 +877,7 @@ class RunControl:
                     allow_cancel=pending.allow_cancel,
                     visible_params_at_launch=pending.visible_params_at_launch,
                     boot_id=None,
+                    pid_namespace=pid_namespace,
                 )
                 pid_starttime = read_proc_starttime(proc.pid)
                 handle = replace(handle, pid_starttime=pid_starttime)
@@ -877,6 +920,7 @@ class RunControl:
                 run_id=run_id,
                 experiment_id=reg.id,
                 config_sha256=reg.config_sha256,
+                config_dir=pending.config_dir,
                 pid=proc.pid,
                 pgid=proc.pid,
                 pid_starttime=pid_starttime,
@@ -885,6 +929,7 @@ class RunControl:
                 allow_cancel=pending.allow_cancel,
                 visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=boot_id,
+                pid_namespace=pid_namespace,
             )
             cleanup_confirmed = self._terminate_failed_spawn(
                 cleanup_handle, exc, acknowledged=runner_acknowledged

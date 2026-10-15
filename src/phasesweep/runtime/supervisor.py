@@ -1,20 +1,21 @@
 """Block a trial command until the orchestrator commits its process identity.
 
-STDLIB-ONLY, NO PHASESWEEP IMPORTS (review v0.5.15 / blocker 1): this script
-runs in its own interpreter BEFORE PhaseSweep's durable process identity
-exists and BEFORE the parent has applied the trainer's environment. Anything
-importable from that environment — a poisoned or shadowed ``phasesweep``
-package via a trainer-composed ``PYTHONPATH``, a ``sitecustomize``/
-``usercustomize`` module, or heavy eager imports in ``phasesweep/__init__.py``
-— must never get a chance to run here: it could fork and ``setsid``-escape
-undetected before any identity record is written. The parent therefore
+STDLIB-ONLY, NO PHASESWEEP IMPORTS: this script runs in its own interpreter
+BEFORE PhaseSweep's durable process identity exists and BEFORE the parent has
+applied the trainer's environment. Anything importable from that environment
+— a poisoned or shadowed ``phasesweep`` package via a trainer-composed
+``PYTHONPATH``, a ``sitecustomize``/``usercustomize`` module, or heavy eager
+imports in ``phasesweep/__init__.py`` — must never get a chance to run here:
+it could fork and ``setsid``-escape undetected before any identity record is
+written. The parent therefore
 launches this file directly (never ``-m phasesweep.runtime.supervisor``)
 under ``python -I -S`` with a minimal sanitized environment. ``-S`` skips
 site initialization (no ``sitecustomize``/``usercustomize``); ``-I``
 (isolated mode) implies ``-P`` on Python >= 3.11, so this script's own
-directory — which contains the sibling module ``phasesweep/runtime/json.py``
-— is never prepended to ``sys.path``, keeping ``import json`` resolved to the
-stdlib module every time. Keep imports here limited to the stdlib modules
+directory — which contains the sibling modules ``phasesweep/runtime/json.py``
+and ``phasesweep/runtime/time.py`` — is never prepended to ``sys.path``,
+keeping ``import json`` and ``import time`` resolved to the stdlib modules
+every time. Keep imports here limited to the stdlib modules
 ``contextlib``, ``os``, ``sys``, ``json``, ``signal``, and ``time``.
 """
 
@@ -65,8 +66,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
     The wire format is ``_HEADER_LEN`` ASCII decimal bytes giving the byte
     length of a UTF-8 JSON body, immediately followed by that many body
     bytes. The body must decode to ``{"cmd": <str>, "env": {<str>: <str>}}``
-    with an optional ``"cwd": <str>`` naming the trainer's working directory
-    (review v0.5.17 / blocker 4).
+    with an optional ``"cwd": <str>`` naming the trainer's working directory.
 
     Encoded on the other end by ``phasesweep.runtime.process._encode_launch_payload``
     (prose reference only — this module is stdlib-only and must never import

@@ -82,7 +82,7 @@ An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any tes
 
 GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
-The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range; do not widen it without targeted validation.
+The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
 The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decoding and error behavior with controlled responses, plus supervised worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B round trip reaches the service. Input tests use the real Hydra 1.3 parser and entrypoint; rendering itself has no Hydra runtime dependency.
 
@@ -117,7 +117,7 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
-- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering.
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. `runtime/supervisor.py` is the launch barrier every trial passes: a stdlib-only script started by path under `python -I -S` with only `PATH` in its environment, which receives the trainer's command and environment only after the trial's process identity is on disk, so nothing from the trainer environment runs before cleanup can find it. Keep its imports to the stdlib; [invariant 9](invariants.md#9-nothing-runs-before-its-process-identity-is-durable) has the whole rule.
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
@@ -138,7 +138,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
-The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md).
+The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md). `tests/test_invariants_doc.py` holds that file to the code: every `Held by` symbol must import, every cited test must exist, and every numbered reference to an invariant in `src/`, `tests/`, or `docs/` must carry the rule's title in quotes, as in `invariant 2 ("Validation writes nothing")`, or link to its heading, so a renumbering cannot silently repoint it. It cannot notice a missing rule: a new ordering rule or ledger entry point needs its own entry, citing the code and the test that hold it.
 
 The ordinary control flow is:
 
@@ -166,14 +166,14 @@ flowchart TD
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
+- `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
 - `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing, and the integration-marker guard.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
-- `tests/test_init.py` and `tests/test_reporting.py`: starter creation, catalog scaffolding, and result rendering.
+- `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and result rendering.
 
 ## Tracked TODOs
 
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK exposes a tested public closed-input-schema API; keep behavior-level request validation as the safety net until then.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
-- TODO(engine): Keep [durability invariants](invariants.md) in step with the ledger chokepoint. A storage constructor outside `engine/ledger.py` already fails `tests/test_ledger_contract.py`, but a new ordering rule or ledger entry point needs its own invariant entry, citing the code and the test that hold it.

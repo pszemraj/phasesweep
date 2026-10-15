@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -17,15 +18,23 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, run_supervised
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownLaunchRefusedError,
     SignalOwnershipUnavailableError,
     _shutdown_handler,
     defer_shutdown_signals,
     install_signal_handlers,
     signal_handler_scope,
 )
-from tests.conftest import make_experiment, write_constant_trainer, write_trainer
+from tests.conftest import (
+    make_experiment,
+    restored_signal_ownership,
+    write_constant_trainer,
+    write_trainer,
+)
 
 
 @pytest.mark.integration
@@ -36,8 +45,8 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
 
     A library that leaves its own SIGTERM/SIGINT/SIGHUP handlers and unblocked
     mask installed after returning steals the embedding process's own
-    shutdown handling permanently (review v0.5.14 / blocker 6). This must be
-    undone whether the run succeeds or raises.
+    shutdown handling permanently. This must be undone whether the run
+    succeeds or raises.
     """
 
     def host_handler(_signum: int, _frame: object) -> None:
@@ -82,13 +91,13 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
 @pytest.mark.signals_own_pid
 def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
     """A signal pending at scope-exit must reach the restored HOST handler, not
-    ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
+    ``_shutdown_handler`` mid-restoration.
 
-    Pre-fix, the mask was restored before the host handlers, so a pending
-    SIGTERM fired while ``_shutdown_handler`` was still installed for it,
-    raising ``PhaseSweepShutdown`` out of the cleanup path and leaving some
-    host handlers unrestored. The fixed order is: block, then restore
-    handlers, then restore the mask.
+    Restoring the mask before the host handlers would let a pending SIGTERM
+    fire while ``_shutdown_handler`` was still installed for it, raising
+    ``PhaseSweepShutdown`` out of the cleanup path and leaving some host
+    handlers unrestored. The required order is: block, then restore handlers,
+    then restore the mask.
     """
     if not hasattr(signal, "pthread_sigmask"):
         pytest.skip("pthread_sigmask not available")
@@ -135,7 +144,7 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
 
     Every other prior handler must still be restored, and the first
     restoration error surfaces once the scope body itself did not already
-    raise (review v0.5.15 / blocker 2A).
+    raise.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:
@@ -298,12 +307,12 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
     """A worker-thread ``install_signal_handlers()`` raises and takes nothing.
 
     During an open main-thread ``signal_handler_scope()`` every shutdown
-    handler already points at ``_shutdown_handler``, so a worker thread used
-    to take the idempotent fast path, flip ``_process_lifetime_owner``, and
+    handler already points at ``_shutdown_handler``, so a worker thread must
+    not take the idempotent fast path, flip ``_process_lifetime_owner``, and
     silently convert the scope's temporary installation into permanent
-    process ownership — the scope exit then skipped restoring the host's
-    handlers (review v0.5.16 / blocker 5). The install must now reject
-    off-main-thread callers before touching any ownership state.
+    process ownership — the scope exit would then skip restoring the host's
+    handlers. The install rejects off-main-thread callers before touching any
+    ownership state.
     """
 
     def host_handler(_signum: int, _frame: object) -> None:
@@ -336,9 +345,9 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
     """A shutdown inside an absorb window is reported, not raised — then honored later.
 
     The publication transaction uses this to win its race against a shutdown signal
-    deterministically (review v0.5.16 / blocker 1): the window exit reports the absorbed signal on
-    the yielded object instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the
-    next trial launch) still delivers the shutdown before new work starts.
+    deterministically: the window exit reports the absorbed signal on the yielded object
+    instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the next trial
+    launch) still delivers the shutdown before new work starts.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:
@@ -540,11 +549,10 @@ def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocki
     Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
     unblocked, so a process-directed SIGTERM sent during the masked launch
     window is delivered to one of them — and CPython then runs the Python
-    handler in the main thread anyway, mid-critical-section. Pre-fix the
-    handler re-acquired ``_launch_lock`` held by that same thread and hung
-    until the MCP server's 30s grace SIGKILLed the runner with no status.json
-    written (the flaky-cancel e2e failures). The handler must record the signal
-    and let the window exit service it.
+    handler in the main thread anyway, mid-critical-section. A handler that
+    re-acquired ``_launch_lock`` held by that same thread would hang until the
+    MCP server's 30s grace SIGKILLed the runner with no status.json written.
+    The handler must record the signal and let the window exit service it.
     """
     code = r"""
 import os, signal, threading, time
@@ -596,3 +604,62 @@ def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
         inner_exited = True
     assert inner_exited, "inner window exit must not service the deferred shutdown"
     assert excinfo.value.code == 128 + signal.SIGTERM
+
+
+def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> None:
+    """A worker thread can tell a shutdown is under way, and the next outermost run starts without one."""
+    with pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+    assert runtime_shutdown.servicing_shutdown_signal() == signal.SIGINT
+    with restored_signal_ownership(), signal_handler_scope():
+        assert runtime_shutdown.servicing_shutdown_signal() is None
+
+
+def test_shutdown_handler_wakes_registered_waiters_after_naming_the_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each waker runs once the servicing signal is visible, and a failing waker stops none of the others."""
+    seen: list[int | None] = []
+
+    def failing() -> None:
+        raise RuntimeError("waker failed")
+
+    monkeypatch.setattr(
+        runtime_shutdown,
+        "_shutdown_wakers",
+        [failing, lambda: seen.append(runtime_shutdown.servicing_shutdown_signal())],
+    )
+    with pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGTERM, None)
+    assert seen == [signal.SIGTERM]
+
+
+def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch that reaches the launch lock after the handler named its signal is refused before any spawn."""
+    monkeypatch.setattr(
+        "phasesweep.runtime.process.servicing_shutdown_signal", lambda: signal.SIGTERM
+    )
+    ran = tmp_path / "ran"
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (
+        (trial_dir / "stdout.log").open("w") as stdout,
+        (trial_dir / "stderr.log").open("w") as stderr,
+        pytest.raises(ShutdownLaunchRefusedError, match="interrupted by signal 15"),
+    ):
+        run_supervised(
+            f"{sys.executable} -c 'open({str(ran)!r}, \"w\")'",
+            env=dict(os.environ),
+            stdout=stdout,
+            stderr=stderr,
+            timeout=10.0,
+            trial_dir=trial_dir,
+            attempt_id="refused-attempt",
+        )
+    assert not ran.exists()
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = json.loads((trial_dir / ATTEMPT_LIFECYCLE_FILE).read_text())
+    assert lifecycle["state"] == "exited"
+    assert lifecycle["cleanup_confirmed"] is True

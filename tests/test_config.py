@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,11 +16,13 @@ from phasesweep.config import (
     Experiment,
     JsonEnvelopeExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.config.search import sampler_capability_line
 from phasesweep.runtime.json import JsonObject, JsonValue
 from tests.conftest import make_experiment, write_yaml
 
@@ -261,6 +264,23 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
     assert experiment.phases[2].fixed_overrides == {"learning_rate": 5e-4}
 
 
+def test_resampling_a_parent_fixed_key_is_valid() -> None:
+    """A key every inherited origin only fixed may be searched by the child."""
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"lr": 1e-4}),
+            Phase(
+                name="child",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+            ),
+        ]
+    )
+
+    assert experiment.sampled_locked_keys("child") == frozenset()
+
+
 @pytest.mark.parametrize(
     ("phases", "match"),
     [
@@ -275,7 +295,11 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
         ),
         pytest.param(
             [
-                Phase(name="base", n_trials=1, fixed_overrides={"lr": 1e-4}),
+                Phase(
+                    name="base",
+                    n_trials=1,
+                    search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+                ),
                 Phase(
                     name="child",
                     n_trials=1,
@@ -560,12 +584,28 @@ def test_execution_accepts_named_inherit_list() -> None:
 
     assert execution.inherit_env == ["WANDB_API_KEY", "HF_TOKEN"]
     assert execution.cwd is None
-    assert ExecutionContext().inherit_env == "all"
+    assert ExecutionContext().inherit_env == "none"
 
 
 def test_execution_rejects_ambiguous_environment_classification() -> None:
     with pytest.raises(ValidationError, match="must not overlap"):
         ExecutionContext(inherit_env=["HF_TOKEN"], passthrough_env=["HF_TOKEN"])
+
+
+def test_tmpdir_is_builtin_passthrough_and_a_written_list_adds_to_it() -> None:
+    """``passthrough_env`` defaults to ``[]``; the effective set always holds ``TMPDIR``."""
+    assert ExecutionContext().passthrough_env == []
+    assert ExecutionContext().effective_passthrough_env() == ("TMPDIR",)
+    assert ExecutionContext(passthrough_env=["TMPDIR"]).effective_passthrough_env() == ("TMPDIR",)
+    written = ExecutionContext(passthrough_env=["WANDB_API_KEY", "HF_TOKEN"])
+    assert written.effective_passthrough_env() == ("HF_TOKEN", "TMPDIR", "WANDB_API_KEY")
+
+
+@pytest.mark.parametrize("passthrough", [[], ["TMPDIR"], ["HF_TOKEN"]])
+def test_inherit_env_naming_tmpdir_is_refused(passthrough: list[str]) -> None:
+    """``TMPDIR`` is always inherited and never digested, so an ``inherit_env`` list may not name it."""
+    with pytest.raises(ValidationError, match=r"inherit_env must not name \['TMPDIR'\].*remove it"):
+        ExecutionContext(inherit_env=["TMPDIR", "HF_HOME"], passthrough_env=passthrough)
 
 
 # ---- migrated from version-named files ----
@@ -670,7 +710,7 @@ def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
-trial_command: "echo"
+trial_command: "echo {overrides}"
 override_format: argparse
 metric:
   name: loss
@@ -680,6 +720,8 @@ phases:
   - &phase_defaults
     name: baseline
     n_trials: 1
+    sampler: { type: random, seed: 0 }
+    search_space: { x: { type: int, low: 0, high: 9 } }
   - <<: *phase_defaults
     name: tuned
     n_trials: 2
@@ -770,13 +812,18 @@ def _sampler_policy_experiment(
     :param str | None storage: Storage URL to declare, or ``None`` for in-memory.
     :param JsonObject | None sampler: Sampler mapping, or ``None`` to leave the default.
     :param int n_trials: Trial budget for the single phase.
-    :param JsonObject | None search_space: Search space; defaults to one float ``lr``.
+    :param JsonObject | None search_space: Search space; ``None`` means one float ``lr``,
+        and an empty mapping means a fixed configuration.
     :return Experiment: Validated experiment.
     """
     phase: JsonObject = {
         "name": "lr",
         "n_trials": n_trials,
-        "search_space": search_space or {"lr": {"type": "float", "low": 0.1, "high": 1.0}},
+        "search_space": (
+            {"lr": {"type": "float", "low": 0.1, "high": 1.0}}
+            if search_space is None
+            else search_space
+        ),
     }
     if sampler is not None:
         phase["sampler"] = sampler
@@ -790,27 +837,15 @@ def _sampler_policy_experiment(
         pytest.param({"type": "tpe"}, "requires an explicit sampler.seed", id="tpe_unseeded"),
         pytest.param({"type": "cmaes"}, "requires an explicit sampler.seed", id="cmaes_unseeded"),
         pytest.param({"type": "random"}, "requires an explicit sampler.seed", id="random_unseeded"),
-        pytest.param(
-            {"type": "tpe", "seed": 0},
-            "requires sampler.acknowledge_nonresumable: true",
-            id="tpe_unacknowledged",
-        ),
-        pytest.param(
-            {"type": "cmaes", "seed": 1},
-            "requires sampler.acknowledge_nonresumable: true",
-            id="cmaes_unacknowledged",
-        ),
     ],
 )
-def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
+def test_persistent_storage_rejects_unseeded_samplers(
     tmp_path: Path, sampler: JsonObject | None, message: str
 ) -> None:
-    """Persistent storage must state the sampler contract at config load, not mid-run.
+    """Persistent storage refuses an unseeded stochastic sampler at config load.
 
-    An unseeded stochastic sampler makes a durable study irreproducible, and
-    TPE/CMA-ES hold process-local state Optuna storage does not persist, so
-    ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
-    only after the operator has already been interrupted.
+    The seed keys every draw by its position in the study, which is what lets
+    a durable study resume and grow without drawing a configuration twice.
     """
     storage = f"journal:///{tmp_path}/phases.journal"
     with pytest.raises(ValueError, match=message) as excinfo:
@@ -821,15 +856,13 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
 @pytest.mark.parametrize(
     "sampler",
     [
-        pytest.param({"type": "tpe", "seed": 0, "acknowledge_nonresumable": True}, id="tpe"),
-        pytest.param({"type": "cmaes", "seed": 1, "acknowledge_nonresumable": True}, id="cmaes"),
-        pytest.param({"type": "random", "seed": 3}, id="random_needs_no_acknowledgement"),
+        pytest.param({"type": "tpe", "seed": 0}, id="tpe"),
+        pytest.param({"type": "cmaes", "seed": 1}, id="cmaes"),
+        pytest.param({"type": "random", "seed": 3}, id="random"),
     ],
 )
-def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
-    tmp_path: Path, sampler: JsonObject
-) -> None:
-    """A seeded sampler with the required acknowledgement loads unchanged."""
+def test_persistent_storage_accepts_seeded_samplers(tmp_path: Path, sampler: JsonObject) -> None:
+    """A seeded sampler loads unchanged on persistent storage."""
     experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler
     )
@@ -849,8 +882,8 @@ def test_sampler_seed_accepts_optuna_domain_boundaries(seed: int) -> None:
     assert Sampler(type="random", seed=seed).seed == seed
 
 
-def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
-    """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
+def test_persistent_storage_accepts_grid_without_seed(tmp_path: Path) -> None:
+    """Grid enumerates a fixed matrix, so it needs no seed."""
     experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal",
         sampler={"type": "grid"},
@@ -858,7 +891,59 @@ def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_pat
         search_space={"lr": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.5}},
     )
     assert experiment.phases[0].sampler.seed is None
-    assert experiment.phases[0].sampler.acknowledge_nonresumable is False
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        pytest.param(None, id="default_tpe"),
+        pytest.param({"type": "tpe"}, id="tpe"),
+        pytest.param({"type": "cmaes"}, id="cmaes"),
+        pytest.param({"type": "random"}, id="random"),
+    ],
+)
+def test_empty_search_space_skips_the_seed_on_persistent_storage(
+    tmp_path: Path, sampler: JsonObject | None
+) -> None:
+    """A fixed configuration draws nothing, so no seed is owed."""
+    experiment = _sampler_policy_experiment(
+        storage=f"journal:///{tmp_path}/phases.journal",
+        sampler=sampler,
+        n_trials=1,
+        search_space={},
+    )
+    assert experiment.phases[0].sampler.seed is None
+
+
+@pytest.mark.parametrize(
+    "sampler", [{"type": "tpe"}, {"type": "random", "seed": 0}, {"type": "grid"}]
+)
+def test_in_memory_fixed_configuration_refuses_identical_trials(
+    tmp_path: Path, sampler: JsonObject
+) -> None:
+    """With ``storage: null`` nothing is ever retried, so load refuses what every launch would.
+
+    Several runs of one fixed configuration are repeats, so only repeats may ask for them. A
+    persistent study may hold failed attempts for the extra trials to replace, which only a
+    launch can see, so the same phase loads there.
+    """
+    phase = Phase.model_validate({"name": "x", "n_trials": 3, "sampler": sampler})
+    with pytest.raises(ValidationError) as excinfo:
+        make_experiment(phases=[phase])
+    assert (
+        "Phase 'x': n_trials=3 with an empty search_space would run 3 identical trials. Use "
+        "n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
+    ) in str(excinfo.value)
+
+    persistent = make_experiment(storage=f"journal:///{tmp_path}/phases.journal", phases=[phase])
+    assert persistent.phases[0].n_trials == 3
+
+    fixed = make_experiment(phases=[Phase.model_validate({"name": "x", "n_trials": 1})])
+    assert fixed.phases[0].n_trials == 1
+    audit = Phase.model_validate(
+        {"name": "x", "n_trials": 3, "sampler": {"type": "grid"}, "repeats": _SEEDS}
+    )
+    assert make_experiment(phases=[audit]).phases[0].repeats is not None
 
 
 @pytest.mark.parametrize("storage", ["", "storage: null\n"], ids=["omitted", "explicit_null"])
@@ -884,8 +969,321 @@ def test_in_memory_storage_keeps_the_sampler_block_optional(tmp_path: Path, stor
     assert experiment.phases[0].sampler.seed is None
 
 
-@pytest.mark.parametrize("sampler_type", ["grid", "random"])
-def test_acknowledge_nonresumable_rejected_on_resumable_samplers(sampler_type: str) -> None:
-    """The acknowledgement states a contract these samplers do not impose."""
-    with pytest.raises(ValidationError, match="acknowledge_nonresumable"):
-        Sampler(type=sampler_type, seed=0, acknowledge_nonresumable=True)  # type: ignore[arg-type]
+def test_metric_bounds_are_optional_finite_and_ordered() -> None:
+    """Each bound is optional alone, finite, never boolean, and ordered when both are set."""
+    from phasesweep.config.models import experiment_contract_lines
+
+    extractor: JsonObject = {"type": "log_regex", "pattern": r"x=(?P<value>[0-9.]+)"}
+
+    def metric(**bounds: JsonValue) -> Metric:
+        return Metric.model_validate({"extractor": extractor, **bounds})
+
+    unbounded = metric()
+    assert (unbounded.min, unbounded.max) == (None, None)
+    assert (metric(min=0.5).min, metric(min=0.5).max) == (0.5, None)
+    assert (metric(max=2).min, metric(max=2).max) == (None, 2.0)
+    assert (metric(min=0.5, max=0.5).min, metric(min=0.5, max=0.5).max) == (0.5, 0.5)
+
+    with pytest.raises(ValidationError, match=r"min \(3.0\) > max \(2.0\)"):
+        metric(min=3, max=2)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="must be finite"):
+            metric(min=bad)
+        with pytest.raises(ValidationError, match="must be finite"):
+            metric(max=bad)
+    with pytest.raises(ValidationError, match="must be numbers, not booleans"):
+        metric(max=True)
+
+    plain = experiment_contract_lines(make_experiment(metric=unbounded))[0]
+    bounded = experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0]
+    assert "bounds" not in plain
+    assert "bounds={'max': 2.0, 'min': 0.5}" in bounded
+    only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
+    assert "bounds={'max': 2.0}" in only_max
+
+
+_LOG_EXTRACTOR: JsonObject = {"type": "log_regex", "pattern": r"m=(?P<value>[0-9.]+)"}
+
+
+def _observation(name: str) -> Observation:
+    """Return a local ``log_regex`` observation called ``name``."""
+    return Observation.model_validate({"name": name, "extractor": _LOG_EXTRACTOR})
+
+
+def test_observe_names_are_distinct_from_metric_and_constraints() -> None:
+    """One namespace covers the metric, constraints and observations."""
+    metric = Metric.model_validate({"name": "loss", "extractor": _LOG_EXTRACTOR})
+    memory = Constraint.model_validate({"name": "memory", "extractor": _LOG_EXTRACTOR, "max": 5})
+
+    def build(*names: str) -> Experiment:
+        return make_experiment(
+            metric=metric,
+            constraints=[memory],
+            observe=[_observation(name) for name in names],
+        )
+
+    for clash in (("loss",), ("memory",), ("peak", "peak")):
+        with pytest.raises(ValidationError, match="Metric, constraint and observe names"):
+            build(*clash)
+    assert [o.name for o in build("peak", "temperature").observe] == ["peak", "temperature"]
+    assert make_experiment().observe == []
+
+
+@pytest.mark.parametrize(
+    "extractor",
+    [
+        {"type": "wandb", "entity": "e", "project": "p", "metric_key": "peak"},
+        {"type": "mlflow", "metric_key": "peak", "select": "last"},
+    ],
+    ids=["wandb", "mlflow"],
+)
+def test_observe_refuses_remote_extractors(extractor: JsonObject, tmp_path: Path) -> None:
+    """Remote readers wait for every key, so an observation may only read local files."""
+    reason = (
+        r"Observation 'peak' cannot use a \w+ extractor: remote extractors wait for every "
+        r"requested key.*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
+    )
+    with pytest.raises(ValidationError, match=reason):
+        Observation.model_validate({"name": "peak", "extractor": extractor})
+    with pytest.raises(ValidationError, match=reason):
+        Observation(
+            name="peak",
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="k"),
+        )
+
+    body = (
+        "experiment: t\n"
+        'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        f"observe:\n  - {{ name: peak, extractor: {json.dumps(extractor)} }}\n"
+        "phases:\n"
+        "  - name: lr\n"
+        "    n_trials: 2\n"
+        "    search_space: { lr: { type: float, low: 0.1, high: 1.0 } }\n"
+    )
+    with pytest.raises(ValidationError, match="local json extractor"):
+        load_experiment(write_yaml(tmp_path, body))
+    local = body.replace(
+        json.dumps(extractor), "{ type: json, path: result.json, key: peak_memory_gb }"
+    )
+    loaded = load_experiment(write_yaml(tmp_path, local))
+    assert [(o.name, o.extractor.type) for o in loaded.observe] == [("peak", "json")]
+
+
+def test_observe_rejects_evaluation_axis() -> None:
+    """Only the metric extractor's axis is read, so an observation may not set one."""
+    envelope: JsonObject = {
+        "type": "json_envelope",
+        "objective_name": "peak",
+        "split": "test",
+        "policy": "final",
+    }
+    assert Observation.model_validate({"name": "peak", "extractor": envelope}).name == "peak"
+    with pytest.raises(
+        ValidationError,
+        match="Observation 'peak' sets evaluation_axis, which only the metric extractor's",
+    ):
+        Observation.model_validate(
+            {"name": "peak", "extractor": {**envelope, "evaluation_axis": "tokens"}}
+        )
+
+
+_SEEDS: JsonObject = {"key": "seed", "values": [0, 1, 2]}
+
+
+def _repeats_phase(name: str = "p", **fields: JsonValue) -> Phase:
+    """Return a seeded random phase over two configurations x three seeds, with ``fields`` applied."""
+    spec: JsonObject = {
+        "name": name,
+        "n_trials": 6,
+        "sampler": {"type": "random", "seed": 0},
+        "search_space": {"lr": {"type": "categorical", "choices": [0.1, 0.2]}},
+        "repeats": _SEEDS,
+    }
+    spec.update(fields)
+    return Phase.model_validate(spec)
+
+
+@pytest.mark.parametrize(
+    ("sampler", "spelled"),
+    [
+        ({"type": "tpe", "seed": 0}, "sampler.type='tpe'"),
+        ({"type": "cmaes", "seed": 0}, "sampler.type='cmaes'"),
+        ({"type": "random"}, "sampler.type='random' without a seed"),
+    ],
+)
+def test_repeats_requires_grid_or_seeded_random(sampler: JsonObject, spelled: str) -> None:
+    numeric: JsonObject = {"lr": {"type": "float", "low": 0.1, "high": 0.2}}
+    with pytest.raises(
+        ValidationError,
+        match=f"Phase 'p': repeats needs sampler.type grid, or sampler.type random with a "
+        f"seed, and this phase uses {spelled}. Only those two keep",
+    ):
+        make_experiment(phases=[_repeats_phase(sampler=sampler, search_space=numeric)])
+
+    grid = make_experiment(phases=[_repeats_phase(sampler={"type": "grid"})])
+    assert grid.phases[0].repeats is not None
+    seeded = make_experiment(phases=[_repeats_phase()]).phases[0]
+    assert seeded.sampler.seed == 0
+    assert sampler_capability_line(seeded, "journal:///tmp/x.journal") == (
+        "phase 'p': sampler=random seed=0 (resumable, reproducible), repeats=seed×3 (mean)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("build", "match"),
+    [
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data.shard", "values": [0, 1, 2]},
+                    search_space={"data.shard": {"type": "int", "low": 0, "high": 1}},
+                )
+            ],
+            "repeats.key 'data.shard' is also a search_space key",
+            id="searched",
+        ),
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data.shard", "values": [0, 1, 2]},
+                    fixed_overrides={"data.shard": 4},
+                )
+            ],
+            "repeats.key 'data.shard' is also a fixed_overrides key",
+            id="fixed",
+        ),
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data", "values": [0, 1, 2]},
+                    fixed_overrides={"data.shard": 4},
+                )
+            ],
+            "dotted-key namespace collision",
+            id="local-prefix",
+        ),
+        pytest.param(
+            lambda: [
+                Phase(name="base", n_trials=1, fixed_overrides={"optim.lr": 0.1}),
+                _repeats_phase(
+                    "child", inherits=["base"], repeats={"key": "optim", "values": [0, 1, 2]}
+                ),
+            ],
+            "dotted-key namespace collision",
+            id="inherited-prefix",
+        ),
+        pytest.param(
+            lambda: [_repeats_phase(repeats={"key": "data..shard", "values": [0, 1]})],
+            "phase 'p' repeats.key: override key 'data..shard' has an empty dotted segment",
+            id="syntax",
+        ),
+    ],
+)
+def test_repeats_key_is_free_of_search_space_fixed_overrides_and_prefixes(
+    build: Callable[[], list[Phase]], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(phases=build())
+
+
+@pytest.mark.parametrize(
+    ("values", "match"),
+    [
+        ([0], "at least 2 items"),
+        ([1, 1.0], "repeats.values must remain distinguishable"),
+        ([0, False], "repeats.values must remain distinguishable"),
+        ([0.0, float("nan")], "repeats.values must be finite floats"),
+        ([[0], [1]], "repeats.values"),
+        ([{"a": 1}, {"a": 2}], "repeats.values"),
+    ],
+)
+def test_repeats_values_follow_categorical_choice_rules(values: JsonValue, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        Phase.model_validate(
+            {"name": "p", "n_trials": 2, "repeats": {"key": "seed", "values": values}}
+        )
+    accepted = Phase.model_validate(
+        {"name": "p", "n_trials": 4, "repeats": {"key": "seed", "values": [None, True, 2, "s"]}}
+    )
+    assert accepted.repeats is not None
+    assert accepted.repeats.values == [None, True, 2, "s"]
+    assert accepted.repeats.reduce == "mean"
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 3},
+            r"grid sampler has 6 combinations \(2 configurations x 3 repeats\) but n_trials=3\. "
+            r"Grid phases run the full matrix by default; a grid with repeats always runs the "
+            r"full matrix, so set n_trials: 6\.",
+            id="grid-short",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 9},
+            r"n_trials=9 exceeds the grid cardinality 6 \(2 configurations x 3 repeats\)",
+            id="grid-over",
+        ),
+        pytest.param(
+            {"n_trials": 7},
+            "seeded random with repeats runs each configuration 3 times, once per "
+            "repeats.values entry, so n_trials must be a multiple of 3; got 7.",
+            id="random-multiple",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "search_space": {}, "n_trials": 6},
+            r"repeats over an empty search_space runs one configuration once per repeat value, "
+            r"so n_trials must be 3 \(the number of repeats.values\), not 6\.",
+            id="empty-space",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 3, "allow_partial_grid": True},
+            "allow_partial_grid cannot be combined with repeats",
+            id="partial-grid",
+        ),
+    ],
+)
+def test_repeats_trial_count_covers_every_repeat(fields: JsonObject, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(phases=[_repeats_phase(**fields)])
+    assert make_experiment(phases=[_repeats_phase(n_trials=12)]).phases[0].n_trials == 12
+
+
+def test_repeats_key_overrides_inherited_value_and_is_never_exported() -> None:
+    """The repeat key settles conflicting parents, and descendants never inherit it."""
+    parents = [
+        Phase(name="a", n_trials=1, fixed_overrides={"data.shard": 1}),
+        Phase(name="b", n_trials=1, fixed_overrides={"data.shard": 2}),
+    ]
+    with pytest.raises(ValidationError, match="inherits conflicting key"):
+        make_experiment(phases=[*parents, Phase(name="c", n_trials=1, inherits=["a", "b"])])
+    repeats: JsonObject = {"key": "data.shard", "values": [0, 1, 2]}
+    child = _repeats_phase("c", inherits=["a", "b"], repeats=repeats)
+    # data.shard is not exported, so its prefix is free below the repeats phase.
+    grandchild = Phase(name="d", n_trials=1, inherits=["c"], fixed_overrides={"data": "full"})
+    experiment = make_experiment(phases=[*parents, child, grandchild])
+    assert [phase.name for phase in experiment.phases] == ["a", "b", "c", "d"]
+    with pytest.raises(ValidationError, match="dotted-key namespace collision"):
+        make_experiment(
+            phases=[*parents, grandchild.model_copy(update={"inherits": ["a"]})],
+        )
+
+
+@pytest.mark.parametrize("key", ["seed", "trainer.seed"])
+def test_seed_search_keys_say_how_to_fix_the_seed(key: str) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Phase(name="p", n_trials=2, search_space={key: {"type": "int", "low": 0, "high": 9}})
+    assert (
+        f"Phase 'p': seed keys cannot be searched: ['{key}']. A searched seed lets seed noise "
+        "win as if it were a configuration. Fix the seed in fixed_overrides or trainer_config. "
+        f"To compare finalists across seeds, use repeats: {{key: {key}, values: [0, 1, 2]}}."
+    ) in str(excinfo.value)
+    assert Phase(
+        name="p", n_trials=2, search_space={"seedling": {"type": "int", "low": 0, "high": 9}}
+    )
+    with pytest.raises(ValidationError, match="allow_seed_search"):
+        Phase.model_validate({"name": "p", "n_trials": 1, "allow_seed_search": True})

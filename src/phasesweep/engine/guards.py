@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import optuna
 
 from phasesweep.config import Experiment
@@ -21,7 +23,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.optuna import _finished_trial_count
@@ -96,8 +98,9 @@ def _preflight_existing_studies(
         be read while its stale trials were recovered.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
-    :raises TrialTargetRegressionError: A phase's study already accepted a
-        higher trial target than the current config requests.
+    :raises TrialTargetRefusedError: A phase's study already accepted a
+        higher trial target than the current config requests, or a fixed
+        configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
     :raises PhaseSweepError: Multiple studies failed preflight for mixed
@@ -110,17 +113,15 @@ def _preflight_existing_studies(
     # Discovery, root checks, and claims already happened in ONE strict pass
     # (claim_ledger), and its study objects are the ones every later step
     # operates on: an invocation offering a second publication root must not
-    # reap, inspect, or claim anything in either tree (review v0.5.19 /
-    # finding F5), and a storage read that fails must abort rather than let a
-    # second, luckier read hand recovery a study whose root was never checked
-    # (PR #5 review / reviewer 2, issue 1).
+    # reap, inspect, or claim anything in either tree, and a storage read that
+    # fails must abort rather than let a second, luckier read hand recovery a
+    # study whose root was never checked.
     loaded = ledger.studies
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase
     # list, so attempts from renamed/removed phases or changed storage URLs
-    # are recovered before any current-config validation or launch (review
-    # v0.5.17 / blocker 3).
+    # are recovered before any current-config validation or launch.
     try:
         _preflight_active_attempts(experiment, report, confirm=True)
     except Exception as exc:
@@ -183,41 +184,63 @@ def _preflight_existing_studies(
                 )
                 if needs_new_trials:
                     _validate_environment_cohort(
-                        study, _environment_identity(experiment, phase.name).digest
+                        study, _environment_identity(experiment, phase.name)
                     )
         except Exception as exc:
             errors.append(exc)
-    if errors:
-        first = errors[0]
-        if len(errors) == 1:
-            raise first
-        message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
-            str(error) for error in errors
-        )
-        # No single error speaks for an aggregate, whatever its types: it
-        # routes to a remediation only when every collected error names the
-        # same one, and otherwise to reading the refusals it lists.
-        remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
-        shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
-        for error_type in (
-            StudySchemaMismatchError,
-            StudyFingerprintMismatchError,
-            StudyStorageUnavailableError,
-            TrialTargetRegressionError,
-        ):
-            if all(isinstance(error, error_type) for error in errors):
-                raise error_type(message, action=shared) from first
-        cleanup_error = next(
-            (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
-            None,
-        )
-        if cleanup_error is not None:
-            raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
-        unexpected = next(
-            (error for error in errors if not isinstance(error, PhaseSweepError)),
-            None,
-        )
-        if unexpected is not None:
-            raise RuntimeError(message) from unexpected
-        raise PhaseSweepError(message, action=shared) from first
+    _raise_collected_errors(errors)
     return studies
+
+
+def _raise_collected_errors(errors: Sequence[Exception]) -> None:
+    """Raise the one refusal a preflight collected, or one refusal that combines several.
+
+    The live preflight and the dry-run preview both collect a refusal per
+    study and report them through this, so a preview names the same studies,
+    in the same message and type, as the launch it previews.
+
+    :param Sequence[Exception] errors: Refusals collected across the studies, in
+        phase order; nothing is raised when it is empty.
+    :raises StudySchemaMismatchError: Every collected refusal is one, or the only one.
+    :raises StudyFingerprintMismatchError: Every collected refusal is one.
+    :raises StudyStorageUnavailableError: Every collected refusal is one.
+    :raises TrialTargetRefusedError: Every collected refusal is one.
+    :raises ProcessCleanupUncertainError: Any collected refusal is one.
+    :raises PhaseSweepError: The collected refusals are expected but of mixed kinds.
+    :raises RuntimeError: At least one collected error is an unexpected
+        implementation failure that must retain traceback reporting.
+    """
+    if not errors:
+        return
+    first = errors[0]
+    if len(errors) == 1:
+        raise first
+    message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
+        str(error) for error in errors
+    )
+    # No single error speaks for an aggregate, whatever its types: it
+    # routes to a remediation only when every collected error names the
+    # same one, and otherwise to reading the refusals it lists.
+    remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
+    shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
+    for error_type in (
+        StudySchemaMismatchError,
+        StudyFingerprintMismatchError,
+        StudyStorageUnavailableError,
+        TrialTargetRefusedError,
+    ):
+        if all(isinstance(error, error_type) for error in errors):
+            raise error_type(message, action=shared) from first
+    cleanup_error = next(
+        (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
+        None,
+    )
+    if cleanup_error is not None:
+        raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
+    unexpected = next(
+        (error for error in errors if not isinstance(error, PhaseSweepError)),
+        None,
+    )
+    if unexpected is not None:
+        raise RuntimeError(message) from unexpected
+    raise PhaseSweepError(message, action=shared) from first

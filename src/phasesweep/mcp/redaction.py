@@ -86,13 +86,12 @@ def winners_payload(
 
     A published result is *historical evidence*: ``metric`` and
     ``declared_phases`` must describe the generation the winners came from, not
-    whatever the config says today (review v0.5.16 / blocker 4). Callers are
-    responsible for sourcing both from the represented generation;
-    ``result_context`` and ``published_config_matches_current`` then tell the
-    agent which config those labels came from and whether it still matches the
-    one a further run would execute. Visibility policy is unaffected: the
-    *current* policy still decides which historical values are redacted, it
-    just never relabels them.
+    whatever the config says today. Callers are responsible for sourcing both
+    from the represented generation; ``result_context`` and
+    ``published_config_matches_current`` then tell the agent which config those
+    labels came from and whether it still matches the one a further run would
+    execute. Visibility policy is unaffected: the *current* policy still
+    decides which historical values are redacted, it just never relabels them.
 
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
@@ -150,6 +149,8 @@ def winners_payload(
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
                 "confound": view.confound,
+                "observed": view.observed,
+                "repeats": view.repeats,
             }
         )
     return {
@@ -195,19 +196,18 @@ def status_payload(
     published one -- ``False`` for a pinned read of a failed-publication
     generation, even though its winners still show.
 
-    ``publication_integrity`` carries the five-state MCP verdict through unchanged
-    (review v0.5.18 / finding F4). The accompanying ``publication_error`` is
-    deliberately *not* forwarded: the enum is what an agent must branch on,
-    and the free-text detail belongs to the operator-facing CLI, which is the
-    surface trusted with local specifics.
+    ``publication_integrity`` carries the five-state MCP verdict through
+    unchanged. The accompanying ``publication_error`` is deliberately *not*
+    forwarded: the enum is what an agent must branch on, and the free-text
+    detail belongs to the operator-facing CLI, which is the surface trusted
+    with local specifics.
 
     ``result_context``, ``published_config_matches_current`` and
-    ``result_phase_plan`` are forwarded rather than dropped (review v0.5.16 /
-    blocker 4). The ``phases`` list describes the *current* config's phases --
-    what a further run would execute -- so under a config edited since
-    publication it can legitimately show no winners beside ``is_published:
-    true``. Without these three the agent had no way to tell that apart from an
-    empty publication.
+    ``result_phase_plan`` are forwarded rather than dropped. The ``phases``
+    list describes the *current* config's phases -- what a further run would
+    execute -- so under a config edited since publication it can legitimately
+    show no winners beside ``is_published: true``. Without these three the
+    agent cannot tell that apart from an empty publication.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.

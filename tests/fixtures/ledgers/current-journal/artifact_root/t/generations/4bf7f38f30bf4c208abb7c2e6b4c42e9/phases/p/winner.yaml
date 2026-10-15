@@ -16,26 +16,26 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: de5853ae14ef4e939d9d61f287d15ce3
-attempt_id: 58489bcd09ed449b84ff57dba09df034
+generation_id: 4bf7f38f30bf4c208abb7c2e6b4c42e9
+attempt_id: 81e84803826944e2b986076fe31cdd47
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: de5853ae14ef4e939d9d61f287d15ce3
-  attempt_id: 58489bcd09ed449b84ff57dba09df034
+  generation_id: 4bf7f38f30bf4c208abb7c2e6b4c42e9
+  attempt_id: 81e84803826944e2b986076fe31cdd47
 trainer_input:
   schema_version: 1
   format: argparse
   filename: overrides_resolved.json
   size_bytes: 13
   sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
-phase_fingerprint: c4289da47b105110f9512dc4f94eee2af1a5d55ee4f24b70f993c31afa699dd6
+phase_fingerprint: 832e0119fefa26cb674c8c6231ed8dd0102c8971b8e390e2811e6024bb151a02
 objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-11T02:19:04+00:00'
+  recorded_at: '2026-10-14T22:04:06+00:00'
   schema_version: 3
   source:
     kind: file
@@ -44,26 +44,31 @@ objective_provenance:
     path: stdout.log
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
-trainer_env_digest: 5d88581b4e34a066ba6405cef5beb63e06e58cd8e765874d1c75129ed068c01e
+trainer_env_digest: 1338386f7f8cdbfd4bdfc268ad6097810d7e41d44100270d843e81c446aa528e
 trainer_inherit_env: none
 confound:
-  schema_version: 1
+  schema_version: 2
   ranked_trials:
   - 0
   - 1
+  ranked_groups: null
   checks:
     evaluation_point:
       verdict: n/a
-      reason: log_regex objectives report no evaluation position
+      reason: log_regex objectives report no evaluation position; json_envelope (report_objective),
+        wandb (evaluation_axis) or mlflow (selected step) would bind one
     survivorship:
       verdict: ok
       detail:
         ranked: 2
         infeasible: 0
+        incomplete_group: 0
         failed: 0
-        pruned: 0
     tie:
       verdict: heterogeneous
       detail:
         tied_trials:
         - 1
+        within_noise: null
+observed: {}
+repeats: null

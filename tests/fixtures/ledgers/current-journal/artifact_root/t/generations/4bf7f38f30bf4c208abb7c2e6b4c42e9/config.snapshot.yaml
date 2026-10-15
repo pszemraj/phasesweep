@@ -1,7 +1,7 @@
 experiment: t
 storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
 workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
-trial_command: python -c 'print("PSWOBJ=0.5")' {overrides}
+trial_command: printf 'PSWOBJ=0.5\n' {overrides}
 trainer_config: {}
 provenance:
   revision: golden-fixture-v1
@@ -15,7 +15,10 @@ metric:
     file: stdout.log
     pattern: PSWOBJ=(?P<value>[0-9.eE+-]+)
     select: last
+  max: null
+  min: null
 constraints: []
+observe: []
 phases:
 - name: p
   comment: null
@@ -28,6 +31,7 @@ phases:
       high: 10
       log: false
       step: 1
+  repeats: null
   n_trials: 2
   n_jobs: 1
   gpu_policy: single_per_trial
@@ -39,13 +43,11 @@ phases:
     type: random
     seed: 0
     n_startup_trials: 10
-    acknowledge_nonresumable: false
   timeout_seconds_per_trial: 259200.0
   allow_unbounded_trials: false
   timeout_seconds_per_phase: null
   allow_incomplete_on_timeout: false
   allow_partial_grid: false
-  allow_seed_search: false
   gates: []
 env: {}
 execution:

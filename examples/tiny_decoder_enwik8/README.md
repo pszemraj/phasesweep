@@ -92,7 +92,7 @@ execution:
   cwd: /absolute/path/to/phasesweep
 ```
 
-These root-key changes preserve the smoke search while satisfying the [persistent storage and absolute path requirements for MCP](../../docs/mcp.md#the-catalog).
+These root-key changes preserve the smoke search while satisfying the [persistent storage requirement for MCP](../../docs/mcp.md#the-catalog).
 
 ```bash
 phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml

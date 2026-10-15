@@ -17,12 +17,14 @@ from phasesweep.config import (
     IntParam,
     JsonExtractor,
     Phase,
+    Repeats,
     Sampler,
     check_bounds,
+    sampler_search_space,
 )
 from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
 from phasesweep.config.search import _placeholder_value_for, grid_search_space
-from phasesweep.engine.optuna import _build_sampler
+from phasesweep.engine.optuna import _build_sampler, _suggest
 from tests.conftest import make_experiment
 
 
@@ -458,9 +460,8 @@ def test_categorical_rejects_equal_but_distinct_choices(
     ``CategoricalDistribution`` records a sampled value as ``choices.index(value)``,
     so ``1``, ``1.0``, and ``True`` all persist as the first equal choice. The
     trainer would run one value while the published winner and every inherited
-    override claimed another (PR #5 review / reviewer 2, blocker 1). A plain
-    repeated choice is the same hazard and also inflates cardinality and skews
-    sampling weight.
+    override claimed another. A plain repeated choice is the same hazard and
+    also inflates cardinality and skews sampling weight.
     """
     with pytest.raises(ValidationError, match=message):
         CategoricalParam(type="categorical", choices=choices)
@@ -836,3 +837,65 @@ def test_placeholder_value_for_categorical_is_first_choice() -> None:
     """The placeholder for a categorical param is its first listed choice."""
     param = CategoricalParam(type="categorical", choices=["b", "a", "c"])
     assert _placeholder_value_for(param) == "b"
+
+
+def test_grid_repeat_axis_visits_each_configuration_once_per_value() -> None:
+    """The grid treats the repeat key as one more axis, so every cell runs exactly once."""
+    phase = Phase(
+        name="p",
+        n_trials=6,
+        sampler=Sampler(type="grid", seed=3),
+        search_space={"x": CategoricalParam(type="categorical", choices=["a", "b"])},
+        repeats=Repeats(key="seed", values=[0, 1, 2]),
+    )
+    space = sampler_search_space(phase)
+    assert list(space) == ["x", "seed"]
+    study = optuna.create_study(sampler=_build_sampler(phase.sampler, space, repeats=phase.repeats))
+    study.optimize(
+        lambda trial: float(sum(hash(_suggest(trial, k, p)) % 7 for k, p in space.items())),
+        n_trials=phase.n_trials,
+    )
+    cells = [(trial.params["x"], trial.params["seed"]) for trial in study.trials]
+    assert sorted(cells) == [(x, seed) for x in ("a", "b") for seed in (0, 1, 2)]
+
+
+def test_repeat_values_need_distinct_cli_wire_forms() -> None:
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        sampler=Sampler(type="grid"),
+        repeats=Repeats(key="seed", values=[1, "1"]),
+    )
+    with pytest.raises(
+        ValidationError,
+        match=r"repeats.key 'seed' has choices 1 at index 0 and '1' at index 1, which both "
+        r"render as '1' under override_format='argparse'",
+    ):
+        make_experiment(phases=[phase])
+    assert (
+        make_experiment(
+            phases=[phase],
+            override_format="yaml_file",
+            trial_command="train --config {config_path}",
+        )
+        .phases[0]
+        .repeats
+    )
+
+
+def test_repeat_axis_counts_toward_grid_cardinality_limit() -> None:
+    """A grid that fits the ceiling alone is refused once the repeat axis multiplies it."""
+    search_space = {"left": CategoricalParam(type="categorical", choices=list(range(64)))}
+    search_space["right"] = CategoricalParam(type="categorical", choices=list(range(64)))
+    with pytest.raises(ValidationError, match="combinations.*maximum of 4,096"):
+        make_experiment(
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=8_192,
+                    sampler=Sampler(type="grid"),
+                    search_space=search_space,
+                    repeats=Repeats(key="seed", values=[0, 1]),
+                )
+            ]
+        )

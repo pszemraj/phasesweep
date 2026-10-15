@@ -145,10 +145,10 @@ def test_run_supervised_persists_pgid_on_failure(tmp_path: Path) -> None:
 def test_run_supervised_retains_identity_and_records_exit_on_success(tmp_path: Path) -> None:
     """Clean exit retains the identity and durably records the 'exited' state.
 
-    The identity used to be unlinked on clean exit, which made an orchestrator
-    death between process exit and the Optuna terminal commit (evidence
-    extraction, gates) indistinguishable from a missing identity — recovery
-    then failed closed forever (review v0.5.17 / blocker 2 gap B).
+    Unlinking the identity on clean exit would make an orchestrator death
+    between process exit and the Optuna terminal commit (evidence extraction,
+    gates) indistinguishable from a missing identity — recovery would then
+    fail closed forever.
     """
     if not Path("/proc/self/stat").exists():
         pytest.skip("Linux-only test")
@@ -220,13 +220,12 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
 ) -> None:
     """A metadata write failure after Popen must not leave the child running.
 
-    Looped ~30 times (review v0.5.15 / blocker 4): pre-fix, ``_kill_group``
-    only reaped the direct child when a single nonblocking ``poll()`` already
-    observed it exited, so a child that died right after ``poll()`` returned
-    ``None`` could remain an unreaped zombie despite ``cleanup_confirmed``
-    being reported ``True``. The bounded, unconditional ``wait()`` fix reaps
-    deterministically; the loop guards against a single lucky run masking a
-    reintroduced race.
+    Looped ~30 times: ``_kill_group`` must not reap the direct child only when
+    a single nonblocking ``poll()`` already observed it exited, since a child
+    that died right after ``poll()`` returned ``None`` could remain an unreaped
+    zombie despite ``cleanup_confirmed`` being reported ``True``. The bounded,
+    unconditional ``wait()`` reaps deterministically; the loop guards against a
+    single lucky run masking a reintroduced race.
     """
     _patch_process_identity_write_failure(monkeypatch)
 
@@ -497,7 +496,7 @@ def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A direct child that never reaps within the bounded wait must report cleanup
-    as unconfirmed, not silently ``True`` (review v0.5.15 / blocker 4)."""
+    as unconfirmed, not silently ``True``."""
     monkeypatch.setattr(
         "phasesweep.runtime.process._terminate_process_group",
         lambda pgid, *, grace_seconds: True,
@@ -665,14 +664,14 @@ def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
 @pytest.mark.parametrize(
     ("poison_file", "marker_name", "attempt_id"),
     [
-        # Pre-fix (review v0.5.15 / blocker 1), the supervisor ran ``-m phasesweep.runtime.supervisor`` under the FULL trainer environment, including any ``PYTHONPATH`` composed from ``experiment.env``, so a shadowed ``phasesweep`` package executed at import time, before ``process_identity.json`` existed. The fix launches a stdlib-only script directly under a sanitized ``{"PATH": ...}`` environment.
+        # Running the supervisor with ``-m phasesweep.runtime.supervisor`` under the FULL trainer environment, including any ``PYTHONPATH`` composed from ``experiment.env``, would execute a shadowed ``phasesweep`` package at import time, before ``process_identity.json`` exists. The supervisor is launched as a stdlib-only script directly under a sanitized ``{"PATH": ...}`` environment instead.
         pytest.param(
             "phasesweep/__init__.py",
             "poison-marker",
             "poison-pythonpath",
             id="phasesweep-package",
         ),
-        # Even without an ``-m phasesweep...`` import, a bare ``python`` runs ``sitecustomize``/``usercustomize`` during site initialization when their directory is importable at process start; ``-S`` disables that (review v0.5.15 / blocker 1).
+        # Even without an ``-m phasesweep...`` import, a bare ``python`` runs ``sitecustomize``/``usercustomize`` during site initialization when their directory is importable at process start; ``-S`` disables that.
         pytest.param(
             "sitecustomize.py",
             "sitecustomize-marker",
@@ -712,7 +711,7 @@ def test_supervisor_never_imports_poisoned_modules_from_pythonpath(
 
 def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None:
     """The framed ack payload must still deliver the full trainer environment
-    to the exec'd command (review v0.5.15 / blocker 1)."""
+    to the exec'd command."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     out_path = tmp_path / "env-var.txt"
@@ -731,7 +730,7 @@ def test_run_supervised_delivers_trainer_env_via_payload(tmp_path: Path) -> None
 def test_run_supervised_enters_payload_cwd_before_exec(tmp_path: Path) -> None:
     """The supervisor chdirs into the payload's working directory before exec,
     so relative-path trainer commands resolve against the execution contract's
-    cwd (review v0.5.17 / blocker 4)."""
+    cwd."""
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     trainer_home = tmp_path / "trainer_home"
@@ -769,7 +768,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
 ) -> None:
     """``_spawn_blocked_supervisor`` must launch the stdlib script directly under
     ``-I -S`` with a minimal sanitized environment; the trainer command must
-    never appear in argv (review v0.5.15 / blocker 1)."""
+    never appear in argv."""
     import phasesweep.runtime.process as process
     import phasesweep.runtime.shutdown as shutdown
 
@@ -1324,10 +1323,9 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
 ) -> None:
     """A delayed real trainer child cannot outlive the trial's own budget.
 
-    The readiness wait used to be a fixed ``_SUPERVISOR_READY_TIMEOUT_SECONDS``
-    regardless of the remaining budget; with a 10s allowance a 0.15s trial
-    budget could stall far past its deadline and then still launch (review
-    v0.5.16 / blocker 6).
+    The readiness wait is capped by the remaining budget, not a fixed
+    ``_SUPERVISOR_READY_TIMEOUT_SECONDS``; with a 10s allowance a 0.15s trial
+    budget would otherwise stall far past its deadline and then still launch.
     """
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
@@ -1387,11 +1385,11 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
 ) -> None:
     """A one-trial phase whose budget dies mid-launch must not publish success.
 
-    Review v0.5.16 / blocker 6 reproduction: with startup delay injected into
-    the launch path and a tiny phase budget, the trainer used to start after
-    the deadline had expired and the phase published success with
-    ``incomplete: false``. Now the launch aborts pre-payload, the trial
-    fails, and the phase surfaces a TimeoutError — no winner, no publication.
+    With startup delay injected into the launch path and a tiny phase budget,
+    the trainer must not start after the deadline has expired and the phase
+    must not publish success with ``incomplete: false``. The launch aborts
+    pre-payload, the trial fails, and the phase surfaces a TimeoutError — no
+    winner, no publication.
     """
     trial_dir_marker = tmp_path / "trainer_ran.txt"
     experiment = make_experiment(
@@ -1411,7 +1409,7 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
 
     monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not trial_dir_marker.exists(), "trainer started after the phase deadline expired"
@@ -1441,7 +1439,7 @@ def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
 
     monkeypatch.setattr(phase_mod, "prepare_trainer_input", slow_prepare)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not trial_dir_marker.exists(), "trainer started after input preparation used the budget"
@@ -1480,7 +1478,7 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
 
     monkeypatch.setattr(trial_module, "_record_trainer_environment", delayed_record)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not marker.exists()
@@ -1658,7 +1656,7 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
 
     The shutdown handler kills every active trial group of an ``n_jobs > 1``
     phase through this path; serial escalation would multiply worst-case
-    shutdown latency by the trial parallelism (review v0.5.17 gap hunt).
+    shutdown latency by the trial parallelism.
     """
     grace = 3.0
     procs: list[subprocess.Popen] = []
@@ -1923,12 +1921,10 @@ def test_reaper_raises_when_cleanup_uncertain(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
+            pid_namespace="pid:[4026539001]@100",
         )
 
-    monkeypatch.setattr(
-        "phasesweep.engine.attempts.read_stale_process_identity",
-        fake_identity,
-    )
+    monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: False,
@@ -1957,7 +1953,7 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     # Pattern: actually kill the group with the real implementation, then
     # report uncertain. Exercises the orchestrator's "cleanup uncertainty"
     # branch without leaving real ``time.sleep(60)`` zombies behind for the
-    # rest of the test run (review v0.5.11).
+    # rest of the test run.
     _report_uncertain_after_real_terminate(monkeypatch)
 
     result = _run_supervised(
@@ -1979,18 +1975,18 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
 ) -> None:
     """Unsafe cleanup must be a hard phase abort under ``n_jobs > 1``.
 
-    v0.5.11 had two coupled defects in the parallel path:
-      1. The GPU lease was released before ``cleanup_confirmed`` was
-         observed, so a queued worker could acquire the just-freed lease
+    Two properties of the parallel path matter:
+      1. The GPU lease is not released before ``cleanup_confirmed`` is
+         observed, so a queued worker cannot acquire the just-freed lease
          and launch a second trial onto the leaked process group.
       2. Optuna's threaded n_jobs>1 ``study.optimize`` does NOT propagate
          non-caught objective exceptions: it logs them and marks the
-         trial FAIL. The public exception surfaced as
-         ``NoFeasibleTrialError`` instead of ``UnsafeProcessCleanupError``.
+         trial FAIL. The public exception must still be
+         ``UnsafeProcessCleanupError``, not ``NoFeasibleTrialError``.
 
-    The fix is an orchestrator-owned hard_abort flag, set inside the GPU
-    lease before cleanup_confirmed is checked, and re-raised after
-    ``study.optimize`` returns.
+    An orchestrator-owned fatal slot (``run.record_fatal``), set inside the GPU
+    lease before cleanup_confirmed is checked and re-raised by
+    ``run.raise_if_fatal`` after ``study.optimize`` returns, provides both.
     """
     import contextlib as _contextlib
 
@@ -2016,8 +2012,8 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         with pytest.raises(UnsafeProcessCleanupError):
             run_experiment(exp)
 
-        # The queued second worker must have pruned before launch. If the
-        # GPU was reused or hard_abort was checked too late, a second
+        # The queued second worker must have stopped before launch. If the
+        # GPU was reused or the abort flag was checked too late, a second
         # ``trial_*/process_identity.json`` record would exist.
         launched_identities = sorted(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
         assert len(launched_identities) == 1, (
@@ -2117,7 +2113,7 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
     hard-abort path where ``UnsafeProcessCleanupError`` propagates directly
     out of ``study.optimize`` rather than being re-raised after the call
     returns. Without this, the forensic CSV is missing precisely when the
-    user needs it most — after a safety-critical abort. Review v0.5.12."""
+    user needs it most — after a safety-critical abort."""
     import contextlib as _contextlib
 
     _report_uncertain_after_real_terminate(monkeypatch)

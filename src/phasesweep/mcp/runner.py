@@ -8,9 +8,9 @@ server from the frozen registry; it is never agent input.
 
 The server starts this process in its own state directory, not the
 experiment's, so that nothing in the project tree can execute during
-interpreter startup - before any identity exists to clean up (review v0.5.17 /
-blocker 9). The project directory arrives as ``--cwd`` and is entered here,
-after every import has run and this runner's identity is durable.
+interpreter startup - before any identity exists to clean up. The project
+directory arrives as ``--cwd`` and is entered here, after every import has run
+and this runner's identity is durable.
 """
 
 from __future__ import annotations
@@ -42,13 +42,12 @@ from phasesweep.engine.errors import (
     OperatorAction,
     PhaseSweepError,
     PublishedStudyMissingError,
-    SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import (
@@ -65,7 +64,7 @@ from phasesweep.mcp.snapshots import (
     finalize_result_snapshot,
     mark_result_snapshot_published,
 )
-from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     absorb_shutdown_signals,
@@ -81,8 +80,7 @@ FailureCode: TypeAlias = Literal[
     "storage_unavailable",
     "tracking_unavailable",
     "published_study_missing",
-    "sampler_continuation_unsupported",
-    "trial_target_regression",
+    "trial_target_refused",
     "experiment_busy",
     "trainer_failed",
     "timeout",
@@ -212,8 +210,7 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     # An unwritable workdir still fits the storage category.
     (ActiveAttemptPersistenceError, "storage_unavailable"),
-    (SamplerContinuationUnsupportedError, "sampler_continuation_unsupported"),
-    (TrialTargetRegressionError, "trial_target_regression"),
+    (TrialTargetRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )
 # Categories that only occur at one stage, whatever stage the caller reports.
@@ -442,10 +439,10 @@ def _write_status_file_with_retry(
 ) -> None:
     """Write one terminal status record, retrying only transient persistence errors.
 
-    Only :class:`OSError` is retried (PR #5 review / reviewer 2 pass 2, blocker
-    6). A serialization error is a defect of the payload, not of the
-    filesystem: retrying it cannot succeed, and the caller depends on seeing it
-    immediately so it can downgrade the record to a serializable one.
+    Only :class:`OSError` is retried. A serialization error is a defect of the
+    payload, not of the filesystem: retrying it cannot succeed, and the caller
+    depends on seeing it immediately so it can downgrade the record to a
+    serializable one.
 
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict[str, object] payload: JSON-serializable terminal status payload.
@@ -588,12 +585,12 @@ def _write_status(
 
     Nothing raises out of the persistence work itself, by design: this runs
     from ``main``'s ``finally`` with the run's own exception possibly in
-    flight, so raising a persistence error would mask the run's primary exit
-    (PR #5 review / reviewer 2 pass 2, blocker 6). The failure is reported
-    through the return value instead, which ``main`` turns into a nonzero exit
-    code on the otherwise-successful path. A shutdown signal deferred by the
-    window below is still delivered at its exit, after the terminal record is
-    durable; that is the run's own cancellation, not a persistence error.
+    flight, so raising a persistence error would mask the run's primary exit.
+    The failure is reported through the return value instead, which ``main``
+    turns into a nonzero exit code on the otherwise-successful path. A shutdown
+    signal deferred by the window below is still delivered at its exit, after
+    the terminal record is durable; that is the run's own cancellation, not a
+    persistence error.
 
     Every write is monotonic: state only ever moves toward more evidence.
     A ``complete`` transition that cannot be persisted leaves the durable
@@ -703,7 +700,7 @@ def _persist_spawned_handle(
     config_sha256: str,
     started_at: str,
     allow_cancel: bool,
-) -> None:
+) -> RunHandle:
     """Persist this runner's process identity before it launches any training work.
 
     :param Path state_dir: Server state dir whose ``runs/`` receives the handle.
@@ -712,9 +709,10 @@ def _persist_spawned_handle(
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
     :param bool allow_cancel: Cancel permission frozen at launch time.
-    :raises RuntimeError: If Linux ``/proc`` start time or boot id is unavailable,
-        so the handle could not be made PID-reuse safe, or the server never
-        created a pending handle for ``run_id``.
+    :raises RuntimeError: If Linux ``/proc`` start time, boot id, or PID namespace
+        is unavailable, so the handle could not be made PID-reuse safe, or the
+        server never created a pending handle for ``run_id``.
+    :return RunHandle: The spawned handle now on disk.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -730,27 +728,38 @@ def _persist_spawned_handle(
         raise RuntimeError(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux boot id is unavailable"
         )
+    pid_namespace = read_pid_namespace()
+    if pid_namespace is None:
+        raise RuntimeError(
+            "cannot persist a PID-reuse-safe MCP runner handle because the Linux PID "
+            "namespace is unavailable"
+        )
     pending = store.get(run_id)
     if pending is None:
         raise RuntimeError(f"cannot persist runner identity for unknown run {run_id!r}")
-    store.update(
-        RunHandle(
-            run_id=run_id,
-            experiment_id=experiment_id,
-            config_sha256=config_sha256,
-            pid=pid,
-            pgid=pgid,
-            pid_starttime=pid_starttime,
-            started_at=started_at,
-            launch_state="spawned",
-            allow_cancel=allow_cancel,
-            visible_params_at_launch=pending.visible_params_at_launch,
-            # Binds pid/pid_starttime to this boot: after a reboot the pair can
-            # name an unrelated process, and a reader that knows the boot
-            # differs can rule the runner dead without signalling anything.
-            boot_id=boot_id,
-        )
+    handle = RunHandle(
+        run_id=run_id,
+        experiment_id=experiment_id,
+        config_sha256=config_sha256,
+        config_dir=pending.config_dir,
+        pid=pid,
+        pgid=pgid,
+        pid_starttime=pid_starttime,
+        started_at=started_at,
+        launch_state="spawned",
+        allow_cancel=allow_cancel,
+        visible_params_at_launch=pending.visible_params_at_launch,
+        # Binds pid/pid_starttime to this boot: after a reboot the pair can
+        # name an unrelated process, and a reader that knows the boot
+        # differs can rule the runner dead without signalling anything.
+        boot_id=boot_id,
+        # Binds pid/pgid to the namespace that numbers them: a reader in
+        # another PID namespace sees unrelated processes under the same
+        # numbers and must not probe or signal them.
+        pid_namespace=pid_namespace,
     )
+    store.update(handle)
+    return handle
 
 
 def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> None:
@@ -868,7 +877,7 @@ def main(argv: list[str] | None = None) -> int:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
         # after Popen but before its own spawned-handle save reaches disk.
-        _persist_spawned_handle(
+        handle = _persist_spawned_handle(
             state_dir=state_dir,
             run_id=args.run_id,
             experiment_id=args.experiment_id,
@@ -896,10 +905,14 @@ def main(argv: list[str] | None = None) -> int:
         # find and terminate.
         os.chdir(project_cwd)
         try:
+            # The snapshot sits in the state directory, so relative config
+            # paths resolve against the directory recorded at launch, not the
+            # snapshot's location or this process's cwd.
             config = load_experiment_snapshot(
                 config_path,
                 args.config_sha256,
                 source=f"run snapshot {args.run_id}",
+                config_dir=Path(handle.config_dir),
             )
         except (OSError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc

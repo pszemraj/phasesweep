@@ -33,11 +33,10 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     PublishedStudyMissingError,
     RunRequestError,
-    SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
     read_status,
     read_winner,
     read_winners,
@@ -73,7 +72,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
@@ -162,7 +160,7 @@ def _two_phase_experiment(
 ) -> Experiment:
     """Build an arch -> lr two-phase experiment for from-phase tests.
 
-    Each phase has a search space, so v0.5.7 trial_command validation needs
+    Each phase has a search space, so trial_command validation needs
     ``{overrides}``. The trainer writes a constant ``r.json`` so trials
     actually complete and the experiment produces a saved winner.
     """
@@ -196,7 +194,7 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
     :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
         surface :func:`_reject_bound_descendant_topups` uses.
     """
-    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE) for _ in range(completed)]
+    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE, user_attrs={})] * completed
     return SimpleNamespace(
         user_attrs={} if fingerprint is None else {"phasesweep_fingerprint": fingerprint},
         get_trials=lambda *, deepcopy: trials,
@@ -288,7 +286,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     """A projection failure during the very first publication is diagnostic-only.
 
     Convenience projections (root ``winner.yaml`` etc.) are a
-    best-effort, post-commit cache (review v0.5.15 / blocker 3): a failure
+    best-effort, post-commit cache: a failure
     partway through them must not fail the run or block the pointer commit,
     even on a generation's first-ever publication. Reads must still resolve
     correctly via the generation-scoped artifacts regardless of which root
@@ -477,8 +475,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
         ),
         # Under whole_node the device-set SIZE is the trainer's world size —
         # semantic — while its spelling stays run-control, and under
-        # single_per_trial the whole list stays run-control (review v0.5.17
-        # gap hunt).
+        # single_per_trial the whole list stays run-control.
         (
             "whole_node_device_count",
             lambda: (
@@ -521,9 +518,8 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
 ) -> None:
     """The trainer's cwd and env-inheritance contract are semantic inputs.
 
-    Both were unbound implicit inputs before review v0.5.17 / blocker 4: one
-    study could mix trials launched from different directories or with
-    different credentials visible. Both fingerprints must move when either
+    Left unbound, one study could mix trials launched from different
+    directories or with different credentials visible. Both fingerprints must move when either
     changes, and must not move when the operator merely spells out the
     default block.
     """
@@ -542,15 +538,17 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
         "unbound": make_experiment(),
         "explicit_default": make_experiment(execution=ExecutionContext()),
         "cwd": make_experiment(execution=ExecutionContext(cwd=str(tmp_path))),
-        "inherit_none": make_experiment(execution=ExecutionContext(inherit_env="none")),
+        "inherit_all": make_experiment(execution=ExecutionContext(inherit_env="all")),
         "inherit_names": make_experiment(execution=ExecutionContext(inherit_env=["HF_TOKEN"])),
+        "explicit_tmpdir": make_experiment(execution=ExecutionContext(passthrough_env=["TMPDIR"])),
     }
     experiment_fps = {name: _experiment_semantic_fingerprint(exp) for name, exp in variants.items()}
     phase_fps = {name: _phase_fingerprint(exp, exp.phases[0], {}) for name, exp in variants.items()}
 
-    # Writing the default block out longhand is not a semantic edit.
-    assert experiment_fps["unbound"] == experiment_fps["explicit_default"]
-    assert phase_fps["unbound"] == phase_fps["explicit_default"]
+    # Writing the default block out longhand, or the built-in TMPDIR, is not a semantic edit.
+    for longhand in ("explicit_default", "explicit_tmpdir"):
+        assert experiment_fps["unbound"] == experiment_fps[longhand]
+        assert phase_fps["unbound"] == phase_fps[longhand]
 
     monkeypatch.chdir(invocation_b)
     second_invocation = make_experiment()
@@ -564,14 +562,18 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _experiment_semantic_fingerprint(explicit_first) == experiment_fps["unbound"]
     assert _phase_fingerprint(explicit_first, explicit_first.phases[0], {}) == phase_fps["unbound"]
 
-    distinct = ["unbound", "cwd", "inherit_none", "inherit_names"]
+    distinct = ["unbound", "cwd", "inherit_all", "inherit_names"]
     assert len({experiment_fps[name] for name in distinct}) == len(distinct)
     assert len({phase_fps[name] for name in distinct}) == len(distinct)
 
     # The phase payload carries the same resolved contract as the experiment one.
     cwd_exp = variants["cwd"]
     payload = _phase_semantic_payload(cwd_exp, cwd_exp.phases[0], {})
-    assert payload["execution"] == {"cwd": str(tmp_path.resolve()), "inherit_env": "all"}
+    assert payload["execution"] == {
+        "cwd": str(tmp_path.resolve()),
+        "inherit_env": "none",
+        "passthrough_env": ["TMPDIR"],
+    }
 
     # Names are a set, not a sequence: reordering the list is not an edit.
     reordered = make_experiment(
@@ -729,32 +731,6 @@ def test_populated_study_without_environment_identity_fails_closed(
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
-def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
-    """Toggling the acknowledgement must not move the phase fingerprint.
-
-    The flag never changes what a trial samples or means — on persistent
-    storage its legal value is fully determined by ``sampler.type`` — so
-    acknowledging an existing study's sampler (review v0.5.18 / finding F7)
-    must not invalidate that study.
-    """
-    from phasesweep.engine.fingerprints import _phase_semantic_payload
-
-    plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
-    acknowledged = make_experiment(
-        sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
-    )
-    assert _phase_fingerprint(plain, plain.phases[0], {}) == _phase_fingerprint(
-        acknowledged, acknowledged.phases[0], {}
-    )
-    payload = _phase_semantic_payload(acknowledged, acknowledged.phases[0], {})
-    assert "acknowledge_nonresumable" not in payload["phase"]["sampler"]
-    # The semantic sampler fields still move the fingerprint.
-    reseeded = make_experiment(sampler=Sampler(type="tpe", seed=1, acknowledge_nonresumable=True))
-    assert _phase_fingerprint(acknowledged, acknowledged.phases[0], {}) != _phase_fingerprint(
-        reseeded, reseeded.phases[0], {}
-    )
-
-
 def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
     """A json_equals gate value's *type* is semantic, so it must be in the digest.
 
@@ -763,9 +739,8 @@ def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
     The fingerprint hashes ``model_dump(mode="json")`` through
     ``json.dumps(..., default=str)``, which preserves that distinction only for
     values strict JSON can hold — which is why ``JsonEqualsGate.value`` is
-    restricted to a strict JSON-scalar union (PR #5 review / reviewer 2,
-    blocker 4). Anything it now rejects (a YAML date, an int-keyed mapping)
-    would have collapsed onto a colliding twin here.
+    restricted to a strict JSON-scalar union. Anything it rejects (a YAML
+    date, an int-keyed mapping) would collapse onto a colliding twin here.
     """
 
     def fingerprint_for(value: bool | int | float | str | None) -> str:
@@ -817,65 +792,64 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
 
-# The runtime continuation guard keys only on NON_RESUMABLE_SAMPLERS
-# membership, so one stateful sampler stands for TPE and CMA-ES. Persistent
-# storage requires the config-level non-resumable acknowledgement, which does
-# not weaken that guard.
-_STATEFUL_SAMPLER = Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True)
+_SEEDED_TPE = Sampler(type="tpe", seed=0, n_startup_trials=10)
 
 
 @pytest.mark.integration
-def test_stateful_sampler_rejects_interrupted_resume_and_top_up(tmp_path: Path) -> None:
-    """A partially complete TPE/CMA-ES study can be neither resumed nor topped up.
-
-    Optuna storage does not persist process-local sampler state, so a fresh
-    process would restart the seeded suggestion stream and could re-evaluate
-    identical startup suggestions (review v0.5.14 / blocker 3).
-    """
+def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> None:
+    """An aborted TPE phase continues when its target rises, drawing from TPE's model what one run with the same outcomes draws."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=3,
         max_consecutive_failures=1,
-        sampler=_STATEFUL_SAMPLER,
+        sampler=Sampler(type="tpe", seed=0, n_startup_trials=0),  # all draws from the model
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
-    assert len(study.trials) == 1
-
     write_constant_trainer(tmp_path)
-    with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
-        run_experiment(experiment)
-
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert len(study.trials) == 1
-
     top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
-    with pytest.raises(
-        SamplerContinuationUnsupportedError,
-        match="process-local continuation state.*new experiment name",
-    ):
-        run_experiment(top_up)
+    run_experiment(top_up)
+    # One uninterrupted run whose trial 0 fails as the aborted one did.
+    control_trainer = write_trainer(
+        tmp_path / "control_trainer.py",
+        """
+        import json, os, sys
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            sys.exit(1)
+        with open(sys.argv[sys.argv.index("--out") + 1], "w") as out:
+            out.write(json.dumps({"x": 0.5}))
+        print("x=0.5")
+        """,
+    )
+    control = make_experiment(
+        persistent=tmp_path / "control",
+        trainer=control_trainer,
+        phases=[phase.model_copy(update={"n_trials": 4, "max_consecutive_failures": 2})],
+    )
+    run_experiment(control)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert len(study.trials) == 1
+    trials = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).trials
+    expected = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
+    ).trials
+    assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
+    assert [t.params for t in trials] == [t.params for t in expected]
 
 
 @pytest.mark.integration
-def test_stateful_sampler_completed_target_reruns_as_noop(tmp_path: Path) -> None:
-    """A stateful study that reached its accepted target republishes without new trials."""
+def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
+    """A TPE study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=2,
-        sampler=_STATEFUL_SAMPLER,
+        sampler=_SEEDED_TPE,
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
@@ -904,7 +878,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     winner_before = _winner_path(experiment, "p").read_bytes()
 
     lowered = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 1})]})
-    with pytest.raises(TrialTargetRegressionError, match="accepted a target of 3"):
+    with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
         run_experiment(lowered)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
@@ -972,7 +946,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
 
 @pytest.mark.integration
 def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
-    """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
+    """One persistent study cannot back two publication roots."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
@@ -1113,7 +1087,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same relative URL from another cwd cannot reinterpret one tree."""
+    """A Python-built experiment's relative URL from another cwd cannot reinterpret one tree."""
     trainer = write_constant_trainer(tmp_path)
     registration_cwd = tmp_path / "registration"
     foreign_cwd = tmp_path / "foreign"
@@ -1248,9 +1222,9 @@ def _unbound_two_phase_studies(
 def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials: int) -> None:
     """A refused run must not leave an earlier phase bound to the rejected root.
 
-    Claiming inside the check loop bound every phase examined before the
-    conflicting one, so the tree the operator was told nothing happened to
-    already had a binding pointing at it (re-review v0.5.19 / blocker B3).
+    Claiming inside the check loop would bind every phase examined before the
+    conflicting one, leaving a binding pointing at a tree the operator was told
+    nothing happened to.
     """
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
@@ -1277,8 +1251,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
 
     The unreadable study aborts the run either way - as unconfirmed cleanup,
     with the storage failure chained beneath it - so claiming the readable
-    studies would invent a binding for an invocation that never ran a trial
-    (re-review v0.5.19 / blocker B3).
+    studies would invent a binding for an invocation that never ran a trial.
     """
     import phasesweep.engine.ledger as ledger
 
@@ -1514,14 +1487,14 @@ def _fabricate_interrupted_attempt(
 def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path) -> None:
     """A read that fails once must abort the run, not be retried into recovery.
 
-    Reviewer repro (PR #5 review / reviewer 2, issue 1): discovery swallowed
-    the storage failure, the main preflight loop re-read the study, the second
-    read succeeded, and stale-trial reaping then mutated a study whose
-    artifact-root binding had never been checked - a wrong-root invocation
-    silently failing the bound tree's RUNNING trial. Discovery is now the only
-    read, so the failure escalates and nothing in either tree is touched. The
-    unpatched second invocation pins the same refusal for the ordinary
-    wrong-root case: it conflicts before the registry scan can reap anything.
+    If discovery swallowed the storage failure and the main preflight loop
+    re-read the study, the second read would succeed and stale-trial reaping
+    would mutate a study whose artifact-root binding had never been checked -
+    a wrong-root invocation silently failing the bound tree's RUNNING trial.
+    Discovery is the only read, so the failure escalates and nothing in either
+    tree is touched. The unpatched second invocation pins the same refusal for
+    the ordinary wrong-root case: it conflicts before the registry scan can
+    reap anything.
     """
     import phasesweep.engine.ledger as ledger
 
@@ -1859,43 +1832,6 @@ def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) ->
         run_experiment(exp, from_phase="lr")
 
 
-@pytest.mark.integration
-def test_winner_and_trial_attrs_record_trainer_environment_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every trial records which environment produced it; the winner keeps the digest.
-
-    Names are diagnostic and persisted; values are secrets and never leave the
-    process (review v0.5.18 / finding F3).
-    """
-    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
-    trainer = write_constant_trainer(tmp_path)
-    exp = make_experiment(
-        persistent=tmp_path,
-        trainer=trainer,
-        env={"PHASESWEEP_TEST_SECRET": "config-secret"},
-        execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
-        n_trials=1,
-    )
-
-    run_experiment(exp)
-
-    identity = _environment_identity(exp, "p")
-    data = yaml.safe_load(_winner_path(exp, "p").read_text())
-    assert data["trainer_env_digest"] == identity.digest
-    assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
-
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    attrs = study.get_trials(deepcopy=False)[0].user_attrs
-    names = attrs[TRAINER_ENV_NAMES_ATTR]
-    assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
-    assert names == sorted(names) == list(identity.names)
-    assert {"PHASESWEEP_TEST_SECRET", "PHASESWEEP_TEST_TOKEN"} <= set(names)
-    serialized = json.dumps(attrs, default=str)
-    assert "config-secret" not in serialized
-    assert "ambient-secret" not in serialized
-
-
 def test_save_winner_replace_failure_preserves_existing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1967,11 +1903,10 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
 ) -> None:
     """A resource failure before any trial must not bind an empty study forever.
 
-    Reviewer repro (review v0.5.17 / finding A): the fingerprint is stamped
-    before GPU preflight; a config that failed before launching any trial used
-    to leave a zero-trial study bound to that fingerprint, so the *corrected*
-    config was rejected with StudyFingerprintMismatchError even though nothing
-    ever ran.
+    The fingerprint is stamped before GPU preflight; a config that fails
+    before launching any trial must not leave a zero-trial study bound to that
+    fingerprint, or the *corrected* config would be rejected with
+    StudyFingerprintMismatchError even though nothing ever ran.
     """
     from tests.conftest import make_experiment, write_trainer
 

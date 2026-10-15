@@ -1,9 +1,10 @@
 """Every read path, against the golden ledger, writes nothing and refuses honestly.
 
 Two durability invariants meet here. A read path never creates a study and
-never constructs file-backed storage (invariant 3); and it validates the
-artifact-root binding and then the ledger format *before* any bind, claim, or
-open, leaving the bytes untouched when it refuses (invariant 2). The golden
+never constructs file-backed storage, invariant 6 ("Read paths construct and
+write nothing"); and it validates the artifact-root binding and then the
+ledger format *before* any bind, claim, or open, leaving the bytes untouched
+when it refuses, invariant 2 ("Validation writes nothing"). The golden
 fixture under ``tests/fixtures/ledgers`` is real PhaseSweep output for these
 checks to run against, rather than bytes a test invented.
 
@@ -26,10 +27,11 @@ from typing import Any
 import pytest
 import yaml
 
+from phasesweep import run_experiment
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
-from phasesweep.engine.read import read_status, read_winners
+from phasesweep.engine.read import read_status, read_trial_tables, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
@@ -56,11 +58,18 @@ REQUIRED_FIXTURES = ("current-journal",)
 PURE_READ_PATHS = (
     "engine-read_status",
     "engine-read_winners",
+    "engine-read_trial_tables",
     "ledger-read_phase_trials",
     "cli-status",
+    "cli-status-trials",
     "cli-show-winners",
     "mcp-snapshot",
+    "engine-run_dry_run",
+    "cli-run-dry-run",
 )
+#: Dry runs, which preview their example command on a throwaway study that has no
+#: storage, so they may call ``optuna.create_study`` for that one study and no other.
+DRY_RUN_READ_PATHS = ("engine-run_dry_run", "cli-run-dry-run")
 #: Recovery preflight, which needs live studies and is only held to
 #: bytes-unchanged plus its verdict.
 RECOVERY_READ_PATH = "mcp-recover-inspect"
@@ -207,11 +216,15 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
             expected = _RECOVERY_LEDGER_ONLY_VERDICTS.get(expected, expected)
         verdict, state_changes = _recover_inspect(materialized, tmp_path)
     else:
-        attempts = forbid_file_backed_storage(monkeypatch)
+        attempts = forbid_file_backed_storage(
+            monkeypatch, allow_memory_studies=read_path in DRY_RUN_READ_PATHS
+        )
         if read_path == "engine-read_status":
             verdict = _engine_verdict(lambda: read_status(materialized.experiment))
         elif read_path == "engine-read_winners":
             verdict = _engine_verdict(lambda: read_winners(materialized.experiment))
+        elif read_path == "engine-read_trial_tables":
+            verdict = _engine_verdict(lambda: read_trial_tables(materialized.experiment))
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
             verdict = _engine_verdict(
@@ -221,9 +234,19 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
             verdict = _engine_verdict(lambda: capture_result_snapshot(materialized.experiment))
         elif read_path == "cli-status":
             verdict = _cli_verdict(["status", str(materialized.config_path)], monkeypatch, capsys)
+        elif read_path == "cli-status-trials":
+            verdict = _cli_verdict(
+                ["status", str(materialized.config_path), "--trials"], monkeypatch, capsys
+            )
         elif read_path == "cli-show-winners":
             verdict = _cli_verdict(
                 ["show-winners", str(materialized.config_path)], monkeypatch, capsys
+            )
+        elif read_path == "engine-run_dry_run":
+            verdict = _engine_verdict(lambda: run_experiment(materialized.experiment, dry_run=True))
+        elif read_path == "cli-run-dry-run":
+            verdict = _cli_verdict(
+                ["run", str(materialized.config_path), "--dry-run"], monkeypatch, capsys
             )
         else:  # pragma: no cover - guarded by READ_PATHS
             raise AssertionError(f"unknown read path: {read_path}")
@@ -234,6 +257,25 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         f"{read_path} over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
     )
     assert state_changes == {}, f"{read_path} changed the MCP state directory: {state_changes}"
+
+
+@pytest.mark.parametrize("mode", LEDGER_MODES)
+def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry run replays the fixture's finished phase and hands out its real winner.
+
+    The matrix above asserts only the verdict, which a placeholder winner satisfies as well, so
+    this pins the replay itself: a stand-in winner has trial number -1.
+    """
+    materialized = materialize("current-journal", tmp_path, mode=mode)
+    attempts = forbid_file_backed_storage(monkeypatch, allow_memory_studies=True)
+
+    winners = run_experiment(materialized.experiment, dry_run=True)
+
+    assert attempts == []
+    assert winners["p"].trial_number != -1
+    assert materialized.unchanged(), materialized.changes()
 
 
 @pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())

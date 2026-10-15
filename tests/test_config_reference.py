@@ -8,13 +8,33 @@ line must have its counterpart on the key it names.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
+import yaml
+from pydantic import ValidationError
 
 import phasesweep.config as config_models
 from phasesweep.config import Experiment, load_experiment
-from phasesweep.config.io import load_experiment_bytes
+from phasesweep.config.io import describe_validation_error, load_experiment_bytes
+from phasesweep.config.reference import (
+    ReferenceEntry,
+    _parse,
+    _parse_notes,
+    closest,
+    first_sentence,
+    loc_to_path,
+    lookup,
+    plain_path,
+    reference_entries,
+    reference_notes,
+    sub_key_count,
+    top_level_entries,
+)
 from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
 from phasesweep.runtime.json import JsonObject
 
@@ -118,40 +138,20 @@ def _schema_inventory() -> dict[str, str]:
 
 
 def _reference_entries() -> dict[str, tuple[str, list[str]]]:
-    """Read indented signatures and their comment lines, keeping every discriminator alternative."""
+    """Read the packaged reference and check every entry's description and signature shape.
+
+    :return dict[str, tuple[str, list[str]]]: Signature and comment lines per documented path,
+        keeping every discriminator alternative.
+    """
     inventory: dict[str, tuple[str, list[str]]] = {}
-    stack: list[tuple[int, str]] = []
-    comments: list[str] = []
-    for line in (REPO / "docs/config_reference.yaml").read_text().splitlines():
-        stripped = line.lstrip()
-        if not stripped:
-            comments.clear()
-            continue
-        if stripped.startswith("#"):
-            comments.append(stripped.removeprefix("#").strip())
-            continue
-        match = re.fullmatch(r"( *)(- )?([\w.-]+): (.+)", line)
-        assert match is not None, f"Unrecognized reference entry: {line}"
-        indent = len(match[1]) + (2 if match[2] else 0)
-        key, signature = match[3], match[4]
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        if stack and stack[-1][1] == "search_space":
-            key = "<key>"
-        tag = re.fullmatch(r'"([^"\n]+)" \(required\)', signature) if key == "type" else None
-        if tag is not None:
-            parent_indent, parent = stack[-1]
-            stack[-1] = (parent_indent, parent.split("[type=", 1)[0] + f"[type={tag[1]}]")
-        path = ".".join([*(part for _, part in stack), key])
-        assert path not in inventory, f"Duplicate documented path: {path}"
-        assert comments, f"Description missing at {path}"
-        assert not comments[-1].startswith("Variant "), f"Description missing at {path}"
-        assert re.search(r" = .+| \(required\)$| \(optional\)$", signature), path
-        if signature.endswith(" (optional)"):
-            assert any(comment.startswith("Unset:") for comment in comments), path
-        inventory[path] = (signature, comments.copy())
-        stack.append((indent, key + ("[]" if signature.startswith("list[") else "")))
-        comments.clear()
+    for entry in reference_entries():
+        comments = list(entry.comments)
+        assert comments, f"Description missing at {entry.path}"
+        assert not comments[-1].startswith("Variant "), f"Description missing at {entry.path}"
+        assert re.search(r" = .+| \(required\)$| \(optional\)$", entry.signature), entry.path
+        if entry.signature.endswith(" (optional)"):
+            assert any(comment.startswith("Unset:") for comment in comments), entry.path
+        inventory[entry.path] = (entry.signature, comments)
     return inventory
 
 
@@ -290,6 +290,52 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
         load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
 
 
+def test_config_guide_index_lists_every_top_level_key() -> None:
+    """The guide's reference index names each top-level key under the section it sits in."""
+    guide = (REPO / "docs/config.md").read_text()
+    index = guide.split("## Reference index\n", 1)[1].split("\n## ", 1)[0]
+    rows = re.findall(
+        r"^\| ([^|`]+?) \| ((?:`[^`]+`(?:, )?)+) \| `phasesweep explain ([^`]+)` \|$",
+        index,
+        re.MULTILINE,
+    )
+    documented = {section: re.findall(r"`([^`]+)`", keys) for section, keys, _ in rows}
+    assert len(documented) == len(rows), "Duplicate index section"
+    expected: dict[str, list[str]] = {}
+    for entry in top_level_entries():
+        expected.setdefault(entry.section, []).append(entry.path)
+    assert documented == expected
+    for section, _, command_key in rows:
+        assert command_key in documented[section], (section, command_key)
+
+
+def test_top_level_entries_are_the_undotted_paths_in_file_order() -> None:
+    """Top-level keys are exactly the entries whose path has no dot."""
+    paths = [entry.path for entry in top_level_entries()]
+    assert paths[:4] == ["experiment", "trial_command", "metric", "phases"]
+    assert paths == [entry.path for entry in reference_entries() if "." not in entry.path]
+
+
+def test_sub_key_count_counts_entries_below_a_key() -> None:
+    """A leaf has none, and a container counts every entry below it."""
+    by_path = {entry.path: entry for entry in reference_entries()}
+    assert sub_key_count(by_path["storage"]) == 0
+    assert sub_key_count(by_path["execution"]) == len(
+        [path for path in by_path if path.startswith("execution.")]
+    )
+    assert sub_key_count(by_path["phases"]) > 40
+
+
+def test_first_sentence_stops_at_the_first_full_stop_and_shortens_long_ones() -> None:
+    """A listing row shows one sentence, cut at a word boundary when it is long."""
+    storage = next(entry for entry in reference_entries() if entry.path == "storage")
+    assert first_sentence(storage) == "Where the study ledger is kept."
+    long = ReferenceEntry("k", "string", ("Word " * 40 + "end. Second.",), "S")
+    assert first_sentence(long, 30) == "Word Word Word Word Word..."
+    assert first_sentence(long, None) == "Word " * 40 + "end."
+    assert first_sentence(ReferenceEntry("k", "string", (), "S")) == ""
+
+
 def test_mcp_catalog_table_matches_all_catalog_paths() -> None:
     """Keep the separate catalog field table complete in both directions."""
     expected = {
@@ -306,3 +352,207 @@ def test_mcp_catalog_table_matches_all_catalog_paths() -> None:
         "missing": sorted(expected - actual),
         "extra": sorted(actual - expected),
     }
+
+
+def test_reference_entries_record_their_section_and_are_immutable() -> None:
+    """Every entry names the section marker above it, and entries cannot be edited."""
+    entries = reference_entries()
+    assert entries[0].path == "experiment"
+    assert entries[0].section == "Required experiment fields"
+    assert {entry.section for entry in entries} == {
+        "Required experiment fields",
+        "Trainer inputs",
+        "Storage and provenance",
+        "Constraints",
+        "Observations",
+        "MLflow target and ownership",
+        "Execution environment",
+    }
+    by_path = {entry.path: entry for entry in entries}
+    assert by_path["execution.inherit_env"].section == "Execution environment"
+    assert isinstance(by_path["trial_command"].comments, tuple)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        entries[0].path = "other"
+
+
+def test_reference_parser_rejects_unrecognized_lines_and_duplicate_paths() -> None:
+    """The parser fails loudly instead of skipping a line it cannot place."""
+    with pytest.raises(ValueError, match="Unrecognized reference entry"):
+        _parse("# about\nnot an entry\n")
+    with pytest.raises(ValueError, match="Duplicate documented path: name"):
+        _parse("# one\nname: string (required)\n\n# two\nname: string (required)\n")
+    parsed = _parse("# ---------- First ----------\n\n# one\nname: string (required)\n")
+    assert parsed == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+
+
+def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() -> None:
+    """The first header block is for maintainers, the block after its blank line is the notes."""
+    text = (
+        "# about this file\n# parsed by x\n\n# note one\n# note two\n\n"
+        "# ---------- First ----------\n\n# one\nname: string (required)\n"
+    )
+    assert _parse_notes(text) == ("note one", "note two")
+    assert _parse(text) == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+    with pytest.raises(ValueError, match="no general notes"):
+        _parse_notes("# about this file\n\n# ---------- First ----------\n\n# one\nname: string\n")
+
+
+def test_packaged_reference_notes_hold_user_notes_and_no_maintainer_lines() -> None:
+    """The packaged notes cover paths, YAML typing and environment variables, not the file itself."""
+    notes = "\n".join(reference_notes())
+    for fragment in ("Config file:", "Paths:", "YAML scalars follow PyYAML", "PHASESWEEP_LOCK_DIR"):
+        assert fragment in notes
+    for maintainer in ("does not load as YAML", "maintained by hand", "parsed by", "tests/"):
+        assert maintainer not in notes
+    assert not any(
+        comment.startswith("Config file:")
+        for entry in reference_entries()
+        for comment in entry.comments
+    )
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "phases[].sampler.type",
+        "phases.sampler.type",
+        "phases.0.sampler.type",
+        "phases[0].sampler.type",
+        "  phases[].sampler.type  ",
+    ],
+)
+def test_plain_path_accepts_every_spelling_of_one_key(typed: str) -> None:
+    """Brackets, indexes and variant tags never change which key is meant."""
+    assert plain_path(typed) == "phases.sampler.type"
+
+
+def test_plain_path_drops_variant_tags_and_list_markers() -> None:
+    """A documented inventory path reduces to the dotted form lookups compare."""
+    assert plain_path("phases[].gates[][type=sha256].path") == "phases.gates.path"
+    assert plain_path("phases[].search_space.<key>[type=float].low") == (
+        "phases.search_space.<key>.low"
+    )
+
+
+def test_lookup_returns_the_entry_and_everything_below_it() -> None:
+    """A key matches itself and its descendants, in every spelling."""
+    sampler = [entry.path for entry in lookup("phases[].sampler")]
+    assert sampler[0] == "phases[].sampler"
+    assert "phases[].sampler.type" in sampler
+    assert all(path.startswith("phases[].sampler") for path in sampler)
+    assert [entry.path for entry in lookup("phases.0.sampler")] == sampler
+    assert [entry.path for entry in lookup("phases.sampler")] == sampler
+    assert [entry.path for entry in lookup("inherit_env")] == []
+    exact = lookup("execution.inherit_env")
+    assert [entry.path for entry in exact] == ["execution.inherit_env"]
+    assert exact[0].signature.startswith('"all" | "none" | list[string]')
+
+
+def test_lookup_labels_each_variant_of_a_shared_key() -> None:
+    """A key several discriminator variants share returns one labelled entry per variant."""
+    paths = [entry.path for entry in lookup("metric.extractor.path")]
+    assert "metric.extractor[type=json].path" in paths
+    assert "metric.extractor[type=json_envelope].path" in paths
+    assert len(paths) == len(set(paths)) >= 2
+    low = [entry.path for entry in lookup("phases.search_space.lr.low")]
+    assert low == [
+        "phases[].search_space.<key>[type=float].low",
+        "phases[].search_space.<key>[type=int].low",
+    ]
+
+
+def test_lookup_of_an_unknown_key_is_empty_and_an_empty_key_is_everything() -> None:
+    """Misses return nothing so callers can fall back to suggestions."""
+    assert lookup("phases.sampler.typ") == ()
+    assert lookup("") == reference_entries()
+
+
+def test_closest_suggests_the_documented_key_for_a_partial_or_misspelled_one() -> None:
+    """A bare leaf finds its parent path, and a typo finds the key it misspells."""
+    assert closest("inherit_env") == ("execution.inherit_env",)
+    assert closest("sampler.type") == ("phases[].sampler.type",)
+    assert closest("phases.sampler.typ")[0] == "phases[].sampler.type"
+    assert closest("trial_comand")[0] == "trial_command"
+    assert closest("zzzzzz") == ()
+    assert closest("") == ()
+    assert len(closest("type")) == 3
+    assert all("[type=" not in suggestion for suggestion in closest("type"))
+
+
+def _error_locs(change: Callable[[dict], None]) -> list[tuple[int | str, ...]]:
+    """Validate the minimal starting example after a change and return its error locations.
+
+    :param Callable[[dict], None] change: Edit applied to the loaded example mapping.
+    :return list[tuple[int | str, ...]]: The ``loc`` of every validation error.
+    """
+    data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
+    change(data)
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(data)
+    return [error["loc"] for error in caught.value.errors(include_input=False)]
+
+
+def test_loc_to_path_maps_variant_and_search_key_segments() -> None:
+    """Indexes and variant tags drop out, and a user-chosen search key maps to ``<key>``."""
+
+    def bad_sampler(data: dict) -> None:
+        data["phases"][0]["sampler"] = {"type": "bogus"}
+
+    def bad_extractor_path(data: dict) -> None:
+        data["metric"]["extractor"]["path"] = 3
+
+    def bad_search_bound(data: dict) -> None:
+        data["phases"][0]["search_space"] = {"lr": {"type": "float", "low": "x", "high": 1}}
+
+    def bad_gate_digest(data: dict) -> None:
+        data["phases"][0]["gates"] = [{"type": "sha256", "path": "a"}]
+
+    def bad_inherit_env(data: dict) -> None:
+        data["execution"] = {"inherit_env": 3}
+
+    def bad_env_value(data: dict) -> None:
+        data["env"] = {"A": 1}
+
+    cases = [
+        (bad_sampler, "phases[].sampler.type"),
+        (bad_extractor_path, "metric.extractor.path"),
+        (bad_search_bound, "phases[].search_space.<key>.low"),
+        (bad_gate_digest, "phases[].gates[].sha256"),
+        (bad_inherit_env, "execution.inherit_env"),
+        (bad_env_value, "env"),
+    ]
+    for change, expected in cases:
+        locs = _error_locs(change)
+        assert {loc_to_path(loc) for loc in locs} == {expected}, locs
+
+
+def test_describe_validation_error_adds_distinct_quoted_hints() -> None:
+    """Errors under one key give one hint, and a path with brackets is shell-quoted."""
+    data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
+    data["env"] = {"A": 1, "B": 2}
+    data["phases"][0]["sampler"] = {"type": "bogus"}
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(data)
+    assert len(caught.value.errors()) == 3
+    assert describe_validation_error(caught.value) == (
+        f"{caught.value}\nsee: phasesweep explain 'phases[].sampler.type'"
+        "\nsee: phasesweep explain env"
+    )
+
+
+def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
+    """An experiment-level validator reports an empty location, so there is no key to explain."""
+    data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
+    data["phases"][0]["inherits"] = ["baseline"]
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(data)
+    assert [error["loc"] for error in caught.value.errors()] == [()]
+    assert describe_validation_error(caught.value) == str(caught.value)
+
+
+def test_loc_to_path_has_no_key_for_unknown_or_model_level_locations() -> None:
+    """An empty location or an undocumented top-level key yields no hint."""
+    assert loc_to_path(()) is None
+    assert loc_to_path(("bogus",)) is None
+    assert loc_to_path(("trainer_config", "a", "b")) == "trainer_config"
+    assert loc_to_path(("phases", 2, "n_trials")) == "phases[].n_trials"

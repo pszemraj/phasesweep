@@ -8,7 +8,7 @@ Host locks key on a *canonical physical device identity*, not on the spelling of
 the configured token: at pool construction every numeric index is resolved to
 the GPU UUID ``nvidia-smi`` reports for it, so ``gpu_ids: [0]`` in one run and
 ``gpu_devices: ["GPU-<uuid of 0>"]`` in another contend for one lock file
-instead of double-booking the card (review v0.5.17 / blocker 6).
+instead of double-booking the card.
 
 MIG limitation: a ``MIG-...`` token locks on the MIG instance itself. phasesweep
 does not bind a MIG instance to its parent GPU, so a run holding a MIG instance
@@ -29,6 +29,7 @@ import re
 import subprocess
 import threading
 import time
+import weakref
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from typing import IO
 from phasesweep.config.models import GpuPolicy
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
+from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
@@ -50,7 +52,7 @@ class GpuLeaseTimeoutError(TimeoutError):
 
 
 class GpuLeaseCancelledError(RuntimeError):
-    """Raised when the owning phase cancels queued GPU lease waits."""
+    """Raised when the owning phase cancels queued GPU lease waits, or a shutdown is being serviced."""
 
 
 @dataclass(frozen=True)
@@ -79,8 +81,7 @@ class GpuDevice:
         """Return a stable, path-safe lock identifier for this device's physical GPU.
 
         Derived from :attr:`lock_identity`, never from the visible token, so a
-        numeric index and the GPU UUID naming the same card share one lock file
-        (review v0.5.17 / blocker 6).
+        numeric index and the GPU UUID naming the same card share one lock file.
         """
         identity = self.lock_identity
         if identity.isdigit():
@@ -191,8 +192,7 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
         # Require a real device-identity shape. Restricted drivers (vGPU,
         # locked-down containers) report "[N/A]"/"[Not Supported]" for every
         # index; accepting those would map ALL indices to one identity and
-        # silently collapse a multi-GPU pool to a single lock (review
-        # v0.5.17 gap hunt).
+        # silently collapse a multi-GPU pool to a single lock.
         if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
     return ids, uuid_map
@@ -293,10 +293,9 @@ def _bind_lock_identities(
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
     same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two (review v0.5.17 / blocker 6). Every ``GPU-``
-    token, including a full-length or lowercase spelling, resolves through the
-    readable inventory; abbreviated UUID prefixes resolve only when exactly one
-    card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
+    one host lock instead of two. Every ``GPU-`` token, including a full-length
+    or lowercase spelling, resolves through the readable inventory; abbreviated
+    UUID prefixes resolve only when exactly one card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
     This both canonicalizes case and rejects a UUID that CUDA would turn into an
     empty visibility set while phasesweep held no real-device lock.
 
@@ -419,10 +418,9 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
     trainer's world size, and that declared count is what the phase fingerprint
     records (``whole_node_device_count``). Deduplication is therefore not a
     convenience here: dropping an aliased token would run a 1-GPU world under a
-    2-GPU study identity, and the two runs would be indistinguishable afterwards
-    (PR #5 review / reviewer 2, blocker 2). ``single_per_trial`` is unaffected —
-    there the list is a pool whose size is pure throughput, so dedupe with a
-    warning stays correct.
+    2-GPU study identity, and the two runs would be indistinguishable
+    afterwards. ``single_per_trial`` is unaffected — there the list is a pool
+    whose size is pure throughput, so dedupe with a warning stays correct.
 
     Only *actual* collapses are reported. A collapse is visible either as a
     token that :func:`_normalize_devices` removed (an exact repeat, or an empty
@@ -519,6 +517,7 @@ class GpuPool:
 
         if devices:
             self._available = list(devices)
+        _live_pools.add(self)
 
     @classmethod
     def create(
@@ -711,9 +710,14 @@ class GpuPool:
         :return float | None: Remaining seconds, or ``None`` when no deadline is active.
         :raises GpuLeaseTimeoutError: The deadline has already passed, so
             waiting further would overrun the phase/run wallclock budget.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits,
+            or a shutdown signal is being serviced.
         """
         if self._cancelled.is_set():
             raise GpuLeaseCancelledError("GPU lease wait cancelled by phase abort.")
+        signum = servicing_shutdown_signal()
+        if signum is not None:
+            raise GpuLeaseCancelledError(f"GPU lease wait cancelled by shutdown signal {signum}.")
         if deadline is None:
             return None
         remaining = deadline - time.monotonic()
@@ -736,6 +740,10 @@ class GpuPool:
     def cancel_waiters(self) -> None:
         """Cancel current and future lease waits and wake local-slot waiters."""
         self._cancelled.set()
+        self.wake_waiters()
+
+    def wake_waiters(self) -> None:
+        """Wake local-slot waiters so each re-checks cancellation and shutdown."""
         with self._condition:
             self._condition.notify_all()
 
@@ -886,8 +894,10 @@ class GpuPool:
         Yields:
             A :class:`GpuAssignment` carrying the CUDA visibility token (the
             pinned disable sentinel for explicit CPU isolation, or ``None``
-            for an inactive pool) and the host-lock descriptors the trainer
-            must inherit so exclusion survives an orchestrator hard exit.
+            for an inactive pool) and the host-lock descriptors the supervisor
+            guardian inherits so exclusion survives an orchestrator hard exit.
+            The trainer does not inherit them: the supervisor closes every
+            descriptor above stderr before it execs the trainer.
 
         Raises:
             GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
@@ -910,6 +920,20 @@ class GpuPool:
             )
         finally:
             self._release(acquired)
+
+
+# Every pool alive in this process, so a shutdown can wake the threads queued on
+# any of them; a pool drops out once nothing references it.
+_live_pools: weakref.WeakSet[GpuPool] = weakref.WeakSet()
+
+
+def _wake_live_pools() -> None:
+    """Wake every live pool's queued lease waiters to see a shutdown being serviced."""
+    for pool in list(_live_pools):
+        pool.wake_waiters()
+
+
+register_shutdown_waker(_wake_live_pools)
 
 
 def _normalize_devices(tokens: Iterable[int | str]) -> list[GpuDevice]:

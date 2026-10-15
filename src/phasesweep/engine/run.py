@@ -24,8 +24,12 @@ import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
-from phasesweep.config.search import sampler_capability_line
+from phasesweep.config.models import (
+    _metric_semantics_payload,
+    experiment_contract_lines,
+    experiment_warnings,
+)
+from phasesweep.config.search import sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
@@ -33,6 +37,13 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.preview import (
+    PhasePreview,
+    RecordedPhase,
+    _dry_run_total_line,
+    _preview_ledger,
+    _preview_phase,
+)
 from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -84,12 +95,12 @@ class TerminalReport:
     """One engine invocation's primary outcome and independent cleanup evidence.
 
     ``winners`` is the engine's own authoritative winner mapping, populated on
-    the success path while the experiment lock is still held (review v0.5.16 /
-    blocker 2): a terminal-result consumer (the MCP runner's snapshot capture)
-    must be able to freeze the published outcome from the exact in-memory
-    state the engine just returned, instead of re-deriving it from mutable
-    storage or optional diagnostic files whose absence would then contradict
-    an engine-defined success. ``None`` on every failure path.
+    the success path while the experiment lock is still held: a
+    terminal-result consumer (the MCP runner's snapshot capture) must be able
+    to freeze the published outcome from the exact in-memory state the engine
+    just returned, instead of re-deriving it from mutable storage or optional
+    diagnostic files whose absence would then contradict an engine-defined
+    success. ``None`` on every failure path.
     """
 
     generation_id: str
@@ -182,18 +193,18 @@ def run_experiment(
     """Run all phases in order, returning a map of phase name to Winner.
 
     If ``from_phase`` is given, prior phases are loaded from disk.
-    If ``dry_run`` is True, example commands are logged but nothing launches.
+    If ``dry_run`` is True, the trials each phase would launch and an example
+    command are logged but nothing launches.
 
     For non-dry-run invocations this acquires an
     :func:`phasesweep.engine.locking._experiment_lock` for
-    the entire phase sequence (review v0.5.6 / blocker 1). Phase-level state
-    on disk (``winner.yaml``, fingerprints, ``summary.yaml``) is consistent
-    only at run granularity, so two same-experiment processes must not
-    interleave across phases.
+    the entire phase sequence. Phase-level state on disk (``winner.yaml``,
+    fingerprints, ``summary.yaml``) is consistent only at run granularity, so
+    two same-experiment processes must not interleave across phases.
 
-    Signal handlers are installed here (review v0.5.7 / blocker 3) so library
-    callers using the public API get the same cleanup guarantees as CLI
-    callers. Skipped on dry-run because no children will launch.
+    Signal handlers are installed here so library callers using the public
+    API get the same cleanup guarantees as CLI callers. Skipped on dry-run
+    because no children will launch.
 
     Args:
         experiment: Parsed experiment config (result of
@@ -201,8 +212,13 @@ def run_experiment(
         from_phase: Name of a phase to resume from; earlier phases are loaded
             from their persisted ``winner.yaml`` files (with fingerprint
             verification). ``None`` runs every phase from scratch.
-        dry_run: If ``True``, render and log one example trial command per
-            phase but launch no subprocesses; no summary is written.
+        dry_run: If ``True``, log the trials each phase would launch given the
+            attempts the ledger already records, and render one example trial
+            command per phase, but launch no subprocesses; no summary is
+            written and the ledger is only read. It applies the launch's claim
+            and preflight refusals over the recorded studies, except those
+            that need a RUNNING attempt recovered first, the trainer
+            environment, the stored fingerprints, or the trial evidence.
         terminal_callback: Optional synchronous callback invoked with the
             structured terminal report while the experiment lock is still held.
         publication_hook: Optional required precommit/postcommit sidecar used by
@@ -213,13 +229,15 @@ def run_experiment(
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
-        :class:`Winner`. For dry runs the winners are placeholders.
+        :class:`Winner`. For dry runs a phase that would replay its recorded
+        result returns that result's winner, and every other phase returns a
+        placeholder.
 
     Raises:
         NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``
             with no feasible trial.
         UnsafeProcessCleanupError: A phase hard-aborted because a trial's
-            process group could not be confirmed dead (review v0.5.11).
+            process group could not be confirmed dead.
         TrialEvidenceMissingError: A trial eligible to win no longer has the
             on-disk evidence its study records, or the selected winner's
             objective source no longer matches its frozen provenance.
@@ -317,8 +335,7 @@ def _run_experiment_outcome(
     )
     # signal_handler_scope() is the outermost context manager so shutdown-signal
     # ownership is scoped to this call tree and restored on every exit path,
-    # not left installed on the host process forever (review v0.5.14 /
-    # blocker 6).
+    # not left installed on the host process forever.
     with (
         signal_handler_scope(),
         locking_ops._experiment_lock(experiment),
@@ -384,22 +401,21 @@ def _run_experiment_outcome(
                 from_phase=from_phase,
             )
             # Selection reads Optuna alone, so a tree whose candidate evidence
-            # was deleted would silently reselect and republish those trials
-            # (PR #5 review / reviewer 2, blocker 7). Refuse here - after
-            # recovery has resolved every stale attempt, before the generation
-            # is marked running and before any trial launches - so nothing is
-            # added to a tree that cannot honestly be ranked. Deliberately not
-            # repeated on the post-failure reconciliation call below: an
-            # evidence gap found while cleaning up must never displace the
-            # primary error, and publication on that path is covered by the
-            # selection-time winner check.
+            # was deleted would silently reselect and republish those trials.
+            # Refuse here - after recovery has resolved every stale attempt,
+            # before the generation is marked running and before any trial
+            # launches - so nothing is added to a tree that cannot honestly be
+            # ranked. Deliberately not repeated on the post-failure
+            # reconciliation call below: an evidence gap found while cleaning
+            # up must never displace the primary error, and publication on
+            # that path is covered by the selection-time winner check.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
             resume_ops._reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,
                 existing_studies=existing_studies,
             )
-            resume_ops._reject_unsupported_sampler_topups(
+            resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,
                 existing_studies=existing_studies,
@@ -480,7 +496,7 @@ def _run_experiment_outcome(
             # the current pointer to that more specific state; a second generic
             # "failed" write here would be refused for the record (write-once)
             # but would silently clobber the current pointer, which has no
-            # monotonic guard within one invocation (review v0.5.15 / blocker 3).
+            # monotonic guard within one invocation.
             generation_ops._persist_failed_state_unless_recorded(
                 path_ops._generation_record_path(experiment, failed_generation_id),
                 lambda: generation_ops._write_generation_state(
@@ -575,12 +591,11 @@ def _run_experiment_outcome(
                     # successful result, so raising here would present a
                     # committed success as a caller-visible failure; on the
                     # failure path it would replace the engine's original
-                    # error (review v0.5.14 / item C). BaseException on
-                    # purpose (review v0.5.16 / blocker 1): a
-                    # KeyboardInterrupt/SystemExit escaping the callback must
-                    # not rewrite the engine outcome either — real shutdown
-                    # signals are honored separately by the signal handler,
-                    # not by exceptions leaking out of a diagnostic consumer.
+                    # error. BaseException on purpose: a KeyboardInterrupt/
+                    # SystemExit escaping the callback must not rewrite the
+                    # engine outcome either — real shutdown signals are
+                    # honored separately by the signal handler, not by
+                    # exceptions leaking out of a diagnostic consumer.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
 
@@ -648,8 +663,9 @@ def _run_experiment_inner(
         ledger: The claimed ledger every phase opens its live study through,
             claimed for this same ``experiment``. ``None`` is a dry run: no
             subprocesses launch, no ``summary.yaml`` is written, each phase
-            previews against an in-memory study, and each phase's sampler
-            capability line is logged up front.
+            previews its example command against an in-memory study and its
+            launch count against the attempts the ledger already records, and
+            each phase's sampler capability line is logged up front.
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
@@ -664,21 +680,36 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
+        PublicationAccessError: A dry run reads a recorded publication this
+            user cannot read.
+        PublicationIntegrityError: A dry run reads a recorded publication
+            that is unreadable, malformed, or fails validation.
+        PhaseSweepError: A dry run found a refusal a launch makes over the
+            recorded studies, as :func:`phasesweep.engine.preview._preview_ledger`
+            documents.
 
     """
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
+    recorded: dict[str, RecordedPhase | None] = {}
+    previews: list[PhasePreview] = []
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
-        # Capability disclosure (review v0.5.18 / finding F7): restate the same
-        # per-phase resume/reproduce contract `phasesweep validate` prints, in
-        # the preview an operator reads immediately before committing to a run.
-        log.info("DRY RUN %s", _metric_scoring_line(experiment.metric))
+        # Capability disclosure: restate the same per-phase resume/reproduce
+        # contract `phasesweep validate` prints, in the preview an operator
+        # reads immediately before committing to a run.
+        for line in experiment_contract_lines(experiment):
+            log.info("DRY RUN %s", line)
+        for warning in experiment_warnings(experiment):
+            log.warning("DRY RUN warning: %s", warning)
         for previewed in experiment.phases:
-            log.info("DRY RUN %s", sampler_capability_line(previewed))
+            log.info("DRY RUN %s", sampler_capability_line(previewed, experiment.resolved_storage))
+            for warning in sampler_warnings(previewed):
+                log.warning("DRY RUN warning: %s", warning)
+        recorded = _preview_ledger(experiment, from_phase=from_phase)
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.
@@ -728,20 +759,25 @@ def _run_experiment_inner(
                     )
                     log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
                 except FileNotFoundError:
-                    winners[phase.name] = _placeholder_winner(phase, inherited)
+                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
                     log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue
         skip_until = False
 
         _warn_flagged_inheritance(phase.name, inherited)
-        winner = _run_phase(
-            experiment,
-            phase,
-            inherited,
-            generation_id=generation_id,
-            ledger=ledger,
-            run_deadline=run_deadline,
-        )
+        if ledger is None:
+            previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
+            winner = previews[-1].winner
+        else:
+            assert generation_id is not None
+            winner = _run_phase(
+                experiment,
+                phase,
+                inherited,
+                generation_id=generation_id,
+                ledger=ledger,
+                run_deadline=run_deadline,
+            )
         if not dry_run:
             assert generation_id is not None
             artifact_io._save_winner(
@@ -750,28 +786,38 @@ def _run_experiment_inner(
                 winner,
                 generation_id=generation_id,
             )
+            group = winner.repeats
             log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s",
+                "phase=%s WINNER trial=%d metric=%g params=%s%s",
                 phase.name,
                 winner.trial_number,
                 winner.metric,
                 winner.params,
+                ""
+                if group is None
+                else (
+                    f" ({group['reduce']} over {group['spread']['n']} repeats of "
+                    f"{group['key']!r}: sd={group['spread']['sd']:g}, "
+                    f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
+                    f"members {[member['trial_number'] for member in group['members']]})"
+                ),
             )
         winners[phase.name] = winner
 
     if dry_run:
+        log.info("DRY RUN %s", _dry_run_total_line(previews))
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 
     assert generation_id is not None
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    # The summary is the generation's versioned result manifest (review
-    # v0.5.16 / blockers 3+4): it lists every artifact with its content hash
-    # so publication can validate the complete result graph, and it freezes
-    # the config semantics (metric, phase plan, config fingerprint) that give
-    # those numbers meaning so later reads never reinterpret them through
-    # whatever config happens to be loaded.
+    # The summary is the generation's versioned result manifest: it lists
+    # every artifact with its content hash so publication can validate the
+    # complete result graph, and it freezes the config semantics (metric,
+    # phase plan, config fingerprint) that give those numbers meaning so later
+    # reads never reinterpret them through whatever config happens to be
+    # loaded.
     summary = {
         "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
         "experiment": experiment.experiment,
@@ -867,8 +913,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     resolves the current pointer and the last-success pointer exactly once
     each. Every phase's winner path is then resolved by :func:`_cli_phase_payloads`
     from that same captured published-generation id, so one status object can
-    never mix generation A's identity with generation B's artifacts (review
-    v0.5.15 / blocker 3).
+    never mix generation A's identity with generation B's artifacts.
 
     The returned mapping is the single experiment status snapshot shared by
     every caller, including ``phasesweep status <experiment>``. Its keys are
@@ -888,10 +933,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
-      verdict -- conditional on that verdict (review v0.5.18 / finding F4). Published
-      results that no longer validate are reported as corrupt rather than as
-      an experiment that never published. After printing this payload, the CLI
-      turns ``"failed"`` into
+      verdict -- conditional on that verdict. Published results that no longer
+      validate are reported as corrupt rather than as an experiment that never
+      published. After printing this payload, the CLI turns ``"failed"`` into
       :class:`~phasesweep.engine.PublicationIntegrityError` and
       ``"permission_denied"`` into
       :class:`~phasesweep.engine.PublicationAccessError`; both exit non-zero.
@@ -912,7 +956,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     per-study cost of computing them here is one small YAML read plus a config
     fingerprint, negligible beside the per-phase Optuna storage reads this call
     already performs. ``tests/test_engine_status_shape.py`` pins both key sets
-    so neither can drift silently again.
+    so neither can drift silently.
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload with generation identity plus per-phase

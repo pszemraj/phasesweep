@@ -14,12 +14,13 @@ from typing import Any, NamedTuple
 import yaml
 
 import phasesweep.engine.paths as path_ops
-from phasesweep.config import Experiment, Metric
+from phasesweep.config import Experiment, Metric, Repeats
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
+from phasesweep.engine.repeats import _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
     _GENERATION_FILE_FILENAMES,
     _MANIFEST_GENERATION_FILE_KINDS,
@@ -28,6 +29,7 @@ from phasesweep.engine.state import (
     PUBLICATION_POINTER_SCHEMA_VERSION,
     WINNER_FILENAME,
     _parse_winner_source,
+    _validate_observed_block,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
 
@@ -37,6 +39,15 @@ class PlannedPhase(NamedTuple):
 
     name: str
     comment: str | None
+
+
+class SnapshotPhases(NamedTuple):
+    """What a generation's validated config snapshot says about each of its phases."""
+
+    inherits: Mapping[str, tuple[str, ...]]
+    """Each phase's parents, in plan order."""
+    repeats: Mapping[str, Repeats | None]
+    """Each phase's configured ``repeats``, or ``None`` for a phase without them."""
 
 
 @dataclass(frozen=True)
@@ -183,12 +194,12 @@ def _unreadable_artifact_permission_detail(subject: str) -> str:
     """Build the manifest-failure detail for an artifact this user may not read.
 
     A permission denial is not corruption, and reporting it as corruption sends
-    the operator to inspect or restore a namespace that is perfectly healthy
-    (re-review v0.5.19 / observation N1). Every generation's
-    ``config.snapshot.yaml`` is owner-only, so a second operator reading a
-    sound tree hits exactly this case; the verdict still fails closed -- an
-    unvalidatable publication may not be reported as published -- but the
-    remedy named is the publishing user, not the restore procedure.
+    the operator to inspect or restore a namespace that is perfectly healthy.
+    Every generation's ``config.snapshot.yaml`` is owner-only, so a second
+    operator reading a sound tree hits exactly this case; the verdict still
+    fails closed -- an unvalidatable publication may not be reported as
+    published -- but the remedy named is the publishing user, not the restore
+    procedure.
 
     :param str subject: Artifact that could not be read, named by role
         (e.g. ``"config_snapshot artifact"``), never by path.
@@ -211,27 +222,27 @@ def _validate_generation_manifest(
 ) -> ValidatedPublication:
     """Validate one generation's complete result graph against its summary manifest.
 
-    "Published" must mean the immutable result is internally complete
-    (review v0.5.16 / blocker 3): every artifact the summary claims exists,
-    hashes to the recorded content, parses, and cross-checks against the
-    summary's own winner facts — and the namespace holds nothing the
-    manifest does not list. Runs both pre-commit (before the last-success
-    pointer may advance) and on every read before a pointer target is trusted.
+    "Published" must mean the immutable result is internally complete: every
+    artifact the summary claims exists, hashes to the recorded content,
+    parses, and cross-checks against the summary's own winner facts — and the
+    namespace holds nothing the manifest does not list. Runs both pre-commit
+    (before the last-success pointer may advance) and on every read before a
+    pointer target is trusted.
 
     The manifest covers phase-scoped winners (``kind`` + ``phase``) and the
     namespace-root provenance files frozen at claim time (``kind`` + ``path``; see
-    :func:`_validate_generation_provenance_files`, review v0.5.18 / finding
-    F6). Every current-format summary lists both provenance files, each of
-    which must exist and match its recorded hash.
+    :func:`_validate_generation_provenance_files`). Every current-format
+    summary lists both provenance files, each of which must exist and match
+    its recorded hash.
 
     A winner carried forward from an earlier generation additionally has that
     generation resolved in this same tree
-    (:func:`_validate_winner_source_generation`, PR #5 review / reviewer 2,
-    blocker 7): the cited namespace holds the evidence behind the number, so a
-    publication whose source generation is absent - or which disagrees with the
-    winner that source published - is not a result this tree can stand behind.
-    The provenance graph shares ancestors, so one top-level call validates
-    each generation it reaches at most once, through ``validated``.
+    (:func:`_validate_winner_source_generation`): the cited namespace holds
+    the evidence behind the number, so a publication whose source generation
+    is absent - or which disagrees with the winner that source published - is
+    not a result this tree can stand behind. The provenance graph shares
+    ancestors, so one top-level call validates each generation it reaches at
+    most once, through ``validated``.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
@@ -245,8 +256,10 @@ def _validate_generation_manifest(
     :raises PublicationAccessError: An artifact cannot be read by the current user.
     :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
         absent, altered, unparsable, or inconsistent with the summary, a
-        winner cites a source generation this tree does not hold, or the
-        provenance graph loops back on a generation still being validated.
+        winner cites a source generation this tree does not hold, a winner's
+        ``repeats`` block is not the repeat axis its config snapshot phase
+        configures, or the provenance graph loops back on a generation still
+        being validated.
     :return ValidatedPublication: The summary, its phase plan and metric
         semantics, and every winner exactly as this validation read it.
     """
@@ -306,7 +319,7 @@ def _validate_generation_manifest(
         if key in listed:
             raise _fail(f"duplicate artifact entry for {key}")
         listed[key] = entry
-    inherits = _validate_generation_provenance_files(
+    snapshot_phases = _validate_generation_provenance_files(
         generation_dir,
         summary,
         listed_files,
@@ -433,10 +446,29 @@ def _validate_generation_manifest(
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
             try:
-                _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
+                confound = _validate_confound_block(
+                    payload.get("confound"), winner_trial=source_trial
+                )
             except ValueError as exc:
                 raise _fail(
                     f"winner for phase {name!r} has no valid confound block ({exc})"
+                ) from exc
+            try:
+                _validate_observed_block(payload.get("observed"))
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid observed block ({exc})"
+                ) from exc
+            try:
+                repeats = _validate_repeats_block(
+                    payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
+                )
+                if name not in snapshot_phases.repeats:
+                    raise ValueError("the config snapshot plans no such phase")
+                _check_repeats_axis(repeats, snapshot_phases.repeats[name])
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid repeats block ({exc})"
                 ) from exc
             winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
@@ -452,7 +484,7 @@ def _validate_generation_manifest(
         generation_id=generation_id,
         summary=summary,
         phase_plan=phase_plan,
-        inherits=inherits,
+        inherits=snapshot_phases.inherits,
         metric=metric,
         winners=winners,
     )
@@ -642,7 +674,8 @@ def _validate_winner_source_generation(
             )
     # Completion, phase fingerprint, and confound verdicts belong to the
     # exposing selection -- a top-up re-selecting this trial ranks a larger
-    # population -- while the fields below come from the cited source trial.
+    # population -- while the fields below come from the cited source trial,
+    # or for a repeats winner from its group, which never changes once complete.
     for field_name in (
         "metric",
         "params",
@@ -653,6 +686,8 @@ def _validate_winner_source_generation(
         "trainer_input",
         "trainer_env_digest",
         "trainer_inherit_env",
+        "observed",
+        "repeats",
     ):
         if source_payload.get(field_name) != payload.get(field_name):
             raise fail(
@@ -667,23 +702,23 @@ def _validate_generation_provenance_files(
     listed_files: Mapping[str, Mapping[str, Any]],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
-) -> Mapping[str, tuple[str, ...]]:
+) -> SnapshotPhases:
     """Validate a generation's claim-time provenance files against its manifest.
 
     Extends the manifest invariant -- every listed artifact exists and hashes
     to its recorded content, and the namespace holds nothing the manifest does
-    not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``
-    (review v0.5.18 / finding F6). The two are all-or-nothing: they are
-    written together at claim time and every current-format summary must list
-    both. A missing file or manifest entry is therefore a format violation.
+    not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``.
+    The two are all-or-nothing: they are written together at claim time and
+    every current-format summary must list both. A missing file or manifest
+    entry is therefore a format violation.
 
     Note that the snapshot is owner-only, so a reader who cannot read it
     cannot validate the publication at all -- the same fail-closed outcome as
     any other unreadable manifest-listed artifact. A permission denial is
     reported as its own reason rather than as "missing or unreadable"
-    (:func:`_unreadable_artifact_permission_detail`, re-review v0.5.19 /
-    observation N1): a second operator on a healthy tree hits it routinely,
-    and the remedy is the publishing user, not a namespace restore.
+    (:func:`_unreadable_artifact_permission_detail`): a second operator on a
+    healthy tree hits it routinely, and the remedy is the publishing user, not
+    a namespace restore.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param Mapping[str, Any] summary: Parsed generation summary payload, whose
@@ -698,7 +733,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return Mapping[str, tuple[str, ...]]: Each snapshot phase's parents, in plan order.
+    :return SnapshotPhases: Each snapshot phase's parents, in plan order, and its
+        configured ``repeats``.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -777,6 +813,7 @@ def _validate_generation_provenance_files(
     # Rebuilding a generation's lineage reads this graph, never the current
     # config's, so every parent must name a phase planned before its child.
     inherits: dict[str, tuple[str, ...]] = {}
+    repeats: dict[str, Repeats | None] = {}
     for phase in snapshot_phases:
         parents = phase.get("inherits")
         if not isinstance(parents, list) or any(
@@ -784,7 +821,16 @@ def _validate_generation_provenance_files(
         ):
             raise fail("config_snapshot artifact has a malformed inheritance graph")
         inherits[phase["name"]] = tuple(parents)
-    return inherits
+        try:
+            raw_repeats = phase.get("repeats")
+            repeats[phase["name"]] = (
+                None if raw_repeats is None else Repeats.model_validate(raw_repeats)
+            )
+        except ValueError as exc:
+            raise fail(
+                f"config_snapshot artifact has a malformed repeats block for {phase['name']!r}"
+            ) from exc
+    return SnapshotPhases(inherits=inherits, repeats=repeats)
 
 
 @dataclass(frozen=True)
@@ -849,14 +895,13 @@ def _read_pointer_target_summary(
     """Read a pointer target's own immutable summary and confirm its identity.
 
     The per-generation lifecycle record is informational and written *after*
-    the last-success pointer commit (review v0.5.15 / blocker 3), so requiring
-    ``state == "complete"``/``"published"`` on it would create a crash window
-    where a just-committed publication reads back as nothing-published. This
-    fails closed on the pointer target's own immutable *summary*: its bytes
-    must match the pointer's anchors, and it must parse as a mapping naming
-    this exact experiment and generation. Callers then validate the complete
-    artifact manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
-    blocker 3).
+    the last-success pointer commit, so requiring ``state == "complete"``/
+    ``"published"`` on it would create a crash window where a just-committed
+    publication reads back as nothing-published. This fails closed on the
+    pointer target's own immutable *summary*: its bytes must match the
+    pointer's anchors, and it must parse as a mapping naming this exact
+    experiment and generation. Callers then validate the complete artifact
+    manifest (:func:`_validate_generation_manifest`).
 
     :param Path summary_path: Immutable generation summary YAML file to read.
     :param str experiment_name: Experiment the summary must name.

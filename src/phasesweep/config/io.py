@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
+from phasesweep.config.common import CONFIG_DIR_CONTEXT
 from phasesweep.config.models import Experiment
+from phasesweep.config.reference import loc_to_path
+
+# Hint lines after a validation error; the first errors are the likeliest root causes.
+_MAX_HINTS = 3
 
 
 class ConfigError(ValueError):
@@ -162,17 +169,45 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     return data
 
 
-def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experiment:
+def describe_validation_error(exc: ValidationError) -> str:
+    """Render a validation error followed by pointers into the configuration reference.
+
+    Each error location maps to the deepest documented key it points into. The first
+    distinct keys, in error order, become ``see: phasesweep explain <key>`` lines, quoted
+    for a shell because reference paths contain ``[]`` and ``<>``. Errors without a
+    location, such as the experiment-level validators', and locations the reference does
+    not document add no line.
+
+    :param ValidationError exc: Validation failure of an :class:`Experiment`.
+    :return str: ``str(exc)`` plus up to three hint lines.
+    """
+    paths: list[str] = []
+    for error in exc.errors(include_input=False):
+        path = loc_to_path(error["loc"])
+        if path is not None and path not in paths:
+            paths.append(path)
+    hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
+    return "\n".join([str(exc), *hints])
+
+
+def load_experiment_bytes(
+    data: bytes, source: str | Path = "<bytes>", *, config_dir: Path | None = None
+) -> Experiment:
     """Parse and validate a config from an already-read byte snapshot.
 
     Args:
         data: UTF-8 YAML bytes.
         source: Human-readable source label used in validation errors.
+        config_dir: Absolute directory of the config file the bytes came from.
+            Relative ``workdir``, journal ``storage`` and ``execution.cwd``
+            paths resolve against it. ``None`` leaves them relative to the
+            process working directory.
 
     Returns:
         :class:`Experiment` parsed from exactly ``data``.
 
     Raises:
+        ValueError: ``config_dir`` is not absolute.
         ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
             duplicate mapping keys rejected by the strict loader), or the top level
             is not a mapping.
@@ -180,12 +215,15 @@ def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experi
             model validation.
 
     """
+    if config_dir is not None and not config_dir.is_absolute():
+        raise ValueError(f"config_dir must be absolute; got {str(config_dir)!r}")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
-    return Experiment.model_validate(parsed)
+    context = None if config_dir is None else {CONFIG_DIR_CONTEXT: config_dir}
+    return Experiment.model_validate(parsed, context=context)
 
 
 def load_experiment(path: str | Path) -> Experiment:
@@ -194,7 +232,11 @@ def load_experiment(path: str | Path) -> Experiment:
     Uses a strict loader that rejects duplicate mapping keys. PyYAML's default
     ``safe_load`` silently keeps the last value for a duplicate key, which can
     cause an experiment to silently use the wrong search range or fixed
-    override (review v0.5.6 / non-blocking hardening item).
+    override.
+
+    Relative ``workdir``, journal ``storage`` and ``execution.cwd`` paths
+    resolve against the directory of the file after symlinks are resolved, so
+    the same file names the same artifact tree from any working directory.
 
     Args:
         path: Filesystem path to the experiment YAML file.
@@ -211,4 +253,6 @@ def load_experiment(path: str | Path) -> Experiment:
 
     """
     path_obj = Path(path)
-    return load_experiment_bytes(path_obj.read_bytes(), source=path_obj)
+    return load_experiment_bytes(
+        path_obj.read_bytes(), source=path_obj, config_dir=path_obj.resolve().parent
+    )

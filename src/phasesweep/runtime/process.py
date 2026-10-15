@@ -11,19 +11,18 @@ Design:
   - A global registry of live children lets us clean up on orchestrator death.
   - PID files in each trial_dir let operators identify orphans manually.
 
-Launch barrier (review v0.5.15 / blocker 1): every trial launches through a
-two-phase supervisor. Before the parent acknowledges, the supervisor is a
-stdlib-only helper script (``phasesweep.runtime.supervisor``) run directly
-(never ``-m``) under ``python -I -S`` with a minimal sanitized environment —
-just ``PATH``. It cannot import the phasesweep package, a poisoned/shadowed
-package from the trainer's ``PYTHONPATH``, or a trainer-composed
-``sitecustomize``, and it starts in ~30ms instead of paying phasesweep's
-package-import cost. Only after this process durably persists
-``process_identity.json`` does it send the trainer's shell command and full
-environment to the supervisor as a framed JSON payload. The supervisor stays
-outside the trainer's process group as a trusted GPU-lease guardian; its
-blocked child becomes the recorded process-group leader before executing
-``/bin/sh -c cmd``.
+Launch barrier: every trial launches through a two-phase supervisor. Before
+the parent acknowledges, the supervisor is a stdlib-only helper script
+(``phasesweep.runtime.supervisor``) run directly (never ``-m``) under
+``python -I -S`` with a minimal sanitized environment — just ``PATH``. It
+cannot import the phasesweep package, a poisoned/shadowed package from the
+trainer's ``PYTHONPATH``, or a trainer-composed ``sitecustomize``, and it
+starts in ~30ms instead of paying phasesweep's package-import cost. Only
+after this process durably persists ``process_identity.json`` does it send the
+trainer's shell command and full environment to the supervisor as a framed
+JSON payload. The supervisor stays outside the trainer's process group as a
+trusted GPU-lease guardian; its blocked child becomes the recorded
+process-group leader before executing ``/bin/sh -c cmd``.
 """
 
 from __future__ import annotations
@@ -42,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -54,14 +53,17 @@ from phasesweep.runtime.reaper import (
     _process_group_alive,
     _terminate_process_group,
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownLaunchRefusedError,
     _launch_lock,
     _register,
     _unregister,
     defer_shutdown_signals,
+    servicing_shutdown_signal,
 )
 
 log = logging.getLogger("phasesweep.runtime.process")
@@ -70,10 +72,9 @@ _DIRECT_CHILD_REAP_TIMEOUT_SECONDS = 5.0
 _GUARDIAN_EXIT_TIMEOUT_SECONDS = (
     _supervisor._GROUP_TERM_GRACE_SECONDS + _DIRECT_CHILD_REAP_TIMEOUT_SECONDS
 )
-# With the -I -S stdlib-only launch (review v0.5.15 / blocker 1), supervisor
-# startup no longer pays phasesweep's package-import cost (~0.55s pre-fix) —
-# real-world readiness lands in ~30ms. 10s stays generous headroom for a
-# loaded host, not a tight bound.
+# With the -I -S stdlib-only launch, supervisor startup does not pay
+# phasesweep's package-import cost, so real-world readiness lands in ~30ms.
+# 10s stays generous headroom for a loaded host, not a tight bound.
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
 # poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
 # trial timeout may be longer.
@@ -86,8 +87,8 @@ def _supervisor_script_path() -> str:
     Importing :mod:`phasesweep.runtime.supervisor` here (in the PARENT) is
     safe — the parent already has the full ``phasesweep`` package loaded.
     Only the supervisor *subprocess* must stay import-free before the
-    ready/ack barrier (review v0.5.15 / blocker 1); this import never runs in
-    that subprocess, which launches the file directly via its path instead.
+    ready/ack barrier; this import never runs in that subprocess, which
+    launches the file directly via its path instead.
 
     :return str: Absolute path to ``supervisor.py`` on disk.
     :raises RuntimeError: If the imported module has no ``__file__`` (e.g. a
@@ -109,19 +110,17 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
     Returns ``True`` when the group is confirmed gone, ``False`` when cleanup
     is uncertain (survived SIGKILL, permission denied, etc.). Callers must
     propagate uncertainty so the orchestrator can refuse to schedule more work
-    onto a potentially-leaked GPU (review v0.5.9 / blocker 3).
+    onto a potentially-leaked GPU.
 
-    Pre-v0.5.15 this only reaped the direct child (``proc``) when a single
-    nonblocking ``poll()`` already observed it exited — a race where the
-    child died right after ``poll()`` returned ``None`` left it an unreaped
-    zombie despite ``cleanup_confirmed`` being reported ``True`` (review
-    v0.5.15 / blocker 4). Once :func:`_terminate_process_group` confirms every
-    group member is gone, this now unconditionally does one bounded blocking
-    ``wait`` on the direct child so it is provably reaped (or cleanup is
-    reported unconfirmed) before returning. This never calls ``proc.wait()``
-    from ``_shutdown_handler`` itself — that path documents why it must not
-    block (see :func:`_shutdown_handler`); this function only runs on normal
-    (non-signal-handler) cleanup paths.
+    Once :func:`_terminate_process_group` confirms every group member is gone,
+    this unconditionally does one bounded blocking ``wait`` on the direct
+    child so it is provably reaped (or cleanup is reported unconfirmed) before
+    returning. A single nonblocking ``poll()`` would not be enough: a child
+    that died right after ``poll()`` returned ``None`` would stay an unreaped
+    zombie despite ``cleanup_confirmed`` being reported ``True``. This never
+    calls ``proc.wait()`` from ``_shutdown_handler`` itself — that path
+    documents why it must not block (see :func:`_shutdown_handler`); this
+    function only runs on normal (non-signal-handler) cleanup paths.
 
     Worst case this blocks for roughly ``_KILL_GRACE_SECONDS`` (10s) SIGTERM
     grace + ~2s SIGKILL confirm inside :func:`_terminate_process_group`, plus
@@ -259,11 +258,11 @@ def _choose_process_deadline(
 class _LaunchDeadlineExpired(Exception):
     """The launch deadline expired before the trainer payload was delivered.
 
-    Raised inside the supervised-launch critical section (review v0.5.16 /
-    blocker 6) so :func:`run_supervised` can classify the outcome as a
-    timeout — the trainer never started — instead of a generic launch
-    failure. Carries the cleanup confirmation and pid when the raising site
-    already aborted the blocked supervisor itself.
+    Raised inside the supervised-launch critical section so
+    :func:`run_supervised` can classify the outcome as a timeout — the trainer
+    never started — instead of a generic launch failure. Carries the cleanup
+    confirmation and pid when the raising site already aborted the blocked
+    supervisor itself.
     """
 
     def __init__(
@@ -290,6 +289,7 @@ def _trial_process_identity(
     attempt_id: str,
     pid: int,
     pgid: int,
+    pid_namespace: str,
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
@@ -299,6 +299,8 @@ def _trial_process_identity(
             reader cannot mistake it for a different trial's process.
         pid: PID of the just-launched supervisor process.
         pgid: Process-group ID the supervisor was registered under.
+        pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in,
+            from :func:`read_pid_namespace` before the launch.
 
     Returns:
         A :class:`StaleProcessIdentity` combining the given fields with the
@@ -314,6 +316,7 @@ def _trial_process_identity(
         pgid=pgid,
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
+        pid_namespace=pid_namespace,
     )
 
 
@@ -335,6 +338,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
                 "pgid": identity.pgid,
                 "proc_starttime": identity.proc_starttime,
                 "boot_id": identity.boot_id,
+                "pid_namespace": identity.pid_namespace,
             },
             sort_keys=True,
         )
@@ -351,14 +355,13 @@ _ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
 class AttemptLifecycle:
     """Durable coarse lifecycle state for one trial attempt.
 
-    Closes the two recovery windows the transient identity file could not
-    represent (review v0.5.17 / blocker 2): ``allocated`` says a durable
-    Optuna ``RUNNING`` trial exists but no process launch was attempted (the
-    worker may still be queued for a GPU), ``launching`` is committed before
-    ``Popen`` so a failed identity write cannot masquerade as that pre-launch
-    state, and ``exited`` says the supervised process group is confirmed gone
-    even though evidence extraction and the Optuna terminal commit may not
-    have happened yet.
+    Covers the recovery windows the process identity file alone cannot
+    represent: ``allocated`` says a durable Optuna ``RUNNING`` trial exists but
+    no process launch was attempted (the worker may still be queued for a
+    GPU), ``launching`` is committed before ``Popen`` so a failed identity
+    write cannot masquerade as that pre-launch state, and ``exited`` says the
+    supervised process group is confirmed gone even though evidence extraction
+    and the Optuna terminal commit may not have happened yet.
     """
 
     state: str
@@ -505,9 +508,9 @@ def _sanitized_supervisor_env() -> dict[str, str]:
     composed for this trial — is intentionally withheld: the interpreter
     that runs ``supervisor.py`` has not yet passed the ready/ack barrier, so
     it must not see anything a trainer-composed environment could use to
-    execute code before phasesweep's process identity is durable (review
-    v0.5.15 / blocker 1). The trainer environment is delivered separately,
-    over the ack pipe, only after identity persistence succeeds.
+    execute code before phasesweep's process identity is durable. The trainer
+    environment is delivered separately, over the ack pipe, only after
+    identity persistence succeeds.
 
     :return dict[str, str]: ``{"PATH": ...}`` using the parent's ``PATH``, or
         a conservative fallback when the parent has none.
@@ -525,7 +528,7 @@ def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None
     :param str cmd: Shell command string the supervisor execs with ``/bin/sh``.
     :param dict[str, str] env: Full trainer process environment.
     :param str | None cwd: Optional working directory the supervisor changes
-        into before exec'ing the trainer (review v0.5.17 / blocker 4).
+        into before exec'ing the trainer.
     :return bytes: An ASCII decimal length header (byte length of the UTF-8
         JSON body) immediately followed by that many body bytes.
     """
@@ -651,13 +654,12 @@ def _spawn_blocked_supervisor(
     :func:`_sanitized_supervisor_env`. Passes it a readiness pipe and an
     acknowledgement pipe. Blocks (via ``select``) until the supervisor
     forks a blocked trainer session and reports that child's PID, or
-    ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses —
-    capped by the remaining launch ``deadline`` when one is given (review
-    v0.5.16 / blocker 6), so a slow supervisor startup can never outlive the
-    trial's own wallclock budget. Then registers the new process group. On
-    any failure — timeout, an unexpected readiness byte, or an exception
-    from ``Popen`` itself — any spawned process group is killed and
-    unregistered before the exception propagates.
+    ``_SUPERVISOR_READY_TIMEOUT_SECONDS`` elapses — capped by the remaining
+    launch ``deadline`` when one is given, so a slow supervisor startup can
+    never outlive the trial's own wallclock budget. Then registers the new
+    process group. On any failure — timeout, an unexpected readiness byte, or
+    an exception from ``Popen`` itself — any spawned process group is killed
+    and unregistered before the exception propagates.
 
     Args:
         stdout: Already-open file handle that receives the subprocess stdout.
@@ -786,13 +788,13 @@ def run_supervised(
     """Launch a shell command in its own process group with full lifecycle management.
 
     Launches a small stdlib-only supervisor first (see module docstring for
-    the pre-ACK/post-ACK launch boundary; review v0.5.15 / blocker 1). The
-    supervisor waits on an inherited acknowledgement pipe while the parent
-    atomically persists ``process_identity.json``. Only after the identity is
-    durable does the parent send the trainer command and full trainer
-    environment to the supervisor as a framed JSON payload. The supervisor
-    then stays alive outside the trainer's process group as a lease guardian
-    while a descriptor-scrubbed child executes the trainer command. If the parent dies
+    the pre-ACK/post-ACK launch boundary). The supervisor waits on an
+    inherited acknowledgement pipe while the parent atomically persists
+    ``process_identity.json``. Only after the identity is durable does the
+    parent send the trainer command and full trainer environment to the
+    supervisor as a framed JSON payload. The supervisor then stays alive
+    outside the trainer's process group as a lease guardian while a
+    descriptor-scrubbed child executes the trainer command. If the parent dies
     before delivering that payload, pipe EOF makes the supervisor exit
     without starting training.
 
@@ -800,20 +802,19 @@ def run_supervised(
     returned 0 and no descendant processes were left alive — the attempt
     lifecycle is durably advanced to ``exited``. If the root exits cleanly
     but leaves GPU-holding descendants running, we treat that as a lifecycle
-    failure and kill the group (review v0.5.5 / blocker 1).
+    failure and kill the group.
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
     ``timeout`` is the per-trial launch-plus-execution budget, converted to an
-    absolute ``time.monotonic()`` deadline at entry (review v0.5.16 /
-    blocker 6). ``wallclock_deadline`` carries the already-running phase/run
-    budget through work performed before this function. The earlier deadline
-    wins. Every supervised stage consumes it: the supervisor readiness wait
-    is capped to the remainder, the deadline is re-checked after identity
-    persistence and *before* the trainer payload crosses the ack pipe — an
-    expired deadline aborts the blocked supervisor and returns a timeout
-    without ever starting the trainer — and the wait for the trainer root
-    uses the recomputed remainder. Cleanup grace after a timeout or an
+    absolute ``time.monotonic()`` deadline at entry. ``wallclock_deadline``
+    carries the already-running phase/run budget through work performed
+    before this function. The earlier deadline wins. Every supervised stage
+    consumes it: the supervisor readiness wait is capped to the remainder, the
+    deadline is re-checked after identity persistence and *before* the trainer
+    payload crosses the ack pipe — an expired deadline aborts the blocked
+    supervisor and returns a timeout without ever starting the trainer — and
+    the wait for the trainer root uses the recomputed remainder. Cleanup grace after a timeout or an
     in-budget root exit is explicitly post-deadline time.
 
     Once the supervisor is spawned, launch failures — an expired deadline, a
@@ -834,8 +835,7 @@ def run_supervised(
             deadline. Work before this call has already consumed it.
         cwd: Optional working directory the supervisor changes into before
             exec'ing the trainer, delivered over the ack pipe with the rest
-            of the launch payload (review v0.5.17 / blocker 4). ``None``
-            keeps the invocation cwd.
+            of the launch payload. ``None`` keeps the invocation cwd.
         gpu_lease_fds: Open host GPU-lock descriptors inherited by the trusted
             supervisor guardian, not its trainer child. The orchestrator
             closes only its copies; the guardian retains each lock until the
@@ -849,6 +849,10 @@ def run_supervised(
         confirm the group is gone).
 
     Raises:
+        PhaseSweepError: This process's PID namespace is unreadable, so nothing
+            was recorded or launched.
+        ShutdownLaunchRefusedError: A shutdown signal is being serviced, so
+            no process was started and the attempt is recorded as exited.
         RuntimeError: The supervisor never signalled readiness, or signalled an
             unexpected byte, so no process group was ever created.
         OSError: The supervisor process or its pipes could not be created, or
@@ -875,9 +879,8 @@ def run_supervised(
     # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
     # SIGTERM/SIGINT cannot land between ``_launch_lock`` acquisition and
-    # signal masking (review v0.5.9 / blocker 2). Reversing the order
-    # (``_launch_lock`` first, then ``defer_shutdown_signals()``) creates
-    # two deadlock windows:
+    # signal masking. Reversing the order (``_launch_lock`` first, then
+    # ``defer_shutdown_signals()``) creates two deadlock windows:
     #
     # 1. Signal lands after lock acquired but before mask set: handler runs
     #    in same thread and blocks on the lock it already holds.
@@ -892,9 +895,27 @@ def run_supervised(
     ack_write: int | None = None
     status_read: int | None = None
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
+    # The trial inherits this namespace, so it is read before anything is
+    # recorded or spawned: without it a later cleanup could not tell the
+    # trial's PID from another namespace's, so the launch is refused with
+    # nothing to undo.
+    pid_namespace = read_pid_namespace()
+    if pid_namespace is None:
+        raise PhaseSweepError(
+            "cannot read this process's PID namespace: /proc must be the procfs of its own "
+            "PID namespace, with that namespace's PID 1 readable. Refused to launch a trial "
+            "whose process identity could not be tied to it.",
+            action=OperatorAction.FIX_CONFIG,
+        )
 
     try:
         with defer_shutdown_signals(), _launch_lock:
+            # The handler sets the servicing signal before it takes this lock
+            # to snapshot children, so a launch past this check is in its
+            # snapshot and one after it never starts a process.
+            signum = servicing_shutdown_signal()
+            if signum is not None:
+                raise ShutdownLaunchRefusedError(signum)
             # Advance durably before Popen. Without this boundary, a spawned
             # supervisor whose identity write and cleanup both fail is
             # indistinguishable on recovery from a worker killed while still
@@ -915,20 +936,20 @@ def run_supervised(
                 attempt_id=attempt_id,
                 pid=pgid,
                 pgid=pgid,
+                pid_namespace=pid_namespace,
             )
             _write_process_identity(identity_path, identity)
             if deadline is not None and time.monotonic() >= deadline:
                 # The budget expired during launch bookkeeping. The payload
                 # has NOT been delivered, so the blocked supervisor can be
-                # aborted without any trainer work ever starting (review
-                # v0.5.16 / blocker 6).
+                # aborted without any trainer work ever starting.
                 raise _LaunchDeadlineExpired(
                     "trial launch deadline expired before the trainer payload was delivered",
                     pid=pgid,
                 )
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
-            # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
+            # ack pipe as a framed JSON payload.
             _write_all(
                 ack_write,
                 _encode_launch_payload(cmd, env, cwd),
@@ -1163,13 +1184,13 @@ def run_supervised(
                 os.close(status_read)
         _unregister(pgid)
 
-    # The identity record is deliberately RETAINED on clean exit (review
-    # v0.5.17 / blocker 2 gap B): the orchestrator can still die between
-    # here and the Optuna terminal commit (evidence extraction, gates), and
-    # recovery must be able to distinguish "safely exited" from "identity
-    # missing". Both this normal path and the failed-wait cleanup path above
-    # write the durable 'exited' transition only after confirming that the
-    # whole group is gone; a wait exception alone is never proof of exit.
+    # The identity record is deliberately RETAINED on clean exit: the
+    # orchestrator can still die between here and the Optuna terminal commit
+    # (evidence extraction, gates), and recovery must be able to distinguish
+    # "safely exited" from "identity missing". Both this normal path and the
+    # failed-wait cleanup path above write the durable 'exited' transition
+    # only after confirming that the whole group is gone; a wait exception
+    # alone is never proof of exit.
     if cleanup_confirmed:
         _record_attempt_exited(
             trial_dir,

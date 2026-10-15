@@ -1,7 +1,11 @@
-"""Installed-package starter configuration workflow."""
+"""Installed-package template configuration workflow."""
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -12,49 +16,243 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from phasesweep import load_experiment
-from phasesweep.cli import _starter_experiment_text
+from phasesweep.cli import _template_names, _template_purpose
 from phasesweep.cli import cli as cli_main
+from phasesweep.engine import run_experiment
+from phasesweep.engine.state import Winner
 from phasesweep.mcp.registry import Registry
 from phasesweep.runtime.files import file_url_path
 
+TEMPLATES = _template_names()
 
-def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
+
+def _template_bytes(template: str) -> bytes:
+    """Read one packaged template file as shipped.
+
+    :param str template: Template name.
+    :return bytes: The file's exact bytes.
+    """
+    return resources.files("phasesweep").joinpath("templates", f"{template}.yaml").read_bytes()
+
+
+@pytest.fixture
+def trainer_python_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the test interpreter the ``python`` the templates' trial command finds.
+
+    Templates run ``python -m phasesweep.examples.fake_train`` with the default
+    ``inherit_env: none``, so the trainer gets only the ambient ``PATH``.
+    """
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
+    )
+
+
+def _init_and_run(tmp_path: Path, template: str) -> dict[str, Winner]:
+    """Write a template in a scratch directory and run it on the toy trainer.
+
+    Asserts that every phase published a winner that ``show-winners`` can read.
+
+    :param Path tmp_path: Directory that holds the scratch directory.
+    :param str template: Template name.
+    :return dict[str, Winner]: Winners by phase name.
+    """
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        written = runner.invoke(cli_main, ["init", "--template", template])
+        assert written.exit_code == 0, written.output
+        config = f"{template}.yaml"
+        experiment = load_experiment(Path(config).resolve())
+        winners = run_experiment(experiment)
+        assert list(winners) == [phase.name for phase in experiment.phases]
+        shown = runner.invoke(cli_main, ["show-winners", config])
+        assert shown.exit_code == 0, shown.output
+    return winners
+
+
+def test_init_list_prints_every_template_with_a_purpose(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli_main, ["init", "--list"])
+
+        assert result.exit_code == 0, result.output
+        assert list(Path().iterdir()) == []
+    listed = [line.split(maxsplit=1) for line in result.output.splitlines()]
+    assert [name for name, _purpose in listed] == TEMPLATES
+    assert TEMPLATES[0] == "starter"
+    for name, purpose in listed:
+        assert purpose == _template_purpose(name)
+        assert purpose.strip()
+
+
+def test_init_default_writes_starter_yaml_in_cwd(tmp_path: Path) -> None:
     runner = CliRunner()
     with runner.isolated_filesystem(temp_dir=tmp_path):
         result = runner.invoke(cli_main, ["init"])
-        assert result.exit_code == 0, result.output
-        assert "phasesweep validate experiment.yaml" in result.output
-        assert "phasesweep run experiment.yaml --dry-run" in result.output
-        assert "phasesweep mcp init-catalog --from experiment.yaml" in result.output
 
-        config_path = Path("experiment.yaml").resolve()
+        assert result.exit_code == 0, result.output
+        assert [path.name for path in Path().iterdir()] == ["starter.yaml"]
+
+
+def test_init_into_directory_writes_template_named_file(tmp_path: Path) -> None:
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    created = tmp_path / "new" / "configs"
+
+    into_existing = CliRunner().invoke(
+        cli_main, ["init", "--template", "noisy", "-o", str(existing)]
+    )
+    into_created = CliRunner().invoke(
+        cli_main, ["init", "--template", "chained", "-o", f"{created}{os.sep}"]
+    )
+
+    assert into_existing.exit_code == 0, into_existing.output
+    assert (existing / "noisy.yaml").is_file()
+    assert into_created.exit_code == 0, into_created.output
+    assert (created / "chained.yaml").is_file()
+    assert f"phasesweep validate {existing / 'noisy.yaml'}" in into_existing.output
+
+
+def test_init_unknown_template_exits_2(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli_main, ["init", "--template", "bogus"])
+
+        assert result.exit_code == 2
+        assert "'bogus' is not one of" in result.output
+        assert list(Path().iterdir()) == []
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_template_headers_name_explain(template: str) -> None:
+    first, second, *_rest = _template_bytes(template).decode("utf-8").splitlines()
+
+    assert first.startswith("# phasesweep template: ")
+    assert _template_purpose(template)
+    assert second.startswith("# Details on any key: phasesweep explain ")
+    assert "phasesweep explain 'phases[].sampler'" in second
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_init_writes_template_bytes_verbatim(tmp_path: Path, template: str) -> None:
+    output = tmp_path / "out" / "chosen.yaml"
+
+    result = CliRunner().invoke(cli_main, ["init", "--template", template, "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    assert output.read_bytes() == _template_bytes(template)
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_init_template_loads_validates_and_scaffolds_a_catalog(
+    tmp_path: Path, template: str
+) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        config = f"{template}.yaml"
+        result = runner.invoke(cli_main, ["init", "--template", template])
+        assert result.exit_code == 0, result.output
+        assert f"Wrote the {template} template to" in result.output
+        assert f"phasesweep validate {config}" in result.output
+        assert f"phasesweep run {config} --dry-run" in result.output
+        assert f"phasesweep status {config} --trials" in result.output
+        assert f"phasesweep mcp init-catalog --from {config}" in result.output
+        assert "phasesweep explain" in result.output
+
+        config_path = Path(config).resolve()
+        experiment = load_experiment(config_path)
+        # Config-relative paths and a pinned trainer directory: the same file
+        # names the same study from any directory.
+        assert experiment.workdir == str(config_path.parent / "runs")
+        assert experiment.execution.cwd == str(config_path.parent)
+        assert experiment.storage == "auto"
+        assert "phasesweep.examples.fake_train" in experiment.trial_command
+
+        validated = runner.invoke(cli_main, ["validate", config])
+        assert validated.exit_code == 0, validated.output
+        dry_run = runner.invoke(cli_main, ["run", config, "--dry-run"])
+        assert dry_run.exit_code == 0, dry_run.output
+        scaffolded = runner.invoke(
+            cli_main, ["mcp", "init-catalog", "--from", config, "-o", "catalog.yaml"]
+        )
+        assert scaffolded.exit_code == 0, scaffolded.output
+        assert Registry.load(Path("catalog.yaml")).get(template).allow_launch is False
+
+
+def test_starter_template_shape(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        assert runner.invoke(cli_main, ["init"]).exit_code == 0
+
+        config_path = Path("starter.yaml").resolve()
+        # The template is written verbatim; its relative workdir anchors at load.
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["workdir"] == "./runs"
         experiment = load_experiment(config_path)
         assert experiment.experiment == "phasesweep_starter"
-        assert Path(experiment.workdir).is_absolute()
-        assert experiment.storage == "auto"
         assert file_url_path(experiment.resolved_storage) == str(
             config_path.parent / "runs" / experiment.experiment / "study.journal"
         )
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
         assert experiment.phases[1].inherits == ["depth"]
-        assert "phasesweep.examples.fake_train" in experiment.trial_command
         assert experiment.override_format == "yaml_file"
         assert experiment.execution.inherit_env == "none"
         assert "{config_path}" in experiment.trial_command
         assert experiment.trainer_config["model"]["n_layers"] == 8
         assert "--out" not in experiment.trial_command
 
-        validated = runner.invoke(cli_main, ["validate", "experiment.yaml"])
-        assert validated.exit_code == 0, validated.output
-        dry_run = runner.invoke(cli_main, ["run", "experiment.yaml", "--dry-run"])
-        assert dry_run.exit_code == 0, dry_run.output
-        scaffolded = runner.invoke(
-            cli_main,
-            ["mcp", "init-catalog", "--from", "experiment.yaml", "-o", "catalog.yaml"],
-        )
-        assert scaffolded.exit_code == 0, scaffolded.output
-        assert Registry.load(Path("catalog.yaml")).get("experiment").allow_launch is False
+
+def test_argparse_template_renders_trainer_config_leaves_as_flags(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        assert runner.invoke(cli_main, ["init", "--template", "argparse"]).exit_code == 0
+        experiment = load_experiment(Path("argparse.yaml").resolve())
+
+        with caplog.at_level(logging.INFO):
+            run_experiment(experiment, dry_run=True)
+
+    assert experiment.override_format == "argparse"
+    assert "{overrides}" in experiment.trial_command
+    assert "--model.n_layers=8" in caplog.text
+    assert "--optimizer.weight_decay=0.05" in caplog.text
+    assert "--optimizer.lr=" in caplog.text
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("trainer_python_on_path")
+@pytest.mark.parametrize("template", [name for name in TEMPLATES if name != "noisy"])
+def test_init_template_runs_to_a_winner_per_phase_on_the_toy_trainer(
+    tmp_path: Path, template: str
+) -> None:
+    """Every template but ``noisy``, which its own test below runs, publishes a winner per phase."""
+    assert _init_and_run(tmp_path, template)
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("trainer_python_on_path")
+def test_noisy_template_winner_comes_from_single_trials_and_records_the_observation(
+    tmp_path: Path,
+) -> None:
+    winners = _init_and_run(tmp_path, "noisy")
+
+    assert list(winners) == ["learning_rate"]
+    assert winners["learning_rate"].repeats is None
+    assert winners["learning_rate"].observed == {"param_bytes": 8_800_000.0}
+
+
+def test_noisy_template_is_a_dense_single_seed_learning_rate_grid(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        assert runner.invoke(cli_main, ["init", "--template", "noisy"]).exit_code == 0
+        experiment = load_experiment(Path("noisy.yaml").resolve())
+
+    (phase,) = experiment.phases
+    assert phase.repeats is None
+    assert phase.n_trials == 8
+    assert phase.sampler.type == "grid"
+    assert list(phase.search_space) == ["optimizer.lr"]
+    assert experiment.trainer_config["seed"] == 1
 
 
 def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> None:
@@ -68,52 +266,29 @@ def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> No
     assert Path(experiment.workdir) == output.parent / "runs"
 
 
-def _assert_starter_destination_round_trip(output: Path) -> Path:
-    """Render and initialize ``output``, then return its decoded work directory."""
-    runs_dir = output.parent / "runs"
-    rendered = yaml.safe_load(_starter_experiment_text(output))
-    assert rendered["workdir"] == str(runs_dir)
-    assert rendered["storage"] == "auto"
+def test_init_round_trips_non_bmp_destination_path(tmp_path: Path) -> None:
+    """A non-BMP character in the destination directory survives config load.
+
+    The starter's relative workdir resolves against the config file's
+    directory, so the loaded workdir must name that directory's ``runs`` with
+    every character intact; a lone surrogate would fail every later
+    filesystem call with ``UnicodeEncodeError``.
+    """
+    project = tmp_path / "\U0001f680 sweeps"
+    project.mkdir()
+    output = project / "starter.yaml"
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
     assert result.exit_code == 0, result.output
-    return Path(load_experiment(output).workdir)
-
-
-@pytest.mark.parametrize(
-    "project_name",
-    [
-        pytest.param("\U0001f680 sweeps", id="non_bmp_character"),
-        pytest.param("__PHASESWEEP_STORAGE__", id="placeholder_literal"),
-    ],
-)
-def test_init_round_trips_awkward_destination_paths(tmp_path: Path, project_name: str) -> None:
-    """Rendered paths must survive YAML decoding byte-for-byte.
-
-    ``json.dumps`` with the default ``ensure_ascii=True`` escapes a non-BMP
-    character as a UTF-16 surrogate pair, which a YAML double-quoted scalar
-    decodes into lone surrogates; every later filesystem call on the decoded
-    workdir then fails with ``UnicodeEncodeError``.
-
-    Placeholder substitution must also never rescan text it already inserted.
-    Replacing the placeholders one after another lets a destination path that
-    contains a placeholder literal be rewritten by a later replacement, which
-    corrupts a config that ``init`` still reports as written.
-    """
-    project = tmp_path / project_name
-    project.mkdir()
-    output = project / "experiment.yaml"
-    runs_dir = output.parent / "runs"
-    workdir = _assert_starter_destination_round_trip(output)
-    # Lone surrogates raise UnicodeEncodeError here; a real path does not.
+    workdir = Path(load_experiment(output).workdir)
     workdir.mkdir(parents=True)
-    assert workdir == runs_dir
+    assert workdir == project / "runs"
 
 
 def test_init_preserves_question_mark_in_journal_path(tmp_path: Path) -> None:
     project = tmp_path / "local?sweeps"
-    output = project / "experiment.yaml"
+    output = project / "starter.yaml"
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -152,7 +327,7 @@ def test_init_prints_next_commands_with_the_expanded_path(
 
 
 def test_init_refuses_to_replace_existing_file(tmp_path: Path) -> None:
-    output = tmp_path / "experiment.yaml"
+    output = tmp_path / "starter.yaml"
     output.write_text("keep me\n")
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
@@ -163,7 +338,7 @@ def test_init_refuses_to_replace_existing_file(tmp_path: Path) -> None:
 
 
 def test_init_refuses_broken_symlink(tmp_path: Path) -> None:
-    output = tmp_path / "experiment.yaml"
+    output = tmp_path / "starter.yaml"
     output.symlink_to(tmp_path / "missing-target.yaml")
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
@@ -193,7 +368,7 @@ def test_init_write_failure_is_a_user_facing_error_that_does_not_claim_destinati
     ``FileExistsError``. Whichever step fails, the destination is never claimed
     and no temporary file is left behind.
     """
-    output = tmp_path / "experiment.yaml"
+    output = tmp_path / "starter.yaml"
 
     def fail(*_args: object) -> None:
         raise error
@@ -207,14 +382,14 @@ def test_init_write_failure_is_a_user_facing_error_that_does_not_claim_destinati
     assert f"phasesweep init: cannot write {output}: {error}" in result.output
     assert "Traceback" not in result.output
     assert not output.exists()
-    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
+    assert not list(tmp_path.glob(".starter.yaml.*.tmp"))
 
 
 def test_init_losing_publish_race_preserves_other_writer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    output = tmp_path / "experiment.yaml"
+    output = tmp_path / "starter.yaml"
 
     def lose_publish_race(_source: Path, destination: Path) -> None:
         destination.write_text("other process\n")
@@ -227,4 +402,4 @@ def test_init_losing_publish_race_preserves_other_writer(
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "other process\n"
-    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
+    assert not list(tmp_path.glob(".starter.yaml.*.tmp"))

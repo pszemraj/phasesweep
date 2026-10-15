@@ -135,8 +135,8 @@ def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Pat
         "WAITING": 0,
         "RUNNING": 0,
         "COMPLETE": 0,
-        "PRUNED": 0,
         "FAIL": 0,
+        "INTERRUPTED": 0,
     }
     assert phase["terminal_trials_total"] == 0
     assert phase["terminal_trials_before_run"] == 0
@@ -186,8 +186,8 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         "WAITING": 0,
         "RUNNING": 0,
         "COMPLETE": 2,
-        "PRUNED": 0,
         "FAIL": 1,
+        "INTERRUPTED": 0,
     }
     assert run_status["phases"][0]["terminal_trials_total"] == 3
     assert run_status["phases"][0]["terminal_trials_before_run"] == 3

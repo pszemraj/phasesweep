@@ -72,7 +72,9 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     :param Sequence[Path] configs: Experiment configs, one catalog entry each.
     :return str: Complete catalog YAML with explanatory comments.
     :raises CatalogError: Two configs derive the same experiment id, or
-        ``PHASESWEEP_HOME`` is not a usable private root.
+        ``PHASESWEEP_HOME`` is relative, has a symlinked component, or names an
+        existing directory that is not owner-only. A missing ``PHASESWEEP_HOME``
+        is created owner-only.
     """
     catalog_dir = output.parent.resolve()
     seen: dict[str, Path] = {}
@@ -92,7 +94,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             f"""\
   - id: {experiment_id_scalar}          # the only token the agent ever sends
     config: {config_path}   # resolved relative to this catalog file
-    cwd: "."                     # detached runner cwd; trainer inherits it only when execution.cwd is unset
+    cwd: "."                     # detached runner cwd, relative to this catalog; the trainer's only when execution.cwd is unset
     # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
     # Side effects default to false. Uncomment deliberately to let the agent act:
