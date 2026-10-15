@@ -914,12 +914,13 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
     )
     first_finished = threading.Event()
     second_entered = threading.Event()
+    leading_trial_number = 0
     original_optimize = optuna.Study.optimize
     launched = []
 
     def optimize(study, objective, **kwargs):
         def scheduled_objective(trial):
-            if trial.number == 0:
+            if trial.number == leading_trial_number:
                 assert second_entered.wait(10)
                 try:
                     return objective(trial)
@@ -955,10 +956,14 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
     updated = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}
     )
-    # The raised target reruns the stopped trial before any new draw.
-    # Under two workers the new draw may launch too.
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(updated)
+    # Schedule the rerun ahead of the fresh draw while both workers are present.
+    leading_trial_number = 2
+    first_finished.clear()
+    second_entered.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(optuna.Study, "optimize", optimize)
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(updated)
     assert launched[0] == 0 and 2 in launched and 1 not in launched
     assert study.trials[2].user_attrs[RERUN_OF_ATTR] == 1
     assert [trial.user_attrs for trial in study.trials[:2]] == [

@@ -8,7 +8,7 @@ cd phasesweep
 pip install -e ".[dev,wandb,mlflow]"
 ```
 
-The development extra includes MCP and Hydra for integration checks and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
 
 To install unreleased `main` without an editable checkout:
 
@@ -18,10 +18,13 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 
 ## Quality gates
 
-Run the repository checks sequentially:
+During iteration, run the mandatory checks and tests for the changed subsystem.
+Use the parallel fast lane below for broader coverage; reserve the complete suite
+for qualification. Run the repository checks sequentially:
 
 ```bash
-pytest
+pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py tests/test_ledger_read_paths.py
+pytest --collect-only
 ruff check .
 ruff format --check .
 mypy src
@@ -55,11 +58,33 @@ The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routin
 
 ### Test tiers
 
-Plain `pytest` above is the authoritative suite and stays the merge and release check. While iterating, two subsets are available:
+Plain `pytest` runs the complete non-live qualification suite. For broader checks
+while iterating, use two process workers for the fast lane:
 
 ```bash
-pytest -m "not live and not integration"   # fast review tier
-pytest -m "integration and not live"       # integration tier only
+pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid"
+```
+
+`loadfile` keeps each test module in one worker. Test homes, caches, journals and
+host-lock directories use per-test temporary paths. Keep the worker count bounded;
+`-n auto` can overload process-launch and deadline checks.
+
+Run the complementary lane serially, after the workers have exited:
+
+```bash
+pytest -m "not live and (integration or signals_own_pid)"
+```
+
+Together these lanes cover the same cases as plain `pytest`. The serial lane
+retains integration timing checks and every test that signals its own process,
+including self-signalling cases outside the integration tier. Run both lanes
+without concurrent lint, type checks or other validation. CI and mandatory hooks
+retain their existing serial collection and contract-test scope.
+
+To inspect the cost of a qualification run:
+
+```bash
+pytest --durations=25
 ```
 
 > [!NOTE]

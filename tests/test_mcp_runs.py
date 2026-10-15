@@ -881,6 +881,7 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
         ("boot_id", "11111111-1111-1111-1111-111111111111"),
         ("pid_namespace", "pid:[4026531836]@1"),
     ],
+    ids=["pid", "pgid", "boot-id", "pid-namespace"],
 )
 def test_launching_handle_cannot_have_process_identity(
     tmp_path: Path, field: str, value: object
