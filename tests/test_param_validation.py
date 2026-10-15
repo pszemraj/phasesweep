@@ -177,6 +177,25 @@ def test_validate_rejects_incompatible_phase_settings() -> None:
         )
 
 
+def test_grid_config_validation_does_not_enumerate_parameter_lists(monkeypatch) -> None:
+    """Validation counts the full matrix without calling the value-list builder."""
+
+    def refuse_enumeration(*args, **kwargs):
+        pytest.fail("config validation materialized the grid")
+
+    monkeypatch.setattr("phasesweep.config.search.grid_search_space", refuse_enumeration)
+    experiment = make_experiment(
+        n_trials=12,
+        sampler=Sampler(type="grid"),
+        search_space={
+            "width": IntParam(type="int", low=1, high=3),
+            "scale": FloatParam(type="float", low=0.0, high=0.5, step=0.5),
+            "model": CategoricalParam(type="categorical", choices=["a", "b"]),
+        },
+    )
+    assert experiment.phases[0].n_trials == 12
+
+
 def test_validate_rejects_invalid_grid_configs() -> None:
     """Grid sampler configs must be exactly enumerable and complete by default."""
     cases = [
@@ -289,6 +308,13 @@ def test_validate_accepts_divisible_grid_float() -> None:
                 "right": CategoricalParam(type="categorical", choices=list(range(64))),
             },
             id="product-of-small-dimensions",
+        ),
+        pytest.param(
+            {
+                "wide": IntParam(type="int", low=0, high=4_096),
+                "tiny": FloatParam(type="float", low=0.0, high=1.0e-12, step=1.0e-13),
+            },
+            id="cardinality-cap-precedes-float-collapse",
         ),
     ],
 )

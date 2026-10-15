@@ -886,6 +886,33 @@ def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path)
             run_extractor(make_trial_context(case_dir), cfg)
 
 
+@pytest.mark.parametrize("kind", ["json", "json_envelope"])
+def test_json_extractors_preserve_read_failure_diagnostics(tmp_path, monkeypatch, kind):
+    target = tmp_path / "result.json"
+    target.write_text("{}")
+    failure = PermissionError("read denied")
+    original = Path.read_bytes
+
+    def unreadable(path):
+        if path == target:
+            raise failure
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+    cfg = (
+        JsonExtractor(type="json", path="result.json", key="x")
+        if kind == "json"
+        else JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="final"
+        )
+    )
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(make_trial_context(tmp_path), cfg)
+    noun = "JSON" if kind == "json" else "JSON envelope"
+    assert str(caught.value) == f"Could not read {noun} at {target}: read denied"
+    assert caught.value.__cause__ is failure
+
+
 def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
     payload = {
         "schema_version": 1,

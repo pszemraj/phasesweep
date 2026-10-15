@@ -491,11 +491,11 @@ def _validate_sampler_search_space(phase: Phase) -> None:
       12-decimal canonical rounding, which would make the cardinality below
       overcount the distinct configurations.
 
-    The cardinality is a product of the enumerated value-list lengths, so it is
-    only truthful while those lists are duplicate-free. Categorical duplicates
-    are rejected by :class:`CategoricalParam` and float collapse by
-    :func:`grid_search_space`, both before this product is taken. The repeat
-    axis is part of the grid, so it counts toward the cardinality and its cap.
+    Cardinality is the product of validated parameter counts. Categorical
+    duplicates are rejected by :class:`CategoricalParam`; float collapse,
+    bounds, step fidelity, and the cardinality cap are checked by
+    :func:`_grid_value_counts` without building the parameter value lists.
+    The repeat axis is part of the grid, so it counts toward cardinality and its cap.
     The grid checks cover only a phase that draws: a fixed configuration
     consults no sampler, so a one-point grid does not bound its target. The
     retry rule in :func:`fixed_configuration_target_refusal` does.
@@ -506,7 +506,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
         or with a trial count that does not cover every repeat, if the CMA-ES
         sampler is paired with categorical params or the ``cmaes`` package is
         not importable, if the grid sampler cannot enumerate a parameter
-        (raised by :func:`grid_search_space`), or if ``n_trials`` exceeds the
+        (raised by :func:`_grid_value_counts`), or if ``n_trials`` exceeds the
         grid cardinality or does not equal it without ``allow_partial_grid``.
     """
     sampler_type = phase.sampler.type
@@ -541,10 +541,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     if sampler_type == "grid" and phase_draws(phase):
         cardinality = math.prod(
-            len(values)
-            for values in grid_search_space(
-                sampler_search_space(phase), phase_name=phase.name
-            ).values()
+            _grid_value_counts(sampler_search_space(phase), phase_name=phase.name).values()
         )
         repeat_note = (
             ""
@@ -630,9 +627,13 @@ def _grid_value_counts(
 ) -> dict[str, int]:
     """Return GridSampler value counts before materializing parameter lists.
 
+    Float counts include validation of 12-decimal rounding against uniqueness,
+    exact configured steps, and bounds. No parameter value lists are retained.
+
     :param Mapping[str, SearchParam] search_space: Search-space specification to inspect.
     :param str phase_name: Phase name included in validation errors.
-    :raises ValueError: If a parameter cannot be represented as a grid.
+    :raises ValueError: If a parameter cannot be represented faithfully as a
+        grid or the concrete matrix exceeds the supported cardinality.
     :return dict[str, int]: Number of concrete values for each parameter.
     """
     counts: dict[str, int] = {}
@@ -657,23 +658,6 @@ def _grid_value_counts(
                     f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
                 )
             counts[name] = _float_step_count(param.low, param.high, param.step) + 1
-    return counts
-
-
-def grid_search_space(
-    search_space: dict[str, SearchParam],
-    *,
-    phase_name: str = "<direct>",
-) -> dict[str, list[Any]]:
-    """Build Optuna ``GridSampler`` values and validate grid-only constraints.
-
-    :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
-    :param str phase_name: Phase name included in validation errors.
-    :raises ValueError: If a parameter cannot be represented as a grid or the
-        concrete matrix exceeds the supported cardinality.
-    :return dict[str, list[Any]]: Concrete grid values keyed by parameter name.
-    """
-    counts = _grid_value_counts(search_space, phase_name=phase_name)
     cardinality = math.prod(counts.values())
     if cardinality > _MAX_GRID_CARDINALITY:
         raise ValueError(
@@ -682,25 +666,15 @@ def grid_search_space(
             "Reduce the search space or use a stochastic sampler."
         )
 
-    grid: dict[str, list[Any]] = {}
     for name, param in search_space.items():
-        if isinstance(param, CategoricalParam):
-            grid[name] = list(param.choices)
-        elif isinstance(param, IntParam):
-            grid[name] = list(range(param.low, param.high + 1, param.step))
-        else:
+        if isinstance(param, FloatParam):
             assert param.step is not None
-            values = [round(param.low + i * param.step, 12) for i in range(counts[name])]
-            # Post-canonicalization collapse: the round(..., 12) above maps
-            # adjacent points onto the same float once the step drops below
-            # ~1e-12, so the grid would publish fewer unique configurations
-            # than the cardinality check counts — the same "complete grid" lie
-            # duplicate categorical choices would produce.
-            unique = len(set(values))
-            if unique != len(values):
+            count = counts[name]
+            unique = len({round(param.low + i * param.step, 12) for i in range(count)})
+            if unique != count:
                 raise ValueError(
                     f"Phase {phase_name!r}: grid float param {name!r} collapses to "
-                    f"{unique} unique value(s) instead of {len(values)} after rounding "
+                    f"{unique} unique value(s) instead of {count} after rounding "
                     f"to 12 decimal places (low={param.low}, high={param.high}, "
                     f"step={param.step}). Rescale the parameter — sweep an exponent or "
                     "a multiplier — so adjacent grid points differ by more than 1e-12."
@@ -710,14 +684,41 @@ def grid_search_space(
             if any(
                 not (param.low <= value <= param.high)
                 or Fraction(str(value)) != origin + index * spacing
-                for index, value in enumerate(values)
+                for index, value in enumerate(
+                    round(param.low + i * param.step, 12) for i in range(count)
+                )
             ):
                 raise ValueError(
                     f"Phase {phase_name!r}: grid float param {name!r} cannot preserve its "
                     "configured bounds and step after rounding to 12 decimal places. "
                     "Rescale the parameter or use explicit categorical choices."
                 )
-            grid[name] = values
+    return counts
+
+
+def grid_search_space(
+    search_space: dict[str, SearchParam],
+    *,
+    phase_name: str = "<direct>",
+) -> dict[str, list[StrictJsonScalar]]:
+    """Build Optuna ``GridSampler`` values and validate grid-only constraints.
+
+    :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
+    :param str phase_name: Phase name included in validation errors.
+    :raises ValueError: If a parameter cannot be represented as a grid or the
+        concrete matrix exceeds the supported cardinality.
+    :return dict[str, list[StrictJsonScalar]]: Concrete grid values keyed by parameter name.
+    """
+    counts = _grid_value_counts(search_space, phase_name=phase_name)
+    grid: dict[str, list[StrictJsonScalar]] = {}
+    for name, param in search_space.items():
+        if isinstance(param, CategoricalParam):
+            grid[name] = list(param.choices)
+        elif isinstance(param, IntParam):
+            grid[name] = list(range(param.low, param.high + 1, param.step))
+        else:
+            assert param.step is not None
+            grid[name] = [round(param.low + i * param.step, 12) for i in range(counts[name])]
     return grid
 
 

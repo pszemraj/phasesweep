@@ -7,7 +7,8 @@ import json
 import math
 import os
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -149,6 +150,32 @@ class DeadlineExceededError(ExtractorError):
     """Raised when the phase/run deadline directly prevents extraction."""
 
 
+@contextmanager
+def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
+    """Translate file-read and JSON-decoding failures into extractor diagnostics.
+
+    :param Path target: Trial-relative file being read.
+    :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
+    :raises ExtractorError: The file is missing, unreadable, or malformed.
+    :return Iterator[None]: Context covering the read and parse of the same bytes.
+    """
+    try:
+        yield
+    except FileNotFoundError as exc:
+        missing = (
+            f"JSON file not found: {exc.args[0]}"
+            if noun == "JSON"
+            else f"{noun} not found: {target}"
+        )
+        raise ExtractorError(missing) from exc
+    except UnicodeError as exc:
+        raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
+    except ValueError as exc:
+        raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read {noun} at {target}: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class TrialContext:
     """Everything an extractor might need to find a trial's result."""
@@ -199,21 +226,11 @@ def _extract_json(
 
     """
     digest: dict[str, Any] = {}
+    target = ctx.trial_dir / cfg.path
     try:
-        target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
-    except FileNotFoundError as exc:
-        raise ExtractorError(f"JSON file not found: {exc.args[0]}") from exc
-    except UnicodeError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
-    except ValueError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
-    except OSError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"Could not read JSON at {target}: {exc}") from exc
+        with _trial_json_read_errors(target, noun="JSON"):
+            _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
     except KeyError as exc:
-        target = ctx.trial_dir / cfg.path
         raise ExtractorError(
             f"Key {cfg.key!r} not found in {target} (failed at {exc.args[0]!r})."
         ) from exc
@@ -248,17 +265,9 @@ def _extract_json_envelope(
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
-    try:
+    with _trial_json_read_errors(target, noun="JSON envelope"):
         raw = target.read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
-    except FileNotFoundError as exc:
-        raise ExtractorError(f"JSON envelope not found: {target}") from exc
-    except UnicodeError as exc:
-        raise ExtractorError(f"JSON envelope at {target} is not valid UTF-8: {exc}") from exc
-    except ValueError as exc:
-        raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
-    except OSError as exc:
-        raise ExtractorError(f"Could not read JSON envelope at {target}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise ExtractorError(f"JSON envelope at {target} must be an object.")
