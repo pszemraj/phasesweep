@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,6 +85,7 @@ from phasesweep.mcp.runs import (
 from phasesweep.mcp.snapshots import (
     McpPublicationState,
     RunResultSnapshot,
+    WinnerSnapshot,
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
 )
@@ -684,7 +685,7 @@ class PhaseSweepMCP:
         str,
         Experiment | None,
         EngineStatus,
-        list[PhaseWinnerView],
+        Sequence[PhaseWinnerView | WinnerSnapshot],
         RunHandle,
         RunnerView,
         ResultSource,
@@ -708,6 +709,7 @@ class PhaseSweepMCP:
         # unavailable-result placeholders need the sibling configuration.
         experiment = None if snapshot is not None else self._load_run_experiment(handle)
         snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot, view)
+        winners: Sequence[PhaseWinnerView | WinnerSnapshot]
         if snapshot is None:
             assert experiment is not None
             status, winners = self._live_result(target_id, experiment, handle)
@@ -719,7 +721,7 @@ class PhaseSweepMCP:
             winners = (
                 []
                 if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}
-                else snapshot.winner_views()
+                else snapshot.winners
             )
         elif status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
             winners = []

@@ -1109,11 +1109,7 @@ class RunStore:
         payload = {
             "run_id": handle.run_id,
             "config_sha256": handle.config_sha256,
-            "pid": identity.pid,
-            "pgid": identity.pgid,
-            "pid_starttime": identity.pid_starttime,
-            "boot_id": identity.boot_id,
-            "pid_namespace": identity.pid_namespace,
+            **asdict(identity),
             "cleanup_confirmed": False,
         }
         private_atomic_write_text(
@@ -1347,26 +1343,10 @@ class RunStore:
             pid_namespace=pid_namespace,
         )
         if handle.launch_state == "spawned":
-            durable_identity = handle.process_identity
+            durable_identity = asdict(handle.process_identity)
             if any(
-                marker_value is not None and marker_value != durable_value
-                for marker_value, durable_value in zip(
-                    (
-                        identity.pid,
-                        identity.pgid,
-                        identity.pid_starttime,
-                        identity.boot_id,
-                        identity.pid_namespace,
-                    ),
-                    (
-                        durable_identity.pid,
-                        durable_identity.pgid,
-                        durable_identity.pid_starttime,
-                        durable_identity.boot_id,
-                        durable_identity.pid_namespace,
-                    ),
-                    strict=True,
-                )
+                value is not None and value != durable_identity[name]
+                for name, value in asdict(identity).items()
             ):
                 return None
         return identity

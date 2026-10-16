@@ -1290,37 +1290,29 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
     assert (identity.pid, identity.pgid, identity.pid_starttime) == (runner_pid, runner_pid, 111)
 
 
-def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["boot_id", "pid_namespace"])
+def test_process_identity_roundtrips_through_handle_and_cleanup_marker(
+    tmp_path: Path, field: str
+) -> None:
     store = RunStore(tmp_path / "state")
-    boot_id = read_boot_id()
-    if boot_id is None:
+    value = read_boot_id() if field == "boot_id" else "pid:[4026539001]@100"
+    if value is None:
         pytest.skip("boot id unavailable on this platform")
-    handle = make_dead_run_handle(run_id="exp-1", boot_id=boot_id)
+    handle = (
+        make_dead_run_handle(run_id="exp-1", boot_id=value)
+        if field == "boot_id"
+        else make_dead_run_handle(run_id="exp-1", pid_namespace=value)
+    )
 
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
 
     loaded = store.get("exp-1")
     assert loaded == handle
-    assert loaded.boot_id == boot_id
-    assert json.loads(store.cleanup_uncertain_path("exp-1").read_text())["boot_id"] == boot_id
-    assert store.cleanup_identity(loaded).boot_id == boot_id
-
-
-def test_pid_namespace_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    namespace = "pid:[4026539001]@100"
-    handle = make_dead_run_handle(run_id="exp-1", pid_namespace=namespace)
-
-    store.create(handle)
-    store.mark_cleanup_uncertain(handle)
-
-    loaded = store.get("exp-1")
-    assert loaded == handle
-    assert loaded.pid_namespace == namespace
+    assert getattr(loaded, field) == value
     marker = json.loads(store.cleanup_uncertain_path("exp-1").read_text())
-    assert marker["pid_namespace"] == namespace
-    assert store.cleanup_identity(loaded).pid_namespace == namespace
+    assert marker[field] == value
+    assert getattr(store.cleanup_identity(loaded), field) == value
 
 
 def test_cleanup_marker_cannot_move_a_spawned_identity_to_another_namespace(

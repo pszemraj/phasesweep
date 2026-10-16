@@ -1153,6 +1153,18 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     )
 
 
+def _write_captured_terminal_status(
+    status_path: Path, snapshot: dict[str, object], *, run_id: str = "r0"
+) -> bool:
+    """Persist a successful terminal outcome and its captured result snapshot."""
+    return mcp_runner._write_status(
+        status_path,
+        {"run_id": run_id, "returncode": 0, "error_class": None, "cleanup_confirmed": True},
+        result_snapshot=snapshot,
+        result_snapshot_error=None,
+    )
+
+
 def test_runner_records_snapshot_serialization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1163,30 +1175,12 @@ def test_runner_records_snapshot_serialization_failure(
         lambda *_args, **_kwargs: {"not_json": object()},
     )
 
-    mcp_runner._write_status(
-        status_path,
-        {
-            "run_id": "r0",
-            "returncode": 0,
-            "error_class": None,
-            "cleanup_confirmed": True,
-        },
-        result_snapshot={},
-        result_snapshot_error=None,
-    )
+    _write_captured_terminal_status(status_path, {})
 
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "failed"
     assert final["result_snapshot_error"] == "TypeError"
     assert "result_snapshot" not in final
-
-
-_TERMINAL_PAYLOAD: dict[str, object] = {
-    "run_id": "r0",
-    "returncode": 0,
-    "error_class": None,
-    "cleanup_confirmed": True,
-}
 
 
 def test_transient_terminal_status_write_failure_is_retried(
@@ -1205,15 +1199,7 @@ def test_transient_terminal_status_write_failure_is_retried(
     )
     monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_file)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"captured": True}) is True
 
     # Failed pending write, its retry, then the complete write.
     assert replace_file.call_count == 3
@@ -1240,15 +1226,7 @@ def test_transient_snapshot_state_write_failure_is_retried(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", write_failing_on_the_complete_transition)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"captured": True}) is True
 
     assert states == ["pending", "complete", "complete"]
     final = json.loads(status_path.read_text())
@@ -1265,15 +1243,7 @@ def test_exhausted_status_write_retries_report_missing_terminal_evidence(
     monkeypatch.setattr(mcp_runner, "write_status_file", write_status)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
-        assert (
-            mcp_runner._write_status(
-                status_path,
-                dict(_TERMINAL_PAYLOAD),
-                result_snapshot={"captured": True},
-                result_snapshot_error=None,
-            )
-            is False
-        )
+        assert _write_captured_terminal_status(status_path, {"captured": True}) is False
 
     assert write_status.call_count == 3
     assert not status_path.exists()
@@ -1306,15 +1276,7 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", write_only_the_pending_record)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            {**_TERMINAL_PAYLOAD, "run_id": run_id},
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"captured": True}, run_id=run_id) is True
 
     # Three exhausted complete attempts, and no downgrade write after them.
     assert states == ["pending", "complete", "complete", "complete"]
@@ -1345,15 +1307,7 @@ def test_unserializable_captured_snapshot_still_records_terminal_evidence(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", counting_write)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"not_json": object()},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"not_json": object()}) is True
 
     assert writes == ["pending", "failed"]
     final = json.loads(status_path.read_text())

@@ -45,7 +45,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus
 from phasesweep.mcp.server import (
     AwaitRunResult,
     GetRunResultsResult,
@@ -99,6 +99,26 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+def _published_run_terminal(
+    tmp_path: Path,
+) -> tuple[PhaseSweepMCP, Registry, RunStore, RunHandle, TerminalStatus]:
+    """Load the completed terminal record of a published run through a restarted app."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    return app, registry, store, handle, terminal
+
+
+def _read_run_tool(app: PhaseSweepMCP, read_tool: str, run_id: str) -> dict[str, object]:
+    """Read one run, using a zero-timeout poll for the asynchronous await tool."""
+    if read_tool == "await_run":
+        return asyncio.run(app.await_run(run_id, timeout_seconds=0))
+    return getattr(app, read_tool)(run_id=run_id)
 
 
 @pytest.mark.integration
@@ -248,12 +268,8 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     read_method: str,
 ) -> None:
     """Live status and result reads never expose a downgraded ledger's details."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
@@ -281,12 +297,8 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
     integrity: str,
 ) -> None:
     """A frozen publication verdict suppresses winners across both snapshot paths."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     snapshot = json.loads(json.dumps(complete["result_snapshot"]))
     snapshot["status"]["publication_integrity"] = integrity
     unusable = {**complete, "result_snapshot": snapshot}
@@ -543,13 +555,9 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     read_tool: str,
 ) -> None:
     """Cleanup uncertainty reserves the run without erasing its frozen result."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
+    app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     store.config_snapshot_path(run_id).unlink()
-    handle = store.get(run_id)
-    assert handle is not None
-    terminal = store.recorded_terminal_status(handle)
-    assert terminal is not None
     write_run_status(store, **{**terminal, "cleanup_confirmed": False})
     store.mark_cleanup_uncertain(handle)
     logs_before = tree_snapshot(store.log_path(run_id).parent)
@@ -581,12 +589,8 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
     """A pending-to-complete write cannot pair terminal facts with running state."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     original_load_config = app._load_run_experiment
@@ -604,11 +608,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     monkeypatch.setattr(app, "_load_run_experiment", finish_after_config_snapshot)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
-    payload = (
-        asyncio.run(app.await_run(run_id, timeout_seconds=0))
-        if read_tool == "await_run"
-        else app.status(run_id=run_id)
-    )
+    payload = _read_run_tool(app, read_tool, run_id)
 
     assert finalized
     assert payload["result_source"] == "frozen_run_snapshot"
@@ -624,12 +624,8 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
     """A runner's final write during its exit probe remains readable."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     store.config_snapshot_path(run_id).unlink()
     finalized = False
@@ -644,15 +640,7 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
     monkeypatch.setattr(store, "runner_may_be_alive", finish_before_reporting_exit)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
-    payload = (
-        app.winners(run_id=run_id)
-        if read_tool == "winners"
-        else (
-            asyncio.run(app.await_run(run_id, timeout_seconds=0))
-            if read_tool == "await_run"
-            else app.status(run_id=run_id)
-        )
-    )
+    payload = _read_run_tool(app, read_tool, run_id)
 
     assert finalized
     assert payload["result_source"] == "frozen_run_snapshot"
@@ -687,12 +675,8 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str, transition: str
 ) -> None:
     """A live read follows final snapshot or recovery state recorded during it."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     if transition.startswith("no_status_runner_exit"):
         store.status_path(run_id).unlink()
     else:
@@ -727,15 +711,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
         else contextlib.nullcontext()
     )
     with lock:
-        payload = (
-            app.winners(run_id=run_id)
-            if read_tool == "winners"
-            else (
-                asyncio.run(app.await_run(run_id, timeout_seconds=0))
-                if read_tool == "await_run"
-                else app.status(run_id=run_id)
-            )
-        )
+        payload = _read_run_tool(app, read_tool, run_id)
     if transition == "no_status_runner_exit_with_recovery_lock":
         assert not store.cleanup_uncertain(handle)
         assert store.observe(handle).state == "running"
@@ -773,12 +749,8 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
     """A frozen result can coexist with cleanup uncertainty added during the read."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    complete = store.recorded_terminal_status(handle)
-    assert complete is not None
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
     original_status_payload = app._snapshot_status_payload
     marked = False
 
@@ -797,11 +769,7 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     monkeypatch.setattr(app, "_snapshot_status_payload", reserve_after_snapshot_payload)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
-    payload = (
-        asyncio.run(app.await_run(run_id, timeout_seconds=0))
-        if read_tool == "await_run"
-        else app.status(run_id=run_id)
-    )
+    payload = _read_run_tool(app, read_tool, run_id)
 
     assert marked
     assert payload["result_source"] == "frozen_run_snapshot"

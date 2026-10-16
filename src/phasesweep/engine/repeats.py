@@ -556,14 +556,9 @@ def _repeats_summary(record: RepeatsRecord) -> RepeatsSummary:
     :param RepeatsRecord record: A validated ``repeats`` block.
     :return RepeatsSummary: The string-free summary.
     """
-    stats = record["spread"]
     return {
         "reduce": record["reduce"],
-        "n": stats["n"],
-        "mean": stats["mean"],
-        "sd": stats["sd"],
-        "min": stats["min"],
-        "max": stats["max"],
+        **record["spread"],
         "member_trials": [member["trial_number"] for member in record["members"]],
     }
 

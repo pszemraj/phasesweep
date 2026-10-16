@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
 from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
-from phasesweep.mcp.snapshots import McpPublicationState
+from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
 
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
@@ -58,7 +59,7 @@ def _visible_winner_params(
 
 def winners_payload(
     experiment_id: str,
-    views: list[PhaseWinnerView],
+    views: Sequence[PhaseWinnerView | WinnerSnapshot],
     *,
     metric: dict[str, Any],
     declared_phases: list[str],
@@ -70,13 +71,14 @@ def winners_payload(
     result_context: ResultContext = "current_config",
     published_config_matches_current: bool | None = None,
 ) -> dict[str, Any]:
-    """Build the ``get_run_results`` payload from path-free phase-winner views.
+    """Build the ``get_run_results`` payload from live views or frozen winners.
 
     Expose sampled params under the visibility policy; omit effective overrides, fixed
     values and inherited values.
 
     :param str experiment_id: Catalog id whose winners are being returned.
-    :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
+    :param Sequence[PhaseWinnerView | WinnerSnapshot] views: Live engine views or
+        validated frozen winners.
     :param dict[str, Any] metric: Optimization metric and objective-evidence
         assurance the represented generation recorded.
     :param list[str] declared_phases: Phase plan the represented generation
@@ -125,9 +127,17 @@ def winners_payload(
                 "params_redacted": redacted,
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
-                "confound": view.confound,
-                "observed": view.observed,
-                "repeats": view.repeats,
+                "confound": (
+                    view.confound.model_dump(mode="json")
+                    if isinstance(view, WinnerSnapshot)
+                    else view.confound
+                ),
+                "observed": dict(view.observed),
+                "repeats": (
+                    view.repeats.model_dump(mode="json")
+                    if isinstance(view, WinnerSnapshot) and view.repeats is not None
+                    else view.repeats
+                ),
             }
         )
     return {

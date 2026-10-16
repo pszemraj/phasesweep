@@ -16,7 +16,7 @@ import select
 import subprocess
 import sys
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO, Any
 
@@ -267,19 +267,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     """
     atomic_write_text(
         path,
-        json.dumps(
-            {
-                "schema_version": identity.schema_version,
-                "attempt_id": identity.attempt_id,
-                "pid": identity.pid,
-                "pgid": identity.pgid,
-                "proc_starttime": identity.proc_starttime,
-                "boot_id": identity.boot_id,
-                "pid_namespace": identity.pid_namespace,
-            },
-            sort_keys=True,
-        )
-        + "\n",
+        json.dumps(asdict(identity), sort_keys=True) + "\n",
     )
 
 

@@ -27,13 +27,12 @@ from phasesweep.engine.read import (
     read_result,
     read_status,
 )
-from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
+from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
     RecoveredTrialState,
     Winner,
-    WinnerSource,
     WinnerSourceKind,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
@@ -249,21 +248,6 @@ class RepeatsSpread(_SnapshotModel):
         description="Trial numbers of the members, ascending; the last one is trial_number."
     )
 
-    def view(self) -> RepeatsSummary:
-        """Return the summary in the engine's read-view shape.
-
-        :return RepeatsSummary: The same reducer, spread and member trial numbers.
-        """
-        return {
-            "reduce": self.reduce,
-            "n": self.n,
-            "mean": self.mean,
-            "sd": self.sd,
-            "min": self.min,
-            "max": self.max,
-            "member_trials": list(self.member_trials),
-        }
-
 
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
@@ -368,34 +352,6 @@ class RunResultSnapshot(_SnapshotModel):
             "published_config_matches_current": status.published_config_matches_current,
             "result_phase_plan": list(status.result_phase_plan),
         }
-
-    def winner_views(self) -> list[PhaseWinnerView]:
-        """Return stored winners as the engine view consumed by MCP redaction.
-
-        :return list[PhaseWinnerView]: Winner views with intentionally empty effective overrides.
-        """
-        return [
-            PhaseWinnerView(
-                phase=winner.phase,
-                trial_number=winner.trial_number,
-                metric=winner.metric,
-                params=winner.params,
-                effective_overrides={},
-                gates_passed=winner.gates_passed,
-                incomplete=winner.incomplete,
-                source=WinnerSource(
-                    kind=winner.source.kind,
-                    phase=winner.source.phase,
-                    trial_number=winner.source.trial_number,
-                    generation_id=winner.source.generation_id,
-                    attempt_id=winner.source.attempt_id,
-                ),
-                confound=winner.confound.model_dump(mode="json"),
-                observed=dict(winner.observed),
-                repeats=None if winner.repeats is None else winner.repeats.view(),
-            )
-            for winner in self.winners
-        ]
 
 
 def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultSnapshot:
