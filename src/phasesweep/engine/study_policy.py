@@ -96,7 +96,6 @@ class _AcceptedPartialDecision:
     finished_trials: int
     completed_trials: int
     timeout_scope: str
-    recovered_abort_sequence: int | None
 
 
 class _AllocationRecord(TypedDict):
@@ -165,7 +164,6 @@ def _load_accepted_partial_decision(
         finished_trials=finished_trials,
         completed_trials=completed_trials,
         timeout_scope=timeout_scope,
-        recovered_abort_sequence=recovered_abort_sequence,
     )
 
 
