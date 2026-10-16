@@ -65,14 +65,12 @@ ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 6
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
     """Return an opaque comparison key, or an explicit in-memory identity.
 
-    The canonical identity is credential-free but may contain other target
-    selectors from a query or nested connection string. The artifact tree is
-    intentionally shareable, so it stores only this digest while private
-    recovery state retains the operational URL.
+    The artifact tree stores only the identity digest. Private recovery state
+    retains the operational URL, including any target selectors and credentials.
 
     :param Experiment experiment: Experiment whose persistent ledger is identified.
     :return str | None: Full SHA-256 hex digest of the canonical persistent
-        storage identity, or ``None`` for deliberate no-ledger execution.
+        storage identity, or ``None`` for in-memory execution.
     """
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
     if storage_identity is None:

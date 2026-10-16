@@ -813,7 +813,7 @@ def run_supervised(
         if proc is None:
             if isinstance(exc, UnsafeProcessCleanupError):
                 # The spawn helper owned a child before it could return the
-                # Popen handle. Its failed cleanup is intentionally not
+                # Popen handle. Its failed cleanup is not
                 # rewritten as a childless terminal attempt.
                 raise
             # No child identity exists to support the best-effort fallback used

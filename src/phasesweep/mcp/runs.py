@@ -576,48 +576,42 @@ class RunStore:
     def log_path(self, run_id: str) -> Path:
         """Path to the captured stdout/stderr log for a run.
 
-        :param str run_id: Run id whose log path should be returned.
-        :return Path: Operator-only runner log path.
+        :return: Operator-only runner log path.
         """
         return self._logs_dir / f"{run_id}.log"
 
     def status_path(self, run_id: str) -> Path:
         """Path to the runner-written terminal-cause ``status.json`` for a run.
 
-        :param str run_id: Run id whose terminal status path should be returned.
-        :return Path: Operator-only status JSON path.
+        :return: Operator-only status JSON path.
         """
         return self._logs_dir / f"{run_id}.status.json"
 
     def config_snapshot_path(self, run_id: str) -> Path:
         """Path to the per-run config snapshot consumed by the detached runner.
 
-        :param str run_id: Run id whose config snapshot path should be returned.
-        :return Path: Operator-only config snapshot path.
+        :return: Operator-only config snapshot path.
         """
         return self._logs_dir / f"{run_id}.config.yaml"
 
     def cleanup_uncertain_path(self, run_id: str) -> Path:
         """Path to the server-owned marker for unconfirmed process cleanup.
 
-        :param str run_id: Run id whose cleanup marker path should be returned.
-        :return Path: Operator-only cleanup uncertainty marker path.
+        :return: Operator-only cleanup uncertainty marker path.
         """
         return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
 
     def cleanup_recovery_path(self, run_id: str) -> Path:
         """Path to the operator recovery evidence file for a run.
 
-        :param str run_id: Run id whose recovery evidence path should be returned.
-        :return Path: Operator-only cleanup recovery JSON path.
+        :return: Operator-only cleanup recovery JSON path.
         """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
     def launch_lease_path(self, run_id: str) -> Path:
         """Path to the kernel-backed lease for a prepared launch.
 
-        :param str run_id: Run id whose preparation lease should be returned.
-        :return Path: Private launch-lease path.
+        :return: Private launch-lease path.
         """
         return self._logs_dir / f"{run_id}.launch.lock"
 
@@ -771,7 +765,7 @@ class RunStore:
         """Load persisted handles and identify malformed handle records.
 
         :return tuple: Readable handles and stable identities for malformed
-            handle files. Orphaned sibling evidence is intentionally outside
+            handle files. Orphaned sibling evidence is outside
             this scan and is added only by :meth:`launch_inventory`.
         """
         handles: list[RunHandle] = []

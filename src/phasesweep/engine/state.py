@@ -193,9 +193,7 @@ RERUN_OF_ATTR = "phasesweep_rerun_of"
 # later failures form the new recovery streak.
 PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
-# Terminal decision recorded before selecting/publishing a winner from an
-# intentionally incomplete timeout. It makes selection crash-replayable
-# without silently scheduling the trial slots the timeout deliberately left.
+# Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
 PHASE_DECISION_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"

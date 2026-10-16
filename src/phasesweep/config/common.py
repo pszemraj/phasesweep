@@ -29,7 +29,7 @@ CONFIG_DIR_CONTEXT = "config_dir"
 def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
     """Normalize an HTTP(S) endpoint without nonempty credentials, query, or fragment.
 
-    :return str | None: Lowercase scheme and authority with trailing path slashes
+    :return: Lowercase scheme and authority with trailing path slashes
         removed, or ``None`` when the endpoint is invalid.
     """
     if (
@@ -49,10 +49,10 @@ def anchor_relative_path(value: str, info: ValidationInfo) -> str:
     Absolute and home-relative paths stay unchanged. Without a config directory
     in the validation context, relative paths keep working-directory semantics.
 
-    :param str value: Nonempty configured path.
-    :param ValidationInfo info: Validation info whose context may carry
+    :param value: Nonempty configured path.
+    :param info: Validation info whose context may carry
         :data:`CONFIG_DIR_CONTEXT`.
-    :return str: ``value`` joined onto the config directory when it is relative,
+    :return: ``value`` joined onto the config directory when it is relative,
         otherwise ``value`` unchanged.
     """
     context = info.context
@@ -68,7 +68,7 @@ _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 def is_sha256_hex(value: object) -> TypeGuard[str]:
     """Recognize a SHA-256 digest as written by PhaseSweep.
 
-    :return bool: Whether ``value`` is a lowercase 64-character hex digest.
+    :return: Whether ``value`` is a lowercase 64-character hex digest.
     """
     return isinstance(value, str) and bool(_SHA256_HEX_PATTERN.fullmatch(value))
 
@@ -77,7 +77,7 @@ def _reject_boolean_number(value: object) -> object:
     """Reject YAML booleans before Pydantic coerces them to zero or one.
 
     :raises ValueError: If the value is a boolean.
-    :return object: The unchanged non-boolean value.
+    :return: The unchanged non-boolean value.
     """
     if isinstance(value, bool):
         raise ValueError("numeric config values must be numbers, not booleans")
@@ -111,8 +111,8 @@ class _Frozen(BaseModel):
 def _require_finite(label: str, value: float) -> None:
     """Reject NaN and infinite numeric values.
 
-    :param str label: Field label included in the error.
-    :param float value: Numeric value to validate.
+    :param label: Field label included in the error.
+    :param value: Numeric value to validate.
     :raises ValueError: The value is not finite.
     """
     if not math.isfinite(value):
@@ -122,10 +122,10 @@ def _require_finite(label: str, value: float) -> None:
 def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
     """Return whether ``value`` is finite and inside optional numeric bounds.
 
-    :param float value: The numeric value to test.
-    :param float | None min_value: Optional inclusive lower bound.
-    :param float | None max_value: Optional inclusive upper bound.
-    :return bool: ``True`` when ``value`` is finite and within all supplied bounds.
+    :param value: The numeric value to test.
+    :param min_value: Optional inclusive lower bound.
+    :param max_value: Optional inclusive upper bound.
+    :return: ``True`` when ``value`` is finite and within all supplied bounds.
     """
     if not math.isfinite(value):
         return False
@@ -142,9 +142,9 @@ def _validate_optional_bounds(
 ) -> None:
     """Reject empty, non-finite, or inverted optional bounds.
 
-    :param str label: Human-readable label included in validation errors.
-    :param float | None min_value: Optional inclusive lower bound.
-    :param float | None max_value: Optional inclusive upper bound.
+    :param label: Human-readable label included in validation errors.
+    :param min_value: Optional inclusive lower bound.
+    :param max_value: Optional inclusive upper bound.
     :raises ValueError: If no bound is set, a bound is non-finite, or ``min > max``.
     """
     if min_value is None and max_value is None:
@@ -160,10 +160,10 @@ def _validate_optional_bounds(
 def _validate_safe_name(kind: str, value: str) -> str:
     """Reject empty names and characters unsafe for path/study-name components.
 
-    :param str kind: Human-readable object kind included in validation errors.
-    :param str value: Candidate name to validate.
+    :param kind: Human-readable object kind included in validation errors.
+    :param value: Candidate name to validate.
     :raises ValueError: If ``value`` is empty or contains an unsafe character.
-    :return str: The validated name, unchanged.
+    :return: The validated name, unchanged.
     """
     if not SAFE_NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
@@ -173,8 +173,8 @@ def _validate_safe_name(kind: str, value: str) -> str:
 def _validate_override_key(key: str, *, label: str) -> None:
     """Require nonempty dotted override keys with ``[A-Za-z0-9_-]`` segments.
 
-    :param str key: Candidate fixed or search-space key.
-    :param str label: Context included in validation errors.
+    :param key: Candidate fixed or search-space key.
+    :param label: Context included in validation errors.
     :raises ValueError: A segment is empty, padded, or contains disallowed characters.
     """
     if not key:
@@ -204,7 +204,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
 
     ``model`` conflicts with ``model.depth``; ``model.depths`` does not.
 
-    :return list[tuple[str, str]]: Lexically sorted ``(short, long)`` collisions.
+    :return: Lexically sorted ``(short, long)`` collisions.
     """
     collisions: list[tuple[str, str]] = []
     for key in keys:

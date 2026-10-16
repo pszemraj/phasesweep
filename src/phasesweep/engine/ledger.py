@@ -921,9 +921,8 @@ class PhaseTrials:
 
     #: The study's trials, with their historical attributes exactly as recorded.
     trials: list[optuna.trial.FrozenTrial]
-    #: Numbers of this study's trials whose cleanup uncertainty a recovery
-    #: confirmed. Recovery never rewrites the trial's own attributes, so this
-    #: study-level ledger is the only place the confirmation is recorded.
+    #: Trial numbers whose cleanup was confirmed by the study-level recovery ledger.
+    #: Recovery leaves the trial attributes unchanged.
     cleanup_recovered: frozenset[int]
 
 
@@ -1042,20 +1041,13 @@ def _create_ledger_directory(directory: Path) -> None:
 
 
 def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> ClaimedLedger:
-    """Check existing studies, then bind the tree and claim them under the experiment lock.
+    """Validate all phases and claim their ledger under the experiment lock.
 
-    Require a complete format scan and repair an incomplete final journal record
-    before opening live storage. Discovery distinguishes confirmed absence from an
-    unreadable study; any read or ownership failure aborts before claims or recovery.
-    The returned study objects are the same ones preflight reaps and validates.
-
-    Check every declared phase before writing. Reached published phases must retain
-    their recorded trial identity and history; skipped phases load saved winners.
-    Absent studies are created and bound later by :func:`open_phase_study`.
-
-    Recheck the tree binding immediately before the first write. Create the ledger
-    directory, bind the tree, then claim empty studies, leaving no study bound to
-    a tree that does not name the same ledger.
+    Repair a partial final record before opening live storage. Read or ownership
+    failures abort before claims or recovery. Reached published phases require their
+    recorded trial history; skipped phases use saved winners. Recheck the tree binding,
+    create the ledger directory, bind the tree, then claim empty studies. Absent studies
+    are created by :func:`open_phase_study`; existing studies are returned for preflight.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.

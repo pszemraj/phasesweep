@@ -192,7 +192,7 @@ def _reap_remaining_group(pgid: int) -> bool:
         pass
 
     # There is nobody left upstream to protect this lease after an
-    # orchestrator hard exit. If SIGKILL cannot be confirmed, deliberately
+    # orchestrator hard exit. If SIGKILL cannot be confirmed,
     # wait without a deadline rather than reopening the GPU to another run.
     _wait_for_group_exit(pgid, None)
     return True
@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     if child_pid == 0:
         os._exit(_run_trainer(ready_fd, ack_fd))
 
-    # The guardian is deliberately outside the trainer's new session and
+    # The guardian is outside the trainer's new session and
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)

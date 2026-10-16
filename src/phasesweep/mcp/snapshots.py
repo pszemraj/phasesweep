@@ -321,14 +321,7 @@ class RunResultSnapshot(_SnapshotModel):
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
-    """Semantic fingerprint of the represented result's config, when known.
-
-    The runner computes this while executing from its frozen catalog working
-    directory. Keeping the digest in the terminal snapshot lets later MCP
-    reads compare against the current catalog without consulting the artifact
-    tree or resolving an omitted ``execution.cwd`` against the server's own
-    unrelated working directory.
-    """
+    """Represented config's semantic fingerprint, captured using the run's working directory."""
 
     def status_payload(self) -> EngineStatus:
         """Return the stored status in the engine reader's path-free shape.

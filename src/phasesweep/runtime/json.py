@@ -21,10 +21,10 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 def nonempty_text(value: object, *, label: str) -> str:
     """Require a nonempty string.
 
-    :param object value: Candidate value.
-    :param str label: Field name for the diagnostic.
+    :param value: Candidate value.
+    :param label: Field name for the diagnostic.
     :raises ValueError: The value is not a nonempty string.
-    :return str: The validated value.
+    :return: The validated value.
     """
     if not isinstance(value, str) or not value:
         raise ValueError(f"{label} must be a nonempty string.")
@@ -42,7 +42,7 @@ def _reject_constant(value: str) -> NoReturn:
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Build an object while rejecting duplicate member names.
 
-    :return dict[str, Any]: Mapping containing each unique member.
+    :return: Mapping containing each unique member.
     :raises ValueError: A member name repeats, which the standard ``json``
         parser would silently resolve last-wins.
     """
@@ -59,7 +59,7 @@ def strict_json_loads(text: str) -> Any:
 
     Reject ``Infinity``, ``-Infinity`` and ``NaN``.
 
-    :return Any: Parsed JSON value.
+    :return: Parsed JSON value.
     """
     return json.loads(
         text,
@@ -75,7 +75,7 @@ def progress_position(value: Any) -> int | float | None:
     metric) an objective was measured: a finite, non-negative JSON number.
     Integers stay integers so step groups compare and render exactly.
 
-    :return int | float | None: ``value`` when valid, else ``None``.
+    :return: ``value`` when valid, else ``None``.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -89,7 +89,7 @@ def json_value(value: object) -> JsonValue:
     """Narrow a decoded value to the JSON data model, rebuilding its containers.
 
     :raises ValueError: An object key is not a string, or a value lies outside the JSON model.
-    :return JsonValue: An equal value whose lists and objects carry the narrowed type.
+    :return: An equal value whose lists and objects carry the narrowed type.
     """
     if value is None or isinstance(value, str | int | float | bool):
         return value
@@ -109,7 +109,7 @@ def json_object(value: object) -> JsonObject:
     """Narrow a decoded value to a JSON object.
 
     :raises ValueError: ``value`` is not a JSON object.
-    :return JsonObject: An equal object whose members carry the narrowed type.
+    :return: An equal object whose members carry the narrowed type.
     """
     narrowed = json_value(value)
     if not isinstance(narrowed, dict):
@@ -120,7 +120,7 @@ def json_object(value: object) -> JsonObject:
 def dump_json(model: BaseModel) -> JsonObject:
     """Dump a Pydantic model to its JSON-mode object.
 
-    :return JsonObject: The model's fields in JSON-compatible form.
+    :return: The model's fields in JSON-compatible form.
     """
     dumped: object = model.model_dump(mode="json")
     return json_object(dumped)
@@ -129,11 +129,11 @@ def dump_json(model: BaseModel) -> JsonObject:
 def json_text(record: Mapping[str, object], key: str) -> str:
     """Read a string member of a decoded JSON object.
 
-    :param Mapping[str, object] record: Decoded JSON object.
-    :param str key: Member name.
+    :param record: Decoded JSON object.
+    :param key: Member name.
     :raises KeyError: The member is absent.
     :raises ValueError: The member is not a string.
-    :return str: The member's value.
+    :return: The member's value.
     """
     value = record[key]
     if not isinstance(value, str):
@@ -144,11 +144,11 @@ def json_text(record: Mapping[str, object], key: str) -> str:
 def json_optional_text(record: Mapping[str, object], key: str) -> str | None:
     """Read a string-or-null member of a decoded JSON object.
 
-    :param Mapping[str, object] record: Decoded JSON object.
-    :param str key: Member name.
+    :param record: Decoded JSON object.
+    :param key: Member name.
     :raises KeyError: The member is absent.
     :raises ValueError: The member is neither a string nor ``null``.
-    :return str | None: The member's value.
+    :return: The member's value.
     """
     value = record[key]
     if value is not None and not isinstance(value, str):
@@ -161,11 +161,11 @@ def json_optional_text(record: Mapping[str, object], key: str) -> str | None:
 def json_integer(record: Mapping[str, object], key: str) -> int:
     """Read an integer member of a decoded JSON object.
 
-    :param Mapping[str, object] record: Decoded JSON object.
-    :param str key: Member name.
+    :param record: Decoded JSON object.
+    :param key: Member name.
     :raises KeyError: The member is absent.
     :raises ValueError: The member is not an integer, or is a boolean.
-    :return int: The member's value.
+    :return: The member's value.
     """
     value = record[key]
     if isinstance(value, bool) or not isinstance(value, int):
@@ -176,11 +176,11 @@ def json_integer(record: Mapping[str, object], key: str) -> int:
 def json_number(record: Mapping[str, object], key: str) -> float:
     """Read a numeric member of a decoded JSON object, keeping integers exact.
 
-    :param Mapping[str, object] record: Decoded JSON object.
-    :param str key: Member name.
+    :param record: Decoded JSON object.
+    :param key: Member name.
     :raises KeyError: The member is absent.
     :raises ValueError: The member is not a number, or is a boolean.
-    :return float: The member's value, unchanged.
+    :return: The member's value, unchanged.
     """
     value = record[key]
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -191,7 +191,7 @@ def json_number(record: Mapping[str, object], key: str) -> float:
 def json_text_map(value: object) -> dict[str, str] | None:
     """Narrow a decoded value to an object whose members are all strings.
 
-    :return dict[str, str] | None: A copy of ``value``, or ``None`` when it is not such an object.
+    :return: A copy of ``value``, or ``None`` when it is not such an object.
     """
     if not isinstance(value, dict):
         return None
@@ -206,7 +206,7 @@ def json_text_map(value: object) -> dict[str, str] | None:
 def json_number_map(value: object) -> dict[str, float] | None:
     """Narrow a decoded value to an object whose members are all numbers.
 
-    :return dict[str, float] | None: A copy of ``value`` with members unchanged, or ``None``
+    :return: A copy of ``value`` with members unchanged, or ``None``
         when it is not such an object; booleans are not numbers here.
     """
     if not isinstance(value, dict):
