@@ -456,9 +456,6 @@ def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None
     if cwd is not None:
         payload["cwd"] = cwd
     body = json.dumps(payload).encode("utf-8")
-    # supervisor.py's _HEADER_LEN is the single source of truth for the frame
-    # header width; derive the format width from it rather than hardcoding
-    # the digit count here.
     return f"{len(body):0{_supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 

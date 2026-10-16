@@ -56,6 +56,15 @@ The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routin
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
 
+### Source prose review
+
+```bash
+python scripts/sample_docstrings.py -n 30
+python scripts/sample_docstrings.py --audit > prose-review.txt
+```
+
+The audit scans every source docstring (including attribute documentation) and comment, reporting narrative wording, repeated paragraphs of at least 20 words, and prose blocks of at least 120 words before API sections. It reports every candidate with its location and reason; it does not edit files or fail because of findings. Review the context before removing text: emphasis and length can describe useful contracts, and stale behavior claims require checking the implementation. Runtime strings such as field descriptions, CLI help and error messages are outside this scan. This is an optional local review tool, not a hook or CI check.
+
 ### Test tiers
 
 Plain `pytest` runs the complete non-live qualification suite. For broader checks

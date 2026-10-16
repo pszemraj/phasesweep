@@ -714,8 +714,6 @@ def extract_trial_result(
         )
 
     if rc != 0 and failure_reason is None:
-        # The one place a nonzero exit's cause is composed, so trials.csv, the
-        # TRIAL line and the outcome record all carry the same stderr quote.
         stderr_line = _stderr_last_line(executed.ctx.trial_dir)
         failure_reason = f"non-zero exit code {rc}"
         if stderr_line is not None:

@@ -14,9 +14,7 @@ import signal
 import sys
 import time
 
-# Single source of truth for the wire frame's header width and the readiness
-# frame's leading tag: phasesweep.runtime.process reads both constants
-# directly (the parent already imports this module).
+# Wire frame constants shared with phasesweep.runtime.process.
 _HEADER_LEN = 10
 _READY_PID_WIDTH = 10
 _READY_TAG = b"R"
