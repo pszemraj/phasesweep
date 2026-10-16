@@ -175,71 +175,33 @@ def run_experiment(
     publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
 ) -> dict[str, Winner]:
-    """Run all phases in order, returning a map of phase name to Winner.
+    """Run the ordered phases and return their winners.
 
-    If ``from_phase`` is given, prior phases are loaded from disk.
-    If ``dry_run`` is True, the trials each phase would launch and an example
-    command are logged but nothing launches.
+    Live runs hold the experiment lock across all phases and install shutdown
+    handlers. Dry runs inspect recorded state and render commands without writes
+    or subprocesses. Dry-run checks omit recovery-dependent checks, trainer
+    environments, stored fingerprints, and trial evidence.
 
-    For non-dry-run invocations this acquires an
-    :func:`phasesweep.engine.locking._experiment_lock` for
-    the entire phase sequence. Phase-level state on disk (``winner.yaml``,
-    fingerprints, ``summary.yaml``) is consistent only at run granularity, so
-    two same-experiment processes must not interleave across phases.
-
-    Signal handlers are installed here so library callers using the public
-    API get the same cleanup guarantees as CLI callers. Skipped on dry-run
-    because no children will launch.
-
-    Args:
-        experiment: Parsed experiment config (result of
-            :func:`phasesweep.load_experiment`).
-        from_phase: Name of a phase to resume from; earlier phases are loaded
-            from their persisted ``winner.yaml`` files (with fingerprint
-            verification). ``None`` runs every phase from scratch.
-        dry_run: If ``True``, log the trials each phase would launch given the
-            attempts the ledger already records, and render one example trial
-            command per phase, but launch no subprocesses; no summary is
-            written and the ledger is only read. It applies the launch's claim
-            and preflight refusals over the recorded studies, except those
-            that need a RUNNING attempt recovered first, the trainer
-            environment, the stored fingerprints, or the trial evidence.
-        terminal_callback: Optional synchronous callback invoked with the
-            structured terminal report while the experiment lock is still held.
-        publication_hook: Optional required precommit/postcommit sidecar used by
-            detached runners to make their frozen result durable with publication.
-        generation_id: Optional caller-owned invocation identity. Detached MCP
-            runs use their run id; direct callers receive a generated identity.
-            Supplied values must contain only alphanumerics, underscores, and dashes.
-
-    Returns:
-        Mapping from phase name (in declaration order) to that phase's
-        :class:`Winner`. For dry runs a phase that would replay its recorded
-        result returns that result's winner, and every other phase returns a
-        placeholder.
-
-    Raises:
-        NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``
-            with no feasible trial.
-        UnsafeProcessCleanupError: A phase hard-aborted because a trial's
-            process group could not be confirmed dead.
-        TrialEvidenceMissingError: A trial eligible to win no longer has the
-            on-disk evidence its study records, or the selected winner's
-            objective source no longer matches its frozen provenance.
-        RunRequestError: A caller-supplied generation id already names an
-            immutable generation in this experiment.
-        PhaseSweepError: An expected preflight, storage,
-            publication, or recovery refusal requires operator action.
-        RuntimeError: An internal engine invariant fails.
-        ValueError: A caller-supplied generation id is not a safe filesystem name,
-            or ``from_phase`` names no declared phase (rejected before state writes).
-        FileNotFoundError: ``--from-phase`` requested but a prior phase has
-            no persisted ``winner.yaml``.
-
+    :param experiment: Parsed experiment config.
+    :param from_phase: Resume phase; validate and load earlier published winners.
+        None starts at the first phase, reusing recorded trials where applicable.
+    :param dry_run: Preview remaining trial counts and one command per phase.
+    :param terminal_callback: Synchronous diagnostic callback under the experiment lock.
+    :param publication_hook: Required sidecar around publication commit, if supplied.
+    :param generation_id: Invocation identity, generated if omitted. Supplied names
+        may contain only alphanumerics, underscores, and dashes.
+    :return Mapping[str, Winner]: Winners in declaration order. Dry runs return
+        replayed winners where available and placeholders elsewhere.
+    :raises NoFeasibleTrialError: A phase exhausted its failure limit or has no feasible trial.
+    :raises UnsafeProcessCleanupError: A trial's process group may still be alive.
+    :raises TrialEvidenceMissingError: A candidate's evidence or objective source changed.
+    :raises RunRequestError: The supplied generation id already exists.
+    :raises PhaseSweepError: Preflight, storage, publication, or recovery refused the run.
+    :raises RuntimeError: An engine invariant failed.
+    :raises ValueError: An unsafe generation id or unknown resume phase was supplied.
+    :raises FileNotFoundError: A skipped phase has no published winner.
     """
-    # Pydantic's model_copy(update=...) deliberately skips validation. Revalidate
-    # the instance directly so mutable default collections and field-set state
-    # survive while copied unknown or invalid values are still rejected.
+    # Revalidate copied models while preserving mutable defaults and field-set state.
     experiment = Experiment.model_validate(experiment)
     if from_phase is not None and from_phase not in {phase.name for phase in experiment.phases}:
         raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
@@ -250,9 +212,7 @@ def run_experiment(
             ledger=None,
             generation_id=None,
         )
-    # A fresh artifact tree cannot be a no-op replay, so validate its launch
-    # environments before creating state. Existing current-format trees defer
-    # the same check until recovery proves a phase has new work remaining.
+    # Fresh-tree launch checks precede writes; existing trees defer them until work remains.
     environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
     if environments_preflighted:
         _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
@@ -264,15 +224,10 @@ def run_experiment(
         generation_id=generation_id,
         environments_preflighted=environments_preflighted,
     )
-    # Publication and its terminal callback are already durable/successful at
-    # this boundary. Deliver any shutdown absorbed by the one-way commit window
-    # before returning control or allowing a long-lived caller to start work.
+    # Deliver shutdown deferred by the publication commit before returning to the caller.
     try:
         service_pending_shutdown()
     except PhaseSweepShutdown as exc:
-        # This is the sole post-publication delivery point. Keep that fact on
-        # the control-flow exception so process frontends can explain the
-        # signalled exit without re-reading mutable publication pointers.
         exc.published_result_committed = True
         raise
     return dict(winners)
@@ -287,64 +242,41 @@ def _run_experiment_outcome(
     generation_id: str | None = None,
     environments_preflighted: bool = False,
 ) -> Mapping[str, Winner]:
-    """Run all phases and return the winners while the experiment lock is held.
+    """Run and publish one generation while holding the experiment lock.
 
-    This is the non-dry-run engine core behind :func:`run_experiment`. The
-    winners are materialized while the experiment lock is still held, so they
-    are exactly those produced (and published) by this invocation's generation
-    — never a later external top-up's.
-
-    :param Experiment experiment: Parsed experiment config.
-    :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
-    :param Callable[[TerminalReport], None] | None terminal_callback: Optional
-        diagnostic callback; see :func:`run_experiment`.
-    :param PublicationHook | None publication_hook: Optional required
-        publication sidecar; see :func:`run_experiment`.
-    :param str | None generation_id: Optional caller-owned invocation identity.
-    :param bool environments_preflighted: Every reached launch environment was
-        checked before entering this core for a fresh artifact tree.
-    :return Mapping[str, Winner]: Winners produced by this invocation's generation.
-    :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
-        to win whose recorded evidence is no longer in this tree, or selection
-        found the winner's objective source altered; raised before any trial
-        work in the first case, before publication in the second.
-    :raises ProcessCleanupUncertainError: The run failed and post-failure
-        reconciliation could not confirm process cleanup; the original failure
-        is chained as the cause but is unsafe to handle on its own.
-    :raises PhaseSweepShutdown: A shutdown arrived while the published result was
-        mirrored to MLflow; it is marked ``published_result_committed``.
-    :raises BaseException: The run's own failure, re-raised unchanged after the
-        generation is durably recorded as failed — or, when reconciliation was
-        interrupted by ``KeyboardInterrupt``, ``SystemExit``, or
-        ``GeneratorExit``, that control-flow exception chained from it.
+    :param experiment: Parsed experiment config.
+    :param from_phase: Optional resume point; see :func:`run_experiment`.
+    :param terminal_callback: Optional diagnostic callback.
+    :param publication_hook: Optional required publication sidecar.
+    :param generation_id: Optional caller-owned invocation identity.
+    :param environments_preflighted: Launch environments were checked before any
+        writes to a fresh artifact tree.
+    :return Mapping[str, Winner]: This invocation's winners, captured under the lock.
+    :raises TrialEvidenceMissingError: Candidate evidence failed preflight or winner validation.
+    :raises ProcessCleanupUncertainError: Post-failure cleanup was not confirmed;
+        the original failure is chained.
+    :raises PhaseSweepShutdown: Shutdown during MLflow mirroring; the exception
+        records that the result is already committed.
+    :raises BaseException: The run's failure after recording failed state, or a
+        control-flow exception that interrupted reconciliation, chained from it.
     """
     require_posix_runtime()
 
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
-    # signal_handler_scope() is the outermost context manager so shutdown-signal
-    # ownership is scoped to this call tree and restored on every exit path,
-    # not left installed on the host process forever.
+    # Restore signal ownership on every exit, including lock acquisition failures.
     with (
         signal_handler_scope(),
         locking_ops._experiment_lock(experiment),
         contextlib.ExitStack() as run_stack,
     ):
-        # Resolve both ownership directions before the generation claim. The
-        # claimed handle carries the studies this strict discovery found, so
-        # preflight operates on exactly those objects instead of rereading
-        # storage, and every phase opens its live study through the handle.
         try:
             claimed = ledger_ops.claim_ledger(
                 ledger_ops.validate_ledger(experiment), from_phase=from_phase
             )
         except StudyStorageUnavailableError as exc:
-            # The ledger may contain attempts from an earlier orchestrator. A
-            # failed ownership read cannot prove those processes are resolved,
-            # even though this invocation has not claimed a generation or
-            # launched anything of its own. Recovery cannot read the ledger
-            # either, so the ledger's repair is the first step the message names.
+            # Unreadable ownership state cannot rule out earlier live attempts.
             unknown = (
                 "Artifact ownership could not be checked because required persistent "
                 f"study state is unavailable: {exc} Cleanup state is therefore unknown."
@@ -391,15 +323,7 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
-            # Selection reads Optuna alone, so a tree whose candidate evidence
-            # was deleted would silently reselect and republish those trials.
-            # Refuse here - after recovery has resolved every stale attempt,
-            # before the generation is marked running and before any trial
-            # launches - so nothing is added to a tree that cannot honestly be
-            # ranked. Deliberately not repeated on the post-failure
-            # reconciliation call below: an evidence gap found while cleaning
-            # up must never displace the primary error, and publication on
-            # that path is covered by the selection-time winner check.
+            # Validate candidate evidence after recovery and before launching new work.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
             resume_ops._reject_bound_descendant_topups(
                 experiment,
@@ -468,10 +392,7 @@ def _run_experiment_outcome(
                 isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
             )
             if original_cleanup_uncertain:
-                # A later signal can interrupt reconciliation before it inspects
-                # the registry entry that records the original uncertain group.
-                # Preserve that existing evidence even when the signal handler
-                # had no currently tracked child to clean up itself.
+                # Preserve prior cleanup uncertainty even if a signal interrupts reconciliation.
                 cleanup.mark_uncertain(exc)
             primary_error = control_error or exc
             shutdown_cleanup_uncertain = (
@@ -482,12 +403,7 @@ def _run_experiment_outcome(
                 cleanup.mark_uncertain(primary_error)
             failed_generation_id = generation_id
             failed_error_class = type(primary_error).__name__
-            # If the publication transaction already wrote a terminal record for
-            # this generation (state "publication_failed"), it also already drove
-            # the current pointer to that more specific state; a second generic
-            # "failed" write here would be refused for the record (write-once)
-            # but would silently clobber the current pointer, which has no
-            # monotonic guard within one invocation.
+            # Keep a more specific publication_failed record and pointer intact.
             generation_ops._persist_failed_state_unless_recorded(
                 path_ops._generation_record_path(experiment, failed_generation_id),
                 lambda: generation_ops._write_generation_state(
@@ -531,10 +447,7 @@ def _run_experiment_outcome(
                 and not shutdown_cleanup_uncertain
                 and control_error is None
             ):
-                # Cleanup uncertainty intentionally becomes the actionable error;
-                # the original failure remains chained for diagnosis but is unsafe to handle alone,
-                # so its action is replaced too: recovery has to settle cleanup before its remedy.
-                # A cleanup refusal that names its own repair keeps it, and its text says it.
+                # Cleanup recovery takes precedence; preserve the original failure as the cause.
                 if isinstance(cleanup.error, ProcessCleanupUncertainError):
                     raise ProcessCleanupUncertainError.rewrap(
                         cleanup.error,
@@ -576,17 +489,7 @@ def _run_experiment_outcome(
                         )
                     terminal_callback(terminal_report)
                 except BaseException:  # noqa: BLE001 - see comment: outcome authority
-                    # A reporting callback is a diagnostic consumer of the
-                    # outcome, never an authority over it. On the success path
-                    # the generation is already published as the last
-                    # successful result, so raising here would present a
-                    # committed success as a caller-visible failure; on the
-                    # failure path it would replace the engine's original
-                    # error. BaseException on purpose: a KeyboardInterrupt/
-                    # SystemExit escaping the callback must not rewrite the
-                    # engine outcome either — real shutdown signals are
-                    # honored separately by the signal handler, not by
-                    # exceptions leaking out of a diagnostic consumer.
+                    # Callback failures cannot replace the committed result or the engine error.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
 
@@ -645,40 +548,21 @@ def _run_experiment_inner(
     run_deadline: float | None = None,
     publication_hook: PublicationHook | None = None,
 ) -> dict[str, Winner]:
-    """Sequential phase loop assuming locks/signal handlers are already set up.
+    """Execute the phase sequence under the caller's locks and signal handlers.
 
-    Args:
-        experiment: Parsed experiment config.
-        from_phase: Optional name of the phase to resume from; earlier phases
-            are loaded from disk.
-        ledger: The claimed ledger every phase opens its live study through,
-            claimed for this same ``experiment``. ``None`` is a dry run: no
-            subprocesses launch, no ``summary.yaml`` is written, each phase
-            previews its example command against an in-memory study and its
-            launch count against the attempts the ledger already records, and
-            each phase's sampler capability line is logged up front.
-        generation_id: Current invocation identity, or ``None`` for dry-run.
-        preloaded_winners: Strictly validated skipped-phase winners loaded before
-            the current generation was committed.
-        run_deadline: Optional precomputed whole-run monotonic deadline. Preflight
-            passes this through so validation and stale cleanup consume the same
-            invocation budget as trial execution.
-        publication_hook: Optional required sidecar around publication commit.
-
-    Returns:
-        Same as :func:`run_experiment`: a phase-name to :class:`Winner` mapping.
-
-    Raises:
-        TimeoutError: The whole-run wallclock deadline expired before a phase
-            could start.
-        PublicationAccessError: A dry run reads a recorded publication this
-            user cannot read.
-        PublicationIntegrityError: A dry run reads a recorded publication
-            that is unreadable, malformed, or fails validation.
-        PhaseSweepError: A dry run found a refusal a launch makes over the
-            recorded studies, as :func:`phasesweep.engine.preview._preview_ledger`
-            documents.
-
+    :param experiment: Parsed experiment config.
+    :param from_phase: Resume point whose earlier winners are loaded from disk.
+    :param ledger: Claimed ledger, or None for read-only command and trial-count previews.
+    :param generation_id: Invocation identity, or None for a dry run.
+    :param preloaded_winners: Validated skipped-phase winners captured before generation commit.
+    :param run_deadline: Monotonic deadline including preflight and stale cleanup.
+    :param publication_hook: Optional required publication sidecar.
+    :return Mapping[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
+    :raises TimeoutError: The run deadline expired before a phase started.
+    :raises PublicationAccessError: A recorded dry-run publication is inaccessible.
+    :raises PublicationIntegrityError: A recorded dry-run publication fails validation.
+    :raises PhaseSweepError: Dry-run inspection found a launch refusal; see
+        :func:`phasesweep.engine.preview._preview_ledger`.
     """
     dry_run = ledger is None
     skip_until = from_phase is not None
@@ -689,9 +573,6 @@ def _run_experiment_inner(
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
-        # Capability disclosure: restate the same per-phase resume/reproduce
-        # contract `phasesweep validate` prints, in the preview an operator
-        # reads immediately before committing to a run.
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
@@ -719,9 +600,7 @@ def _run_experiment_inner(
             raise TimeoutError(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start."
             )
-        # Inherited winners must be resolved before either the skip-path winner
-        # load (so we can verify its fingerprint against the *current* parent
-        # context) or the actual run path.
+        # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}
 
         if skip_until and phase.name != from_phase:
@@ -800,12 +679,7 @@ def _run_experiment_inner(
     assert generation_id is not None
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    # The summary is the generation's versioned result manifest: it lists
-    # every artifact with its content hash so publication can validate the
-    # complete result graph, and it freezes the config semantics (metric,
-    # phase plan, config fingerprint) that give those numbers meaning so later
-    # reads never reinterpret them through whatever config happens to be
-    # loaded.
+    # Freeze artifact hashes and result labels together for generation-consistent reads.
     summary = {
         "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
         "experiment": experiment.experiment,
@@ -895,56 +769,20 @@ def _cli_phase_payloads(
 
 
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
-    """Collect read-only status for one experiment config.
+    """Collect CLI status from one read-only generation snapshot.
 
-    Built on a single :func:`phasesweep.engine.read.read_status` call, which
-    resolves the current pointer and the last-success pointer exactly once
-    each. Every phase's winner path is then resolved by :func:`_cli_phase_payloads`
-    from that same captured published-generation id, so one status object can
-    never mix generation A's identity with generation B's artifacts.
+    Return experiment and ledger paths, current/published/represented generation
+    ids, publication integrity, and phase counts and winner paths. MLflow configs
+    also include delivery counts across generations. Winner paths use the captured
+    published generation. Fresh experiments have null generation ids; root-level
+    projections do not establish publication authority. Failed trial inspection is
+    distinguished from confirmed absence by ``trial_data_available``.
 
-    The returned mapping is the single experiment status snapshot shared by
-    every caller, including ``phasesweep status <experiment>``. Its keys are
-    exactly, in order:
-
-    * ``kind``: always ``"experiment"``.
-    * ``experiment``: configured experiment name.
-    * ``workdir``: experiment artifact root.
-    * ``ledger_path``: absolute path of the journal ledger, for Optuna's own
-      CLI or a dashboard copy; ``None`` for in-memory storage. The MCP read
-      view never carries it.
-    * ``current_generation_id``, ``published_generation_id``,
-      ``represented_generation_id``, ``is_published``: the identity split
-      defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
-      the represented generation is the published one). A fresh workdir with
-      no generation metadata leaves all three null; root-level winner
-      projections never establish publication authority.
-    * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
-      ``"permission_denied"``, and ``publication_error`` beside either failure
-      verdict -- conditional on that verdict. Published results that no longer
-      validate are reported as corrupt rather than as an experiment that never
-      published. After printing this payload, the CLI turns ``"failed"`` into
-      :class:`~phasesweep.engine.errors.PublicationIntegrityError` and
-      ``"permission_denied"`` into
-      :class:`~phasesweep.engine.errors.PublicationAccessError`; both exit non-zero.
-    * ``phases``: one payload per phase in declaration order, each with
-      ``trials``, ``running``, ``n_trials``, ``completed``,
-      ``generation_trials`` (scoped to ``current_generation_id``), ``name``,
-      ``winner`` (path string or ``None``), ``published_study_unavailable``
-      (a published phase's local trial identity could not be matched), and
-      ``trial_data_available`` (true for known counts, including confirmed
-      absence; false when inspection failed).
-    * ``tracking_delivery``: MLflow configs only, last; pending and delivered
-      result-upload counts across every generation, the scope
-      ``phasesweep sync-tracking`` retries by default.
-
-    ``read_status``'s summary-derived fields (``metric``, ``result_context``,
-    ``published_config_matches_current``, ``summary_present``) are deliberately
-    *not* part of this payload: they are the MCP read view's contract.
+    CLI callers escalate failed or inaccessible publications after rendering the
+    payload. Metric and result-context fields remain in the MCP read view.
 
     :param Experiment experiment: Parsed experiment config to inspect.
-    :return dict[str, Any]: Status payload with generation identity plus per-phase
-        winner paths and trial counts, as enumerated above.
+    :return dict: Status payload with generation identity and per-phase results.
     """
     status = read_status(experiment)
     integrity = status["publication_integrity"]

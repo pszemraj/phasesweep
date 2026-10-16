@@ -100,36 +100,17 @@ def select_winner(
     phase_name: str | None = None,
     repeats: RepeatAxis | None = None,
 ) -> SelectedTrial:
-    """Pick the best feasible completed trial from a phase study.
+    """Select the best feasible COMPLETE trial, or complete repeat group.
 
-    Rules:
-      1. Trial must be COMPLETE, with a finite value, a truthy feasibility
-         attr, and nonempty generation/attempt ids
-         (:func:`phasesweep.engine.evidence._selection_candidate_identity`).
-      2. The metric value must lie inside the metric's ``min``/``max`` bounds,
-         and all constraint values (read from user_attrs) must satisfy theirs.
-      3. Among survivors, argmin/argmax on metric.
-      4. Ties — exact float equality only — broken by lower draw position
-         (:func:`phasesweep.engine.optuna._draw_positions`), so the winner
-         never depends on which trials an interruption made rerun later.
+    Require finite metric values, execution ids, feasibility, and metric/constraint
+    bounds. Rank by exact argmin or argmax, breaking exact ties by lower draw position.
 
-    With ``repeats``, the ranked units are complete repeat groups: a
-    configuration ranks only when it has one trial per repeat value and every
-    one of them passes rules 1 and 2. Groups rank by the reducer over their
-    member metrics, exact ties go to the group with the lowest member draw
-    position, and the group's highest-numbered member names the winner.
+    With repeats, require one eligible trial per repeat value, rank the reduced member
+    metrics, and break ties by the group's lowest draw position. Its highest-numbered
+    member supplies the scalar winner identity.
 
-    Ordering is exact, never approximate. An absolute epsilon (say 1e-12)
-    would fold everything within that distance of the optimum into one "tie"
-    band, which silently reorders any objective whose natural scale sits at or
-    below it: two genuinely different results at 1e-13 and 3e-13 would rank by
-    draw position rather than by value. PhaseSweep has no way to know a
-    config's meaningful resolution, so it does not guess one.
-
-    The ranked population is also classified for confounds
-    (:func:`phasesweep.engine.confound._assess_population`) and any flagged
-    check is logged once per selection. The verdicts are advisory: they never
-    change which trial wins or whether selection succeeds.
+    Assess and log confounds over the ranked population. These verdicts are advisory
+    and never alter ranking or selection success.
 
     Args:
         study: Optuna study for the phase whose winner we want.
@@ -402,13 +383,7 @@ def _observed_values(trial: optuna.trial.FrozenTrial) -> dict[str, float]:
 
 
 def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
-    """Return whether a trial may be ranked under the current bounds.
-
-    The trial must pass :func:`_selection_candidate_identity`, hold a metric
-    value inside the metric's viability bounds, and hold every constraint
-    value inside its bounds. The bounds are re-checked here, from the stored
-    values, in case the rules changed or a stored value is non-finite (defense
-    in depth).
+    """Require selection identity and stored metric/constraint values within current bounds.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
     :param Experiment experiment: Parsed experiment; supplies the metric and constraint bounds.

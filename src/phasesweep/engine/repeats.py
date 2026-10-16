@@ -473,15 +473,11 @@ def _validate_repeats_block(
     metric_value: float,
     ranked_groups: Sequence[Sequence[int]] | None,
 ) -> RepeatsRecord | None:
-    """Validate a winner payload's ``repeats`` block against the winner beside it.
+    """Validate a repeat-group record against its winner and ranked confound population.
 
-    The one validator for the block, shared by publication validation, the
-    winner loader, and the winner read paths, which differ only in how they
-    wrap the ``ValueError``. The scalar winner fields describe the group's
-    highest-numbered member, so they must equal the last member; the metric,
-    the spread, and the observed values must be what the members recompute
-    to; and the members must be one of the groups the winner's validated
-    confound block ranked.
+    Scalar identity fields must match the highest-numbered member. Recompute the
+    aggregate metric, spread, and observations, and require membership in the
+    confound block's ranked groups.
 
     :param Mapping[str, object] payload: Decoded winner payload holding ``repeats``.
     :param float metric_value: The winner's published metric value.
@@ -548,12 +544,9 @@ def _scalar_identity(value: RepeatValue) -> tuple[type, RepeatValue]:
 
 
 def _check_repeats_axis(record: RepeatsRecord | None, configured: Repeats | None) -> None:
-    """Require a validated ``repeats`` block to be the one a phase's repeat axis produces.
+    """Match a validated group to its configured repeat key, reducer, and values.
 
-    :func:`_validate_repeats_block` proves a block consistent with the winner
-    beside it, and its key and reducer come from the block itself. This
-    compares them with the configured axis: the same key and reducer, one
-    member per configured repeat value, and every configured value exactly once.
+    Require every configured repeat value exactly once.
 
     :param RepeatsRecord | None record: The block :func:`_validate_repeats_block` returned.
     :param Repeats | None configured: The phase's configured ``repeats``, or ``None``.

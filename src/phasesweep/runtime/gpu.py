@@ -1,23 +1,11 @@
-"""GPU pool: hands out CUDA device tokens and prevents double-booking.
+"""Lease CUDA devices and prevent double-booking through host lock files.
 
-Every trial subprocess gets at most one visible CUDA device when phasesweep can
-resolve CUDA device tokens. If no GPUs are visible, single-job CPU work remains
-a transparent no-op; parallel CPU work requires an explicit opt-in.
+Numeric indices and GPU UUID spellings bind to one canonical GPU UUID.
+Single-job CPU work needs no pool; parallel CPU work requires an explicit opt-in.
+MIG tokens lock individual instances and do not exclude their parent GPU.
 
-Host locks key on a *canonical physical device identity*, not on the spelling of
-the configured token: at pool construction every numeric index is resolved to
-the GPU UUID ``nvidia-smi`` reports for it, so ``gpu_ids: [0]`` in one run and
-``gpu_devices: ["GPU-<uuid of 0>"]`` in another contend for one lock file
-instead of double-booking the card.
-
-MIG limitation: a ``MIG-...`` token locks on the MIG instance itself. phasesweep
-does not bind a MIG instance to its parent GPU, so a run holding a MIG instance
-and a run holding the whole parent device do not exclude each other.
-
-Scope caveat: "host-wide" throughout this module means "every orchestrator that
-resolves the same phasesweep lock directory". The default lock directory is
-per-user (``.cache/phasesweep/locks`` under the OS account home); coordinating
-across users requires a shared ``PHASESWEEP_LOCK_DIR``.
+Locks coordinate orchestrators using the same directory. The default is per-user;
+cross-user coordination requires a shared ``PHASESWEEP_LOCK_DIR``.
 """
 
 from __future__ import annotations
@@ -189,10 +177,7 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
         index, uuid = index.strip(), uuid.strip()
         if index.isdigit():
             ids.append(int(index))
-        # Require a real device-identity shape. Restricted drivers (vGPU,
-        # locked-down containers) report "[N/A]"/"[Not Supported]" for every
-        # index; accepting those would map ALL indices to one identity and
-        # silently collapse a multi-GPU pool to a single lock.
+        # Ignore driver placeholders; only GPU-/MIG- identities can bind lock tokens.
         if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
     return ids, uuid_map
@@ -265,22 +250,11 @@ def _bind_lock_identities(
     uuid_map: dict[str, str] | None = None,
     mig_uuids: set[str] | None = None,
 ) -> list[GpuDevice]:
-    """Bind each device to the canonical physical GPU its host lock keys on.
+    """Bind CUDA tokens to canonical GPU or MIG lock identities.
 
-    Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
-    same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two. Every ``GPU-`` token, including a full-length
-    or lowercase spelling, resolves through the readable inventory; abbreviated
-    UUID prefixes resolve only when exactly one card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
-    This both canonicalizes case and rejects a UUID that CUDA would turn into an
-    empty visibility set while phasesweep held no real-device lock.
-
-    Binding is kept separate from deduplication so a caller that must fail
-    closed on aliasing can see which tokens collapsed onto one card before they
-    are silently dropped (:func:`_require_distinct_whole_node_devices`). Every
-    token fails closed when its required ``nvidia-smi`` inventory cannot be
-    read: accepting an unverified index or UUID could expose no CUDA device or
-    split the host lock namespace between index and UUID spellings.
+    Indices and unique UUID prefixes resolve through the NVIDIA inventory. Missing or
+    unreadable identities are refused. Preserve aliases and order so whole-node
+    validation can detect a declared world size larger than the physical device set.
 
     :param list[GpuDevice] devices: Devices built from configured, ambient, or
         detected tokens.
@@ -388,20 +362,10 @@ def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
 
 
 def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDevice]) -> None:
-    """Fail closed when a whole-node device set collapses to fewer physical GPUs.
+    """Refuse whole-node tokens that name fewer devices than the declared world size.
 
-    Under ``gpu_policy='whole_node'`` the configured token list *declares* the
-    trainer's world size, and that declared count is what the phase fingerprint
-    records (``whole_node_device_count``). Deduplication is therefore not a
-    convenience here: dropping an aliased token would run a 1-GPU world under a
-    2-GPU study identity, and the two runs would be indistinguishable
-    afterwards. ``single_per_trial`` is unaffected — there the list is a pool
-    whose size is pure throughput, so dedupe with a warning stays correct.
-
-    Only *actual* collapses are reported. A collapse is visible either as a
-    token that :func:`_normalize_devices` removed (an exact repeat, or an empty
-    token) or as two bound devices sharing one ``lock_identity``. Failed
-    inventory resolution raises before this check.
+    Exact repeats, empty tokens and shared bound identities count as collapses.
+    Single-per-trial pool deduplication is handled separately.
 
     :param list[str] requested: Stripped device tokens exactly as configured,
         before normalization dropped anything.
@@ -545,11 +509,8 @@ class GpuPool:
         if explicit is not None:
             bound = _bind_lock_identities(_normalize_devices(explicit))
             if policy == "whole_node":
-                # Config validation rejects exactly-repeated tokens, but physical
-                # aliasing (index vs UUID for one card) can only be seen once
-                # nvidia-smi has been probed — which happens here, after the
-                # no-op-republish early return in the phase runner. Fail closed
-                # rather than lease a smaller world than the fingerprint claims.
+                # Only the probed inventory exposes physical aliases. Reject a smaller world
+                # than the declared whole-node device count.
                 _require_distinct_whole_node_devices(
                     [str(token).strip() for token in explicit], bound
                 )
@@ -750,11 +711,7 @@ class GpuPool:
                 candidates = list(self._available)
                 self._available.clear()
 
-            # This thread owns every candidate until it hands them back. A
-            # lock-layer failure that skipped the hand-back would shrink the
-            # pool permanently: later acquires would block forever (or report
-            # a lease timeout that phase attribution mistakes for wallclock
-            # exhaustion), so the hand-back must survive any exception.
+            # Return all candidates on failure so later acquires cannot lose pool capacity.
             acquired: _GpuAcquisition | None = None
             try:
                 for device in candidates:

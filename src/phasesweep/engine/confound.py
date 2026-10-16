@@ -1,23 +1,12 @@
-"""Selection-time confound verdicts over a phase's ranked population.
+"""Advisory confound verdicts over a phase's ranked population.
 
-PhaseSweep has no control trial: every trial in a phase is a peer, and
-selection picks the best ranked value. A confound verdict therefore answers
-whether the population selection just compared was homogeneous enough for
-"best" to mean what it says. Every verdict is advisory: it never blocks
-selection or publication.
+Without repeats, ranked units are individual trials. With repeats, they are
+complete groups; feasible members of unfinished groups count as ``incomplete_group``.
+Group aggregates are also compared using combined standard errors as a noise
+heuristic, not a significance test.
 
-The population takes one of two shapes. Without ``repeats`` the ranked units
-are single trials, and the ledger holds no replicates to estimate noise from,
-so every check is a countable fact about the population. With ``repeats`` the
-ranked units are complete repeat groups (``ranked_groups``), each a list of
-member trials. The tie check then also compares each group's aggregate with
-the winning group's against their combined standard errors; that comparison
-is an advisory heuristic, never a p-value. Feasible trials whose group never
-completed are counted as ``incomplete_group``, apart from infeasible ones.
-
-The block is computed once per selection and frozen onto the winner. A
-carried winner keeps it verbatim, and it never joins a fingerprint, so an
-observation can never invalidate a study or block a top-up.
+Verdicts are frozen at selection, carried unchanged with the winner, and excluded
+from fingerprints. They never block selection, publication, or top-ups.
 """
 
 from __future__ import annotations
@@ -112,19 +101,12 @@ def _evaluation_point(
     ranked: Sequence[optuna.trial.FrozenTrial],
     provenance: Mapping[int, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Check that every ranked objective was measured at one training position.
+    """Compare ranked objectives on their declared training-progress axis.
 
-    The position is on the extractor's declared ``evaluation_axis`` -- the
-    progress axis the sweep holds fixed: optimizer step, tokens for a
-    fixed-token sweep, or a W&B step metric. ``json_envelope`` objectives
-    report it; ``wandb`` objectives locate it in run history; ``mlflow``
-    objectives use the step of the selected observation. Comparing any
-    other axis would flag designed differences: a fixed-token batch-size sweep
-    ends trials at different steps, and checkpoint labels usually embed the
-    step. The axis is part of the fingerprinted extractor config, so every
-    ranked trial declares the same one. The exact positions are recorded, and
-    the check flags only positions more than ``_POSITION_TOLERANCE`` short of
-    the furthest.
+    JSON envelopes record the position; W&B uses its selected history position and
+    MLflow the selected observation's step. Record all positions and flag those
+    more than ``_POSITION_TOLERANCE`` short of the furthest. Other axes, including
+    checkpoint labels, are excluded from this comparison.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
     :param Mapping[int, Mapping[str, Any]] provenance: Their readable objective
@@ -163,18 +145,11 @@ def _survivorship(
     ranked: Sequence[optuna.trial.FrozenTrial],
     incomplete_group: Collection[int],
 ) -> dict[str, Any]:
-    """Check whether failed trials at least match the ranked ones.
+    """Flag when failed trials are at least as numerous as ranked units.
 
-    When they do, "best" is a claim about the survivors: anything that made a
-    configuration fail, diverge, or run out of time is now correlated with
-    which configurations could win. Failed trials include evidence-gate and
-    extraction failures. An infeasible trial violated one of the operator's
-    constraints or the metric's own bounds, which define what may win, so it is
-    counted but never flags. A feasible trial whose repeat group never
-    completed is counted as ``incomplete_group`` and never flags either: the
-    member that kept its group out is counted where it belongs. An interrupted
-    trial measured nothing and reruns, so it is not counted at all.
-    The counts are recorded whatever the verdict, and the check always runs.
+    Failures include evidence-gate and extraction errors. Infeasible trials and
+    feasible members of incomplete repeat groups are counted separately and do not
+    flag; interrupted trials are excluded. Counts are recorded for every verdict.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
@@ -263,10 +238,7 @@ def _groups(pairs: Iterable[tuple[int, Any]]) -> list[dict[str, Any]]:
 
 
 def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
-    """Return the record of a check that ran, its verdict derived from its evidence.
-
-    Assessment and validation share this derivation, so a persisted verdict
-    can never disagree with the evidence recorded beside it.
+    """Build a check record with its verdict derived from the recorded evidence.
 
     :param ConfoundCheck name: The check.
     :param dict[str, Any] detail: Evidence recorded whatever the verdict.
@@ -314,10 +286,6 @@ def _not_checked(reason: str) -> dict[str, Any]:
 
 def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, Any]:
     """Validate a persisted ``confound`` block and return a plain copy.
-
-    Shared by :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
-    :func:`phasesweep.engine.artifacts._load_winner`, and the winner read
-    paths, which differ only in how they wrap the ``ValueError``.
 
     :param object data: Parsed ``confound`` value from a ``winner.yaml``.
     :param int winner_trial: Trial number of the winner the block sits on.

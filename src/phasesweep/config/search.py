@@ -74,17 +74,11 @@ class FloatParam(_Frozen):
 
     @model_validator(mode="after")
     def _validate(self) -> FloatParam:
-        """Reject non-finite bounds, ``low > high``, log+nonpositive, log+step combos.
+        """Validate finite, ordered float bounds and compatible log/step settings.
 
-        Returns:
-            Self, unchanged. Pydantic ``mode='after'`` validator protocol.
-
-        Raises:
-            ValueError: ``low`` or ``high`` is non-finite, ``low > high``,
-                ``log`` is set with ``low <= 0``, ``step`` is non-finite or
-                ``<= 0``, ``log`` and ``step`` are combined, or the stepped
-                interval does not include the configured high bound.
-
+        :raises ValueError: Bounds are non-finite or reversed, log has a nonpositive low
+            or a step, or the step is nonpositive, non-finite, or misses the high bound.
+        :return FloatParam: Validated parameter.
         """
         _require_finite("float param low", self.low)
         _require_finite("float param high", self.high)
@@ -114,18 +108,11 @@ class IntParam(_Frozen):
 
     @model_validator(mode="after")
     def _validate(self) -> IntParam:
-        """Reject unsafe bounds, log+nonpositive, non-positive step, and log+step!=1.
+        """Validate exact integer bounds and compatible log/step settings.
 
-        Returns:
-            Self, unchanged. Pydantic ``mode='after'`` validator protocol.
-
-        Raises:
-            ValueError: Bounds cannot round-trip exactly through Optuna,
-                ``log`` is set with ``low <= 0``, ``step <= 0``, or ``log`` is
-                combined with ``step != 1`` (which Optuna's
-                ``IntDistribution`` rejects at construction time), or the
-                stepped interval does not include the configured high bound.
-
+        :raises ValueError: Bounds cannot round-trip through Optuna, the step is nonpositive
+            or misses the high bound, or log has a nonpositive low or a step other than one.
+        :return IntParam: Validated parameter.
         """
         _validate_optuna_integer_domain(self.low, self.high)
         if self.log and self.low <= 0:
@@ -133,8 +120,6 @@ class IntParam(_Frozen):
         if self.step <= 0:
             raise ValueError("int param step must be > 0")
         if self.log and self.step != 1:
-            # Optuna's IntDistribution rejects this at construction time.
-            # Catch it here so config-load fails instead of trial-launch.
             raise ValueError("int param cannot use log=true with step != 1")
         if (self.high - self.low) % self.step:
             raise ValueError(
@@ -153,38 +138,14 @@ class CategoricalParam(_Frozen):
     @field_validator("choices")
     @classmethod
     def _choices_are_unique_optuna_scalars(cls, choices: list[Any]) -> list[Any]:
-        """Reject choices Optuna can't store (lists, dicts, NaN, ...) and equal choices.
+        """Require finite Optuna scalars distinct under Python equality.
 
-        Optuna keeps a duplicated choice verbatim — ``CategoricalDistribution([1, 1, 2])``
-        has three choices and ``GridSampler`` enumerates three points — so
-        ``[1, 1, 2]`` would run three trials over two distinct assignments and
-        still report the grid complete. Duplicates also silently double a
-        choice's sampling weight under TPE/random.
+        Optuna persists the first equal choice, so ``1``, ``1.0``, and ``True``
+        cannot coexist as choices. Duplicates also alter random sampling weights.
 
-        Uniqueness is by plain Python equality, across types, because that is
-        the comparison Optuna itself uses. ``CategoricalDistribution.
-        to_internal_repr`` locates a sampled value with ``choices.index(value)``,
-        i.e. by ``==``, when it records ``FrozenTrial.params``. So choices that
-        are distinct objects but compare equal — ``1``/``1.0``/``True``,
-        ``0``/``False``, ``0.0``/``-0.0`` — all collapse onto the *first* equal
-        choice the moment the trial is recorded. The trainer still receives the
-        live suggested value, but the published winner, the inherited overrides
-        of every child phase, and TPE's own history are rebuilt from the
-        collapsed ``params``: a phase that ran ``--x true`` publishes a winner
-        claiming ``x: 1``. Rejecting equal choices at config load is what makes
-        every accepted choice round-trip identically.
-
-        Args:
-            choices: The candidate choices list pre-validation.
-
-        Returns:
-            The same list, unchanged.
-
-        Raises:
-            ValueError: An element is not an Optuna-compatible scalar
-                (``None``/``bool``/``int``/``float``/``str``), is a non-finite
-                float, or compares equal to an earlier choice.
-
+        :param choices: Candidate choices in configured order.
+        :raises ValueError: A choice is unsupported, non-finite, or equal to an earlier choice.
+        :return: The choices, unchanged.
         """
         _validate_optuna_choices(choices, label="categorical choices")
         return choices
@@ -202,8 +163,6 @@ def _validate_optuna_choices(choices: Sequence[object], *, label: str) -> None:
         (``None``/``bool``/``int``/``float``/``str``), is a non-finite float,
         or compares equal to an earlier element.
     """
-    # Optuna only accepts None|bool|int|float|str as categorical choices.
-    # Anything else (lists, dicts, custom objects) fails at suggest time.
     allowed = (str, int, float, bool, type(None))
     for index, c in enumerate(choices):
         if not isinstance(c, allowed):
@@ -214,10 +173,6 @@ def _validate_optuna_choices(choices: Sequence[object], *, label: str) -> None:
             )
         if isinstance(c, float) and not math.isfinite(c):
             raise ValueError(f"{label} must be finite floats; got {c!r}")
-        # Pairwise ``==`` rather than a hash/identity key: equal objects of
-        # different types (1 vs 1.0 vs True) are exactly the collision
-        # Optuna's index lookup cannot distinguish, and this also holds if
-        # a choice type ever stops being hashable.
         for earlier_index in range(index):
             earlier = choices[earlier_index]
             if c == earlier:
@@ -270,11 +225,7 @@ class Repeats(_Frozen):
 
 
 def sampler_search_space(phase: Phase) -> dict[str, SearchParam]:
-    """Return every axis the phase's sampler draws: the search space plus the repeat axis.
-
-    The only way to get a sampler's search space, so suggestion, grid
-    enumeration, cardinality, wire-form checks and command preflight all see
-    the repeat axis.
+    """Return the search space with the repeat axis appended when configured.
 
     :param Phase phase: Phase whose axes are listed.
     :return dict[str, SearchParam]: ``search_space`` with ``repeats.key`` appended when set.
@@ -309,12 +260,9 @@ class Sampler(_Frozen):
 
     @model_validator(mode="after")
     def _validate_n_startup_trials_applies(self) -> Sampler:
-        """Reject a non-default ``n_startup_trials`` for a sampler that ignores it.
+        """Reject non-default startup trials for samplers that ignore the setting.
 
-        Checked by value, not by whether the field was explicitly set, so a
-        config that spells out the default (e.g. a config snapshot dump)
-        keeps loading; only a value that would actually change behavior on a
-        sampler that never reads this field is refused.
+        An explicitly written default remains valid for every sampler.
 
         :raises ValueError: ``n_startup_trials`` is not the default value for
             a sampler type other than ``"tpe"``.
@@ -332,12 +280,7 @@ class Sampler(_Frozen):
 
 
 def phase_draws(phase: Phase) -> bool:
-    """Say whether a phase asks its sampler for any values.
-
-    A phase with an empty search space and no repeats is a fixed
-    configuration: its sampler is never consulted, so the seed and
-    resumability requirements that guard sampler draws do not apply to it. A
-    repeats phase always draws its repeat values, from grid or seeded random.
+    """Return whether the search space or repeats supplies any sampler axis.
 
     :param Phase phase: Phase to inspect.
     :return bool: ``True`` when the sampler has any axis to draw.
@@ -346,15 +289,10 @@ def phase_draws(phase: Phase) -> bool:
 
 
 def sampler_capability_line(phase: Phase, storage: str | None) -> str:
-    """Render the one-line resume/reproduce contract disclosed for ``phase``.
+    """Describe a phase's resume and reproduction contract.
 
-    Shared by ``phasesweep validate`` and ``phasesweep run --dry-run`` so both
-    surfaces state the same contract in the same words before any trial runs.
-    A phase resumes only on persistent storage; an in-memory study ends with
-    the process. Grid, which shuffles with a fixed seed when none is set, and a
-    seeded sampler are reproducible too, except TPE and CMA-ES under ``n_jobs``
-    above 1, whose draws depend on which trials have finished when each one is
-    drawn.
+    Resuming requires persistent storage. Grid and seeded draws are reproducible;
+    parallel TPE and CMA-ES draws also depend on trial completion order.
 
     :param Phase phase: Phase whose sampler capability is described.
     :param str | None storage: The experiment's resolved storage, ``None`` for
@@ -387,12 +325,10 @@ def sampler_capability_line(phase: Phase, storage: str | None) -> str:
 
 
 def sampler_warnings(phase: Phase) -> list[str]:
-    """List the advisory warnings about a phase's sampler and trial budget.
+    """List advisory sampler and trial-budget warnings without blocking execution.
 
-    Shared by ``phasesweep validate`` and ``phasesweep run --dry-run``. A
-    warning never blocks a run. A phase that draws nothing has no sampler to
-    warn about, but a fixed configuration asking for several trials is told
-    that only a launch can say whether they are retries.
+    Fixed configurations have no sampler warnings; multiple requested trials
+    may represent retries, which only the existing study can establish.
 
     :param Phase phase: Phase whose sampler, trial target and failure budget are checked.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
@@ -426,17 +362,11 @@ def sampler_warnings(phase: Phase) -> list[str]:
 def fixed_configuration_target_refusal(
     phase: Phase, *, finished: int, completed: int
 ) -> str | None:
-    """Say why a fixed configuration may not run to ``phase.n_trials``, if it may not.
+    """Refuse extra measurements of an already completed fixed configuration.
 
-    A fixed configuration runs the same trial every time, so it keeps at most
-    one completed result, and ``n_trials`` above 1 only replaces failed
-    attempts; an interrupted attempt reruns without one and never counts. With
-    ``finished`` attempts and none completed, the
-    target may reach ``finished + 1``: one more attempt than the failures it
-    replaces. Once one attempt completed, feasible or not, the configuration
-    has been measured and the target may not pass the attempts already made, or
-    a rerun would shop for a better draw of the same configuration. A phase
-    that draws is never refused here.
+    A fixed configuration keeps at most one COMPLETE result, feasible or not.
+    Without one, the target may allow one attempt beyond its finished failures.
+    Interrupted reruns do not count. Sampled phases are unrestricted here.
 
     :param Phase phase: Phase whose ``n_trials`` is checked.
     :param int finished: Finished attempts its study already holds, interrupted
@@ -474,31 +404,11 @@ def fixed_configuration_target_refusal(
 
 
 def _validate_sampler_search_space(phase: Phase) -> None:
-    """Reject sampler/search-space combinations Optuna will not accept at runtime.
+    """Validate sampler compatibility and the concrete trial target at config load.
 
-    Run at config-load. Catches:
-
-    * ``allow_partial_grid: true`` with a sampler other than ``grid``; the
-      switch is read only for grid, so any other sampler would silently ignore it.
-    * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
-      categorical params silently fail every trial trying to cast 'b' to float.
-    * CMA-ES without the ``cmaes`` package importable; reports an installation
-      hint before any generation is claimed or trial starts.
-    * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
-      not enumerate log-spaced values.
-    * Grid sampler with float param missing ``step``.
-    * Grid sampler with a float param whose enumerated points collapse under the
-      12-decimal canonical rounding, which would make the cardinality below
-      overcount the distinct configurations.
-
-    Cardinality is the product of validated parameter counts. Categorical
-    duplicates are rejected by :class:`CategoricalParam`; float collapse,
-    bounds, step fidelity, and the cardinality cap are checked by
-    :func:`_grid_value_counts` without building the parameter value lists.
-    The repeat axis is part of the grid, so it counts toward cardinality and its cap.
-    The grid checks cover only a phase that draws: a fixed configuration
-    consults no sampler, so a one-point grid does not bound its target. The
-    retry rule in :func:`fixed_configuration_target_refusal` does.
+    Grid counts include the repeat axis, float rounding, step fidelity, bounds,
+    and the cardinality cap without materializing values. Fixed configurations
+    instead use :func:`fixed_configuration_target_refusal`.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
     :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
@@ -569,12 +479,9 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
 
 def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
-    """Require a sampler and trial count that run every configuration once per repeat value.
+    """Require complete repeat groups under grid or seeded random sampling.
 
-    Only grid, whose cells each hold one configuration and one repeat value,
-    and seeded random, whose draws are keyed by configuration slot, keep a
-    configuration's repeats together. A partial grid would visit the shuffled
-    configuration x repeat matrix in part and leave most groups incomplete.
+    Partial grids are refused because they can leave configuration groups incomplete.
 
     :param Phase phase: Phase whose sampler and trial target are checked.
     :param Repeats repeats: The phase's repeats block.
@@ -723,17 +630,10 @@ def grid_search_space(
 
 
 def _placeholder_value_for(param: SearchParam) -> Any:
-    """Synthesize one valid value for a search-space param (used in template render preflight).
+    """Choose one valid value for command-template preflight.
 
-    Args:
-        param: A concrete search parameter from a phase's ``search_space``.
-
-    Returns:
-        For ``FloatParam`` and ``IntParam`` the configured ``low`` bound,
-        which the param validators keep finite, on the step lattice, and
-        positive under ``log=True``; for ``CategoricalParam`` the first
-        listed choice.
-
+    :param SearchParam param: Configured search parameter.
+    :return: The numeric low bound or first categorical choice.
     """
     if isinstance(param, (FloatParam, IntParam)):
         return param.low
@@ -741,13 +641,9 @@ def _placeholder_value_for(param: SearchParam) -> Any:
 
 
 def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:
-    """Synthesize one deterministic valid value for each search-space param.
+    """Choose deterministic preflight values for every sampler axis.
 
-    Args:
-        search_space: Search parameters keyed by override name.
-
-    Returns:
-        Placeholder values keyed by override name.
-
+    :param Mapping[str, SearchParam] search_space: Parameters keyed by override name.
+    :return: One valid value per parameter.
     """
     return {name: _placeholder_value_for(param) for name, param in search_space.items()}

@@ -52,20 +52,11 @@ EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
-    """Return the execution contract's contribution to semantic fingerprints.
+    """Return execution-context semantics for fingerprinting.
 
-    The trainer's working directory and ambient-environment inheritance are
-    semantic inputs: two invocations differing in either can evaluate
-    different code or data under one study. A configured cwd contributes its
-    RESOLVED path — a relative cwd invoked from two directories is two
-    different execution contexts and must not share a study. An unconfigured
-    cwd contributes the resolved invocation directory because that is where
-    the trainer actually runs. Ambient variable *values* are enforced through
-    the trial environment cohort rather than embedded in this config digest.
-    The effective pass-through names (the built-in ``TMPDIR`` plus the
-    configured ``passthrough_env``) and their classification are config
-    semantics, but their values may change. Put fixed semantic values in
-    ``env``, which is fingerprinted.
+    Include the resolved trainer cwd, inheritance policy,
+    and effective pass-through names. Ambient tracked values are checked by the trial
+    cohort; pass-through values may change without altering semantics.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
@@ -117,17 +108,10 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
 
 
 def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
-    """Hash the experiment semantics that give a published result its meaning.
+    """Hash the experiment semantics recorded with each published result.
 
-    Stamped into each generation's summary manifest so reads can tell
-    whether the config supplied *today* still matches the config that
-    produced a published result — metric name/goal/extractor, constraints,
-    trial command, env, provenance, and every phase's ordered semantic
-    identity all contribute. Run-control
-    fields (``n_trials`` top-ups, throughput knobs, comments) are excluded
-    for the same reason :data:`_RUN_CONTROL_KEYS` excludes them from phase
-    fingerprints: they never change what the published numbers mean, so they
-    must not flag a published result as reinterpreted.
+    Include metric/extractor, constraints, command, environment, provenance, and
+    ordered phase semantics. Exclude run-control targets, throughput, and comments.
 
     :param Experiment experiment: Parsed experiment config to fingerprint.
     :return str: SHA-256 hex digest (64 characters) of the canonicalised
@@ -145,14 +129,10 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
-    """Return one phase's model dump reduced to execution and output semantics.
+    """Return phase execution and output semantics, excluding run control.
 
-    ``gpu_ids``/``gpu_devices`` are run-control (which card runs a trial does
-    not change its meaning) — except under ``whole_node``, where the configured
-    device-set SIZE is the trainer's world size and therefore semantic: a
-    4-GPU DDP evaluation and a 1-GPU evaluation of the same phase must not
-    share a study. Only the count joins the fingerprint, so respelling the
-    same set (indices vs UUIDs) or moving hosts does not invalidate a study.
+    GPU identities are excluded. Under ``whole_node``, their count defines trainer
+    world size and is included; equivalent index and UUID spellings retain identity.
 
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
@@ -169,12 +149,9 @@ def _phase_semantic_payload(
     phase: Phase,
     inherited_winners: dict[str, Winner],
 ) -> dict[str, Any]:
-    """Return a dict capturing only fields that change *trial meaning*.
+    """Return fields that change trial meaning, including configured environment values.
 
-    Excludes run-control fields so that bumping ``n_trials`` to top up a study
-    is a compatible operation. Includes ``experiment.env``: env vars like
-    ``CUBLAS_WORKSPACE_CONFIG`` or ``MY_TRAINER_SEED`` change training
-    behavior and must invalidate reuse.
+    Run-control fields such as ``n_trials`` are excluded, allowing study top-ups.
 
     :param Experiment experiment: Experiment supplying command, input format,
         environment, metric, constraints, and provenance.

@@ -59,7 +59,7 @@ def tracking_root(experiment: Experiment) -> Path:
 
 
 def write_record(path: Path, record: Mapping[str, object]) -> None:
-    """Atomically persist private tracking state using existing file primitives.
+    """Atomically persist private tracking state.
 
     :param Path path: Record destination.
     :param Mapping[str, object] record: JSON-compatible payload.
@@ -121,11 +121,10 @@ def operation_deadline(experiment: Experiment, deadline: float | None = None) ->
 
 @contextmanager
 def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[tuple[str, Path]]:
-    """Register a controller worker that owns no Optuna trial.
+    """Register a tracking worker and retain ownership until its cleanup is confirmed.
 
-    The registry entry is retired only when the lifecycle record proves the
-    worker never launched or its cleanup was confirmed. A record that cannot be
-    read leaves the entry in place, since the worker may still be alive.
+    Unreadable lifecycle records retain the registry entry. Entries are retired
+    when the worker never launched or cleanup is confirmed.
 
     :param Experiment experiment: Registry owner.
     :param str generation_id: Producing generation.
@@ -214,15 +213,11 @@ def _create_bound(
     deadline: float | None,
     attempt_directory: Path | None = None,
 ) -> RunBinding:
-    """Bind or create the identity's run, sending the creation request at most once.
+    """Bind or create an identity's run, persisting intent before sending creation.
 
-    A pending record marks the request before it is sent. Only a worker's
-    well-formed rejection proves that nothing was created, and it removes the
-    record. An unconfirmed outcome or a timeout may still have created the
-    run, so the identity is then only searched, never created again; an empty
-    search leaves the creation unresolved and the record in place, across
-    restarts. Any other failure propagates with the record kept, since it
-    shows nothing about the request.
+    A confirmed rejection removes pending intent. Unknown outcomes, timeouts,
+    and other failures retain it; subsequent calls search rather than create.
+    An empty search leaves the creation unresolved across restarts.
 
     :param Experiment experiment: Configured experiment.
     :param RunIdentity identity: Exact creation identity.
@@ -342,12 +337,10 @@ def _find_bound(
 def resolve_pending_creations(
     experiment: Experiment, environment: Mapping[str, str], generation_id: str | None
 ) -> None:
-    """Bind the runs that unresolved creations left behind, without creating any.
+    """Reconcile pending creations with one read-only search per record, without polling.
 
-    Each pending record in scope gets one read-only search with no polling: a
-    run that a timed-out request created late is bound and its record
-    removed, while an absent run leaves its record for a later call. A search
-    that fails leaves its record too, with a warning.
+    A found run is bound and its pending record removed. Missing runs and search
+    failures retain their records; failures also emit a warning.
 
     :param Experiment experiment: Configured experiment.
     :param Mapping[str, str] environment: Composed credentials and transport.
@@ -482,11 +475,7 @@ def require_tracking_target(
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> None:
-    """Reach the MLflow target before a phase allocates any trial.
-
-    A missing experiment, refused credentials, or an unreachable server then
-    stops the run once with its own cause, instead of failing every trial and
-    consuming the phase's trial budget.
+    """Resolve the MLflow target before allocating a phase's trials.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: Current invocation identity.
@@ -534,11 +523,9 @@ def prepare_attempt(
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> RunIdentity:
-    """Bind the source experiment and optionally create the trainer's run.
+    """Bind the source experiment and optionally create the trainer's native run.
 
-    The native runs of the inherited winners are recorded beside the
-    identity, so the attempt's projection can be rebuilt after the process
-    that launched it is gone.
+    Persist inherited winner run IDs beside the attempt identity for later projection replay.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str phase: Current phase name.

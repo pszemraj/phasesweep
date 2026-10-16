@@ -1,6 +1,6 @@
 # Runtime behavior
 
-PhaseSweep runs one ordered Experiment on a Linux host. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. Every trial's process identity records the PID namespace its numbers belong to, so `/proc` must be the procfs of the orchestrator's own PID namespace, with that namespace's PID 1 readable; the trial launcher refuses to start a trial otherwise. GPUs are optional; the core CLI can run CPU-only work. The optional MCP server additionally requires Linux `/proc` process start times for detached-run cancellation and recovery.
+PhaseSweep runs one ordered Experiment on a Linux host for a trusted researcher or team. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. Every trial's process identity records the PID namespace its numbers belong to, so `/proc` must be the procfs of the orchestrator's own PID namespace, with that namespace's PID 1 readable; the trial launcher refuses to start a trial otherwise. GPUs are optional; the core CLI can run CPU-only work. The optional MCP server additionally requires Linux `/proc` process start times for detached-run cancellation and recovery.
 
 ## Output layout
 
@@ -84,9 +84,9 @@ Selection logs one `WARNING` naming every flagged check and its numbers, and a p
 
 ### Trust boundary
 
-The workdir is operator-trusted. By default its directories and files are not owner-only: new files take the process umask and a rewrite keeps the mode the file already had, so operators and tooling keep ordinary access to logs, evidence, winners, and resolved overrides. Engine records such as trial artifacts, `process_identity.json`, and `attempt_lifecycle.json` use ordinary path handling and are not symlink-hardened; records that need crash-safe replacement, including those two, are written to a temporary file and renamed into place atomically.
+Workdir artifacts use ordinary paths and permissions: new files follow umask, and replacements preserve existing modes. Logs, evidence, winners, and resolved overrides remain accessible to the operator and tooling. Process identity and lifecycle records use atomic replacement.
 
-Three things inside the tree are hardened:
+Private records inside the tree have these additional requirements:
 
 | Path | Mode | PhaseSweep refuses to |
 | --- | --- | --- |

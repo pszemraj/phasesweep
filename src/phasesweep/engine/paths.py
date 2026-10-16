@@ -78,20 +78,12 @@ def _trial_dir_for(
 
 
 def _attempts_dir(experiment: Experiment) -> Path:
-    """Return the experiment-level active-attempt registry directory.
+    """Return the registry of trial and tracking attempts that may own a process.
 
-    One JSON entry per attempt that may still own a live process, written at
-    allocation: a trial attempt, or a tracking operation that owns no trial.
-    A trial's entry is retired once its Optuna trial is durably terminal,
-    except that a trial with unconfirmed or unsafe cleanup keeps it past
-    terminal state until the study's cleanup-recovery ledger records that
-    cleanup (``engine.phase._settle_finished_trial``). A tracking operation's
-    entry is retired by ``tracking.session.tracking_operation`` once its
-    lifecycle record shows the worker never launched or its cleanup was
-    confirmed. Preflight resolves and retires whatever a crashed run left
-    behind. Recovery scans this registry *independently of the current phase
-    graph*, so a renamed or removed phase cannot hide a stale attempt from
-    preflight.
+    Entries are written at allocation. Trials retire after durable terminal state,
+    retaining entries until uncertain cleanup is recovered. Tracking entries retire
+    when their lifecycle proves no launch or confirmed cleanup. Recovery scans the
+    registry independently of the current phase graph.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :return Path: Directory containing active-attempt registry entries.

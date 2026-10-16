@@ -72,9 +72,6 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
 
-# Agent-facing tool descriptions. Descriptions are the one instruction channel
-# present on every call even when the user loads no prompt, so each one chains
-# to the next tool in the workflow by literal name.
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call this first for "
     "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
@@ -696,14 +693,10 @@ def _raise_safe_tool_error(tool_name: str, exc: Exception) -> NoReturn:
 
 
 def _safe_tool(fn: F) -> F:
-    """Translate exceptions into redacted tool errors.
+    """Wrap tools with redacted ``ValueError`` failures while preserving their signatures.
 
-    ``McpToolError`` -> re-raised as ``ValueError`` with its safe message.
-    FastMCP's low-level handler serializes tool exceptions as
-    ``CallToolResult(isError=True)``. Anything else -> logged to stderr and
-    replaced with a generic message so an unexpected ``Exception`` (e.g. an OSError
-    carrying a path) never reaches the agent. ``functools.wraps`` preserves the
-    signature so FastMCP still derives the tool schema.
+    Known tool failures retain their safe messages. Unexpected exceptions are logged and
+    replaced with a generic error; FastMCP returns either as ``isError`` text.
 
     :param F fn: Tool implementation to wrap.
     :return F: Wrapped function that raises only safe tool errors.
@@ -772,11 +765,7 @@ def _tool_annotations(
 def _strict_tool_inputs(mcp: Any) -> None:
     """Make FastMCP's generated argument models reject undeclared keys.
 
-    ``mcp.server.fastmcp.FastMCP`` 1.27.x does not expose a public switch for
-    closed input schemas, so this intentionally patches the generated tool
-    metadata. Keep the narrow dependency pin and startup verification together
-    with this hook: if SDK internals move, ``_verify_strict_tool_inputs`` must
-    fail before serving permissive tools.
+    Uses pinned SDK metadata; startup verification rejects incompatible schemas.
     """
     for tool in mcp._tool_manager.list_tools():
         arg_model = tool.fn_metadata.arg_model
@@ -1071,12 +1060,7 @@ def serve(catalog: Path) -> int:
 
 
 def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
-    """Run one tool of the served catalog in this process and print its result.
-
-    The call goes through FastMCP's own ``call_tool``, so the strict input
-    schema, the redaction wrapper and the audit log run as they do for a connected
-    client, except that the audit records carry ``transport: "cli"`` so they stay
-    distinguishable from a served client's.
+    """Dispatch and print one tool through FastMCP with CLI transport audit records.
 
     :param Path catalog: Operator-authored catalog file.
     :param str tool: Registered tool name, such as ``list_experiments``.

@@ -44,12 +44,7 @@ BindingState = Literal["bound", "unbound"]
 
 
 def _artifact_root_identity(experiment: Experiment) -> str:
-    """Return the single artifact root a persistent study is allowed to publish into.
-
-    Derived through :func:`phasesweep.engine.paths._experiment_dir` — the same
-    helper every artifact
-    path is built from — so the recorded binding and the namespace actually
-    written can never drift apart.
+    """Return the resolved artifact root derived from the shared engine path builder.
 
     :param Experiment experiment: Parsed experiment supplying workdir and name.
     :return str: Resolved ``<workdir>/<experiment>`` namespace as a string.
@@ -106,11 +101,7 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
 def _root_durable_state_entry(experiment: Experiment) -> str | None:
     """Return the first known PhaseSweep state entry in an unbound root.
 
-    Arbitrary operator files do not establish storage ownership. A note,
-    ``.DS_Store``, or other unrelated file may already live in a chosen output
-    directory before the first run, and treating it as PhaseSweep state makes
-    the experiment name unusable. Only paths PhaseSweep itself creates require
-    a format-boundary refusal.
+    Unrelated operator files do not establish ownership or require a format refusal.
 
     :param Experiment experiment: Experiment whose artifact root is inspected.
     :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
@@ -157,18 +148,10 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
 
 
 def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
-    """Classify an artifact tree's recorded ownership, writing nothing.
+    """Classify a tree's experiment and ledger ownership without reading the ledger.
 
-    Study attributes bind ledger to tree. This reverse record binds tree to
-    ledger, preventing a second database from combining its trial counts with
-    another database's publication. Existing unmarked PhaseSweep state is
-    refused as an unsupported format.
-
-    This is step one of the fixed ledger order, so it is strictly read-only: it
-    neither writes the record (:func:`_write_artifact_root_binding`) nor opens
-    or inspects the ledger itself
-    (:func:`phasesweep.engine.ledger._scan_ledger_format`). Separating the two
-    is what lets a pure read path classify a tree without touching a byte.
+    The tree-to-ledger record complements each study's tree binding. Refuse foreign
+    ownership and unmarked PhaseSweep state; do not write or scan storage here.
 
     :param Experiment experiment: Config whose root and storage must agree.
     :return BindingState: ``"bound"`` when the tree already records exactly
@@ -222,11 +205,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
 
 
 def _write_artifact_root_binding(experiment: Experiment) -> None:
-    """Record this experiment's ownership of a tree the caller already checked.
-
-    Callers reach here only after :func:`_check_artifact_root_binding` returned
-    ``"unbound"``, so this writes the first ownership record rather than
-    replacing one.
+    """Write the first ownership record after an unbound tree passes inspection.
 
     :param Experiment experiment: Experiment whose artifact root is claimed.
     :raises ArtifactRootConflictError: The record could not be written.
@@ -257,10 +236,9 @@ def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
 
 
 def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> bool:
-    """Decide, without writing anything, whether a study may claim the offered root.
+    """Check whether an empty study may claim the offered root, without writing.
 
-    The read-only half of the binding, split out so a multi-phase run can
-    check every declared phase before it claims any of them.
+    Multi-phase callers inspect every declared study before claiming any.
 
     :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
@@ -285,13 +263,10 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
 
 
 def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
-    """Refuse a study that records an artifact root other than this config's.
+    """Refuse an existing study bound to another root, without claiming it.
 
-    The ownership half of :func:`_artifact_root_claim_needed`, split out for
-    callers that use existing studies without ever claiming one (MCP recovery
-    reaps through them). A study that records no root passes, because it is
-    not bound to anyone else; whether it may be claimed is the claim's
-    question, not this one.
+    An unbound study passes; claimability is checked separately. Recovery callers
+    apply this ownership check before using a live study.
 
     :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.

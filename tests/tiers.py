@@ -1,48 +1,13 @@
-"""Static classifier that decides which tests belong to the integration tier.
+"""Classify integration tests from process management and wall-clock waits in their source.
 
-The fast review tier is ``pytest -m "not live and not integration"``. A test
-belongs to the integration tier when it manages real processes, waits on
-wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
-slow. This module enforces the part of that rule a test's own source shows: a
-test that manages processes or waits on the clock *directly*, in its body or in
-a same-module helper or fixture. ``tests/conftest.py`` fails collection when
-such a test lacks the marker.
+Detection follows same-module helpers and fixtures without importing them. Shared
+helpers are classified by name and checked by ``scan_helpers``. Process primitives,
+session creation, sleeps, expiring waits, timers, and generated sleep calls qualify.
+Handshake timeouts and monotonic clock reads do not.
 
-What the scanner does not see is deliberate. An engine run with a quick trainer,
-such as ``run_experiment`` over an ``echo`` trainer, spawns its subprocess inside
-the package; it stays in the fast tier, which relies on those runs for engine
-coverage. Any other slow test is marked by the classification rule in
-``docs/development.md``, not by this scanner. Pytest's duration report identifies
-slow tests at runtime.
-
-Detection is syntactic: it never imports the module under inspection and never
-touches the filesystem beyond reading source. Two rules fire here:
-
-* **Rule (a), real processes** -- a reference to a process primitive in
-  :data:`PROCESS_PRIMITIVES` or the ``os.spawn*`` family, under any import
-  spelling; a ``start_new_session=`` keyword argument; or a call to a shared
-  helper in :data:`PROCESS_DRIVER_CALLS`.
-* **Rule (b), wall-clock waits** -- a call whose leaf name is ``sleep``
-  (``time.sleep``, ``asyncio.sleep``, a bare imported ``sleep``); a ``.wait(``
-  given a timeout that is meant to run out, i.e. on a freshly built object no
-  other code can set (``threading.Event().wait(5)``) or asserted to return false
-  (``assert not ready.wait(5)``); a reference to a primitive in
-  :data:`WALLCLOCK_PRIMITIVES` (``threading.Timer``, ``select.select``,
-  ``signal.pause``); a call to a shared helper in :data:`WALLCLOCK_HELPER_CALLS`;
-  or a string literal that embeds ``sleep(``, which is how the suite injects
-  delays into generated trainer scripts. A handshake such as
-  ``assert ready.wait(timeout=5)`` returns as soon as another thread sets the
-  event, so its timeout only bounds a hang and does not qualify. Monotonic clock
-  reads such as ``time.monotonic`` and ``time.perf_counter`` measure elapsed
-  time without spending it and never qualify.
-
-Both rules resolve transitively through same-module helper functions and
-same-module fixtures, so a test that only calls a local ``_spawn_runner()``
-helper, or only requests a local fixture that spawns, is still classified by
-what that helper does. Helpers shared from ``tests/conftest.py``,
-``tests/mcp_helpers.py`` and ``tests/ledger_fixtures.py`` live in another module,
-so they are classified by name instead: :func:`scan_helpers` finds the ones that
-spawn or wait, and ``tests/test_tier_guard.py`` fails until each is registered.
+Package-internal subprocesses are outside this scanner's scope. Other slow tests
+need explicit markers under the policy in docs/development.md. Collection rejects
+unmarked tests detected here.
 """
 
 from __future__ import annotations

@@ -47,12 +47,8 @@ def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
 def anchor_relative_path(value: str, info: ValidationInfo) -> str:
     """Resolve a relative config path against the loaded config file's directory.
 
-    Anchoring at load makes one config file name one set of paths from any
-    working directory. Without a config directory in the validation context
-    (an experiment built in Python, or a re-validation of already anchored
-    values) the value is returned unchanged and keeps working-directory
-    semantics. A leading ``~`` is left for consumers to expand, so it stays
-    home-relative.
+    Absolute and home-relative paths stay unchanged. Without a config directory
+    in the validation context, relative paths keep working-directory semantics.
 
     :param str value: Nonempty configured path.
     :param ValidationInfo info: Validation info whose context may carry
@@ -120,20 +116,11 @@ class _Frozen(BaseModel):
 
 
 def _require_finite(label: str, value: float) -> None:
-    """Raise ``ValueError`` if ``value`` is NaN or +/-inf.
+    """Reject NaN and infinite numeric values.
 
-    Used at config-load to keep silently-broken bounds out of the runtime: a
-    constraint with ``max: .nan`` would otherwise be vacuous because
-    ``x > nan`` is always ``False``.
-
-    Args:
-        label: Human-readable name of the field (e.g. ``"constraint.max"``);
-            included verbatim in the error message.
-        value: The numeric value to validate.
-
-    Raises:
-        ValueError: If ``value`` is not finite (``math.isfinite`` returns False).
-
+    :param str label: Field label included in the error.
+    :param float value: Numeric value to validate.
+    :raises ValueError: The value is not finite.
     """
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite; got {value!r}")
@@ -194,19 +181,11 @@ _OVERRIDE_KEY_SEGMENT = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
 def _validate_override_key(key: str, *, label: str) -> None:
-    """Reject override keys that would render to ambiguous shell arguments.
+    """Require nonempty dotted override keys with ``[A-Za-z0-9_-]`` segments.
 
-    Args:
-        key: The candidate key from ``fixed_overrides`` or ``search_space``.
-            Must be a non-empty string of dotted ``[A-Za-z0-9_-]`` segments.
-        label: Human-readable context prepended to any error message
-            (e.g. ``"phase 'lr' search_space"``).
-
-    Raises:
-        ValueError: ``key`` is empty; has leading/trailing or embedded
-            whitespace; or contains an empty dotted segment or a segment with
-            disallowed characters.
-
+    :param str key: Candidate fixed or search-space key.
+    :param str label: Context included in validation errors.
+    :raises ValueError: A segment is empty, padded, or contains disallowed characters.
     """
     if not key:
         raise ValueError(f"{label}: override key cannot be empty.")
@@ -231,28 +210,12 @@ def _validate_override_key(key: str, *, label: str) -> None:
 
 
 def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
-    """Return pairs ``(short, long)`` where ``short`` is a strict path-prefix of ``long``.
+    """Find override keys that are strict dotted-path prefixes of other keys.
 
-    Two keys collide when one's dot-path is a strict prefix of the other's.
+    ``model`` conflicts with ``model.depth``; ``model.depths`` does not.
 
-    Examples:
-        * ``model`` and ``model.depth`` collide — CLI formats render
-          contradictory arguments, and dotted override composition cannot represent both a
-          scalar and a nested object at the same key.
-        * ``model.depth`` and ``model.depths`` do **not** collide (different
-          siblings, same depth).
-        * ``a.b.c`` and ``a.b.c.d`` do collide.
-
-    Used in ``Experiment._validate_phase_graph``.
-
-    Args:
-        keys: The combined fixed-overrides / search-space / inherited key set
-            for one phase.
-
-    Returns:
-        Lexically-sorted ``(short, long)`` pairs where ``short`` is a strict
-        path-prefix of ``long``. Empty list when no collisions are present.
-
+    :param set[str] keys: Fixed, sampled, and inherited override keys.
+    :return list[tuple[str, str]]: Lexically sorted ``(short, long)`` collisions.
     """
     parts_by_key = {key: tuple(key.split(".")) for key in keys}
     seen: set[tuple[str, str]] = set()

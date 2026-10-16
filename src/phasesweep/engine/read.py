@@ -1,21 +1,9 @@
-"""Read-only views of experiment results for status and winner reporting.
+"""Read-only status, winners, and trial tables for engine and MCP callers.
 
-This module is the single public surface for *reading* run state without
-launching anything or reaching into engine-private path helpers. The MCP
-layer is the primary consumer; the CLI consumes a narrow slice of it (see
-:func:`phasesweep.engine.run.experiment_status`) for its path-bearing status
-view, so winner and status shapes have exactly one definition.
-
-Reads here are permissive about partial run state and never raise on a missing
-winner. They still fail closed when the artifact root belongs to another
-storage ledger: combining one database's trial counts with another database's
-publication is not a partial result. They do NOT re-verify phase fingerprints:
-that check belongs to the resume path in ``engine.artifacts._load_winner``, not to
-a status read.
-
-A published generation is read once, by publication validation, and its facts
-come from what that validation read. Only a generation that is not the
-validated publication (pinned, unfinished, or failed) is read from its files.
+Missing and partial results are reported permissively; conflicting artifact-root
+ownership is refused. Resume fingerprint checks belong to ``artifacts._load_winner``.
+Published facts come from the bytes publication validation read. Unpublished
+represented generations are read permissively from their own files.
 """
 
 from __future__ import annotations
@@ -128,10 +116,7 @@ class PhaseWinnerView:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
-    # The metric semantics the winner itself recorded: a persisted winner is
-    # historical evidence, so its value is reported under the name and goal it
-    # was optimized for, never relabeled by whatever metric the current config
-    # declares.
+    # Metric labels recorded by the winning generation, independent of current config.
     metric_name: str | None = None
     metric_goal: str | None = None
     # Path-free projection of the winner's confound block: verdicts, check
@@ -153,15 +138,10 @@ def _phase_status_payloads(
     published_trials: Mapping[str, _TrialRef | None],
     winners_present: set[str],
 ) -> list[dict[str, Any]]:
-    """Build the path-free per-phase status payloads ``read_status`` returns.
+    """Build path-free per-phase status from one trial and publication capture.
 
-    :func:`phasesweep.engine.run.experiment_status` builds the CLI's separate,
-    path-bearing phase view from this function's output instead of asking it
-    for paths, so no call here can ever put a filesystem path in its result.
-
-    ``winners_present`` must come from the caller's single resolution of the
-    represented generation, so one status object spanning several phases can
-    never mix identities from two different pointer resolutions.
+    ``winners_present`` must refer to the caller's single represented-generation
+    resolution. CLI callers add their paths separately.
 
     :param Experiment experiment: Parsed experiment whose phase study counts are reported.
     :param Mapping[str, _PhaseTrialStats] phase_stats: Counts, availability and
@@ -221,11 +201,7 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         payload is malformed.
     """
     try:
-        # winner.yaml stores metric as {<metric_name>: value, "goal": ...}. The
-        # winner is historical evidence: pull the value by the name the file
-        # itself recorded, NOT the currently configured metric name — reading
-        # a published x/minimize result through a config renamed to y would
-        # silently drop the winner entirely.
+        # Read the metric under its recorded name, even if the current config renamed it.
         metric_block = data.get("metric") or {}
         if not isinstance(metric_block, Mapping):
             return None
@@ -375,14 +351,10 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
 
 
 def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] | None:
-    """Return the phase names an unvalidated represented generation recorded.
+    """Return the phase names recorded by an unvalidated represented generation.
 
-    Only the plan's names are returned. The summary's other phase records
-    (``phases``) carry composed hyperparameters that agent-facing payloads
-    must never see; the plan is the design-time list the engine froze beside
-    the metric semantics for exactly this purpose (engine/run.py's generation
-    summary). The plan is parsed by the same rule publication validation
-    applies, which refuses what this permissive read reports as no plan.
+    Use the recorded design-time plan, excluding the summary's composed overrides.
+    Malformed plans return no plan; publication validation refuses them.
 
     :param Mapping[str, Any] | None summary_payload: Parsed generation summary, or ``None``.
     :return list[str] | None: Recorded phase names in execution order, or
@@ -443,93 +415,38 @@ def read_status(
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
 ) -> EngineStatus:
-    """Per-phase trial counts and winner presence for one experiment.
+    """Read path-free progress and represented-result status for one experiment.
 
-    The payload is always path-free: no field ever carries a filesystem path.
-    The redaction layer in ``phasesweep.mcp.redaction`` takes this function's
-    output as already path-free and does not strip paths itself.
-    :func:`phasesweep.engine.run.experiment_status` builds the CLI's separate,
-    path-bearing phase view on top of this function's path-free ``phases``
-    payload instead of asking this function for paths.
+    Resolve the current and last-success pointers once each. Published winner and
+    summary facts come from that validation capture; a pinned unpublished generation
+    uses its own files. Pointer identities remain truthful even for a pinned read:
 
-    Trial counts come from ``read_trial_stats``, which reports empty counts
-    for a study that does not exist yet, never creates one as a side effect,
-    and swallows transient backend errors (e.g. a momentary journal-ledger lock
-    while the runner writes) by reporting empty counts rather than raising.
-    ``trial_data_available`` distinguishes a successful empty read from missing
-    or unreadable storage so callers never treat ambiguous zeros as evidence.
-    The path-free phase payload also carries ``running_attempts``: the
-    identities of the RUNNING trials those same counts describe, from the same
-    snapshot, or ``None`` when ``trial_data_available`` is ``False``. It exists
-    so a caller that must reconcile RUNNING rows -- the MCP terminal snapshot
-    -- never needs a second, intolerant storage read after this one.
+    - ``current_generation_id`` names the most recent invocation's mutable pointer.
+    - ``published_generation_id`` names the validated last-success pointer.
+    - ``represented_generation_id`` is the pinned id, or the published id by default.
+    - ``is_published`` is true only when a non-null represented id equals the published id.
+    - ``publication_integrity`` is ``ok``, ``absent``, ``failed``, or ``permission_denied``.
+      Failed validation exposes no published winner. Failure details are path-free;
+      permission denial does not imply artifact corruption.
 
-    This resolves the current pointer and the last-success pointer *exactly
-    once each* and reuses those two captured ids for every downstream fact in
-    this call -- no helper reached from here re-resolves either pointer, so
-    one status object can never mix identities from two different pointer
-    reads. Four identities are always reported, and each is truthful
-    independent of ``generation_id``:
+    The ``phases`` progress view follows the current config. Metric labels and
+    ``result_phase_plan`` follow the represented generation. ``result_context`` and
+    ``published_config_matches_current`` report which semantics apply after config edits.
+    ``winner_present`` and ``summary_present`` refer to the represented generation.
 
-    - ``current_generation_id``: always the actual mutable current pointer
-      (the most recent invocation's own claim, whether failed, in-progress,
-      or a much older publication); *never* forced to equal a pinned
-      ``generation_id``.
-    - ``published_generation_id``: always the actual validated last-success
-      pointer; *never* forced to equal a pinned ``generation_id`` either. A
-      pinned read of a generation whose own publication failed correctly
-      reports the *older* generation here, not the pinned one.
-    - ``represented_generation_id``: the generation whose winner/summary
-      facts this payload actually shows -- ``generation_id`` itself when
-      pinned, otherwise the captured ``published_generation_id``.
-    - ``is_published``: ``True`` when ``represented_generation_id`` is not
-      ``None`` and equals ``published_generation_id``. A pinned read of a
-      failed-publication generation is ``is_published: False`` while still
-      showing that generation's own (unpublished) winners. Without a
-      generation identity, status is unpublished.
-    - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
-      ``"permission_denied"`` --
-      *why* ``published_generation_id`` is what it is. ``"absent"`` means
-      nothing was ever published, a healthy state for a fresh tree;
-      ``"failed"`` means a last-success pointer exists but its target no
-      longer validates; ``"permission_denied"`` means this user cannot
-      complete validation without implying corruption. Both are accompanied by
-      a short, path-free ``publication_error``. Keeping the states distinct
-      stops a fresh tree and corrupt evidence from both reading as nothing
-      published, which would invite a re-run over the corrupt evidence. A
-      ``"failed"`` payload reports exactly the no-publication facts --
-      nothing is fabricated from an unvalidated generation -- so
-      ``published_generation_id`` is ``None``, ``is_published`` is ``False``,
-      and no winner reads as present.
+    ``generation_trials`` counts the pinned generation, or the current generation in
+    default mode. Other trial counts are cumulative. Counts and ``running_attempts``
+    come from one storage capture. Absent studies have known zero counts; unreadable
+    storage has ``trial_data_available=False`` and ``running_attempts=None``.
 
-    Two views coexist in this payload and must not be confused. The
-    *config-progress* view -- the ``phases`` list, with its trial counts,
-    targets, and per-phase winner presence -- describes the phases the current
-    config declares, because that is what a further run would execute. The
-    *result* view -- the metric descriptor, ``result_phase_plan``, and the
-    publication identity fields -- describes the represented generation on its
-    own terms. Under a config edited since publication the two legitimately
-    disagree, and ``result_context`` / ``published_config_matches_current``
-    say so explicitly rather than leaving a reader to conclude the publication
-    is empty.
+    ``published_study_unavailable`` means a published phase's trial identity or
+    completion boundary could not be matched. With available trial data, history is
+    confirmed missing, replaced, or incomplete: execution is refused, although skipped
+    phases may load saved winners. With unavailable data, inspection was incomplete
+    and recovery may be required before further MCP launches. Artifact integrity is
+    reported separately.
 
-    Winner/summary facts (``winner_present``, top-level ``summary_present``)
-    scope to ``represented_generation_id``. ``generation_trials`` scopes to
-    ``current_generation_id`` in default mode (live progress of whatever is
-    currently running/most recent) but to the *pinned* id in pinned mode --
-    a pinned caller wants that specific generation's own trial counts, not
-    whatever else may be current by the time the read happens. ``trials``,
-    ``running``, ``completed``, and ``trial_data_available`` are cumulative,
-    all-time counts for the phase's study and are not generation-scoped.
-    ``published_study_unavailable`` reports a current published phase whose local
-    trial identity or recorded completion boundary could not be matched in storage.
-    When both it and ``trial_data_available`` are true, history is confirmed missing,
-    replaced, or incomplete; executing the phase is refused, while earlier phases
-    may still load saved winners via ``from_phase``. When ``trial_data_available``
-    is false, the history could not be completely inspected, including an incomplete
-    journal append; a run can report cleanup uncertainty and
-    require operator recovery before further MCP launches. Publication
-    integrity describes the artifacts separately.
+    MCP consumes this path-free payload; the CLI adds paths in its separate view.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional invocation identity to pin the
@@ -585,14 +502,11 @@ def read_result(
     comparison_experiment: Experiment | None = None,
     phase_names: Sequence[str] | None = None,
 ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
-    """Read status and the represented generation's winners from one pointer resolution.
+    """Read status and represented-generation winners from one pointer resolution.
 
-    A caller that reports both must use this single read: separate pointer
-    resolutions could describe different publications. Winners default to the
-    status payload's ``result_phase_plan``, so a phase renamed since publication neither hides
-    its published winner nor reports the new name as missing. A published
-    generation's winners are the bytes publication validation read; any other
-    represented generation is read permissively.
+    Winners default to the recorded ``result_phase_plan``, preserving published names
+    after config edits. Published winners use validated bytes; other represented
+    generations are read permissively.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional generation to represent, as for
@@ -679,12 +593,7 @@ def _read_status(
     # pointer's generation published.
     phase_stats = read_trial_stats(ledger, published_trials)
 
-    # The represented generation's winner/summary facts are historical
-    # evidence, so the metric they are reported under must be the one that
-    # generation actually optimized — never the metric the config supplied
-    # today. The generation's own summary is the source of that
-    # interpretation; only when it records none does the current config
-    # describe the result.
+    # Prefer the represented generation's recorded metric semantics; use config as fallback.
     comparison = comparison_experiment or experiment
     metric_payload: JsonObject = _metric_semantics_payload(comparison.metric)
     result_phase_plan = [phase.name for phase in experiment.phases]
@@ -900,16 +809,11 @@ def _trial_table(
 
 
 def read_trial_tables(experiment: Experiment) -> TrialTables:
-    """Read every configured phase's trials as table rows, writing nothing.
+    """Read configured phases' trial tables without creating storage or writing files.
 
-    Built on :func:`phasesweep.engine.ledger.validate_ledger` and
-    :func:`phasesweep.engine.ledger.read_phase_trials`, so it creates no study,
-    constructs no file-backed storage, and writes no byte. The publication
-    pointer is resolved once, before the trials are read, and the winner marks
-    come from that resolution. They therefore name the published generation's
-    winners, which is not the winner of a rerun that has not published yet. A
-    phase with no study, and every phase of an in-memory ledger, has no rows. A
-    phase whose trials cannot be read is reported unavailable instead of empty.
+    Resolve publication once before capturing trials; winner marks identify that
+    publication, excluding uncommitted reruns. Absent studies and in-memory ledgers
+    have no rows. Unreadable phases are reported unavailable.
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
     :raises ArtifactRootConflictError: The artifact root cannot be read or is bound to another ledger.

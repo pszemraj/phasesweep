@@ -1,10 +1,4 @@
-"""Outbound payload construction.
-
-Payloads are built only from typed, path-free views (PhaseWinnerView, the
-read_status dict, catalog summaries). There is no path to interpolate a
-trial_command, env value, or storage URL into a result, so there is nothing to
-redact after the fact.
-"""
+"""Build outbound payloads from path-free status, winner and catalog views."""
 
 from __future__ import annotations
 
@@ -78,19 +72,10 @@ def winners_payload(
 ) -> dict[str, Any]:
     """Build the ``get_run_results`` payload from path-free phase-winner views.
 
-    MCP output exposes sampled ``params`` only, and values are redacted unless
-    the catalog explicitly allows them. ``effective_overrides`` can include
-    config-authored fixed or inherited values, so it is intentionally kept out
-    of agent-visible tool results.
-
-    A published result is *historical evidence*: ``metric`` and
-    ``declared_phases`` must describe the generation the winners came from, not
-    whatever the config says today. Callers are responsible for sourcing both
-    from the represented generation; ``result_context`` and
-    ``published_config_matches_current`` then tell the agent which config those
-    labels came from and whether it still matches the one a further run would
-    execute. Visibility policy is unaffected: the *current* policy still
-    decides which historical values are redacted, it just never relabels them.
+    Expose sampled params under the visibility policy; omit effective overrides, fixed
+    values and inherited values. ``metric`` and ``declared_phases`` must come from the
+    represented generation. ``result_context`` and ``published_config_matches_current``
+    disclose those labels' source and current-config agreement.
 
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
@@ -177,36 +162,15 @@ def status_payload(
     result_source: ResultSource,
     elapsed_seconds: int | None,
 ) -> dict[str, Any]:
-    """Build the ``get_run_status`` payload from the path-free read_status dict.
+    """Build the ``get_run_status`` payload from path-free trial and process state.
 
-    ``status`` is the read_status output (already path-free). ``run`` is the
-    process-level state for the specific run_id. Timing fields are counts of
-    seconds computed by the server - durations only, never timestamps of
-    operator activity or anything path-shaped.
+    Timing fields are durations in seconds. Trial progress belongs to the current or
+    pinned generation; winner and summary facts belong to ``represented_generation_id``.
+    ``is_published`` records whether that represented generation is published.
 
-    ``current_generation_id``/``published_generation_id``/
-    ``represented_generation_id``/``is_published`` follow the identity
-    contract :func:`phasesweep.engine.read.read_status` defines:
-    ``attempts_launched_this_run``/``terminal_trials_this_run`` describe
-    ``current_generation_id`` in a live (non-pinned) read, or the pinned
-    generation itself for a run-scoped read; ``winner_present`` and the
-    top-level ``summary_present`` describe ``represented_generation_id``.
-    ``is_published`` says whether the represented generation is the actual
-    published one -- ``False`` for a pinned read of a failed-publication
-    generation, even though its winners still show.
-
-    ``publication_integrity`` carries the five-state MCP verdict through
-    unchanged. The accompanying ``publication_error`` is deliberately *not*
-    forwarded: the enum is what an agent must branch on, and the free-text
-    detail belongs to the operator-facing CLI, which is the surface trusted
-    with local specifics.
-
-    ``result_context``, ``published_config_matches_current`` and
-    ``result_phase_plan`` are forwarded rather than dropped. The ``phases``
-    list describes the *current* config's phases -- what a further run would
-    execute -- so under a config edited since publication it can legitimately
-    show no winners beside ``is_published: true``. Without these three the
-    agent cannot tell that apart from an empty publication.
+    Forward publication integrity without its operator-only free-text error. Forward
+    result context, config agreement and recorded phase plan alongside the current
+    config's phase list.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.

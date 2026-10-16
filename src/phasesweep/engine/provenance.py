@@ -19,15 +19,10 @@ from phasesweep.runtime.files import file_sha256, private_atomic_write_text
 
 
 def _phase_config_fingerprint(phase: Phase) -> str:
-    """Hash one phase's configured semantics, independent of any winner.
+    """Hash a phase's configured semantics independently of inherited winners.
 
-    This is exactly the per-phase element
-    :func:`phasesweep.engine.fingerprints._experiment_semantic_fingerprint` folds
-    into its own digest, hashed on its own so a reproducibility record can
-    localize *which* phase's configuration differs between two generations.
-    It is deliberately not ``winner.yaml``'s ``phase_fingerprint``, which
-    additionally binds each inherited winner's effective overrides and
-    therefore cannot exist before any phase has run.
+    This identifies phase-level config drift before execution. Winner fingerprints
+    also bind inherited effective overrides.
 
     :param Phase phase: Phase whose configured semantics are hashed.
     :return str: SHA-256 hex digest (64 characters) of the canonicalised payload.
@@ -46,38 +41,19 @@ def _write_generation_provenance(
     *,
     caller_owned_id: bool,
 ) -> None:
-    """Freeze the configuration and provenance that produced one generation.
+    """Freeze configuration and provenance immediately after generation claim.
 
-    Written at claim time, immediately after the namespace is created and
-    before any lifecycle state exists, so a generation that later fails still
-    records what configuration ran. Two files land side by side:
+    ``config.snapshot.yaml`` materializes defaults, normalizes key order, and freezes
+    an omitted execution cwd as the resolved invocation directory. Its configured
+    environment may contain secrets, so it is owner-only (0600).
 
-    * ``config.snapshot.yaml`` -- the canonicalized effective config rendered
-      as YAML. It is the engine's execution view, *not* a copy of the
-      operator's file: key order is normalized, defaults are materialized,
-      comments are not preserved, and an omitted ``execution.cwd`` is frozen
-      as the resolved invocation directory the trainer inherited. Because
-      ``env:`` may hold secrets it is written owner-only (0600) through the
-      private atomic writer, even though its directory is deliberately
-      operator-readable (see the trust-boundary note in ``docs/runtime.md``).
-    * ``reproducibility.json`` -- an ordinary umask-governed artifact that is
-      safe to read and share: versions, the semantic fingerprints, the
-      operator-declared ``provenance`` mapping (public by design), and the
-      SHA-256 of the snapshot's bytes. Digests, never values: no env values,
-      no ambient values, and nothing from the snapshot's contents beyond its
-      digest.
+    ``reproducibility.json`` uses ordinary umask permissions and contains versions,
+    semantic fingerprints, public configured provenance, the snapshot's SHA-256,
+    and ``generation_id_source`` (``caller`` or ``engine``). It exposes no environment
+    or snapshot values. The source field preserves external launch provenance if
+    launcher state is lost; it does not grant authority to a reader.
 
-    Both files are picked up by :func:`phasesweep.engine.publication_validation._generation_artifact_manifest` and are
-    therefore hash-covered by the publication manifest.
-
-    ``reproducibility.json`` also records ``generation_id_source``: whether the
-    generation's identity was supplied by an external launcher (``"caller"``)
-    or minted by the engine (``"engine"``). A launcher that grants an identity
-    also freezes that run's authority (e.g. the MCP server's winner-visibility
-    grant) in its own state; the field records that such a grant existed, in
-    the artifact tree the results live in, so the evidence survives the
-    launcher's state directory being deleted or replaced. No reader acts on
-    it; it is provenance for an operator.
+    Both files are required and hash-covered by the generation manifest.
 
     :param Experiment experiment: Experiment whose configuration is frozen.
     :param str generation_id: Freshly claimed generation namespace to write into.

@@ -57,21 +57,9 @@ class WinnerSource:
 
 
 def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
-    """Validate and reconstruct a persisted ``winner_source`` mapping.
+    """Parse the exact winner-source key set, recognized kind, and execution identity.
 
-    Owns every well-formedness check a caller needs before trusting a
-    ``winner_source`` block: that it is a mapping, that its ``kind`` is a
-    recognized :data:`WinnerSourceKind`, that it has exactly the five
-    required keys, and that its ``phase`` agrees with ``expected_phase`` (the
-    phase the caller is reading a winner *for* — a mismatch means the winner
-    was copied or misattributed across phases). Shared by
-    :func:`phasesweep.engine.artifacts._load_winner`,
-    :func:`phasesweep.engine.read.read_result`, and
-    :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
-    which differ only in what they do when this raises: the first two wrap it
-    as :class:`phasesweep.engine.errors.WinnerIntegrityError` or treat the
-    winner as absent, respectively, while the manifest validator wraps it as
-    :class:`phasesweep.engine.errors.PublicationIntegrityError`.
+    Require its phase to match ``expected_phase``. Callers apply their own error policy.
 
     :param object data: Parsed ``winner_source`` block from a persisted
         ``winner.yaml``.
@@ -122,17 +110,10 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
 
 @dataclass
 class Winner:
-    """Phase winner: sampled params, full effective overrides, and metric value.
+    """Phase winner with sampled params, composed overrides, metric, and retained evidence.
 
-    ``phase_fingerprint`` is the SHA-256 of the phase's semantic execution
-    context at the time the winner was selected. Persisted into ``winner.yaml``
-    and re-checked when ``--from-phase`` skips earlier phases — without that
-    check, editing a parent phase's search space, fixed overrides, env, metric,
-    or trial command and then resuming would silently inherit the *old* winner
-    against the *new* parent config.
-
-    Every optional field is ``None`` only on placeholder winners produced for
-    the dry-run skip path, which never get persisted.
+    The semantic phase fingerprint is verified when a resume loads skipped winners.
+    Dry-run placeholders lack execution evidence and are never persisted.
     """
 
     trial_number: int
@@ -416,12 +397,10 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
 
 
 def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
-    """Return the outcome stale recovery records for a RUNNING trial whose orchestrator stopped.
+    """Return the durable outcome to record when recovering a RUNNING trial.
 
-    A failure or fatal error the objective already recorded stands, and so does an
-    interruption; anything else, including a success Optuna never committed and
-    no record at all, becomes ``interrupted``. Shared by recovery and the dry run, so the
-    preview predicts what recovery writes.
+    Preserve recorded failure, fatal, or interrupted outcomes. Missing or uncommitted
+    success outcomes recover as interrupted. Preview uses the same rule.
 
     :param _ParsedTrialOutcome | None parsed: The trial's valid, unduplicated recorded
         outcome, or ``None`` when it has none.
@@ -468,11 +447,7 @@ def _unduplicated_outcome(
 def _recovered_trial_state(
     trial: FrozenTrial, sequence_counts: Counter[int]
 ) -> RecoveredTrialState:
-    """Predict the counted state stale recovery leaves a RUNNING trial in.
-
-    Read from the outcome the trial's objective recorded, which nothing changes
-    once its orchestrator has stopped, so a dry run or a frozen snapshot can
-    count the trial as recovery will.
+    """Predict the counted state stale recovery derives from a RUNNING trial's outcome.
 
     :param FrozenTrial trial: RUNNING trial to predict for.
     :param Counter[int] sequence_counts: The study's

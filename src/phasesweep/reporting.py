@@ -117,14 +117,11 @@ def report_objective(
     progress: Mapping[str, int | float] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Atomically publish this trial's objective as a PhaseSweep result envelope.
+    """Atomically publish this attempt's objective as a result envelope.
 
-    The destination and attempt identity come from environment variables injected
-    for a ``json_envelope`` metric extractor. ``extra`` may add top-level JSON
-    fields for constraint extractors, report-only ``observe`` entries (read with a
-    ``json`` extractor) or evidence gates, but cannot replace the envelope fields
-    managed by this helper. Missing parent directories in a
-    nested configured destination are created by the atomic artifact writer.
+    The managed trial environment supplies destination and attempt identity.
+    Extra JSON fields may serve constraints, observations, or gates but cannot
+    replace envelope fields. Missing destination parent directories are created.
 
     :param float value: Finite objective value produced by the evaluation. Here
         and in ``step`` and ``progress``, NumPy scalars count as numbers;

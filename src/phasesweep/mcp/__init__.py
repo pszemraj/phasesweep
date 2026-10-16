@@ -1,10 +1,7 @@
-"""Optional MCP server layer: a capability-narrowed interface to the engine.
+"""Optional MCP tools for operator-cataloged experiments.
 
-The agent picks an experiment from a human-curated catalog by id and may only
-launch a sweep, monitor it, and read the winning hyperparameters. It never
-supplies, edits, or sees a ``trial_command``, ``env``, ``storage``, or
-``workdir``. Only :mod:`phasesweep.mcp.server` imports the ``mcp`` SDK; every
-other module here is SDK-free.
+Agents select experiment IDs and receive path-free results under catalog permissions.
+Only :mod:`phasesweep.mcp.server` imports the MCP SDK.
 """
 
 from __future__ import annotations

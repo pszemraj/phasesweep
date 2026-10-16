@@ -192,11 +192,7 @@ def _preflight_existing_studies(
 
 
 def _raise_collected_errors(errors: Sequence[Exception]) -> None:
-    """Raise the one refusal a preflight collected, or one refusal that combines several.
-
-    The live preflight and the dry-run preview both collect a refusal per
-    study and report them through this, so a preview names the same studies,
-    in the same message and type, as the launch it previews.
+    """Raise one refusal, or an aggregate preserving the collected studies and remedies.
 
     :param Sequence[Exception] errors: Refusals collected across the studies, in
         phase order; nothing is raised when it is empty.

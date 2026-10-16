@@ -69,20 +69,11 @@ _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 
 
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
-    """Return a trial's execution identity when it could win winner selection.
+    """Return execution identity for COMPLETE, finite, feasible trials with nonempty ids.
 
-    The shared eligibility prefix used directly by both this module's
-    preflight and :func:`phasesweep.engine.selection.select_winner`: COMPLETE
-    state, a finite value, a truthy feasibility attr, and nonempty
-    generation/attempt ids. A trial that fails any of these can never be
-    selected, so declining to verify its evidence here is not result-biasing
-    - unlike skipping an eligible trial, which would change which trial wins.
-
-    ``select_winner`` applies its own constraint-bounds filter on top of this
-    prefix; this function deliberately does not: constraint bounds are
-    config-mutable, so a trial outside today's bounds can re-enter the
-    candidate set under a later config and its evidence must still be there
-    when it does.
+    Selection additionally applies current constraint bounds. Evidence preflight
+    excludes that mutable filter, preserving evidence for trials that may become
+    eligible after a bounds edit. Ineligible trials cannot affect winner selection.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
     :return tuple[str, str] | None: ``(generation_id, attempt_id)`` for a
@@ -352,12 +343,9 @@ def _verify_trainer_input_evidence(
     *,
     subject: str,
 ) -> None:
-    """Content-verify the historical generated input one trainer consumed.
+    """Verify the generated input recorded by a trial, independently of current config.
 
-    The filename comes from the trial's versioned record, not the current
-    experiment config. Validating the format/filename pair keeps that
-    historical path trial-relative and prevents a malformed ledger value from
-    redirecting verification outside the evidence directory.
+    Require the versioned format/filename pair to identify a trial-relative file.
 
     :param Path trial_dir: Structurally translated trial evidence directory.
     :param Any record: Raw ``TRAINER_INPUT_ATTR`` Optuna user attribute.
@@ -446,13 +434,10 @@ def _verify_trial_evidence_dir(
     mlflow_query: MlflowQuery | None = None,
     mlflow_target: SourceIdentity | None = None,
 ) -> None:
-    """Require one trial's evidence directory and audit artifacts to still exist.
+    """Require a trial's translated evidence directory and its recorded artifacts.
 
-    ``trial_dir`` is always the structurally translated directory: the current
-    config's phase directory plus the trial's own directory name. A lifecycle
-    record is required, but its ``state`` is deliberately not constrained: the
-    transition to ``exited`` is best-effort, so an ``allocated`` record is an
-    ordinary outcome for a completed trial.
+    A lifecycle record must belong to the attempt. Its state is not constrained:
+    writing ``exited`` is best-effort, so completed trials may retain ``allocated``.
 
     :param Path trial_dir: Translated evidence directory for the trial.
     :param str subject: Caller-built label naming the study, phase, and trial.
@@ -605,22 +590,13 @@ def _validate_selection_evidence(
     experiment: Experiment,
     studies: Mapping[str, optuna.Study],
 ) -> None:
-    """Require every trial that could win to still have its evidence on disk.
+    """Require on-disk evidence for every trial that could win before new execution.
 
-    Winner selection consults Optuna alone - state, value, feasibility,
-    execution ids, constraint readings - and never touches the filesystem, so
-    an experiment whose winning trial directory was deleted would reselect
-    that trial and republish its number, metric, and provenance from a tree
-    holding nothing behind them. This runs on the launch path before any
-    generation claim or trial work, so a tree that cannot honestly be ranked
-    is refused before it is added to.
-
-    Only selection-eligible trials are candidates
-    (:func:`_selection_candidate_identity`); the rest can never win, so passing
-    over them cannot bias the result. Every candidate's small generated trainer
-    input is content-verified. The potentially unbounded objective source is
-    checked for existence and recorded size only. The winning objective source is digest-verified at
-    selection time instead (:func:`_verify_winner_objective_evidence`).
+    Check selection eligibility through :func:`_selection_candidate_identity`.
+    Content-verify each candidate's generated input and check its objective source's
+    existence and recorded size. Digest-verify the winning objective at selection
+    through :func:`_verify_winner_objective_evidence`. Missing eligible evidence
+    refuses the run without dropping trials from the ranked population.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
     :param Mapping[str, optuna.Study] studies: Existing phase studies keyed by
@@ -697,17 +673,10 @@ def _verify_winner_objective_evidence(
     phase_name: str,
     selected: SelectedTrial,
 ) -> None:
-    """Digest-verify the evidence behind a trial that is about to be published.
+    """Digest-verify objective evidence before publishing a complete or partial winner.
 
-    The launch preflight content-verifies every candidate's small generated
-    trainer input and proves its objective source still exists; this additionally
-    proves the winning objective source is byte-for-byte the evidence its frozen
-    provenance recorded.
-
-    It runs on every selection, so a deadline-truncated partial publication is
-    covered on the same terms as a complete one. A repeats winner stands on
-    every member of its group, so each member is verified against its own
-    metric and provenance (:func:`phasesweep.engine.repeats.evidence_members`).
+    Verify every repeat-group member against its own metric and provenance; scalar
+    winners require only their source trial.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
     :param str phase_name: Phase whose winner was just selected.
@@ -751,13 +720,9 @@ def _verify_skipped_winner_evidence(
     phase: Phase,
     winner: Winner,
 ) -> None:
-    """Content-verify a skipped winner against its concrete source trial.
+    """Verify a skipped winner from its recorded source identities without loading its study.
 
-    ``--from-phase`` has no reason to require the prior phase's Optuna study:
-    the authenticated winner artifact contains the source phase, trial,
-    generation, attempt, objective provenance, and generated-input identity
-    needed to inspect the source tree directly, and for a repeats winner the
-    same identity for every member of its group.
+    Repeat winners supply the corresponding evidence identity for every group member.
 
     :param Experiment experiment: Experiment owning the artifact tree.
     :param Phase phase: Exposed skipped phase whose winner is being carried.

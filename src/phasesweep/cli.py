@@ -99,12 +99,7 @@ def cli() -> None:
 def main() -> None:
     """Run the CLI behind a process-level error boundary.
 
-    The console entry point, so every failure reaches the operator as a
-    diagnostic rather than a traceback. Click runs in ``standalone_mode=False``
-    so its exceptions surface here instead of being converted inside Click;
-    it still returns the exit status for ``ctx.exit()`` paths, and commands
-    that call ``sys.exit`` themselves raise ``SystemExit``, which is a
-    ``BaseException`` and passes through untouched.
+    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
@@ -578,13 +573,9 @@ def _publication_integrity_error(
     detail: str,
     namespace_root: Path,
 ) -> PublicationIntegrityError:
-    """Build the one diagnostic every corrupt-publication read surface reports.
+    """Build an actionable diagnostic for a corrupt publication.
 
-    Carries the validation failure *and* the reason not to re-run: a
-    successful re-run publishes a new generation, the last-success pointer
-    advances past the corrupt one, and nothing reports the corruption
-    afterwards. The immutable namespace is still on disk until then, so
-    inspecting or restoring it first is the whole remedy.
+    Direct the operator to inspect its namespace before rerunning advances the pointer.
 
     :param str subject: Experiment the corrupt publication belongs to.
     :param str detail: Validation error explaining why it no longer validates.
@@ -654,14 +645,10 @@ def show_winners(config_path: Path) -> None:
 
 
 def _show_experiment_winners(experiment: Experiment) -> None:
-    """Print winner files for one experiment.
+    """Print winners using their generation's recorded phase plan and validated bytes.
 
-    A published result is rendered against the phase plan recorded in its own
-    generation summary: old evidence must never be decorated with the current
-    config's annotations, and a config that has drifted since publication is
-    labeled historical instead of silently reinterpreted. Each winner prints
-    the exact bytes publication validation read, never a second read of the
-    file.
+    Label configuration drift as historical; do not reinterpret recorded evidence or
+    reread winner files.
 
     :param Experiment experiment: Experiment whose published winners are rendered.
     :raises PublicationAccessError: This user cannot validate the publication.
@@ -891,12 +878,7 @@ def mcp() -> None:
 
 
 def _catalog_error_text(exc: CatalogError) -> str:
-    """Render a catalog error together with its actionable fix.
-
-    ``CatalogError`` carries the remediation in ``suggestion``; formatting the
-    exception alone silently drops it and leaves the operator with a diagnosis
-    but no instruction. Matches the ``fix:`` line ``mcp check`` prints per
-    entry. Operator-facing: messages and suggestions may include paths.
+    """Render a catalog error with its optional actionable fix; paths may be included.
 
     :param CatalogError exc: Raised catalog error to render.
     :return str: Message, plus a trailing ``fix:`` line when a suggestion exists.

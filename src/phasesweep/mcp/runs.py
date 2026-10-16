@@ -1,10 +1,6 @@
-"""On-disk run-handle store for detached sweeps.
+"""Persist detached run identities, logs and terminal status.
 
-A launched sweep is a detached process; its identity must outlive the server
-process. Each run is one JSON handle under ``<state_dir>/runs/`` plus a log and
-a ``status.json`` under ``<state_dir>/logs/``. Run state is *derived* on read
-(live PID check + status.json), never stored mutably, so a server crash mid-run
-loses nothing and there is no stale-state write race.
+Run state is derived from process visibility and recorded evidence; reads write nothing.
 """
 
 from __future__ import annotations
@@ -88,11 +84,6 @@ __all__ = [
 
 log = logging.getLogger("phasesweep.mcp.runs")
 
-# Run ids are minted by ``new_run_id`` from this same character class. A lookup
-# id, however, arrives from the (untrusted) agent and is interpolated into a
-# handle path, so re-validate it here: this is the one place an id becomes a
-# filesystem path, and the class excludes ``/`` and ``.`` so ``..`` traversal
-# cannot escape the runs dir.
 
 # 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
@@ -112,12 +103,7 @@ _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
 
 class UnsupportedStateFormatError(ValueError):
-    """An MCP state directory holds an unsupported run-store format.
-
-    The subclass lets operator recovery tell this refusal, whose
-    remedy is a fresh MCP state directory, apart from a state directory that is
-    simply missing.
-    """
+    """An MCP state directory uses an unsupported format and requires a fresh state directory."""
 
 
 def _strict_unlink(path: Path) -> None:
@@ -184,12 +170,7 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class RunnerView:
-    """How this process sees one run's runner, derived once per decision.
-
-    One read payload, one cancel step, or one recovery derives it once and
-    passes it to every state question it asks, so the answers cannot disagree
-    and ``/proc`` is scanned once per decision.
-    """
+    """Runner visibility derived once and reused within one state decision."""
 
     visibility: RunnerVisibility
     #: For an ``unobservable`` runner, why it cannot be acted on from here,
@@ -269,21 +250,15 @@ class RunHandle:
     config_dir: str
     pid: int | None
     pgid: int | None
-    # /proc start time for PID-reuse-safe liveness. None only on the pre-spawn
-    # "launching" placeholder: a spawned handle is never persisted without it
-    # (see mcp/runner.py _persist_spawned_handle and mcp/tools.py _spawn).
+    # PID-reuse-safe /proc start time; None only before spawn.
     pid_starttime: int | None
     started_at: str  # ISO-8601 UTC
     visible_params_at_launch: Literal["none", "all"] | list[str]
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
-    # Boot that pid/pid_starttime belong to. None only on the pre-spawn
-    # "launching" placeholder: a spawned handle is never persisted without it
-    # (see mcp/runner.py _persist_spawned_handle and mcp/tools.py _spawn).
+    # Boot that numbered the PID; None only before spawn.
     boot_id: str | None = None
-    # PID namespace that pid/pgid are numbered in, as its inode and the start
-    # time of its PID 1. A reader in another namespace cannot probe them. None
-    # only on the pre-spawn "launching" placeholder, like boot_id.
+    # Namespace inode and PID 1 start time; None only before spawn.
     pid_namespace: str | None = None
 
     @property
@@ -361,18 +336,11 @@ class RunStore:
 
     @classmethod
     def open_existing(cls, state_dir: Path) -> RunStore:
-        """Open an existing run store without creating or chmodding any path.
+        """Open an existing run store without creating paths or changing permissions.
 
-        This is the operator-recovery entry point. Recovery accepts a path on
-        the command line, so opening it must be observational: a typo must not
-        create a new state tree or change permissions on an unrelated
-        directory.
-
-        The format marker decides what a failure means. With a marker, the
-        path is a state directory and anything else wrong with it is damage.
-        Without one, run handles make it unmarked PhaseSweep state, and their
-        absence means the path names some other directory. A path whose
-        ancestors cannot be walked never reaches a state directory at all.
+        The marker distinguishes state damage from an unsupported format. Without a marker,
+        run handles identify unmarked state; otherwise the path is an unrelated directory.
+        Unwalkable ancestors refuse opening.
 
         :param Path state_dir: Existing MCP state directory containing ``runs/``
             and ``logs/`` subdirectories.
@@ -413,8 +381,7 @@ class RunStore:
             )
             raise ValueError(f"not an existing MCP state directory; {detail}{wrong_path}") from None
         except OSError:
-            # The directory exists but cannot be searched, so whether it holds
-            # a marker is unknown; validating it below reports that damage.
+            # Marker presence is unknown until directory validation succeeds.
             pass
         missing = []
         for path in (state_dir, store._runs_dir, store._logs_dir):
@@ -442,11 +409,7 @@ class RunStore:
             return False
 
     def _require_current_marker_for_recovery(self) -> None:
-        """Require a readable marker naming the supported format, telling damage apart.
-
-        A marker that reads and names another format is unsupported state.
-        One that cannot be read, or reads as anything but a format
-        record, is this state directory's own damage.
+        """Require the supported format marker; report unreadable or malformed markers as damage.
 
         :raises UnsupportedStateFormatError: The marker names another format.
         :raises UnsafePrivatePathError: The marker is unreadable, unsafe, or malformed.
@@ -523,11 +486,8 @@ class RunStore:
     def _has_durable_state_evidence(self) -> bool:
         """Return whether an unmarked namespace contains run-store evidence.
 
-        Empty ``runs/`` and ``logs/`` directories, as well as the catalog
-        scaffolder's root-level ``origin`` record, remain fresh. Any entry
-        below the run or log directories is durable evidence: interrupted
-        writes and unfamiliar records must fail closed rather than be
-        treated as an empty namespace.
+        Empty run/log directories and the scaffold's root ``origin`` record remain fresh.
+        Any run/log entry, including interrupted writes or unknown records, counts as evidence.
 
         :return bool: Whether durable unmarked run-store evidence is present.
         :raises UnsafePrivatePathError: A present run-store directory is unsafe.
@@ -585,16 +545,9 @@ class RunStore:
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:
-        """Hold the launch lock for the context, yielding whether it was acquired.
+        """Try to hold the shared, nonblocking launch lock across capacity checks and spawn.
 
-        The concurrency cap is enforced by counting live runs and then
-        spawning; that check-then-spawn must be atomic or two near-simultaneous
-        launches can both pass the cap and oversubscribe the GPU. This is an
-        ``flock`` on a file under ``state_dir``, so it serializes launches both
-        across threads in one server and across servers that share a state dir
-        (which scan the same runs dir). It is non-blocking: the manager yields
-        ``False`` when another launch already holds it, leaving the caller to
-        surface a retryable error rather than block a request handler.
+        The file lock serializes threads and servers sharing this state directory.
 
         :return Iterator[bool]: Context manager yielding True when the lock was acquired.
         """
@@ -754,9 +707,7 @@ class RunStore:
         if handle is None:
             return
         if handle.launch_state != "spawned" and self.recorded_terminal_status(handle) is None:
-            # A free sidecar is the remaining proof that Popen never crossed
-            # the preparation boundary. Keep it when terminal bookkeeping also
-            # failed so orphan recovery can release the capacity reservation.
+            # Retain the lease for orphan recovery when terminal bookkeeping failed.
             return
         self.remove_launch_lease(preparation.handle.run_id)
 
@@ -819,12 +770,7 @@ class RunStore:
         private_atomic_write_text(target, payload + "\n", strict_dir_fsync=True)
 
     def get(self, run_id: str) -> RunHandle | None:
-        """Load a run handle by id, or ``None`` if there is no such handle.
-
-        An id that is not of the minted shape (``[A-Za-z0-9_-]+``) can never
-        match a stored handle, so it is reported as absent rather than used to
-        build a path - this keeps an agent-supplied id from traversing out of
-        the runs dir (e.g. ``../../etc/foo``).
+        """Load a run handle, returning ``None`` for absent or path-unsafe IDs.
 
         :param str run_id: Agent-supplied run id to look up.
         :return RunHandle | None: Persisted handle when present and well-shaped, otherwise ``None``.
@@ -866,14 +812,10 @@ class RunStore:
         return handles
 
     def launch_inventory(self) -> tuple[list[RunHandle], set[str]]:
-        """Load handles and count records whose launch authority is unreadable.
+        """Load handles and identify unreadable records that reserve launch capacity.
 
-        Ordinary read tools intentionally skip malformed handles so one bad
-        historical record does not hide every healthy run. Launch is different:
-        capacity is a safety decision, and neither a malformed handle nor
-        per-run evidence with no readable handle can be assumed terminal.
-
-        The caller must hold :meth:`launch_lock` across this scan and the spawn.
+        Read tools skip malformed handles; launch cannot assume those records are terminal.
+        The caller must hold :meth:`launch_lock` across this scan and spawn.
 
         :return tuple[list[RunHandle], set[str]]: Readable handles and stable
             identities for malformed handles or orphan evidence.
@@ -892,13 +834,9 @@ class RunStore:
         return handles, unreadable
 
     def is_pre_spawn_orphan(self, run_id: str) -> bool:
-        """Return whether ``run_id`` is a provably abandoned preparation.
+        """Return whether a free inherited lease proves this preparation abandoned.
 
-        Transactional launches carry a kernel lease across ``Popen``. A free
-        lease plus a valid launching handle proves that no runner can still
-        cross the acknowledgement boundary; a child that was created inherits
-        and holds the lease until it has durably replaced the handle with its
-        process identity or exits.
+        The child holds the lease until its process identity is durable or it exits.
 
         :param str run_id: Candidate orphan run identity.
         :return bool: Whether the preparation is safe to remove automatically.
@@ -937,10 +875,7 @@ class RunStore:
         if handle_path.exists() or handle_path.is_symlink():
             invalid = invalid or handle is None or handle.launch_state != "launching"
         elif self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
-            # A runner opens its log before Popen and releases the inherited
-            # lease after persisting its spawned handle. If that handle is
-            # later lost, the log prevents a stale free lease from proving
-            # this was an abandoned preparation.
+            # A log without its handle prevents a stale lease from proving abandonment.
             invalid = True
         if invalid:
             lease.close()
@@ -965,11 +900,8 @@ class RunStore:
                 archive_path = log_path.with_suffix(".log.recovered")
                 if log_path.exists() or log_path.is_symlink():
                     recovered_log = archive_path
-                    # A child can fail before recording its identity. Keep its only
-                    # diagnostic outside the active-run evidence namespace, and
-                    # make the rename durable before removing the launch reservation.
-                    # Run IDs include a fresh UUID and are never reused by the server;
-                    # this rename is not an exclusive archive operation for reused IDs.
+                    # Archive diagnostics durably before removing the reservation.
+                    # UUID-based run IDs are not reused.
                     directory_fd = open_directory_fd(
                         self._logs_dir,
                         create=False,
@@ -1013,7 +945,6 @@ class RunStore:
         if payload is None:
             return None
         try:
-            # This on-disk JSON is checked field by field after construction.
             handle = RunHandle(**payload)  # type: ignore[arg-type]
         except TypeError:
             return None
@@ -1069,39 +1000,19 @@ class RunStore:
         return handle
 
     def state(self, handle: RunHandle, *, view: RunnerView | None = None) -> RunState:
-        """Derive the current state from status.json and a live PID check.
+        """Derive run state without changing durable evidence.
 
-        A finalized status.json (written by the runner on every exit) is
-        authoritative: returncode 0 -> succeeded, a signalled code ->
-        cancelled, and any other return code -> failed. The engine's exit
-        status is the single authority on success; a failed *result snapshot*
-        capture degrades the run's frozen results, never its outcome, so an
-        optional diagnostic artifact cannot contradict an engine-defined,
-        already-published success. Pending result snapshot capture remains
-        running so another launch cannot mutate shared result storage before
-        the snapshot is frozen. With no status.json, a live
-        (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
-        cannot prove that its separately-sessioned trial descendants are gone,
-        so it remains ``running`` (``recovery_required`` reports it) until
-        operator recovery records cleanup evidence - unless its recorded boot
-        id differs from the current boot, which proves no process from that
-        boot survived and settles cleanup without signalling anything. An
-        unresolved pre-spawn handle also remains ``running`` because a server
-        restart cannot know whether ``Popen`` completed before the crash; known
-        launch failures write terminal status explicitly.
+        Finalized terminal return codes determine success, failure or cancellation; snapshot
+        capture failure does not change the engine outcome. Pending snapshots reserve capacity.
+        A live PID or unresolved pre-spawn handle remains running.
 
-        A runner recorded in another PID namespace is neither alive nor dead
-        from here: its PID numbers name unrelated processes, so it stays
-        ``running`` on durable evidence alone and is never reaped or signalled.
-        When the host's initial namespace proves its processes absent, it is a
-        dead runner like one in this namespace, so the run stays ``running``
-        until recovery settles it: unlike an ended boot, that proof says
-        nothing about its trials and need not hold for the next reader.
+        A dead or unverifiable spawned runner without terminal evidence remains running until
+        recovery confirms cleanup of its separate trial groups. An ended boot settles process
+        cleanup; explicit uncertain trial evidence still requires reconciliation.
 
-        Deriving state writes nothing: every writer that must reserve cleanup
-        (cancel, failed-spawn cleanup, operator recovery) persists its own
-        marker, and a marker that a later status or boot supersedes is read as
-        inert rather than deleted.
+        Foreign-namespace PID numbers are never probed or signalled. Host-proven absence
+        settles only the runner group, not its trials. Superseded cleanup markers remain on disk
+        but no longer reserve capacity.
 
         :param RunHandle handle: The run handle to evaluate.
         :param RunnerView | None view: The caller's derivation of the runner,
@@ -1205,12 +1116,7 @@ class RunStore:
         return None if status is None else dict(status)
 
     def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
-        """Persist that a cancel attempt could not confirm process-group cleanup.
-
-        A dead root PID normally derives to ``failed`` and frees the MCP
-        concurrency slot. When cancellation could not prove the process group is
-        gone, descendants may still hold resources, so this server-owned marker
-        keeps the run in the live set until a later cleanup attempt succeeds.
+        """Persist unconfirmed process-group cleanup to reserve capacity until cleanup is settled.
 
         :param RunHandle handle: Run handle whose cleanup is uncertain.
         """
@@ -1250,11 +1156,9 @@ class RunStore:
         return self._read_cleanup_identity(handle) is not None
 
     def cleanup_identity(self, handle: RunHandle) -> ProcessIdentity:
-        """Return the strongest runner identity available for cleanup.
+        """Return a valid cleanup marker's process identity, or the durable handle identity.
 
-        If a pending handle was the only handle durably saved, a cleanup marker
-        written from the spawned handle may carry the only usable PID/PGID. Keep
-        that marker identity authoritative when present and valid.
+        A marker may hold the only PID/PGID when the saved handle is still pre-spawn.
 
         :param RunHandle handle: Run handle whose runner identity is needed.
         :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
@@ -1269,16 +1173,10 @@ class RunStore:
         return handle.process_identity
 
     def runner_view(self, handle: RunHandle) -> RunnerView:
-        """Relate this run's strongest identity to the boot and PID namespace reading it.
+        """Classify the strongest runner identity in this boot and PID namespace.
 
-        ``gone`` is a conclusive not-alive / cleanup-confirmed verdict: it is
-        safe to skip signalling a PID or process group entirely, because the
-        boot that numbered them has ended. ``absent`` proves only the runner
-        dead: from the host's initial PID namespace no process of its own
-        group or PID remains in the namespace it was recorded in, and nothing
-        is signalled there. ``unobservable`` is the opposite of a verdict: the
-        recorded numbers belong to another PID namespace, so this process can
-        neither probe nor signal them.
+        ``gone`` proves its boot ended, including descendants. ``absent`` proves only its runner
+        group absent from another namespace. ``unobservable`` forbids local probes or signals.
 
         :param RunHandle handle: Run handle whose recorded boot and namespace are checked.
         :return RunnerView: ``gone``, ``absent``, ``unobservable`` (with the
@@ -1385,11 +1283,7 @@ class RunStore:
         }
 
     def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
-        """Return exact attempts the runner reported as cleanup-uncertain.
-
-        These identities bind recovery of an older-generation attempt to the
-        run whose terminal report actually named it, without letting arbitrary
-        later reconciliation serve as evidence for that run.
+        """Return the exact attempts named cleanup-uncertain by this run's terminal report.
 
         :param RunHandle handle: Run whose terminal cleanup cause is read.
         :return set[str]: Persisted uncertain attempt identities.
@@ -1402,13 +1296,7 @@ class RunStore:
     def snapshot_recovery_required(
         self, handle: RunHandle, *, view: RunnerView | None = None
     ) -> bool:
-        """Return whether a dead runner left snapshot finalization pending.
-
-        A live runner may legitimately expose the short durable ``pending``
-        interval between its two atomic status writes. Once its exact process
-        identity is gone, no writer can complete that status and operator
-        recovery must either finalize the embedded snapshot or record it as
-        unavailable.
+        """Return whether a dead runner left a pending snapshot for operator finalization.
 
         :param RunHandle handle: Persisted run whose terminal status is checked.
         :param RunnerView | None view: The caller's derivation of the runner,

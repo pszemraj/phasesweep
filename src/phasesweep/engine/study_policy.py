@@ -59,10 +59,7 @@ class _PhasePolicyState:
 
 
 def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
-    """Apply one terminal outcome to a running consecutive-failure count.
-
-    Shared by live recording and replay reconstruction so both apply the
-    same consecutive-failure policy transition.
+    """Apply a terminal outcome to the consecutive-failure count.
 
     :param int consecutive_failures: Count observed before ``outcome``.
     :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
@@ -78,12 +75,9 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 
 
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
-    """Return whether a phase's consecutive-failure abort threshold is met.
+    """Check the live or resumed failure count against the configured threshold.
 
-    Shared by the live per-outcome check and the check before a resumed
-    phase launches new work, so both compare the same count against the same
-    threshold. Replay never applies it to recorded outcomes: the abort each
-    outcome tripped is recorded with that outcome.
+    Replay uses the abort recorded with each outcome, not today's threshold.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.
@@ -303,15 +297,10 @@ def _record_recovery_boundary(
     phase: Phase,
     recovered_abort_sequence: int,
 ) -> None:
-    """Durably acknowledge one phase abort as recovered.
+    """Durably acknowledge an abort and accept the raised trial target in one write.
 
-    Outcomes recorded up to the study's current largest sequence stop counting
-    toward the consecutive-failure streak that :func:`_load_phase_policy_state`
-    replays, and an abort recorded with any of them stops being the phase's
-    active abort. The record names the consumed abort for the audit trail.
-    It also accepts ``phase.n_trials`` as the trial target
-    (:func:`_accepted_trial_target`), so the raised target that authorizes a
-    recovery and the recovery itself become durable in this one write.
+    Outcomes through the current maximum sequence no longer count toward the failure
+    streak or supply its active abort. Record the consumed abort and ``phase.n_trials``.
 
     :param optuna.Study study: Study whose recovery boundary is written.
     :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.
@@ -363,11 +352,9 @@ def _validate_study_direction(
     study: optuna.Study,
     goal: Literal["minimize", "maximize"],
 ) -> None:
-    """Reject a durable study whose objective direction differs from the config.
+    """Require stored objective direction to match config before trial launch.
 
-    Optuna's ``load_if_exists=True`` keeps the stored direction and silently
-    ignores the direction supplied by a later caller. PhaseSweep therefore
-    validates the durable value explicitly before any trial can be launched.
+    Optuna's ``load_if_exists`` retains the stored direction without checking the offered one.
 
     :param optuna.Study study: Existing or newly created single-objective study.
     :param Literal goal: Direction required by the experiment metric.
@@ -558,12 +545,7 @@ def _record_allocation_context(
 
 
 def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.trial.FrozenTrial]:
-    """Return the interrupted trials that still need a rerun, in trial-number order.
-
-    A source needs one exactly when it is interrupted and no trial names it
-    under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Both facts are fixed
-    once written, so the answer needs no "scheduled" flag and a crash between
-    two reruns loses or duplicates none.
+    """Return interrupted trials not yet named by a rerun, in trial-number order.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.

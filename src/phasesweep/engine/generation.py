@@ -29,19 +29,11 @@ log = logging.getLogger(__name__)
 
 
 def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
-    """Create one exclusively owned generation namespace under the experiment lock.
+    """Exclusively claim a generation namespace under the experiment lock.
 
-    The claim is only complete once the namespace records the configuration
-    that is about to run: :func:`phasesweep.engine.provenance._write_generation_provenance`
-    freezes ``config.snapshot.yaml`` and ``reproducibility.json`` before this
-    returns, so a generation that later fails preflight, execution, or
-    publication still says what search spaces, fixed overrides, execution
-    context, env, and trial command produced it. A failure writing them fails
-    the claim rather than starting a run whose configuration would be
-    unrecoverable. The record also freezes whether the id was caller-supplied,
-    so a generation launched under an external authority grant (a detached MCP
-    run) stays recognizable as such even if the launcher's own state is later
-    lost.
+    Freeze the effective configuration and reproducibility record before returning;
+    provenance failure aborts the claim. The record retains whether an external
+    launcher supplied the generation id, even if its own state is later lost.
 
     :param Experiment experiment: Experiment whose generations root is created if missing.
     :param str | None requested_id: Caller-supplied generation id to claim, or
@@ -81,33 +73,23 @@ _TERMINAL_GENERATION_STATES = frozenset({"published", "publication_failed", "fai
 
 
 def _persist_terminal_failure(write_state: Callable[[], None]) -> None:
-    """Persist failed-state bookkeeping without replacing the active exception.
+    """Persist failure bookkeeping without replacing the propagating exception.
 
-    Bookkeeping is never more authoritative than the failure it records: the
-    original exception carries safety-critical semantics (signal exit codes,
-    cleanup uncertainty, trainer failure identity) that a secondary filesystem
-    error must not overwrite. Catching ``BaseException`` is intentional in
-    this narrow helper — even a second control-flow exception (another
-    SIGINT/SIGTERM, a nested ``SystemExit``) delivered during persistence must
-    not supersede the primary failure that is already propagating.
+    Log secondary failures, including control-flow exceptions, while preserving the
+    primary error's identity, cleanup semantics, and exit status.
 
     :param Callable[[], None] write_state: Zero-argument persistence action.
     """
     try:
         write_state()
-    except BaseException:  # noqa: BLE001 - see docstring: primary exception must survive
+    except BaseException:  # noqa: BLE001
         log.exception("failed to persist terminal failure state; preserving the original error")
 
 
 def _persist_failed_state_unless_recorded(
     record_path: Path, write_failed: Callable[[], None]
 ) -> None:
-    """Write the generic "failed" state, unless a more specific record already exists.
-
-    If a ``publication_failed`` record was already written for this
-    generation, the generic ``failed`` state write must not run: the current
-    pointer was already driven terminal with the more specific outcome, and
-    the write-once record must not be re-attempted on top of it.
+    """Write generic failed state unless publication failure is already recorded.
 
     :param Path record_path: Immutable per-generation record path to check.
     :param Callable[[], None] write_failed: Zero-argument "failed" state
@@ -118,25 +100,17 @@ def _persist_failed_state_unless_recorded(
 
 
 def _log_on_failure(action: Callable[[], None], message: str) -> None:
-    """Run a post-commit best-effort action, logging instead of raising on failure.
+    """Run post-commit bookkeeping, logging any failure without propagating it.
 
-    Exists for the post-commit best-effort steps of the publication
-    transaction (record write, pointer refresh, root artifact projection):
-    once the authoritative pointer has committed, nothing after it may fail
-    the run, so each such step must log its own failure and never propagate
-    it. Catching ``BaseException`` is intentional: a
-    ``KeyboardInterrupt``/``SystemExit`` escaping one of these steps would
-    propagate into the caller's terminal-failure handler and reclassify an
-    already-committed publication as failed. Real shutdown *signals* are
-    additionally kept out of these steps entirely by the enclosing
-    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window.
+    Control-flow exceptions must not reclassify a committed result. The surrounding
+    publication transaction also absorbs shutdown signals until commit bookkeeping ends.
 
     :param Callable[[], None] action: Zero-argument best-effort action.
     :param str message: Message logged (with exception info) on failure.
     """
     try:
         action()
-    except BaseException:  # noqa: BLE001 - see docstring: commit outcome must survive
+    except BaseException:  # noqa: BLE001
         log.exception(message)
 
 
@@ -165,14 +139,10 @@ def _write_generation_record_once(
     payload: dict[str, Any],
     label: str,
 ) -> None:
-    """Create one generation's immutable terminal record exactly once.
+    """Create an immutable terminal lifecycle record once.
 
-    The per-generation record is written only for a terminal state
-    (``published`` / ``publication_failed`` / ``failed``), and only ever
-    once. A second attempt for any generation -- even a same-state rewrite --
-    is refused and logged; the first content is never touched. Progress
-    states (``preflighting`` / ``running``) never reach this function at all;
-    see the ``state in _TERMINAL_GENERATION_STATES`` guard in the callers.
+    Only ``published``, ``publication_failed``, and ``failed`` states are recorded.
+    Subsequent writes, including same-state rewrites, are refused and logged.
 
     :param Path record_path: Immutable per-generation lifecycle record path.
     :param str generation_id: Immutable generation namespace being recorded;
@@ -204,16 +174,10 @@ def _write_generation_state(
     error_class: str | None = None,
     write_record: bool = True,
 ) -> None:
-    """Write one generation's current-pointer projection and/or immutable record.
+    """Write mutable current-generation progress and/or its immutable terminal record.
 
-    The current pointer (``generation.yaml``) is a mutable progress record --
-    every state (``preflighting``, ``running``, ``published``,
-    ``publication_failed``, ``failed``) may be written to it, with no
-    monotonic guard: a new invocation legitimately overwrites it starting from
-    ``preflighting``. The per-generation record under
-    ``generations/<id>/generation.yaml`` is truly immutable: it is only ever
-    written for a terminal state, and only once (see
-    :func:`_write_generation_record_once`); progress states never touch it.
+    The current pointer accepts every state and may restart at ``preflighting`` for
+    a new invocation. Per-generation records accept terminal states only, once.
 
     :param Experiment experiment: Experiment whose generation state is written.
     :param str generation_id: Immutable generation namespace being recorded.
@@ -266,16 +230,10 @@ def _validate_publishable_summary(
     experiment_name: str,
     generation_id: str,
 ) -> tuple[dict[str, Any], bytes]:
-    """Parse back one generation's own immutable summary before its publication commit.
+    """Read a generation's summary before committing its last-success pointer.
 
-    Pre-commit validation core for :func:`_validate_generation_publishable`.
-    This runs *before* the
-    last-success pointer commits and before the per-generation lifecycle
-    record is ever written for this generation, so it cannot check that
-    record (it does not exist yet); it instead confirms the immutable summary
-    itself parses as a mapping naming the expected experiment and generation
-    id, and returns it so the caller can validate the complete manifest
-    without re-reading.
+    Require a mapping naming the expected experiment and generation, and return it
+    for manifest validation without rereading. No terminal lifecycle record exists yet.
 
     :param Path summary_path: Immutable summary YAML path to read back.
     :param str experiment_name: Expected owning experiment name the summary must carry.
@@ -307,19 +265,10 @@ def _validate_publishable_summary(
 def _validate_generation_publishable(
     experiment: Experiment, generation_id: str
 ) -> tuple[validation_ops.ValidatedPublication, bytes]:
-    """Validate a generation's complete result manifest before its publication commit.
+    """Validate summary identity and the complete artifact manifest before commit.
 
-    Checks the generation's immutable summary names this exact experiment and
-    generation id, then validates the versioned artifact manifest end to end
-    (:func:`phasesweep.engine.publication_validation._validate_generation_manifest`):
-    every winner artifact the summary claims must exist, hash to its recorded
-    content, parse, and cross-check against the summary's own winner facts
-    (trial number, metric name, value, goal, source identity fields,
-    completion metadata) — and the namespace must hold nothing the manifest
-    does not list. A winner's own ``generation_id`` is deliberately *not*
-    required to equal ``generation_id``: a winner is legitimately carried
-    forward from whichever generation actually produced the best trial, so the
-    field is checked for well-formedness only.
+    Carried winners may name their source generation; their ids need not equal the
+    generation exposing them.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to validate.
@@ -344,16 +293,12 @@ def _validate_generation_publishable(
 
 
 def _record_superseded_publication(experiment: Experiment, *, superseding_id: str) -> None:
-    """Write the lifecycle record of the generation the last-success pointer names, if missing.
+    """Record the old pointer target's publication before replacing its only commit proof.
 
-    The pointer commits before its target's record is written best-effort, so
-    a controller that died in between leaves the pointer as the only durable
-    proof that the target committed. Replacing the pointer would discard that
-    proof, so the record is written first. A well-formed pointer is sufficient
-    proof: its target's artifacts are validated whenever they are read, so
-    nothing is re-validated here. ``from_phase`` is ``None`` because the
-    original invocation's resume point is not recoverable. An existing record
-    of any state is never touched.
+    A crash may leave a committed pointer without its best-effort lifecycle record.
+    Write that missing record first, preserving any existing record. The unavailable
+    original resume point is recorded as ``from_phase=None``; artifact validation
+    remains the reader's responsibility.
 
     :param Experiment experiment: Experiment whose pointer is about to move.
     :param str superseding_id: Generation about to replace the pointer's target.
@@ -385,58 +330,27 @@ def _publish_generation(
     winners: Mapping[str, Winner],
     publication_hook: PublicationHook | None,
 ) -> None:
-    """Publish a generation as the experiment's last successful result.
+    """Commit a generation as the experiment's last successful publication.
 
-    This is the publication transaction, in strict order:
+    Under an absorbed-shutdown-signal window:
 
-    1. Immutable generation-scoped artifacts (winners/summary) are
-       already written by the time this runs.
-    2. Pre-commit validation (:func:`_validate_generation_publishable`):
-       parse this generation's own summary and winner files back and
-       confirm they name themselves correctly.
-    3. Write the lifecycle record of the generation the last-success pointer
-       currently names when it has none (:func:`_record_superseded_publication`):
-       step 5 is about to stop naming it, and the pointer may be the only
-       proof it committed.
-    4. When supplied, require the detached runner's sidecar hook to durably
-       prepare its frozen result.
-    5. Commit ``last_successful_generation.yaml`` atomically -- the single
-       authoritative publication event. Failures in any preceding step
-       leave the prior pointer untouched.
+    1. Validate the already-written immutable summary and artifact manifest.
+    2. Record the prior pointer target as published if its lifecycle record is missing.
+    3. Require any detached-runner hook to durably prepare the frozen result.
+    4. Atomically commit ``last_successful_generation.yaml``.
 
-    If any of steps 2 through 5 raises, the immutable per-generation record is written
-    once with state ``"publication_failed"`` (+ ``error_class``), the current
-    pointer is driven to ``"publication_failed"``, the prior last-success
-    pointer is left untouched (still authoritative), and the original
-    exception re-raises. Persisting that bookkeeping is itself best-effort
-    (:func:`_persist_terminal_failure`): a secondary failure while writing it
-    is logged, never substituted for the primary error.
+    A failure before commit preserves the prior pointer, records ``publication_failed``
+    best-effort, and reraises the original error. The pointer write is the authoritative
+    publication event.
 
-    Once step 5 has committed, nothing after it may fail the run:
+    After commit, independently notify the sidecar, create the published lifecycle
+    record, refresh the current pointer, and project convenience root artifacts.
+    Each step logs its failures without failing the run or preventing subsequent
+    steps. Readers use immutable generation artifacts, not convenience projections.
 
-    6. Best-effort, notify the prepared sidecar that the pointer committed.
-    7. Write the immutable per-generation record once, state ``"published"``.
-    8. Best-effort, diagnostic-only: drive the current pointer to
-       ``"published"``, then refresh the convenience projections
-       (root ``winner.yaml`` / ``summary.yaml``). These are post-commit
-       caches for humans only -- no reader derives publication authority
-       from them, and once any generation has published, reads resolve the
-       generation-scoped artifacts directly (see
-       :func:`phasesweep.engine.paths._generation_winner_path`), so a
-       failure projecting them never affects what callers actually see.
-
-    Steps 6 through 8 each independently log and swallow their own failure so one
-    cannot prevent the other from running.
-
-    The whole transaction runs inside an
-    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window: a
-    shutdown signal that arrives after the pointer commit must not reclassify
-    the committed publication as failed or cancelled. The race has a
-    deterministic winner — a shutdown delivered before this window opens
-    cancels the run with nothing published; one delivered inside it is
-    absorbed until the publication is durably classified and then honored at
-    the next checkpoint (the next trial launch, or the MCP runner's terminal
-    status write) before any new work starts.
+    A shutdown before this window cancels without publication. One received inside
+    is deferred until durable classification, then honored at the next launch or
+    runner-terminal checkpoint before further work starts.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.
@@ -492,7 +406,7 @@ def _publish_generation(
             )
 
         def _write_published_record() -> None:
-            """Step 7: write the immutable per-generation record once, state ``published``."""
+            """Create the immutable per-generation published lifecycle record once."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,

@@ -36,13 +36,10 @@ def _lock_digest(material: dict[str, Any]) -> str:
 
 
 def _lock_path_from_material(name: str, material: dict[str, str], label: str) -> Path:
-    """Lock path under the configured host lock directory.
+    """Return a host lock path derived from a namespace identity.
 
-    ``name`` is part of the lock *filename*, so two configs whose material
-    hashes identically still miss each other unless their name components
-    match too. Callers must therefore derive it from the same identity the
-    material keys on — the resolved output namespace for the output lock —
-    not from an arbitrary spelling of it.
+    The filename includes ``name`` as well as the digest; both must derive from the
+    same canonical namespace so alternate spellings contend on one lock.
 
     :param str name: Human-readable prefix derived from the lock identity.
     :param dict[str, str] material: Identity material hashed into the filename.
@@ -53,13 +50,7 @@ def _lock_path_from_material(name: str, material: dict[str, str], label: str) ->
 
 
 def _output_lock_material(experiment: Experiment) -> dict[str, str]:
-    """Identity for the *output namespace* lock: which directory we write to.
-
-    Catches the case where two configs share a workdir + experiment name but
-    point at different storage backends — without an output lock those would
-    silently overwrite each other's ``trial_*/``, ``winner.yaml``, and
-    ``summary.yaml``. Always taken regardless of storage backend, including
-    in-memory storage.
+    """Identify the resolved output namespace, including for in-memory runs.
 
     :param Experiment experiment: Experiment supplying the output namespace.
     :return dict[str, str]: Lock material keyed on the resolved experiment directory.
@@ -74,11 +65,7 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
 
 
 def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
-    """Identity for the *Optuna storage* lock: which study namespace we write to.
-
-    Catches the case where two configs share storage + experiment name but
-    point at different workdirs. Returns ``None`` for in-memory storage —
-    there is no shared backend, so the output lock alone is sufficient.
+    """Identify the persistent storage study namespace, or return ``None`` for memory.
 
     :param Experiment experiment: Experiment supplying storage and study namespace.
     :return dict[str, str] | None: Canonical persistent-storage lock material,
@@ -99,13 +86,9 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
 
 
 def _run_lock_paths(experiment: Experiment) -> list[Path]:
-    """All same-host locks required for one full experiment run.
+    """Return sorted same-host output and persistent-storage lock paths.
 
-    For persistent storage we take *both* locks (output + storage); for
-    in-memory storage we take only the output lock. The list is sorted by
-    path so acquisition order is deterministic across processes — relevant
-    for clear error messages, not for deadlock avoidance (we use
-    ``LOCK_NB``).
+    In-memory runs need only the output lock. Acquisition is nonblocking.
 
     :param Experiment experiment: Experiment whose lock set is derived.
     :return list[Path]: Lock paths in deterministic string order: one output
@@ -130,21 +113,10 @@ def _run_lock_paths(experiment: Experiment) -> list[Path]:
 
 @contextlib.contextmanager
 def _experiment_lock(experiment: Experiment) -> Iterator[None]:
-    """Take all same-host locks needed for one full experiment run.
+    """Hold same-host advisory locks for the whole phase-chained experiment.
 
-    The phase-chained pipeline has cross-phase state — parent ``winner.yaml``,
-    child fingerprints, ``summary.yaml``, ``--from-phase`` semantics — so the
-    consistency domain is the entire run, not a single phase study. It spans
-    both the *output namespace* (filesystem artifacts under
-    ``<workdir>/<experiment>/``) and the *Optuna storage namespace*.
-
-    Two configs can disagree on storage but share output paths, or vice
-    versa; either case can corrupt skipped-phase reuse and trial logs. We
-    therefore take an output lock *always*, and a storage lock additionally
-    whenever storage is persistent. In-memory storage has no shared backend,
-    so the output lock alone suffices.
-
-    Both locks are *same-host advisory only*.
+    Always lock the output namespace; also lock persistent storage. Either namespace
+    may be shared by configs that differ on the other, so both constrain execution.
 
     :param Experiment experiment: Experiment whose complete lock set is acquired.
     :raises ExperimentLockBusyError: Another process holds the output or storage lock.

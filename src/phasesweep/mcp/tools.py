@@ -106,15 +106,10 @@ log = logging.getLogger("phasesweep.mcp.server")
 
 DEFAULT_LIST_LIMIT = 50
 MAX_LIST_LIMIT = 100
-# await_run blocks server-side so one call replaces many status polls. Keep the
-# default below common 30-second MCP client deadlines; callers with a longer
-# tool-call budget can opt into the larger supported range.
+# Default wait fits within common 30-second MCP client deadlines.
 AWAIT_DEFAULT_TIMEOUT_SECONDS = 20
 AWAIT_MIN_TIMEOUT_SECONDS = 5
 AWAIT_MAX_TIMEOUT_SECONDS = 600
-# Recheck cadence inside one await. Kept at the minimum timeout so a
-# default-length wait rechecks run state several times mid-wait instead of only
-# at entry and at the deadline.
 AWAIT_RECHECK_SECONDS = 5
 
 
@@ -135,9 +130,6 @@ class _SpawnBookkeepingError(Exception):
         self.cleanup_confirmed = cleanup_confirmed
 
 
-# Environment variables that make the interpreter execute code before the
-# detached runner's first statement. They are dropped from the child's
-# environment; PYTHONNOUSERSITE backs up the ``-s`` flag for the same reason.
 _PRE_IMPORT_CODE_ENV_VARS = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -147,12 +139,7 @@ _PRE_IMPORT_CODE_ENV_VARS = (
 
 
 def _runner_env() -> dict[str, str]:
-    """Build the detached runner's environment without pre-import code hooks.
-
-    Everything else the operator exported is preserved: the runner's trials
-    legitimately need ``PATH``, ``CUDA_*``, credentials, and the rest of the
-    ambient environment, so this strips exactly the variables that can run
-    code before ``phasesweep.mcp.runner`` gets control.
+    """Remove interpreter startup hooks while preserving other operator environment variables.
 
     :return dict[str, str]: Copy of this server's environment with the
         pre-import code hooks removed and ``PYTHONNOUSERSITE`` forced on.
@@ -177,11 +164,7 @@ def _runner_protocol_argv(
     launch_ack_fd: int | None = None,
     launch_lease_fd: int | None = None,
 ) -> list[str]:
-    """Build the required detached-runner protocol arguments.
-
-    Interpreter hardening flags and the project cwd stay at the spawn boundary:
-    they govern how the child starts, while this list is the stable identity and
-    persistence contract consumed by :mod:`phasesweep.mcp.runner`.
+    """Build detached-runner identity, handshake and persistence arguments.
 
     :param str run_id: Claimed run identifier.
     :param Path config_snapshot_path: Immutable config snapshot for the run.
@@ -423,13 +406,11 @@ class PhaseSweepMCP:
 
     @staticmethod
     def explain_config(key: str | None = None) -> JsonObject:
-        """Describe configuration keys from the packaged reference, independent of the catalog.
+        """Describe a packaged config key without reading the catalog or experiment files.
 
-        With no key, or a blank one, the entries are the top-level keys with the first sentence
-        of their description, and the notes are the reference's general notes. With a key, they
-        are that key and every key below it with the full description, one entry per
-        discriminator variant, and the notes are empty. Nothing here touches the catalog,
-        a config file or the filesystem.
+        A blank key returns top-level keys, their first description sentence and general notes.
+        A supplied key returns full descriptions for it and its descendants, with one entry per
+        discriminator variant and no general notes.
 
         :param str | None key: Config key as the reference spells it, such as ``phases[].sampler``,
             ``phases.sampler`` or ``phases.0.sampler``.
@@ -612,18 +593,11 @@ class PhaseSweepMCP:
         run_id: str,
         timeout_seconds: int = AWAIT_DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Wait until a launched run changes, then return its full status.
+        """Wait for terminal state, required recovery, a new phase winner or the clamped timeout.
 
-        A bounded sleep-and-recheck loop over the same reads ``status`` does:
-        no new state, no side effects. Returns early when the run reaches a
-        terminal state, operator recovery is required, or a phase gains a
-        winner; otherwise returns the current status when the (clamped)
-        timeout elapses. A blocking status read already in progress cannot be
-        preempted safely and may finish after that deadline. Rechecks run every
-        ``AWAIT_RECHECK_SECONDS`` (or as late as one estimated read duration
-        before the deadline) and re-resolve the run from disk, so state written
-        while this request is active is observed. After a server restart, a
-        fresh call resumes from the same durable run.
+        Read-only rechecks resolve durable state every ``AWAIT_RECHECK_SECONDS``. Reserve time
+        for the next estimated read; an already-running blocking read may cross the deadline.
+        Return the current full status on timeout.
 
         :param str run_id: Detached run id to wait on.
         :param int timeout_seconds: Requested wait, clamped to
@@ -661,13 +635,6 @@ class PhaseSweepMCP:
             elif time.monotonic() >= deadline:
                 reason = "timeout"
             elif time.monotonic() + read_seconds >= deadline:
-                # Another read as slow as the one just finished would end past
-                # the deadline. Do not start it, but wait out the caller's
-                # remaining budget before returning the fresh snapshot in hand.
-                # The status read itself is blocking filesystem/storage work in
-                # a worker thread and cannot be preempted safely; if that read
-                # already crossed the deadline, the branch above returns as
-                # soon as it finishes.
                 await asyncio.sleep(max(0.0, deadline - time.monotonic()))
                 reason = "timeout"
             else:
@@ -702,10 +669,7 @@ class PhaseSweepMCP:
         target_id, experiment, status, _winners, handle, view, result_source = (
             self._read_result_target(run_id)
         )
-        # Keep the captured results while pairing them with the latest cleanup
-        # and recovery state: snapshot finalization, recovery, or the runner's
-        # exit can change the run's files after target resolution, so the run
-        # is derived again from its files as they are now.
+        # Refresh cleanup and recovery state after result acquisition.
         run = self._run_payload(
             handle,
             view,
@@ -805,14 +769,10 @@ class PhaseSweepMCP:
         experiment: Experiment,
         handle: RunHandle,
     ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
-        """Read live status and winners, leaving catalog drift unknown after decataloging.
+        """Read one publication's live status and winners using the saved run config.
 
-        Both come from one pointer resolution, so the winners always belong to
-        the publication the status describes. ``read_result`` normally
-        compares against its read config when no comparison config is
-        supplied. A run snapshot remains the correct artifact locator after its
-        catalog entry is removed, but it is not a current catalog config and
-        therefore cannot support a drift verdict.
+        After decataloging, that config still locates artifacts but cannot establish current
+        catalog drift; leave the drift verdict unknown.
 
         :param str experiment_id: Catalog id associated with the read target.
         :param Experiment experiment: Live run snapshot config.
@@ -859,15 +819,9 @@ class PhaseSweepMCP:
         *,
         result_source: ResultSource,
     ) -> EngineStatus:
-        """Return frozen run facts with a config-only live drift comparison.
+        """Return frozen result facts with only config drift recomputed from the current catalog.
 
-        A terminal run snapshot is the historical read authority for that run.
-        Publication pointers and integrity stay as captured: consulting the
-        live artifact tree here would make an intact snapshot unreadable, and
-        a later generation's damage could erase this run's
-        already-validated winners. Config drift is the sole live field and
-        compares the frozen represented-config fingerprint with the current
-        catalog.
+        Publication pointers and integrity remain frozen; reads require no mutable result artifacts.
 
         :param str experiment_id: Catalog id associated with the run.
         :param RunResultSnapshot snapshot: Validated frozen result snapshot.
@@ -914,13 +868,9 @@ class PhaseSweepMCP:
         )
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
-        """Load and verify the immutable config snapshot for a persisted run.
+        """Load the exact config snapshot pinned by the run handle.
 
-        Run-specific monitoring must follow the exact config the detached
-        runner received, even if the cataloged config has since been edited and
-        the MCP server restarted. The saved handle's hash is the guardrail: a
-        missing, corrupted, or non-experiment snapshot is rejected instead of
-        silently reporting status for the wrong storage or workdir.
+        Reject missing, unreadable, altered or non-experiment snapshots, including after restart.
 
         :param RunHandle handle: Persisted run identity whose snapshot should be loaded.
         :return Experiment: Parsed experiment from the launched per-run snapshot.
@@ -941,30 +891,14 @@ class PhaseSweepMCP:
             raise RunSnapshotUnavailableError(handle.run_id) from None
 
     def winners(self, run_id: str) -> dict[str, Any]:
-        """Return the winning hyperparameters per completed phase.
+        """Return winning sampled hyperparameters under the run's visibility policy.
 
-        Reads are scoped to the immutable config and terminal result snapshots
-        recorded for ``run_id``. Live reads use only that run's saved config;
-        neither path reconstructs results from a catalog experiment.
+        Live reads use its saved config; terminal reads use its frozen snapshot. Metric labels,
+        objective evidence and the phase plan come from the represented generation.
+        ``result_context`` and ``published_config_matches_current`` disclose their source.
 
-        The payload carries ``publication_integrity`` so an empty winner list
-        is never ambiguous: ``"absent"`` means nothing has published yet,
-        ``"failed"`` means a recorded publication no longer validates;
-        ``"permission_denied"`` means this user cannot validate it without
-        implying corruption. Both expose no winners and require operator action.
-
-        Every label describing the winners -- metric name and goal, objective
-        evidence, and the declared phase plan the completeness fields are
-        measured against -- comes from the represented generation's own
-        recorded semantics, never from the current catalog config. Reading
-        them from the current config would relabel historical numbers with a
-        metric they were never optimized for, assert evidence guarantees the
-        run never had, and, after a phase rename, hide the published winner
-        while reporting the new name as missing. ``result_context`` and
-        ``published_config_matches_current`` report which config supplied the
-        labels and whether it still matches the one a further run would
-        execute. Visibility is unchanged: the current policy still decides
-        which historical *values* are redacted.
+        ``publication_integrity`` distinguishes absent, invalid and permission-denied results;
+        invalid or inaccessible publications expose no winners and require operator action.
 
         :param str run_id: Detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
@@ -1033,12 +967,10 @@ class PhaseSweepMCP:
         snapshot: RunResultSnapshot | None,
         view: RunnerView,
     ) -> tuple[RunResultSnapshot | None, ResultSource]:
-        """Resolve one run result without falling back to mutable terminal state.
+        """Resolve a frozen or live run result, or a config-only unavailable-data placeholder.
 
-        A failed terminal snapshot is represented by the same config-only
-        unavailable-data shape used for pre-generation failures. This lets
-        monitoring return the terminal run and an actionable failure while
-        every phase count remains explicitly untrusted.
+        Unavailable terminal results retain their outcome and actionable failure; phase counts
+        remain unknown.
 
         :param Experiment | None experiment: Exact catalog or saved run configuration when a
             current-state read or unavailable-result placeholder needs one. A complete terminal
@@ -1079,12 +1011,7 @@ class PhaseSweepMCP:
         """
         terminal_status = self._runs.recorded_terminal_status(handle)
         if terminal_status is None:
-            # A reboot proves a spawned runner and every descendant are gone,
-            # so it can release capacity even when a hard exit prevented the
-            # runner from writing status.json. It cannot, however, make the
-            # mutable shared study a historical result for that run. Re-read
-            # after the liveness probe: the runner may have completed its status
-            # write between the first read and the probe.
+            # Ended boots settle cleanup, not historical results. Recheck status after probing.
             if self._runs.runner_may_be_alive(handle, view=view):
                 return None
             terminal_status = self._runs.recorded_terminal_status(handle)
@@ -1093,9 +1020,7 @@ class PhaseSweepMCP:
         if terminal_status.get("result_snapshot_state") == "pending":
             if self._runs.runner_may_be_alive(handle, view=view):
                 return None
-            # The runner can publish the complete snapshot and exit between
-            # the status read and its liveness probe. Re-read before treating
-            # the pending state as orphaned.
+            # Recheck finalization after the liveness probe.
             latest_status = self._runs.recorded_terminal_status(handle)
             if latest_status is None or latest_status.get("result_snapshot_state") == "pending":
                 raise RunResultSnapshotUnavailableError(handle.run_id, "pending")
@@ -1105,9 +1030,7 @@ class PhaseSweepMCP:
             return snapshot
         if self._runs.state(handle, view=view) == "running":
             return None
-        # The runner may have completed the second atomic status write between
-        # the first read and the state check. Re-read before declaring a
-        # terminal snapshot unavailable.
+        # Recheck finalization after deriving terminal state.
         latest_status = self._runs.recorded_terminal_status(handle)
         if latest_status is not None:
             terminal_status = latest_status
@@ -1162,11 +1085,7 @@ class PhaseSweepMCP:
                 if from_phase not in reg.phase_names:
                     raise InvalidPhaseError(experiment_id, from_phase)
                 self._require_resume_ready(reg, from_phase)
-            # The cap check and the spawn must be atomic, or two near-simultaneous
-            # launches both pass the cap and oversubscribe the GPU it protects. Hold
-            # the launch lock across the whole decision. One scan then covers both
-            # guards: the same experiment can't double-launch, and no more than
-            # max_concurrent_runs sweeps run at once (default 1).
+            # Hold the launch lock across inventory, capacity checks and spawn.
             with self._runs.launch_lock() as acquired:
                 if not acquired:
                     raise LaunchInProgressError()
@@ -1322,11 +1241,7 @@ class PhaseSweepMCP:
             }
             if before == "running":
                 with self._runs.transition_lock(handle):
-                    # Launch may have durably replaced a pending handle with
-                    # its runner identity, and recovery may have finalized the
-                    # run after the first read. Use the latest handle, and one
-                    # derivation of its runner, for both the state decision and
-                    # any subsequent signal.
+                    # Refresh the durable handle and runner view under the transition lock.
                     refreshed = self._runs.get(run_id)
                     if refreshed is None:
                         raise UnknownRunError(run_id)
@@ -1340,33 +1255,21 @@ class PhaseSweepMCP:
                         "recovery_required": recovery_required,
                     }
                     if before == "running" and handle.launch_state == "launching":
-                        # No PID/PGID is durable yet. Signalling an empty identity
-                        # could let launch continue after a false cancel response.
+                        # A pre-spawn handle supplies no process identity to cancel.
                         raise RunLaunchUnsettledError(run_id)
                     if before == "running" and view.visibility == "unobservable":
-                        # The recorded PID and process group are numbered in
-                        # another PID namespace, where they name unrelated
-                        # processes. Refuse before reserving or signalling.
+                        # Foreign-namespace numbers cannot be signalled locally.
                         raise RunNamespaceMismatchError(run_id)
                     if before == "running":
-                        # Reserve capacity before signalling; recovery cannot
-                        # clear this marker between the reread and its write.
+                        # Reserve cleanup before releasing the transition lock.
                         self._runs.mark_cleanup_uncertain(handle)
             after: RunState
             if before != "running":
                 after = before
                 confirmed: bool | None = None
             else:
-                # Concurrent callers still signal outside the short transition
-                # lock. kill_stale_group treats an already-gone group as confirmed,
-                # terminal status is runner-authoritative, and marker removal
-                # uses missing_ok.
-                # SIGTERM -> grace -> SIGKILL on the runner's process group. A
-                # runner-written status is useful only when it includes explicit
-                # cleanup evidence from the engine shutdown handler. If the server
-                # had to force-kill the runner first, or the handler reported
-                # uncertainty, child trial PGIDs may still live, so keep the run
-                # counted as live and fail closed.
+                # Signal outside the transition lock; concurrent cancels may find the group gone.
+                # Separate trial groups require runner-reported cleanup evidence.
                 identity = self._runs.cleanup_identity(handle)
                 gone = view.visibility == "gone"
                 same_boot = identity.boot_id is not None and identity.boot_id == read_boot_id()
@@ -1439,11 +1342,9 @@ class PhaseSweepMCP:
         return result
 
     def _require_resume_ready(self, reg: RegisteredExperiment, from_phase: str) -> None:
-        """Verify that every earlier phase has a winner the resume may build on.
+        """Apply runner preflight acceptance to all skipped phases before spawning.
 
-        Applies the run preflight's own acceptance rule to each skipped phase,
-        against one resolution of the publication, so a launch is refused
-        before spawning for anything the runner's preflight would refuse after.
+        Use one publication resolution for every prerequisite winner.
 
         :param RegisteredExperiment reg: Registered experiment being resumed.
         :param str from_phase: Requested phase to resume from.
@@ -1575,8 +1476,7 @@ class PhaseSweepMCP:
                 },
             )
         except Exception:
-            # The unresolved launching handle remains a fail-closed concurrency
-            # reservation when even terminal bookkeeping cannot be persisted.
+            # Retain the launch reservation when terminal bookkeeping cannot persist.
             log.exception("failed to finalize launch error for run_id=%s", pending.run_id)
 
     def _terminate_failed_spawn(
@@ -1622,9 +1522,7 @@ class PhaseSweepMCP:
             )
             return False
         if cleanup_confirmed and acknowledged:
-            # After acknowledgement the runner can start trials in separate
-            # process groups. Its own terminal cleanup report is the only
-            # evidence that those groups were also stopped.
+            # Acknowledged runners need terminal cleanup evidence for separate trial groups.
             terminal = self._runs.recorded_terminal_status(handle)
             cleanup_confirmed = terminal is not None and terminal.get("cleanup_confirmed") is True
         if cleanup_confirmed:
@@ -1666,9 +1564,7 @@ class PhaseSweepMCP:
         """
         pending = preparation.handle
         run_id = pending.run_id
-        # The child inherits this namespace, so it is read before any pipe or
-        # child exists: an unreadable namespace refuses the launch with nothing
-        # to clean up.
+        # Require the inherited PID namespace before allocating pipes or spawning.
         pid_namespace = read_pid_namespace()
         if pid_namespace is None:
             raise RuntimeError(
@@ -1682,9 +1578,7 @@ class PhaseSweepMCP:
         ack_read, ack_write = os.pipe()
         cmd = [
             sys.executable,
-            # -P: never prepend the cwd or script dir to sys.path. -s: no
-            # per-user site dir. Both close the pre-identity window described
-            # below; keep them together with the sanitized env.
+            # Exclude cwd/script paths and user site packages during interpreter startup.
             "-P",
             "-s",
             "-m",
@@ -1701,8 +1595,6 @@ class PhaseSweepMCP:
                 launch_ack_fd=ack_read,
                 launch_lease_fd=preparation.lease_fd,
             ),
-            # The runner chdirs here itself once its identity is durable; see
-            # the trust-boundary note below for why Popen must not do it.
             "--cwd",
             str(reg.cwd),
         ]
@@ -1710,24 +1602,8 @@ class PhaseSweepMCP:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
-        # Pre-identity trust boundary. Everything between exec and the runner's
-        # own durable handle write runs before this server can name the process
-        # it just created. Spawning with the experiment's project directory as
-        # cwd would put that window inside the project's reach: interpreter
-        # startup would import a project-local `phasesweep/` shadow package or
-        # `sitecustomize.py`, and a PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected
-        # module would run earlier still. Any of it could fork+setsid out of the
-        # process group recorded below, after which "cleanup confirmed" would be
-        # a claim about an empty group. So the child starts in the server-owned
-        # state directory, with -P/-s and a sanitized environment, and receives
-        # the project directory as an explicit argument it applies only after its
-        # identity is on disk.
         spawn_cwd = self._neutral_spawn_cwd()
-        # Open the log here, hand the fd to the child, then close our copy. The
-        # child keeps it. stdin is /dev/null so the runner never blocks on input.
-        # Once Popen returns, every later operation is inside the BaseException
-        # boundary: shutdown interrupts are ownership failures too, not proof
-        # that no child was created.
+        # Once Popen returns, interrupts also require cleanup of the owned child.
         proc: subprocess.Popen[bytes] | None = None
         handle: RunHandle | None = None
         pid_starttime: int | None = None
@@ -1749,10 +1625,7 @@ class PhaseSweepMCP:
                 ready_write = -1
                 os.close(ack_read)
                 ack_read = -1
-                # Build the minimum usable identity before log close, /proc,
-                # boot-id, or handle enrichment can fail. start_new_session=True
-                # makes the child the group leader, so pgid == pid without a
-                # getpgid() race if it exits quickly.
+                # Record PID/PGID before any fallible enrichment; the child leads its session.
                 handle = replace(
                     pending,
                     pid=proc.pid,
@@ -1785,9 +1658,7 @@ class PhaseSweepMCP:
                 persisted = self._runs.get(run_id)
                 if persisted != handle:
                     raise RuntimeError("detached runner launch receipt did not match its process")
-            # An asynchronous exception may arrive after the byte reaches the
-            # runner but before os.write returns. From this point onward,
-            # cleanup must assume separately-sessioned trials could start.
+            # A delivered ACK can release separate trial groups before os.write returns.
             runner_acknowledged = True
             if os.write(ack_write, LAUNCH_ACK_BYTE) != len(LAUNCH_ACK_BYTE):
                 raise RuntimeError("could not acknowledge the detached runner launch")
@@ -1824,12 +1695,7 @@ class PhaseSweepMCP:
         return handle
 
     def _neutral_spawn_cwd(self) -> Path:
-        """Return the server-owned directory the detached runner is spawned in.
-
-        The runner must not start in a directory the experiment's project can
-        write to, so use the operator-owned MCP state directory that already
-        holds run handles, logs, and config snapshots. It is re-validated here
-        because it must exist and stay owner-only at the moment of the spawn.
+        """Revalidate the owner-only state directory used before the runner identity is durable.
 
         :return Path: Private state directory used as the child's initial cwd.
         """
@@ -1838,25 +1704,16 @@ class PhaseSweepMCP:
         return state_dir
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
-        """Return whether launch-time and current policy permit cancellation.
+        """Require both launch-time and current cancellation permission.
 
-        A catalog edit may revoke cancellation but never grant it, so a still
-        cataloged id is intersected with the permission frozen at launch.
-
-        When the id is gone from the catalog there is no current policy to
-        intersect with, and the launch-time permission stands alone. Refusing
-        there would strand a live detached runner: ``status``
-        still reports it as ``running`` from its snapshot, and
-        ``phasesweep mcp recover-run`` refuses while the runner is alive, so
-        the operator would be left hunting the PGID by hand. Cancellation is
-        risk-reducing and was authorized when this run started.
+        A catalog edit may revoke permission but cannot grant it. Decataloged runs retain their
+        launch-time permission.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
         :return bool: Whether both launch-time and current permission are true,
             or the launch-time permission alone when the id is no longer cataloged.
         """
         if not handle.allow_cancel:
-            # A launch-time denial is permanent for this run.
             return False
         try:
             return self._registry.get(handle.experiment_id).allow_cancel

@@ -134,11 +134,7 @@ def _save_intent(
 
 
 def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
-    """Freeze one accepted trial's result from its durable Optuna record.
-
-    Constraints and observed values come from the trial's own attributes rather
-    than the current config, so the projection can be rebuilt for any accepted
-    trial later.
+    """Freeze an accepted trial projection from its persisted values and attributes.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
@@ -216,12 +212,11 @@ def publish_trial(
     trial: FrozenTrial,
     environment: Mapping[str, str],
 ) -> None:
-    """Mirror a terminal trial after the live controller confirms process cleanup.
+    """Mirror a terminal trial after confirmed process cleanup.
 
-    COMPLETE trials require their native run binding and publish their accepted
-    evidence. Failed or interrupted trials finish only managed runs; attempts
-    without a binding and trainer-owned failed runs are left alone. The same
-    durable outcome decision and intent builder serves recovery and live calls.
+    COMPLETE trials publish accepted evidence to their bound native run.
+    Failed or interrupted trials finish only managed runs; unbound attempts
+    and trainer-owned failed runs are left alone.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
@@ -284,11 +279,9 @@ class _AttemptTrial(NamedTuple):
 
 
 def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, _AttemptTrial]:
-    """Index the ledger's trials of some phases by attempt id.
+    """Index readable study trials by attempt ID with study-local cleanup confirmation.
 
-    A phase whose study cannot be read contributes nothing, so its attempts
-    stay unresolved instead of being guessed. Trial numbers are study-local,
-    so each trial is paired with the recovery ledger of the study it came from.
+    Unreadable studies contribute no trials, leaving their attempts unresolved.
 
     :param ValidatedLedger ledger: Ledger the trials were recorded in.
     :param Iterable[str] phases: Phase names whose studies are read.
@@ -328,17 +321,11 @@ def _save_attempt_intents(
     *,
     ended: str | None,
 ) -> list[Path]:
-    """Save the delivery intent of each unrecorded attempt whose Optuna outcome settles it.
+    """Save unrecorded attempt projections according to their durable Optuna outcomes.
 
-    The trial's state decides what an attempt reports, never the absence of a
-    record: a COMPLETE trial whose callback saved nothing, because a write
-    failed or the controller died after Optuna committed it, gets its accepted
-    projection. A managed run of a trial that was not accepted is finished
-    once its cleanup is established by the trial's own positive evidence,
-    its live controller's confirmation, or a recovery recorded by its study.
-    Recovery leaves trial attributes unchanged, so its confirmation comes
-    from the owning study's ledger. An attempt without a readable trial stays
-    unresolved, as does one whose cleanup is still uncertain.
+    COMPLETE trials receive accepted projections. Unaccepted managed runs finish
+    only after cleanup is confirmed by the trial, live controller, or owning
+    study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
@@ -387,14 +374,10 @@ def _save_attempt_intents(
 
 
 def _save_generation_intents(experiment: Experiment, generation_id: str) -> list[Path]:
-    """Save a published generation's winner references from its committed artifacts.
+    """Build winner projections from a generation's validated committed artifacts.
 
-    Reading the validated artifacts instead of in-memory winners lets
-    sync-tracking rebuild records that a failed write after publication never
-    saved. Phase membership, order, and lineage come from the generation's own
-    validated config snapshot, so a phase appended or rewired since cannot
-    change what an older generation reports. Every projection is built before
-    the first record is saved. Records that already exist are kept.
+    Its recorded phase order and lineage apply even if the current config differs.
+    Build every projection before saving records; preserve records already present.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Published generation that has a summary run.
@@ -508,14 +491,10 @@ def publish_failed_generation(
     error: BaseException,
     ledger: ValidatedLedger,
 ) -> None:
-    """Finish a failed invocation's owned runs only after the engine confirms cleanup.
+    """Finish a failed invocation's owned runs after confirmed cleanup.
 
-    Covers the generation summary and every attempt whose post-trial callback
-    saved no record. Each attempt's Optuna outcome decides what it reports:
-    an accepted trial gets its accepted projection, and the managed run of
-    any other attempt is finished with the invocation's status. Committed
-    generations are left untouched, including after a newer publication replaces
-    the last-success pointer.
+    Accepted trials keep accepted projections; other managed attempts finish with
+    the invocation's status. Committed generations remain untouched.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Failed invocation identity.
@@ -602,13 +581,10 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
 
 
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
-    """Retry result projections, without selecting or training.
+    """Retry pending result projections without selecting or training.
 
-    A run whose creation timed out is bound first if it has since appeared.
-    Records an invocation never saved, because a write failed or the
-    controller died, are then rebuilt: an attempt's from its trial in the
-    Optuna ledger, and a published generation's winner records from its
-    committed artifacts.
+    Reconcile unresolved creations first, then rebuild missing attempt records
+    from Optuna and winner records from committed generation artifacts.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be

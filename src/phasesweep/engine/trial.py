@@ -98,13 +98,9 @@ class TrialResult:
     feasible: bool
     failure_reason: str | None = None
     gate_results: list[GateResult] | None = None
-    # Frozen evidence provenance captured when the objective was extracted:
-    # extractor config fingerprint plus source digest / remote summary subset
-    # None when metric extraction failed.
+    # Evidence captured at metric extraction; absent when extraction failed.
     objective_provenance: dict[str, Any] | None = None
-    # True only when the phase/run deadline directly caused this result to
-    # fail, rather than merely having elapsed by the time another failure was
-    # observed.
+    # True only when the phase/run deadline caused the failure.
     deadline_exhausted: bool = False
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
@@ -131,11 +127,7 @@ _STDERR_QUOTE_CHARS = 200
 # A terminal color or cursor sequence, which would otherwise leave its ``[31m`` residue.
 _ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-# Last stderr lines that suggest the trainer lacked an environment input, so the
-# narrowed-environment hint applies: a failed import (``PYTHONPATH`` dropped), a
-# missing tool or file (``PATH`` dropped), an ``os.environ["NAME"]`` lookup, or
-# words naming an unset variable. Any other line names its own cause and the hint
-# stays out of its way.
+# Stderr patterns eligible for the narrowed-environment hint.
 _MISSING_ENVIRONMENT_STDERR = re.compile(
     r"ModuleNotFoundError|ImportError|No module named"
     r"|command not found|No such file or directory"
@@ -198,9 +190,7 @@ def _trainer_environment(
         except ValueError as exc:
             raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
     elif "WANDB_RUN_ID" not in experiment.env:
-        # Without a remote evidence consumer, an explicitly configured run ID
-        # remains trainer-owned. An ambient/inherited ID is not stable trial
-        # semantics and must not split the persistent-study cohort.
+        # Track explicit trainer-owned W&B identities, but exclude inherited ids from the cohort.
         env.pop("WANDB_RUN_ID", None)
     if experiment.mlflow is not None:
         env.pop("MLFLOW_RUN_ID", None)
@@ -230,18 +220,11 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
 
 @dataclass(frozen=True)
 class EnvironmentIdentity:
-    """Semantic identity of the base environment a trainer receives.
+    """Trainer environment and its persistent-study identity.
 
-    ``tracked`` is the name-to-value mapping the environment cohort covers: the base names,
-    the ``inherit_env`` list names, the ``env`` entries and the keys PhaseSweep composes from
-    config. It leaves out the pass-through names (the built-in ``TMPDIR`` and
-    ``passthrough_env``) so credentials can rotate without contaminating a persistent study.
-    Each trial records it in plain text, so the refusal for a different cohort can show both
-    values. ``digest`` is the SHA-256 of that mapping, the compact key the cohort check compares.
-
-    ``values`` is the full composed mapping used for launch and the opt-in ``environment.json``
-    record. It also holds the pass-through values and, under ``inherit_env: all``, every
-    ambient variable outside the cohort, so it is recorded nowhere but that owner-only file.
+    ``tracked`` contains semantic environment values; ``digest`` hashes that mapping.
+    ``values`` also includes pass-through and untracked ambient values used at launch.
+    Only the opt-in, owner-only ``environment.json`` records the full mapping.
     """
 
     digest: str
@@ -255,37 +238,19 @@ def _environment_identity(
     *,
     require_wandb_online: bool = True,
 ) -> EnvironmentIdentity:
-    """Identify the semantic part of the composed trainer environment.
+    """Hash the trainer environment's semantic values for the persistent-study cohort.
 
-    The cohort covers the names the narrowed contract composes: the base names, the
-    ``inherit_env`` list names, the ``experiment.env`` entries and the W&B and MLflow keys
-    PhaseSweep sets from config. Under ``inherit_env: all`` the trainer still inherits every
-    ambient variable, but one outside that set is inherited untracked, so shell state such as
-    ``SHLVL`` or ``OLDPWD`` cannot split a persistent study.
+    Track base names, explicit inheritance, configured env, and configured backend
+    bindings. Exclude pass-through values and per-trial bindings; explicit env entries
+    remain semantic even when they reuse a pass-through name. Under ``inherit_env: all``,
+    other ambient values reach the trainer without entering the cohort. Hash compact
+    JSON name/value pairs sorted by name. Each allocated trial records the mapping and
+    digest; populated studies must match before allocation.
 
-    Values named by the effective pass-through set (the built-in ``TMPDIR`` plus
-    ``execution.passthrough_env``) are also excluded: they are scratch, credential or
-    transport inputs allowed to change between invocations. Configured ``experiment.env``
-    entries remain semantic even if they reuse a pass-through name, except trial bindings
-    assigned by PhaseSweep, which are removed first.
-
-    The digest is the SHA-256 of the compact JSON encoding of the tracked
-    ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
-    delimiter join because ``experiment.env`` keys are arbitrary config
-    strings: encoding ``{"A": "B=1"}`` and ``{"A=B": "1"}`` as ``A=B=1``
-    would collide, while JSON string quoting keeps the encoding injective.
-    Sorting makes the digest independent of mapping order. It is a checksum of the tracked
-    mapping, not a secrecy measure: each trial records both.
-
-    The digest is stored on every allocated trial and checked against every
-    populated persistent study before another trial is allocated.
-
-    :param Experiment experiment: Parsed experiment supplying the contract.
+    :param Experiment experiment: Experiment supplying the environment contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
-    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
-        caller is preparing new remote work.
-    :return EnvironmentIdentity: The digest, the tracked name-to-value mapping it covers, and
-        the full composed mapping the trainer receives.
+    :param bool require_wandb_online: Reject offline or disabled W&B for new remote work.
+    :return EnvironmentIdentity: Tracked values, their digest, and the full launch environment.
     """
     env = _trainer_environment(
         experiment,
@@ -319,27 +284,17 @@ def _record_trainer_environment(
     identity: EnvironmentIdentity,
     trial_dir: Path,
 ) -> None:
-    """Write the opt-in raw environment record for one trial.
+    """Write the full composed environment to an owner-only file when record_env is enabled.
 
-    A no-op unless ``execution.record_env`` is set. The record holds the whole
-    composed environment, pass-through values and every ambient variable under
-    ``inherit_env: all`` included, so it is written owner-only (0600) through
-    :func:`phasesweep.runtime.files.private_atomic_write_text` rather than the
-    umask-governed artifact writer the rest of the trial directory uses. Only
-    the file is hardened: the trial directory itself stays operator-trusted, so
-    logs and evidence remain readable by ordinary tooling.
+    Capture values before per-trial and GPU bindings. Include ambient and pass-through
+    values, and list pass-through names excluded from the cohort digest.
 
-    The recorded mapping is the full contract-composed environment before the
-    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` lists the
-    effective pass-through names, built-in ``TMPDIR`` included, whose values are
-    left out of the tracked mapping and its digest.
-
-    :param Experiment experiment: Parsed experiment supplying the contract.
-    :param EnvironmentIdentity identity: Identity of the composed environment.
-    :param Path trial_dir: Existing trial directory to write into.
+    :param Experiment experiment: Experiment supplying the environment contract.
+    :param EnvironmentIdentity identity: Composed environment and tracked identity.
+    :param Path trial_dir: Existing trial directory.
     :raises OSError: The record could not be written.
-    :raises UnsafePrivatePathError: An existing ``environment.json`` is not a
-        private, unshared regular file, so replacing it could leak values.
+    :raises UnsafePrivatePathError: An existing environment.json is not a private,
+        unshared regular file.
     """
     if not experiment.execution.record_env:
         return
@@ -363,25 +318,15 @@ def _warn_dropped_cuda_visibility(
     env: dict[str, str],
     gpu_id: int | str | None,
 ) -> None:
-    """Warn once when the trainer's GPU visibility diverges from the parent's.
+    """Warn once per phase when an unleased trainer loses the parent's GPU restriction.
 
-    The narrowed ``inherit_env`` contracts drop the ambient
-    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`~phasesweep.config.models.BASE_INHERITED_ENV`). The
-    GPU pool still reads that ambient value for discovery: it leases and
-    re-binds device tokens, and pins a disable sentinel (``""``/``-1``) into
-    every trial. The remaining unbound case is ``gpu_policy: none``, where the
-    phase deliberately assigns nothing: the child then has no visibility
-    binding and can use host GPUs the parent had hidden, holding no GPU host
-    lock. That is a real hazard, but it is a *configuration* hazard: the fix is
-    a fingerprinted ``env`` entry, not a silent ambient read.
+    Narrowed inheritance omits ambient CUDA_VISIBLE_DEVICES. With gpu_policy: none
+    and no explicit binding, the trainer may see GPUs the parent hid.
 
-    Args:
-        experiment: Parsed experiment supplying the inherit contract.
-        phase_name: Phase whose trials are affected, used for the warn-once key.
-        env: Composed trainer environment, after GPU assignment.
-        gpu_id: Device token assigned by the pool, or ``None`` when the pool
-            leased nothing for this trial.
-
+    :param experiment: Experiment supplying the inheritance contract.
+    :param phase_name: Phase used for the warning identity.
+    :param env: Trainer environment after GPU assignment.
+    :param gpu_id: Assigned device token, or None when no device was leased.
     """
     if gpu_id is not None or "CUDA_VISIBLE_DEVICES" in env:
         return
@@ -456,23 +401,15 @@ def _warn_narrowed_environment_exit(
     return_code: int,
     stderr_line: str | None,
 ) -> None:
-    """Warn once per phase when a trainer exits nonzero under a narrowed environment.
+    """Suggest widening a narrowed environment on its first unexplained trainer failure.
 
-    A trainer that was started without a variable it needs, such as ``PYTHONPATH``
-    or a cache path, can fail with an error that never mentions the environment.
-    Name the contract and the three ways to widen it, once per phase for the
-    process, so the first such failure carries the hint without repeating it for
-    every later trial. A failure whose stderr line names another cause, such as an
-    out-of-memory error, gets no hint and does not use up the phase's one warning.
-    Without a stderr line there is nothing to rule the environment out, so the hint
-    applies.
+    Skip hints when stderr identifies another cause; absent stderr still permits a hint.
 
-    :param Experiment experiment: Parsed experiment supplying the contract.
-    :param str phase_name: Phase whose trial failed, used for the warn-once key.
-    :param int trial_id: Phase-local trial number of the failed trial.
-    :param int return_code: The nonzero exit code the trainer returned.
-    :param str | None stderr_line: The trial's last stderr line from
-        :func:`_stderr_last_line`, or ``None`` when it has none.
+    :param Experiment experiment: Experiment supplying the inheritance contract.
+    :param str phase_name: Phase used for the warning identity.
+    :param int trial_id: Failed trial number.
+    :param int return_code: Trainer exit code.
+    :param str | None stderr_line: Last nonempty stderr line, if available.
     """
     admitted = experiment.execution.inherited_env_names()
     if admitted is None:
@@ -645,62 +582,32 @@ def launch_trial(
     gpu_lease_fds: tuple[int, ...] = (),
     prepared_input: PreparedTrainerInput,
 ) -> ExecutedTrial:
-    """Launch the trial subprocess. Call this while holding the GPU lease.
+    """Launch a trial while the caller holds its GPU lease.
 
-    ``trial_dir`` is passed in (not recomputed) so the caller can persist its
-    resolved absolute path as an Optuna user attribute *before* the subprocess
-    starts. The stale-trial reaper then reads back that exact path on a later
-    run, even if the user changed ``experiment.workdir`` or invoked phasesweep
-    from a different cwd.
+    The caller persists the resolved trial_dir before launch for later recovery.
 
-    Args:
-        experiment: Parsed experiment config; provides ``trial_command``,
-            ``trainer_config``, ``override_format``, and ``env``.
-        phase_name: Name of the running phase (used in ``run_name`` and logs).
-        trial_id: Optuna's numeric trial number.
-        generation_id: Identity of the current engine invocation.
-        attempt_id: Immutable identity of this subprocess attempt.
-        trial_dir: Resolved per-trial directory; created if missing.
-        overrides: Composed overrides (inherited + fixed + sampled) for this trial.
-        timeout_seconds: Per-trial wall-clock budget passed to
-            :func:`run_supervised`, or ``None`` for no per-trial timeout.
-        wallclock_deadline: Optional absolute phase/run deadline. Passing the
-            original deadline preserves time consumed by command rendering,
-            artifact writes, environment recording, cwd resolution, and log
-            opening before supervision begins.
-        gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
-            written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
-        gpu_lease_fds: Host GPU-lock descriptors inherited by the trusted
-            supervisor guardian (not trainer code) so exclusion lasts until
-            the whole trainer process group exits, even if the orchestrator
-            exits abruptly.
-        prepared_input: Exact input materialized and persisted before the GPU lease.
-
-    Returns:
-        :class:`ExecutedTrial` bundling the trial context, the supervised
-        :class:`ProcessResult`.
-
-    Raises:
-        TrialExecutionError: The configured ``execution.cwd`` does not resolve
-            to a directory on this host.
-        OSError: A trial artifact (generated trainer config, resolved overrides,
-            command record, the opt-in ``environment.json``, or the captured
-            output streams) could not be written. Raised before the trainer
-            starts, so no subprocess is left behind.
-        UnsafePrivatePathError: ``execution.record_env`` is set and an existing
-            ``environment.json`` in the trial directory is not a private,
-            unshared regular file.
-
+    :param experiment: Experiment defining command, input format, and environment.
+    :param phase_name: Phase label for runtime placeholders and logs.
+    :param trial_id: Optuna trial number.
+    :param generation_id: Invocation identity.
+    :param attempt_id: Immutable subprocess attempt identity.
+    :param trial_dir: Resolved trial directory; created if missing.
+    :param overrides: Inherited, fixed, and sampled overrides.
+    :param timeout_seconds: Optional per-trial wallclock budget.
+    :param wallclock_deadline: Absolute phase/run deadline including launch preparation.
+    :param gpu_id: CUDA visibility token, or None to leave it unbound.
+    :param gpu_lease_fds: Lock descriptors held by the supervisor guardian until the
+        trainer group exits, including after an orchestrator exit.
+    :param prepared_input: Exact input materialized before acquiring the GPU lease.
+    :return ExecutedTrial: Trial context and supervised process result.
+    :raises TrialExecutionError: Configured execution.cwd is not a directory.
+    :raises OSError: A pre-launch artifact or output stream could not be written.
+    :raises UnsafePrivatePathError: The opt-in environment.json is not a private,
+        unshared regular file.
     """
     workdir = trial_dir
     workdir.mkdir(parents=True, exist_ok=True)
-    # Every engine artifact under ``workdir``, including process-control
-    # records written later, shares this operator-trusted boundary. These
-    # files use ordinary paths rather than the validated O_NOFOLLOW helpers
-    # reserved for the lock namespace, the attempt registry, and MCP state;
-    # forcing trial dirs private would break normal operator/tool visibility
-    # into logs and resolved overrides. See docs/runtime.md's trust-boundary
-    # section.
+    # Trial artifacts use ordinary paths in the operator-trusted workdir.
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     trainer_input = prepared_input
     cmd = render_command(
@@ -715,15 +622,9 @@ def launch_trial(
         materialized_input_path=workdir / trainer_input.filename,
     )
     overrides_sha256 = trainer_input.sha256
-    # Orchestrator-created trial artifact, not symlink-hardened by design (see
-    # the trust-boundary comment above).
     (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
-    # Environment and working directory follow the explicit execution
-    # contract instead of unbounded ambient inheritance. The identity is
-    # computed from the same composition the subprocess receives, and the
-    # opt-in raw record is written before any per-trial binding is layered
-    # on, so the file stays the digest's exact preimage.
+    # Capture the composed environment before per-trial bindings.
     identity = _environment_identity(experiment, phase_name)
     _record_trainer_environment(experiment, identity, workdir)
     env = dict(identity.values)
@@ -733,9 +634,7 @@ def launch_trial(
     wandb_query = _wandb_query(experiment, phase.gates)
     if wandb_query is not None:
         env["WANDB_RUN_ID"] = attempt_id
-    # Without a W&B evidence consumer, monitoring remains trainer-owned: keep
-    # any configured/ambient W&B identity unchanged. Trainers can still bind
-    # monitoring to this attempt explicitly through PHASESWEEP_ATTEMPT_ID.
+    # Without an evidence consumer, preserve trainer-owned W&B identity.
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import read_binding, read_record
@@ -764,9 +663,7 @@ def launch_trial(
         visible_devices = str(gpu_id)
         env["CUDA_VISIBLE_DEVICES"] = visible_devices
         if any(token.strip().isdigit() for token in visible_devices.split(",")):
-            # Numeric tokens are locked against nvidia-smi's PCI-order index
-            # map, so allowing FASTEST_FIRST here could run on a different
-            # physical card than the one whose host lock we hold.
+            # Numeric GPU tokens must use the PCI ordering of the host lock inventory.
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         else:
             env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -822,46 +719,20 @@ def extract_trial_result(
     gates: list[Gate] | None = None,
     deadline: float | None = None,
 ) -> TrialResult:
-    """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
+    """Extract a trial's metric and constraints after releasing the GPU lease.
 
-    Failure modes that produce a `failure_reason` (and thus an Optuna FAIL via
-    TrialExecutionError):
-      * non-zero return code from the subprocess; the reason quotes the last line
-        of the trial's ``stderr.log`` when it has one
-      * metric extractor raised ExtractorError
-      * metric extractor returned a non-finite value
-      * any constraint extractor raised ExtractorError
-      * any constraint extractor returned a non-finite value
-      * the phase/run wallclock deadline expired before extraction completed
+    Process failures, extraction errors, nonfinite values, gate failures, and expired
+    deadlines return a failed TrialResult. Finite bound violations remain COMPLETE
+    and infeasible. Observations run after acceptance; unreadable observations warn
+    and are omitted without changing the result.
 
-    A trial that produced a finite metric and finite constraint values but violated
-    a bound (a constraint's, or the metric's own ``min``/``max``) is COMPLETE+infeasible
-    — that's a valid evaluation, not an instrumentation failure, and should still
-    inform the sampler. Expected extraction and gate
-    failures are returned in :class:`TrialResult`; this function has no domain
-    exception outcome for callers to catch. Report-only observations are read last,
-    after acceptance; one that cannot be read warns and is left out of
-    ``TrialResult.observed`` without affecting the result.
-
-    Args:
-        experiment: Parsed config; supplies the metric and constraint extractors.
-        executed: Output of :func:`launch_trial`; provides the trial context
-            and the :class:`ProcessResult`.
-        gates: Evidence gates that must pass for the trial to count.
-        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
-            ``timeout_seconds_per_phase`` / ``timeout_seconds_per_run`` bound
-            the *whole* trial — extraction and gates included, not just the
-            trainer. Enforcement is cooperative at stage boundaries (before
-            the metric, each constraint, the gates, and the final result), so
-            a single blocking local stage can overrun by at most its own
-            duration; W&B polling additionally caps its request budget to the
-            remainder. An accepted W&B objective's evaluation position is read
-            last, within what remains, and never changes the result.
-
-    Returns:
-        :class:`TrialResult` with either a finite metric and feasibility flag,
-        or ``metric=None`` plus a ``failure_reason``.
-
+    :param experiment: Experiment defining extractors and bounds.
+    :param executed: Trial context and supervised process result.
+    :param gates: Evidence gates required for acceptance.
+    :param deadline: Absolute monotonic phase/run deadline, checked at stage boundaries.
+        Local stages may overrun by their duration; W&B requests use the remaining budget.
+        Objective evaluation-position reads use the remainder without changing acceptance.
+    :return TrialResult: Finite metric and feasibility, or no metric and a failure reason.
     """
     import time
 
@@ -1027,9 +898,6 @@ def extract_trial_result(
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
         )
 
-    # Final boundary check: a slow last stage must not let a trial publish a
-    # "complete" evaluation past the configured wallclock bound — the field
-    # names promise an end-to-end limit.
     expired = _deadline_failure("the trial result could be accepted")
     if expired is not None:
         expired.constraints.update(constraint_values)

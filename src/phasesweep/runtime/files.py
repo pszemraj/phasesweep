@@ -227,14 +227,10 @@ def _lock_policy(path: Path) -> _LockPolicy:
 
 
 def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
-    """Classify an already-opened lock directory's ownership and mode.
+    """Determine the private or shared lock-directory policy.
 
-    Accepts either an owner-only directory (mode ``0700``, owned by the
-    current effective uid) or an administrator-owned shared directory (mode
-    ``03770``, owned by uid 0, with a gid in the caller's current group
-    set). Any other owner/mode combination — including a non-directory,
-    which indicates the path resolved to a symlink or other non-directory
-    entry — is refused.
+    Private directories require mode ``0700`` and the current UID; shared directories
+    require root ownership, mode ``03770`` and membership in the owning group.
 
     :param Path path: Lock directory the ``info`` was captured from, used
         only for error messages.
@@ -265,19 +261,10 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
 
 
 def open_lock_file(path: Path) -> IO[str]:
-    """Open or create a validated regular lock file inside a validated lock directory.
+    """Open a lock file relative to its validated directory descriptor.
 
-    Requires a POSIX runtime and ``O_NOFOLLOW``. Walks and validates
-    ``path.parent`` as a private-or-shared lock directory (see
-    :func:`_lock_policy_for_info`), then opens ``path`` relative to that
-    directory descriptor with ``O_NOFOLLOW`` so a symlinked lock path is
-    refused rather than followed. If the file does not exist it is created
-    exclusively at the policy's file mode; if it already exists, it is
-    opened as-is and re-validated: it must be a regular file with a single
-    hard link, owned by the expected uid (private policy) or gid (shared
-    policy), and already at the policy's file mode. The parent directory
-    descriptor is always closed before returning; the returned file handle
-    is closed automatically if any validation step after opening fails.
+    Refuse symlinks and validate ownership, mode and single-link status against the
+    directory policy. Close the descriptor if validation fails.
 
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
@@ -546,35 +533,13 @@ def open_directory_fd(
     private_final: bool,
     umask_created_dirs: bool = False,
 ) -> int:
-    """Open a directory by walking every path component relative to its parent, refusing symlinks.
+    """Open a directory through a descriptor-relative walk that refuses symlinks.
 
-    Starts from an ``O_DIRECTORY`` descriptor on ``/`` and, for each
-    component, ``lstat``s it relative to the currently-held parent
-    descriptor, opens it with ``O_NOFOLLOW`` relative to that same
-    descriptor, then compares the pre-open ``lstat`` and post-open
-    ``fstat`` device/inode to detect a symlink swapped in between
-    (TOCTOU). A component that is not a real directory — including a
-    symlink — raises, as does a component that changed identity mid-open.
-
-    A missing component is created only when ``create`` is true. By default,
-    it is forced to owner-only mode ``0700`` and validated accordingly;
-    ``umask_created_dirs=True`` instead requests mode ``0777`` and leaves the
-    resulting permissions to the process umask for non-private config paths.
-    When ``create`` is false, the underlying ``FileNotFoundError`` propagates
-    uncaught so callers can distinguish "does not exist" from "unsafe".
-    Components created this way are always
-    validated private unless ``umask_created_dirs`` is true. Pre-existing intermediate
-    components are only checked to be real directories and are **not** required
-    to be owner-only — only the final component is validated against the private
-    owner/mode policy, and only when ``private_final`` is true.
-
-    The walk runs with shutdown signals deferred (see
-    :func:`phasesweep.runtime.shutdown.defer_shutdown_signals`), so
-    ``PhaseSweepShutdown`` cannot land between the per-component descriptor
-    handoffs and strand an intermediate descriptor. A shutdown that arrives
-    mid-walk is serviced when the walk finishes: the just-opened final
-    descriptor is closed here before the shutdown propagates, so the caller
-    never owns a descriptor it does not receive.
+    Each component must remain the same real directory between stat and open.
+    Created components are private unless ``umask_created_dirs`` is set; existing
+    intermediate components need not be private. Only ``private_final`` validates
+    the final directory's private policy. Signals are deferred through descriptor
+    handoffs; the final descriptor is closed if shutdown interrupts its return.
 
     :param Path path: Directory to open, resolved lexically (not through
         the filesystem) before walking.
@@ -682,15 +647,8 @@ def _walk_directory_fd(
                 raise UnsafePrivatePathError(
                     f"Private path component {component_path} changed while it was opened."
                 )
-            # Shutdown signals are deferred for the whole walk (see
-            # ``open_directory_fd``), so ``PhaseSweepShutdown`` cannot land
-            # between these statements, which is what makes the assign-first
-            # order safe: an exception between a store and the close would
-            # strand ``previous_fd``. Closing first would instead leave
-            # ``current_fd`` naming a closed descriptor and turn a shutdown
-            # into ``OSError: [Errno 9] Bad file descriptor`` in the
-            # ``finally`` below. Assigning first also means an exception
-            # raised by ``os.close`` itself cannot double-close.
+            # Signals remain deferred through this ownership transfer. Assign first so a
+            # close failure cannot make finally close the old descriptor again.
             previous_fd = current_fd
             current_fd = next_fd
             os.close(previous_fd)
@@ -967,19 +925,11 @@ def _private_atomic_writer(
     require_private_dir: bool = True,
     strict_dir_fsync: bool = False,
 ) -> Iterator[IO[str]]:
-    """Write to a private temporary file, then atomically replace a validated destination.
+    """Stage private UTF-8 text and atomically replace a validated destination.
 
-    Opens (creating if needed) the private destination directory, creates a
-    uniquely-named owner-only temporary file inside it, and yields a handle
-    to the caller to populate. On a clean exit from the ``with`` block, the
-    handle is flushed and ``fsync``ed, the destination is validated if it
-    already exists (refusing anything but a private, unshared regular file;
-    see :func:`_validate_private_destination`), and the temporary file is
-    renamed onto ``path`` with :func:`os.replace` — atomic because both
-    names resolve relative to the same open parent directory descriptor.
-    The parent directory is then ``fsync``ed under the selected failure policy. If the caller's
-    block raises, or if any step before the rename fails, the temporary
-    file is unlinked and ``path`` is left untouched.
+    The file remains ``0600`` regardless of directory policy. Replacement is relative
+    to the validated parent descriptor; prepublication failures remove staging without
+    changing the destination. Directory fsync follows the selected failure policy.
 
     :param Path path: Destination path to replace.
     :param bool require_private_dir: Whether the destination directory must
@@ -1051,17 +1001,10 @@ def private_atomic_write_text(
 
 @contextlib.contextmanager
 def atomic_text_writer(path: Path, *, newline: str | None = None) -> Iterator[IO[str]]:
-    """Write text through a same-directory temp file and atomically replace ``path``.
+    """Write text through a same-directory stage and atomically replace ``path``.
 
-    Missing parent directories are created before the staging file is opened,
-    so callers may publish directly to a nested artifact path.
-
-    File modes follow the ``workdir`` trust boundary documented in
-    ``docs/runtime.md``: the experiment artifact tree is deliberately *not*
-    owner-only, because operators and tooling need ordinary access to winners,
-    summaries, and evidence. A fresh destination is therefore created ``0o666``
-    masked by the process umask (``0o644`` under the usual ``0o022``), and a
-    rewrite keeps whatever mode the destination already carried.
+    Create missing parent directories. New files use ``0666`` masked by umask;
+    replacements preserve the destination's mode.
 
     :param Path path: Destination path that should be replaced atomically.
     :param str | None newline: Newline handling passed to the text-mode wrapper.
@@ -1108,13 +1051,10 @@ def atomic_create_text(
     *,
     validate: Callable[[Path], object] | None = None,
 ) -> bool:
-    """Stage, optionally validate, and exclusively publish a UTF-8 text file.
+    """Stage, optionally validate, and exclusively publish UTF-8 text.
 
-    The text is written and fsynced to a hidden file beside ``path``, then
-    hard-linked into place, so ``path`` is either absent or complete. The
-    staged file is always removed. This is for workdir files with ordinary
-    permissions (``0o666`` masked by the umask), not the owner-only MCP state
-    store, and the directory fsync after the link is best-effort.
+    A hard link publishes the complete fsynced stage, which is then removed.
+    Files use ``0666`` masked by umask; directory fsync is best-effort.
 
     :param Path path: Destination that must not already exist.
     :param str text: Complete UTF-8 text to publish.
@@ -1253,18 +1193,10 @@ def file_url_path(storage: str) -> str:
 
 
 def journal_file_path(storage: str) -> Path:
-    """Resolve a ``journal:///`` storage URL to the real journal file it names.
+    """Resolve a file-backed journal URL to its canonical path.
 
-    Every journal path and identity comes from here: the file Optuna opens,
-    the journal lock beside it, the same-host storage identity, and the
-    recovery locator. Optuna's journal lock is a symlink named
-    ``<path>.lock`` whose target is ``<path>``, so the path must be real:
-    a relative target resolves against the lock's own directory and dangles,
-    and a symlinked alias of the journal names a second lock, so an append
-    through one spelling and a repair through the other never exclude each
-    other. Resolving also freezes an invocation-relative path against the
-    working directory it was given in. It is also the one place a locator
-    that names another backend is refused.
+    Freeze the working directory and resolve symlinks so storage and repair locks
+    address the same journal.
 
     :param str storage: Journal storage URL, including escaped ``file:`` forms.
     :raises ValueError: ``storage`` does not name a journal file.

@@ -45,12 +45,9 @@ def _validate_trial_path(value: str) -> str:
 
 
 def _validate_trial_file_path(value: str) -> str:
-    """Require a trial-relative path that names a descendant file location.
+    """Require a descendant-file path relative to the trial directory.
 
-    ``.`` legitimately names the whole trial directory for an
-    ``artifact_size`` directory gate, but every extractor and file-backed gate
-    requires a file below that root. Rejecting the root at config load avoids
-    deferring an impossible file open to the first trial.
+    Unlike an artifact-size directory source, a file source cannot name the root.
 
     :param str value: Candidate trial-relative file path.
     :raises ValueError: If ``value`` violates the shared path contract or
@@ -274,45 +271,19 @@ measured. ``json`` and ``log_regex`` objectives record no position, so selection
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
-    """Describe which objective-evidence identities the extractor genuinely enforces.
+    """Describe the identity checks enforced by an objective extractor.
 
-    - ``objective_name``, ``split``, ``policy`` are required
-      :class:`JsonEnvelopeExtractor` fields (``min_length=1``) and are
-      unconditionally checked against the envelope's own reported
-      ``objective.name`` / ``objective.split`` / ``evaluation.policy``. They
-      are bound whenever the extractor kind is ``json_envelope`` at all.
-    - ``checkpoint`` and ``expected_step`` are *optional* extractor fields.
-      The envelope must always structurally report a non-empty checkpoint and
-      a non-negative step (or extraction fails), but that value is compared
-      against the configured value only when the config declares one
-      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``).
-    - ``log_regex`` extractors have no objective_name/split/
-      policy/checkpoint/expected_step concept at all, so every one of those
-      flags is ``False`` for them.
-    - ``attempt_location_scoped`` is ``True`` for local extractors:
-      each reads evidence from a trial directory uniquely scoped to this
-      generation+attempt. Nothing in a ``log_regex`` file's contents identifies
-      the producing attempt, so a file misplaced or symlinked into the wrong
-      trial directory is accepted.
-    - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
-      the envelope structurally echoes ``generation_id``/``attempt_id``/
-      ``overrides_sha256`` in its own body, and
-      ``_extract_json_envelope`` cross-checks those reported values
-      against the runtime's own identity before accepting the result.
-      Other readers have no reported identity fields to check, so it is
-      ``False``.
-    - ``source_identity_keyed`` is ``True`` for W&B and MLflow: the target
-      and bound run ID identify their finished evidence. Local readers use
-      location-addressed files. W&B makes no envelope metadata assurances.
+    Local extractors are location-scoped. Only json_envelope checks the reported
+    attempt, generation, and override digest, plus the objective name, split,
+    and policy. It requires checkpoint and step metadata, but binds their values
+    only when the corresponding optional configuration fields are declared.
+    Remote extractors key evidence by target and run ID; W&B does not enforce
+    envelope metadata. Other kinds leave envelope assurance flags false.
 
-    :param ObjectiveExtractor extractor: Configured objective extractor to describe.
-    :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
-        plus per-field boolean flags describing exactly what the runtime
-        enforces. ``checkpoint_declared``/``expected_step_declared`` report
-        whether the config pinned a value; ``checkpoint_value_bound``/
-        ``expected_step_value_bound`` report whether the runtime actually
-        validates the envelope against that declared value (``True`` only
-        when the corresponding ``*_declared`` flag is also ``True``).
+    :param ObjectiveExtractor extractor: Objective extractor to describe.
+    :return dict[str, str | bool]: Extractor kind and assurance flags.
+        *_declared marks an optional configured value; *_value_bound marks its
+        enforced equality with the envelope.
     """
     if isinstance(extractor, JsonEnvelopeExtractor):
         checkpoint_declared = extractor.checkpoint is not None
@@ -372,26 +343,10 @@ class RequiredFileGate(_Frozen):
 
 
 class JsonEqualsGate(_Frozen):
-    """Require a JSON key to equal an expected JSON scalar.
+    """Require exact JSON scalar type and value equality.
 
-    ``value`` must be a JSON scalar (``bool``, ``int``, ``float``, ``str``, or
-    ``null``) and is validated strictly, because *type identity is part of this
-    gate's semantics*: :func:`phasesweep.evidence.evaluation._json_equals`
-    compares with ``type(actual) is type(gate.value)``, so ``true``, ``1``, and
-    ``1.0`` are three different gates. Coercion would silently rewrite one into
-    another, so no member of the union coerces.
-
-    Non-scalars (mappings, sequences, YAML dates) are rejected outright rather
-    than merely never matching. The study fingerprint hashes
-    ``model_dump(mode="json")`` through ``json.dumps(..., default=str)``, which
-    normalizes exactly the values that strict JSON cannot hold: ``{1: "x"}``
-    and ``{"1": "x"}`` collapse to one digest, as do ``date(2024, 1, 1)`` and
-    ``"2024-01-01"``. Since parsed JSON never yields an int-keyed mapping or a
-    ``date``, those variants could never pass while their surviving twins
-    could — two configs that judge feasibility in mutually exclusive ways would
-    share one phase fingerprint and be allowed to reuse each other's study. Rejecting them at load keeps the fingerprint
-    faithful to runtime behaviour. Non-finite floats (``.nan``, ``.inf``) are
-    rejected for the same reason: JSON has no encoding for them.
+    Booleans, integers, and floats are distinct. Non-scalars and non-finite
+    floats are rejected at config load.
     """
 
     type: Literal["json_equals"]
@@ -402,14 +357,7 @@ class JsonEqualsGate(_Frozen):
     @field_validator("value", mode="before")
     @classmethod
     def _value_is_json_scalar(cls, value: object) -> object:
-        """Reject values strict JSON cannot hold, naming the offending type.
-
-        Runs before the ``StrictJsonScalar`` union purely for the message: the
-        union alone reports one "input should be a valid <member>" error per
-        member, which never says *why* a mapping or a YAML date is wrong. The
-        union remains the authority on type identity (it is what refuses to
-        coerce ``1`` into ``1.0``); this validator only front-runs the cases a
-        config author actually hits.
+        """Reject unsupported scalar values with a diagnostic naming their type.
 
         :param object value: Raw expected value straight from the config.
         :raises ValueError: If ``value`` is not a JSON scalar, or is a

@@ -66,15 +66,10 @@ def _log_phase_header(
 
 
 def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished: int) -> None:
-    """Log one INFO line for a finished trial, the progress stream a ``tail -f`` follows.
+    """Log one finished trial's state, outcome reason, and duration.
 
-    A COMPLETE trial that is infeasible, whether by a constraint or by the
-    metric's bounds, reports ``INFEASIBLE`` in place of its Optuna state, as
-    selection treats it, and an interrupted trial reports ``INTERRUPTED``. The
-    reason is the first line of the recorded outcome cause. A repeats phase adds
-    the trial's repeat value so a reader can see which seed ran, and a rerun
-    names the interrupted trial it reran. Params stay out of the line; the
-    phase's WINNER line carries the winner's.
+    Use ``INFEASIBLE`` or ``INTERRUPTED`` where applicable. Repeat values and rerun
+    sources are included; params remain on the phase's WINNER line.
 
     :param Phase phase: The phase the trial belongs to.
     :param optuna.trial.FrozenTrial trial: The just-finished trial.

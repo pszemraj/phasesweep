@@ -62,11 +62,9 @@ class ValidatedWinner:
 
 @dataclass(frozen=True)
 class ValidatedPublication:
-    """Everything one manifest validation read, for consumers to use instead of rereading.
+    """One manifest validation's captured summary, phase plan, metric, and winner bytes.
 
-    Every published result a reader shows or resumes from comes from this
-    object, so what is consumed is exactly what was validated: no consumer
-    reopens a published artifact by path after validation returns.
+    Consumers read or resume from this capture without reopening published artifacts.
     """
 
     generation_id: str
@@ -83,13 +81,10 @@ class ValidatedPublication:
 
 
 def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
-    """Parse a summary's recorded phase plan.
+    """Parse a complete recorded phase plan with safe names and optional string comments.
 
-    Plan names become path components, so an entry that is not a mapping with a
-    safe name and an optional string comment invalidates the whole plan: a
-    partially parsed plan under-reports a publication as badly as the current
-    config does. Publication validation refuses such a plan; permissive reads
-    of an unvalidated generation fall back to the current config instead.
+    Any malformed entry invalidates the whole plan. Publication validation refuses
+    it; permissive unpublished reads fall back to the current config.
 
     :param object raw: The summary's ``phase_plan`` value.
     :return tuple[PlannedPhase, ...] | None: Recorded phases in execution
@@ -152,17 +147,10 @@ def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
 def _generation_artifact_manifest(
     experiment: Experiment, generation_id: str
 ) -> list[dict[str, str]]:
-    """List and hash every result artifact in one generation's namespace.
+    """List and hash result artifacts present in an exclusively claimed generation.
 
-    Scans the namespace itself rather than reconstructing the set from
-    in-memory bookkeeping so the manifest cannot omit an artifact the run
-    actually wrote. The namespace is exclusively claimed by this invocation, so
-    everything present is this run's own output.
-
-    The namespace-root provenance files written at claim time
-    (:func:`phasesweep.engine.provenance._write_generation_provenance`) are listed first, under entries
-    that carry ``path`` instead of ``phase``. Both are mandatory for every
-    current-format generation.
+    Scan the namespace itself. Mandatory claim-time provenance files precede the
+    phase-ordered winner entries.
 
     :param Experiment experiment: Experiment whose generation is summarized.
     :param str generation_id: Immutable generation namespace to scan.
@@ -191,15 +179,7 @@ def _generation_artifact_manifest(
 
 
 def _unreadable_artifact_permission_detail(subject: str) -> str:
-    """Build the manifest-failure detail for an artifact this user may not read.
-
-    A permission denial is not corruption, and reporting it as corruption sends
-    the operator to inspect or restore a namespace that is perfectly healthy.
-    Every generation's ``config.snapshot.yaml`` is owner-only, so a second
-    operator reading a sound tree hits exactly this case; the verdict still
-    fails closed -- an unvalidatable publication may not be reported as
-    published -- but the remedy named is the publishing user, not the restore
-    procedure.
+    """Describe an unreadable artifact by role, directing validation to its publishing user.
 
     :param str subject: Artifact that could not be read, named by role
         (e.g. ``"config_snapshot artifact"``), never by path.
@@ -220,29 +200,15 @@ def _validate_generation_manifest(
     *,
     validated: dict[str, ValidatedPublication | None] | None = None,
 ) -> ValidatedPublication:
-    """Validate one generation's complete result graph against its summary manifest.
+    """Validate a generation's complete result graph against its summary manifest.
 
-    "Published" must mean the immutable result is internally complete: every
-    artifact the summary claims exists, hashes to the recorded content,
-    parses, and cross-checks against the summary's own winner facts — and the
-    namespace holds nothing the manifest does not list. Runs both pre-commit
-    (before the last-success pointer may advance) and on every read before a
-    pointer target is trusted.
+    Run before pointer commit and on authoritative reads. Every listed artifact must
+    exist, match its hash, parse, and agree with the summary; unlisted artifacts are
+    refused. The manifest includes phase winners and both claim-time provenance files.
 
-    The manifest covers phase-scoped winners (``kind`` + ``phase``) and the
-    namespace-root provenance files frozen at claim time (``kind`` + ``path``; see
-    :func:`_validate_generation_provenance_files`). Every current-format
-    summary lists both provenance files, each of which must exist and match
-    its recorded hash.
-
-    A winner carried forward from an earlier generation additionally has that
-    generation resolved in this same tree
-    (:func:`_validate_winner_source_generation`): the cited namespace holds
-    the evidence behind the number, so a publication whose source generation
-    is absent - or which disagrees with the winner that source published - is
-    not a result this tree can stand behind. The provenance graph shares
-    ancestors, so one top-level call validates each generation it reaches at
-    most once, through ``validated``.
+    Carried winners must resolve to matching source evidence in this artifact tree.
+    Each ancestor is validated at most once per call; revisiting an active ancestor
+    refuses a provenance cycle.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
@@ -491,22 +457,12 @@ def _validate_winner_source_generation(
     permission_fail: Callable[[str], PublicationAccessError],
     validated: dict[str, ValidatedPublication | None],
 ) -> None:
-    """Validate a carried winner against its source in this tree.
+    """Validate a carried winner against its source generation in this artifact tree.
 
-    A carried winner may name an earlier generation, including a top-up or
-    ``--from-phase`` resume. Its cited generation must resolve inside this
-    artifact tree, where the evidence behind its metric lives.
-
-    A source generation with a summary must contain a validated winner record
-    for this phase. An unpublished source needs to exist: a crash after trial
-    completion can leave provenance without a summary, and a later top-up can
-    publish those trials.
-
-    A published source is validated once per top-level call and its cited
-    winner is taken from that validation, so the bytes compared are the bytes
-    its manifest hashed. A source still being validated means the provenance
-    graph loops, which fails closed. An unpublished source has no manifest, so
-    its winner file, when present, is read and parsed directly.
+    A published source supplies the winner bytes captured by its manifest validation.
+    An unpublished source may come from completed trials preceding a crash; it must
+    exist, and any winner file present is read directly. Source generations are
+    validated once per top-level call, and active ancestry cycles are refused.
 
     :param Path generation_dir: The publishing generation's namespace directory.
     :param str generation_id: The publishing generation's own id.
@@ -533,8 +489,7 @@ def _validate_winner_source_generation(
     if source_generation == generation_id:
         return
     if not SAFE_NAME_PATTERN.fullmatch(source_generation):
-        # A corrupt or hostile winner could otherwise steer the lookups below
-        # out of the generations root with a traversal component.
+        # Keep source-generation lookups within the generations root.
         raise fail(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r}, which is not a valid generation name"
@@ -681,22 +636,11 @@ def _validate_generation_provenance_files(
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
 ) -> SnapshotPhases:
-    """Validate a generation's claim-time provenance files against its manifest.
+    """Validate claim-time configuration and reproducibility files against the manifest.
 
-    Extends the manifest invariant -- every listed artifact exists and hashes
-    to its recorded content, and the namespace holds nothing the manifest does
-    not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``.
-    The two are all-or-nothing: they are written together at claim time and
-    every current-format summary must list both. A missing file or manifest
-    entry is therefore a format violation.
-
-    Note that the snapshot is owner-only, so a reader who cannot read it
-    cannot validate the publication at all -- the same fail-closed outcome as
-    any other unreadable manifest-listed artifact. A permission denial is
-    reported as its own reason rather than as "missing or unreadable"
-    (:func:`_unreadable_artifact_permission_detail`): a second operator on a
-    healthy tree hits it routinely, and the remedy is the publishing user, not
-    a namespace restore.
+    Both files are mandatory and must match their hashes and the summary's identity.
+    The reproducibility record also anchors the snapshot bytes. Permission denial
+    is reported separately from corruption.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param Mapping[str, Any] summary: Parsed generation summary payload, whose
@@ -870,16 +814,11 @@ def _read_pointer_target_summary(
     experiment_name: str,
     target: _PointerTarget,
 ) -> dict[str, Any] | None:
-    """Read a pointer target's own immutable summary and confirm its identity.
+    """Read and identify a last-success pointer's immutable summary bytes.
 
-    The per-generation lifecycle record is informational and written *after*
-    the last-success pointer commit, so requiring ``state == "complete"``/
-    ``"published"`` on it would create a crash window where a just-committed
-    publication reads back as nothing-published. This fails closed on the
-    pointer target's own immutable *summary*: its bytes must match the
-    pointer's anchors, and it must parse as a mapping naming this exact
-    experiment and generation. Callers then validate the complete artifact
-    manifest (:func:`_validate_generation_manifest`).
+    Require the pointer's byte anchors and exact experiment/generation identity.
+    The lifecycle record is written after commit and is not publication authority.
+    Callers validate the summary's complete manifest next.
 
     :param Path summary_path: Immutable generation summary YAML file to read.
     :param str experiment_name: Experiment the summary must name.

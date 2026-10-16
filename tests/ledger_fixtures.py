@@ -399,32 +399,15 @@ def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
 def forbid_file_backed_storage(
     monkeypatch: pytest.MonkeyPatch, *, allow_memory_studies: bool = False
 ) -> list[str]:
-    """Make any file-backed storage construction fail, and record every attempt.
+    """Reject and record file-backed storage construction during read-path tests.
 
-    Durability invariant 6 ("Read paths construct and write nothing"): a read
-    path never creates a study and never builds file-backed storage.
-    The tripwires cover ``RDBStorage`` (which runs
-    ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
-    (which creates the journal if absent), and ``optuna.create_study`` -- plus
-    any read-write ``sqlite3.connect``. SQLite is not a supported ledger backend.
+    Patch RDBStorage, JournalFileBackend, create_study, and read-write sqlite connections.
+    Allow load_study and JournalStorage over an in-memory snapshot. The attempts list
+    retains evidence even when a read path catches the injected exception.
 
-    ``optuna.load_study`` is deliberately *not* patched: the journal read path
-    legitimately loads a study over an in-memory ``_JournalSnapshot``, which
-    touches no file. ``JournalStorage`` itself is likewise allowed, because
-    that is the wrapper the snapshot is handed to.
-
-    The attempts are both raised *and* recorded, because several read paths
-    swallow broad exceptions to stay tolerant of a live writer; the returned
-    list survives that, so an assertion on it cannot be silenced.
-
-    A dry run renders its example command on a throwaway in-memory study, which
-    is ``optuna.create_study`` without storage. ``allow_memory_studies`` lets
-    exactly that call through and still refuses one that names storage.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to install the patches.
-    :param bool allow_memory_studies: Whether ``optuna.create_study`` may build a
-        study that has no storage.
-    :return list[str]: Attempted constructions, appended to as they happen.
+    :param pytest.MonkeyPatch monkeypatch: Fixture installing the patches.
+    :param bool allow_memory_studies: Allow create_study only when no storage is supplied.
+    :return list[str]: Construction attempts, appended as they occur.
     """
     from optuna.storages._rdb.storage import RDBStorage
     from optuna.storages.journal._file import JournalFileBackend

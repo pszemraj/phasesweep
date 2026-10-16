@@ -182,15 +182,10 @@ def compose_trainer_config(
     *,
     substitutions: dict[str, str] | None = None,
 ) -> dict[str, JsonValue]:
-    """Apply dotted PhaseSweep overrides to a complete trainer configuration.
+    """Apply dotted overrides to a deep copy of the trainer configuration.
 
-    A dotted key descends through mappings, creating missing mappings as needed.
-    The final segment replaces the base value at that exact path, including a
-    complete mapping or list. Descending through an existing non-mapping is an
-    error because there is no unambiguous YAML result.
-
-    Runtime placeholders expand recursively in base-config strings before
-    overrides apply. Override strings remain literal trainer data.
+    Create missing mappings and replace the exact leaf, including mapping or list
+    values. Expand placeholders in base strings before applying literal overrides.
 
     :param dict[str, JsonValue] trainer_config: Operator-authored base trainer config.
     :param dict[str, JsonValue] overrides: Composed inherited, fixed, and sampled values.
@@ -304,13 +299,11 @@ def compose_trainer_input(
     *,
     substitutions: dict[str, str] | None = None,
 ) -> str | dict[str, JsonValue]:
-    """Compose the selected trainer wire without writing any files.
+    """Compose trainer input without writing files.
 
-    File formats return their exact serialized text. CLI formats return the
-    flattened values, preserving their order and their renderer's validation
-    and diagnostic policy. An empty CLI base passes overrides through in their
-    original order, including tuple values supported by the CLI renderers.
-    Runtime placeholders expand in base strings before overrides apply.
+    File modes return serialized text; CLI modes return ordered flattened values.
+    An empty CLI base preserves override order and supported tuple values.
+    Placeholders expand only in base strings, before overrides apply.
 
     :param dict[str, JsonValue] trainer_config: Base trainer configuration.
     :param dict[str, JsonValue] overrides: Fully composed trial overrides.
@@ -371,14 +364,10 @@ def render_command(
     trainer_config: dict[str, Any] | None = None,
     materialized_input_path: Path | None = None,
 ) -> str:
-    """Substitute placeholders in the user's trial_command template.
+    """Render the trial command with shell-quoted path substitutions.
 
-    Path substitutions (``{trial_dir}``, ``{config_path}``, ``{overrides_path}``)
-    are shell-quoted. This function never writes a trainer input file: the
-    launch path materializes it separately and passes back its exact path via
-    ``materialized_input_path``; without one, rendering stays filesystem-pure
-    while still exercising the exact composition and serializer used at
-    launch, for dry-run previews and config validation.
+    Never write input files. A supplied ``materialized_input_path`` is reused exactly;
+    otherwise compose input for preview or validation without filesystem writes.
 
     Args:
         template: The user's ``trial_command`` template with ``{...}``

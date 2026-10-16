@@ -24,22 +24,13 @@ _HistoryRead = Literal["settled", "lagging", "retry"]
 transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-# How long an accepted objective waits for run history to catch up with its
-# summary before recording no position; the position is advisory, so waiting
-# must not hold every trial for the whole timeout. Reading history that has
-# caught up may use the rest of the read's deadline.
+# History catch-up budget; complete history reads may use the remaining deadline.
 _HISTORY_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
-# The server's silent cap on the rows of one history request, both a sampled
-# request and, until the run's history is exported, a scan page: a longer
-# answer comes back as a sample. A scan page of this many steps holds at most
-# this many rows, so it is never sampled.
+# Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
 
 
-# Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
-# explicitly), which a frozen dataclass refuses with FrozenInstanceError.
-# eq=False keeps the identity equality and hashing every exception has.
 @dataclass(eq=False)
 class WandbPollTimeout(TimeoutError):
     """The complete worker exhausted its summary visibility budget."""
@@ -142,8 +133,7 @@ def _is_retryable_setup_error(exc: Exception) -> bool:
             (ConnectionError, TimeoutError, request_errors.ConnectionError, request_errors.Timeout),
         ):
             return True
-        # The supported SDK can suppress the original sidecar transport cause.
-        # Inspect its response protocol rather than importing its private class.
+        # SDK transport wrappers may expose status without preserving the cause.
         if (
             type(error).__module__.startswith("wandb.")
             and hasattr(error, "response")
@@ -244,9 +234,7 @@ def poll_wandb_summary(
         raise ImportError(
             "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
         )
-    # The worker writes a summary response whole, and only before the
-    # deadline, so one that exists was captured in time even if the worker
-    # was stopped while exiting.
+    # A complete response was captured before the deadline, even if worker exit timed out.
     if response.get("status") != "summary":
         if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
             detail = response.get("cause")
@@ -281,12 +269,9 @@ def locate_wandb_position(
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
 ) -> int | float | None:
-    """Locate where on ``axis`` an accepted objective was logged in run history.
+    """Read an accepted objective's advisory history position on the requested axis.
 
-    Callers run this only once the trial's result is accepted: the position
-    is advisory, so reading it must never cost the trial its objective or
-    the budget its acceptance needs. Every failure, and a worker stopped at
-    the deadline, means "no position".
+    Read failures and deadlines return no position without discarding the objective.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
@@ -345,36 +330,17 @@ def _history_position(
     value: float,
     deadline: float,
 ) -> tuple[_HistoryRead, int | float | None]:
-    """Locate how far along ``axis`` a finished run's objective was measured.
+    """Locate an accepted objective's advisory evaluation position in complete history.
 
-    A plain summary key holds its series' last logged value: the latest
-    history row with that value is where the objective was measured, and a
-    value assigned straight to the summary normally has no matching position.
-    When no exact match exists, a single finite neighboring binary64 value
-    may identify the final metric row. This accommodates observed API rounding
-    but cannot distinguish it from a separately assigned neighboring summary.
-    Ambiguous neighbors, older-only neighbors, and malformed final rows do
-    not supply this advisory position; the captured scalar stays unchanged.
-    The server names an aggregate by its series and aggregation
-    (``eval/loss.min`` summarizes the ``eval/loss`` series), so a recognized
-    aggregation suffix absent from the history index is looked up as its
-    ``head`` series. Other summary-only keys have no position. An aggregate
-    is measured over the whole series, so its position is where the
-    series ends: how far the trial trained, not where its best value fell,
-    which differs between comparable trials by nature.
+    A plain key uses its latest exact-value match. Without one, a single adjacent
+    binary64 value qualifies only when it matches a valid final row. Ambiguous
+    neighbors or a malformed final row disqualify this fallback. Recognized
+    aggregate suffixes use the underlying series' final position.
 
-    The run's history index says how far history reaches and how many rows
-    logged each key, but for a while after a run finishes a read can return
-    part of a series without error: only its newest rows, or a sample. History
-    is ``lagging`` until the index reaches the summary's own ``_step`` and a
-    read returns every row the index counts for the series. The position is
-    advisory evidence, so a failed history read never fails anything: a
-    transient transport failure or a read still running at ``deadline`` is
-    worth a ``retry``, and any other failure is ``settled`` as "no position".
-    A ``define_metric`` step metric the trainer logs in a separate ``log()``
-    call is filled from its previous value, and an axis missing from some of
-    the series' rows keeps the read short of the count, so the axis must be
-    logged with the metric.
+    History is lagging until its index reaches the summary step and all counted
+    series rows are read. The axis must be logged alongside the metric. Transient
+    read failures and deadline expiry request retry; other failures settle with
+    no position. The captured objective is never changed.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -406,10 +372,7 @@ def _history_position(
         else:
             return "settled", None
         count = sum(entry["count"] for entry in logged_keys[series]["typeCounts"])
-        # A series under the cap, such as any evaluation series, comes back from
-        # one sampled request however long the run; a longer one is scanned in
-        # pages of the cap's size in steps, too few rows for the server to
-        # sample even before export.
+        # Below-cap requests return the complete series; longer series require scan pages.
         keys = [series, axis]
         if count < _HISTORY_SAMPLES:
             rows = run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False)
@@ -552,11 +515,10 @@ def _locate_wandb_position(
     value: float,
     deadline: float,
 ) -> int | float | None:
-    """Read where a finished run's objective was logged, within the parent's deadline.
+    """Read a finished run's objective position within the parent's deadline.
 
-    History gets at most ``_HISTORY_SETTLE_SECONDS`` to reach the summary's
-    last step; reading it, and retrying a transient failure, may use the rest
-    of the deadline. Any other failure means "no position".
+    History has _HISTORY_SETTLE_SECONDS to catch up; reads and transient retries
+    may use the rest of the deadline. Other failures return no position.
 
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.

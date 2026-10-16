@@ -1,12 +1,7 @@
-"""Error types for the MCP layer.
+"""MCP errors for agents and operators.
 
-Two audiences, two trees:
-
-* ``McpToolError`` and subclasses are returned to the (untrusted) agent. Their
-  messages use only the experiment id and kind of failure - never a path,
-  command, environment value, or storage URL.
-* ``CatalogError`` is raised at startup to the operator who launched the server
-  and may reference paths.
+``McpToolError`` messages exclude paths, commands, environment values and storage URLs.
+Startup ``CatalogError`` messages are operator-facing and may include paths.
 """
 
 from __future__ import annotations
@@ -224,13 +219,7 @@ class RunCapacityUnknownError(McpToolError):
 
 
 class LaunchInProgressError(McpToolError):
-    """Raised when another launch holds the launch lock. Transient; retry.
-
-    The launch decision (count live runs against the cap, then spawn) is
-    serialized so the cap can't be exceeded by a check-then-spawn race. When a
-    concurrent launch holds that lock, this asks the caller to retry rather than
-    silently proceeding past the cap.
-    """
+    """Raised when another launch holds the shared launch lock; retry the request."""
 
     def __init__(self) -> None:
         """Create a transient launch-in-progress tool error."""

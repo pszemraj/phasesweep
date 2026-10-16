@@ -1,32 +1,9 @@
-"""Static contract pinning every storage constructor to one ledger module.
+"""Enforce ledger-only Optuna storage construction through static source checks.
 
-The durability invariants say read paths must never create studies or build
-file-backed storage, and that validation happens before any bind/claim/open.
-Those rules only hold if there is exactly *one* module that may talk to
-Optuna's storage constructors, so every other module has to go through helpers
-that validate first. This module enforces that statically with :mod:`ast`, so a
-new call site fails in CI before it can ever run.
-
-Most storage entry points are banned by name (:data:`BANNED_LEAVES`): calling,
-referencing, or importing one all count. ``optuna.Study`` and
-``sqlite3.Connection`` are banned only as calls (:data:`BANNED_CALLS`), because
-the same classes annotate study and connection objects.
-
-The chokepoint is ``phasesweep/engine/ledger.py``. Its private names are read
-from its own source, so a helper is private as soon as it is defined. The two
-exception maps (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) are empty
-and compared for exact equality. Every external storage constructor or
-storage-private helper access is rejected; callers use the public ledger
-handle API.
-
-Optuna's journal is PhaseSweep's only durable backend, so SQLite and generic
-SQLAlchemy-RDB constructors (:data:`BANNED_EVERYWHERE`) are refused even inside
-the chokepoint itself; only the journal/Optuna entry points in
-:data:`BANNED_LEAVES`/:data:`BANNED_CALLS` are allowed there.
-
-Each detector also runs over synthetic source that must trip it, so a detector
-that stops finding anything fails here instead of passing every real module.
-
+Ban storage entry points and private ledger access outside engine.ledger. Study and
+connection classes remain usable as annotations. SQLite and SQLAlchemy constructors
+are banned throughout the package. Exception maps must remain empty; synthetic
+source cases exercise each detector.
 """
 
 from __future__ import annotations

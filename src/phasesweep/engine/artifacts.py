@@ -65,15 +65,9 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
 
 
 def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
-    """Create a YAML document at ``path`` exactly once, never overwriting it.
+    """Create one complete YAML document without replacing an existing destination.
 
-    Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
-    pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records: a second call for an already-written
-    path can never clobber the first write, even a same-content rewrite.
-    Delegates to :func:`atomic_create_text`, so ``path`` is staged and fsynced
-    beside itself and only hard-linked into place once complete -- no reader
-    can ever observe a partial write.
+    Use :func:`atomic_create_text` for staged, fsynced publication of immutable records.
 
     :param Path path: Destination path to create; the parent directory is
         created if missing.
@@ -182,17 +176,9 @@ def _save_winner(
 ) -> None:
     """Persist a phase winner into its immutable generation namespace.
 
-    The phase fingerprint is included so ``_load_winner`` can refuse stale
-    winners on ``--from-phase`` resume. Real winners always carry a
-    fingerprint by construction in ``_run_phase``; placeholder winners
-    (dry-run skip) are never saved.
-
-    ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
-    produced the winning trial. Neither ever carries ambient variable values. ``confound`` records the advisory
-    verdicts on the population the source selection ranked, ``observed`` the
-    report-only values the winning trial recorded, and ``repeats`` the winning
-    repeat group; like the provenance fields they are winner-only and never
-    enter ``summary.yaml``.
+    Real winners carry a phase fingerprint for resume validation; dry-run placeholders
+    are never saved. Environment identity excludes ambient values. Confound verdicts,
+    observations, repeats, and evidence provenance remain winner-only fields.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -249,14 +235,10 @@ def _warn_environment_drift(
     phase_name: str,
     stored_digest: str,
 ) -> None:
-    """Warn once when a reused winner was produced under another environment.
+    """Warn once when result reuse crosses semantic environment cohorts.
 
-    Persistent-study preflight refuses to allocate a trial across semantic
-    environment cohorts, but two paths reuse a recorded result without
-    allocating: ``--from-phase`` loads a skipped phase's published winner, and
-    a replay re-selects from a study with no remaining trial slots. This
-    warning tells the operator that the result being built on came from
-    another cohort.
+    Skipped-phase loading and no-work replay reuse results without allocating trials;
+    ordinary top-ups refuse cohort drift before allocation.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
@@ -290,26 +272,12 @@ def _load_winner(
     *,
     publication: ValidatedPublication | None,
 ) -> Winner:
-    """Load a published phase winner and verify it matches the *current* config.
+    """Load validated winner bytes and check reuse against the current config.
 
-    ``--from-phase`` skips earlier phases by reading their persisted winners.
-    Without verification, editing a parent phase's YAML between runs leaves
-    the child phase silently inheriting the *old* winner against the *new*
-    parent config — a correctness bug, not just a performance one.
-
-    We re-compute the fingerprint of the current parent ``phase`` against the
-    currently-resolved ``inherited_winners`` and refuse the load if the
-    fingerprints disagree.
-
-    A recorded semantic environment digest that disagrees with this process is
-    a warning on this explicit skipped-phase path; ordinary study top-ups are
-    refused before allocation (see :func:`_warn_environment_drift`).
-
-    The winner is decoded from the bytes publication validation read, never
-    reread from disk, so what a resume builds on is exactly what was
-    validated. That validation already proved the winner's phase, generation
-    and attempt ids, fingerprint format, source, and completion shape; this
-    function checks only what depends on the current config.
+    Recompute the phase fingerprint with the current inherited overrides. A skipped
+    winner's recorded environment drift warns; ordinary top-ups refuse that drift.
+    Publication validation already checked persisted identities and structure, so
+    this function checks only current-config-dependent requirements.
 
     Args:
         experiment: Parsed experiment config.
