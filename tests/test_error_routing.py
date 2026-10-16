@@ -206,7 +206,7 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
     "study schema": "unsupported phasesweep storage schema",
     "trial target": "has trial state but no",
-    "environment cohort": "new experiment name",
+    "environment cohort": "without a semantic trainer-environment identity",
     "phase fingerprint": "has no semantic fingerprint",
 }
 
@@ -892,7 +892,7 @@ WRAP_CASES = (
         trigger=_recover_through_retargeted_workdir,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original workdir, or use a fresh artifact root",
+        message="publishes into artifact root",
     ),
     RoutingCase(
         id="journal_garbage",
@@ -1414,14 +1414,14 @@ ORIGIN_CASES = (
         trigger=_preflight_registered_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger with its durable attempt and generation",
+        message="attempt or generation identity is missing",
     ),
     RoutingCase(
         id="uncertain_trial_attempt_missing",
         trigger=_inspect_uncertain(TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown. Restore the original storage ledger",
+        message="Process identity is unknown.",
     ),
     RoutingCase(
         # Either the ledger or the tree may be the side that changed, so the
@@ -1488,14 +1488,14 @@ ORIGIN_CASES = (
         trigger=_reap_trial_with_invalid_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger before retrying recovery.",
+        message="invalid persisted 'phasesweep_trial_dir'",
     ),
     RoutingCase(
         id="running_trial_attempt_missing",
         trigger=_reap_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown. Restore the original storage ledger",
+        message="Process identity is unknown.",
     ),
     RoutingCase(
         # The same split as uncertain_trial_identity_files_mismatch.
@@ -1510,7 +1510,7 @@ ORIGIN_CASES = (
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger before retrying recovery.",
+        message="missing or invalid 'phasesweep_trial_dir'",
     ),
     RoutingCase(
         id="recover_during_launch",
@@ -1619,14 +1619,14 @@ ORIGIN_CASES = (
         trigger=_claim_from_moved_workdir,
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
-        message="Restore the original workdir, or use a fresh artifact root",
+        message="publishes into artifact root",
     ),
     RoutingCase(
         id="tree_bound_to_another_ledger",
         trigger=_validate_tree_bound_to_another_ledger,
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
-        message="Use the config that owns this current-format tree",
+        message="bound to a different storage ledger or experiment",
     ),
     RoutingCase(
         id="ledger_directory_path_unusable",

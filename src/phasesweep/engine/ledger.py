@@ -1,19 +1,15 @@
 """Optuna storage construction, read-only snapshots, and ledger claims.
 
-This module owns all storage construction; journal files are the only durable backend.
-Mutating callers hold the experiment lock before validation or recovery. Read-only
-status, winner, preview, and recovery inspection use captured journal snapshots.
+This module owns storage construction; journals are the only durable backend.
+Mutations require the experiment lock. Reads and previews use captured snapshots.
+``validate_ledger`` checks tree ownership before scanning; a bound tree's unreadable
+scan may still serve its frozen publication. ``claim_ledger`` requires a complete
+scan, repairs a partial final record and validates existing studies before writing.
+It then creates the ledger directory, binds the tree and claims empty studies, in
+that order. Execution requires a ClaimedLedger.
 
-:func:`validate_ledger` checks tree ownership before scanning the ledger format.
-A bound tree may retain an unreadable-scan verdict so its frozen publication stays
-readable. :func:`claim_ledger` requires a complete scan, repairs a partial final
-journal record, and checks every existing phase study before writing anything.
-It then creates the ledger directory, binds the tree, and claims empty studies,
-in that order. Trial execution requires the resulting :class:`ClaimedLedger`.
-
-MCP recovery may open existing live studies on a :class:`ValidatedLedger`, but
-checks each study's artifact-root ownership before reaping. Registry recovery
-uses :func:`open_registry_study` to validate a separately recorded ledger.
+MCP recovery may open live studies from a ValidatedLedger, checking their artifact
+ownership before reaping. Registry recovery validates its separately recorded ledger.
 """
 
 from __future__ import annotations
@@ -300,10 +296,8 @@ def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
     :param Path path: Journal file to scan.
     :return tuple[bytes, int] | None: The captured bytes and the offset just
         past their last complete record, or ``None`` when no journal exists.
-    :raises StudyStorageUnavailableError: The journal could not be read, or a
-        malformed record is followed by another. An interrupted append damages
-        only the final record, so that is corruption, and nothing repairs it
-        automatically.
+    :raises StudyStorageUnavailableError: The journal is unreadable or corrupt
+        before its final record; only an incomplete final append is repairable.
     """
     try:
         data = _capture_journal(path)
@@ -319,10 +313,8 @@ def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
     except ValueError as exc:
         raise StudyStorageUnavailableError(
             f"Journal storage {path} holds a malformed record that other records follow. "
-            "An interrupted append damages only the final record, so this is corruption "
-            "and is never repaired automatically: restore the journal from a backup, "
-            f"including any `{path.name}.*.bak` copy a repair left beside it, or recover "
-            "it by hand. Nothing was written."
+            f"Repair backups, if present, are beside it as `{path.name}.*.bak`. "
+            "Nothing was written."
         ) from exc
     return data, end
 
@@ -371,7 +363,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
                 raise IncompleteJournalRecordError(
                     f"Journal storage {path}: another process removed or replaced its journal "
                     "lock during the repair, so its incomplete final record was not truncated. "
-                    f"The journal as it was is saved at {backup}. Retry to check it again. "
+                    f"The journal as it was is saved at {backup}. "
                     "Nothing was appended.",
                     action=OperatorAction.RETRY,
                 )
@@ -379,7 +371,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
                 raise IncompleteJournalRecordError(
                     f"Journal storage {path} changed while its journal lock was held for "
                     "repair, so it was not truncated. The journal as it was is saved at "
-                    f"{backup}. Retry to check it again. Nothing was appended.",
+                    f"{backup}. Nothing was appended.",
                     action=OperatorAction.RETRY,
                 )
             journal.truncate(end)
@@ -387,8 +379,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     except OSError as exc:
         raise IncompleteJournalRecordError(
             f"Journal storage {path} ends with an incomplete record that could not be "
-            f"repaired: {exc}. Restore write access to the journal and its directory, "
-            "then retry. Nothing was appended."
+            f"repaired: {exc}. Nothing was appended."
         ) from exc
     try:
         repaired = _capture_journal(path)
@@ -401,8 +392,7 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Journal storage {path} does not replay after its incomplete final record was "
-            f"removed. The journal as it was is saved at {backup}. Restore the journal "
-            "from a backup or recover it by hand. Nothing was appended."
+            f"removed. The journal as it was is saved at {backup}. Nothing was appended."
         ) from exc
     return backup, len(data) - end
 
@@ -471,7 +461,7 @@ class _JournalLock:
                             f"Journal storage {self.path} ends with an incomplete record, and "
                             f"its journal lock {self.lock_file} was still held after "
                             f"{_JOURNAL_LOCK_WAIT_SECONDS:g} seconds, so the record was not "
-                            "repaired. A writer killed mid-append leaves both behind. If no "
+                            "repaired. If no "
                             f"process is writing to this journal, remove {self.lock_file}, then "
                             "retry. Nothing was written."
                         ) from None
@@ -485,8 +475,7 @@ class _JournalLock:
             if isinstance(exc, OSError):
                 raise IncompleteJournalRecordError(
                     f"Journal storage {self.path} ends with an incomplete record that could not "
-                    f"be repaired: its journal lock could not be taken: {exc}. Restore write "
-                    "access to the journal and its directory, then retry. Nothing was written."
+                    f"be repaired: its journal lock could not be taken: {exc}. Nothing was written."
                 ) from exc
             raise
 

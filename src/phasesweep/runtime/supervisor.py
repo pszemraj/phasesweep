@@ -1,10 +1,8 @@
 """Block a trial command until the orchestrator commits its process identity.
 
-This stdlib-only script runs directly under ``python -I -S`` with a minimal
-pre-ACK environment. It must not import PhaseSweep or trainer code. The blocked
-child becomes the trainer group leader; the guardian stays outside that group
-and retains GPU leases until cleanup. Imports remain limited to ``contextlib``,
-``os``, ``sys``, ``json``, ``signal`` and ``time``.
+Run directly under ``python -I -S`` with a minimal pre-ACK environment and stdlib
+imports only. The blocked child becomes the trainer group leader; the guardian
+stays outside that group and retains GPU leases until cleanup.
 """
 
 from __future__ import annotations

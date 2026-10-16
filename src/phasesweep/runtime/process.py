@@ -679,54 +679,37 @@ def run_supervised(
 ) -> ProcessResult:
     """Launch a shell command in its own process group with durable ownership.
 
-    The trainer receives its command and environment only after its identity is
-    persisted. EOF before that payload prevents execution. The identity is retained;
-    ``exited`` requires confirmed cleanup. A successful root that leaves descendants
-    is a lifecycle failure, and those descendants are terminated.
+    Persist identity before delivering the trainer payload; earlier EOF prevents execution.
+    Identity files remain; ``exited`` requires confirmed cleanup. Surviving descendants cause
+    failure and termination even if their root succeeded. The guardian holds GPU leases
+    until the entire group is gone, independently of the trainer's file descriptors.
 
-    The earlier of ``timeout`` and ``wallclock_deadline`` covers launch and execution,
-    including readiness, identity persistence and payload delivery. Cleanup is outside
-    that budget. Expected post-spawn deadline, identity-write and payload failures
-    return a :class:`ProcessResult` after cleanup.
+    The earlier timeout or absolute deadline covers launch and execution; cleanup is
+    outside that budget. Expected post-spawn deadline, identity-write and payload failures
+    return a ProcessResult after cleanup.
 
     Args:
-        cmd: Shell command string the acknowledged supervisor runs with ``/bin/sh``.
-        env: Full process environment for the subprocess.
-        stdout: Already-open file handle that receives the subprocess stdout.
-        stderr: Already-open file handle that receives the subprocess stderr.
-        timeout: Total wall-clock budget in seconds measured from this call's
-            entry (launch overhead included), or ``None`` for no timeout.
-        trial_dir: Per-trial directory where ``process_identity.json`` is written.
-        attempt_id: Immutable attempt identity already persisted in Optuna.
-        wallclock_deadline: Optional absolute ``time.monotonic()`` phase/run
-            deadline. Work before this call has already consumed it.
-        cwd: Optional working directory the supervisor changes into before
-            exec'ing the trainer, delivered over the ack pipe with the rest
-            of the launch payload. ``None`` keeps the invocation cwd.
-        gpu_lease_fds: Open host GPU-lock descriptors inherited by the trusted
-            supervisor guardian, not its trainer child. The orchestrator
-            closes only its copies; the guardian retains each lock until the
-            entire trainer process group is gone even if trainer code closes
-            every unknown descriptor or its root shell exits before a worker.
+        cmd: Shell command run with ``/bin/sh``.
+        env: Full trainer environment.
+        stdout: Open stdout destination.
+        stderr: Open stderr destination.
+        timeout: Seconds from call entry, or ``None`` for no relative deadline.
+        trial_dir: Directory for ``process_identity.json`` and lifecycle records.
+        attempt_id: Attempt identity already persisted in Optuna.
+        wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
+        cwd: Trainer working directory; ``None`` retains invocation cwd.
+        gpu_lease_fds: GPU-lock descriptors inherited by the guardian alone.
 
     Returns:
-        :class:`ProcessResult` capturing return code, wall-clock duration,
-        timeout flag, ``failure_reason`` (set on timeout or descendant
-        survival), and ``cleanup_confirmed`` (``False`` when SIGKILL did not
-        confirm the group is gone).
+        ProcessResult with return code, elapsed time, timeout attribution, failure reason
+        and cleanup confirmation.
 
     Raises:
-        PhaseSweepError: This process's PID namespace is unreadable, so nothing
-            was recorded or launched.
-        ShutdownLaunchRefusedError: A shutdown signal is being serviced, so
-            no process was started and the attempt is recorded as exited.
-        RuntimeError: The supervisor never signalled readiness, or signalled an
-            unexpected byte, so no process group was ever created.
-        OSError: The supervisor process or its pipes could not be created, or
-            an unexpected post-launch I/O failure occurred after its process
-            group was cleaned and reaped.
-        UnsafeProcessCleanupError: An unexpected failure after launch occurred
-            and cleanup of the trainer process group could not be confirmed.
+        PhaseSweepError: PID namespace is unreadable; nothing is recorded or launched.
+        ShutdownLaunchRefusedError: Shutdown blocks launch; the attempt is recorded exited.
+        RuntimeError: Supervisor readiness failed before creating a process group.
+        OSError: Spawn/pipe creation failed, or unexpected I/O failed after confirmed cleanup.
+        UnsafeProcessCleanupError: Unexpected post-launch failure with uncertain cleanup.
 
     """
     import time
@@ -790,16 +773,12 @@ def run_supervised(
             )
             _write_process_identity(identity_path, identity)
             if deadline is not None and time.monotonic() >= deadline:
-                # The budget expired during launch bookkeeping. The payload
-                # has NOT been delivered, so the blocked supervisor can be
-                # aborted without any trainer work ever starting.
+                # No payload was delivered; abort the blocked supervisor before execution.
                 raise _LaunchDeadlineExpired(
                     "trial launch deadline expired before the trainer payload was delivered",
                     pid=pgid,
                 )
-            # Only now does the trainer command and full trainer environment
-            # cross into the supervisor — after identity is durable, over the
-            # ack pipe as a framed JSON payload.
+            # Deliver the trainer payload only after _write_process_identity commits.
             _write_all(
                 ack_write,
                 _encode_launch_payload(cmd, env, cwd),

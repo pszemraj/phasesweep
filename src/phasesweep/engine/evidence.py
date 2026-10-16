@@ -53,8 +53,6 @@ from phasesweep.runtime.process import (
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
 
-_TRIAL_EVIDENCE_REMEDY = "Restore the artifact tree from a backup, or start a new experiment name."
-
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced.
@@ -97,8 +95,7 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, An
     """
     if OBJECTIVE_PROVENANCE_ATTR not in trial.user_attrs:
         raise TrialEvidenceMissingError(
-            f"Trial {trial.number} has no {OBJECTIVE_PROVENANCE_ATTR!r} evidence. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"Trial {trial.number} has no {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
         )
     raw = trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR]
     if not isinstance(raw, str) or not raw:
@@ -133,8 +130,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         :raises TrialEvidenceMissingError: Always, naming ``subject`` and ``reason``.
         """
         raise TrialEvidenceMissingError(
-            f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence "
-            f"({reason}). {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence ({reason})."
         )
 
     if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
@@ -287,9 +283,7 @@ def _verify_objective_source_evidence(
         its file source is missing, unreadable, or no longer the recorded bytes.
     """
     if provenance is None:
-        raise TrialEvidenceMissingError(
-            f"{subject} has no objective provenance record. {_TRIAL_EVIDENCE_REMEDY}"
-        )
+        raise TrialEvidenceMissingError(f"{subject} has no objective provenance record.")
     _validate_objective_provenance(provenance, subject=subject)
     source = provenance["source"]
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
@@ -303,14 +297,13 @@ def _verify_objective_source_evidence(
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, which is missing or "
-            f"unreadable at {str(source_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"unreadable at {str(source_path)!r}."
         ) from exc
     recorded_size = int(source["size_bytes"])
     if stat_result.st_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} as "
-            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes."
         )
     if not verify_digest:
         return
@@ -320,13 +313,13 @@ def _verify_objective_source_evidence(
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, which could not be "
-            f"read back for verification at {str(source_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"read back for verification at {str(source_path)!r}."
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} with sha256 "
             f"{recorded_digest}, but that file now hashes to {actual_digest}: the bytes behind "
-            f"the published metric have changed. {_TRIAL_EVIDENCE_REMEDY}"
+            f"the published metric have changed."
         )
 
 
@@ -349,7 +342,7 @@ def _verify_trainer_input_evidence(
     if not isinstance(record, Mapping):
         raise TrialEvidenceMissingError(
             f"{subject} has no valid {TRAINER_INPUT_ATTR!r} record, so its historical "
-            f"trainer input cannot be verified. {_TRIAL_EVIDENCE_REMEDY}"
+            f"trainer input cannot be verified."
         )
     input_format = record.get("format")
     filename = record.get("filename")
@@ -363,8 +356,7 @@ def _verify_trainer_input_evidence(
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has a malformed or unsupported {TRAINER_INPUT_ATTR!r} record "
-            f"{dict(record)!r}, so its historical trainer input cannot be located safely. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"{dict(record)!r}, so its historical trainer input cannot be located safely."
         )
     recorded_size = record.get("size_bytes")
     recorded_digest = record.get("sha256")
@@ -376,39 +368,38 @@ def _verify_trainer_input_evidence(
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has an invalid size or content identity in its "
-            f"{TRAINER_INPUT_ATTR!r} record. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{TRAINER_INPUT_ATTR!r} record."
         )
 
     input_path = trial_dir / filename
     if not input_path.is_file():
         raise TrialEvidenceMissingError(
             f"{subject} is missing its recorded trainer input {filename!r} under "
-            f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{str(trial_dir)!r}."
         )
     try:
         actual_size = input_path.stat().st_size
     except OSError as exc:
         raise TrialEvidenceMissingError(
-            f"{subject} cannot read its recorded trainer input {filename!r} at "
-            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} cannot read its recorded trainer input {filename!r} at {str(input_path)!r}."
         ) from exc
     if actual_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} as {recorded_size} bytes, but "
-            f"that file is now {actual_size} bytes. {_TRIAL_EVIDENCE_REMEDY}"
+            f"that file is now {actual_size} bytes."
         )
     try:
         actual_digest = file_sha256(input_path)
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} cannot content-verify its recorded trainer input {filename!r} at "
-            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{str(input_path)!r}."
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} with sha256 {recorded_digest}, "
             f"but that file now hashes to {actual_digest}: the exact trainer input bytes "
-            f"have changed. {_TRIAL_EVIDENCE_REMEDY}"
+            f"have changed."
         )
 
 
@@ -461,24 +452,21 @@ def _verify_trial_evidence_dir(
     """
     if not trial_dir.is_dir():
         raise TrialEvidenceMissingError(
-            f"{subject} has no evidence directory at {str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} has no evidence directory at {str(trial_dir)!r}."
         )
     try:
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
     except ValueError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} has an attempt lifecycle record that is malformed or belongs to "
-            f"another attempt ({exc}). {_TRIAL_EVIDENCE_REMEDY}"
+            f"another attempt ({exc})."
         ) from exc
     if lifecycle is None:
-        raise TrialEvidenceMissingError(
-            f"{subject} has no attempt lifecycle record. {_TRIAL_EVIDENCE_REMEDY}"
-        )
+        raise TrialEvidenceMissingError(f"{subject} has no attempt lifecycle record.")
     for filename in _REQUIRED_TRIAL_EVIDENCE_FILES:
         if not (trial_dir / filename).is_file():
             raise TrialEvidenceMissingError(
-                f"{subject} is missing its {filename!r} audit artifact under "
-                f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+                f"{subject} is missing its {filename!r} audit artifact under {str(trial_dir)!r}."
             )
     _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
@@ -495,8 +483,7 @@ def _verify_trial_evidence_dir(
         raise TrialEvidenceMissingError(
             f"{subject} objective evidence no longer matches its configured extractor "
             "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            "changed after this trial ran, or the saved provenance was altered."
         )
     capture = provenance.get("remote_capture")
     if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
@@ -628,7 +615,7 @@ def _validate_selection_evidence(
             if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
                 raise TrialEvidenceMissingError(
                     f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
-                    f"{stored!r}, so its evidence cannot be located. {_TRIAL_EVIDENCE_REMEDY}"
+                    f"{stored!r}, so its evidence cannot be located."
                 )
             # Identity binding: the persisted directory name must be exactly the
             # one _trial_dir_for builds for this trial's number, generation, and
@@ -645,7 +632,7 @@ def _validate_selection_evidence(
                 raise TrialEvidenceMissingError(
                     f"{subject} records evidence directory {Path(stored).name!r}, which does "
                     f"not name this trial's own generation/attempt identity (expected "
-                    f"{expected_name!r}). {_TRIAL_EVIDENCE_REMEDY}"
+                    f"{expected_name!r})."
                 )
             _verify_trial_evidence_dir(
                 phase_dir / expected_name,

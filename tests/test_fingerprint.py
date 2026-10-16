@@ -712,7 +712,9 @@ def test_populated_study_without_environment_identity_fails_closed(
     assert experiment.storage is not None
     _drop_trial_user_attr_records(experiment.storage, TRAINER_ENV_DIGEST_ATTR)
 
-    with pytest.raises(StudySchemaMismatchError, match="cannot guess.*environment cohort"):
+    with pytest.raises(
+        StudySchemaMismatchError, match="without a semantic trainer-environment identity"
+    ):
         run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
@@ -955,7 +957,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     message = str(excinfo.value)
     assert str(bound_root) in message
     assert str(_experiment_dir(moved)) in message
-    assert "fresh artifact root and local storage" in message
+    assert excinfo.value.action == OperatorAction.FIX_CONFIG
     assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))

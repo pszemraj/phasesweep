@@ -284,29 +284,21 @@ def _publish_generation(
 ) -> None:
     """Commit a generation as the experiment's last successful publication.
 
-    Validate the immutable summary and manifest, record any missing prior publication
-    record, and durably prepare the detached-runner hook before atomically writing
-    ``last_successful_generation.yaml``. That pointer write is the commit: earlier
-    failures preserve the prior pointer, record ``publication_failed`` best-effort,
-    and reraise the original error.
+    Validate immutable artifacts, save any missing prior publication record and prepare
+    the runner hook before atomically replacing ``last_successful_generation.yaml``.
+    This write commits publication; earlier failures retain the old pointer and record
+    ``publication_failed`` best-effort. Later sidecar, lifecycle, pointer and projection
+    updates are best-effort with logged failures; readers use immutable artifacts.
 
-    After commit, sidecar notification, lifecycle recording, and current-pointer /
-    convenience-projection refresh run best-effort with logged failures. Readers
-    use immutable generation artifacts.
-
-    Shutdown signals are absorbed during publication. A shutdown before this window
-    cancels without publication; one received inside is deferred until durable
-    classification, then honored at the next launch or runner-terminal checkpoint
-    before further work starts.
+    Shutdown before this window cancels publication. Signals absorbed inside it are
+    serviced after durable classification, at the next launch or runner checkpoint.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.
     :param str | None from_phase: Resume point recorded on the lifecycle state.
-    :param Mapping[str, Winner] winners: Engine-selected winners to hand to a
-        required publication sidecar.
+    :param Mapping[str, Winner] winners: Engine-selected winners for the publication sidecar.
     :param PublicationHook | None publication_hook: Optional detached-run sidecar.
-    :raises Exception: A pre-commit publication step failed, after best-effort
-        ``publication_failed`` bookkeeping.
+    :raises Exception: Pre-commit failure, after best-effort failure bookkeeping.
     """
     with absorb_shutdown_signals() as absorbed:
         try:

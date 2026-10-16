@@ -123,8 +123,7 @@ def _load_accepted_partial_decision(
         return None
     if not isinstance(raw, dict):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}. "
-            "Use a new experiment name, or archive/delete the inconsistent study."
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}."
         )
     trial_target = raw.get("trial_target")
     outcome_sequence = raw.get("outcome_sequence")
@@ -156,8 +155,7 @@ def _load_accepted_partial_decision(
         )
     ):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: "
-            f"{raw!r}. Use a new experiment name, or archive/delete the inconsistent study."
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: {raw!r}."
         )
     return _AcceptedPartialDecision(
         trial_target=trial_target,
@@ -174,14 +172,10 @@ def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaM
     :param optuna.Study study: Study whose durable state is inconsistent,
         used to name the study in the message.
     :param str detail: Specific description of the malformed state.
-    :return StudySchemaMismatchError: Constructed error for the caller to
-        raise, instructing them to use a new experiment name or
-        archive/delete the inconsistent study.
+    :return StudySchemaMismatchError: Diagnostic carrying the study's remediation action.
     """
     return StudySchemaMismatchError(
-        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}. "
-        "Use a new experiment name, or archive/delete the inconsistent study before "
-        "running again."
+        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}."
     )
 
 
@@ -385,11 +379,8 @@ def _validate_study_direction(
 def _accepted_trial_target(study: optuna.Study) -> int:
     """Return the durable target for a current-format study.
 
-    A recovery record accepts its target in the same write that retires an
-    abort (:func:`_record_recovery_boundary`), and that write lands before
-    ``TRIAL_TARGET_ATTR`` catches up. Reading both keeps a crash between the
-    two from dropping the recovery's authorization or letting the old target
-    run the recovered phase.
+    Recovery records advance before ``TRIAL_TARGET_ATTR``; use the larger target
+    to preserve the accepted budget across an interrupted recovery.
 
     :param optuna.Study study: Study whose accepted trial target is read.
     :return int: The larger of the stored ``phasesweep_trial_target`` user
@@ -410,8 +401,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-            f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
-            "the inconsistent study before running again."
+            f"for {finished} terminal trial(s)."
         )
     recovery = _load_recovery_record(study)
     return stored if recovery is None else max(stored, recovery.trial_target)
@@ -760,8 +750,7 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
     if missing:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated trial(s) without a "
-            f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
-            "which environment cohort owns those results. Use a new experiment name.",
+            f"semantic trainer-environment identity: {missing}.",
         )
     if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))

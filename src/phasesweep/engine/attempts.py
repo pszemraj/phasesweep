@@ -98,12 +98,9 @@ def _trial_dir_from_attr(
 ) -> Path:
     """Read the persisted directory containing a trial's process identity.
 
-    Prefer the persisted ``phasesweep_trial_dir`` attr because it preserves the
-    original workdir even if the operator resumes from a different cwd or edits
-    ``experiment.workdir``. A RUNNING trial with no attribute died before any
-    subprocess could start, so its caller may supply the canonical directory
-    as a fallback. Terminal cleanup recovery requires the persisted attribute
-    and supplies no fallback. An invalid stored value never uses the fallback.
+    Persisted paths survive cwd and workdir changes. Only a RUNNING trial with
+    no directory attribute may use the pre-launch fallback; invalid values and
+    terminal recovery require the persisted path.
 
     :param optuna.trial.FrozenTrial trial: Trial whose process evidence is inspected.
     :param str study_name: Study name used in diagnostics.
@@ -117,8 +114,7 @@ def _trial_dir_from_attr(
         trial_dir = fallback()
         log.warning(
             "RUNNING trial %d in study %s is missing %r; falling back to "
-            "canonical trial_dir=%s. No subprocess can be launched by the "
-            "current orchestrator before this attr is normally persisted.",
+            "canonical pre-launch trial_dir=%s.",
             trial.number,
             study_name,
             TRIAL_DIR_ATTR,
@@ -132,15 +128,13 @@ def _trial_dir_from_attr(
             detail = (
                 f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
                 f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
-                f"{stored!r}. The leaked process group cannot be tied to identity files safely. "
-                "Restore the original storage ledger before retrying recovery."
+                f"{stored!r}. The process group cannot be tied to its identity files."
             )
         else:
             detail = (
                 f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
                 f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
-                "tied to its identity files safely. Restore the original storage ledger "
-                "before retrying recovery."
+                "tied to its identity files."
             )
         raise ProcessCleanupUncertainError(detail, action=OperatorAction.RESTORE_LEDGER)
     return Path(stored)
@@ -192,9 +186,7 @@ def _require_trial_attempt(
     if record is None:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
-            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown. "
-            "Restore the original storage ledger with its durable attempt and generation "
-            "identities before retrying recovery; do not infer replacement identities.",
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown.",
             action=OperatorAction.RESTORE_LEDGER,
         )
     return record
@@ -325,11 +317,8 @@ def _register_active_attempt(
 ) -> None:
     """Durably register a newly allocated attempt before anything is launched.
 
-    The entry binds the attempt to the *producing* phase name, study name,
-    and a frozen storage locator, so preflight can find and resolve it even
-    after the phase was renamed or removed, or the storage URL changed.
-
-    Creation is fail-closed.
+    The producing phase, study and frozen storage locator support recovery
+    after phase or storage configuration changes.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Immutable attempt identity and entry filename.
@@ -361,12 +350,8 @@ def _register_active_attempt(
         raise ActiveAttemptPersistenceError(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
-            "consumed. This entry is the only durable record that would let a later "
-            "run discover this attempt after a phase rename/removal or a storage-URL "
-            "change, so PhaseSweep refuses to launch a trainer it could not account "
-            "for. Restore write access to the experiment workdir, then run again. With "
-            "persistent storage this refusal durably aborts the phase, so that run also "
-            "needs n_trials raised above its accepted target, or a new experiment name."
+            "consumed. Persistent storage records a phase abort; retry needs "
+            "n_trials raised above its accepted target, or a new experiment name."
         ) from exc
 
 
@@ -710,10 +695,7 @@ def _registry_attempt_fail_stale_trial(
                     f"Attempt registry entry {entry_path} cannot be matched to terminal "
                     f"trial {trial.number} in study {entry['study_name']!r}: its durable "
                     "attempt or generation identity is missing. The registry entry is "
-                    "retained; cleanup recovery cannot be attributed to this trial. "
-                    "Restore the original storage ledger with its durable attempt and "
-                    "generation identities before retrying recovery; do not infer "
-                    "replacement identities.",
+                    "retained; cleanup recovery cannot be attributed to this trial.",
                     action=OperatorAction.RESTORE_LEDGER,
                 )
             if not recovered:

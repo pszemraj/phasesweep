@@ -360,11 +360,9 @@ class RunPayload(_ToolPayload):
     )
     runner_observable: bool = Field(
         description=(
-            "False only while the run is running and its runner lives in another PID "
-            "namespace than this server, so this server can neither confirm the runner is "
-            "alive nor cancel it. State then rests on durable evidence alone: keep "
-            "monitoring phase trial counts, do not call cancel_run, and tell the user if "
-            "the counts stop advancing."
+            "False for a running runner in another PID namespace: liveness and cancellation "
+            "are unavailable. Monitor durable trial counts, do not call cancel_run, and "
+            "notify the user if counts stop advancing."
         )
     )
     failure: FailurePayload | None = Field(
@@ -421,14 +419,10 @@ class PhaseStatusPayload(_ToolPayload):
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     published_study_unavailable: bool | None = Field(
         description=(
-            "Whether a current published phase's local trial identity could not be matched. When "
-            "trial_data_available is true, its published trial is confirmed missing or replaced: "
-            "restore the original ledger/study or use a new experiment identity; "
-            "earlier phases may load validated saved winners via from_phase. When "
-            "trial_data_available is false, inspection failed: a run can report "
-            "cleanup_uncertain and require operator "
-            "recovery before further MCP launches. Null means availability was not checked, "
-            "including pre-generation placeholders."
+            "Unmatched published trial identity/history; null when unchecked. With "
+            "trial_data_available=true, restore the original ledger/study or use a new "
+            "experiment; from_phase may load saved winners for skipped phases. With false, "
+            "inspection failed; cleanup_uncertain may require operator recovery before launches."
         )
     )
     trial_data_available: bool = Field(
@@ -454,9 +448,8 @@ class GetRunStatusResult(_ToolPayload):
     experiment_id: ExperimentId
     result_source: ResultSource = Field(
         description=(
-            "Where the result facts came from: the mutable shared study for a live/current "
-            "read, an immutable terminal run snapshot, or an unavailable terminal-snapshot "
-            "placeholder whose counts are explicitly untrusted."
+            "Result source: mutable shared study, immutable terminal snapshot, or unavailable "
+            "terminal-snapshot placeholder with untrusted counts."
         )
     )
     current_generation_id: str | None = Field(
@@ -488,10 +481,8 @@ class GetRunStatusResult(_ToolPayload):
     published_config_matches_current: PublishedConfigMatchesCurrent
     result_phase_plan: list[PhaseName] = Field(
         description=(
-            "Phase plan the represented generation published under, in execution order. "
-            "Equals the phases list's names while the config is unchanged; after an edit "
-            "it is the historical plan, and the phases list is the current one a further "
-            "run would execute."
+            "Represented generation's phase plan in execution order. After config edits, "
+            "this remains historical while phases describes the current plan."
         )
     )
     metric: MetricSnapshot
@@ -501,10 +492,9 @@ class GetRunStatusResult(_ToolPayload):
     tracking_delivery: TrackingDeliveryPayload | None = Field(
         default=None,
         description=(
-            "This run's own MLflow result-upload counts, read live even for a terminal run. "
-            "Null when the run does not use MLflow or its launch config is unavailable. "
-            "Pending uploads never change accepted scores or winners; report them to the "
-            "operator instead of launching another run."
+            "This run's live MLflow upload counts, including after termination; null without "
+            "MLflow or launch config. Pending uploads do not change scores or winners: "
+            "report them to the operator instead of launching another run."
         ),
     )
     elapsed_seconds: int | None = Field(
@@ -584,10 +574,9 @@ class WinnerPhasePayload(_ToolPayload):
     )
     observed: dict[str, float] = Field(
         description=(
-            "Report-only values the winning trial recorded, by observation name. They never "
-            "influenced selection; the metric did. A name whose read failed on that trial is "
-            "absent, and the map is empty when the experiment declares no observations. For a "
-            "phase with repeats, each value is the mean over the members that recorded it."
+            "Report-only winning-trial values by name; these do not affect selection. Failed "
+            "reads are omitted; no observations yields an empty map. With repeats, each value "
+            "is the mean over members that recorded it."
         )
     )
     repeats: RepeatsSpread | None = Field(

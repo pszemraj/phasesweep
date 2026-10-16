@@ -388,45 +388,38 @@ def read_status(
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
 
-    Resolve the current and last-success pointers once each. Published facts come
-    from that validation capture; pinned unpublished generations use their own files.
+    Resolve current and last-success pointers once. Published facts use that capture;
+    pinned unpublished generations use their own files. Generation fields mean:
 
-    - ``current_generation_id`` names the most recent invocation's mutable pointer.
-    - ``published_generation_id`` names the validated last-success pointer.
-    - ``represented_generation_id`` is the pinned id, or the published id by default.
-    - ``is_published`` is true only when a non-null represented id equals the published id.
-    - ``publication_integrity`` is ``ok``, ``absent``, ``failed``, or ``permission_denied``.
-      Failed validation exposes no published winner. Failure details are path-free;
-      permission denial does not imply artifact corruption.
+    - ``current_generation_id``: most recent invocation's mutable pointer.
+    - ``published_generation_id``: validated last-success pointer.
+    - ``represented_generation_id``: pinned id, or published id by default.
+    - ``is_published``: non-null represented id equals the published id.
+    - ``publication_integrity``: ``ok``, ``absent``, ``failed``, or ``permission_denied``.
+      Failed validation exposes no published winner; denial does not imply corruption.
 
-    Progress ``phases`` follow the current config. Metric labels and ``result_phase_plan``
-    use the represented summary's semantics, falling back to the current config when
-    absent; ``result_context`` identifies the source. ``published_config_matches_current``
-    compares semantic fingerprints, or is ``None`` without a recorded fingerprint.
-    Winner and summary presence refer to the represented generation.
+    Progress ``phases`` use current config. Metric labels, ``result_phase_plan``, winner
+    and summary presence use the represented generation. Missing result semantics fall
+    back to current config; ``result_context`` names the source. Semantic fingerprints
+    determine ``published_config_matches_current``, or ``None`` if no fingerprint exists.
 
-    ``generation_trials`` counts the pinned generation, or the current generation in
-    default mode. Other trial counts are cumulative. Counts and ``running_attempts``
-    come from one storage capture. Absent studies have known zero counts; unreadable
-    storage has ``trial_data_available=False`` and ``running_attempts=None``.
+    ``generation_trials`` counts the pinned generation, or current generation by default;
+    other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
+    Absent studies have zero counts; unreadable storage sets ``trial_data_available=False``
+    and ``running_attempts=None``. ``published_study_unavailable`` marks missing/replaced
+    trial identities or incomplete history when readable, otherwise incomplete inspection.
+    Confirmed missing history blocks execution but permits skipped-phase winner loading;
+    incomplete inspection may require MCP recovery. Artifact integrity is independent.
 
-    ``published_study_unavailable`` marks unmatched published trial identities or
-    completion boundaries. Available trial data confirms missing/replaced/incomplete
-    history and refuses execution, although skipped phases may load saved winners.
-    Unavailable data means incomplete inspection and may require MCP recovery.
-    Artifact integrity is separate; the CLI adds paths in its own view.
-
-    :param Experiment experiment: Parsed experiment config whose phases are inspected.
-    :param str | None generation_id: Pin represented artifacts and generation counts
-        without changing either pointer identity.
+    :param Experiment experiment: Experiment whose artifacts and trials are inspected.
+    :param str | None generation_id: Pin represented artifacts and generation counts,
+        leaving pointer identities unchanged.
     :param Experiment | None comparison_experiment: Current config for drift comparison
-        and no-result semantics; artifact and trial reads still use ``experiment``.
-    :raises ArtifactRootConflictError: If the artifact root cannot be read or
-        is bound to a different storage ledger or experiment.
-    :raises ValueError: If ``generation_id`` is not a safe generation name.
-    :return EngineStatus: Path-free identities, integrity, metric/phase semantics,
-        trial counts, running attempts, and artifact presence. ``publication_error``
-        appears only for failed or permission-denied validation.
+        and fallback semantics; reads still use ``experiment``.
+    :raises ArtifactRootConflictError: The root is unreadable or has different ownership.
+    :raises ValueError: ``generation_id`` is not a safe generation name.
+    :return EngineStatus: Identities, integrity, result semantics, progress and artifact
+        presence. Path-free ``publication_error`` appears only for failed or denied validation.
     """
     status, _publication = _read_status(
         experiment,

@@ -369,8 +369,7 @@ def _verify_fingerprint(
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}"
-            f"{_CWD_FOLLOWS_INVOCATION + ' ' if cwd_unset else ''}"
-            "Use a new experiment name, delete the old study, or rename the phase.",
+            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else ''}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
         )

@@ -57,7 +57,7 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.process import write_attempt_lifecycle
@@ -1495,8 +1495,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     elif identity_change in {"missing-attempt", "missing-generation"}:
         with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
             _preflight_active_attempts(experiment, report, confirm=True)
-        assert "Restore the original storage ledger" in str(exc_info.value)
-        assert "before retrying recovery" in str(exc_info.value)
+        assert exc_info.value.action == OperatorAction.RESTORE_LEDGER
         assert report.uncertain_attempt_ids == {"old-attempt"}
     else:
         _preflight_active_attempts(experiment, report, confirm=True)
@@ -1517,7 +1516,11 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
             _recover_cleanup_uncertain_trials(
                 study, experiment, experiment.phases[0].name, confirm=False
             )
-        assert "Restore the original storage ledger" in str(exc_info.value)
+        assert exc_info.value.action is (
+            OperatorAction.RESTORE_LEDGER
+            if identity_change == "missing-attempt"
+            else OperatorAction.INSPECT_LOGS
+        )
     assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
         identity_change in {"generation", "missing-attempt", "missing-generation"}
     )
@@ -1880,7 +1883,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert "No trainer was started" in message
     # The refusal routes only the workdir repair; its message says when the
     # durable abort also needs a higher target, as the rerun below shows.
-    assert "n_trials raised above its accepted target" in message
+    assert "n_trials" in message and "accepted target" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"

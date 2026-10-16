@@ -671,7 +671,7 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
 
     with pytest.raises(
         TrialEvidenceMissingError,
-        match="extractor evaluation contract.*evaluator revision.*start a new experiment name",
+        match="extractor evaluation contract.*evaluator revision",
     ):
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 

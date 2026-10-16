@@ -686,23 +686,15 @@ def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> Non
 def main(argv: list[str] | None = None) -> int:
     """Run one config to completion and record its terminal cause in status.json.
 
-    :param list[str] | None argv: Optional argument vector; defaults to ``sys.argv`` when omitted.
-    :return int: Process exit code: zero when the sweep completed and its
-        terminal evidence is durable, and ``1`` when the sweep itself completed
-        but no status.json record could be persisted at all - the run has no
-        MCP-visible outcome, so exiting zero would claim one it cannot show.
-    :raises RuntimeError: The per-run config snapshot could not be read or did
-        not match its recorded hash.
-    :raises PhaseSweepShutdown: The run was cancelled; re-raised after the
-        cancellation cause is recorded in status.json. Also raised on an
-        otherwise-successful run when a shutdown absorbed during the terminal
-        snapshot capture is serviced at the terminal status write: status.json
-        then records the engine's own successful outcome and this process exits
+    :param list[str] | None argv: Argument vector; defaults to ``sys.argv``.
+    :return int: Zero for a completed sweep with durable terminal evidence; one if the
+        sweep completed but status.json could not be persisted.
+    :raises RuntimeError: The config snapshot is unreadable or its hash mismatches.
+    :raises PhaseSweepShutdown: Cancellation, after recording its cause. A signal absorbed
+        during successful terminal capture preserves that successful status and exits
         with the POSIX signalled code.
-    :raises ProcessCleanupUncertainError: Child-process cleanup could not be
-        confirmed; re-raised after status.json records the uncertainty.
-    :raises BaseException: Whatever the handle write or engine run raised,
-        re-raised after its terminal cause reaches status.json.
+    :raises ProcessCleanupUncertainError: Cleanup is unconfirmed, after recording uncertainty.
+    :raises BaseException: Handle-write or engine failure, after recording its terminal cause.
     """
     parser = argparse.ArgumentParser(prog="phasesweep mcp runner")
     parser.add_argument("--run-id", required=True)

@@ -30,6 +30,7 @@ from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, TRIAL_OUTCOME_SCHEMA_VERSION
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
@@ -528,8 +529,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     if damage in reason_for_damage:
         message = str(excinfo.value)
         assert reason_for_damage[damage] in message
-        assert "continuing could reuse incomplete or unrelated trials" in message
-        assert "Restore the original complete storage ledger and study" in message
+        assert excinfo.value.action == OperatorAction.RESTORE_LEDGER
 
 
 @pytest.mark.integration
