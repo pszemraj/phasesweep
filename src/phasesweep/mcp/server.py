@@ -481,9 +481,9 @@ class GetRunStatusResult(_ToolPayload):
     published_config_matches_current: PublishedConfigMatchesCurrent
     result_phase_plan: list[PhaseName] = Field(
         description=(
-            "Represented generation's phase plan in execution order. For frozen terminal "
-            "results, both result_phase_plan and phases retain the captured run plan after "
-            "catalog edits; use inspect_experiment for the current catalog plan."
+            "Represented generation's phase plan in execution order. Terminal snapshots "
+            "preserve both phase lists captured for that run after catalog edits. "
+            "Use inspect_experiment for the current catalog plan."
         )
     )
     metric: MetricSnapshot

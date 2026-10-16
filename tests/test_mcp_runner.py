@@ -57,6 +57,8 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.errors import (
+    OPERATOR_STEPS,
+    OperatorAction,
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
@@ -495,7 +497,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             blocked = recover_run_cli(state_dir, run_id, confirm=confirm)
             assert blocked.exit_code != 0
             assert "could not be" in blocked.output
-            assert "Restore the original complete storage ledger" in blocked.output
+            assert f"fix: {OPERATOR_STEPS[OperatorAction.RESTORE_LEDGER]}." in blocked.output
+            assert "Retry phasesweep mcp recover-run after repairing" in blocked.output
             if damage == "permission-denied":
                 assert ledger.stat().st_mode & 0o777 == 0
             else:
