@@ -519,10 +519,9 @@ def _judge_recorded_phase(
 ) -> _PhaseResume | Winner:
     """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
 
-    The one place these rules live, shared by the live resume and the dry-run
-    preview. It never writes the study. A replayed winner is evidence-verified
-    only with ``verify_evidence``, which reads trial directories, may query W&B
-    or MLflow, and records the environment-drift warning once per process.
+    Replays the study without writing it. When ``verify_evidence`` is true,
+    the selected winner is checked against its frozen evidence and its
+    environment is compared with the current run.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being judged.
@@ -1619,7 +1618,7 @@ def _select_phase_winner(
     completion: dict[str, Any],
     verify_evidence: bool = True,
 ) -> Winner:
-    """Select the phase winner and bind it to its verified execution identity.
+    """Select the phase winner and preserve its execution identity.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: Phase whose winner is selected.
@@ -1627,11 +1626,8 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose terminal trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
-    :param bool verify_evidence: Whether to re-prove the selected trial and warn about
-        environment drift. The proof reads the trial directories and may query W&B or
-        MLflow, and the drift warning consumes a process-global warning identity
-        through :func:`phasesweep.engine.progress._warn_once`, so a dry run turns both off and leaves them
-        to the launch.
+    :param bool verify_evidence: Whether to verify the selected trial against its
+        frozen evidence and warn if its environment differs from the current run.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,

@@ -435,7 +435,7 @@ def _verify_trial_evidence_dir(
     """Require a trial's translated evidence directory and its recorded artifacts.
 
     A lifecycle record must belong to the attempt. Its state is not constrained:
-    writing ``exited`` is best-effort, so completed trials may retain ``allocated``.
+    writing ``exited`` is best-effort, so completed trials may retain ``launching``.
 
     :param Path trial_dir: Translated evidence directory for the trial.
     :param str subject: Caller-built label naming the study, phase, and trial.

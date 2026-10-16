@@ -39,14 +39,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_partial_grid",
     }
 )
-# Bump on any change to what a fingerprint covers. The covered inputs include
-# the complete trainer_config, the metric with its min/max viability bounds,
-# each phase's repeats block, and the effective execution.cwd: an omitted cwd
-# contributes the invocation directory, so one persistent study cannot launch
-# its relative commands from two directories. whole_node phases also cover
-# their configured device-set size, the trainer's world size. A populated study
-# stamped with another schema fails the fingerprint check on resume, and the
-# refusal names the operator's options.
+# Increment the schema versions when their fingerprint payloads change.
 FINGERPRINT_SCHEMA_VERSION = 7
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 

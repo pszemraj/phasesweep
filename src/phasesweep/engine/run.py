@@ -487,7 +487,7 @@ def _run_experiment_outcome(
                             failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
-                except BaseException:  # noqa: BLE001 - see comment: outcome authority
+                except BaseException:  # noqa: BLE001
                     # Callback failures cannot replace the committed result or the engine error.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
