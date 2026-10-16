@@ -151,5 +151,5 @@ addopts = "-q -m 'not live' --strict-markers"
 markers = [
     "live: tests that use real host hardware or a live external service; explicit opt-in with -m live",
     "signals_own_pid: tests that signal pytest's own PID on purpose; lifts that one target from the runner signal guard in tests/conftest.py",
-    "integration: slow tests, excluded from the fast review tier. Collection fails when an unmarked test manages processes or waits on the clock directly; engine runs with quick trainers stay in the fast tier; any other slow test is marked by the classification rule in docs/development.md",
+    "integration: slow tests with real process management, durable recovery workflows, or backend integration; excluded from the fast review tier; classification is documented in docs/development.md",
 ]

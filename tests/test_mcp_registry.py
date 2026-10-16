@@ -10,9 +10,8 @@ import pytest
 
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
+from tests.conftest import REPO
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
-
-REPO = Path(__file__).resolve().parents[1]
 
 
 def _write(path: Path, body: str) -> Path:
@@ -428,7 +427,7 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     ("old", "new"),
     [
         ("goal: minimize", "goal: sideways"),
-        ("sampler: { type: random, seed: 0 }", "sampler: { type: nope }"),
+        ("sampler:\n    type: random\n    seed: 0", "sampler:\n    type: nope"),
     ],
     ids=["invalid_goal", "unknown_sampler"],
 )
@@ -442,7 +441,7 @@ def test_invalid_config_raises_catalog_error(tmp_path: Path, old: str, new: str)
 def test_invalid_config_error_points_at_the_reference(tmp_path: Path) -> None:
     """An operator authoring a catalog config is told which key to explain."""
     bad = _experiment_yaml(tmp_path).replace(
-        "sampler: { type: random, seed: 0 }", "sampler: { type: nope }", 1
+        "sampler:\n    type: random\n    seed: 0", "sampler:\n    type: nope", 1
     )
     config = _write(tmp_path / "exp.yaml", bad)
     with pytest.raises(CatalogError, match="invalid config") as caught:

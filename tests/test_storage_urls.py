@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
@@ -20,7 +21,8 @@ from phasesweep.runtime.files import (
     file_url_path,
     storage_recovery_locator,
 )
-from tests.conftest import make_experiment, write_yaml
+from tests.conftest import make_experiment
+from tests.experiments import json_metric, phase_payload, write_experiment
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
@@ -101,33 +103,15 @@ def _storage_policy_config(
     storage: str,
     n_jobs: int,
 ) -> Path:
-    parallel = (
-        f"""
-            n_jobs: {n_jobs}
-            allow_no_gpu_isolation: true"""
-        if n_jobs > 1
-        else ""
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        storage: {storage}
-        provenance: {{revision: test-fixture-v1}}
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: p
-            n_trials: 1{parallel}
-            sampler: {{ type: random, seed: 0 }}
-            search_space:
-              x: {{ type: int, low: 0, high: 10 }}
-        """,
+    phase = phase_payload()
+    if n_jobs > 1:
+        phase.update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    return write_experiment(
+        tmp_path / "exp.yaml",
+        storage=yaml.safe_load(storage),
+        workdir=str(tmp_path / "runs"),
+        metric={"name": "x", "goal": "minimize", **json_metric(path="r.json")},
+        phases=[phase],
     )
 
 

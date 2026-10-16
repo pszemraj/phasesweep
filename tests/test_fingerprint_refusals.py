@@ -23,21 +23,9 @@ from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR
 from phasesweep.errors import OperatorAction
 from tests.conftest import make_experiment
-from tests.test_config_paths import _project, _write_config
+from tests.experiments import anchored_phase, project_directory, write_anchored_config
 
 _CWD_SENTENCE = "The trainer working directory follows the directory phasesweep runs from"
-
-
-def _phases(high: int) -> list[dict[str, object]]:
-    """Return one random-sampler phase whose only search-space bound is ``high``."""
-    return [
-        {
-            "name": "p",
-            "n_trials": 1,
-            "sampler": {"type": "random", "seed": 0},
-            "search_space": {"x": {"type": "int", "low": 0, "high": high}},
-        }
-    ]
 
 
 def _stamped_study(experiment: Experiment, *, populated: bool = True) -> optuna.Study:
@@ -58,21 +46,21 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
 
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     """Widening one bound refuses the study and names that key with both values."""
-    project = _project(tmp_path)
-    config = _write_config(
+    project = project_directory(tmp_path)
+    config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=_phases(3),
+        phases=[anchored_phase(3)],
     )
     run_experiment(load_experiment(config))
-    _write_config(
+    write_anchored_config(
         config,
         workdir="runs",
         storage="journal:///study.journal",
         execution={"cwd": "."},
-        phases=_phases(4),
+        phases=[anchored_phase(4)],
     )
 
     with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as caught:
@@ -87,12 +75,12 @@ def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_di
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unset ``execution.cwd`` follows the invocation directory, and the refusal says so."""
-    project = _project(tmp_path)
-    config = _write_config(
+    project = project_directory(tmp_path)
+    config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",
-        phases=_phases(3),
+        phases=[anchored_phase(3)],
     )
     first_cwd = (tmp_path / "first").resolve()
     second_cwd = (tmp_path / "second").resolve()

@@ -29,7 +29,8 @@ from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import invoke_cli_boundary, make_experiment, write_flaky_trainer, write_yaml
+from tests.conftest import invoke_cli_boundary, make_experiment, write_flaky_trainer
+from tests.experiments import write_experiment
 from tests.recovery_helpers import fabricate_stale_trial
 
 _FRESH_THREE = (
@@ -246,27 +247,22 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
     assert _call_count(calls) == 2
 
 
-_FIXED_YAML = """
-    experiment: t
-    storage: auto
-    workdir: {tmp}/runs
-    provenance: {{revision: test}}
-    trial_command: "echo {{overrides}}"
-    override_format: argparse
-    metric:
-      extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-    phases:
-      - name: p
-        n_trials: {n_trials}
-        fixed_overrides: {{x: 1}}
-"""
+def _fixed_config(tmp_path: Path, n_trials: int) -> Path:
+    """Write a fixed configuration without an explicit sampler or search space."""
+    return write_experiment(
+        tmp_path / "exp.yaml",
+        storage="auto",
+        workdir=str(tmp_path / "runs"),
+        provenance={"revision": "test"},
+        phases=[{"name": "p", "n_trials": n_trials, "fixed_overrides": {"x": 1}}],
+    )
 
 
 def test_validate_warns_and_cli_dry_run_refuses_a_persistent_fixed_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Load accepts it with one warning line, and the CLI dry run then refuses a fresh tree."""
-    config = write_yaml(tmp_path, _FIXED_YAML.format(tmp=tmp_path, n_trials=3))
+    config = _fixed_config(tmp_path, 3)
 
     validated = CliRunner().invoke(cli_main, ["validate", str(config)])
     assert validated.exit_code == 0, validated.output
@@ -276,7 +272,7 @@ def test_validate_warns_and_cli_dry_run_refuses_a_persistent_fixed_target(
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) != 0
     assert _FRESH_THREE in capsys.readouterr().err
 
-    one = write_yaml(tmp_path, _FIXED_YAML.format(tmp=tmp_path, n_trials=1))
+    one = _fixed_config(tmp_path, 1)
     clean = CliRunner().invoke(cli_main, ["validate", str(one)])
     assert clean.exit_code == 0, clean.output
     assert "warning:" not in clean.output

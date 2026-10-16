@@ -29,6 +29,7 @@ from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
+from tests.experiments import experiment_yaml, json_metric, phase_payload
 
 if typing.TYPE_CHECKING:
     from mcp.types import CallToolResult
@@ -96,6 +97,13 @@ def write_mcp_config_catalog(
     )
 
 
+def _mcp_phase() -> dict[str, object]:
+    """Build the learning-rate phase shared by MCP experiment fixtures."""
+    return phase_payload(
+        search_space={"lr": {"type": "float", "low": 1.0e-5, "high": 1.0e-2, "log": True}}
+    )
+
+
 def mcp_experiment_config_text(
     tmp_path: Path,
     *,
@@ -103,32 +111,16 @@ def mcp_experiment_config_text(
     phases: str | None = None,
     with_storage: bool = True,
 ) -> str:
-    if phases is None:
-        # Seeded random: reproducible and resumable, so it satisfies the
-        # persistent-storage sampler policy without an acknowledgement.
-        phases = """\
-  - name: p
-    n_trials: 1
-    sampler: { type: random, seed: 0 }
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-"""
-    storage = (
-        f"storage: journal:///{tmp_path}/{name}.journal\nprovenance: {{revision: test-fixture-v1}}\n"
-        if with_storage
-        else ""
-    )
-    return f"""\
-experiment: {name}
-{storage}workdir: {tmp_path}/runs/{name}
-trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
-phases:
-{phases}"""
+    fields: dict[str, object] = {
+        "experiment": name,
+        "workdir": str(tmp_path / "runs" / name),
+        "trial_command": "python train.py --out {trial_dir}/r.json {overrides}",
+        "metric": {"name": "loss", "goal": "minimize", **json_metric("loss", path="r.json")},
+        "phases": [_mcp_phase()] if phases is None else yaml.safe_load(phases),
+    }
+    if with_storage:
+        fields["storage"] = f"journal:///{tmp_path}/{name}.journal"
+    return experiment_yaml(**fields)
 
 
 def slow_mcp_config_text(
@@ -138,24 +130,18 @@ def slow_mcp_config_text(
     name: str = "slow",
     sleep: float = 30.0,
 ) -> str:
-    return f"""\
-experiment: {name}
-storage: journal:///{tmp_path}/{name}.journal
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs/{name}
-trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: p
-    n_trials: 1
-    sampler: {{ type: random, seed: 0 }}
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-"""
+    return experiment_yaml(
+        experiment=name,
+        storage=f"journal:///{tmp_path}/{name}.journal",
+        workdir=str(tmp_path / "runs" / name),
+        trial_command=f"{sys.executable} {trainer} --sleep {sleep} {{overrides}}",
+        metric={
+            "name": "eval_loss",
+            "goal": "minimize",
+            **json_metric("eval_loss", path="result.json", split="validation", policy="synthetic"),
+        },
+        phases=[_mcp_phase()],
+    )
 
 
 def write_slow_mcp_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:

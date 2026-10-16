@@ -119,6 +119,16 @@ The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read
 
 The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decoding and error behavior with controlled responses, plus supervised worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B round trip reaches the service. Input tests use the real Hydra 1.3 parser and entrypoint; rendering itself has no Hydra runtime dependency.
 
+### Shared test setup
+
+Use `tests/conftest.py` for isolation fixtures, model builders and trial records;
+`tests/experiments.py` for dictionary-based YAML configuration;
+`tests/ledger_fixtures.py` for golden publications and journal mutations;
+`tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup;
+and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup.
+Import shared setup from these support modules rather than another test module.
+Keep assertions and scenario-specific malformed input or trainer programs with their tests.
+
 ## PyPI releases
 
 Versions come from Git tags through setuptools-scm. The [`publish.yml` workflow](../.github/workflows/publish.yml) builds one wheel and one source distribution from the commit recorded by a published GitHub Release. The build restricts setuptools-scm's Git tag selection to that release's tag, so other tags on the same commit cannot determine the package version. It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`, then checks that both distributions contain the tag's normalized version and the project name `phasesweep`. GitHub prereleases are skipped, and prerelease version tags are rejected even for normal GitHub Releases.

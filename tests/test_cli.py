@@ -62,6 +62,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_param_echo_trainer,
 )
+from tests.experiments import write_experiment
 from tests.ledger_fixtures import materialize, published_generation_id
 from tests.recovery_helpers import recover_run_cli
 
@@ -502,22 +503,19 @@ def test_run_installs_signal_handlers_before_config_load(
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:
     """``phasesweep validate`` surfaces phase comments so the operator sees
     design intent next to the spec, with a ``#`` prefix to read as documentation."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: depth
-            comment: |
-              first phase: figure out the depth.
-              grid because we want every choice to actually run.
-            n_trials: 1
-            search_space: { x: { type: int, low: 0, high: 1 } }
-        """)
+    p = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            {
+                "name": "depth",
+                "comment": (
+                    "first phase: figure out the depth.\n"
+                    "grid because we want every choice to actually run.\n"
+                ),
+                "n_trials": 1,
+                "search_space": {"x": {"type": "int", "low": 0, "high": 1}},
+            }
+        ],
     )
     runner = CliRunner()
     result = runner.invoke(cli_main, ["validate", str(p)])
@@ -635,28 +633,12 @@ def _write_validation_config(
     tmp_path: Path, phases: str, *, persistent: bool = False, phase_name: str | None = "lr"
 ) -> Path:
     """Write an echo-trainer config from one phase body or a phase-list YAML."""
-    path = tmp_path / "exp.yaml"
-    storage = (
-        f"storage: journal:///{tmp_path}/phases.journal\nprovenance: {{revision: test-fixture-v1}}\n"
-        if persistent
-        else ""
-    )
     if phase_name is not None:
         phases = f"- name: {phase_name}\n" + textwrap.indent(phases, "  ")
-    path.write_text(
-        storage
-        + textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-        """)
-        + textwrap.indent(textwrap.dedent(phases).strip(), "  ")
-        + "\n"
-    )
-    return path
+    fields: dict[str, object] = {"phases": yaml.safe_load(textwrap.dedent(phases))}
+    if persistent:
+        fields["storage"] = f"journal:///{tmp_path}/phases.journal"
+    return write_experiment(tmp_path / "exp.yaml", **fields)
 
 
 def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
