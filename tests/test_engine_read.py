@@ -785,6 +785,7 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
         drifted, phase_names=[phase.name for phase in drifted.phases]
     )
     assert len(winners) == 1
+    assert winners[0].effective_overrides == {"a": 1}
     assert (result_status["metric"]["name"], result_status["metric"]["goal"]) == (
         "objective",
         "minimize",

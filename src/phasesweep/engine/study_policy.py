@@ -38,6 +38,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _parsed_trial_outcome,
+    _study_schema_supported,
     _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
@@ -320,21 +321,18 @@ def _record_recovery_boundary(
 
 
 def _validate_study_schema(study: optuna.Study) -> None:
-    """Initialize an empty study or reject populated incompatible storage.
+    """Validate the recorded study schema and current failure-policy state without writing.
 
-    :param optuna.Study study: Study whose durable schema attr is stamped (when
-        empty and unstamped) or validated against the current schema version.
+    :param optuna.Study study: Study whose durable schema attr and policy state are checked.
     :raises StudySchemaMismatchError: The study already holds trials or a schema
         stamp from an unsupported version, or its durable failure-policy state
         is malformed.
     """
     trials = study.get_trials(deepcopy=False)
     version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
-    if not trials and version is None:
-        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-        return
-    if version == STUDY_SCHEMA_VERSION:
-        _load_phase_policy_state(study)
+    if _study_schema_supported(version, bool(trials)):
+        if version is not None:
+            _load_phase_policy_state(study)
         return
 
     trial_numbers = [trial.number for trial in trials]
@@ -343,6 +341,17 @@ def _validate_study_schema(study: optuna.Study) -> None:
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}.",
     )
+
+
+def _initialize_study_schema(study: optuna.Study) -> None:
+    """Validate a live study and stamp an empty, unmarked allocation.
+
+    :param optuna.Study study: Live study being prepared for execution.
+    :raises StudySchemaMismatchError: The schema or current policy state is unsupported.
+    """
+    _validate_study_schema(study)
+    if study.user_attrs.get(STUDY_SCHEMA_ATTR) is None:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
 
 def _validate_study_direction(

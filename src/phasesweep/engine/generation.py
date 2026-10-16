@@ -20,6 +20,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationCommitError, RunRequestError
 from phasesweep.engine.state import PUBLICATION_POINTER_SCHEMA_VERSION, Winner
+from phasesweep.runtime.files import atomic_create_text
 from phasesweep.runtime.shutdown import absorb_shutdown_signals
 
 if TYPE_CHECKING:
@@ -141,11 +142,8 @@ def _write_generation_state(
         current-generation pointer with this state.
     :param str | None error_class: Optional exception class name to record for
         a failed or publication_failed state.
-    :param bool write_record: If ``False``, skip the write-once per-generation
-        record even for a terminal state. Used by the post-commit
-        current-pointer refresh, whose record was already written moments
-        earlier -- re-attempting it would trip the write-once refusal warning
-        on every successful publication.
+    :param bool write_record: Skip the terminal record when ``False``, as during
+        post-commit current-pointer refresh.
     """
     payload = {
         "experiment": experiment.experiment,
@@ -157,7 +155,7 @@ def _write_generation_state(
     }
     if write_record and state in _TERMINAL_GENERATION_STATES:
         record_path = path_ops._generation_record_path(experiment, generation_id)
-        if not artifact_io._write_yaml_exclusive(record_path, payload):
+        if not atomic_create_text(record_path, yaml.safe_dump(payload, sort_keys=False)):
             log.warning(
                 "Refusing to rewrite terminal generation %s record (existing state %r, attempted %r)",
                 generation_id,

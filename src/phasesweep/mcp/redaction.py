@@ -73,9 +73,7 @@ def winners_payload(
     """Build the ``get_run_results`` payload from path-free phase-winner views.
 
     Expose sampled params under the visibility policy; omit effective overrides, fixed
-    values and inherited values. ``metric`` and ``declared_phases`` must come from the
-    represented generation. ``result_context`` and ``published_config_matches_current``
-    disclose those labels' source and current-config agreement.
+    values and inherited values.
 
     :param str experiment_id: Catalog id whose winners are being returned.
     :param list[PhaseWinnerView] views: Path-free winner views read from engine state.
@@ -85,20 +83,15 @@ def winners_payload(
         published under, in execution order.
     :param ResultSource result_source: Whether results came from current shared
         state or a frozen terminal run snapshot.
-    :param McpPublicationState publication_integrity: Whether the experiment's
-        last-success pointer is valid, absent, names a generation that no
-        longer validates, or cannot be validated as this user. An empty winner
-        list has different remedies under ``"absent"``, ``"failed"``,
-        ``"permission_denied"``, and ``"unknown"``.
+    :param McpPublicationState publication_integrity: Last-success validation verdict,
+        or ``unknown`` when the terminal snapshot is unavailable.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
-    :param ResultContext result_context: Whether ``metric``/``declared_phases``
-        are the represented generation's own recorded semantics or the current
-        config's when nothing is published.
-    :param bool | None published_config_matches_current: Whether the represented
-        generation's recorded config fingerprint matches the config this read
-        was interpreted through; ``None`` when undeterminable.
+    :param ResultContext result_context: Source of the metric and phase plan:
+        represented generation, or current config when nothing is published.
+    :param bool | None published_config_matches_current: Represented/current config
+        fingerprint agreement, or ``None`` when undeterminable.
     :raises RuntimeError: A winner view carries no source provenance.
     :return dict[str, Any]: MCP-safe winners payload.
     """

@@ -18,10 +18,8 @@ import yaml
 from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
-    closest,
     first_sentence,
-    lookup,
-    plain_path,
+    lookup_or_suggest,
     reference_notes,
     sub_key_count,
     top_level_entries,
@@ -509,9 +507,8 @@ def explain(key: str | None, notes: bool) -> None:
     if key is None:
         _render_reference_index()
         return
-    entries = lookup(key) if plain_path(key) else ()
+    entries, near = lookup_or_suggest(key)
     if not entries:
-        near = closest(key)
         hint = (
             f"Closest: {', '.join(near)}."
             if near

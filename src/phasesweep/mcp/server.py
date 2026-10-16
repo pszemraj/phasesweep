@@ -461,30 +461,26 @@ class GetRunStatusResult(_ToolPayload):
     )
     current_generation_id: str | None = Field(
         description=(
-            "Most recent generation id known to this experiment; may be failed or "
-            "in-progress. Null when no generation has ever started. Always the actual "
-            "mutable pointer, never forced to a queried run_id."
+            "Latest mutable generation known to this experiment; may be failed, in progress, "
+            "or differ from the queried run. Null before any generation starts."
         )
     )
     published_generation_id: str | None = Field(
         description=(
-            "Last successfully published generation id. Null when nothing has published "
-            "yet. Always the actual validated pointer, never forced to a queried run_id, "
-            "and may differ from represented_generation_id."
+            "Last validated successful generation; null before the first success "
+            "and may differ from the represented generation."
         )
     )
     represented_generation_id: str | None = Field(
         description=(
-            "The generation whose winner_present, summary_present, and this-run trial "
-            "counts this payload shows: normally the queried run_id. Null for a "
-            "config-only unavailable placeholder."
+            "Generation supplying this payload's winners, summary, and this-run counts; "
+            "normally the queried run, or null for an unavailable placeholder."
         )
     )
     is_published: bool = Field(
         description=(
-            "True only when represented_generation_id is not null and equals "
-            "published_generation_id. A run_id whose own publication failed reports "
-            "false here while still showing that generation's own winners."
+            "True iff the non-null represented_generation_id equals published_generation_id; "
+            "a run can still expose its own winners when this is false."
         )
     )
     publication_integrity: PublicationIntegrity

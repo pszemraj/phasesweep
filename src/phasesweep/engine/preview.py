@@ -41,7 +41,6 @@ from phasesweep.engine.phase import (
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
-    STUDY_SCHEMA_ATTR,
     Winner,
     _outcome_sequence_counts,
     _recovered_trial_state,
@@ -213,11 +212,7 @@ def _refuse_as_a_launch_would(
         record = recorded[phase.name]
         try:
             _validate_study_direction(study, experiment.metric.goal)
-            # The only write ``_validate_study_schema`` makes stamps an empty,
-            # unstamped study, which a snapshot cannot take and which cannot
-            # fail the check.
-            if study.get_trials(deepcopy=False) or STUDY_SCHEMA_ATTR in study.user_attrs:
-                _validate_study_schema(study)
+            _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
                     phase, finished=record.finished, completed=record.completed

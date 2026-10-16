@@ -23,7 +23,6 @@ def _experiment_dir(experiment: Experiment) -> Path:
 def _artifact_root_identity(experiment: Experiment) -> str:
     """Return the artifact namespace resolved through any symlinked experiment leaf.
 
-    :param Experiment experiment: Parsed experiment supplying workdir and name.
     :return str: Resolved ``<workdir>/<experiment>`` namespace as a string.
     """
     return str(_experiment_dir(experiment).resolve())

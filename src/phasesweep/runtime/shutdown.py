@@ -1,11 +1,8 @@
 """Shutdown-signal handling and the live-child registry it drains.
 
-A SIGTERM, SIGINT, or SIGHUP runs ``_shutdown_handler``, which terminates every
-registered process group and raises ``PhaseSweepShutdown`` carrying the
-cleanup evidence. The rest of this module decides who owns those handlers
-(``install_signal_handlers``, ``signal_handler_scope``) and what happens to a
-signal that arrives inside a critical section (``defer_shutdown_signals``,
-``absorb_shutdown_signals``).
+SIGTERM, SIGINT and available SIGHUP terminate registered process groups and raise
+``PhaseSweepShutdown`` with cleanup evidence. Scopes control handler ownership and
+defer or absorb signals during critical sections.
 """
 
 from __future__ import annotations
@@ -74,8 +71,7 @@ class PhaseSweepShutdown(SystemExit):
         super().__init__(128 + signum)
         self.signum = signum
         self.report = report
-        # The engine sets this only when its post-publication checkpoint
-        # services a shutdown that was absorbed while committing results.
+        # Set by the engine's post-publication shutdown checkpoint.
         self.published_result_committed = False
 
 
@@ -90,8 +86,7 @@ _main_thread_defer_depth = 0
 # launches, or register a child the snapshot includes. Reset at the next run.
 _servicing_signum: int | None = None
 
-# Callables the handler runs once it has set ``_servicing_signum``, so waits
-# that would otherwise block a worker thread (a GPU lease queue) wake and see it.
+# Wake worker waits after ``_servicing_signum`` is set.
 _shutdown_wakers: list[Callable[[], None]] = []
 
 
@@ -135,15 +130,12 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     a concurrent handler invocation returns without interrupting cleanup.
 
     Args:
-        signum: The signal number that fired (``SIGTERM``, ``SIGINT``, or
-            ``SIGHUP`` where available).
-        _frame: The interrupted stack frame at signal-delivery time; unused
-            but required by the ``signal.signal`` handler protocol.
+        signum: Shutdown signal number.
+        _frame: Unused frame required by the signal handler protocol.
 
     Raises:
-        SystemExit: With exit code ``128 + signum`` (POSIX ``signaled-exit``
-            convention) — always, except when deferred mid-critical-section
-            or ignored during an active handler invocation as described above.
+        PhaseSweepShutdown: Exit code ``128 + signum``, unless deferred or cleanup
+            is already running.
 
     """
     global _deferred_shutdown_signum, _servicing_signum  # noqa: PLW0603
@@ -155,9 +147,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
     try:
         if _main_thread_defer_depth > 0:
-            # The main thread is inside a launch/unregister critical section and
-            # may already hold the locks below. Record and return; the outermost
-            # window exit services the shutdown.
+            # Avoid reacquiring locks held by the interrupted critical section.
             _deferred_shutdown_signum = signum
             return
         # Any recorded-but-unserviced signal is superseded by this invocation.
@@ -217,8 +207,7 @@ def _unblock_shutdown_signals() -> None:
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
 
 
-# Track temporary and process-lifetime ownership explicitly rather than
-# inferring nesting from handler identity. Only the main thread mutates these.
+# Main-thread ownership state.
 _process_lifetime_owner = False
 _scope_depth = 0
 
@@ -231,10 +220,7 @@ def install_signal_handlers() -> None:
     restoration; later scopes leave process-lifetime ownership intact.
 
     Raises:
-        SignalOwnershipUnavailableError: Called from a thread other than the
-            main thread. ``signal.signal`` is main-thread-only, and so is the
-            ownership handover above; entry points must install from the main
-            thread at process start.
+        SignalOwnershipUnavailableError: Called outside the main thread.
 
     """
     global _process_lifetime_owner  # noqa: PLW0603
@@ -330,8 +316,7 @@ def signal_handler_scope() -> Iterator[None]:
             call already owns the shutdown signals.
 
     Yields:
-        ``None``. Use as ``with signal_handler_scope(): ...`` around the
-        outermost run whose child processes must be cleaned up on shutdown.
+        ``None`` during the run whose children require shutdown cleanup.
 
     """
     global _scope_depth, _servicing_signum  # noqa: PLW0603
@@ -340,8 +325,6 @@ def signal_handler_scope() -> Iterator[None]:
         # A new outermost run starts with no shutdown under way.
         _servicing_signum = None
     if _process_lifetime_owner:
-        # Process-lifetime ownership skips restoration. Repair externally replaced
-        # handlers on the main thread before running.
         _reassert_process_lifetime_handlers()
         yield
         return
@@ -356,9 +339,6 @@ def signal_handler_scope() -> Iterator[None]:
         )
 
     if _scope_depth > 0:
-        # True lexical nesting on the main thread: an enclosing scope call
-        # already installed the handlers and mask. Just track depth so only
-        # the outermost exit restores anything.
         _scope_depth += 1
         try:
             yield
@@ -369,8 +349,7 @@ def signal_handler_scope() -> Iterator[None]:
     prior_handlers: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
     prior_mask = None
     if hasattr(signal, "pthread_sigmask"):
-        # An empty-set SIG_BLOCK call changes nothing; it is a pure read that
-        # returns the mask already in effect, for restoration later.
+        # Read the mask without changing it.
         prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     _scope_depth = 1
     try:
@@ -403,7 +382,7 @@ def defer_shutdown_signals() -> Iterator[None]:
     without ``pthread_sigmask``.
 
     Yields:
-        ``None``. Use as ``with defer_shutdown_signals(): ...``.
+        ``None`` during the critical section.
 
     """
     global _main_thread_defer_depth  # noqa: PLW0603
@@ -419,9 +398,7 @@ def defer_shutdown_signals() -> Iterator[None]:
         if is_main:
             _main_thread_defer_depth -= 1
         if old_mask is not None:
-            # Restoring the mask delivers any kernel-queued signal right here;
-            # its handler runs normally (depth is already back to zero) and
-            # clears any deferred marker before raising.
+            # Mask restoration delivers queued signals after deferral ends.
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
             _service_deferred_shutdown()
@@ -491,9 +468,7 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
     finally:
         drained: int | None = None
         if old_mask is not None and hasattr(signal, "sigtimedwait"):
-            # Consume any kernel-queued shutdown signal for this thread while
-            # it is still blocked, so restoring the mask cannot deliver it as
-            # an asynchronous exception after the window closes.
+            # Drain while blocked to prevent an exception after commit.
             while True:
                 info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
                 if info is None:
@@ -516,13 +491,12 @@ def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
     Args:
-        proc: The ``Popen`` object returned by a just-completed ``Popen()`` call.
+        proc: Newly launched subprocess.
         pgid: Explicit child process group guarded by ``proc``. When omitted,
             register ``proc``'s own process group.
 
     Returns:
-        The process-group ID (``pgid``) the subprocess was registered under.
-        Callers store this for later ``_unregister`` and signal targeting.
+        Registered process-group ID for removal and signal targeting.
 
     """
     resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
@@ -534,9 +508,7 @@ def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
 def _unregister(pgid: int) -> None:
     """Remove a finished process group from the global child registry.
 
-    Defers shutdown signals while holding ``_lock`` so the signal handler
-    (which also acquires ``_lock``) cannot interrupt and deadlock against
-    the same thread.
+    Defer shutdown while holding ``_lock`` to prevent handler re-entry deadlock.
 
     Args:
         pgid: The process-group ID returned by :func:`_register`. A pgid not

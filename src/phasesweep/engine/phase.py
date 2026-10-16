@@ -71,6 +71,7 @@ from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
     _consecutive_failure_threshold_tripped,
+    _initialize_study_schema,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
     _next_consecutive_failures,
@@ -82,7 +83,6 @@ from phasesweep.engine.study_policy import (
     _record_trial_target,
     _validate_environment_cohort,
     _validate_study_direction,
-    _validate_study_schema,
     _validate_trial_target,
 )
 from phasesweep.engine.trial import (
@@ -480,7 +480,7 @@ def _resume_phase(
         accepted partial-timeout decision replays.
     """
     _validate_study_direction(study, experiment.metric.goal)
-    _validate_study_schema(study)
+    _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
     policy_state = _load_phase_policy_state(study)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
@@ -963,10 +963,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise ActiveAttemptPersistenceError(
             f"Could not persist the allocated lifecycle marker for trial "
             f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
-            "No trainer was started and no GPU lease was consumed. Restore "
-            "write access to the experiment workdir, then run again. With persistent "
-            "storage this refusal durably aborts the phase, so that run also needs "
-            "n_trials raised above its accepted target, or a new experiment name."
+            "No trainer was started and no GPU lease was consumed. With persistent "
+            "storage, raise n_trials above its accepted target or use a new experiment name."
         ) from exc
     # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
     _register_active_attempt(

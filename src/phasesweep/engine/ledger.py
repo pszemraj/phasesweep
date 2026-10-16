@@ -69,9 +69,9 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
-    STUDY_SCHEMA_VERSION,
     _outcome_sequence_counts,
     _recovered_trial_state,
+    _study_schema_supported,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.runtime.files import fsync_directory, journal_file_path
@@ -662,13 +662,10 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
     :raises StudySchemaMismatchError: A populated study is unmarked or any study
         carries an unsupported explicit schema version.
     """
-    # Match _validate_study_schema: create_study can survive an interruption
-    # before the first schema stamp, and an empty unmarked study is claimable.
     unsupported = [
         (name, version)
         for name, version, has_trials in versions
-        if (type(version) is not int or version != STUDY_SCHEMA_VERSION)
-        and (version is not None or has_trials)
+        if not _study_schema_supported(version, has_trials)
     ]
     if unsupported:
         detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
@@ -1087,9 +1084,8 @@ def _create_ledger_directory(directory: Path) -> None:
                 action=OperatorAction.FIX_CONFIG,
             ) from exc
         raise PhaseSweepError(
-            f"Storage ledger directory {directory} could not be created: {exc}. Restore "
-            "write access to the directory that holds it, then run again. Nothing was "
-            "written.",
+            f"Storage ledger directory {directory} could not be created: {exc}. "
+            "Nothing was written.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
 

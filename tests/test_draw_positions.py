@@ -445,6 +445,10 @@ def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
     assert _code_of(optuna.samplers.CmaEsSampler.sample_relative).count("trial.number") == 1
     assert "_cma_rng" not in _code_of(optuna.samplers.CmaEsSampler.reseed_rng)
 
+    grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
+    assert grid._search_space == {"x": [0, 1]}
+    assert len(grid._all_grids) == 2
+
 
 def _code_of(function: Callable[..., object]) -> str:
     """Return a function's source with its comments removed.
@@ -453,7 +457,3 @@ def _code_of(function: Callable[..., object]) -> str:
     :return str: Its source lines, each cut at its first ``#``.
     """
     return "\n".join(line.split("#", 1)[0] for line in inspect.getsource(function).splitlines())
-
-    grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
-    assert grid._search_space == {"x": [0, 1]}
-    assert len(grid._all_grids) == 2

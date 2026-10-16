@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import yaml
 
-import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep._metadata import __version__
@@ -15,7 +16,7 @@ from phasesweep.engine.state import (
     REPRODUCIBILITY_SCHEMA_VERSION,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.runtime.files import file_sha256, private_atomic_write_text
+from phasesweep.runtime.files import atomic_text_writer, file_sha256, private_atomic_write_text
 
 
 def _phase_config_fingerprint(phase: Phase) -> str:
@@ -73,30 +74,30 @@ def _write_generation_provenance(
         yaml.safe_dump(snapshot, sort_keys=False),
         require_private_dir=False,
     )
-    artifact_io._write_json_atomic(
-        path_ops._generation_reproducibility_path(experiment, generation_id),
-        {
-            "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
-            "experiment": experiment.experiment,
-            "generation_id": generation_id,
-            "generation_id_source": "caller" if caller_owned_id else "engine",
-            "phasesweep_version": __version__,
-            "schema_versions": {
-                "reproducibility": REPRODUCIBILITY_SCHEMA_VERSION,
-                "generation_summary": GENERATION_SUMMARY_SCHEMA_VERSION,
-                "study_storage": STUDY_SCHEMA_VERSION,
-                "experiment_fingerprint": fingerprint_ops.EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
-                "phase_fingerprint": fingerprint_ops.FINGERPRINT_SCHEMA_VERSION,
-            },
-            "config_fingerprint": fingerprint_ops._experiment_semantic_fingerprint(experiment),
-            "phase_config_fingerprints": [
-                {"name": phase.name, "sha256": _phase_config_fingerprint(phase)}
-                for phase in experiment.phases
-            ],
-            "provenance": dict(sorted(experiment.provenance.items())),
-            "config_snapshot": {
-                "path": GENERATION_CONFIG_SNAPSHOT_FILENAME,
-                "sha256": file_sha256(snapshot_path),
-            },
+    reproducibility_path = path_ops._generation_reproducibility_path(experiment, generation_id)
+    payload = {
+        "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
+        "experiment": experiment.experiment,
+        "generation_id": generation_id,
+        "generation_id_source": "caller" if caller_owned_id else "engine",
+        "phasesweep_version": __version__,
+        "schema_versions": {
+            "reproducibility": REPRODUCIBILITY_SCHEMA_VERSION,
+            "generation_summary": GENERATION_SUMMARY_SCHEMA_VERSION,
+            "study_storage": STUDY_SCHEMA_VERSION,
+            "experiment_fingerprint": fingerprint_ops.EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
+            "phase_fingerprint": fingerprint_ops.FINGERPRINT_SCHEMA_VERSION,
         },
-    )
+        "config_fingerprint": fingerprint_ops._experiment_semantic_fingerprint(experiment),
+        "phase_config_fingerprints": [
+            {"name": phase.name, "sha256": _phase_config_fingerprint(phase)}
+            for phase in experiment.phases
+        ],
+        "provenance": dict(sorted(experiment.provenance.items())),
+        "config_snapshot": {
+            "path": GENERATION_CONFIG_SNAPSHOT_FILENAME,
+            "sha256": file_sha256(snapshot_path),
+        },
+    }
+    with atomic_text_writer(reproducibility_path) as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")

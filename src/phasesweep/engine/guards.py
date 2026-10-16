@@ -26,10 +26,10 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
+    _initialize_study_schema,
     _load_accepted_partial_decision,
     _validate_environment_cohort,
     _validate_study_direction,
-    _validate_study_schema,
     _validate_trial_target,
 )
 from phasesweep.engine.trial import _environment_identity
@@ -171,7 +171,7 @@ def _preflight_existing_studies(
             continue
         try:
             _validate_study_direction(study, experiment.metric.goal)
-            _validate_study_schema(study)
+            _initialize_study_schema(study)
             if reached:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)

@@ -53,11 +53,7 @@ from phasesweep.runtime.process import (
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
 
-_TRIAL_EVIDENCE_REMEDY = (
-    "PhaseSweep will not select or republish a result whose evidence is gone: restore the "
-    "artifact tree from a backup, or start a new experiment name so nothing ranks against "
-    "trials that can no longer be inspected."
-)
+_TRIAL_EVIDENCE_REMEDY = "Restore the artifact tree from a backup, or start a new experiment name."
 
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no

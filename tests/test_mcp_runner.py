@@ -723,14 +723,14 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "record_fail")
 
-    real_write = generation_ops.artifact_io._write_yaml_exclusive
+    real_write = generation_ops.atomic_create_text
 
-    def fail_record_write(path: Path, payload: object) -> bool:
+    def fail_record_write(path: Path, text: str) -> bool:
         if path.name == "generation.yaml":
             raise OSError("simulated record write failure")
-        return real_write(path, payload)
+        return real_write(path, text)
 
-    monkeypatch.setattr(generation_ops.artifact_io, "_write_yaml_exclusive", fail_record_write)
+    monkeypatch.setattr(generation_ops, "atomic_create_text", fail_record_write)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"

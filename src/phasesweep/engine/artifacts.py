@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import json
 import logging
 from collections.abc import Iterator
 from dataclasses import asdict
@@ -36,7 +35,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction
-from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
+from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
 
@@ -63,34 +62,6 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     text = yaml.safe_dump(payload, sort_keys=False)
     with atomic_text_writer(path, newline="") as handle:
         handle.write(text)
-
-
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    """Atomically write a JSON document to ``path`` with the artifact-tree mode.
-
-    :param Path path: Destination JSON path to replace.
-    :param Any payload: JSON-serializable value to write.
-    :raises TypeError: ``payload`` is not JSON-serializable.
-    :raises OSError: The document could not be staged, written, or renamed.
-    """
-    with atomic_text_writer(path) as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
-def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
-    """Create one complete YAML document without replacing an existing destination.
-
-    Use :func:`atomic_create_text` for staged, fsynced publication of immutable records.
-
-    :param Path path: Destination path to create; the parent directory is
-        created if missing.
-    :param Any payload: YAML-serializable value to write.
-    :return bool: ``True`` when this call created and wrote the file;
-        ``False`` when the destination already existed and nothing was
-        written.
-    """
-    text = yaml.safe_dump(payload, sort_keys=False)
-    return atomic_create_text(path, text)
 
 
 @contextlib.contextmanager

@@ -95,27 +95,16 @@ class PhaseStatusSnapshot(_SnapshotModel):
     winner_present: bool
     trial_data_available: bool
     published_study_unavailable: bool | None = None
-    """Whether the published study was unavailable at capture time.
-
-    ``None`` means availability was not checked, as in pre-generation
-    placeholders. It is not evidence of study availability.
-    """
+    """Published study unavailable at capture; ``None`` means unchecked."""
     running_attempts: list[RunningAttemptSnapshot] | None = None
-    """RUNNING rows the frozen counts describe, or ``None`` when unknown.
+    """RUNNING rows behind the frozen counts; ``None`` means no trial data was read.
 
-    ``None`` means the capture read no trial data for this phase, i.e. it
-    pairs with ``trial_data_available: false`` -- an empty list would assert
-    there are no RUNNING rows. A phase with known trial counts always carries
-    a list, empty when nothing is RUNNING, including a confirmed absent study.
+    Known counts carry a list, empty when no row is RUNNING or the study is absent.
     """
 
 
 class StatusSnapshot(_SnapshotModel):
-    """Terminal status with publication pointers frozen at capture time.
-
-    ``represented_generation_id`` identifies its winner and summary facts;
-    ``is_published`` records their publication relationship at capture time.
-    """
+    """Terminal status with generation identity and publication frozen at capture."""
 
     current_generation_id: str | None = None
     published_generation_id: str | None = None
@@ -129,17 +118,12 @@ class StatusSnapshot(_SnapshotModel):
     summary_present: bool
 
     result_context: ResultContext
-    """Whether ``metric`` and ``result_phase_plan`` are the represented
-    generation's own recorded semantics or the executing config's.
-    """
+    """Source of ``metric`` and ``result_phase_plan``: represented generation or config."""
 
     published_config_matches_current: bool | None = None
-    """Whether the represented generation's config matched at capture time.
+    """Config agreement at capture, recomputed against the catalog on run-scoped reads.
 
-    Run-scoped MCP reads recompute this from the frozen represented-config
-    fingerprint and current catalog config; it is ``None`` when no comparison
-    config is available, or when the represented summary recorded no
-    fingerprint.
+    ``None`` means the comparison config or represented fingerprint was unavailable.
     """
 
     result_phase_plan: list[str]

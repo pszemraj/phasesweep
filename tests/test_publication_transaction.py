@@ -337,7 +337,7 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
 @pytest.mark.parametrize(
     "fault",
     [
-        pytest.param("_write_yaml_exclusive", id="immutable-record-write"),
+        pytest.param("atomic_create_text", id="immutable-record-write"),
         pytest.param("_copy_yaml_projection", id="convenience-projection"),
     ],
 )
@@ -352,7 +352,7 @@ def test_postcommit_write_failure_leaves_run_successful(
     run_experiment(experiment)
     first_generation = published_generation_id(experiment)
     assert first_generation is not None
-    record_write = fault == "_write_yaml_exclusive"
+    record_write = fault == "atomic_create_text"
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated projection failure")
@@ -431,14 +431,14 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     """
     experiment = _stored_experiment(tmp_path)
 
-    original = artifact_io._write_yaml_exclusive
+    original = generation_ops.atomic_create_text
 
-    def interrupt_record_write(path: Path, payload: object) -> bool:
+    def interrupt_record_write(path: Path, text: str) -> bool:
         if path.name == "generation.yaml":
             raise KeyboardInterrupt
-        return original(path, payload)
+        return original(path, text)
 
-    monkeypatch.setattr(artifact_io, "_write_yaml_exclusive", interrupt_record_write)
+    monkeypatch.setattr(generation_ops, "atomic_create_text", interrupt_record_write)
 
     winners = run_experiment(experiment)
 
@@ -631,14 +631,14 @@ def test_successful_publication_never_logs_a_record_refusal(
 
 def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
     """Make writing an immutable record raise ``OSError``, for one record path or every one."""
-    original = artifact_io._write_yaml_exclusive
+    original = generation_ops.atomic_create_text
 
-    def flaky(path: Path, payload: object) -> bool:
+    def flaky(path: Path, text: str) -> bool:
         if path.name == "generation.yaml" and (only is None or path == only):
             raise OSError("simulated record write failure")
-        return original(path, payload)
+        return original(path, text)
 
-    monkeypatch.setattr(artifact_io, "_write_yaml_exclusive", flaky)
+    monkeypatch.setattr(generation_ops, "atomic_create_text", flaky)
 
 
 def _publish_without_record(

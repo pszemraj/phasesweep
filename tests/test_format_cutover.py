@@ -43,6 +43,7 @@ from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import (
     _load_recovery_studies,
@@ -123,9 +124,13 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     assert tree_snapshot(root) == before
 
 
-@pytest.mark.parametrize("schema_version", [2, None], ids=["old-version", "unmarked"])
-def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
-    tmp_path: Path, schema_version: int | None
+@pytest.mark.parametrize(
+    "schema_version",
+    [2, None, float(STUDY_SCHEMA_VERSION), True],
+    ids=["old-version", "unmarked", "float-version", "bool-version"],
+)
+def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
+    tmp_path: Path, schema_version: int | float | None
 ) -> None:
     """Changing experiment/workdir cannot reinterpret an old populated ledger as fresh."""
     ledger = tmp_path / "old.journal"
@@ -159,6 +164,36 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
         for path in sorted(tmp_path.glob(f"{ledger.name}*"))
         if path.is_file()
     } == ledger_before
+
+
+def test_float_schema_is_refused_by_live_and_snapshot_checks(tmp_path: Path) -> None:
+    """A numerically equal float stamp is unsupported through every schema check."""
+    storage = f"journal:///{tmp_path / 'float.journal'}"
+    study = optuna.create_study(study_name="t::p", storage=_resolve_storage(storage))
+    study.set_user_attr(STUDY_SCHEMA_ATTR, float(STUDY_SCHEMA_VERSION))
+    study.ask()
+    trials = study.get_trials(deepcopy=False)
+    before = tree_snapshot(tmp_path)
+
+    with pytest.raises(StudySchemaMismatchError, match=r"t::p.*Affected trial numbers: \[0\]"):
+        _initialize_study_schema(study)
+    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+        engine_ledger._check_study_schema(study, trials)
+    with pytest.raises(StudySchemaMismatchError, match="t::p.*Nothing was written"):
+        engine_ledger._scan_ledger_format(storage)
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_empty_unmarked_schema_check_is_read_only_and_live_initializer_stamps() -> None:
+    """Only the live initializer stamps a valid empty allocation, using an integer."""
+    study = optuna.create_study()
+    _validate_study_schema(study)
+    assert STUDY_SCHEMA_ATTR not in study.user_attrs
+
+    _initialize_study_schema(study)
+    assert type(study.user_attrs[STUDY_SCHEMA_ATTR]) is int
+    assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])

@@ -529,7 +529,6 @@ def _write_status(
         when nothing could be persisted at all.
     """
     log = logging.getLogger("phasesweep.mcp.runner")
-    # Defer shutdown through persistence, including signals absorbed during capture.
     with defer_shutdown_signals():
         terminal = {
             **payload,

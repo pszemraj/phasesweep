@@ -234,6 +234,18 @@ ARTIFACT_ROOT_ATTR = "phasesweep_artifact_root_v1"
 CONSTRAINT_PREFIX = "constraint:"
 
 
+def _study_schema_supported(version: object, has_trials: bool) -> bool:
+    """Accept the current integer stamp or an empty, unmarked allocation.
+
+    :param object version: Decoded study schema attr, or None when absent.
+    :param bool has_trials: Whether the study contains any trials.
+    :return bool: Whether the study's schema is supported.
+    """
+    return (type(version) is int and version == STUDY_SCHEMA_VERSION) or (
+        version is None and not has_trials
+    )
+
+
 def constraint_attr(name: str) -> str:
     """Return the persisted user-attr key for a constraint value.
 

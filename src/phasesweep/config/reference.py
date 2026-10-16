@@ -300,6 +300,16 @@ def closest(key: str, limit: int = 3) -> tuple[str, ...]:
     return tuple(suggestions[:limit])
 
 
+def lookup_or_suggest(key: str) -> tuple[tuple[ReferenceEntry, ...], tuple[str, ...]]:
+    """Find entries for a supplied key, suggesting alternatives only on a miss.
+
+    :param str key: User-typed key; an empty normalized path matches nothing.
+    :return tuple[tuple[ReferenceEntry, ...], tuple[str, ...]]: Entries and suggestions.
+    """
+    entries = lookup(key) if plain_path(key) else ()
+    return entries, () if entries else closest(key)
+
+
 def loc_to_path(loc: Sequence[int | str]) -> str | None:
     """Map a validation error location to the deepest documented key it points into.
 

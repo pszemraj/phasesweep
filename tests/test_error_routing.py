@@ -708,7 +708,7 @@ def _preflight(
         if after_claim is not None:
             after_claim(experiment)
         if schema_check is not None:
-            monkeypatch.setattr(guards, "_validate_study_schema", schema_check)
+            monkeypatch.setattr(guards, "_initialize_study_schema", schema_check)
         return guards._preflight_existing_studies(
             replace(claimed, studies=MappingProxyType(dict(studies())))
         )
@@ -1640,7 +1640,7 @@ ORIGIN_CASES = (
         trigger=_claim_ledger_under(_unwritable_directory),
         raised=PhaseSweepError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore write access to the directory that holds it, then run again.",
+        message="could not be created",
         marks=(requires_nonroot,),
     ),
     RoutingCase(
