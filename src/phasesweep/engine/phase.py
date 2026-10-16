@@ -163,8 +163,7 @@ def _partial_completion_for_replay(
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
-            "decision was committed. Use a new experiment name, or archive/delete "
-            "the inconsistent study."
+            "decision was committed."
         )
     return _winner_completion(
         requested_trials=decision.trial_target,

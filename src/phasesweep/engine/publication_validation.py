@@ -19,7 +19,7 @@ from phasesweep.config.models import Experiment, Metric, _metric_semantics_paylo
 from phasesweep.config.search import Repeats
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
-from phasesweep.engine.repeats import _check_repeats_axis, _validate_repeats_block
+from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
     _GENERATION_FILE_FILENAMES,
     _MANIFEST_GENERATION_FILE_KINDS,
@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PUBLICATION_POINTER_SCHEMA_VERSION,
     WINNER_FILENAME,
+    WinnerSource,
     _parse_winner_source,
     _validate_observed_block,
 )
@@ -57,6 +58,11 @@ class ValidatedWinner:
     """The exact bytes whose digest matched the manifest."""
     payload: Mapping[str, Any]
     """The mapping decoded from ``content``."""
+    metric: float
+    source: WinnerSource
+    confound: Mapping[str, object]
+    observed: dict[str, float]
+    repeats: RepeatsRecord | None
 
 
 @dataclass(frozen=True)
@@ -374,7 +380,7 @@ def _validate_generation_manifest(
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid confound block ({exc})") from exc
         try:
-            _validate_observed_block(payload.get("observed"))
+            observed = _validate_observed_block(payload.get("observed"))
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid observed block ({exc})") from exc
         try:
@@ -386,7 +392,15 @@ def _validate_generation_manifest(
             _check_repeats_axis(repeats, snapshot_phases.repeats[name])
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid repeats block ({exc})") from exc
-        winners[name] = ValidatedWinner(content=content, payload=payload)
+        winners[name] = ValidatedWinner(
+            content=content,
+            payload=payload,
+            metric=float(value),
+            source=parsed_source,
+            confound=confound,
+            observed=observed,
+            repeats=repeats,
+        )
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
         for phase_dir in phases_dir.iterdir():

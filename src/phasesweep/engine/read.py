@@ -43,7 +43,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
 )
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
-from phasesweep.engine.publication_validation import _parse_phase_plan
+from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
     RepeatsSummary,
     _repeats_summary,
@@ -187,14 +187,23 @@ def _phase_status_payloads(
     return phases
 
 
-def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | None:
+def _winner_view(
+    winner: Mapping[str, object] | ValidatedWinner, phase_name: str
+) -> PhaseWinnerView | None:
     """Reduce one decoded winner payload using the permissive read contract.
 
-    :param Mapping[str, Any] data: Decoded winner payload.
+    :param Mapping[str, object] | ValidatedWinner winner: Decoded winner payload or
+        captured publication facts.
     :param str phase_name: Phase name exposed by the winner.
     :return PhaseWinnerView | None: The winner view, or ``None`` when the
         payload is malformed.
     """
+    if isinstance(winner, ValidatedWinner):
+        validated = winner
+        data = winner.payload
+    else:
+        validated = None
+        data = winner
     try:
         # Read the metric under its recorded name, even if the current config renamed it.
         metric_block = data.get("metric") or {}
@@ -214,14 +223,24 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         effective_overrides = data.get("effective_overrides") or {}
         if not isinstance(effective_overrides, Mapping):
             return None
-        source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         trial_number = int(data["trial_number"])
-        confound_block = _validate_confound_block(data.get("confound"), winner_trial=trial_number)
+        if validated is None:
+            source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
+            confound_block = _validate_confound_block(
+                data.get("confound"), winner_trial=trial_number
+            )
+            metric = float(metric_block[stored_metric_name])
+            repeats = _validate_repeats_block(
+                data, metric_value=metric, ranked_groups=confound_block["ranked_groups"]
+            )
+            observed = _validate_observed_block(data.get("observed"))
+        else:
+            source = validated.source
+            confound_block = dict(validated.confound)
+            metric = validated.metric
+            repeats = validated.repeats
+            observed = dict(validated.observed)
         confound = _confound_summary(confound_block, winner_trial=trial_number)
-        metric = float(metric_block[stored_metric_name])
-        repeats = _validate_repeats_block(
-            data, metric_value=metric, ranked_groups=confound_block["ranked_groups"]
-        )
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=trial_number,
@@ -232,7 +251,7 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             incomplete=bool(completion.get("incomplete", False)),
             source=source,
             confound=confound,
-            observed=_validate_observed_block(data.get("observed")),
+            observed=observed,
             repeats=None if repeats is None else _repeats_summary(repeats),
         )
     except (KeyError, ValueError, TypeError):
@@ -283,7 +302,7 @@ def _represented_winners(
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
-            _winner_view(validated.winners[name].payload, name)
+            _winner_view(validated.winners[name], name)
             for name in phase_names
             if name in validated.winners
         ]

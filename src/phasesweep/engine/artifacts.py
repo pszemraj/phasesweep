@@ -16,7 +16,6 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
 from phasesweep.engine.optuna import _trial_state_label
 from phasesweep.engine.progress import _warn_once
@@ -24,14 +23,11 @@ from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
-    _validate_repeats_block,
     group_labels_for,
 )
 from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     Winner,
-    _parse_winner_source,
-    _validate_observed_block,
 )
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction
@@ -314,34 +310,26 @@ def _load_winner(
         )
 
     try:
-        source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
         stored_env_digest = data["trainer_env_digest"]
-        metric = float(data["metric"][experiment.metric.name])
-        confound = _validate_confound_block(
-            data["confound"], winner_trial=int(data["trial_number"])
-        )
-        repeats = _validate_repeats_block(
-            data, metric_value=metric, ranked_groups=confound["ranked_groups"]
-        )
-        _check_repeats_axis(repeats, phase.repeats)
+        _check_repeats_axis(validated.repeats, phase.repeats)
         winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
             effective_overrides=dict(data["effective_overrides"]),
-            metric=metric,
+            metric=validated.metric,
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
             phase_fingerprint=stored_fp,
             generation_id=data["generation_id"],
             attempt_id=data["attempt_id"],
-            source=source,
+            source=validated.source,
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
-            confound=confound,
-            observed=_validate_observed_block(data["observed"]),
-            repeats=repeats,
+            confound=dict(validated.confound),
+            observed=dict(validated.observed),
+            repeats=validated.repeats,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

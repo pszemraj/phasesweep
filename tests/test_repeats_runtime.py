@@ -22,6 +22,7 @@ from phasesweep.config.search import (
     Sampler,
     sampler_search_space,
 )
+from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
@@ -32,9 +33,8 @@ from phasesweep.engine.paths import (
     _phase_dir,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.publication_validation import ValidatedWinner
 from phasesweep.engine.read import _winner_view, read_result, read_status, read_trial_tables
-from phasesweep.engine.repeats import ReduceName, reduce_values, spread
+from phasesweep.engine.repeats import ReduceName, _validate_repeats_block, reduce_values, spread
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_trainer
@@ -430,9 +430,21 @@ def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
     """The winner a skipped phase loads must carry the repeat axis the current config declares."""
     experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
     winner = _winner_payload(experiment, generation_id)
-    _forge_axis_mismatch(winner, tamper)
+    aggregate = _forge_axis_mismatch(winner, tamper)
     published = _published_for_resume(experiment)
-    forged = replace(published, winners={"p": ValidatedWinner(content=b"", payload=winner)})
+    confound = _validate_confound_block(
+        winner["confound"], winner_trial=published.winners["p"].source.trial_number
+    )
+    forged_winner = replace(
+        published.winners["p"],
+        payload=winner,
+        metric=aggregate,
+        confound=confound,
+        repeats=_validate_repeats_block(
+            winner, metric_value=aggregate, ranked_groups=confound["ranked_groups"]
+        ),
+    )
+    forged = replace(published, winners={"p": forged_winner})
 
     with pytest.raises(WinnerIntegrityError) as raised:
         artifact_io._load_winner(experiment, experiment.phases[0], {}, publication=forged)
