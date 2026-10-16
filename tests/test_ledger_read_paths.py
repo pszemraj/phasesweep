@@ -20,7 +20,6 @@ verdict over the current ledger a refusal where every pure read says ``ok``.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -97,16 +96,6 @@ def _classify_message(message: str) -> str:
     return f"unclassified: {message}"
 
 
-def _engine_verdict(call: Callable[[], object]) -> str:
-    """Run one in-process read path and report that it completed.
-
-    :param Callable[[], object] call: Read path invocation.
-    :return str: ``"ok"``.
-    """
-    call()
-    return "ok"
-
-
 def _cli_verdict(
     argv: list[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -176,25 +165,8 @@ def _mode_cells() -> list[Any]:
     ]
 
 
-def _matrix() -> list[Any]:
-    """Build the fixture x mode x read-path matrix.
-
-    :return list[pytest.param]: One parameter set per cell.
-    """
-    return [
-        pytest.param(
-            fixture.name,
-            mode,
-            read_path,
-            id=f"{fixture.name}-{mode}-{read_path}",
-        )
-        for fixture in discover_ledger_fixtures()
-        for mode in fixture.modes
-        for read_path in READ_PATHS
-    ]
-
-
-@pytest.mark.parametrize(("fixture_name", "mode", "read_path"), _matrix())
+@pytest.mark.parametrize("read_path", READ_PATHS)
+@pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
 def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     fixture_name: str,
     mode: str,
@@ -217,24 +189,22 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         attempts = forbid_file_backed_storage(
             monkeypatch, allow_memory_studies=read_path in DRY_RUN_READ_PATHS
         )
+        verdict = "ok"
         if read_path == "engine-read_status":
-            verdict = _engine_verdict(lambda: read_status(materialized.experiment))
+            read_status(materialized.experiment)
         elif read_path == "engine-read_result":
-            verdict = _engine_verdict(
-                lambda: read_result(
-                    materialized.experiment,
-                    phase_names=[phase.name for phase in materialized.experiment.phases],
-                )[1]
+            read_result(
+                materialized.experiment,
+                phase_names=[phase.name for phase in materialized.experiment.phases],
             )
         elif read_path == "engine-read_trial_tables":
-            verdict = _engine_verdict(lambda: read_trial_tables(materialized.experiment))
+            read_trial_tables(materialized.experiment)
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
-            verdict = _engine_verdict(
-                lambda: [read_phase_trials(ledger, p) for p in materialized.experiment.phases]
-            )
+            for phase in materialized.experiment.phases:
+                read_phase_trials(ledger, phase)
         elif read_path == "mcp-snapshot":
-            verdict = _engine_verdict(lambda: capture_result_snapshot(materialized.experiment))
+            capture_result_snapshot(materialized.experiment)
         elif read_path == "cli-status":
             verdict = _cli_verdict(["status", str(materialized.config_path)], monkeypatch, capsys)
         elif read_path == "cli-status-trials":
@@ -246,7 +216,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
                 ["show-winners", str(materialized.config_path)], monkeypatch, capsys
             )
         elif read_path == "engine-run_dry_run":
-            verdict = _engine_verdict(lambda: run_experiment(materialized.experiment, dry_run=True))
+            run_experiment(materialized.experiment, dry_run=True)
         elif read_path == "cli-run-dry-run":
             verdict = _cli_verdict(
                 ["run", str(materialized.config_path), "--dry-run"], monkeypatch, capsys

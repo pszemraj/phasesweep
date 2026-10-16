@@ -68,6 +68,25 @@ def _sleeping_score_experiment(
     ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
+def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
+    """Attach the standard trial context to a process result for extraction checks."""
+    return ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=process.return_code,
+            duration_seconds=process.duration_seconds,
+        ),
+        process=process,
+    )
+
+
 @pytest.mark.integration
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -82,17 +101,20 @@ def test_runtime_rejects_unexplained_trial_budget_shortfall(
 
 
 @pytest.mark.integration
-def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
-    """A phase wallclock timeout must not bless the best partial trial by default."""
+@pytest.mark.parametrize("guard", ["phase", "run"], ids=["phase-guard", "run-guard"])
+def test_wallclock_timeout_refuses_incomplete_winner(tmp_path: Path, guard: str) -> None:
+    """A phase or run wallclock timeout must not bless the best partial trial by default."""
     exp = _sleeping_score_experiment(
         tmp_path,
-        experiment="phase_timeout",
-        timeout_seconds_per_phase=0.2,
+        experiment=f"{guard}_timeout",
+        **{f"timeout_seconds_per_{guard}": 0.2},
     )
 
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner",
+        match=r"timed out via phase guard .*Refusing to select a winner"
+        if guard == "phase"
+        else "run guard",
     ):
         run_experiment(exp)
 
@@ -655,18 +677,6 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     assert completion["reason"] == "timeout"
 
 
-@pytest.mark.integration
-def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
-    exp = _sleeping_score_experiment(
-        tmp_path,
-        experiment="run_timeout",
-        timeout_seconds_per_run=0.2,
-    )
-
-    with pytest.raises(TimeoutError, match="run guard"):
-        run_experiment(exp)
-
-
 def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """A successful trainer whose evidence lands past the deadline cannot count.
 
@@ -676,20 +686,9 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """
     experiment = make_experiment(workdir=tmp_path)
     (tmp_path / "r.json").write_text('{"x": 1.0}')
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=0,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
+    executed = _executed_trial(
+        tmp_path,
+        ProcessResult(
             return_code=0,
             timed_out=False,
             pid=123,
@@ -767,20 +766,8 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
         type="wandb", entity="e", project="p", metric_key="eval/loss", evaluation_axis="eval/step"
     )
     experiment = make_experiment(workdir=tmp_path, metric=Metric(extractor=objective))
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=0,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    executed = _executed_trial(
+        tmp_path, ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1)
     )
 
     result = extract_trial_result(experiment=experiment, executed=executed, deadline=150.0)
@@ -812,20 +799,9 @@ def test_trainer_timeout_attribution_follows_wallclock_cap(
     """A killed trainer is deadline-attributed only when its cap was the deadline."""
     experiment = make_experiment(workdir=tmp_path)
     failure = "timed out after 1.0s" if timed_out else "trainer failed"
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=1,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
+    executed = _executed_trial(
+        tmp_path,
+        ProcessResult(
             return_code=1,
             timed_out=timed_out,
             pid=123,

@@ -384,120 +384,100 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
     assert "lr" in lr_eff
 
 
-def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
-    """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
-    cases = [
-        (
-            "n_trials_top_up",
-            lambda: (make_experiment(n_trials=4), make_experiment(n_trials=64)),
+@pytest.mark.parametrize(
+    "before,after,expected_equal",
+    [
+        pytest.param({"n_trials": 4}, {"n_trials": 64}, True, id="n_trials_top_up"),
+        pytest.param(
+            {"n_jobs": 1},
+            {
+                "n_jobs": 4,
+                "gpu_devices": ["GPU-deadbeef"],
+                "allow_no_gpu_isolation": True,
+                "allow_incomplete_on_timeout": True,
+            },
             True,
+            id="throughput_run_control",
         ),
-        (
-            "throughput_run_control",
-            lambda: (
-                make_experiment(n_jobs=1),
-                make_experiment(
-                    n_jobs=4,
-                    gpu_devices=["GPU-deadbeef"],
-                    allow_no_gpu_isolation=True,
-                    allow_incomplete_on_timeout=True,
-                ),
-            ),
-            True,
-        ),
-        (
-            "env",
-            lambda: (
-                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}),
-                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"}),
-            ),
+        pytest.param(
+            {"n_trials": 4, "env": {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}},
+            {"n_trials": 4, "env": {"CUBLAS_WORKSPACE_CONFIG": ":16:8"}},
             False,
+            id="env",
         ),
-        (
-            "provenance",
-            lambda: (
-                make_experiment(provenance={"revision": "trainer-v1"}),
-                make_experiment(provenance={"revision": "trainer-v2"}),
-            ),
+        pytest.param(
+            {"provenance": {"revision": "trainer-v1"}},
+            {"provenance": {"revision": "trainer-v2"}},
             False,
+            id="provenance",
         ),
-        (
-            "trainer_config",
-            lambda: (
-                make_experiment(
-                    trial_command="echo {config_path}",
-                    override_format="yaml_file",
-                    trainer_config={"model": {"depth": 4}},
-                ),
-                make_experiment(
-                    trial_command="echo {config_path}",
-                    override_format="yaml_file",
-                    trainer_config={"model": {"depth": 8}},
-                ),
-            ),
+        pytest.param(
+            {
+                "trial_command": "echo {config_path}",
+                "override_format": "yaml_file",
+                "trainer_config": {"model": {"depth": 4}},
+            },
+            {
+                "trial_command": "echo {config_path}",
+                "override_format": "yaml_file",
+                "trainer_config": {"model": {"depth": 8}},
+            },
             False,
+            id="trainer_config",
         ),
-        (
-            "search_space",
-            lambda: (
-                make_experiment(search_space={"x": IntParam(type="int", low=0, high=10)}),
-                make_experiment(search_space={"x": IntParam(type="int", low=0, high=20)}),
-            ),
+        pytest.param(
+            {"search_space": {"x": IntParam(type="int", low=0, high=10)}},
+            {"search_space": {"x": IntParam(type="int", low=0, high=20)}},
             False,
+            id="search_space",
         ),
-        (
-            "timeout_seconds_per_trial",
-            lambda: (
-                make_experiment(timeout_seconds_per_trial=60.0),
-                make_experiment(timeout_seconds_per_trial=3600.0),
-            ),
+        pytest.param(
+            {"timeout_seconds_per_trial": 60.0},
+            {"timeout_seconds_per_trial": 3600.0},
             False,
+            id="timeout_seconds_per_trial",
         ),
-        (
-            "gpu_policy",
-            lambda: (
-                make_experiment(gpu_policy="single_per_trial"),
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
-            ),
+        pytest.param(
+            {"gpu_policy": "single_per_trial"},
+            {"gpu_policy": "whole_node", "gpu_ids": [0]},
             False,
+            id="gpu_policy",
         ),
         # Under whole_node the device-set SIZE is the trainer's world size —
         # semantic — while its spelling stays run-control, and under
         # single_per_trial the whole list stays run-control.
-        (
-            "whole_node_device_count",
-            lambda: (
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1, 2, 3]),
-            ),
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_ids": [0]},
+            {"gpu_policy": "whole_node", "gpu_ids": [0, 1, 2, 3]},
             False,
+            id="whole_node_device_count",
         ),
-        (
-            "whole_node_device_spelling",
-            lambda: (
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1]),
-                make_experiment(gpu_policy="whole_node", gpu_devices=["GPU-a", "GPU-b"]),
-            ),
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_ids": [0, 1]},
+            {"gpu_policy": "whole_node", "gpu_devices": ["GPU-a", "GPU-b"]},
             True,
+            id="whole_node_device_spelling",
         ),
-        (
-            "single_per_trial_gpu_ids_are_run_control",
-            lambda: (
-                make_experiment(gpu_ids=[0]),
-                make_experiment(gpu_ids=[0, 1, 2, 3]),
-            ),
+        pytest.param(
+            {"gpu_ids": [0]},
+            {"gpu_ids": [0, 1, 2, 3]},
             True,
+            id="single_per_trial_gpu_ids_are_run_control",
         ),
-    ]
-
-    for case, build_pair, expected_equal in cases:
-        exp_a, exp_b = build_pair()
-        fp_a = _phase_fingerprint(exp_a, exp_a.phases[0], {})
-        fp_b = _phase_fingerprint(exp_b, exp_b.phases[0], {})
-        if expected_equal:
-            assert fp_a == fp_b, case
-        else:
-            assert fp_a != fp_b, case
+    ],
+)
+def test_fingerprint_includes_semantic_fields_but_ignores_run_control(
+    before, after, expected_equal
+) -> None:
+    """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
+    exp_a = make_experiment(**before)
+    exp_b = make_experiment(**after)
+    fp_a = _phase_fingerprint(exp_a, exp_a.phases[0], {})
+    fp_b = _phase_fingerprint(exp_b, exp_b.phases[0], {})
+    if expected_equal:
+        assert fp_a == fp_b
+    else:
+        assert fp_a != fp_b
 
 
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
@@ -790,19 +770,19 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     """An aborted TPE phase continues when its target rises, drawing from TPE's model what one run with the same outcomes draws."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
         n_trials=3,
         max_consecutive_failures=1,
         sampler=Sampler(type="tpe", seed=0, n_startup_trials=0),  # all draws from the model
-        search_space={"x": IntParam(type="int", low=0, high=10)},
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    phase = experiment.phases[0]
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
     write_constant_trainer(tmp_path)
-    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
+    top_up = _with_trial_target(experiment, 4)
     run_experiment(top_up)
     # One uninterrupted run whose trial 0 fails as the aborted one did.
     control_trainer = write_trainer(
@@ -836,13 +816,9 @@ def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
     """A TPE study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
-        n_trials=2,
-        sampler=_SEEDED_TPE,
-        search_space={"x": IntParam(type="int", low=0, high=10)},
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=2, sampler=_SEEDED_TPE
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)
 
@@ -857,17 +833,13 @@ def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
 def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
-        n_trials=3,
-        sampler=Sampler(type="random", seed=0),
-        search_space={"x": IntParam(type="int", low=0, high=10)},
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=3, sampler=Sampler(type="random", seed=0)
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winners = run_experiment(experiment)
     winner_before = _winner_path(experiment, "p").read_bytes()
 
-    lowered = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 1})]})
+    lowered = _with_trial_target(experiment, 1)
     with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
         run_experiment(lowered)
 
@@ -970,9 +942,7 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
-    topped_up = experiment.model_copy(
-        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
-    )
+    topped_up = _with_trial_target(experiment, 2)
     run_experiment(topped_up)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))

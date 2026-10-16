@@ -262,12 +262,18 @@ def test_publication_commit_failure_keeps_prior_publication(
 
 
 @pytest.mark.integration
-def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: Path) -> None:
-    """A detached-run snapshot that cannot become durable must block publication."""
+@pytest.mark.parametrize(
+    "prepare_fails", [True, False], ids=["prepare-fails", "committed-interrupts"]
+)
+def test_publication_sidecar_observes_the_pointer_commit_boundary(
+    tmp_path: Path, prepare_fails: bool
+) -> None:
+    """Preparation failures block publication; committed notification cannot downgrade it."""
     experiment = _stored_experiment(tmp_path)
     prepared_generation: str | None = None
+    events: list[str] = []
 
-    class FailingHook:
+    class ObservingHook:
         def prepare(
             self,
             *,
@@ -281,51 +287,29 @@ def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: 
             assert set(winners) == {"p"}
             assert summary["generation_id"] == generation_id
             assert published_generation_id(experiment) is None
-            raise OSError("simulated detached snapshot persistence failure")
-
-        def committed(self, *, generation_id: str) -> None:
-            raise AssertionError(f"uncommitted generation was notified: {generation_id}")
-
-    with pytest.raises(OSError, match="detached snapshot persistence failure"):
-        run_experiment(experiment, publication_hook=FailingHook())
-
-    assert prepared_generation is not None
-    assert published_generation_id(experiment) is None
-    assert _record_state(experiment, prepared_generation) == "publication_failed"
-
-
-@pytest.mark.integration
-def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) -> None:
-    """Postcommit notification observes the pointer and cannot downgrade success."""
-    experiment = _stored_experiment(tmp_path)
-    events: list[str] = []
-
-    class ObservingHook:
-        def prepare(
-            self,
-            *,
-            experiment: Experiment,
-            generation_id: str,
-            winners: Mapping[str, Winner],
-            summary: Mapping[str, object],
-        ) -> None:
-            assert set(winners) == {"p"}
-            assert summary["generation_id"] == generation_id
-            assert published_generation_id(experiment) is None
             events.append(f"prepared:{generation_id}")
+            if prepare_fails:
+                raise OSError("simulated detached snapshot persistence failure")
 
         def committed(self, *, generation_id: str) -> None:
+            assert not prepare_fails, f"uncommitted generation was notified: {generation_id}"
             assert published_generation_id(experiment) == generation_id
             events.append(f"committed:{generation_id}")
             raise KeyboardInterrupt("simulated postcommit interruption")
 
-    winners = run_experiment(experiment, publication_hook=ObservingHook())
-
-    assert set(winners) == {"p"}
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    assert events == [f"prepared:{generation_id}", f"committed:{generation_id}"]
-    assert _record_state(experiment, generation_id) == "published"
+    if prepare_fails:
+        with pytest.raises(OSError, match="detached snapshot persistence failure"):
+            run_experiment(experiment, publication_hook=ObservingHook())
+        assert prepared_generation is not None
+        assert published_generation_id(experiment) is None
+        assert _record_state(experiment, prepared_generation) == "publication_failed"
+    else:
+        winners = run_experiment(experiment, publication_hook=ObservingHook())
+        assert set(winners) == {"p"}
+        generation_id = published_generation_id(experiment)
+        assert generation_id is not None
+        assert events == [f"prepared:{generation_id}", f"committed:{generation_id}"]
+        assert _record_state(experiment, generation_id) == "published"
 
 
 # --------------------------------------------------------------------------
@@ -1335,32 +1319,15 @@ def test_from_phase_preflight_validates_the_published_manifest_once(
         trainer=trainer,
         phases=[
             Phase(
-                name="a",
+                name=name,
+                inherits=[previous] if previous is not None else [],
                 n_trials=1,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=4)},
-            ),
-            Phase(
-                name="b",
-                inherits=["a"],
-                n_trials=1,
-                sampler=Sampler(type="random", seed=1),
-                search_space={"y": IntParam(type="int", low=0, high=4)},
-            ),
-            Phase(
-                name="c",
-                inherits=["b"],
-                n_trials=1,
-                sampler=Sampler(type="random", seed=2),
-                search_space={"z": IntParam(type="int", low=0, high=4)},
-            ),
-            Phase(
-                name="d",
-                inherits=["c"],
-                n_trials=1,
-                sampler=Sampler(type="random", seed=3),
-                search_space={"w": IntParam(type="int", low=0, high=4)},
-            ),
+                sampler=Sampler(type="random", seed=seed),
+                search_space={parameter: IntParam(type="int", low=0, high=4)},
+            )
+            for seed, (name, previous, parameter) in enumerate(
+                [("a", None, "x"), ("b", "a", "y"), ("c", "b", "z"), ("d", "c", "w")]
+            )
         ],
     )
     run_experiment(experiment)

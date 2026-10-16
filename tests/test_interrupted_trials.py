@@ -302,12 +302,8 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     lines = [record.getMessage() for record in caplog.records]
     expected = run_experiment(control)["p"]
 
-    trials = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(exp.resolved_storage)
-    ).get_trials(deepcopy=False)
-    controls = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
-    ).get_trials(deepcopy=False)
+    trials = _phase_trials(exp)
+    controls = _phase_trials(control)
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert _trial_interrupted(trials[0])
     assert trials[1].user_attrs[RERUN_OF_ATTR] == 0

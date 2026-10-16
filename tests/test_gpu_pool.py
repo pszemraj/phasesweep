@@ -104,20 +104,24 @@ def test_gpu_pool_normalizes_and_deduplicates_device_tokens(
     assert [device.visible_token for device in pool._devices] == expected_tokens
 
 
-def test_explicit_gpu_ids_honored_for_single_job():
-    """A single-job phase with gpu_ids=[3] must isolate to GPU 3, not no-op."""
-    pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
+@pytest.mark.parametrize(
+    ("gpu_kwargs", "visible", "lease_count"),
+    [
+        pytest.param({"explicit_ids": [3]}, "3", 1, id="default-single-device"),
+        pytest.param(
+            {"explicit_ids": [0, 1, 2], "policy": "whole_node"},
+            "0,1,2",
+            3,
+            id="whole-node-all-devices",
+        ),
+    ],
+)
+def test_single_job_assigns_configured_gpu_ids(gpu_kwargs, visible, lease_count) -> None:
+    """Default acquisition isolates one GPU; whole-node acquisition leases every configured GPU."""
+    pool = GpuPool.create(n_jobs=1, **gpu_kwargs)
     with pool.acquire() as gid:
-        assert gid.visible_devices == "3"
-        assert len(gid.lease_fds) == 1
-
-
-def test_whole_node_policy_assigns_all_configured_devices() -> None:
-    pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1, 2], policy="whole_node")
-
-    with pool.acquire() as gid:
-        assert gid.visible_devices == "0,1,2"
-        assert len(gid.lease_fds) == 3
+        assert gid.visible_devices == visible
+        assert len(gid.lease_fds) == lease_count
 
 
 def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> None:
@@ -253,14 +257,22 @@ def test_single_job_autodetects_and_leases_visible_gpu(monkeypatch):
         assert gid.visible_devices == "3"
 
 
-def test_single_job_without_gpus_runs_without_isolation(monkeypatch):
-    """CPU-only single-job work does not need an explicit no-GPU opt-in."""
+@pytest.mark.parametrize(
+    ("pool_kwargs", "visible"),
+    [
+        pytest.param({"n_jobs": 1}, None, id="single-job-no-gpus"),
+        pytest.param({"n_jobs": 4, "cuda_visible_devices": "-1"}, "-1", id="explicit-cpu"),
+    ],
+)
+def test_cpu_work_needs_no_gpu_detection_opt_in(monkeypatch, pool_kwargs, visible) -> None:
+    """Single-job CPU work and explicitly disabled CUDA need no no-GPU opt-in."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-
-    pool = GpuPool.create(n_jobs=1)
-
+    pool = GpuPool.create(**pool_kwargs)
     with pool.acquire() as gid:
-        assert gid.visible_devices is None
+        if visible is None:
+            assert gid.visible_devices is None
+        else:
+            assert gid.visible_devices == visible
 
 
 def test_single_job_fails_when_nvidia_smi_is_broken_on_gpu_host(
@@ -308,13 +320,19 @@ def test_broken_nvidia_smi_requires_explicit_fail_open_opt_in(
     assert any("allow_no_gpu_isolation: true" in record.message for record in caplog.records)
 
 
-def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
-
+@pytest.mark.parametrize(
+    ("ambient", "visible"),
+    [
+        pytest.param("2,5", "2", id="numeric-devices"),
+        pytest.param("", "", id="empty-disable-sentinel"),
+    ],
+)
+def test_single_job_pins_ambient_cuda_visibility(monkeypatch, ambient, visible) -> None:
+    """Select one numeric device or preserve the ambient empty CUDA-disable decision."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient)
     pool = GpuPool.create(n_jobs=1)
-
     with pool.acquire() as gid:
-        assert gid.visible_devices == "2"
+        assert gid.visible_devices == visible
 
 
 def test_nonnumeric_cuda_visible_devices_is_leased_as_opaque_token(monkeypatch):
@@ -785,17 +803,6 @@ def test_unresolvable_opaque_token_fails_closed_when_explicit(monkeypatch, caplo
         GpuPool.create(n_jobs=1, explicit_devices=["bogus"])
 
 
-def test_empty_cuda_visible_devices_sentinel_is_pinned(monkeypatch) -> None:
-    """An ambient "" is a decision that CUDA is off; trials must receive it even
-    when a narrowed inherit_env contract drops the ambient variable."""
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-
-    pool = GpuPool.create(n_jobs=1)
-
-    with pool.acquire() as gid:
-        assert gid.visible_devices == ""
-
-
 @pytest.mark.parametrize("sentinel", ["-1", "-1,"])
 def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(
     monkeypatch: pytest.MonkeyPatch,
@@ -808,16 +815,6 @@ def test_configured_disable_sentinel_is_pinned_for_parallel_cpu_sweeps(
 
     with pool.acquire() as gid:
         assert gid.visible_devices == sentinel
-
-
-def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> None:
-    """A configured disable sentinel is already an explicit, isolated CPU request."""
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-
-    pool = GpuPool.create(n_jobs=4, cuda_visible_devices="-1")
-
-    with pool.acquire() as gid:
-        assert gid.visible_devices == "-1"
 
 
 @pytest.mark.parametrize(

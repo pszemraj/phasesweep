@@ -793,42 +793,25 @@ def _assert_log_regex_provenance(
         assert source["match_count"] == expected_count, select
 
 
-def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
-    cases = [
-        ("missing_file", None, JsonExtractor(type="json", path="nope.json", key="x"), "not found"),
-        (
-            "missing_key",
-            {"result.json": {"a": {"b": 1}}},
-            JsonExtractor(type="json", path="result.json", key="a.c"),
-            "not found",
-        ),
-        (
-            "non_numeric",
-            {"result.json": {"x": "abc"}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-        (
-            "numeric_string",
-            {"result.json": {"x": "1.25"}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-        (
-            "boolean",
-            {"result.json": {"x": True}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-    ]
-
-    for case, files, cfg, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        for filename, data in (files or {}).items():
-            (case_dir / filename).write_text(json.dumps(data))
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+@pytest.mark.parametrize(
+    "filename,key,payload,match",
+    [
+        ("nope.json", "x", None, "not found"),
+        ("result.json", "a.c", {"a": {"b": 1}}, "not found"),
+        ("result.json", "x", {"x": "abc"}, "not a JSON number"),
+        ("result.json", "x", {"x": "1.25"}, "not a JSON number"),
+        ("result.json", "x", {"x": True}, "not a JSON number"),
+    ],
+    ids=["missing_file", "missing_key", "non_numeric", "numeric_string", "boolean"],
+)
+def test_json_extractor_reports_missing_or_nonnumeric_values(
+    tmp_path, filename, key, payload, match
+):
+    if payload is not None:
+        (tmp_path / filename).write_text(json.dumps(payload))
+    cfg = JsonExtractor(type="json", path=filename, key=key)
+    with pytest.raises(ExtractorError, match=match):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 @pytest.mark.parametrize(
@@ -847,26 +830,19 @@ def test_json_extractor_rejects_ambiguous_nonstandard_json(tmp_path, payload):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path):
-    cases = [
+@pytest.mark.parametrize(
+    "filename,cfg",
+    [
+        ("result.json", JsonExtractor(type="json", path="result.json", key="x")),
         (
-            "json",
-            "result.json",
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not valid UTF-8",
-        ),
-        (
-            "log",
             "stdout.log",
             LogRegexExtractor(
                 type="log_regex",
                 file="stdout.log",
                 pattern=r"value=(?P<value>[0-9.]+)",
             ),
-            "not valid UTF-8",
         ),
         (
-            "envelope",
             "result.json",
             JsonEnvelopeExtractor(
                 type="json_envelope",
@@ -874,16 +850,14 @@ def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path)
                 split="validation",
                 policy="final_checkpoint",
             ),
-            "not valid UTF-8",
         ),
-    ]
-
-    for case, filename, cfg, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / filename).write_bytes(b"\xff\xfe")
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+    ],
+    ids=["json", "log", "envelope"],
+)
+def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path, filename, cfg):
+    (tmp_path / filename).write_bytes(b"\xff\xfe")
+    with pytest.raises(ExtractorError, match="not valid UTF-8"):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 @pytest.mark.parametrize("kind", ["json", "json_envelope"])
@@ -913,7 +887,8 @@ def test_json_extractors_preserve_read_failure_diagnostics(tmp_path, monkeypatch
     assert caught.value.__cause__ is failure
 
 
-def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
+@pytest.fixture
+def envelope_evidence():
     payload = {
         "schema_version": 1,
         "status": "complete",
@@ -927,16 +902,20 @@ def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
             "step": 1000,
         },
     }
-    (tmp_path / "result.json").write_text(json.dumps(payload))
     cfg = JsonEnvelopeExtractor(
         type="json_envelope",
         path="result.json",
         objective_name="val_loss",
         split="validation",
         policy="final_checkpoint",
-        checkpoint="final.pt",
-        expected_step=1000,
     )
+    return payload, cfg
+
+
+def test_json_envelope_binds_objective_to_current_attempt(tmp_path, envelope_evidence):
+    payload, cfg = envelope_evidence
+    (tmp_path / "result.json").write_text(json.dumps(payload))
+    cfg = cfg.model_copy(update={"checkpoint": "final.pt", "expected_step": 1000})
 
     assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.25)
 
@@ -953,34 +932,16 @@ def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
         (("evaluation", "step"), 900, "step 1000"),
     ],
 )
-def test_json_envelope_rejects_mismatched_provenance(tmp_path, path, value, match):
-    payload = {
-        "schema_version": 1,
-        "status": "complete",
-        "generation_id": "generation-test",
-        "attempt_id": "attempt-test",
-        "overrides_sha256": "a" * 64,
-        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "evaluation": {
-            "policy": "final_checkpoint",
-            "checkpoint": "final.pt",
-            "step": 1000,
-        },
-    }
+def test_json_envelope_rejects_mismatched_provenance(
+    tmp_path, envelope_evidence, path, value, match
+):
+    payload, cfg = envelope_evidence
     target = payload
     for part in path[:-1]:
         target = target[part]
     target[path[-1]] = value
     (tmp_path / "result.json").write_text(json.dumps(payload))
-    cfg = JsonEnvelopeExtractor(
-        type="json_envelope",
-        path="result.json",
-        objective_name="val_loss",
-        split="validation",
-        policy="final_checkpoint",
-        checkpoint="final.pt",
-        expected_step=1000,
-    )
+    cfg = cfg.model_copy(update={"checkpoint": "final.pt", "expected_step": 1000})
 
     with pytest.raises(ExtractorError, match=match):
         run_extractor(make_trial_context(tmp_path), cfg)
@@ -1088,29 +1049,11 @@ def test_provenance_absent_when_extraction_fails(tmp_path):
     assert "source" not in provenance
 
 
-def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
-    payload = {
-        "schema_version": 1,
-        "status": "complete",
-        "generation_id": "generation-test",
-        "attempt_id": "attempt-test",
-        "overrides_sha256": "a" * 64,
-        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "evaluation": {
-            "policy": "final_checkpoint",
-            "checkpoint": "step_1000.pt",
-            "step": 1000,
-        },
-    }
+def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path, envelope_evidence):
+    payload, cfg = envelope_evidence
+    payload["evaluation"]["checkpoint"] = "step_1000.pt"
     raw = json.dumps(payload).encode("utf-8")
     (tmp_path / "result.json").write_bytes(raw)
-    cfg = JsonEnvelopeExtractor(
-        type="json_envelope",
-        path="result.json",
-        objective_name="val_loss",
-        split="validation",
-        policy="final_checkpoint",
-    )
 
     provenance: dict = {}
     run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)

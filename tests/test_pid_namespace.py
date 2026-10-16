@@ -135,16 +135,6 @@ def _identity(
     )
 
 
-def _forbid_signals(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        reaper,
-        "kill_stale_group",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a process outside this PID namespace must never be signalled")
-        ),
-    )
-
-
 def test_read_pid_namespace_names_this_process_namespace() -> None:
     namespace = read_pid_namespace()
     if namespace is None:
@@ -212,7 +202,7 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
     reused = f"{_link(RECORDED)}@200"
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reused)
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     assert same_pid_namespace(reused)
     assert not same_pid_namespace(RECORDED)
@@ -220,11 +210,7 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
 
     _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, reader=reused)
-    monkeypatch.setattr(
-        mcp_runs,
-        "reap_child",
-        lambda _pid: pytest.fail("a PID from another namespace must never be waited on"),
-    )
+    _forbid_reaping(monkeypatch)
     assert store.runner_view(handle).visibility == "unobservable"
     assert store.observe(handle).state == "running"
 
@@ -252,29 +238,24 @@ def test_absence_proof_needs_the_initial_namespace(
     assert recorded_process_blocker(other_clock, pids=(7,), pgids=(7,)) is not None
 
 
-def test_absence_proof_finds_a_recorded_process_in_its_namespace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("pid", "nspid", "nspgid"),
+    [
+        pytest.param(500, [500, 7], None, id="recorded-process"),
+        pytest.param(501, [501, 9], [480, 7], id="group-leader-exited"),
+    ],
+)
+def test_absence_proof_finds_a_recorded_process_or_surviving_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int, nspid, nspgid
 ) -> None:
+    """The recorded PID or a remaining member of its group and session blocks absence."""
     proc = _fake_proc(tmp_path, monkeypatch)
-    _write_process(proc, 500, nspid=[500, 7], namespace=RECORDED)
+    _write_process(proc, pid, nspid=nspid, nspgid=nspgid, namespace=RECORDED)
 
     blocker = recorded_process_blocker(RECORDED, pids=(7,), pgids=(7,))
 
     assert blocker is not None
-    assert "500" in blocker
-
-
-def test_absence_proof_finds_a_group_whose_leader_exited(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No process has the recorded PID any more, but a member of its group and session remains."""
-    proc = _fake_proc(tmp_path, monkeypatch)
-    _write_process(proc, 501, nspid=[501, 9], nspgid=[480, 7], namespace=RECORDED)
-
-    blocker = recorded_process_blocker(RECORDED, pids=(7,), pgids=(7,))
-
-    assert blocker is not None
-    assert "501" in blocker
+    assert str(pid) in blocker
 
 
 def test_a_readable_link_to_another_namespace_rules_a_candidate_out(
@@ -459,7 +440,7 @@ def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signallin
 ) -> None:
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError) as caught:
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
@@ -479,7 +460,7 @@ def test_cleanup_stale_trial_process_settles_an_absent_trial_without_signalling(
     proc = _fake_proc(tmp_path, monkeypatch)
     # A process in another sandbox reusing the trial's numbers is ruled out by its link.
     _write_process(proc, 700, nspid=[700, 4242], namespace=OTHER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     assert cleanup_stale_trial_process(_identity(pid_namespace=RECORDED)) is True
 
@@ -490,7 +471,7 @@ def test_cleanup_stale_trial_process_names_what_blocks_the_absence_proof(
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     proc = _fake_proc(tmp_path, monkeypatch)
     _write_process(proc, 701, nspid=[701, 4242], namespace=RECORDED)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError) as caught:
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
@@ -523,7 +504,7 @@ def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_
     """An identity without boot id or start time is refused as foreign, never with kill advice for its numbers."""
     monkeypatch.setattr(reaper, "read_boot_id", lambda: None)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
         cleanup_stale_trial_process(

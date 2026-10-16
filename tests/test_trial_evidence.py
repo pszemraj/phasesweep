@@ -34,6 +34,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
+    _phase_trials,
     make_experiment,
     write_constant_trainer,
     write_trainer,
@@ -370,25 +371,6 @@ def _sole_trial_dir(experiment: Experiment) -> Path:
     return directories[0]
 
 
-def _trial_count(experiment: Experiment) -> int:
-    """Return how many trials the persistent phase study holds."""
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    return len(study.get_trials(deepcopy=False))
-
-
-def _phase_trial_count(experiment: Experiment, phase_name: str) -> int:
-    """Return the durable trial count for one named phase."""
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, phase),
-        storage=_resolve_storage(experiment.storage),
-    )
-    return len(study.get_trials(deepcopy=False))
-
-
 _MARKED_TRAINER = """
 import argparse
 from pathlib import Path
@@ -450,11 +432,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     experiment = _evidence_experiment(tmp_path, override_format=override_format)
     run_experiment(experiment)
     input_path = _sole_trial_dir(experiment) / filename
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    record = study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
+    record = _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
 
     assert record == {
         "schema_version": 1,
@@ -466,32 +444,36 @@ def test_trial_records_the_exact_generated_trainer_input(
 
 
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+@pytest.mark.parametrize("has_base_config", [True, False], ids=["merged-base", "overrides-only"])
 def test_cli_trainer_input_record_is_the_merged_trainer_config(
     tmp_path: Path,
     override_format: str,
+    has_base_config: bool,
 ) -> None:
-    """The record for argparse and hydra binds the flat base-plus-overrides mapping."""
+    """CLI input records bind the flat mapping, with and without a trainer-config base."""
     experiment = _evidence_experiment(
         tmp_path,
         override_format=override_format,
-        trainer_config={"model": {"depth": 4}, "output_dir": "{trial_dir}/out"},
-        fixed_overrides={"model.width": 64},
+        trainer_config=(
+            {"model": {"depth": 4}, "output_dir": "{trial_dir}/out"} if has_base_config else None
+        ),
+        fixed_overrides={"model.width": 64} if has_base_config else {"b.y": 2, "a": 1},
     )
     run_experiment(experiment)
     trial_dir = _sole_trial_dir(experiment)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    trial = study.get_trials(deepcopy=False)[0]
+    (trial,) = _phase_trials(experiment)
     resolved = trial_dir / "overrides_resolved.json"
 
-    assert json.loads(resolved.read_text()) == {
-        "model.depth": 4,
-        "model.width": 64,
-        "output_dir": f"{trial_dir}/out",
-        "x": trial.params["x"],
-    }
+    if has_base_config:
+        assert json.loads(resolved.read_text()) == {
+            "model.depth": 4,
+            "model.width": 64,
+            "output_dir": f"{trial_dir}/out",
+            "x": trial.params["x"],
+        }
+    else:
+        expected = json.dumps({"b.y": 2, "a": 1, **trial.params}, indent=2, sort_keys=True) + "\n"
+        assert resolved.read_text() == expected
     assert trial.user_attrs[TRAINER_INPUT_ATTR] == {
         "schema_version": 1,
         "format": override_format,
@@ -499,26 +481,6 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
         "size_bytes": resolved.stat().st_size,
         "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
     }
-
-
-@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
-def test_cli_trainer_input_without_trainer_config_is_the_overrides_alone(
-    tmp_path: Path,
-    override_format: str,
-) -> None:
-    """An empty base leaves the recorded bytes as the sorted overrides JSON."""
-    experiment = _evidence_experiment(
-        tmp_path, override_format=override_format, fixed_overrides={"b.y": 2, "a": 1}
-    )
-    run_experiment(experiment)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    params = study.get_trials(deepcopy=False)[0].params
-
-    expected = json.dumps({"b.y": 2, "a": 1, **params}, indent=2, sort_keys=True) + "\n"
-    assert (_sole_trial_dir(experiment) / "overrides_resolved.json").read_text() == expected
 
 
 def _published_winner_payload(experiment: Experiment, generation_id: str) -> dict:
@@ -591,7 +553,7 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     assert "trial 0" in message
     # Fails before any new trial work: the study still holds only the trial
     # whose evidence was broken, and nothing published over the damaged tree.
-    assert _trial_count(topup) == 1
+    assert len(_phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -611,11 +573,7 @@ def test_present_incomplete_objective_provenance_blocks_selection(
     """Partial current provenance records cannot publish."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    trial = deepcopy(study.get_trials(deepcopy=False)[0])
+    trial = deepcopy(_phase_trials(experiment)[0])
     record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
     if damage == "empty":
         record = {}
@@ -647,7 +605,7 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     topup = _evidence_experiment(tmp_path, n_trials=2)
     winners = run_experiment(topup)
 
-    assert _trial_count(topup) == 2
+    assert len(_phase_trials(topup)) == 2
     second_generation = published_generation_id(topup)
     assert second_generation is not None
     assert second_generation != first_generation
@@ -675,7 +633,7 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     ):
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
-    assert _trial_count(experiment) == 1
+    assert len(_phase_trials(experiment)) == 1
     assert _pointer_bytes(experiment) == pointer_before
 
 
@@ -715,7 +673,7 @@ def test_topup_refuses_damaged_generated_trainer_input(
     with pytest.raises(TrialEvidenceMissingError, match="trainer input"):
         run_experiment(topup)
 
-    assert _trial_count(topup) == 1
+    assert len(_phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -803,7 +761,7 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     with pytest.raises(TrialEvidenceMissingError, match=expected):
         run_experiment(resumed, from_phase="q")
 
-    assert _phase_trial_count(resumed, "q") == 1
+    assert len(_phase_trials(resumed, "q")) == 1
     assert not marker.exists()
     assert _pointer_bytes(resumed) == pointer_before
 
@@ -853,7 +811,7 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
         match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
     ):
         run_experiment(experiment(2), from_phase="q")
-    assert _phase_trial_count(original, "q") == 1
+    assert len(_phase_trials(original, "q")) == 1
     assert not marker.exists()
     with pytest.raises(
         TrialEvidenceMissingError,
@@ -881,14 +839,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     payload = yaml.safe_load(
         (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
     )
-    p_study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.storage),
-    )
-    assert (
-        payload["trainer_input"]
-        == p_study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
-    )
+    assert payload["trainer_input"] == _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
         storage=_resolve_storage(experiment.storage),

@@ -270,14 +270,17 @@ def _bounded_metric(**bounds: float) -> Metric:
     )
 
 
-def _phase_trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
-    """Read the trials of the experiment's phase ``p``.
+def _phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
+    """Read one phase's trials from the experiment's ledger.
 
     :param Experiment experiment: Experiment whose ledger is read.
+    :param str phase_name: Phase whose study is read.
     :return list[optuna.trial.FrozenTrial]: Its trials in number order.
     """
     storage = _resolve_storage(experiment.resolved_storage)
-    return optuna.load_study(study_name="t::p", storage=storage).get_trials(deepcopy=False)
+    return optuna.load_study(
+        study_name=f"{experiment.experiment}::{phase_name}", storage=storage
+    ).get_trials(deepcopy=False)
 
 
 @pytest.fixture(autouse=True)
