@@ -226,9 +226,7 @@ def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setenv(name, value)
 
 
-def _write_config(
-    config_path: Path, *, backend: str, ledger_dir: Path, workdir: Path
-) -> Experiment:
+def _write_config(config_path: Path, *, ledger_dir: Path, workdir: Path) -> Experiment:
     """Write and load the fixture experiment config for a materialized copy.
 
     The config comes from the same builder the generator used, with only the
@@ -238,13 +236,12 @@ def _write_config(
     checkout path.
 
     :param Path config_path: Where to write the YAML.
-    :param str backend: Ledger backend recorded in the manifest.
     :param Path ledger_dir: Directory holding the copied ledger file.
     :param Path workdir: Artifact-root parent this read should use.
     :return Experiment: Parsed experiment config.
     """
     payload = experiment_payload(
-        storage_url=storage_url(backend, ledger_dir),
+        storage_url=storage_url(ledger_dir),
         workdir=workdir,
     )
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -319,7 +316,6 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
     if mode not in LEDGER_MODES:
         raise ValueError(f"unsupported ledger fixture mode: {mode!r}")
     fixture = fixture_by_name(name)
-    backend = str(fixture.manifest["backend"])
     root = tmp_path / "fixture"
     if mode == "tree":
         copy_fixture(name, root)
@@ -331,7 +327,6 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         workdir = root / "unvisited_workdir"
     experiment = _write_config(
         tmp_path / "experiment.yaml",
-        backend=backend,
         ledger_dir=root / "ledger",
         workdir=workdir,
     )

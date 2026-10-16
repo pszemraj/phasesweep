@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the golden on-disk ledger fixture committed under tests/fixtures/ledgers.
+"""Generate the golden journal fixture under tests/fixtures/ledgers.
 
-The fixture is one real PhaseSweep run -- two trials of one phase, seeded
-random sampler, no GPU -- captured verbatim on the journal backend.
-
-Run it from the repository root, in the environment under test::
-
-    python -m tests.fixtures.make_ledger_fixtures
-
-The experiment pins ``execution.cwd`` to ``/``, so the phase fingerprints it
-stores name no directory of the generating checkout: a fixture read from any
-clone path recomputes the fingerprint it was published with. The trials are
-generated under the pinned ``FIXTURE_ENVIRONMENT``, so their recorded trainer
-environment names no variable of the generating shell.
+Run ``python -m tests.fixtures.make_ledger_fixtures`` from the repository root.
+The fixture contains two seeded random trials, with no GPU, trainer cwd ``/``,
+and the pinned ``FIXTURE_ENVIRONMENT``. Its manifest records the toolchain and
+verified read-path expectations.
 """
 
 from __future__ import annotations
@@ -42,22 +34,14 @@ PHASE = "p"
 N_TRIALS = 2
 #: Provenance revision recorded in every fixture config.
 PROVENANCE_REVISION = "golden-fixture-v1"
-#: Trainer working directory. An unset ``execution.cwd`` fingerprints the
-#: invocation directory, which would tie every stored phase fingerprint to the
-#: checkout path the generator ran in. ``/`` exists on every host, and the
-#: inline trainer reads no files.
+#: Trainer cwd, independent of the generating checkout.
 TRAINER_CWD = "/"
-#: Objective token the inline trainer prints. Deliberately not a parameter name,
-#: so an override echoed into a trial log can never be mistaken for the metric.
+#: Objective token, distinct from override names.
 OBJECTIVE_TOKEN = "PSWOBJ"
 #: Constant objective the inline trainer reports.
 OBJECTIVE_VALUE = "0.5"
-#: Inline trainer: no file on disk, so the fingerprinted ``trial_command`` holds
-#: no generation-time path and a materialized fixture reproduces it exactly. It
-#: uses only the shell's ``printf`` builtin, so the trial launches under the
-#: pinned ``PATH`` below, which holds no interpreter. ``printf`` ignores the
-#: override arguments it is given. ``render_command`` runs ``str.format`` over
-#: this template, so it must not contain a literal ``{`` or ``}``.
+#: Shell-builtin trainer ignores overrides and needs no Python interpreter.
+#: Literal braces must be escaped for render_command's str.format expansion.
 TRIAL_COMMAND = f"printf '{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\\n' {{overrides}}"
 #: The base environment a fixture's trials are generated under, and the one a test
 #: applies before it resumes a fixture study and allocates new trials. A persistent
@@ -150,17 +134,9 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
     }
 
 
-def storage_url(backend: str, ledger_dir: Path) -> str:
-    """Build the ledger URL for one backend under a ledger directory.
-
-    :param str backend: ``"journal"``, the only backend this fixture set produces.
-    :param Path ledger_dir: Directory holding the ledger file.
-    :return str: Resolved storage URL.
-    :raises ValueError: The backend is not one this fixture set produces.
-    """
-    if backend != "journal":
-        raise ValueError(f"Unsupported fixture backend: {backend!r}")
-    return f"{backend}:///{ledger_dir / LEDGER_FILENAME}"
+def storage_url(ledger_dir: Path) -> str:
+    """Return the journal URL for the fixture ledger."""
+    return f"journal:///{ledger_dir / LEDGER_FILENAME}"
 
 
 @dataclass(frozen=True)
@@ -349,7 +325,7 @@ def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
     from phasesweep import load_experiment, run_experiment
 
     payload = experiment_payload(
-        storage_url=storage_url("journal", paths.ledger_dir),
+        storage_url=storage_url(paths.ledger_dir),
         workdir=paths.artifact_root,
     )
     config_path = scratch / "experiment.yaml"
