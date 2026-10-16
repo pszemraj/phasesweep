@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
+from phasesweep.config.common import _validate_safe_name
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
@@ -67,7 +68,7 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
         name.
     :raises ValueError: ``data`` is not a mapping, its ``kind`` is not a
         recognized :data:`WinnerSourceKind`, it is missing a required key or
-        carries an extra one, a field cannot be coerced to its expected
+        carries an extra one, a field does not have its expected
         type, or its ``phase`` disagrees with ``expected_phase``.
     :return WinnerSource: The reconstructed source.
     """
@@ -87,12 +88,12 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
     phase = data.get("phase")
     if not isinstance(phase, str) or not phase:
         raise ValueError("invalid winner_source phase")
+    _validate_safe_name("winner_source phase", phase)
     if phase != expected_phase:
         raise ValueError(f"winner_source names phase {phase!r}, expected {expected_phase!r}")
-    try:
-        trial_number = int(data["trial_number"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid winner_source trial_number") from exc
+    trial_number = data["trial_number"]
+    if not isinstance(trial_number, int) or isinstance(trial_number, bool):
+        raise ValueError("invalid winner_source trial_number")
     generation_id = data["generation_id"]
     attempt_id = data["attempt_id"]
     if not isinstance(generation_id, str) or not generation_id:

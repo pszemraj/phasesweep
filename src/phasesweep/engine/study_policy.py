@@ -341,8 +341,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
     detail = "missing" if version is None else repr(version)
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
-        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
-        "Use a fresh artifact root and fresh local storage with this PhaseSweep release.",
+        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}.",
     )
 
 
@@ -397,8 +396,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
         if not study.get_trials(deepcopy=False):
             return 0
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
-            "Use a fresh local ledger and artifact root.",
+            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}.",
         )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(

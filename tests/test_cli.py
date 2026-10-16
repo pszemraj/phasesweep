@@ -47,6 +47,7 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     GpuConfigurationError,
+    OperatorAction,
     PhaseSweepError,
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
@@ -1629,9 +1630,11 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert captured.err.strip() == (
-        "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
-        "run `phasesweep run` again with the same config."
+        "phasesweep: Trial 0 cleanup could not be confirmed.\n"
+        "fix: run `phasesweep run` again with the same config for a CLI run, or "
+        "`phasesweep mcp recover-run` for an MCP run."
     )
+    assert str(refusal) == "Trial 0 cleanup could not be confirmed."
 
 
 @pytest.mark.parametrize(
@@ -1770,6 +1773,49 @@ def test_cli_boundary_reports_expected_run_failure(
     assert ("Traceback" in captured.err) is expects_traceback
     if not verbose:
         assert "Traceback" not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("action", "remedy"),
+    [
+        (OperatorAction.FRESH_NAMESPACE, "fresh artifact root and local storage"),
+        (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
+        (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
+        (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
+        (OperatorAction.RETRY, "Wait briefly, then start a new run"),
+        (OperatorAction.INSPECT_LOGS, "inspect the PhaseSweep run log"),
+    ],
+)
+def test_cli_boundary_renders_action_once(
+    action: OperatorAction,
+    remedy: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Action advice is printed once without becoming part of translated diagnostics."""
+    diagnostic = "required state is unavailable"
+    original = PhaseSweepError(diagnostic, action=action)
+    translated = PhaseSweepError.rewrap(original, str(original))
+    translated = PhaseSweepError.rewrap(translated, str(translated))
+    assert translated.args == (diagnostic,)
+    assert str(translated) == diagnostic
+
+    def fail(**_kwargs: object) -> None:
+        raise translated
+
+    monkeypatch.setattr(cli_main, "main", fail)
+    assert invoke_cli_boundary([], monkeypatch) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    diagnostic_line, fix_line = captured.err.splitlines()
+    assert diagnostic_line == f"phasesweep: {diagnostic}"
+    assert fix_line.startswith("fix: ")
+    assert fix_line.count(remedy) == 1
+    if action is OperatorAction.FRESH_NAMESPACE:
+        assert "new experiment name" not in fix_line
+    if action is OperatorAction.RUN_RECOVER_RUN:
+        assert "`phasesweep mcp recover-run` for an MCP run" in fix_line
 
 
 @pytest.mark.parametrize(

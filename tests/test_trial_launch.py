@@ -27,6 +27,7 @@ from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRIAL_DIR_ATTR
 from phasesweep.engine.trial import (
+    EnvironmentIdentity,
     ExecutedTrial,
     TrialExecutionError,
     TrialResult,
@@ -60,6 +61,7 @@ def _capture_launch_env(
     gpu_lease_fds: tuple[int, ...] = (),
     experiment_kwargs: dict[str, Any] | None = None,
     overrides: dict[str, Any] | None = None,
+    environment_identity: EnvironmentIdentity | None = None,
 ) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
@@ -117,6 +119,11 @@ def _capture_launch_env(
         gpu_id=gpu_id,
         gpu_lease_fds=gpu_lease_fds,
         prepared_input=prepared,
+        environment_identity=(
+            _environment_identity(experiment, "p")
+            if environment_identity is None
+            else environment_identity
+        ),
     )
     captured["trainer_input"] = prepared.record()
     return captured
@@ -854,6 +861,24 @@ def test_environment_identity_digest_ignores_mapping_order(
 
     assert forward.digest == reversed_order.digest
     assert len(forward.digest) == 64
+
+
+def test_launch_trial_uses_prepared_environment_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = ExecutionContext(inherit_env="all", record_env=True)
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    identity = _environment_identity(make_experiment(execution=execution), "p")
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+
+    captured = _capture_launch_env(
+        tmp_path, monkeypatch, execution=execution, environment_identity=identity
+    )
+
+    assert captured["TZ"] == "Europe/Berlin"
+    recorded = json.loads((tmp_path / "trial_0" / "environment.json").read_text())
+    assert recorded["env"] == identity.values
+    assert recorded["digest"] == identity.digest
 
 
 def test_environment_identity_digest_tracks_values(

@@ -18,6 +18,19 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 """A JSON object: string keys over :data:`JsonValue`."""
 
 
+def nonempty_text(value: object, *, label: str) -> str:
+    """Require a nonempty string.
+
+    :param object value: Candidate value.
+    :param str label: Field name for the diagnostic.
+    :raises ValueError: The value is not a nonempty string.
+    :return str: The validated value.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a nonempty string.")
+    return value
+
+
 def _reject_constant(value: str) -> NoReturn:
     """Reject non-standard constants accepted by Python's JSON parser.
 

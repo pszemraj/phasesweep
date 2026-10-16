@@ -367,11 +367,8 @@ class JsonEqualsGate(_Frozen):
         if not isinstance(value, (bool, int, float, str, type(None))):
             raise ValueError(
                 "json_equals gate value must be a JSON scalar (bool, int, float, str, or "
-                f"null); got {type(value).__name__}. Parsed JSON never produces that type, so "
-                "such a gate could never pass, and the study fingerprint would render it "
-                "identically to a value that can — silently sharing one study between two "
-                "configs that disagree on feasibility. YAML dates are the common case: quote "
-                "them ('2024-01-01') to compare against the JSON string."
+                f"null); got {type(value).__name__}. Quote YAML dates ('2024-01-01') "
+                "to compare against a JSON string."
             )
         if isinstance(value, float):
             _require_finite("json_equals gate value", value)

@@ -577,12 +577,14 @@ def invoke_cli_boundary(
     # ``CliRunner`` invokes the Click group directly and so bypasses the
     # process-level error boundary under test; a patched ``sys.argv`` reaches it.
     monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
-    # ``debug`` mirrors what ``-v`` sets in a real process. ``_configure_logging``
-    # cannot, because ``logging.basicConfig`` is a no-op once pytest's own root
-    # handler is installed.
-    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
-    with pytest.raises(SystemExit) as excinfo:
-        cli_boundary()
+    logger = logging.getLogger()
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            cli_boundary()
+    finally:
+        logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
 

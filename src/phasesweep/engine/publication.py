@@ -15,6 +15,39 @@ from phasesweep.engine.state import PublicationState
 log = logging.getLogger(__name__)
 
 
+def raise_for_unusable_publication(
+    experiment_name: str, state: str, error: str | None, namespace_root: Path
+) -> None:
+    """Refuse an unusable publication with its typed operator diagnostic.
+
+    :param str experiment_name: Experiment named by the captured publication verdict.
+    :param str state: Publication integrity state from that verdict.
+    :param str | None error: Validation diagnostic from the same verdict.
+    :param Path namespace_root: Artifact namespace to inspect for integrity failures.
+    :raises PublicationAccessError: Read permission prevents publication validation.
+    :raises PublicationIntegrityError: The recorded publication no longer validates.
+    """
+    if state not in {"permission_denied", "failed"}:
+        return
+    detail = str(error).rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail += "."
+    subject = f"Experiment {experiment_name!r}"
+    if state == "permission_denied":
+        raise PublicationAccessError(
+            f"{subject} records a publication that cannot be validated as the current user: "
+            f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
+            "the publication as the publishing user or restore read permission before launching "
+            "another run."
+        )
+    raise PublicationIntegrityError(
+        f"{subject} records a publication that no longer validates: {detail} "
+        "Do not run anything over this tree until you have inspected or restored the "
+        f"generation namespace under {namespace_root} -- a successful run would advance the "
+        "last-success pointer past the corrupt generation and nothing would report it again."
+    )
+
+
 @dataclass(frozen=True)
 class PublicationPointer:
     """Four-state resolution of a last-success publication pointer.

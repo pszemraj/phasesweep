@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
 from phasesweep.engine.state import _validate_observed_block
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, json_object, nonempty_text
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
@@ -363,19 +363,6 @@ def _finite_number(value: object, *, label: str) -> float:
     return float(value)
 
 
-def _nonempty_text(value: object, *, label: str) -> str:
-    """Validate a nonempty string.
-
-    :param object value: Parsed value.
-    :param str label: Field name for the diagnostic.
-    :raises ValueError: The value is not a nonempty string.
-    :return str: The value.
-    """
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"repeats {label} is not a nonempty string")
-    return value
-
-
 def _repeat_value(value: object) -> RepeatValue:
     """Validate one recorded repeat value.
 
@@ -415,12 +402,12 @@ def _validate_member(data: object) -> RepeatMember:
         "trial_number": number,
         "repeat": _repeat_value(data["repeat"]),
         "metric": _finite_number(data["metric"], label="member metric"),
-        "generation_id": _nonempty_text(data["generation_id"], label="member generation_id"),
-        "attempt_id": _nonempty_text(data["attempt_id"], label="member attempt_id"),
+        "generation_id": nonempty_text(data["generation_id"], label="repeats member generation_id"),
+        "attempt_id": nonempty_text(data["attempt_id"], label="repeats member attempt_id"),
         "objective_provenance": provenance,
         "trainer_input": trainer_input,
         "constraints": {
-            _nonempty_text(name, label="member constraint name"): _finite_number(
+            nonempty_text(name, label="repeats member constraint name"): _finite_number(
                 value, label="member constraint value"
             )
             for name, value in constraints.items()
@@ -499,7 +486,7 @@ def _validate_repeats_block(
         return None
     if not isinstance(data, Mapping) or set(data) != _REPEATS_KEYS:
         raise ValueError("repeats block must have exactly key, reduce, spread and members")
-    key = _nonempty_text(data["key"], label="key")
+    key = nonempty_text(data["key"], label="repeats key")
     reduce = data["reduce"]
     if reduce not in REDUCERS:
         raise ValueError(f"repeats reduce is not one of {', '.join(REDUCERS)}")

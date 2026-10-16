@@ -136,74 +136,6 @@ _MISSING_ENVIRONMENT_STDERR = re.compile(
 )
 
 
-def _trainer_environment(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    require_wandb_online: bool = True,
-    tracked_only: bool = False,
-) -> dict[str, str]:
-    """Compose the trainer environment per the execution contract.
-
-    ``inherit_env: none`` (the default) starts from the minimal base; a list
-    adds exactly the named semantic ambient variables on top of that base, and
-    ``all`` copies the whole ambient environment. The pass-through names (the
-    built-in ``TMPDIR`` plus ``passthrough_env``) are inherited under either
-    narrowed contract. Configured
-    ``experiment.env`` values apply last, except trial-bound keys that
-    PhaseSweep assigns for each attempt.
-
-    :param Experiment experiment: Parsed experiment supplying the contract.
-    :param str phase_name: Phase whose remote consumers manage W&B identity.
-    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
-        caller is preparing new remote work.
-    :param bool tracked_only: Start from the ambient names the environment cohort covers even
-        under ``inherit_env: all``, which gives the names :func:`_environment_identity` tracks.
-    :raises PhaseSweepError: The W&B environment cannot be composed because explicit
-        settings conflict or remote logging is disabled (``FIX_CONFIG``).
-    :return dict[str, str]: The composed trainer environment.
-    """
-    admitted = experiment.execution.inherited_env_names()
-    if admitted is None and not tracked_only:
-        env = os.environ.copy()
-    else:
-        names = [
-            *experiment.execution.tracked_env_names(),
-            *experiment.execution.effective_passthrough_env(),
-        ]
-        env = {name: os.environ[name] for name in names if name in os.environ}
-    env.update(experiment.env)
-    # These values are assigned for each trial after the base environment is
-    # recorded. Ambient copies cannot affect the trainer or its study cohort.
-    for name in _TRIAL_BOUND_ENV:
-        env.pop(name, None)
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
-    query = _wandb_query(experiment, phase.gates)
-    if query is not None:
-        try:
-            env = compose_wandb_environment(
-                query,
-                experiment.env,
-                env,
-                require_online=require_wandb_online,
-            )
-        except ValueError as exc:
-            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
-    elif "WANDB_RUN_ID" not in experiment.env:
-        # Track explicit trainer-owned W&B identities, but exclude inherited ids from the cohort.
-        env.pop("WANDB_RUN_ID", None)
-    if experiment.mlflow is not None:
-        env.pop("MLFLOW_RUN_ID", None)
-        env.pop("MLFLOW_EXPERIMENT_NAME", None)
-        env["MLFLOW_TRACKING_URI"] = experiment.mlflow.tracking_uri
-        if experiment.mlflow.experiment_id is not None:
-            env["MLFLOW_EXPERIMENT_ID"] = experiment.mlflow.experiment_id
-        else:
-            env.pop("MLFLOW_EXPERIMENT_ID", None)
-            env["MLFLOW_EXPERIMENT_NAME"] = str(experiment.mlflow.experiment_name)
-    return env
-
-
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
     """Return the ``inherit_env`` contract in its canonical persisted form.
 
@@ -252,19 +184,49 @@ def _environment_identity(
     :param bool require_wandb_online: Reject offline or disabled W&B for new remote work.
     :return EnvironmentIdentity: Tracked values, their digest, and the full launch environment.
     """
-    env = _trainer_environment(
-        experiment,
-        phase_name,
-        require_wandb_online=require_wandb_online,
-    )
-    cohort_names = set(
-        _trainer_environment(
-            experiment,
-            phase_name,
-            require_wandb_online=require_wandb_online,
-            tracked_only=True,
+    cohort_names = set(experiment.execution.tracked_env_names()) | set(experiment.env)
+    admitted = experiment.execution.inherited_env_names()
+    if admitted is None:
+        env = os.environ.copy()
+    else:
+        names = [
+            *experiment.execution.tracked_env_names(),
+            *experiment.execution.effective_passthrough_env(),
+        ]
+        env = {name: os.environ[name] for name in names if name in os.environ}
+    env.update(experiment.env)
+    # These values are assigned for each trial after the base environment is
+    # recorded. Ambient copies cannot affect the trainer or its study cohort.
+    for name in _TRIAL_BOUND_ENV:
+        env.pop(name, None)
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    query = _wandb_query(experiment, phase.gates)
+    if query is not None:
+        cohort_names.update(("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_RESUME"))
+        try:
+            env = compose_wandb_environment(
+                query,
+                experiment.env,
+                env,
+                require_online=require_wandb_online,
+            )
+        except ValueError as exc:
+            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
+    elif "WANDB_RUN_ID" not in experiment.env:
+        # Track explicit trainer-owned W&B identities, but exclude inherited ids from the cohort.
+        env.pop("WANDB_RUN_ID", None)
+    if experiment.mlflow is not None:
+        env.pop("MLFLOW_RUN_ID", None)
+        env.pop("MLFLOW_EXPERIMENT_NAME", None)
+        env["MLFLOW_TRACKING_URI"] = experiment.mlflow.tracking_uri
+        cohort_names.update(
+            ("MLFLOW_TRACKING_URI", "MLFLOW_EXPERIMENT_ID", "MLFLOW_EXPERIMENT_NAME")
         )
-    )
+        if experiment.mlflow.experiment_id is not None:
+            env["MLFLOW_EXPERIMENT_ID"] = experiment.mlflow.experiment_id
+        else:
+            env.pop("MLFLOW_EXPERIMENT_ID", None)
+            env["MLFLOW_EXPERIMENT_NAME"] = str(experiment.mlflow.experiment_name)
     passthrough = frozenset(experiment.execution.effective_passthrough_env()) - set(experiment.env)
     tracked = {
         name: value
@@ -581,6 +543,7 @@ def launch_trial(
     gpu_id: int | str | None = None,
     gpu_lease_fds: tuple[int, ...] = (),
     prepared_input: PreparedTrainerInput,
+    environment_identity: EnvironmentIdentity,
 ) -> ExecutedTrial:
     """Launch a trial while the caller holds its GPU lease.
 
@@ -599,6 +562,7 @@ def launch_trial(
     :param gpu_lease_fds: Lock descriptors held by the supervisor guardian until the
         trainer group exits, including after an orchestrator exit.
     :param prepared_input: Exact input materialized before acquiring the GPU lease.
+    :param environment_identity: Base environment validated before allocating trials.
     :return ExecutedTrial: Trial context and supervised process result.
     :raises TrialExecutionError: Configured execution.cwd is not a directory.
     :raises OSError: A pre-launch artifact or output stream could not be written.
@@ -625,9 +589,8 @@ def launch_trial(
     (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
     # Capture the composed environment before per-trial bindings.
-    identity = _environment_identity(experiment, phase_name)
-    _record_trainer_environment(experiment, identity, workdir)
-    env = dict(identity.values)
+    _record_trainer_environment(experiment, environment_identity, workdir)
+    env = dict(environment_identity.values)
     phase = next(
         (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
     )

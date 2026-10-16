@@ -31,7 +31,12 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.run import PublicationHook, TerminalReport, run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OPERATOR_STEPS,
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+)
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -95,25 +100,8 @@ class FailurePayload(FailureCausePayload):
     cause: FailureCausePayload | None = None
 
 
-# Path-free operator steps; detailed diagnostics remain in the run log.
-_OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.FRESH_NAMESPACE: (
-        "use a new experiment name, or a fresh artifact root and local storage"
-    ),
-    OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
-    OperatorAction.RESTORE_TREE: (
-        "repair the experiment tree's files and permissions, deleting a file only if "
-        "certain nothing is running"
-    ),
-    OperatorAction.RUN_RECOVER_RUN: "run phasesweep mcp recover-run",
-    OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",
-    OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log and the logs its error points to",
-}
 _SELF_CONTAINED_STEPS = frozenset({OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS})
 _RUN_LOG_DETAILS = "The error in the PhaseSweep run log gives the details."
-_RETRY_REMEDIATION = (
-    "Wait briefly, then start a new run; another process currently holds this experiment."
-)
 
 
 def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") -> str:
@@ -124,7 +112,12 @@ def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") 
     :return str: The remediation, pointing at the run log when a step needs
         the error's details.
     """
-    phrases = [_OPERATOR_STEPS[step] for step in steps]
+    phrases = [
+        "run phasesweep mcp recover-run"
+        if step is OperatorAction.RUN_RECOVER_RUN
+        else OPERATOR_STEPS[step]
+        for step in steps
+    ]
     joined = phrases[0]
     if len(phrases) > 1:
         joined = f"{', and '.join(phrases[:-1])}, then {phrases[-1]}"
@@ -143,7 +136,7 @@ def _routed_next_steps(action: OperatorAction) -> dict[str, object]:
         otherwise the operator's step.
     """
     if action is OperatorAction.RETRY:
-        return {"retryable": True, "actor": "agent", "remediation": _RETRY_REMEDIATION}
+        return {"retryable": True, "actor": "agent", "remediation": f"{OPERATOR_STEPS[action]}."}
     return {"retryable": False, "actor": "operator", "remediation": _operator_remediation([action])}
 
 

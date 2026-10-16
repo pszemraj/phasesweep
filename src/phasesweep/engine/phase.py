@@ -1042,6 +1042,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     gpu_id=gpu_assignment.visible_devices,
                     gpu_lease_fds=gpu_assignment.lease_fds,
                     prepared_input=prepared_input,
+                    environment_identity=run.environment_identity,
                 )
             except ShutdownLaunchRefusedError as exc:
                 # The shutdown began between the check above and the launch lock.

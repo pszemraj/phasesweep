@@ -44,10 +44,8 @@ def _reconcile_existing_studies(
 ) -> dict[str, optuna.Study]:
     """Rediscover and reconcile every existing study after a run has ended.
 
-    Post-execution reconciliation cannot reuse the handle the run claimed
-    before it started: phases created studies since then, and those must be
-    reaped too. It therefore validates and claims the ledger afresh, then runs
-    the same preflight over what that discovery found.
+    Validate and claim a fresh ledger so post-run preflight includes studies
+    created during execution.
 
     :param Experiment experiment: Parsed experiment whose declared phases are inspected.
     :param _PreflightCleanupReport cleanup_report: Report the reconciliation's

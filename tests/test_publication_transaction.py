@@ -824,16 +824,23 @@ def test_publication_refuses_invalid_winner_artifact(
         pytest.param(
             "kind", "unknown_source", True, "invalid winner_source kind", id="unknown-kind"
         ),
-        pytest.param(
-            "phase", "../other", True, "has no valid winner_source phase", id="unsafe-phase"
-        ),
+        pytest.param("phase", "../other", True, "winner_source phase name", id="unsafe-phase"),
         pytest.param("phase", "other", True, "names phase 'other', expected 'p'", id="other-phase"),
         pytest.param(
             "trial_number",
             999,
             True,
-            "has no valid winner_source trial_number",
+            "winner_source that disagrees with its trial_number",
             id="trial-number",
+        ),
+        pytest.param(
+            "trial_number", True, True, "invalid winner_source trial_number", id="bool-trial"
+        ),
+        pytest.param(
+            "trial_number", 0.0, True, "invalid winner_source trial_number", id="float-trial"
+        ),
+        pytest.param(
+            "trial_number", "0", True, "invalid winner_source trial_number", id="string-trial"
         ),
         pytest.param("study", 999, True, "missing [], unexpected ['study']", id="extra-key"),
         pytest.param(

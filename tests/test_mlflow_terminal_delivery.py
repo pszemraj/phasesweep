@@ -770,7 +770,7 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     assert read_status(Experiment.model_validate(config))["published_generation_id"] == run_id
     handle = store.get(run_id)
     assert handle is not None
-    assert store.cleanup_recovery_required(handle) is (failure == "worker")
+    assert store.observe(handle).cleanup_recovery_required is (failure == "worker")
 
 
 def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(

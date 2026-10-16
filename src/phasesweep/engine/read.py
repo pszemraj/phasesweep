@@ -116,9 +116,6 @@ class PhaseWinnerView:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
-    # Metric labels recorded by the winning generation, independent of current config.
-    metric_name: str | None = None
-    metric_goal: str | None = None
     # Path-free projection of the winner's confound block: verdicts, check
     # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
     confound: dict[str, Any] | None = None
@@ -209,7 +206,6 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         if len(stored_metric_names) != 1:
             return None
         stored_metric_name = str(stored_metric_names[0])
-        stored_goal = metric_block.get("goal")
         gates = [g for g in (data.get("gates") or []) if isinstance(g, dict)]
         completion = data.get("completion") or {}
         if not isinstance(completion, Mapping):
@@ -232,8 +228,6 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             phase=phase_name,
             trial_number=trial_number,
             metric=metric,
-            metric_name=stored_metric_name,
-            metric_goal=str(stored_goal) if isinstance(stored_goal, str) else None,
             params=dict(params),
             effective_overrides=dict(effective_overrides),
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),

@@ -351,27 +351,12 @@ def _validate_generation_manifest(
         fingerprint = payload.get("phase_fingerprint")
         if not is_sha256_hex(fingerprint):
             raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
-        source = payload.get("winner_source")
-        if not isinstance(source, Mapping):
-            raise _fail(f"winner for phase {name!r} has no valid winner_source")
-        # _parse_winner_source owns kind, key set, and phase equality. The
-        # safe-name and exact-int checks stay here because it checks
-        # neither: it only requires a nonempty phase and coerces with int().
-        source_phase = source.get("phase")
-        if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
-            raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
-        source_trial = source.get("trial_number")
-        if (
-            not isinstance(source_trial, int)
-            or isinstance(source_trial, bool)
-            or source_trial != payload.get("trial_number")
-        ):
-            raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
         try:
-            parsed_source = _parse_winner_source(source, expected_phase=name)
+            parsed_source = _parse_winner_source(payload.get("winner_source"), expected_phase=name)
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid winner_source ({exc})") from exc
         for id_field, parsed_value in (
+            ("trial_number", parsed_source.trial_number),
             ("generation_id", parsed_source.generation_id),
             ("attempt_id", parsed_source.attempt_id),
         ):
@@ -383,7 +368,9 @@ def _validate_generation_manifest(
         if not isinstance(payload.get("completion"), Mapping):
             raise _fail(f"winner for phase {name!r} has no completion metadata")
         try:
-            confound = _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
+            confound = _validate_confound_block(
+                payload.get("confound"), winner_trial=parsed_source.trial_number
+            )
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid confound block ({exc})") from exc
         try:

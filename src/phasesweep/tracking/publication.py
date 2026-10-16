@@ -455,11 +455,11 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
     :raises OSError: A delivery record cannot be read or written.
     :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
     """
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
 
     if not (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
         return  # No-work replay never imports the SDK or creates remote runs.
-    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    environment = _environment_identity(experiment, experiment.phases[0].name).values
     for path in _save_generation_intents(experiment, generation_id):
         _deliver(experiment, path, environment)
 
@@ -501,7 +501,7 @@ def publish_failed_generation(
     :param BaseException error: Authoritative engine failure, without its private message.
     :param ValidatedLedger ledger: The invocation's ledger, holding its trials.
     """
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import PhaseSweepShutdown
 
     parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
@@ -510,7 +510,7 @@ def publish_failed_generation(
     if _published(experiment, generation_id):
         return
     status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
-    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    environment = _environment_identity(experiment, experiment.phases[0].name).values
     attempts = _unrecorded_attempts(experiment, generation_id)
     trials = _attempt_trials(ledger, {binding["phase"] for _, binding in attempts})
     paths = _save_attempt_intents(experiment, generation_id, attempts, trials, ended=status)
@@ -598,7 +598,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
     from phasesweep.engine.locking import _experiment_lock
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import signal_handler_scope
     from phasesweep.tracking.mlflow import require_mlflow_sdk
 
@@ -620,7 +620,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             and read_record(source)["source"] != experiment.mlflow.evidence_identity()
         ):
             raise ValueError("Tracking delivery belongs to a different target or generation.")
-        environment = _trainer_environment(experiment, experiment.phases[0].name)
+        environment = _environment_identity(experiment, experiment.phases[0].name).values
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
         parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))

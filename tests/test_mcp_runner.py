@@ -57,7 +57,6 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.errors import (
-    OperatorAction,
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
@@ -347,7 +346,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     assert status["result_snapshot_state"] == "complete"
     handle = store.get(run_id)
     assert handle is not None
-    assert store.recovery_required(handle) is False
+    assert store.observe(handle).recovery_required is False
     assert _generation_path(experiment).read_bytes() == generation_before
     assert not (_experiment_dir(experiment) / "study.journal").exists()
 
@@ -484,8 +483,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
         handle = store.get(run_id)
         assert handle is not None
-        assert store.state(handle) == "running"
-        assert store.recovery_required(handle)
+        observation = store.observe(handle)
+        assert observation.state == "running"
+        assert observation.recovery_required
         with pytest.raises(ConcurrencyLimitError):
             app.launch("other")
 
@@ -526,11 +526,12 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     store.status_path(run_id).write_bytes(terminal_before)
     preflight = recover_run_cli(state_dir, run_id)
     assert preflight.exit_code == 0, preflight.output
-    assert store.recovery_required(handle)
+    assert store.observe(handle).recovery_required
     confirmed = recover_run_cli(state_dir, run_id, confirm=True)
     assert confirmed.exit_code == 0, confirmed.output
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
     assert live_runs(store) == []
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
@@ -703,7 +704,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert mcp_runner._OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE] in remediation
+    assert "fresh artifact root and local storage" in remediation
 
 
 @pytest.mark.integration
@@ -748,7 +749,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     assert [w["phase"] for w in terminal["result_snapshot"]["winners"]] == ["p"]
     handle = store.get(run_id)
     assert handle is not None
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 @pytest.mark.integration
@@ -1316,8 +1317,9 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
     assert durable["result_snapshot_state"] == "pending"
     assert durable["result_snapshot"] == {"captured": True}
     assert "result_snapshot_error" not in durable
-    assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.snapshot_recovery_required
 
 
 def test_unserializable_captured_snapshot_still_records_terminal_evidence(
@@ -1394,7 +1396,9 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
-    assert store.state(make_run_handle(run_id=run_id, experiment_id="no_status")) == "running"
+    assert (
+        store.observe(make_run_handle(run_id=run_id, experiment_id="no_status")).state == "running"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1727,7 +1731,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
     assert handle.pid_starttime == read_proc_starttime(os.getpid())
     assert handle.started_at == started_at
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
     assert calls == [("srv", None, False)]
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None

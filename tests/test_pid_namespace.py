@@ -226,7 +226,7 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
         lambda _pid: pytest.fail("a PID from another namespace must never be waited on"),
     )
     assert store.runner_view(handle).visibility == "unobservable"
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 # The absence proof: from the host's initial PID namespace only, a recorded
@@ -703,9 +703,10 @@ def test_foreign_namespace_runner_reads_running_and_writes_nothing(
     assert view.reason is not None
     assert RECORDED in view.reason
     assert store.runner_may_be_alive(handle)
-    assert store.state(handle) == "running"
-    assert not store.recovery_required(handle)
-    assert not store.snapshot_recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert not observation.recovery_required
+    assert not observation.snapshot_recovery_required
     assert live_runs(store) == [handle]
     assert tree_snapshot(registry.state_dir) == before
 
@@ -717,7 +718,7 @@ def test_foreign_namespace_terminal_status_still_settles(
     _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch)
     _write_finished_status(store, handle.run_id)
 
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 def test_foreign_namespace_runner_holds_its_concurrency_slot(
@@ -741,8 +742,9 @@ def test_absent_runner_reads_as_a_dead_runner_that_needs_recovery(
 
     assert store.runner_view(handle).visibility == "absent"
     assert not store.runner_may_be_alive(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [handle]
     run = app.status(run_id=handle.run_id)["run"]
     assert run["state"] == "running"
@@ -772,7 +774,7 @@ def test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run(
 
     shutil.rmtree(proc / "900")
     recover_run(registry.state_dir, handle.run_id, confirm=True, emit=lambda _m: None)
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
 
     _add_runner_blocker(proc, handle)
     settled = app.status(run_id=handle.run_id)["run"]
@@ -861,7 +863,7 @@ def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
     assert "await_run" in str(caught.value)
     assert str(registry.state_dir) not in str(caught.value)
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     events = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [(event["tool"], event["outcome"], event["error_type"]) for event in events] == [
         (TOOL_CANCEL_RUN, "error", "RunNamespaceMismatchError")
@@ -937,8 +939,9 @@ def test_recover_run_settles_an_absent_runner_without_signalling(
     assert terminal["error_class"] == "RunnerExitedWithoutStatus"
     assert terminal["cleanup_confirmed"] is True
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
 
 
 def test_spawn_refuses_unreadable_pid_namespace_before_popen(

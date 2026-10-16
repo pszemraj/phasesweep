@@ -81,10 +81,11 @@ def test_unmarked_output_root_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"unmarked PhaseSweep state.*fresh artifact root.*Nothing was written",
-    ):
+        match=r"unmarked PhaseSweep state.*Nothing was written",
+    ) as excinfo:
         run_experiment(experiment)
 
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert tree_snapshot(root) == before
     assert not _artifact_root_binding_path(experiment).exists()
 
@@ -114,11 +115,11 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=rf"unsupported PhaseSweep format {ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1}"
-        r".*fresh artifact root",
-    ):
+        match=rf"unsupported PhaseSweep format {ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1}",
+    ) as excinfo:
         run_experiment(experiment)
 
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert tree_snapshot(root) == before
 
 
@@ -147,10 +148,11 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
 
     with pytest.raises(
         StudySchemaMismatchError,
-        match=r"old_experiment::removed_phase.*fresh local storage ledger",
-    ):
+        match=r"old_experiment::removed_phase.*Nothing was written",
+    ) as excinfo:
         run_experiment(experiment)
 
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert not _experiment_dir(experiment).exists()
     assert {
         path.name: path.read_bytes()

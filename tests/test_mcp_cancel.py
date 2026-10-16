@@ -63,7 +63,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         app.cancel(pending.run_id)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
-    assert store.recovery_required(pending)
+    assert store.observe(pending).recovery_required
 
     runner_pid = reaped_pid()
     spawned = replace(
@@ -132,7 +132,7 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
         return True
 
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", record_kill)
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
     result = app.cancel("srv-boot")
 
@@ -238,7 +238,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     )
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert store.cleanup_uncertain_path(run_id).is_file()
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
@@ -443,4 +443,4 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     assert result["state"] == "failed"
     assert result["recovery_required"] is False
     assert not store.cleanup_uncertain_path(run_id).exists()
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"

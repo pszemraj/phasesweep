@@ -580,16 +580,26 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
 def _load_snapshot_study(
     storage: JournalStorage | optuna.storages.InMemoryStorage, study_name: str
 ) -> optuna.Study | None:
-    """Load a study from a replayed snapshot, returning only confirmed absence.
+    """Load and schema-check a snapshot study, returning only confirmed absence.
 
     :param JournalStorage | optuna.storages.InMemoryStorage storage: Captured or invocation-local storage.
     :param str study_name: Named study to inspect.
     :return optuna.Study | None: Existing study, or ``None`` when its name is absent.
+    :raises StudyStorageUnavailableError: The study or its trials could not be read.
+    :raises StudySchemaMismatchError: The study carries an unsupported schema.
     """
     try:
-        return optuna.load_study(study_name=study_name, storage=storage)
-    except KeyError:
-        return None
+        try:
+            study = optuna.load_study(study_name=study_name, storage=storage)
+        except KeyError:
+            return None
+        trials = study.get_trials(deepcopy=False)
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Snapshot storage could not be replayed while reading study {study_name!r}."
+        ) from exc
+    _check_study_schema(study, trials)
+    return study
 
 
 def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
@@ -666,8 +676,7 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
-            f"state: {detail}. Use a fresh local storage ledger and artifact root with "
-            "this PhaseSweep release. Nothing was written.",
+            f"state: {detail}. Nothing was written.",
         )
 
 
@@ -756,7 +765,6 @@ def _phase_trial_stats(
     if study is None:
         return _PhaseTrialStats({}, True, {}, [])
     trials = study.get_trials(deepcopy=False)
-    _check_study_schema(study, trials)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
@@ -989,19 +997,12 @@ def _read_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Stu
     """
     _require_scanned(ledger)
     study_name = _phase_study_name(ledger.experiment, phase)
-    study: optuna.Study | None
     if ledger.backend == "memory":
         if not isinstance(ledger, ClaimedLedger) or ledger.memory_storage is None:
             return None
-        study = _load_snapshot_study(ledger.memory_storage, study_name)
-    else:
-        assert ledger.storage_url is not None
-        study = _load_journal_study_snapshot(ledger.storage_url, study_name)
-    if study is None:
-        return None
-    trials = study.get_trials(deepcopy=False)
-    _check_study_schema(study, trials)
-    return study
+        return _load_snapshot_study(ledger.memory_storage, study_name)
+    assert ledger.storage_url is not None
+    return _load_journal_study_snapshot(ledger.storage_url, study_name)
 
 
 def read_phase_studies(ledger: ValidatedLedger) -> dict[str, optuna.Study | None]:
@@ -1032,16 +1033,7 @@ def read_phase_studies(ledger: ValidatedLedger) -> dict[str, optuna.Study | None
         if snapshot is None:
             studies[phase.name] = None
             continue
-        try:
-            study = _load_snapshot_study(snapshot, study_name)
-        except Exception as exc:
-            raise StudyStorageUnavailableError(
-                f"Journal storage {ledger.storage_url} could not be replayed while reading "
-                f"study {study_name!r}."
-            ) from exc
-        if study is not None:
-            _check_study_schema(study, study.get_trials(deepcopy=False))
-        studies[phase.name] = study
+        studies[phase.name] = _load_snapshot_study(snapshot, study_name)
     return studies
 
 

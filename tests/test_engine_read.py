@@ -781,10 +781,14 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
     assert status["published_config_matches_current"] is False
     assert status["phases"][0]["winner_present"] is True
 
-    winners = read_result(drifted, phase_names=[phase.name for phase in drifted.phases])[1]
+    result_status, winners = read_result(
+        drifted, phase_names=[phase.name for phase in drifted.phases]
+    )
     assert len(winners) == 1
-    assert winners[0].metric_name == "objective"
-    assert winners[0].metric_goal == "minimize"
+    assert (result_status["metric"]["name"], result_status["metric"]["goal"]) == (
+        "objective",
+        "minimize",
+    )
 
 
 def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None:
@@ -837,27 +841,36 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
         == []
     )
 
-    (winner,) = read_result(
+    result_status, (winner,) = read_result(
         renamed, generation_id=generation_id, phase_names=status["result_phase_plan"]
-    )[1]
+    )
     assert winner.phase == "p"
-    assert (winner.metric_name, winner.metric_goal) == ("objective", "minimize")
+    assert (result_status["metric"]["name"], result_status["metric"]["goal"]) == (
+        "objective",
+        "minimize",
+    )
 
 
-def test_read_result_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
-    """A winner_source citing another phase reads as absent, not as that phase's winner.
-
-    The permissive reader enforces phase agreement through
-    ``_parse_winner_source``, including when publication validation fails.
-    """
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("phase", "other", id="other-phase"),
+        pytest.param("trial_number", True, id="bool-trial"),
+        pytest.param("trial_number", 0.0, id="float-trial"),
+        pytest.param("trial_number", "0", id="string-trial"),
+    ],
+)
+def test_read_result_rejects_a_malformed_winner_source(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """The permissive reader treats invalid source phase or field types as absent."""
     experiment = _published(tmp_path)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner = yaml.safe_load(winner_path.read_text())
-    assert winner["winner_source"]["phase"] == "p"
-    winner["winner_source"]["phase"] = "other"
+    winner["winner_source"][field] = value
     winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
 
     assert read_result(experiment, generation_id=generation_id, phase_names=["p"])[1] == []

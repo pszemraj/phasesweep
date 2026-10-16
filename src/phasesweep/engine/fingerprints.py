@@ -345,8 +345,7 @@ def _verify_fingerprint(
         if trials:
             raise StudyFingerprintMismatchError(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
-                "fingerprint. Its populated state is unsupported by this release. Use a "
-                "fresh local ledger and artifact root.",
+                "fingerprint. Its populated state is unsupported by this release.",
             )
         _stamp_fingerprint(study, fp, payload)
     elif existing != fp:

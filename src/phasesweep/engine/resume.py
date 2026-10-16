@@ -13,12 +13,9 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import (
-    PublicationAccessError,
-    PublicationIntegrityError,
-    StudyContextConflictError,
-)
+from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
@@ -104,10 +101,9 @@ def _published_for_resume(experiment: Experiment) -> ValidatedPublication | None
         experiment,
         raise_on_manifest_error=True,
     )
-    if pointer.state == "permission_denied":
-        raise PublicationAccessError(pointer.error or "Published result is unreadable.")
-    if pointer.state == "failed":
-        raise PublicationIntegrityError(pointer.error or "Published result is invalid.")
+    publication_ops.raise_for_unusable_publication(
+        experiment.experiment, pointer.state, pointer.error, _experiment_dir(experiment)
+    )
     return pointer.validated
 
 

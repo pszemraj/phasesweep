@@ -364,7 +364,7 @@ def live_runs(store: RunStore) -> list[RunHandle]:
     :param RunStore store: Store whose handles are scanned.
     :return list[RunHandle]: All handles whose derived state is currently ``running``.
     """
-    return [handle for handle in store.list_handles() if store.state(handle) == "running"]
+    return [handle for handle in store.list_handles() if store.observe(handle).state == "running"]
 
 
 def claim_runner_handle(

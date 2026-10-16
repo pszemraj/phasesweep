@@ -361,8 +361,9 @@ def _recovery_needs(
     :raises RunRecoveryError: No immutable snapshot remains for a result that cannot be rebuilt.
     :return _RecoveryNeeds: Decisions and parsed terminal evidence used by later recovery steps.
     """
-    cleanup_required = store.cleanup_recovery_required(handle, view=view)
-    snapshot_recovery_required = store.snapshot_recovery_required(handle, view=view)
+    observation = store.observe(handle, view=view)
+    cleanup_required = observation.cleanup_recovery_required
+    snapshot_recovery_required = observation.snapshot_recovery_required
     terminal_cleanup_uncertain = (
         terminal_status is not None
         and terminal_status.get("cleanup_confirmed") is False

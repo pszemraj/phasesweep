@@ -999,30 +999,12 @@ class RunStore:
                 return None
         return handle
 
-    def state(self, handle: RunHandle, *, view: RunnerView | None = None) -> RunState:
-        """Derive run state without changing durable evidence.
-
-        Finalized terminal return codes determine success, failure or cancellation; snapshot
-        capture failure does not change the engine outcome. Pending snapshots reserve capacity.
-        A live PID or unresolved pre-spawn handle remains running.
-
-        A dead or unverifiable spawned runner without terminal evidence remains running until
-        recovery confirms cleanup of its separate trial groups. An ended boot settles process
-        cleanup; explicit uncertain trial evidence still requires reconciliation.
-
-        Foreign-namespace PID numbers are never probed or signalled. Host-proven absence
-        settles only the runner group, not its trials. Superseded cleanup markers remain on disk
-        but no longer reserve capacity.
-
-        :param RunHandle handle: The run handle to evaluate.
-        :param RunnerView | None view: The caller's derivation of the runner,
-            or ``None`` to derive it here.
-        :return RunState: One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
-        """
-        return self.observe(handle, view=view).state
-
     def observe(self, handle: RunHandle, *, view: RunnerView | None = None) -> RunObservation:
         """Read and classify one run without mutating its persisted evidence.
+
+        Finalized return codes determine terminal state independently of snapshot capture.
+        A dead or unverifiable runner without terminal evidence stays running until
+        recovery reconciles its trial cleanup.
 
         A valid uncertainty marker reserves capacity unless terminal cleanup
         or an ended boot supersedes it. An ended boot settles processes but
@@ -1219,33 +1201,6 @@ class RunStore:
             key=lambda handle: (datetime.fromisoformat(handle.started_at), handle.run_id),
         )
 
-    def recovery_required(self, handle: RunHandle, *, view: RunnerView | None = None) -> bool:
-        """Return whether operator cleanup or snapshot recovery is required.
-
-        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
-        :param RunnerView | None view: The caller's derivation of the runner,
-            or ``None`` to derive it here.
-        :return bool: True when cleanup remains uncertain, a runner observed
-            or proven dead left no terminal status, or terminal snapshot
-            finalization was interrupted after the runner exited.
-        """
-        return self.observe(handle, view=view).recovery_required
-
-    def cleanup_recovery_required(
-        self, handle: RunHandle, *, view: RunnerView | None = None
-    ) -> bool:
-        """Return whether cleanup evidence still requires operator recovery.
-
-        :param RunHandle handle: Persisted run whose cleanup evidence is checked.
-        :param RunnerView | None view: The caller's derivation of the runner,
-            or ``None`` to derive it here.
-        :return bool: True when a server marker still reserves process
-            cleanup or terminal runner status still needs trial reconciliation.
-            A prior boot proves processes dead but does not update their
-            durable trial rows or an already-frozen result snapshot.
-        """
-        return self.observe(handle, view=view).cleanup_recovery_required
-
     def cleanup_recovered_attempt_evidence(
         self,
         handle: RunHandle,
@@ -1292,18 +1247,6 @@ class RunStore:
         if status is None:
             return set()
         return set(status.get("uncertain_attempt_ids") or [])
-
-    def snapshot_recovery_required(
-        self, handle: RunHandle, *, view: RunnerView | None = None
-    ) -> bool:
-        """Return whether a dead runner left a pending snapshot for operator finalization.
-
-        :param RunHandle handle: Persisted run whose terminal status is checked.
-        :param RunnerView | None view: The caller's derivation of the runner,
-            or ``None`` to derive it here.
-        :return bool: True only for an orphaned pending snapshot state.
-        """
-        return self.observe(handle, view=view).snapshot_recovery_required
 
     def runner_may_be_alive(self, handle: RunHandle, *, view: RunnerView | None = None) -> bool:
         """Return whether a spawned handle may still identify a live runner.

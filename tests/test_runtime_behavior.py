@@ -62,6 +62,7 @@ from phasesweep.engine.study_policy import (
     _record_recovery_boundary,
 )
 from phasesweep.engine.trial import (
+    EnvironmentIdentity,
     ExecutedTrial,
     TrialExecutionError,
     _environment_identity,
@@ -559,12 +560,12 @@ def test_terminal_callback_reports_success_evidence(
     captured: list[TerminalReport] = []
     validated_environments: list[str] = []
 
-    def validate_environment(_experiment: Experiment, phase_name: str) -> dict[str, str]:
+    def validate_environment(_experiment: Experiment, phase_name: str) -> EnvironmentIdentity:
         assert not _artifact_root_binding_path(experiment).exists()
         validated_environments.append(phase_name)
-        return {}
+        return _environment_identity(_experiment, phase_name)
 
-    monkeypatch.setattr("phasesweep.engine.run._trainer_environment", validate_environment)
+    monkeypatch.setattr("phasesweep.engine.run._environment_identity", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase

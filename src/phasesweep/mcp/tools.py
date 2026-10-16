@@ -907,7 +907,7 @@ class PhaseSweepMCP:
             self._read_result_target(run_id)
         )
         if result_source == "current_shared_study" and (
-            self._runs.recovery_required(handle, view=view)
+            self._runs.observe(handle, view=view).recovery_required
             or not self._runs.runner_may_be_alive(handle, view=view)
         ):
             assert experiment is not None
@@ -1028,7 +1028,7 @@ class PhaseSweepMCP:
         snapshot = parse_result_snapshot(terminal_status)
         if snapshot is not None:
             return snapshot
-        if self._runs.state(handle, view=view) == "running":
+        if self._runs.observe(handle, view=view).state == "running":
             return None
         # Recheck finalization after deriving terminal state.
         latest_status = self._runs.recorded_terminal_status(handle)
@@ -1121,7 +1121,9 @@ class PhaseSweepMCP:
                         and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
                     )
                     raise RunCapacityUnknownError(len(unreadable), recoverable)
-                live = [handle for handle in handles if self._runs.state(handle) == "running"]
+                live = [
+                    handle for handle in handles if self._runs.observe(handle).state == "running"
+                ]
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)
                 if busy is not None:

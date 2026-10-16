@@ -73,8 +73,9 @@ def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: 
     loaded = store.get("exp-1")
 
     assert loaded == handle
-    assert store.state(loaded) == "running"
-    assert store.recovery_required(loaded)
+    observation = store.observe(loaded)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [loaded]
 
 
@@ -821,7 +822,7 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         assert store.launch_inventory() == ([], {f"run:{handle.run_id}"})
     elif record_kind == "status":
         assert store.recorded_terminal_status(handle) is None
-        assert store.state(handle) == "running"
+        assert store.observe(handle).state == "running"
     elif record_kind == "cleanup_uncertain":
         assert not store.cleanup_uncertain(handle)
     else:
@@ -944,7 +945,7 @@ def test_terminal_status_determines_state(
     handle = make_run_handle(run_id="exp-1")
     write_run_status(store, "exp-1", returncode=returncode, error_class=error_class)
 
-    assert store.state(handle) == expected_state
+    assert store.observe(handle).state == expected_state
 
 
 def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_path: Path) -> None:
@@ -968,7 +969,7 @@ def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_p
         result_snapshot_error="InterruptedFinalization",
     )
 
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 @pytest.mark.parametrize("runner_live", [True, False], ids=["live_runner", "dead_runner"])
@@ -989,9 +990,10 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(
         result_snapshot_state="pending",
     )
 
-    assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle) == (not runner_live)
-    assert store.recovery_required(handle) == (not runner_live)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.snapshot_recovery_required == (not runner_live)
+    assert observation.recovery_required == (not runner_live)
     assert live_runs(store) == [handle]
 
     write_run_status(
@@ -1004,9 +1006,10 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(
         result_snapshot={},
     )
 
-    assert store.state(handle) == "succeeded"
-    assert not store.snapshot_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "succeeded"
+    assert not observation.snapshot_recovery_required
+    assert not observation.recovery_required
     assert live_runs(store) == []
 
 
@@ -1065,7 +1068,7 @@ def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> N
     private_atomic_write_text(store.status_path("exp-1"), json.dumps(payload))
 
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 def test_status_read_failures_do_not_break_state_scans(
@@ -1079,7 +1082,7 @@ def test_status_read_failures_do_not_break_state_scans(
     store.status_path("exp-1").write_bytes(b"\xff")
     store.status_path("exp-1").chmod(0o600)
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
     private_atomic_write_text(store.status_path("exp-1"), '{"returncode": 0}')
@@ -1093,7 +1096,7 @@ def test_status_read_failures_do_not_break_state_scans(
     monkeypatch.setattr(mcp_runs, "read_private_text", fail_status_read)
 
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
 
@@ -1109,14 +1112,14 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
         cleanup_confirmed=True,
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
     assert live_runs(store) == []
 
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1")
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
@@ -1125,8 +1128,9 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     store.create(handle)
     before = tree_snapshot(tmp_path / "state")
 
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [handle]
     assert not store.cleanup_uncertain(handle)
     assert tree_snapshot(tmp_path / "state") == before
@@ -1144,7 +1148,7 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
         ),
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
 
 
 def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
@@ -1181,7 +1185,7 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
 
     def read_state() -> None:
         started.set()
-        observed.append(store.state(handle))
+        observed.append(store.observe(handle).state)
         finished.set()
 
     with store.transition_lock(handle):
@@ -1250,9 +1254,10 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
     before = tree_snapshot(tmp_path / "state")
 
     assert not store.cleanup_uncertain(handle)
-    assert store.state(handle) == "running"
+    observation = store.observe(handle)
+    assert observation.state == "running"
     assert not store.cleanup_uncertain(handle)
-    assert store.recovery_required(handle)
+    assert observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1358,8 +1363,9 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
     assert store.runner_may_be_alive(handle)
     assert not store.cleanup_uncertain(handle)
     assert store.cleanup_identity(handle).boot_id == handle.boot_id
-    assert store.state(handle) == "running"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert not observation.recovery_required
 
 
 def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) -> None:
@@ -1376,10 +1382,11 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
     )
     store.create(handle)
 
-    assert store.state(handle) == "failed"
+    observation = store.observe(handle)
+    assert observation.state == "failed"
     assert not store.cleanup_uncertain(handle)
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert live_runs(store) == []
 
 
@@ -1391,9 +1398,10 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     assert handle.boot_id is None
     store.create(handle)
 
-    assert store.state(handle) == "running"
+    observation = store.observe(handle)
+    assert observation.state == "running"
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.recovery_required(handle)
+    assert observation.recovery_required
 
 
 def test_terminal_status_written_during_liveness_check_does_not_require_recovery(
@@ -1414,8 +1422,9 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
         return False
 
     monkeypatch.setattr(mcp_runs, "is_same_live_process", runner_finishes)
-    assert store.state(handle) == "succeeded"
-    assert store.recovery_required(handle) is False
+    observation = store.observe(handle)
+    assert observation.state == "succeeded"
+    assert observation.recovery_required is False
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
@@ -1427,9 +1436,10 @@ def test_earlier_boot_supersedes_a_persisted_cleanup_uncertainty_marker(tmp_path
     before = tree_snapshot(tmp_path / "state")
 
     assert store.cleanup_uncertain(handle)
-    assert store.state(handle) == "failed"
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1441,9 +1451,10 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
     store.create(handle)
     write_unsafe_cleanup_status(store, "exp-1")
 
-    assert store.state(handle) == "failed"
-    assert store.cleanup_recovery_required(handle)
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert observation.cleanup_recovery_required
+    assert observation.recovery_required
 
 
 def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> None:
@@ -1459,8 +1470,8 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
     store.create(handle)
     write_run_status(store, "exp-1", returncode=0, result_snapshot_state="pending")
 
-    assert store.snapshot_recovery_required(handle)
-    assert not store.snapshot_recovery_required(replace(handle, boot_id=None))
+    assert store.observe(handle).snapshot_recovery_required
+    assert not store.observe(replace(handle, boot_id=None)).snapshot_recovery_required
 
 
 def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Path) -> None:
@@ -1477,10 +1488,11 @@ def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Pat
     )
     before = tree_snapshot(tmp_path / "state")
 
-    assert store.state(handle) == "cancelled"
+    observation = store.observe(handle)
+    assert observation.state == "cancelled"
     assert store.cleanup_uncertain_path("exp-1").exists()
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1492,7 +1504,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     store.create(handle)
     write_unsafe_cleanup_status(store, "exp-1")
 
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
     private_atomic_write_text(
@@ -1508,7 +1520,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
         ),
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
     assert live_runs(store) == []
 
 
@@ -1549,8 +1561,9 @@ def test_cleanup_recovery_rejects_records_that_cannot_release_the_reservation(
     )
 
     assert not store._cleanup_recovered(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
 
 
 def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
@@ -1618,8 +1631,9 @@ def test_state_reserves_recovery_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     # different process than the one we launched. The runner is gone, but its
     # separately-sessioned descendants are not proven gone, so fail closed.
     handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
@@ -1639,10 +1653,11 @@ def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path
             time.sleep(0.02)
         assert is_pid_zombie(proc.pid)
         handle = make_run_handle(run_id="zomb", pid=proc.pid, starttime=starttime)
-        assert store.state(handle) == "running"
-        assert store.recovery_required(handle)
+        observation = store.observe(handle)
+        assert observation.state == "running"
+        assert observation.recovery_required
         assert not store.cleanup_uncertain_path(handle.run_id).exists()
-        # state() reaped the child, so the zombie is gone, not merely filtered.
+        # observe() reaped the child, so the zombie is gone, not merely filtered.
         assert not is_pid_zombie(proc.pid)
     finally:
         proc.wait()

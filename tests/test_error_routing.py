@@ -168,7 +168,7 @@ def test_every_operator_error_declares_its_action():
         assert plain.action is cls.default_action
         assert routed.action is OperatorAction.RETRY
 
-        # The action is a routing attribute, never part of what the operator reads.
+        # Boundaries render actions; the exception itself retains its diagnostic.
         assert str(routed) == str(plain)
         assert plain.args == routed.args
 
@@ -203,11 +203,11 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     assert foreign.action is RunRecoveryError.default_action
 
 
-_UNMARKED_STUDY_REMEDY_MARKERS = {
-    "study schema": "fresh artifact root",
-    "trial target": "fresh local ledger",
+_UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
+    "study schema": "unsupported phasesweep storage schema",
+    "trial target": "has trial state but no",
     "environment cohort": "new experiment name",
-    "phase fingerprint": "fresh local ledger",
+    "phase fingerprint": "has no semantic fingerprint",
 }
 
 
@@ -240,8 +240,7 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
-    # The routed action is additional to, not a replacement for, the remedy prose.
-    assert _UNMARKED_STUDY_REMEDY_MARKERS[label] in str(excinfo.value), label
+    assert _UNMARKED_STUDY_DIAGNOSTIC_MARKERS[label] in str(excinfo.value), label
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
@@ -256,7 +255,7 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "offline")
 
     with pytest.raises(PhaseSweepError) as excinfo:
-        trial._trainer_environment(experiment, "p")
+        trial._environment_identity(experiment, "p")
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert str(excinfo.value) == (
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
@@ -884,7 +883,7 @@ WRAP_CASES = (
         trigger=_recover_over_malformed_registry_entry,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="delete the entry file if you are certain nothing is running.",
+        message="Investigate the attempt's trial directory.",
     ),
     RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,
@@ -1466,14 +1465,14 @@ ORIGIN_CASES = (
         trigger=_scan_registry(damage=_field_dropped),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Delete the entry file only if you are certain no process",
+        message="has an unsupported or partial schema.",
     ),
     RoutingCase(
         id="registry_entry_trial_dir_missing",
         trigger=_scan_registry(damage=_trial_dir_removed),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Delete the entry file only if you are certain nothing is running.",
+        message="its process state cannot be verified.",
     ),
     # recover-run runs every cleanup check below in both of its modes, so none
     # of these may route back to it.
@@ -1722,7 +1721,7 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
 
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.FRESH_NAMESPACE: "new experiment name",
+        OperatorAction.FRESH_NAMESPACE: "fresh artifact root and local storage",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "repair the experiment tree",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",

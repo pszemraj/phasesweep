@@ -596,7 +596,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         nonlocal finalized
         experiment = original_load_config(saved)
         if not finalized:
-            assert store.state(saved) == "running"
+            assert store.observe(saved).state == "running"
             finalized = True
             write_run_status(store, **complete)
         return experiment
@@ -738,7 +738,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
         )
     if transition == "no_status_runner_exit_with_recovery_lock":
         assert not store.cleanup_uncertain(handle)
-        assert store.state(handle) == "running"
+        assert store.observe(handle).state == "running"
 
     assert finalized
     if transition == "complete":
@@ -762,7 +762,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
             assert payload["phases"][0]["winner_present"] is False
             assert payload["run"]["recovery_required"] is True
             assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
-        assert store.recovery_required(handle)
+        assert store.observe(handle).recovery_required
         if read_tool == "await_run":
             assert payload["reason"] == "recovery_required"
 
@@ -788,7 +788,7 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
         nonlocal marked
         status = original_status_payload(experiment_id, snapshot, result_source=result_source)
         if not marked:
-            assert store.state(handle) == "succeeded"
+            assert store.observe(handle).state == "succeeded"
             marked = True
             write_run_status(store, **{**complete, "cleanup_confirmed": False})
             store.mark_cleanup_uncertain(handle)

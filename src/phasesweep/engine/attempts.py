@@ -35,7 +35,7 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
     _unduplicated_outcome,
 )
-from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
@@ -447,8 +447,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
             "Recovery cannot prove whether a process from this attempt is still "
-            "alive. Investigate the attempt's trial directory, then delete the "
-            "entry file if you are certain nothing is running.",
+            "alive. Investigate the attempt's trial directory.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
@@ -481,9 +480,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             locator_identity = canonical_storage_identity(payload["storage_locator"])
         except ValueError as exc:
             raise ProcessCleanupUncertainError(
-                f"Attempt registry entry {entry_path} has an unsupported or partial "
-                "schema. Delete the entry file only if you are certain no process "
-                "from this attempt is running.",
+                f"Attempt registry entry {entry_path} has an unsupported or partial schema.",
                 action=OperatorAction.RESTORE_TREE,
             ) from exc
     if (
@@ -511,9 +508,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         or type(payload.get("trial_number")) is not int
     ):
         raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} has an unsupported or partial "
-            "schema. Delete the entry file only if you are certain no process "
-            "from this attempt is running.",
+            f"Attempt registry entry {entry_path} has an unsupported or partial schema.",
             action=OperatorAction.RESTORE_TREE,
         )
     return payload
@@ -556,8 +551,7 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
     if not trial_dir.is_dir():
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} points at a missing trial "
-            f"directory {trial_dir}; its process state cannot be verified. "
-            "Delete the entry file only if you are certain nothing is running.",
+            f"directory {trial_dir}; its process state cannot be verified.",
             action=OperatorAction.RESTORE_TREE,
         )
     return _AttemptRecord(
@@ -874,8 +868,7 @@ class _RegistryEntryDiscovery:
         """
         return ProcessCleanupUncertainError(
             f"Attempt registry entry {self.entry_path} has a malformed lifecycle record in "
-            f"{record.trial_dir}. Delete the entry file only if you are certain nothing is "
-            "running.",
+            f"{record.trial_dir}.",
             action=OperatorAction.RESTORE_TREE,
         )
 
@@ -887,8 +880,7 @@ class _RegistryEntryDiscovery:
         """
         return ProcessCleanupUncertainError(
             f"Attempt registry entry {self.entry_path} has a missing or malformed "
-            f"process identity in {record.trial_dir}. "
-            "Delete the entry file only if you are certain nothing is running.",
+            f"process identity in {record.trial_dir}.",
             action=OperatorAction.RESTORE_TREE,
         )
 
@@ -1045,8 +1037,7 @@ class _CleanupUncertainTrialDiscovery(_TrialDiscovery):
             f"study {self.study_name}: process cleanup could not be confirmed. "
             f"experiment={self.experiment_name} phase={record.phase_name} "
             f"trial_dir={record.trial_dir} pid={identity.pid} pgid={identity.pgid}. "
-            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
-            f"{RERUN_CLEANUP_RECOVERY}."
+            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`)."
         )
 
     def cleaned(self, record: _AttemptRecord, identity: StaleProcessIdentity) -> None:

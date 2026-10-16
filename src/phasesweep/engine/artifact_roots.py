@@ -13,8 +13,6 @@ import optuna
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    PublicationAccessError,
-    PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
@@ -26,7 +24,10 @@ from phasesweep.engine.optuna import (
     _published_trial_matches,
 )
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication import (
+    _resolve_publication_pointer,
+    raise_for_unusable_publication,
+)
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from phasesweep.errors import OperatorAction
 from phasesweep.runtime.files import (
@@ -170,8 +171,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             raise ArtifactRootConflictError(
                 f"Artifact root {expected['artifact_root']!r} contains unmarked "
                 f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
-                "Use a fresh artifact root and fresh local storage with this PhaseSweep "
-                "release. Nothing was written.",
+                "Nothing was written.",
             ) from None
         return "unbound"
     except PermissionError as exc:
@@ -190,8 +190,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
-            f"format {raw.get('schema_version')!r}. Use a fresh artifact root and fresh "
-            "local storage with this PhaseSweep release. Nothing was written.",
+            f"format {raw.get('schema_version')!r}. Nothing was written.",
         )
     if raw != expected:
         raise ArtifactRootConflictError(
@@ -254,8 +253,7 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         if trial_count:
             raise ArtifactRootConflictError(
                 f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
-                "artifact root, which is unsupported PhaseSweep state. Use a fresh "
-                "artifact root and local storage with this release. Nothing was written.",
+                "artifact root, which is unsupported PhaseSweep state. Nothing was written.",
             )
         return True
     _check_study_artifact_root(study, experiment)
@@ -326,10 +324,9 @@ def _check_published_phase_studies(
     :raises StudyStorageUnavailableError: A published study's trials cannot be read.
     """
     publication = _resolve_publication_pointer(experiment)
-    if publication.state == "permission_denied":
-        raise PublicationAccessError(publication.error or "Published result is unreadable.")
-    if publication.state == "failed":
-        raise PublicationIntegrityError(publication.error or "Published result is invalid.")
+    raise_for_unusable_publication(
+        experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
+    )
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary
     )

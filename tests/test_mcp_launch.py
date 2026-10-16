@@ -500,8 +500,9 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
 
     (handle,) = store.list_handles()
     assert handle.launch_state == "launching"
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
     assert live_runs(store) == []
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None
@@ -609,8 +610,9 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
         assert terminal is not None
         assert terminal["cleanup_confirmed"] is True
         assert terminal["error_class"] == "OSError"
-        assert store.state(pending) == "failed"
-        assert not store.recovery_required(pending)
+        observation = store.observe(pending)
+        assert observation.state == "failed"
+        assert not observation.recovery_required
     finally:
         for proc in spawned:
             if proc.poll() is None:
@@ -678,8 +680,9 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
     assert terminal is not None
     assert terminal["cleanup_confirmed"] is cleanup_confirmed
     assert terminal["error_class"] == type(error).__name__
-    assert store.state(pending) == expected_state
-    assert store.recovery_required(pending) is (not cleanup_confirmed)
+    observation = store.observe(pending)
+    assert observation.state == expected_state
+    assert observation.recovery_required is (not cleanup_confirmed)
     assert cleanup_calls
     if failing_reader == "starttime":
         assert cleanup_calls[0][1] is None
@@ -702,7 +705,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         restarted.launch("srv")
 
-    assert store.recovery_required(pending)
+    assert store.observe(pending).recovery_required
     assert live_runs(store) == [pending]
 
 
@@ -770,7 +773,7 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
         app.launch("srv")
 
     (failed,) = store.list_handles()
-    assert store.state(failed) == "failed"
+    assert store.observe(failed).state == "failed"
     assert not store.launch_lease_path(failed.run_id).exists()
     patch_popen_capture(monkeypatch)
     assert app.launch("srv")["state"] == "running"
@@ -814,9 +817,10 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     (handle,) = store.list_handles()
     assert handle.launch_state == "spawned"
     assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
-    assert store.state(handle) == "running"
+    observation = store.observe(handle)
+    assert observation.state == "running"
     assert store.cleanup_uncertain(handle)
-    assert store.recovery_required(handle)
+    assert observation.recovery_required
     status = store.recorded_terminal_status(handle)
     assert status is not None
     assert status["cleanup_confirmed"] is False
@@ -869,8 +873,9 @@ def test_launch_refuses_runner_without_linux_process_identity(
     handles = store.list_handles()
     assert len(handles) == 1
     assert handles[0].launch_state == "spawned"
-    assert store.state(handles[0]) == expected_state
-    assert store.recovery_required(handles[0]) is (not cleanup_confirmed)
+    observation = store.observe(handles[0])
+    assert observation.state == expected_state
+    assert observation.recovery_required is (not cleanup_confirmed)
     assert bool(store.cleanup_uncertain(handles[0])) is (not cleanup_confirmed)
     assert cleanup_calls and cleanup_calls[0][1] is None
 
@@ -907,8 +912,9 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     assert terminal is not None
     assert terminal["cleanup_confirmed"] is False
     assert terminal["error_class"] == type(error).__name__
-    assert store.state(pending) == "running"
-    assert store.recovery_required(pending)
+    observation = store.observe(pending)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert store.cleanup_uncertain(pending)
 
 
@@ -958,8 +964,9 @@ def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_on
     assert terminal is not None
     assert terminal["cleanup_confirmed"] is False
     assert store.cleanup_uncertain(pending)
-    assert store.state(pending) == "running"
-    assert store.recovery_required(pending)
+    observation = store.observe(pending)
+    assert observation.state == "running"
+    assert observation.recovery_required
     clear_marker.assert_not_called()
 
 

@@ -64,7 +64,7 @@ from phasesweep.engine.state import (
     WinnerSource,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
@@ -1161,7 +1161,8 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
         run_experiment(experiment)
 
     message = str(excinfo.value)
-    assert "fresh artifact root" in message
+    assert "records no artifact root" in message
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert "nothing was written" in message.lower()
     assert (
         ARTIFACT_ROOT_ATTR

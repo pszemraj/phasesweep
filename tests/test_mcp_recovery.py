@@ -348,7 +348,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_unsafe_cleanup_status(store, run_id)
 
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
@@ -517,8 +517,9 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     later_trial = write_launched_stale_trial(config, generation_id="srv-later-run")
 
     assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
     assert live_runs(store) == []
 
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
@@ -587,8 +588,9 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
         result_snapshot_state="pending",
     )
 
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     status = app.status(run_id=run_id)
     winners = app.winners(run_id=run_id)
     awaited = asyncio.run(app.await_run(run_id))
@@ -616,8 +618,9 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     assert terminal["result_snapshot_error"] == "InterruptedFinalization"
     # The engine exit status stays authoritative: an unavailable frozen
     # snapshot degrades result reads (below), never the run outcome itself.
-    assert store.state(handle) == "succeeded"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "succeeded"
+    assert not observation.recovery_required
     assert live_runs(store) == []
     unavailable = app.status(run_id=run_id)
     assert unavailable["result_source"] == "terminal_snapshot_unavailable"
@@ -654,8 +657,9 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     assert "automated recovery cannot safely" in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
@@ -722,7 +726,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     assert entry_path.is_file()
     assert not store.status_path(run_id).exists()
     assert not store.cleanup_recovery_path(run_id).exists()
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
@@ -734,7 +738,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["registered_attempts_reconciled"] == 1
     assert not entry_path.exists()
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
 
 
 class _TrackingRun(NamedTuple):
@@ -818,8 +822,9 @@ def _recovered_tracking_run(run: _TrackingRun) -> None:
     assert recovery["reaped_attempt_ids"] == [run.operation_id]
     assert recovery["reaped_running_trials"] == 0
     assert not run.entry_path.exists()
-    assert run.store.state(run.handle) == "failed"
-    assert not run.store.recovery_required(run.handle)
+    observation = run.store.observe(run.handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
     assert run.study.get_trials() == trials_before
 
 
@@ -866,7 +871,7 @@ def test_tracking_entry_outlives_a_failed_receipt_write(
             assert recovered.exit_code == 0, recovered.output
             record = json.loads(run.store.cleanup_recovery_path(run_id).read_text())
             assert record["reaped_attempt_ids"] == [run.operation_id]
-            assert not run.store.recovery_required(run.handle)
+            assert not run.store.observe(run.handle).recovery_required
 
     assert run.entry_path.is_file()
     assert not run.receipt_path(run_id).exists()
@@ -907,7 +912,7 @@ def test_tracking_receipt_of_another_generation_is_evidence_only_when_reported(
 
     assert refused.exit_code != 0
     assert "could not confirm any trial-level cleanup evidence" in refused.output
-    assert run.store.recovery_required(run.handle)
+    assert run.store.observe(run.handle).recovery_required
 
 
 @pytest.mark.parametrize(
@@ -980,7 +985,7 @@ def test_damaged_tracking_receipt_is_not_cleanup_evidence(
     assert "Ignoring" in caplog.text
     assert refused.exit_code != 0
     assert "could not confirm any trial-level cleanup evidence" in refused.output
-    assert run.store.recovery_required(run.handle)
+    assert run.store.observe(run.handle).recovery_required
 
 
 @pytest.mark.integration
@@ -1204,12 +1209,12 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
             assert frozen_phase["trials"]["RUNNING"] == 0
             assert frozen_phase["trials"]["INTERRUPTED"] == 1
             assert frozen_phase["running_attempts"] == []
-        assert store.state(handle) == "failed"
+        assert store.observe(handle).state == "failed"
     else:
         assert result.exit_code != 0
         assert "could not confirm any trial-level cleanup evidence" in result.output
         assert not recovery_path.exists()
-        assert store.state(handle) == "running"
+        assert store.observe(handle).state == "running"
         with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("srv")
 
@@ -1334,7 +1339,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     assert trial_cleanup_calls == []
     assert not store.cleanup_uncertain_path(run_id).exists()
     assert not store.cleanup_recovery_path(run_id).exists()
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     if expect_running_before_confirm:
         study = _load_first_phase_study(config)
         trial = next(t for t in study.get_trials(deepcopy=False) if t.number == trial_number)
@@ -1356,7 +1361,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     assert recovery["cleanup_confirmed"] is True
     assert recovery["reaped_running_trials"] == expected_reaped_running
     assert recovery["cleanup_uncertain_terminal_trials"] == expected_cleanup_uncertain_terminal
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
     assert runner_cleanup_calls == [(handle.pid, 111, handle.pid)]
     assert trial_cleanup_calls == [(trial_pid, trial_starttime, trial_pid)]
     trial = _load_phase_trial(config, trial_number)
@@ -1425,8 +1430,9 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         monkeypatch=monkeypatch,
         earlier_boot=earlier_boot,
     )
-    assert store.state(handle) == ("failed" if earlier_boot else "running")
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == ("failed" if earlier_boot else "running")
+    assert observation.recovery_required
 
     snapshot = Mock(
         wraps=finalize_result_snapshot,
@@ -1441,7 +1447,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert store.cleanup_recovery_path(run_id).is_file()
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
-    assert store.recovery_required(handle)
+    assert store.observe(handle).recovery_required
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
     frozen_status = app.status(run_id=run_id)
     assert frozen_status["result_source"] == "frozen_run_snapshot"
@@ -1467,7 +1473,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert phase["trials"]["INTERRUPTED"] == 1
     assert phase["generation_trials"]["RUNNING"] == 0
     assert phase["generation_trials"]["INTERRUPTED"] == 1
-    assert not store.recovery_required(handle)
+    assert not store.observe(handle).recovery_required
     recovered_status = app.status(run_id=run_id)["phases"][0]
     # An interrupted trial is not terminal for the budget: it reruns.
     assert recovered_status["terminal_trials_this_run"] == 0
@@ -1488,7 +1494,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert repeat.exit_code == 0, repeat.output
     assert "No cleanup uncertainty or terminal result repair" in repeat.output
     assert store.status_path(run_id).read_bytes() == final_status
-    assert not store.recovery_required(handle)
+    assert not store.observe(handle).recovery_required
 
 
 @pytest.mark.integration
@@ -1520,7 +1526,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
 
     assert failed.exit_code != 0
     assert "failed to finalize terminal result snapshot" in failed.output
-    assert store.recovery_required(handle)
+    assert store.observe(handle).recovery_required
     frozen_status = app.status(run_id=run_id)
     assert frozen_status["run"]["recovery_required"] is True
     assert frozen_status["result_source"] == "frozen_run_snapshot"
@@ -1544,7 +1550,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert not store.cleanup_uncertain_path(run_id).exists()
-    assert not store.recovery_required(handle)
+    assert not store.observe(handle).recovery_required
     phase = app.status(run_id=run_id)["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
     assert phase["trials"]["INTERRUPTED"] == 1
@@ -1610,7 +1616,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert recovery["reaped_running_trials"] == 0
     assert recovery["cleanup_uncertain_terminal_trials"] == 0
-    assert store.state(handle) == "cancelled"
+    assert store.observe(handle).state == "cancelled"
     assert live_runs(store) == []
 
 
@@ -1667,7 +1673,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     phase = terminal["result_snapshot"]["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
     assert phase["trials"]["INTERRUPTED"] == 1
-    assert store.state(handle) == "cancelled"
+    assert store.observe(handle).state == "cancelled"
     assert live_runs(store) == []
 
 
@@ -1708,7 +1714,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     assert replay.exit_code != 0
     assert "could not confirm any trial-level cleanup evidence" in replay.output
     assert not store.cleanup_recovery_path(second_run).exists()
-    assert store.state(second_handle) == "running"
+    assert store.observe(second_handle).state == "running"
 
 
 def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_record(
@@ -1752,7 +1758,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     study = _load_first_phase_study(config)
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
     assert not recovery_record.exists()
-    assert store.recovery_required(handle)
+    assert store.observe(handle).recovery_required
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
@@ -1846,6 +1852,6 @@ def test_operator_recovery_refuses_unverifiable_run(
     assert result.exit_code != 0
     assert expected_message in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     if not terminal_without_evidence:
         assert store.cleanup_uncertain_path(run_id).is_file()

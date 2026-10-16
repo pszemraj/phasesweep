@@ -27,14 +27,16 @@ from phasesweep.config.reference import (
     top_level_entries,
 )
 from phasesweep.config.search import phase_draws
-from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication import (
+    _resolve_publication_pointer,
+    raise_for_unusable_publication,
+)
 from phasesweep.engine.read import TrialTable, TrialTables, read_trial_tables
 from phasesweep.engine.run import experiment_status, run_experiment
-from phasesweep.errors import PhaseSweepError, UnsafeProcessCleanupError
+from phasesweep.errors import OPERATOR_STEPS, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -120,6 +122,7 @@ def main() -> None:
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
         click.echo(f"phasesweep: {exc}", err=True)
+        click.echo(f"fix: {OPERATOR_STEPS[exc.action]}.", err=True)
         # -v (see _configure_logging) means the operator asked for internals.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
@@ -398,8 +401,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
-    :raises UnsafeProcessCleanupError: A trial's cleanup was refused; the message gains
-        the ``phasesweep run`` retry advice.
     """
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
@@ -414,13 +415,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             sys.exit(2)
     try:
         run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-    except UnsafeProcessCleanupError as exc:
-        # A trial's cleanup refusal describes the leak, and the study keeps
-        # that text as the cause a later phase-abort refusal quotes, so the
-        # recovery a CLI operator runs is added here rather than at the raise.
-        raise UnsafeProcessCleanupError.rewrap(
-            exc, f"{exc} To retry its cleanup, run `phasesweep run` again with the same config."
-        ) from exc
     except PhaseSweepShutdown as exc:
         if exc.published_result_committed:
             click.echo(
@@ -558,80 +552,6 @@ def _render_reference_index() -> None:
     )
 
 
-def _terminate_sentence(detail: str) -> str:
-    """Trim trailing whitespace and supply terminal punctuation when absent.
-
-    :param str detail: Diagnostic clause or sentence.
-    :return str: The trimmed text ending in a period, question mark or exclamation mark.
-    """
-    detail = detail.rstrip()
-    return detail if detail.endswith((".", "!", "?")) else f"{detail}."
-
-
-def _publication_integrity_error(
-    subject: str,
-    detail: str,
-    namespace_root: Path,
-) -> PublicationIntegrityError:
-    """Build an actionable diagnostic for a corrupt publication.
-
-    Direct the operator to inspect its namespace before rerunning advances the pointer.
-
-    :param str subject: Experiment the corrupt publication belongs to.
-    :param str detail: Validation error explaining why it no longer validates.
-        Punctuated here rather than at the raising site, since validators
-        return bare reason clauses.
-    :param Path namespace_root: Artifact root holding the generation namespaces
-        the operator must inspect.
-    :return PublicationIntegrityError: Complete single-line operator diagnostic.
-    """
-    detail = _terminate_sentence(detail)
-    return PublicationIntegrityError(
-        f"{subject} records a publication that no longer validates: {detail} "
-        f"Do not run anything over this tree until you have inspected or restored the "
-        f"generation namespace under {namespace_root} -- a successful run would advance the "
-        "last-success pointer past the corrupt generation and nothing would report it again."
-    )
-
-
-def _publication_access_error(subject: str, detail: str) -> PublicationAccessError:
-    """Build the diagnostic for a publication this user cannot validate.
-
-    :param str subject: Experiment the publication belongs to.
-    :param str detail: Path-free permission diagnostic from the validator.
-    :return PublicationAccessError: Complete single-line operator diagnostic.
-    """
-    detail = _terminate_sentence(detail)
-    return PublicationAccessError(
-        f"{subject} records a publication that cannot be validated as the current user: "
-        f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
-        "the publication as the publishing user or restore read permission before launching "
-        "another run."
-    )
-
-
-def _raise_on_failed_publication(
-    experiment: str, integrity: str, error: str | None, workdir: Path
-) -> None:
-    """Escalate an unusable publication verdict to its typed operator error.
-
-    Uses the supplied resolution without re-resolving the pointer, so output
-    and exit status describe the same publication.
-
-    :param str experiment: Experiment the publication belongs to.
-    :param str integrity: ``publication_integrity`` of the supplied resolution.
-    :param str | None error: ``publication_error`` beside a ``failed`` or ``permission_denied`` verdict.
-    :param Path workdir: Artifact root holding the generation namespaces.
-    :raises PublicationAccessError: Publication validation was denied by permissions.
-    :raises PublicationIntegrityError: A reported publication no longer validates.
-    """
-    if integrity == "permission_denied":
-        raise _publication_access_error(f"Experiment {experiment!r}", str(error))
-    if integrity != "failed":
-        return
-    raise _publication_integrity_error(f"Experiment {experiment!r}", str(error), workdir)
-
-
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
@@ -659,7 +579,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     """
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
-    _raise_on_failed_publication(
+    raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
     validated = publication.validated
@@ -820,7 +740,7 @@ def status(config_path: Path, show_trials: bool) -> None:
     if show_trials:
         tables = read_trial_tables(config)
         click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
-        _raise_on_failed_publication(
+        raise_for_unusable_publication(
             tables.experiment,
             tables.publication_integrity,
             tables.publication_error,
@@ -829,7 +749,7 @@ def status(config_path: Path, show_trials: bool) -> None:
         return
     payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
-    _raise_on_failed_publication(
+    raise_for_unusable_publication(
         str(payload["experiment"]),
         str(payload["publication_integrity"]),
         None if payload.get("publication_error") is None else str(payload["publication_error"]),

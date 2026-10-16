@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.runtime.files import atomic_write_text
-from phasesweep.runtime.json import progress_position
+from phasesweep.runtime.json import nonempty_text, progress_position
 
 _IDENTITY_ENV = (
     "PHASESWEEP_GENERATION_ID",
@@ -42,19 +42,6 @@ def _required_trial_environment(name: str) -> str:
             f"report_objective() requires {name}; call it from a PhaseSweep trial "
             "using a json_envelope metric extractor."
         )
-    return value
-
-
-def _nonempty_string(value: str, *, label: str) -> str:
-    """Require a nonempty string used to describe an evaluation.
-
-    :param str value: Candidate string.
-    :param str label: Argument name used in the error.
-    :raises ValueError: If ``value`` is not a nonempty string.
-    :return str: The validated value.
-    """
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be a nonempty string.")
     return value
 
 
@@ -157,8 +144,8 @@ def report_objective(
     if not isinstance(step_number, int) or step_number < 0:
         raise ValueError(f"step must be a non-negative integer, got {step!r}.")
     evaluation: dict[str, Any] = {
-        "policy": _nonempty_string(policy, label="policy"),
-        "checkpoint": _nonempty_string(checkpoint, label="checkpoint"),
+        "policy": nonempty_text(policy, label="policy"),
+        "checkpoint": nonempty_text(checkpoint, label="checkpoint"),
         "step": step_number,
     }
     if progress is not None:
@@ -179,8 +166,8 @@ def report_objective(
         "attempt_id": identity["PHASESWEEP_ATTEMPT_ID"],
         "overrides_sha256": identity["PHASESWEEP_OVERRIDES_SHA256"],
         "objective": {
-            "name": _nonempty_string(name, label="name"),
-            "split": _nonempty_string(split, label="split"),
+            "name": nonempty_text(name, label="name"),
+            "split": nonempty_text(split, label="split"),
             "value": numeric_value,
         },
         "evaluation": evaluation,

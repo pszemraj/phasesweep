@@ -53,10 +53,10 @@ class _SnapshotModel(BaseModel):
 
 
 class ObjectiveEvidenceSnapshot(_SnapshotModel, _ObjectiveEvidenceFields):
-    """Assurance properties of the configured objective extractor.
+    """Identity checks enforced by the configured objective extractor.
 
-    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
-    exactly what each flag means and which runtime checks back it.
+    False means unenforced. ``*_declared`` marks configured expectations;
+    ``*_value_bound`` marks enforced equality with those expectations.
     """
 
 
