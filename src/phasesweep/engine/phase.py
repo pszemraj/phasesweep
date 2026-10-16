@@ -1704,8 +1704,6 @@ def _placeholder_winner(
         effective_overrides=effective,
         placeholder_keys=frozenset(stand_ins & effective.keys()),
         metric=float("nan"),
-        constraints={},
-        gates=[],
         completion=_winner_completion(
             requested_trials=phase.n_trials,
             finished_trials=0,

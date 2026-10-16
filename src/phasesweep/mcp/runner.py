@@ -852,32 +852,21 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_error=_recorded_cleanup_error(terminal_report),
             )
         raise
-    except ProcessCleanupUncertainError as exc:
-        status["returncode"] = 1
-        primary, failure_stage = _terminal_error(terminal_report, exc)
-        status["error_class"] = type(exc).__name__
-        status["cleanup_confirmed"] = (
-            terminal_report.cleanup_confirmed if terminal_report is not None else False
-        )
-        status["failure"] = _terminal_failure_payload(
-            primary,
-            stage=failure_stage,
-            cleanup_confirmed=False,
-            cleanup_error=_recorded_cleanup_error(terminal_report),
-        )
-        raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
         status["returncode"] = 1
         primary, failure_stage = _terminal_error(terminal_report, exc)
-        status["error_class"] = type(primary).__name__
+        cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError)
+        status["error_class"] = type(exc if cleanup_uncertain else primary).__name__
         cleanup_confirmed = (
-            terminal_report.cleanup_confirmed if terminal_report is not None else True
+            terminal_report.cleanup_confirmed
+            if terminal_report is not None
+            else not cleanup_uncertain
         )
         status["cleanup_confirmed"] = cleanup_confirmed
         status["failure"] = _terminal_failure_payload(
             primary,
             stage=failure_stage,
-            cleanup_confirmed=cleanup_confirmed,
+            cleanup_confirmed=False if cleanup_uncertain else cleanup_confirmed,
             cleanup_error=_recorded_cleanup_error(terminal_report),
         )
         raise

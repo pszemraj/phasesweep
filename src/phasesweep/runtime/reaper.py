@@ -838,45 +838,16 @@ def kill_stale_group(
             except (PermissionError, OSError) as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
-        elif pid_alive:
-            # After PID reuse, the saved PGID may still identify original descendants;
-            # refuse it only when its own leader identity appears reused.
-            if pgid is not None and not _process_group_exists(pgid):
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "PID was reused, but stored process group %d no longer "
-                    "exists.",
-                    pid,
-                    pgid,
-                )
-                return True
-            if pgid is None:
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "PID was reused and no stored PGID is available. Cleanup "
-                    "status is uncertain.",
-                    pid,
-                )
-                return False
-            pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
-            if pgid_reused is None:
-                log.warning(
-                    "Stored PGID %d has a live but unreadable leader; refusing "
-                    "PGID fallback because process identity is unknown.",
-                    pgid,
-                )
-                return False
-            if pgid_reused:
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "stored PGID %d is led by a different process. Refusing "
-                    "PGID fallback to avoid killing an unrelated process group.",
-                    pid,
-                    pgid,
-                )
-                return False
+        elif pid_alive and pgid is None:
+            log.warning(
+                "PID %d is alive but starttime does not match saved value; "
+                "PID was reused and no stored PGID is available. Cleanup "
+                "status is uncertain.",
+                pid,
+            )
+            return False
 
-    if target_pgid is None and pgid is not None and saved_starttime is not None:
+    if target_pgid is None and pgid is not None:
         if not _process_group_exists(pgid):
             return True
         pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)

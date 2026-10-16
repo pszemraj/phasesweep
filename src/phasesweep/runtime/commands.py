@@ -19,6 +19,7 @@ import yaml
 from pydantic import ConfigDict, TypeAdapter
 from pydantic import JsonValue as PydanticJsonValue
 
+from phasesweep.config.common import _find_prefix_collisions
 from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
@@ -318,9 +319,9 @@ def compose_trainer_input(
     if fmt in ("argparse", "hydra") and not trainer_config:
         return dict(overrides)
     if fmt == "json_file":
+        collisions = {child for _, child in _find_prefix_collisions(set(overrides))}
         for key in overrides:
-            parts = key.split(".")
-            if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
+            if key in collisions:
                 raise ValueError(
                     f"Cannot expand override {key!r}: a parent key is also overridden."
                 )

@@ -366,13 +366,8 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
     zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
     return RunResultSnapshot(
         status=StatusSnapshot(
-            current_generation_id=None,
-            published_generation_id=None,
-            represented_generation_id=None,
-            is_published=False,
             publication_integrity="unknown",
             result_context="current_config",
-            published_config_matches_current=None,
             result_phase_plan=[phase.name for phase in experiment.phases],
             metric=MetricSnapshot.model_validate(_metric_semantics_payload(experiment.metric)),
             phases=[
@@ -385,14 +380,12 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
                     generation_trials={},
                     winner_present=False,
                     trial_data_available=False,
-                    running_attempts=None,
                 )
                 for phase in experiment.phases
             ],
             summary_present=False,
         ),
         winners=[],
-        represented_config_fingerprint=None,
     )
 
 

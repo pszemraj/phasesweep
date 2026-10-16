@@ -206,21 +206,11 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
 
     :return list[tuple[str, str]]: Lexically sorted ``(short, long)`` collisions.
     """
-    parts_by_key = {key: tuple(key.split(".")) for key in keys}
-    seen: set[tuple[str, str]] = set()
-
-    items = list(parts_by_key.items())
-    for i, (a, a_parts) in enumerate(items):
-        for b, b_parts in items[i + 1 :]:
-            if a_parts == b_parts:
-                continue
-            if len(a_parts) < len(b_parts):
-                shorter_parts, shorter_key, longer_key = a_parts, a, b
-                longer_parts = b_parts
-            else:
-                shorter_parts, shorter_key, longer_key = b_parts, b, a
-                longer_parts = a_parts
-            if longer_parts[: len(shorter_parts)] == shorter_parts:
-                seen.add((shorter_key, longer_key))
-
-    return sorted(seen)
+    collisions: list[tuple[str, str]] = []
+    for key in keys:
+        prefix = key
+        while "." in prefix:
+            prefix = prefix.rsplit(".", 1)[0]
+            if prefix in keys:
+                collisions.append((prefix, key))
+    return sorted(collisions)

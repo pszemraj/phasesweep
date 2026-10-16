@@ -718,12 +718,8 @@ class PhaseSweepMCP:
             snapshot, result_source = self._result_snapshot_view(experiment, handle, None, view)
         if snapshot is not None:
             status = self._snapshot_status_payload(target_id, snapshot, result_source=result_source)
-            winners = (
-                []
-                if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}
-                else snapshot.winners
-            )
-        elif status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
+            winners = snapshot.winners
+        if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
             winners = []
         return target_id, experiment, status, winners, handle, view, result_source
 
