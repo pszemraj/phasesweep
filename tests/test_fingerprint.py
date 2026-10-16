@@ -493,7 +493,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     """
     from phasesweep.engine.fingerprints import (
         _experiment_semantic_fingerprint,
-        _phase_semantic_payload,
+        _phase_fingerprint_payload,
     )
 
     invocation_a = tmp_path / "invocation-a"
@@ -536,7 +536,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
 
     # The phase payload carries the same resolved contract as the experiment one.
     cwd_exp = variants["cwd"]
-    payload = _phase_semantic_payload(cwd_exp, cwd_exp.phases[0], {})
+    payload = _phase_fingerprint_payload(cwd_exp, cwd_exp.phases[0], {})
     assert payload["execution"] == {
         "cwd": str(tmp_path.resolve()),
         "inherit_env": "none",
@@ -1591,12 +1591,12 @@ def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     """
     from importlib.metadata import version as pkg_version
 
-    from phasesweep.engine.fingerprints import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_fingerprint_payload
 
     assert __version__ == pkg_version("phasesweep")
 
     exp = make_experiment()
-    payload = _phase_semantic_payload(exp, exp.phases[0], {})
+    payload = _phase_fingerprint_payload(exp, exp.phases[0], {})
     assert payload["fingerprint_schema_version"] == FINGERPRINT_SCHEMA_VERSION
     assert "phasesweep_version" not in payload
 

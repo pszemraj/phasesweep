@@ -790,7 +790,7 @@ WRAP_CASES = (
         trigger=_run_fails_then_registry_turns_shared,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original registry with mode 0700 before retrying.",
+        message="is not a real owner-only directory (mode 0700)",
     ),
     RoutingCase(
         # Negative: unconfirmed cleanup deliberately replaces the run's own remedy.
@@ -1493,7 +1493,7 @@ ORIGIN_CASES = (
         trigger=_scan_registry(patch=_fd_listing_fails),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original registry and access to it before retrying.",
+        message="cannot be enumerated safely.",
     ),
     RoutingCase(
         id="running_trial_dir_invalid",
@@ -1660,7 +1660,7 @@ ORIGIN_CASES = (
         trigger=_top_up_from_another_environment,
         raised=StudyFingerprintMismatchError,
         action=OperatorAction.FIX_CONFIG,
-        message="Restore the original semantic environment",
+        message="No trial was allocated.",
     ),
 )
 

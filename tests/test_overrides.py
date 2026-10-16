@@ -19,8 +19,7 @@ from phasesweep.runtime.commands import (
     compose_trainer_config,
     compose_trainer_input,
     flatten_trainer_config,
-    format_argparse,
-    format_hydra,
+    format_cli_overrides,
     render_command,
 )
 from tests.conftest import (
@@ -33,7 +32,7 @@ from tests.conftest import (
 
 
 def test_argparse():
-    s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
+    s = format_cli_overrides({"lr": 3e-4, "weight_decay": 0.05}, "argparse")
     assert s == "--lr=0.0003 --weight_decay=0.05"
 
 
@@ -43,7 +42,9 @@ def test_argparse_round_trips_option_like_values(tag):
     parser.add_argument("--offset", type=float)
     parser.add_argument("--tag")
 
-    parsed = parser.parse_args(shlex.split(format_argparse({"offset": -1e-5, "tag": tag})))
+    parsed = parser.parse_args(
+        shlex.split(format_cli_overrides({"offset": -1e-5, "tag": tag}, "argparse"))
+    )
 
     assert parsed.offset == -1e-5
     assert parsed.tag == tag
@@ -51,7 +52,7 @@ def test_argparse_round_trips_option_like_values(tag):
 
 def test_argparse_renders_the_documented_wire_forms():
     """The accepted value set renders exactly what config_reference.yaml promises."""
-    s = format_argparse(
+    s = format_cli_overrides(
         {
             "none": None,
             "flag": True,
@@ -59,7 +60,8 @@ def test_argparse_renders_the_documented_wire_forms():
             "ratio": 2.5,
             "tag": "s",
             "items": [1, "a", False],
-        }
+        },
+        "argparse",
     )
 
     assert shlex.split(s) == [
@@ -82,11 +84,9 @@ def test_argparse_renders_the_documented_wire_forms():
     ],
 )
 def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
-    """Defense in depth behind the config validator: str()-ing a mapping or a
-    date into a command line is how two different commands end up sharing one
-    fingerprint."""
+    """Unsupported literals fail before a command can be rendered."""
     with pytest.raises(TypeError, match="yaml_file"):
-        format_argparse({"model": value})
+        format_cli_overrides({"model": value}, "argparse")
 
 
 def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
@@ -475,7 +475,7 @@ def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
     from hydra.core.override_parser.overrides_parser import OverridesParser
     from omegaconf import OmegaConf
 
-    argument = shlex.split(format_hydra({"value": value}))[0]
+    argument = shlex.split(format_cli_overrides({"value": value}, "hydra"))[0]
     parsed = OverridesParser.create().parse_override(argument)
     assert not parsed.is_sweep_override()
     actual = OmegaConf.to_container(OmegaConf.create({"value": parsed.value()}), resolve=True)[

@@ -432,7 +432,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        assert "Restore the original complete storage ledger" in refused_run.stderr
+        assert "restore or repair the storage ledger and access to it" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()

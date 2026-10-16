@@ -27,12 +27,13 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
+from click.testing import CliRunner
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import run_experiment
-from phasesweep.cli import _show_experiment_winners
+from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
@@ -970,7 +971,6 @@ def test_manifest_rejects_a_malformed_phase_plan(tmp_path: Path, phase_plan: obj
 def test_published_reads_consume_the_bytes_validation_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A winner swapped after validation read it never reaches a consumer.
 
@@ -1008,8 +1008,11 @@ def test_published_reads_consume_the_bytes_validation_read(
         publication=_published_for_resume(experiment),
     )
     assert resumed.metric == validated_metric
-    _show_experiment_winners(experiment)
-    assert validated_bytes.decode("utf-8") in capsys.readouterr().out
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+    result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
+    assert result.exit_code == 0, result.output
+    assert validated_bytes.decode("utf-8") in result.output
 
 
 # --------------------------------------------------------------------------

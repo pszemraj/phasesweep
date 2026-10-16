@@ -367,8 +367,10 @@ def _trainer_cwd_line(experiment: Experiment) -> str:
             "trainer cwd: follows the directory phasesweep runs from (the catalog cwd under "
             "MCP) and is part of the study identity; set execution.cwd to pin it"
         )
-    resolved = Path(configured).expanduser().resolve()
-    return f"trainer cwd: {resolved} (execution.cwd; part of the study identity)"
+    return (
+        f"trainer cwd: {experiment.execution.resolved_cwd()} "
+        "(execution.cwd; part of the study identity)"
+    )
 
 
 class _NamedExtractor(_Frozen):
@@ -902,6 +904,13 @@ class ExecutionContext(_Frozen):
                 )
         return self
 
+    def resolved_cwd(self) -> Path | None:
+        """Resolve the configured trainer directory through home and symlink expansion.
+
+        :return: Absolute directory, or ``None`` to inherit the invocation directory.
+        """
+        return None if self.cwd is None else Path(self.cwd).expanduser().resolve()
+
     def effective_passthrough_env(self) -> tuple[str, ...]:
         """List every pass-through name: the built-in ones plus ``passthrough_env``.
 
@@ -1013,6 +1022,14 @@ class Experiment(_Frozen):
             return self.storage
         root = Path(self.workdir).expanduser().resolve() / self.experiment
         return local_storage_url(root / "study.journal")
+
+    def phase(self, name: str) -> Phase:
+        """Look up a configured phase by its unique name.
+
+        :return: The matching configured phase.
+        :raises StopIteration: No phase has that name.
+        """
+        return next(phase for phase in self.phases if phase.name == name)
 
     def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
         """Yield the phases a run resuming at ``from_phase`` reaches, in order.
@@ -1223,7 +1240,7 @@ class Experiment(_Frozen):
         Each exported override key carries its producing phase as its origin.
         Re-exporting preserves that origin, making a same-origin diamond valid.
         Different origins for one inherited key require a child fixed override;
-        a fixed child key deliberately establishes a new origin. A key is locked
+        a fixed child key establishes a new origin. A key is locked
         for a child only when some inherited origin sampled it; keys the
         inherited phases only fixed may be searched.
 

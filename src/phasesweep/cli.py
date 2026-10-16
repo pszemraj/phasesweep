@@ -432,8 +432,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 def validate(config_path: Path) -> None:
     """Validate static config in ``config_path`` without running anything.
 
-    This intentionally does not resolve the caller's ambient execution
-    environment; a non-dry ``run`` performs that preflight before it claims work.
+    A non-dry ``run`` checks the ambient execution environment before claiming work.
     """
     config = _load_cli_config(config_path)
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
@@ -557,23 +556,13 @@ def _render_reference_index() -> None:
 )
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
-    """Print winner files referenced by ``config_path``."""
-    _show_experiment_winners(_load_cli_config(config_path))
-
-
-def _show_experiment_winners(experiment: Experiment) -> None:
     """Print winners using their generation's recorded phase plan and validated bytes.
 
-    Label configuration drift as historical; do not reinterpret recorded evidence or
-    reread winner files.
-
-    :param Experiment experiment: Experiment whose published winners are rendered.
+    :param config_path: Config used to locate the publication and label drift as historical.
     :raises PublicationAccessError: This user cannot validate the publication.
-    :raises PublicationIntegrityError: The last-success pointer names a
-        generation that no longer validates. Nothing is rendered in that case:
-        printing "(no winner yet)" beside a corrupt publication reads as a
-        phase that simply has not run.
+    :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     """
+    experiment = _load_cli_config(config_path)
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
     raise_for_unusable_publication(
@@ -875,9 +864,6 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     """Serve the MCP server over stdio.
 
-    The MCP SDK import stays behind this command so the base CLI still works
-    without installing the ``mcp`` optional dependency.
-
     :param click.Context ctx: Active Click context used to exit with the server return code.
     :param Path catalog: Operator-authored MCP catalog to load.
     """
@@ -926,9 +912,6 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
 @click.pass_context
 def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path) -> None:
     """Call one MCP tool without a client, for scripting or debugging.
-
-    The MCP SDK import stays behind this command so the base CLI still works
-    without installing the ``mcp`` optional dependency.
 
     :param click.Context ctx: Active Click context used to exit with the call's return code.
     :param str tool: Tool name, such as ``list_experiments``.

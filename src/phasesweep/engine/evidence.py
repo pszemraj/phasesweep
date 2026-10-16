@@ -278,7 +278,7 @@ def _verify_objective_source_evidence(
     :param str subject: Caller-built label naming the study, phase, and trial.
     :param bool verify_digest: Also re-hash the source and compare it against
         the recorded ``sha256``. Reserved for the winner (see
-        :func:`_verify_winner_objective_evidence`).
+        :func:`_verify_winner_evidence`).
     :raises TrialEvidenceMissingError: The record is absent or malformed, or
         its file source is missing, unreadable, or no longer the recorded bytes.
     """
@@ -586,7 +586,7 @@ def _validate_selection_evidence(
     Check selection eligibility through :func:`_selection_candidate_identity`.
     Content-verify each candidate's generated input and check its objective source's
     existence and recorded size. Digest-verify the winning objective at selection
-    through :func:`_verify_winner_objective_evidence`. Missing eligible evidence
+    through :func:`_verify_winner_evidence`. Missing eligible evidence
     refuses the run without dropping trials from the ranked population.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
@@ -599,7 +599,7 @@ def _validate_selection_evidence(
     """
     for phase_name, study in studies.items():
         phase_dir = _phase_dir(experiment, phase_name)
-        phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+        phase = experiment.phase(phase_name)
         verification = _EvidenceVerification(experiment, phase)
         for trial in study.get_trials(deepcopy=False):
             identity = _selection_candidate_identity(trial)
@@ -650,27 +650,34 @@ def _validate_selection_evidence(
             )
 
 
-def _verify_winner_objective_evidence(
+def _verify_winner_evidence(
     experiment: Experiment,
-    phase_name: str,
-    selected: SelectedTrial,
+    phase: Phase,
+    winner: SelectedTrial | Winner,
 ) -> None:
-    """Digest-verify objective evidence before publishing a complete or partial winner.
+    """Digest-verify a selected or carried winner against each member's own evidence.
 
-    Verify every repeat-group member against its own metric and provenance; scalar
-    winners require only their source trial.
+    Carried winners use their recorded source phase without loading its study.
+    Scalar winners require only their source trial; repeat winners require every member.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
-    :param str phase_name: Phase whose winner was just selected.
-    :param SelectedTrial selected: The winning trial and its frozen provenance.
+    :param Phase phase: Phase whose winner is selected or carried into the publication.
+    :param SelectedTrial | Winner winner: Selected trial or authenticated carried winner.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
         generated trainer input, or objective source of the winner or of any
         member of its group are missing, foreign, or altered.
     """
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    if isinstance(winner, Winner):
+        source = winner.source
+        assert source is not None
+        phase_name = source.phase
+        subject = f"Skipped phase {phase.name!r} winner source phase {phase_name!r} trial"
+    else:
+        phase_name = phase.name
+        label = "winner trial" if winner.repeats is None else "winner group member trial"
+        subject = f"Phase {phase_name!r} {label}"
     verification = _EvidenceVerification(experiment, phase)
-    label = "winner trial" if selected.repeats is None else "winner group member trial"
-    for member in evidence_members(selected):
+    for member in evidence_members(winner):
         _verify_trial_evidence_dir(
             _trial_dir_for(
                 experiment,
@@ -680,53 +687,8 @@ def _verify_winner_objective_evidence(
                 attempt_id=member.attempt_id,
             ),
             subject=(
-                f"Phase {phase_name!r} {label} {member.trial_number} "
+                f"{subject} {member.trial_number} "
                 f"(generation {member.generation_id!r}, attempt {member.attempt_id!r})"
-            ),
-            attempt_id=member.attempt_id,
-            provenance=member.objective_provenance,
-            trainer_input=member.trainer_input,
-            verify_objective_digest=True,
-            verification=verification,
-            metric_value=member.metric,
-            constraints=member.constraints,
-        )
-
-
-def _verify_skipped_winner_evidence(
-    experiment: Experiment,
-    phase: Phase,
-    winner: Winner,
-) -> None:
-    """Verify a skipped winner from its recorded source identities without loading its study.
-
-    Repeat winners supply the corresponding evidence identity for every group member.
-
-    :param Experiment experiment: Experiment owning the artifact tree.
-    :param Phase phase: Exposed skipped phase whose winner is being carried.
-    :param Winner winner: Authenticated winner loaded from the prior publication.
-    :raises TrialEvidenceMissingError: The evidence of the source trial, or of
-        any member of its group, has been removed or changed.
-    """
-    # Publication validation already bound the source to this phase and to the
-    # winner's own trial, generation, and attempt, and the group's last member
-    # to that same source.
-    source = winner.source
-    assert source is not None
-    verification = _EvidenceVerification(experiment, phase)
-    for member in evidence_members(winner):
-        _verify_trial_evidence_dir(
-            _trial_dir_for(
-                experiment,
-                source.phase,
-                member.trial_number,
-                generation_id=member.generation_id,
-                attempt_id=member.attempt_id,
-            ),
-            subject=(
-                f"Skipped phase {phase.name!r} winner source phase {source.phase!r} trial "
-                f"{member.trial_number} (generation {member.generation_id!r}, attempt "
-                f"{member.attempt_id!r})"
             ),
             attempt_id=member.attempt_id,
             provenance=member.objective_provenance,

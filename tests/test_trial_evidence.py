@@ -261,8 +261,8 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                     target = target[field]
                 target[fields[-1]] = replacement
                 with pytest.raises(TrialEvidenceMissingError):
-                    evidence_ops._verify_winner_objective_evidence(
-                        experiment, phase.name, replace(winner, objective_provenance=altered)
+                    evidence_ops._verify_winner_evidence(
+                        experiment, phase, replace(winner, objective_provenance=altered)
                     )
     # Remote deletion and unavailable credentials/SDK cannot affect frozen reads/replay.
     wandb_worker_sdk("raise AssertionError('remote access after publication')")
@@ -593,7 +593,7 @@ def test_present_incomplete_objective_provenance_blocks_selection(
         evidence_ops._validate_selection_evidence(experiment, {"p": study})
     with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
         selected = select_winner(study, experiment, phase_name="p")
-        evidence_ops._verify_winner_objective_evidence(experiment, "p", selected)
+        evidence_ops._verify_winner_evidence(experiment, experiment.phases[0], selected)
 
 
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:

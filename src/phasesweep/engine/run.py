@@ -288,8 +288,7 @@ def _run_experiment_outcome(
                     exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
                 ) from exc
             raise ProcessCleanupUncertainError(
-                f"{unknown} Restore the original complete storage ledger and access to it "
-                "before retrying. For an MCP run, then run phasesweep mcp recover-run.",
+                f"{unknown} An MCP run requires phasesweep mcp recover-run after ledger repair.",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         if not environments_preflighted:
@@ -738,12 +737,8 @@ def _cli_phase_payloads(
 ) -> list[dict[str, Any]]:
     """Rebuild ``read_status``'s path-free phase payloads into the CLI's view.
 
-    ``experiment_status`` always calls :func:`phasesweep.engine.read.read_status`
-    unpinned, so each phase's winner is always scoped to the already-resolved
-    published generation, never a pinned one. This drops the MCP-only keys
-    (``phase``, ``winner_present``, ``running_attempts``) and adds ``name``
-    plus a resolved ``winner`` path -- the only place in this call that ever
-    puts a filesystem path in a status payload.
+    Use the unpinned published generation for winner paths. Replace MCP's ``phase``,
+    ``winner_present`` and ``running_attempts`` with CLI ``name`` and ``winner`` fields.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param list[dict[str, Any]] phases: Path-free phase payloads from ``read_status``.

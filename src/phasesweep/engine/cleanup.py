@@ -70,8 +70,7 @@ def _reap_stale_trials(
         # recover-run reaps through here too and cannot read the ledger either,
         # so restoring it comes first.
         raise ProcessCleanupUncertainError(
-            f"Could not inspect study {study.study_name!r} for stale RUNNING trials. "
-            "Restore the original complete storage ledger and access to it before retrying.",
+            f"Could not inspect study {study.study_name!r} for stale RUNNING trials.",
             action=OperatorAction.RESTORE_LEDGER,
         ) from exc
     for trial in trials:

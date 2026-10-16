@@ -185,7 +185,7 @@ def _environment_identity(
     # recorded. Ambient copies cannot affect the trainer or its study cohort.
     for name in _TRIAL_BOUND_ENV:
         env.pop(name, None)
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    phase = experiment.phase(phase_name)
     query = _wandb_query(experiment, phase.gates)
     if query is not None:
         cohort_names.update(("WANDB_BASE_URL", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_RESUME"))
@@ -382,26 +382,6 @@ def _warn_narrowed_environment_exit(
     )
 
 
-def _resolved_execution_cwd(experiment: Experiment) -> Path | None:
-    """Resolve the configured trainer working directory, if any.
-
-    :param Experiment experiment: Parsed experiment supplying ``execution.cwd``.
-    :raises TrialExecutionError: The configured directory does not exist.
-    :return Path | None: Resolved absolute directory, or ``None`` when the
-        trainer inherits the invocation working directory.
-    """
-    configured = experiment.execution.cwd
-    if configured is None:
-        return None
-    resolved = Path(configured).expanduser().resolve()
-    if not resolved.is_dir():
-        raise TrialExecutionError(
-            f"execution.cwd {configured!r} resolves to {resolved}, which is not a "
-            "directory on this host."
-        )
-    return resolved
-
-
 class TrialExecutionError(RuntimeError):
     """Raised when a trial subprocess crashes or extraction fails.
 
@@ -576,9 +556,7 @@ def launch_trial(
     # Capture the composed environment before per-trial bindings.
     _record_trainer_environment(experiment, environment_identity, workdir)
     env = dict(environment_identity.values)
-    phase = next(
-        (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
-    )
+    phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
     if wandb_query is not None:
         env["WANDB_RUN_ID"] = attempt_id
@@ -592,7 +570,12 @@ def launch_trial(
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
             env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
-    trainer_cwd = _resolved_execution_cwd(experiment)
+    trainer_cwd = experiment.execution.resolved_cwd()
+    if trainer_cwd is not None and not trainer_cwd.is_dir():
+        raise TrialExecutionError(
+            f"execution.cwd {experiment.execution.cwd!r} resolves to {trainer_cwd}, which is not a "
+            "directory on this host."
+        )
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name

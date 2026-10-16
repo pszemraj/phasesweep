@@ -349,8 +349,8 @@ def _register_active_attempt(
         raise ActiveAttemptPersistenceError(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
-            "consumed. Persistent storage records a phase abort; retry needs "
-            "n_trials raised above its accepted target, or a new experiment name."
+            "consumed. Persistent storage records a phase abort; retry requires "
+            "n_trials above its accepted target."
         ) from exc
 
 
@@ -397,9 +397,9 @@ def _open_attempt_registry(
         return
     except (OSError, UnsafePrivatePathError) as exc:
         raise ProcessCleanupUncertainError(
-            f"Attempt registry {attempts_dir} is not a real owner-only directory. "
+            f"Attempt registry {attempts_dir} is not a real owner-only directory (mode 0700). "
             "Recovery cannot trust process authority reached through a symlink or "
-            "shared path. Restore the original registry with mode 0700 before retrying.",
+            "shared path.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     try:
@@ -407,8 +407,7 @@ def _open_attempt_registry(
             names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".json"))
         except OSError as exc:
             raise ProcessCleanupUncertainError(
-                f"Attempt registry {attempts_dir} cannot be enumerated safely. "
-                "Restore the original registry and access to it before retrying.",
+                f"Attempt registry {attempts_dir} cannot be enumerated safely.",
                 action=OperatorAction.RESTORE_TREE,
             ) from exc
         yield directory_fd, [attempts_dir / name for name in names]

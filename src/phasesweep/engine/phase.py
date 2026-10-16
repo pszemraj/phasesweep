@@ -30,7 +30,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.evidence import _verify_winner_objective_evidence
+from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
@@ -404,7 +404,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
         f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
         f"successful phase. Increase n_trials above {trial_target} to explicitly schedule "
-        "new recovery attempts, or use a new experiment name.",
+        "new recovery attempts.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -423,8 +423,8 @@ def _raise_streak_at_limit(phase: Phase, consecutive_failures: int, trial_target
         f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
         f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
         f"it launches no more trials at its accepted n_trials={trial_target}. Increase "
-        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, raise "
-        "max_consecutive_failures, or use a new experiment name.",
+        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, or raise "
+        "max_consecutive_failures.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -927,7 +927,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             could not be persisted; nothing was launched and no GPU lease
             was consumed.
         _TrialOutcomeUnrecordedAbort: A successful trial's terminal
-            outcome could not be persisted, so the trial is deliberately
+            outcome could not be persisted, so the trial is
             left ``RUNNING`` for stale-attempt recovery.
 
     """
@@ -962,7 +962,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             f"Could not persist the allocated lifecycle marker for trial "
             f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
             "No trainer was started and no GPU lease was consumed. With persistent "
-            "storage, raise n_trials above its accepted target or use a new experiment name."
+            "storage, retry requires n_trials above its accepted target."
         ) from exc
     # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
     _register_active_attempt(
@@ -1638,7 +1638,7 @@ def _select_phase_winner(
     """
     selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
     if verify_evidence:
-        _verify_winner_objective_evidence(experiment, phase.name, selected)
+        _verify_winner_evidence(experiment, phase, selected)
         # Replayed winners may predate the current environment cohort.
         _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
     effective = _winner_overrides(experiment, phase, selected.params, inherited_winners)

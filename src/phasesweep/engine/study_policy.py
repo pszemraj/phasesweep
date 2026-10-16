@@ -371,8 +371,7 @@ def _validate_study_direction(
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} optimizes {stored or 'no direction'}, but the current "
         f"config requires {goal}. Optuna does not change a persistent study's direction "
-        "when load_if_exists=True. Use a new experiment/phase name or remove the "
-        "incompatible study before running again."
+        "when load_if_exists=True."
     )
 
 
@@ -424,8 +423,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     if phase.n_trials < accepted_target:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
-            f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
-            "target or a new experiment name."
+            f"trial(s), but the current config requests {phase.n_trials}."
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
@@ -758,9 +756,7 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
             f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
-            "No trial was allocated. Restore the original semantic environment, pin "
-            "the value under env, classify variables that may differ, such as "
-            "rotating credentials, under execution.passthrough_env, or use a new "
-            "experiment name.",
+            "No trial was allocated. Values under env are pinned; ambient variables under "
+            "execution.passthrough_env, such as rotating credentials, do not split cohorts.",
             action=OperatorAction.FIX_CONFIG,
         )

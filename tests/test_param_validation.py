@@ -18,7 +18,7 @@ from phasesweep.config.search import (
     IntParam,
     Repeats,
     Sampler,
-    _placeholder_value_for,
+    _placeholder_values_for,
     grid_search_space,
     sampler_search_space,
 )
@@ -849,18 +849,18 @@ def test_extreme_float_bounds_load_under_every_override_format(
     assert exp.override_format == override_format
 
 
-def test_placeholder_value_for_stepped_int_is_on_the_lattice() -> None:
+def test_placeholder_values_for_stepped_int_is_on_the_lattice() -> None:
     """The placeholder for a stepped IntParam is a point on its step lattice."""
     param = IntParam(type="int", low=0, high=6, step=2)
-    value = _placeholder_value_for(param)
+    value = _placeholder_values_for({"x": param})["x"]
     assert value == param.low
     assert (value - param.low) % param.step == 0
 
 
-def test_placeholder_value_for_categorical_is_first_choice() -> None:
+def test_placeholder_values_for_categorical_is_first_choice() -> None:
     """The placeholder for a categorical param is its first listed choice."""
     param = CategoricalParam(type="categorical", choices=["b", "a", "c"])
-    assert _placeholder_value_for(param) == "b"
+    assert _placeholder_values_for({"x": param})["x"] == "b"
 
 
 def test_grid_repeat_axis_visits_each_configuration_once_per_value() -> None:

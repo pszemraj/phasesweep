@@ -622,21 +622,13 @@ def grid_search_space(
     return grid
 
 
-def _placeholder_value_for(param: SearchParam) -> Any:
-    """Choose one valid value for command-template preflight.
-
-    :param SearchParam param: Configured search parameter.
-    :return: The numeric low bound or first categorical choice.
-    """
-    if isinstance(param, (FloatParam, IntParam)):
-        return param.low
-    return param.choices[0]
-
-
 def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str, Any]:
     """Choose deterministic preflight values for every sampler axis.
 
     :param Mapping[str, SearchParam] search_space: Parameters keyed by override name.
     :return: One valid value per parameter.
     """
-    return {name: _placeholder_value_for(param) for name, param in search_space.items()}
+    return {
+        name: param.low if isinstance(param, (FloatParam, IntParam)) else param.choices[0]
+        for name, param in search_space.items()
+    }

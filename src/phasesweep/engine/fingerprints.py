@@ -55,11 +55,7 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
     return {
-        "cwd": str(
-            Path(experiment.execution.cwd).expanduser().resolve()
-            if experiment.execution.cwd is not None
-            else Path.cwd().resolve()
-        ),
+        "cwd": str(experiment.execution.resolved_cwd() or Path.cwd().resolve()),
         "inherit_env": experiment.execution.inherit_env_contract(),
         "passthrough_env": list(experiment.execution.effective_passthrough_env()),
     }
@@ -136,12 +132,12 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
-def _phase_semantic_payload(
+def _phase_fingerprint_payload(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-) -> dict[str, Any]:
-    """Return fields that change trial meaning, including configured environment values.
+) -> JsonObject:
+    """Return canonical JSON fields that change the meaning of a trial.
 
     Run-control fields such as ``n_trials`` are excluded, allowing study top-ups.
 
@@ -150,7 +146,7 @@ def _phase_semantic_payload(
     :param Phase phase: Phase whose run-control keys are excluded.
     :param dict[str, Winner] inherited_winners: Parent winners whose effective
         overrides contribute to identity.
-    :return dict[str, Any]: JSON-serializable configured trial semantics.
+    :return: Configured trial semantics normalized to the JSON representation being hashed.
     """
     semantic_phase = _semantic_phase_dump(phase)
     payload = {
@@ -161,7 +157,7 @@ def _phase_semantic_payload(
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
         },
     }
-    return payload
+    return json_object(json.loads(json.dumps(payload, default=str)))
 
 
 def _phase_fingerprint(
@@ -181,27 +177,6 @@ def _phase_fingerprint(
     return _semantic_payload_digest(
         _phase_fingerprint_payload(experiment, phase, inherited_winners)
     )
-
-
-def _phase_fingerprint_payload(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-) -> JsonObject:
-    """Return the canonical payload a phase fingerprint is the digest of.
-
-    The semantic payload is normalised to plain JSON data before it is hashed,
-    so the mapping a study stores is exactly what its stored digest covers.
-
-    :param Experiment experiment: Experiment forwarded to
-        :func:`_phase_semantic_payload`.
-    :param Phase phase: Phase being fingerprinted.
-    :param dict[str, Winner] inherited_winners: Parent winners contributing
-        effective overrides to identity.
-    :return JsonObject: The semantic payload as JSON data.
-    """
-    payload = _phase_semantic_payload(experiment, phase, inherited_winners)
-    return json_object(json.loads(json.dumps(payload, default=str)))
 
 
 _ABSENT = object()

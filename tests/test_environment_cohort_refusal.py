@@ -305,20 +305,16 @@ def test_a_long_value_is_cut_to_where_the_two_differ(monkeypatch: pytest.MonkeyP
     assert "/opt/tool-00/bin" not in message
 
 
-def test_the_message_keeps_the_remedies(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_message_keeps_environment_classification(monkeypatch: pytest.MonkeyPatch) -> None:
     experiment = make_experiment()
     study = _record(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
     message = _refusal(study, _identity(experiment))
 
-    for remedy in (
-        "Restore the original semantic environment",
-        "pin the value under env",
-        "execution.passthrough_env",
-        "new experiment name",
-    ):
-        assert remedy in message
+    assert "Values under env are pinned" in message
+    assert "execution.passthrough_env" in message
+    assert "do not split cohorts" in message
 
 
 def test_matching_environment_is_not_refused() -> None:

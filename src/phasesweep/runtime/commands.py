@@ -87,7 +87,7 @@ def _render_override_value(
         if fmt == "argparse":
             return value
         # OmegaConf resolves interpolations even inside Hydra quoted strings.
-        # Literal interpolation syntax is deliberately outside this wire contract.
+        # Literal interpolation syntax is outside this wire contract.
         if "${" in value or any(ord(char) < 32 for char in value):
             raise _OverrideValueError(fmt, value, position)
         # Hydra only unescapes backslashes preceding a quote (including the
@@ -121,15 +121,17 @@ def _render_override_value(
     raise _OverrideValueError(fmt, value, position)
 
 
-def format_hydra(overrides: dict[str, Any]) -> str:
-    """Render native Hydra arguments without importing the trainer's SDK.
+def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideFormat) -> str:
+    """Render shell-quoted override tokens for argparse or Hydra.
 
-    :param dict[str, Any] overrides: Scalar/list values keyed by dotted parameter names.
-    :return str: Shell-quoted native ``key=value`` tokens.
-    :raises TypeError: A literal has no faithful supported Hydra representation.
+    :param overrides: Scalar/list values keyed by dotted parameter names.
+    :param fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
+    :return: Space-separated ``key=value`` tokens in insertion order.
+    :raises TypeError: A value has no faithful representation in the selected grammar.
     """
+    prefix = "--" if fmt == "argparse" else ""
     return " ".join(
-        shlex.quote(f"{key}={_render_override_value(value, 'hydra')}")
+        shlex.quote(f"{prefix}{key}={_render_override_value(value, fmt)}")
         for key, value in overrides.items()
     )
 
@@ -154,27 +156,6 @@ def encode_overrides_json(payload: object) -> str:
     :raises ValueError: A value is non-finite or recursive.
     """
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
-
-
-def format_argparse(overrides: dict[str, Any]) -> str:
-    """Render argparse options as shell-quoted ``--key=value`` tokens.
-
-    Args:
-        overrides: Mapping from override key to value.
-
-    Returns:
-        A single space-separated string of shell-quoted ``--key=value`` tokens.
-
-    Raises:
-        TypeError: A value is outside the shared CLI override contract (see
-            :func:`_render_override_value`). Statically-known override values
-            are already rejected at config load; this covers anything else.
-
-    """
-    parts: list[str] = []
-    for k, v in overrides.items():
-        parts.append(shlex.quote(f"--{k}={_render_override_value(v, 'argparse')}"))
-    return " ".join(parts)
 
 
 def compose_trainer_config(
@@ -415,7 +396,7 @@ def render_command(
     else:
         values = compose_trainer_input(base, overrides, fmt, substitutions=config_substitutions)
         assert isinstance(values, dict)
-        overrides_str = format_argparse(values) if fmt == "argparse" else format_hydra(values)
+        overrides_str = format_cli_overrides(values, "argparse" if fmt == "argparse" else "hydra")
 
     return template.format(
         config_path=shlex.quote(config_path) if config_path else "",
