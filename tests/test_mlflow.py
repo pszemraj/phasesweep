@@ -546,6 +546,14 @@ def native_experiment(tmp_path):
     return Experiment.model_validate(config)
 
 
+def _scripted_response(script, request):
+    """Consume the next response for an action, evaluating deferred responses."""
+    if not script.get(request["action"]):
+        pytest.fail(f"Unscripted {request['action']} request.")
+    response = script[request["action"]].pop(0)
+    return response() if callable(response) else response
+
+
 class _ScriptedWorker:
     """A stand-in for the supervised worker that answers each action from a script."""
 
@@ -562,11 +570,7 @@ class _ScriptedWorker:
 
     def __call__(self, request, **kwargs):
         self.requests.append(request)
-        if not self.script.get(request["action"]):
-            pytest.fail(f"Unscripted {request['action']} request.")
-        outcome = self.script[request["action"]].pop(0)
-        if callable(outcome):
-            outcome = outcome()
+        outcome = _scripted_response(self.script, request)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -783,11 +787,7 @@ class _WorkerProcess:
         request_path, response_path = (Path(part) for part in parts[-2:])
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.requests.append(request)
-        if not self.script.get(request["action"]):
-            pytest.fail(f"Unscripted {request['action']} request.")
-        response = self.script[request["action"]].pop(0)
-        if callable(response):
-            response = response()
+        response = _scripted_response(self.script, request)
         response_path.write_text(json.dumps(response), encoding="utf-8")
         return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
 

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
+from unittest.mock import Mock
 
 import pytest
 
@@ -535,23 +536,34 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
                 os.kill(worker_pid, signal.SIGKILL)
 
 
-def test_numeric_index_and_uuid_token_lock_the_same_physical_gpu(tmp_path, monkeypatch) -> None:
-    """gpu_ids=[0] and the UUID of GPU 0 must contend for one host lock, not two."""
+@pytest.mark.parametrize(
+    ("uuid", "ambient"),
+    [
+        ("GPU-32ad40d6-019f-386a-321d-3901216c78ad", False),
+        ("GPU-deadbeef", True),
+    ],
+    ids=["configured-index-blocks-explicit-uuid", "ambient-uuid-blocks-configured-index"],
+)
+def test_index_and_uuid_share_one_host_lock(tmp_path, monkeypatch, uuid, ambient) -> None:
+    """Configured indices and explicit or ambient UUIDs contend in both ownership directions."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
+    if ambient:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", uuid)
+        by_uuid = GpuPool.create(n_jobs=1)
+    else:
+        by_uuid = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
 
     by_index = GpuPool.create(n_jobs=1, explicit_ids=[0])
-    by_uuid = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
-
     assert _gpu_lock_path(by_index._devices[0]) == _gpu_lock_path(by_uuid._devices[0])
+    owner, waiter = (by_uuid, by_index) if ambient else (by_index, by_uuid)
 
-    with by_index.acquire() as gid:
+    with owner.acquire() as gid:
         # The trainer still sees the token the operator configured.
-        assert gid.visible_devices == "0"
+        assert gid.visible_devices == (uuid if ambient else "0")
         with (
             pytest.raises(TimeoutError, match="Wallclock deadline"),
-            by_uuid.acquire(deadline=time.monotonic() + 0.02),
+            waiter.acquire(deadline=time.monotonic() + 0.02),
         ):
             pass
         assert len(list(tmp_path.glob("gpu_*.lock"))) == 1
@@ -572,25 +584,6 @@ def test_autodetected_indices_resolve_to_the_same_lock_as_uuid_tokens(tmp_path, 
     assert _gpu_lock_path(detected._devices[0]) == _gpu_lock_path(GpuDevice(uuid))
     with detected.acquire() as gid:
         assert gid.visible_devices == "0"
-
-
-def test_ambient_uuid_and_configured_index_share_one_lock(tmp_path, monkeypatch) -> None:
-    """A UUID inherited via CUDA_VISIBLE_DEVICES cannot double-book a configured index."""
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    uuid = "GPU-deadbeef"
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", uuid)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
-
-    ambient = GpuPool.create(n_jobs=1)
-    configured = GpuPool.create(n_jobs=1, explicit_ids=[0])
-
-    with ambient.acquire() as gid:
-        assert gid.visible_devices == uuid
-        with (
-            pytest.raises(TimeoutError, match="Wallclock deadline"),
-            configured.acquire(deadline=time.monotonic() + 0.02),
-        ):
-            pass
 
 
 def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
@@ -912,27 +905,16 @@ def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
     """A write failure after flock succeeds must not leak a locked handle that
     excludes every other run from the GPU."""
 
-    class _Handle:
-        def seek(self, _pos: int) -> None:
-            pass
-
-        def truncate(self) -> None:
-            pass
-
-        def write(self, text: str) -> None:
-            raise OSError("disk full")
-
-        def flush(self) -> None:
-            pass
-
+    handle = Mock()
+    handle.write.side_effect = OSError("disk full")
     released: list[object] = []
-    monkeypatch.setattr("phasesweep.runtime.gpu.try_lock_file", lambda path: _Handle())
+    monkeypatch.setattr("phasesweep.runtime.gpu.try_lock_file", lambda path: handle)
     monkeypatch.setattr("phasesweep.runtime.gpu.unlock_file", released.append)
 
     with pytest.raises(OSError, match="disk full"):
         _try_host_gpu_lease(GpuDevice("0"))
 
-    assert len(released) == 1
+    assert released == [handle]
 
 
 @pytest.mark.live

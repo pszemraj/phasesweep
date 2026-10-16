@@ -204,11 +204,11 @@ def _stage_terminal_uncertain_run(
     *,
     run_id: str,
     mark_uncertain: bool,
-) -> tuple[RunStore, RunHandle, int, Path, Callable[[], Result]]:
+) -> tuple[RunStore, RunHandle, int, Path, Path, Callable[[], Result]]:
     """Stage a run whose only cleanup evidence is one of its own
     cleanup-uncertain terminal trials (generation id == run id, matching the
     detached-runner contract). Returns ``(store, handle, trial_number,
-    config, recover)``."""
+    config, state_dir, recover)``."""
     config = _config(tmp_path)
     trial_number = write_uncertain_failed_trial(config, generation_id=run_id)
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
@@ -222,7 +222,7 @@ def _stage_terminal_uncertain_run(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
     recover = partial(recover_run_cli, registry.state_dir, run_id, confirm=True)
-    return store, handle, trial_number, config, recover
+    return store, handle, trial_number, config, registry.state_dir, recover
 
 
 @pytest.mark.parametrize("interrupted_recovery", [False, True])
@@ -1681,35 +1681,23 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
     first_run = "srv-terminal-first"
-    trial_number = write_uncertain_failed_trial(
-        config,
-        generation_id=first_run,
+    store, handle, trial_number, config, state_dir, recover = _stage_terminal_uncertain_run(
+        tmp_path, monkeypatch, run_id=first_run, mark_uncertain=False
     )
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-
-    def fake_cleanup(*args: object, **kwargs: object) -> bool:
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
-
-    stage_dead_run(store, first_run, config, reg.id, cleanup_uncertain=False)
-    write_unsafe_cleanup_status(store, first_run)
-
-    first = recover_run_cli(registry.state_dir, first_run, confirm=True)
+    first = recover()
 
     assert first.exit_code == 0, first.output
     study = _load_first_phase_study(config)
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
 
     second_run = "srv-terminal-second"
-    second_handle = stage_dead_run(store, second_run, config, reg.id, cleanup_uncertain=False)
+    second_handle = stage_dead_run(
+        store, second_run, config, handle.experiment_id, cleanup_uncertain=False
+    )
     write_unsafe_cleanup_status(store, second_run)
 
-    replay = recover_run_cli(registry.state_dir, second_run, confirm=True)
+    replay = recover_run_cli(state_dir, second_run, confirm=True)
 
     assert replay.exit_code != 0
     assert "could not confirm any trial-level cleanup evidence" in replay.output
@@ -1728,7 +1716,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     from phasesweep.runtime.files import private_atomic_write_text as real_write
 
     run_id = "srv-ledger-retry"
-    store, handle, trial_number, config, recover = _stage_terminal_uncertain_run(
+    store, handle, trial_number, config, _state_dir, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=False
     )
     experiment = load_experiment(config)
@@ -1784,7 +1772,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     recovery record is already on disk. The study ledger supplies the
     evidence."""
     run_id = "srv-terminal-marker-retry"
-    store, handle, _trial_number, _config_path, recover = _stage_terminal_uncertain_run(
+    store, handle, _trial, _config, _state_dir, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True
     )
 

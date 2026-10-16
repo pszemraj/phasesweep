@@ -552,12 +552,7 @@ def test_validate_cli_renders_comment(tmp_path: Path) -> None:
 
 
 def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
-    """``phasesweep validate`` states each phase's resume/reproduce contract up front.
-
-    The runtime guard rejects a mid-target TPE/CMA-ES resume, but only after the
-    operator has already been interrupted; the capability line puts the same
-    contract in front of them before any trial runs.
-    """
+    """Validation reports sampler capabilities and identifies fixed configurations."""
     p = _write_validation_config(
         tmp_path,
         """
@@ -580,6 +575,9 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
           allow_no_gpu_isolation: true
           sampler: { type: cmaes, seed: 1 }
           search_space: { dropout: { type: float, low: 0.0, high: 0.3 } }
+        - name: baseline
+          n_trials: 1
+          fixed_overrides: { lr: 0.1 }
         """,
         persistent=True,
         phase_name=None,
@@ -594,27 +592,9 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
     # Under several workers a model sampler's draws depend on which trials have finished.
     assert "phase 'reg': sampler=cmaes seed=1 (resumable)" in result.output
-
-
-def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path) -> None:
-    """A phase with no search_space needs no seed and is reported as fixed."""
-    p = _write_validation_config(
-        tmp_path,
-        """
-        - name: baseline
-          n_trials: 1
-          fixed_overrides: { lr: 0.1 }
-        """,
-        persistent=True,
-        phase_name=None,
-    )
-
-    result = CliRunner().invoke(cli_main, ["validate", str(p)])
-
-    assert result.exit_code == 0, result.output
     assert "- baseline: n_trials=1 (fixed configuration)" in result.output
     assert "phase 'baseline': fixed configuration, no sampler draws (resumable)" in result.output
-    assert "sampler=" not in result.output
+    assert all("sampler=" not in line for line in result.output.splitlines() if "baseline" in line)
 
 
 def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:

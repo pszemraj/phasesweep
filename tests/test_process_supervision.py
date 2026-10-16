@@ -1785,7 +1785,7 @@ def test_reaper_raises_when_cleanup_uncertain(
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
-    with pytest.raises(RuntimeError, match="cleanup could not prove"):
+    with pytest.raises(RuntimeError, match="process cleanup could not be confirmed"):
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
 

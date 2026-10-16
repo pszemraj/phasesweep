@@ -16,7 +16,7 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     PublicationIntegrityError,
@@ -45,10 +45,9 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import make_experiment, mark_current_format, write_flaky_trainer
+from tests.conftest import _bounded_metric, make_experiment, write_flaky_trainer
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import stamp_artifact_root
+from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
@@ -104,10 +103,7 @@ def _persistent(
     tmp_path: Path, *phases: Phase, trainer: Path | None = None, maximize: bool = False
 ) -> Experiment:
     """Build an experiment whose ledger lives beside its workdir under ``tmp_path``."""
-    metric = Metric(
-        goal="maximize" if maximize else "minimize",
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-    )
+    metric = _bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=list(phases), metric=metric)
 
 
@@ -148,12 +144,7 @@ def _record(
     as an objective that recorded its outcome just before its orchestrator died. Its
     COMPLETE trials hold no objective evidence, so selecting a winner from them fails.
     """
-    study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase}",
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = _new_phase_study(experiment, phase)
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)

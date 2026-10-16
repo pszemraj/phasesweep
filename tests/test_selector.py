@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 import optuna
 import pytest
@@ -22,9 +23,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     constraint_attr,
 )
-from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import JsonExtractor
-from tests.conftest import make_experiment
+from tests.conftest import log_regex_provenance, make_experiment
 
 # Allocation writes both attrs on every trial before its trainer runs.
 _ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"schema_version": 1}}
@@ -32,19 +32,7 @@ _ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"sc
 
 def _objective_provenance_json() -> str:
     """Return a structurally valid current-format local objective record."""
-    return json.dumps(
-        {
-            "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
-            "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
-            "recorded_at": "2026-01-01T00:00:00+00:00",
-            "source": {
-                "kind": "file",
-                "path": "stdout.log",
-                "size_bytes": 0,
-                "sha256": "0" * 64,
-            },
-        }
-    )
+    return json.dumps(log_regex_provenance())
 
 
 def _make_exp(constraints=None, *, goal: str = "minimize"):
@@ -93,18 +81,6 @@ def _add_trial(
         state=optuna.trial.TrialState.COMPLETE,
     )
     study.add_trial(trial)
-
-
-class _TrialOrderStudy:
-    """Small test double exposing trials in a deliberate non-Optuna order."""
-
-    study_name = "t::p"
-
-    def __init__(self, trials):
-        self._trials = trials
-
-    def get_trials(self, *, deepcopy: bool):
-        return list(self._trials)
 
 
 def test_argmin_over_feasible():
@@ -204,7 +180,9 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
     _add_trial(study, 0.0, params={"x": 2})
     trials = list(reversed(study.get_trials(deepcopy=False)))
 
-    w = select_winner(_TrialOrderStudy(trials), exp)  # type: ignore[arg-type]
+    reordered = Mock(spec=["study_name", "get_trials"], study_name="t::p")
+    reordered.get_trials.side_effect = lambda *, deepcopy: list(trials)
+    w = select_winner(reordered, exp)
 
     assert w.trial_number == 1
     assert w.params == {"x": 1}
@@ -248,29 +226,9 @@ def test_exact_tie_goes_to_the_lowest_draw_position_not_the_lowest_trial_number(
 
 def test_rejects_nan_constraint_values_defensively():
     """If a NaN somehow reaches user_attrs, the selector must reject it."""
-    study = optuna.create_study(study_name="t", direction="minimize")
-
-    # Trial 0: clean, feasible.
-    t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
-    t0.set_user_attr(FEASIBLE_ATTR, True)
-    t0.set_user_attr(GENERATION_ID_ATTR, "generation-test")
-    t0.set_user_attr(ATTEMPT_ID_ATTR, "attempt-0")
-    t0.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
-    for key, value in _ALLOCATION_ATTRS.items():
-        t0.set_user_attr(key, value)
-    t0.set_user_attr(constraint_attr("size"), 100.0)
-    study.tell(t0, 0.5)
-
-    # Trial 1: NaN constraint value but mistakenly marked feasible.
-    t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
-    t1.set_user_attr(FEASIBLE_ATTR, True)
-    t1.set_user_attr(GENERATION_ID_ATTR, "generation-test")
-    t1.set_user_attr(ATTEMPT_ID_ATTR, "attempt-1")
-    t1.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
-    for key, value in _ALLOCATION_ATTRS.items():
-        t1.set_user_attr(key, value)
-    t1.set_user_attr(constraint_attr("size"), float("nan"))
-    study.tell(t1, 0.1)  # Better metric, but invalid.
+    study = _make_study()
+    _add_trial(study, 0.5, constraint_vals={"size": 100.0})
+    _add_trial(study, 0.1, constraint_vals={"size": float("nan")})
 
     exp = _make_exp(
         [

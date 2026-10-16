@@ -862,7 +862,8 @@ def test_carried_result_ignores_older_publication_files(tmp_path: Path, damage: 
     run_experiment(experiment)
     assert published_generation_id(experiment) != source_generation
     expected = read_result(experiment)[1]
-    assert expected[0].generation_id == source_generation
+    assert expected[0].source is not None
+    assert expected[0].source.generation_id == source_generation
     source_dir = _generations_dir(experiment) / source_generation
     source_winner = source_dir / "phases" / "p" / "winner.yaml"
     if damage == "deleted_generation":

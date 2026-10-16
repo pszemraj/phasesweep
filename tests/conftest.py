@@ -36,9 +36,10 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.files import file_url_path
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.reaper import _read_proc_stat
 from tests.tiers import flagged_tests
 
@@ -609,6 +610,16 @@ def invoke_cli_boundary(
         logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+def log_regex_provenance() -> JsonObject:
+    """Return a current-format ``log_regex`` objective provenance record."""
+    return {
+        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+        "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},
+    }
 
 
 def single_trial_confound(trial_number: int) -> dict[str, Any]:

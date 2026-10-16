@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import optuna
@@ -23,11 +24,11 @@ from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.errors import PhaseSweepError
-from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
+    make_trial_context,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -71,15 +72,9 @@ def _sleeping_score_experiment(
 def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
     """Attach the standard trial context to a process result for extraction checks."""
     return ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
+        ctx=replace(
+            make_trial_context(tmp_path),
             overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
             return_code=process.return_code,
             duration_seconds=process.duration_seconds,
         ),

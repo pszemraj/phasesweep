@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.errors import CatalogError
@@ -22,6 +22,13 @@ def _write_config(tmp_path: Path, filename: str, *, name: str = "srv") -> Path:
     config = tmp_path / filename
     config.write_text(mcp_experiment_config_text(tmp_path, name=name))
     return config
+
+
+def _init_catalog(config: Path, output: Path) -> Result:
+    """Invoke catalog scaffolding for one configuration through the CLI."""
+    return CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
 
 
 def test_derive_experiment_id_sanitizes_stem(tmp_path: Path) -> None:
@@ -41,9 +48,7 @@ def test_scaffold_rejects_duplicate_ids(tmp_path: Path) -> None:
 def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 0, result.output
     assert f"wrote {output}" in result.output
 
@@ -73,9 +78,7 @@ def test_init_catalog_pins_runner_cwd_to_catalog_directory(tmp_path: Path) -> No
     config = _write_config(configs, "srv.yaml")
     output = project / "catalog.yaml"
 
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
 
     assert result.exit_code == 0, result.output
     assert Registry.load(output).get("srv").cwd == project.resolve()
@@ -89,10 +92,7 @@ def test_init_catalog_honors_umask(tmp_path: Path) -> None:
     output = tmp_path / "project" / "catalog.yaml"
     previous_umask = os.umask(0o002)
     try:
-        result = CliRunner().invoke(
-            cli_main,
-            ["mcp", "init-catalog", "--from", str(config), "-o", str(output)],
-        )
+        result = _init_catalog(config, output)
     finally:
         os.umask(previous_umask)
 
@@ -122,9 +122,7 @@ def test_init_catalog_quotes_config_paths_and_implicit_yaml_scalar_ids(
     config = _write_config(tmp_path, filename)
     output = tmp_path / "catalog.yaml"
 
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
 
     assert result.exit_code == 0, result.output
     experiment_id = derive_experiment_id(config)
@@ -143,9 +141,7 @@ def test_init_catalog_quotes_state_dir_with_yaml_punctuation(
     output = catalog_dir / "catalog.yaml"
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state # one"))
 
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
 
     assert result.exit_code == 0, result.output
     assert Registry.load(output).state_dir.parent == tmp_path / "state # one" / "phasesweep" / "mcp"
@@ -178,9 +174,7 @@ def test_home_override_pins_scaffold_state(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setenv("PHASESWEEP_HOME", str(root))
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 0, result.output
     state = Registry.load(output).state_dir
     assert state.parent == root / "mcp"
@@ -196,9 +190,7 @@ def test_missing_home_override_is_created_owner_only_by_scaffold(
     monkeypatch.setenv("PHASESWEEP_HOME", str(root))
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 0, result.output
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     assert Registry.load(output).state_dir.parent == root / "mcp"
@@ -210,9 +202,7 @@ def test_scaffold_rejects_invalid_home_override(
     monkeypatch.setenv("PHASESWEEP_HOME", "relative")
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 2
     assert "PHASESWEEP_HOME must be an absolute path" in result.output
     assert not output.exists()
@@ -224,9 +214,7 @@ def test_scaffold_refuses_unsafe_state(tmp_path: Path) -> None:
     state = Path(yaml.safe_load(scaffold_catalog_text(output, [config]))["state_dir"])
     state.mkdir(parents=True)
     state.chmod(0o755)
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 2
     assert not output.exists()
     assert stat.S_IMODE(state.stat().st_mode) == 0o755
@@ -236,9 +224,7 @@ def test_init_catalog_validates_before_publish(tmp_path: Path) -> None:
     config = tmp_path / "mem.yaml"
     config.write_text(mcp_experiment_config_text(tmp_path, name="mem", with_storage=False))
     output = tmp_path / "catalog.yaml"
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 2
     assert "storage must be persistent" in result.output
     assert not output.exists()
@@ -250,9 +236,7 @@ def test_init_catalog_refuses_to_overwrite(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
     output.write_text("operator-authored\n")
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "operator-authored\n"
@@ -278,9 +262,7 @@ def test_init_catalog_losing_publish_race_preserves_other_writer(
 
     monkeypatch.setattr("phasesweep.runtime.files.os.link", lose_publish_race)
 
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
+    result = _init_catalog(config, output)
 
     assert result.exit_code == 2
     assert "refusing to overwrite" in result.output
