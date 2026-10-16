@@ -532,6 +532,64 @@ def test_missing_binding_never_creates_or_discovers_a_summary(tmp_path, monkeypa
     assert publication.delivery_status(experiment) == {"pending": 0, "delivered": 0}
 
 
+@pytest.mark.parametrize("recorded_state", ["published", "failed"])
+def test_failure_publisher_preserves_historical_generation_outcome(
+    tmp_path, monkeypatch, recorded_state
+):
+    """A newer publication cannot turn an older success into a failure or hide an older failure."""
+    from phasesweep.engine.generation import _write_generation_state
+    from phasesweep.engine.paths import _last_successful_generation_path
+    from tests.ledger_fixtures import materialize, published_generation_id
+
+    fixture = materialize("current-journal", tmp_path / "publication", mode="tree")
+    experiment = fixture.experiment.model_copy(
+        update={"mlflow": native_experiment(tmp_path).mlflow}
+    )
+    ledger = validate_ledger(experiment)
+    newer_generation = published_generation_id(experiment)
+    assert newer_generation is not None
+    generation = "a" * 32
+    assert generation != newer_generation
+    _write_generation_state(
+        experiment,
+        generation_id=generation,
+        state=recorded_state,
+        from_phase=None,
+        publish_current=False,
+    )
+    write_record(
+        tracking_root(experiment) / generation / "generation-binding.json",
+        {**_binding(), "phase": "generation", "attempt_id": generation},
+    )
+    pointer = _last_successful_generation_path(experiment)
+    pointer_before = pointer.read_bytes()
+    requests = []
+    monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
+
+    publication.publish_failed_generation(
+        experiment, generation, RuntimeError("late error"), ledger
+    )
+
+    assert pointer.read_bytes() == pointer_before
+    assert published_generation_id(experiment) == newer_generation
+    assert (
+        _recorded_generation_state(_generation_record_path(experiment, generation))
+        == recorded_state
+    )
+    if recorded_state == "published":
+        assert requests == []
+        assert publication.delivery_status(experiment, generation) == {"pending": 0, "delivered": 0}
+    else:
+        (request,) = requests
+        assert request["finish"] == "FAILED"
+        assert request["projection"]["summary"] == {
+            "generation_id": generation,
+            "status": "FAILED",
+            "error_class": "RuntimeError",
+        }
+        assert publication.delivery_status(experiment, generation) == {"pending": 0, "delivered": 1}
+
+
 def _remote_example(tmp_path, monkeypatch):
     """Run the native example against in-process MLflow answers and a no-op trainer."""
     config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
