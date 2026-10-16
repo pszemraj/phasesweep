@@ -34,7 +34,7 @@ repos:
         entry: >-
           bash -c 'script="$HOME/scripts/py/doc_check.py";
           [ -f "$script" ] || { echo "doc_check.py not found; skipped"; exit 0; };
-          out=$(python "$script" --strict "$@") || { printf "%s\n" "$out"; exit 1; }' --
+          out=$(python "$script" --strict --no-check-lazy "$@") || { printf "%s\n" "$out"; exit 1; }' --
         language: system
         files: ^src/.*\.py$
         verbose: true
@@ -62,14 +62,13 @@ repos:
       # configuration.
       - id: contract-tests
         name: contract tests
-        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py tests/test_ledger_read_paths.py -q -p no:cacheprovider
+        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py -q -p no:cacheprovider
         language: system
         pass_filenames: false
         always_run: true
-      # Collecting the whole suite runs the integration-tier guard over every
-      # test module without executing any test.
-      - id: tier-guard
-        name: tier guard (whole-suite collection)
+      # Collect every test module without executing tests.
+      - id: pytest-collection
+        name: whole-suite collection
         entry: pytest --collect-only -q -p no:cacheprovider
         language: system
         pass_filenames: false

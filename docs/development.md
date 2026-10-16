@@ -23,7 +23,7 @@ Use the parallel fast lane below for broader coverage; reserve the complete suit
 for qualification. Run the repository checks sequentially:
 
 ```bash
-pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py tests/test_ledger_read_paths.py
+pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
 pytest --collect-only
 ruff check .
 ruff format --check .
@@ -49,10 +49,10 @@ pre-commit install
 | module size | commit | changed `src/` and `tests/` Python files |
 | typing escapes | commit | lines the commit adds to `src/` and `tests/` Python files |
 | contract tests | commit | every commit |
-| tier guard | commit | every commit, collecting the whole suite |
+| whole-suite collection | commit | every commit, collecting the whole suite |
 | `mypy src` | push | the whole package |
 
-The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, `tests/test_tier_guard.py`, and `tests/test_ledger_read_paths.py`. The tier guard collects the whole suite without running it, which applies the [integration-marker guard](#test-tiers) to every test module. `doc-check` runs the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the hook prints that it skipped. It is a maintainer-local check, and CI does not run it. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. The typing-escapes hook ([`scripts/check_typing_escapes.py`](../scripts/check_typing_escapes.py)) refuses `Any`, `typing.cast`, and `# type: ignore` on any line a commit adds or edits, including `Any` in a docstring `:param` or `:return` type. There is no exemption: narrow with `isinstance`, describe a known shape with a `TypedDict` and an external API with a `Protocol`, use `JsonValue`/`JsonObject` from `phasesweep.runtime.json` for open JSON, or `object` for an opaque value. Editing a line that already carries one of these means fixing it. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
+The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, and `tests/test_ledger_read_paths.py`. Whole-suite collection imports every test module without running tests. `doc-check` checks docstring presence and typing without requiring signature restatement. It runs the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the hook prints that it skipped. It is a maintainer-local check, and CI does not run it. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. The typing-escapes hook ([`scripts/check_typing_escapes.py`](../scripts/check_typing_escapes.py)) refuses `Any`, `typing.cast`, and `# type: ignore` on any line a commit adds or edits, including `Any` in a docstring `:param` or `:return` type. There is no exemption: narrow with `isinstance`, describe a known shape with a `TypedDict` and an external API with a `Protocol`, use `JsonValue`/`JsonObject` from `phasesweep.runtime.json` for open JSON, or `object` for an opaque value. Editing a line that already carries one of these means fixing it. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
 
@@ -109,13 +109,11 @@ PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
 
 A test is `@pytest.mark.integration` when it manages real processes, waits on wall-clock time, drives a multi-step durable recovery workflow, or is otherwise slow: its call phase takes at least one second. Everything else stays in the fast tier, including engine runs with quick trainers, such as `run_experiment` over an `echo` trainer, which spawn their subprocess inside the package.
 
-The guard enforces only what a test's source shows: `tests/conftest.py` fails collection when a test manages processes or waits on the clock *directly*, in its body or a same-module helper or fixture, without the marker (`tests/tiers.py` lists the primitives). A test that is slow for any other reason is marked by the classification rule above. Use pytest's built-in duration report in the fast-lane command above to identify these cases. Durations are advisory; timing thresholds do not fail a run.
-
-The scanner cannot follow a call into another module, so a helper shared from a non-test module under `tests/` that spawns or waits is registered by name in `PROCESS_DRIVER_CALLS` or `WALLCLOCK_HELPER_CALLS` in `tests/tiers.py`, and a test that calls it, or requests it as a fixture, is classified as if it did the work itself. `test_shared_helpers_that_spawn_or_wait_are_registered` in `tests/test_tier_guard.py` scans those modules and fails until every such helper is registered. `reaped_pid` is deliberately not registered: its child has exited before it returns, so its caller neither manages a live process nor waits.
+Mark tests explicitly according to the rules above, including tests that call shared helpers. Use pytest's built-in duration report to identify slow cases. Durations are advisory; timing thresholds do not fail a run.
 
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
+GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, whole-suite collection, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
 The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
@@ -203,7 +201,7 @@ flowchart TD
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
 - `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
-- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing, and the integration-marker guard.
+- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and result rendering.
 

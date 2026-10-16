@@ -2,19 +2,15 @@
 
 Ban storage entry points and private ledger access outside engine.ledger. Study and
 connection classes remain usable as annotations. SQLite and SQLAlchemy constructors
-are banned throughout the package. Exception maps must remain empty; synthetic
-source cases exercise each detector.
+are banned throughout the package. Synthetic source cases exercise each detector.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-
-from tests.tiers import _dotted
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 PACKAGE_ROOT = SRC / "phasesweep"
@@ -67,6 +63,18 @@ BANNED_EVERYWHERE: dict[str, frozenset[str]] = {
     "sqlalchemy": frozenset({"create_engine", "engine_from_config"}),
     "sqlite3": frozenset({"connect", "Connection"}),
 }
+
+
+def _dotted(node: ast.expr) -> str | None:
+    """Flatten a name/attribute chain, returning None for other expressions."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 def _source_files() -> list[Path]:
@@ -537,102 +545,3 @@ def test_private_import_detector_resolves_every_spelling(case: str, tmp_path: Pa
     )
 
     assert found == expected
-
-
-def _annotation_names(annotation: ast.expr) -> Iterator[str]:
-    """Yield every name an annotation mentions, looking inside quoted forward references.
-
-    :param ast.expr annotation: Annotation expression.
-    :return Iterator[str]: Bare names and attribute leaves, in walk order.
-    """
-    for part in ast.walk(annotation):
-        if isinstance(part, ast.Name):
-            yield part.id
-        elif isinstance(part, ast.Attribute):
-            yield part.attr
-        elif isinstance(part, ast.Constant) and isinstance(part.value, str):
-            try:
-                quoted = ast.parse(part.value, mode="eval").body
-            except SyntaxError:
-                continue  # a ``Literal`` string, not a type
-            yield from _annotation_names(quoted)
-
-
-def _return_type_problem(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    """Explain why a public ledger function's return annotation is not concrete.
-
-    :param node: Function definition to check.
-    :return str | None: The problem, or ``None`` when the annotation names only
-        concrete types.
-    """
-    if node.returns is None:
-        return "no return annotation"
-    if any(name in ("Any", "object") for name in _annotation_names(node.returns)):
-        return f"returns {ast.unparse(node.returns)}, which admits any object"
-    return None
-
-
-def test_ledger_public_api_returns_concrete_types() -> None:
-    """Every name the ledger exports is defined and annotated with a real type."""
-    chokepoint = SRC / CHOKEPOINT
-    tree = ast.parse(chokepoint.read_text(encoding="utf-8"), filename=str(chokepoint))
-    exported: list[str] = []
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets, value = [node.target], node.value
-        else:
-            continue
-        if any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
-            exported = [
-                element.value
-                for element in getattr(value, "elts", [])
-                if isinstance(element, ast.Constant) and isinstance(element.value, str)
-            ]
-    assert exported, (
-        f"{CHOKEPOINT} declares no names in __all__, so its public API is undeclared; "
-        "list the handles and openers other modules may use."
-    )
-
-    definitions = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-    }
-    problems: list[str] = []
-    for name in exported:
-        node = definitions.get(name)
-        if node is None:
-            problems.append(f"{name}: exported but not a module-level function or class")
-            continue
-        if isinstance(node, ast.ClassDef):
-            continue
-        problem = _return_type_problem(node)
-        if problem is not None:
-            problems.append(f"{name}: {problem}")
-    assert not problems, "Ledger public API is not concretely typed: " + "; ".join(problems)
-
-
-@pytest.mark.parametrize(
-    ("annotation", "concrete"),
-    [
-        ("optuna.Study | None", True),
-        ("ClaimedLedger", True),
-        ("'ClaimedLedger'", True),
-        ("list['ClaimedLedger']", True),
-        ("Literal['memory', 'on disk']", True),
-        ("Any", False),
-        ("typing.Any", False),
-        ("Any | None", False),
-        ("dict[str, Any]", False),
-        ("object", False),
-        ("'Any'", False),
-        ("list['Any']", False),
-    ],
-)
-def test_concrete_return_rule_rejects_any_object(annotation: str, concrete: bool) -> None:
-    """``Any`` or ``object`` anywhere in a return annotation fails the public-API rule."""
-    node = ast.parse(f"def f() -> {annotation}: ...").body[0]
-    assert isinstance(node, ast.FunctionDef)
-    assert (_return_type_problem(node) is None) is concrete

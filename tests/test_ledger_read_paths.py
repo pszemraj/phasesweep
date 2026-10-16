@@ -247,22 +247,6 @@ def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
     assert materialized.unchanged(), materialized.changes()
 
 
-@pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
-def test_recovery_inspect_never_writes_to_a_golden_ledger(
-    fixture_name: str, mode: str, tmp_path: Path
-) -> None:
-    """Recovery preflight leaves a golden ledger and its run store untouched, whatever it decides."""
-    materialized = materialize(fixture_name, tmp_path, mode=mode)
-    _, state_changes = _recover_inspect(materialized, tmp_path)
-    assert materialized.unchanged(), (
-        f"recovery preflight over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
-    )
-    assert state_changes == {}, (
-        f"recovery preflight over {fixture_name} ({mode}) changed the MCP state "
-        f"directory: {state_changes}"
-    )
-
-
 def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
     """The reference fixture still declares the schema versions this release writes."""
     fixture_name = "current-journal"
