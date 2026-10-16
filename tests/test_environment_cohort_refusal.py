@@ -30,6 +30,7 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     _environment_identity,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import make_experiment, write_constant_trainer
@@ -82,6 +83,9 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
     """Return the refusal text for ``current`` against ``study``."""
     with pytest.raises(StudyFingerprintMismatchError) as caught:
         _validate_environment_cohort(study, current)
+    assert type(caught.value) is StudyFingerprintMismatchError
+    assert caught.value.action is OperatorAction.FIX_CONFIG
+    assert "No trial was allocated." in str(caught.value)
     return str(caught.value)
 
 

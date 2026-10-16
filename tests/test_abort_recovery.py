@@ -122,12 +122,11 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
 
 
 @pytest.mark.integration
-def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
-    """Raising n_trials after an abort is the explicit resume path.
-
-    The top-up schedules genuinely new attempts; reaching a successful winner
-    selection consumes the durable abort record.
-    """
+@pytest.mark.parametrize("interrupt_selection", [False, True], ids=["normal", "selection-crash"])
+def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt_selection: bool
+) -> None:
+    """A raised target retires the durable abort before selection and survives replay."""
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
     db = tmp_path / "abort.journal"
@@ -146,6 +145,26 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
         run_experiment(_exp(3))
 
     flag.touch()
+    if interrupt_selection:
+        import phasesweep.engine.phase as phase_module
+
+        def crash_in_selection(*args: object, **kwargs: object) -> None:
+            study = optuna.load_study(
+                study_name="t::p", storage=_resolve_storage(f"journal:///{db}")
+            )
+            assert _load_phase_policy_state(study).abort is None
+            raise RuntimeError("simulated crash during winner selection")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(phase_module, "_select_phase_winner", crash_in_selection)
+            with pytest.raises(
+                RuntimeError, match="simulated crash during winner selection"
+            ) as caught:
+                run_experiment(_exp(6))
+            assert type(caught.value) is RuntimeError
+        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+        assert _load_phase_policy_state(study).abort is None
+
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)

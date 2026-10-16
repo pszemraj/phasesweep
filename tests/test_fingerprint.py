@@ -926,10 +926,12 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     with pytest.raises(ArtifactRootConflictError) as excinfo:
         run_experiment(moved)
 
+    assert type(excinfo.value) is ArtifactRootConflictError
     message = str(excinfo.value)
+    assert "publishes into artifact root" in message
     assert str(bound_root) in message
     assert str(_experiment_dir(moved)) in message
-    assert excinfo.value.action == OperatorAction.FIX_CONFIG
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
@@ -1023,8 +1025,11 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert all(character in "0123456789abcdef" for character in binding["storage_key"])
 
     foreign = owner.model_copy(update={"storage": f"journal:///{tmp_path / 'foreign.journal'}"})
-    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger") as excinfo:
         run_experiment(foreign)
+    assert type(excinfo.value) is ArtifactRootConflictError
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
+    assert "bound to a different storage ledger or experiment" in str(excinfo.value)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1645,8 +1650,11 @@ def test_from_phase_rejects_stale_parent_winner(
     run_experiment(exp_v1)
 
     exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, **after)
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as excinfo:
         run_experiment(exp_v2, from_phase="lr")
+    assert type(excinfo.value) is StudyFingerprintMismatchError
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
+    assert "or restore the matching config before resuming." in str(excinfo.value)
 
 
 @pytest.mark.integration

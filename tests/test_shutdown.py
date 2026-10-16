@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -104,10 +105,10 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
         signal.signal(sig, host_handler)
 
     with signal_handler_scope():
-        # Block SIGTERM ourselves so the kill below queues instead of
-        # firing immediately (the scope's own entry unblocks it).
+        # Queue SIGTERM on this blocked thread, even if other threads have it
+        # unblocked (the scope's own entry unblocks it here).
         signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
-        os.kill(os.getpid(), signal.SIGTERM)
+        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
         assert received == [], "signal fired before scope exit"
 
     # Scope exit order: block -> restore handlers -> restore mask. The pending

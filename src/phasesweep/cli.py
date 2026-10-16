@@ -96,6 +96,11 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
+def _operational_error_text(exc: PhaseSweepError) -> str:
+    """Format an operational diagnosis with its routed operator step."""
+    return f"{exc}\nfix: {OPERATOR_STEPS[exc.action]}."
+
+
 def main() -> None:
     """Run the CLI behind a process-level error boundary.
 
@@ -119,8 +124,7 @@ def main() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(f"phasesweep: {exc}", err=True)
-        click.echo(f"fix: {OPERATOR_STEPS[exc.action]}.", err=True)
+        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
         # -v (see _configure_logging) means the operator asked for internals.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
@@ -844,7 +848,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     try:
         recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
     except RunRecoveryError as exc:
-        raise click.ClickException(str(exc)) from None
+        raise click.ClickException(_operational_error_text(exc)) from None
 
 
 @mcp.command(

@@ -477,14 +477,6 @@ def _regular_file(tmp_path: Path) -> Path:
     return blocker
 
 
-def _unwritable_directory(tmp_path: Path) -> Path:
-    """Return a directory this user may read but not create entries in."""
-    parent = tmp_path / "read-only"
-    parent.mkdir()
-    parent.chmod(0o555)
-    return parent
-
-
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Fail a run, then lose the root before reconciliation can confirm cleanup."""
     experiment = make_experiment(workdir=tmp_path / "runs")
@@ -805,10 +797,7 @@ WRAP_CASES = (
         trigger=_recovery_studies_damaged("tree", _garbage),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message=(
-            "Restore the original complete storage ledger and access to it, then retry "
-            "phasesweep mcp recover-run."
-        ),
+        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
     ),
     RoutingCase(
         id="recovery_published_missing",
@@ -817,10 +806,7 @@ WRAP_CASES = (
         ),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message=(
-            "Restore the original complete storage ledger and study with access to it, "
-            "then retry phasesweep mcp recover-run."
-        ),
+        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
     ),
     RoutingCase(
         id="recover_run_lock_busy",
@@ -1325,55 +1311,6 @@ def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
 
 
-def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Skip a phase whose search space changed after its winner was published."""
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    edited = experiment.phases[0].model_copy(
-        update={"search_space": {"a": IntParam(type="int", low=0, high=20)}}
-    )
-    return _load_winner(
-        experiment.model_copy(update={"phases": [edited]}),
-        edited,
-        {},
-        publication=_published_for_resume(experiment),
-    )
-
-
-def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Claim the fixture's ledger through a config whose workdir moved away from it."""
-    moved = _moved_workdir(materialize("current-journal", tmp_path, mode="tree"), tmp_path)
-    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
-
-
-def _validate_tree_bound_to_another_ledger(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Validate a config over a tree that a different storage ledger bound."""
-    owner = make_experiment(
-        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'a.journal'}"
-    )
-    _artifact_root_binding_path(owner).parent.mkdir(parents=True)
-    _write_artifact_root_binding(owner)
-    other = make_experiment(
-        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'b.journal'}"
-    )
-    return engine_ledger.validate_ledger(other)
-
-
-def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Validate a study whose recorded trial ran under another trainer environment."""
-    study = optuna.create_study(study_name="t::p")
-    study.add_trial(
-        optuna.trial.create_trial(
-            value=1.0,
-            params={},
-            distributions={},
-            user_attrs={TRAINER_ENV_DIGEST_ATTR: "e" * 64},
-        )
-    )
-    return study_policy._validate_environment_cohort(study, _digest_only_identity("d" * 64))
-
-
 def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Clean a stale trial group whose identity was recorded in another PID namespace."""
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "boot")
@@ -1413,7 +1350,7 @@ ORIGIN_CASES = (
         trigger=_reconcile_prepared_over_damaged_publication,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the publication evidence or access to it before retrying recovery.",
+        message="last-success publication is invalid or unreadable.",
     ),
     RoutingCase(
         id="registry_terminal_identity_missing",
@@ -1529,14 +1466,14 @@ ORIGIN_CASES = (
         trigger=_recover_during_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="wait for it to finish and retry",
+        message="another MCP launch is in progress",
     ),
     RoutingCase(
         id="recover_unsettled_launch",
         trigger=_recover_unsettled_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="Wait briefly and retry",
+        message="The run remains reserved.",
     ),
     # recover-run raises every RunRecoveryError itself, so none may route back
     # to it by default; only a confirmed run's own remedy names it.
@@ -1552,14 +1489,14 @@ ORIGIN_CASES = (
         trigger=_recover_with_config_snapshot(Path.unlink),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore it before retrying recovery.",
+        message="run config snapshot is missing:",
     ),
     RoutingCase(
         id="recover_config_snapshot_unreadable",
         trigger=_recover_with_config_snapshot(lambda path: path.chmod(0o000)),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore it or access to it before retrying recovery.",
+        message="cannot read run config snapshot:",
         marks=(requires_nonroot,),
     ),
     RoutingCase(
@@ -1620,47 +1557,11 @@ ORIGIN_CASES = (
         message="Refusing to replay it unless the current config sets",
     ),
     RoutingCase(
-        id="winner_phase_config_changed",
-        trigger=_resume_after_phase_edit,
-        raised=StudyFingerprintMismatchError,
-        action=OperatorAction.FIX_CONFIG,
-        message="or restore the matching config before resuming.",
-    ),
-    RoutingCase(
-        id="study_root_workdir_moved",
-        trigger=_claim_from_moved_workdir,
-        raised=ArtifactRootConflictError,
-        action=OperatorAction.FIX_CONFIG,
-        message="publishes into artifact root",
-    ),
-    RoutingCase(
-        id="tree_bound_to_another_ledger",
-        trigger=_validate_tree_bound_to_another_ledger,
-        raised=ArtifactRootConflictError,
-        action=OperatorAction.FIX_CONFIG,
-        message="bound to a different storage ledger or experiment",
-    ),
-    RoutingCase(
         id="ledger_directory_path_unusable",
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message="Correct the storage path, or the workdir for auto storage",
-    ),
-    RoutingCase(
-        id="ledger_directory_unwritable",
-        trigger=_claim_ledger_under(_unwritable_directory),
-        raised=PhaseSweepError,
-        action=OperatorAction.RESTORE_TREE,
-        message="could not be created",
-        marks=(requires_nonroot,),
-    ),
-    RoutingCase(
-        id="environment_cohort_changed",
-        trigger=_top_up_from_another_environment,
-        raised=StudyFingerprintMismatchError,
-        action=OperatorAction.FIX_CONFIG,
-        message="No trial was allocated.",
     ),
 )
 

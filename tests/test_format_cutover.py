@@ -270,26 +270,39 @@ def test_claim_ledger_creates_ledger_parent_but_validate_does_not(tmp_path: Path
     assert ledger_file.is_file()
 
 
+@pytest.mark.parametrize(
+    "denial", ["injected", pytest.param("permissions", marks=requires_nonroot)]
+)
 def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denial: str
 ) -> None:
     """A ledger directory that cannot be created leaves the tree unbound and correctable."""
-    experiment = _experiment(
-        tmp_path, storage=f"journal:///{tmp_path / 'missing' / 'study.journal'}"
-    )
+    parent = tmp_path / "read-only" if denial == "permissions" else tmp_path
+    missing = parent / "missing"
+    experiment = _experiment(tmp_path, storage=f"journal:///{missing / 'study.journal'}")
     real_mkdir = Path.mkdir
 
     def refuse_ledger_directory(path: Path, *args: object, **kwargs: object) -> None:
-        if path == tmp_path / "missing":
+        if path == missing:
             raise PermissionError(13, "Permission denied", str(path))
         real_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
+    if denial == "permissions":
+        parent.mkdir()
+        parent.chmod(0o555)
+    else:
+        monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
 
-    with pytest.raises(PhaseSweepError, match="could not be created") as refused:
-        claim_ledger(validate_ledger(experiment))
+    try:
+        with pytest.raises(PhaseSweepError, match="could not be created") as refused:
+            claim_ledger(validate_ledger(experiment))
+    finally:
+        if denial == "permissions":
+            parent.chmod(0o755)
 
-    assert isinstance(refused.value.__cause__, PermissionError)
+    assert type(refused.value) is PhaseSweepError
+    assert refused.value.action is OperatorAction.RESTORE_TREE
+    assert type(refused.value.__cause__) is PermissionError
     assert not _artifact_root_binding_path(experiment).exists()
 
 

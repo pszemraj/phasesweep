@@ -1586,8 +1586,7 @@ def _replay_met_target(
     if resume.recovery_abort is not None:
         raise StudySchemaMismatchError(
             f"Phase {phase.name!r} accepted an abort recovery target but has no "
-            "remaining trial slots. Use a new experiment name rather than reusing "
-            "this inconsistent study."
+            "remaining trial slots."
         )
     trials = study.get_trials(deepcopy=False)
     return _select_phase_winner(

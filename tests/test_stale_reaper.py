@@ -1186,13 +1186,9 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     """
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
-    owner = _write_config(
-        tmp_path / "b.yaml", backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "b"
-    )
+    owner = _write_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
     config_a = tmp_path / "a.yaml"
-    recovering = _write_config(
-        config_a, backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "a"
-    )
+    recovering = _write_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
     study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.journal"

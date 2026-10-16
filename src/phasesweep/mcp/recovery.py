@@ -273,7 +273,7 @@ def _recover_pre_spawn_orphan(
     with store.launch_lock() as acquired:
         if not acquired:
             raise RunRecoveryError(
-                "another MCP launch is in progress; wait for it to finish and retry",
+                "another MCP launch is in progress",
                 action=OperatorAction.RETRY,
             )
         if store.is_pre_spawn_orphan(run_id):
@@ -335,7 +335,7 @@ def _resolve_launch_state(
             raise RunRecoveryError(
                 "launch outcome is unresolved: the durable handle cannot distinguish a "
                 "pre-spawn failure from a child that has not persisted its process identity. "
-                "The run remains reserved. Wait briefly and retry; if this persists after a "
+                "The run remains reserved. If this persists after a "
                 "server crash, inspect the host because automated recovery cannot safely "
                 "declare that no runner was spawned.",
                 action=OperatorAction.RETRY,
@@ -469,7 +469,7 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
     snapshot = store.config_snapshot_path(handle.run_id)
     if not snapshot.is_file():
         raise RunRecoveryError(
-            f"run config snapshot is missing: {snapshot}. Restore it before retrying recovery.",
+            f"run config snapshot is missing: {snapshot}.",
             action=OperatorAction.RESTORE_TREE,
         )
     try:
@@ -481,14 +481,12 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
         )
     except OSError as exc:
         raise RunRecoveryError(
-            f"cannot read run config snapshot: {snapshot}. Restore it or access to it "
-            "before retrying recovery.",
+            f"cannot read run config snapshot: {snapshot}.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     except ValueError as exc:
         raise RunRecoveryError(
-            f"{exc}; refusing recovery. Restore the run's original config snapshot "
-            "before retrying recovery.",
+            f"{exc}; refusing recovery.",
             action=OperatorAction.RESTORE_TREE,
         ) from None
 
@@ -556,8 +554,7 @@ def _publication_recovery_action(
             return "abort", None
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
-            "last-success publication is invalid or unreadable. Restore the "
-            "publication evidence or access to it before retrying recovery.",
+            "last-success publication is invalid or unreadable.",
             action=OperatorAction.RESTORE_TREE,
         )
     return None, None
@@ -586,10 +583,7 @@ def _load_recovery_studies(
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
-    unavailable_remedy = (
-        " Restore the original complete storage ledger and access "
-        "to it, then retry phasesweep mcp recover-run."
-    )
+    recovery_step = " Retry phasesweep mcp recover-run after repairing the storage ledger."
     try:
         ledger = validate_ledger(config)
         if confirm:
@@ -602,7 +596,7 @@ def _load_recovery_studies(
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
         raise RunRecoveryError(
-            f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+            f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
         ) from exc
     loaded_studies = {}
     for phase in config.phases:
@@ -610,7 +604,7 @@ def _load_recovery_studies(
             study = open_existing_study(ledger, phase)
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
-                f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+                f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
             ) from exc
         if study is not None:
             try:
@@ -637,9 +631,7 @@ def _load_recovery_studies(
             )
         except (PublishedStudyMissingError, StudyStorageUnavailableError) as exc:
             raise RunRecoveryError(
-                f"{exc} Restore the original complete storage ledger "
-                "and study with access to it, then retry "
-                "phasesweep mcp recover-run.",
+                f"{exc}{recovery_step}",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
     return loaded_studies

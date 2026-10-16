@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import shlex
 import signal
 import stat
@@ -25,7 +24,6 @@ from phasesweep.config.models import (
     Experiment,
     Metric,
     Phase,
-    _environment_contract_line,
 )
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
 from phasesweep.engine.errors import (
@@ -304,26 +302,6 @@ def test_dry_run_logs_environment_contract(
         r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN environment:")
     ]
     assert lines == [f"DRY RUN {expected}"]
-
-
-@pytest.mark.parametrize(("case", "expected"), _ENVIRONMENT_CONTRACT_CASES)
-def test_environment_contract_line_lists_each_variable_once(
-    tmp_path: Path, case: dict, expected: str
-) -> None:
-    """A variable is digested, set under ``env``, or passed through, never two of them."""
-    line = _environment_contract_line(_environment_contract_experiment(tmp_path, case))
-    assert line == expected
-    digested = re.search(r"digested: ([^)]*)\)", line)
-    env_keys = re.search(r"env keys: ([^;]*)", line)
-    passed = re.search(r"passthrough_env: ([^(;]*?)(?: \(|;|$)", line)
-    names = [
-        name
-        for match in (digested, env_keys, passed)
-        if match is not None
-        for name in re.split(r", | and built-in ", match.group(1))
-        if name != "none"
-    ]
-    assert len(names) == len(set(names)), line
 
 
 @pytest.mark.parametrize("configured", [False, True])

@@ -47,6 +47,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
 )
+from phasesweep.errors import OPERATOR_STEPS, OperatorAction
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
@@ -90,6 +91,23 @@ from tests.recovery_helpers import (
     write_trial_identity,
     write_uncertain_failed_trial,
 )
+
+
+@pytest.mark.parametrize("action", [OperatorAction.RESTORE_TREE, OperatorAction.FRESH_NAMESPACE])
+def test_recovery_cli_renders_routed_operator_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: OperatorAction
+) -> None:
+    """Recovery preserves the routed remedy through Click's operator-error boundary."""
+
+    def refuse_recovery(*_args: object, **_kwargs: object) -> None:
+        raise mcp_recovery.RunRecoveryError("study ownership differs", action=action)
+
+    monkeypatch.setattr("phasesweep.cli.recover_run", refuse_recovery)
+
+    result = recover_run_cli(tmp_path, "refused-run", confirm=True)
+
+    assert result.exit_code == 1
+    assert result.output == f"Error: study ownership differs\nfix: {OPERATOR_STEPS[action]}.\n"
 
 
 def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:

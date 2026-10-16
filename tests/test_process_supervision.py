@@ -1396,14 +1396,20 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     )
 
 
-def test_descendant_reaping_grace_is_outside_trial_wallclock(tmp_path: Path) -> None:
+def test_descendant_reaping_grace_is_outside_trial_wallclock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An in-budget root exit remains a lifecycle failure, not a timeout."""
+    import phasesweep.runtime.process as process
+
     trial_dir = tmp_path / "trial"
     ready = tmp_path / "descendant_ready"
+    root_pid = tmp_path / "root_pid"
+    budget = 5.0
     child_script = (
         "import os, pathlib, signal, time; "
         "signal.signal(signal.SIGTERM, "
-        "lambda *_: (time.sleep(0.8), os._exit(0))); "
+        f"lambda *_: (time.sleep({budget + 0.5}), os._exit(0))); "
         f"pathlib.Path({str(ready)!r}).touch(); "
         "time.sleep(60)"
     )
@@ -1412,23 +1418,35 @@ def test_descendant_reaping_grace_is_outside_trial_wallclock(tmp_path: Path) -> 
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
         f"ready = pathlib.Path({str(ready)!r}); "
         "\nwhile not ready.exists(): time.sleep(0.005)\n"
+        f"pathlib.Path({str(root_pid)!r}).write_text(str(os.getpid())); "
         "os._exit(0)"
     )
 
+    real_wait = process._wait_for_guardian_exit
+
+    def wait_for_cleanup(proc: subprocess.Popen[bytes]) -> bool:
+        # The root-exit status has already arrived; the guardian still owns cleanup.
+        assert root_pid.exists()
+        assert not is_pid_alive(int(root_pid.read_text()))
+        assert proc.poll() is None
+        assert time.monotonic() - started < budget, "root exit did not precede the deadline"
+        return real_wait(proc)
+
+    monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
     started = time.monotonic()
     result = _run_supervised(
         trial_dir,
         shlex.join([sys.executable, "-c", parent_script]),
-        timeout=0.5,
+        timeout=budget,
         attempt_id="post-root-grace-attempt",
     )
-    elapsed = time.monotonic() - started
 
     assert result.timed_out is False
     assert result.return_code == 0
+    assert result.cleanup_confirmed is True
     assert result.failure_reason is not None
     assert "still had live descendants" in result.failure_reason
-    assert elapsed > 0.7, "test did not exercise cleanup beyond the wallclock budget"
+    assert result.duration_seconds > budget, "test did not exercise cleanup beyond the budget"
 
 
 def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:

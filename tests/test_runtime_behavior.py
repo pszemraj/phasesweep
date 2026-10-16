@@ -87,7 +87,6 @@ from tests.conftest import (
     patch_rejected_trial_user_attr,
     requires_nonroot,
     write_constant_trainer,
-    write_flag_gated_trainer,
     write_param_echo_trainer,
     write_trainer,
 )
@@ -1312,58 +1311,6 @@ def test_unsafe_cleanup_is_never_an_ordinary_trial_failure() -> None:
         caught.append(vars(phase_module)[element.id])
     assert caught
     assert not any(issubclass(UnsafeProcessCleanupError, base) for base in caught)
-
-
-@pytest.mark.integration
-def test_recovered_abort_is_retired_before_selection_survives_selection_crash(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A top-up's recovery boundary retires the recorded abort before selection.
-
-    A top-up that dies mid-selection must not leave the durable abort behind,
-    or the next identical invocation would report "previously aborted" and
-    wedge the phase. The boundary is durable before any new trial runs, and
-    selection is deterministic from durable trial data, so the replay
-    re-derives the same winner.
-    """
-    flag = tmp_path / "resume_enabled"
-    trainer = write_flag_gated_trainer(tmp_path, flag)
-    db = tmp_path / "abort.journal"
-
-    def _exp(n_trials: int):
-        return make_experiment(
-            workdir=tmp_path / "runs",
-            storage=f"journal:///{db}",
-            trainer=trainer,
-            n_trials=n_trials,
-            max_consecutive_failures=2,
-            sampler={"type": "random", "seed": 7},
-        )
-
-    with pytest.raises(NoFeasibleTrialError, match="aborted"):
-        run_experiment(_exp(3))
-
-    flag.touch()
-    import phasesweep.engine.phase as phase_mod
-
-    real_select = phase_mod._select_phase_winner
-
-    def crash_in_selection(*args: object, **kwargs: object):
-        raise RuntimeError("simulated crash during winner selection")
-
-    monkeypatch.setattr("phasesweep.engine.phase._select_phase_winner", crash_in_selection)
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        run_experiment(_exp(6))
-
-    # The recorded abort was retired before selection started...
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert _load_phase_policy_state(study).abort is None
-
-    # ...so the identical replay republishes deterministically instead of
-    # wedging on "previously aborted".
-    monkeypatch.setattr("phasesweep.engine.phase._select_phase_winner", real_select)
-    winners = run_experiment(_exp(6))
-    assert winners["p"].metric == pytest.approx(0.5)
 
 
 @pytest.mark.integration

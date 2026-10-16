@@ -45,7 +45,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
-from tests.conftest import _bounded_metric, make_experiment, write_flaky_trainer
+from tests.conftest import _bounded_metric, make_experiment, requires_nonroot, write_flaky_trainer
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
 from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
 
@@ -567,6 +567,7 @@ def test_fresh_experiment_previews_every_phase_as_before(
     assert not (tmp_path / "runs").exists()
 
 
+@requires_nonroot
 def test_unreadable_trial_data_previews_a_fresh_phase_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -599,6 +600,7 @@ def test_unreadable_trial_data_previews_a_fresh_phase_and_says_so(
     assert _PLACEHOLDERS in _commands(caplog)[-1]
 
 
+@requires_nonroot
 def test_uninspectable_ledger_on_an_unbound_tree_previews_fresh_phases_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
