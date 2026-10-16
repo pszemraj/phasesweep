@@ -11,7 +11,11 @@ import pytest
 
 from phasesweep import load_experiment
 from phasesweep.evidence.evaluation import evaluate_gates
-from phasesweep.evidence.models import ArtifactSizeGate, JsonEqualsGate, Sha256Gate
+from phasesweep.evidence.models import (
+    ArtifactSizeGate,
+    JsonEqualsGate,
+    Sha256Gate,
+)
 from tests.conftest import (
     make_trial_context,
     patch_path_method_failure,
@@ -328,11 +332,12 @@ def test_artifact_size_directory_gate_reports_stat_failure(
     assert message in result.detail
 
 
-def test_gate_results_mark_expired_local_gate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("deadline", [0.0, float("nan")], ids=["expired", "nan"])
+def test_gate_results_mark_expired_local_gate(tmp_path: Path, deadline: float) -> None:
     """An expired deadline marks an unevaluated local gate as exhausted."""
     gate = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
 
-    expired = evaluate_gates(make_trial_context(tmp_path), [gate], deadline=0.0)[0]
+    expired = evaluate_gates(make_trial_context(tmp_path), [gate], deadline=deadline)[0]
     ordinary = evaluate_gates(make_trial_context(tmp_path), [gate])[0]
 
     assert expired.deadline_exhausted is True

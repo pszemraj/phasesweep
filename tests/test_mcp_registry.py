@@ -135,7 +135,7 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
 
     from phasesweep.config.models import Experiment
     from phasesweep.mcp.runs import load_experiment_snapshot
-    from phasesweep.runtime.files import canonical_storage_identity, file_sha256, storage_backend
+    from phasesweep.runtime.files import canonical_storage_identity, file_sha256
 
     payload = yaml.safe_load(_experiment_yaml(tmp_path))
     payload["storage"] = "auto"
@@ -143,7 +143,9 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", yaml.safe_dump(payload))
     registered = Registry.load(write_mcp_catalog(tmp_path, {"auto": config})).get("auto")
     assert registered.experiment.storage == "auto"
-    assert storage_backend(registered.experiment.resolved_storage) == "journal"
+    resolved_storage = registered.experiment.resolved_storage
+    assert resolved_storage is not None
+    assert resolved_storage.startswith("journal:///")
     assert not Path(registered.experiment.workdir).exists()
     snapshot = load_experiment_snapshot(
         config, file_sha256(config), source="test", config_dir=config.resolve().parent

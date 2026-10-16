@@ -1,4 +1,4 @@
-"""Storage URL parsing and canonicalization: backend detection, absolute vs. relative path preservation, and the same-host lock identity that equivalent URLs must share."""
+"""Storage URL parsing and canonicalization: absolute vs. relative path preservation, and the same-host lock identity that equivalent URLs must share."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from phasesweep.engine.run import run_experiment
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
-    storage_backend,
     storage_recovery_locator,
 )
 from tests.conftest import make_experiment, write_yaml
@@ -37,7 +36,7 @@ def test_auto_storage_resolves_without_writing(
     assert url is not None
     assert experiment.storage == experiment.model_dump()["storage"] == "auto"
     assert "resolved_storage" not in experiment.model_dump()
-    assert storage_backend(url) == "journal"
+    assert url.startswith("journal:///")
     assert file_url_path(url) == str(tmp_path / "relative" / "t" / "study.journal")
     assert not (tmp_path / "relative").exists()
     explicit = experiment.model_copy(update={"storage": url})
@@ -232,17 +231,10 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
 
     monkeypatch.chdir(recovery_cwd)
     assert locator is not None
-    assert storage_backend(locator) == "journal"
+    assert locator.startswith("journal:///")
     assert Path(file_url_path(locator)).is_absolute() or "file:/" in file_url_path(locator)
     assert "studies.journal" in locator
     assert str(registration_cwd) in locator
-
-
-def test_storage_backend_collapses_dialect_suffixes() -> None:
-    """A `+driver` suffix folds into its base scheme name; unset storage is None."""
-    assert storage_backend("journal:///x.journal") == "journal"
-    assert storage_backend("postgresql+psycopg2://h/db") == "postgresql"
-    assert storage_backend(None) is None
 
 
 def test_file_url_path_preserves_absolute_paths() -> None:

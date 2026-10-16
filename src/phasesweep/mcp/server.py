@@ -816,7 +816,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("phasesweep", instructions=agent_prompt_text(strip=True))
+    mcp = FastMCP("phasesweep", instructions=agent_prompt_text())
     # Pinned FastMCP 1.27 has no version constructor argument; leaving the
     # underlying version unset advertises the MCP SDK as PhaseSweep's version.
     mcp._mcp_server.version = __version__
@@ -1008,7 +1008,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
         :return str: Prompt text.
         """
-        return agent_prompt_text(strip=True)
+        return agent_prompt_text()
 
     _strict_tool_inputs(mcp)
     return mcp

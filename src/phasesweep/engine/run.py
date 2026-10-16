@@ -143,7 +143,6 @@ def _terminal_report_from_cleanup(
     primary_error: BaseException | None,
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
-    cleanup_confirmed: bool | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
 
@@ -152,15 +151,12 @@ def _terminal_report_from_cleanup(
     :param BaseException | None primary_error: Invocation's authoritative error.
     :param str | None failure_stage: Stage where the invocation failed.
     :param Mapping[str, Winner] | None winners: Successful published winners.
-    :param bool | None cleanup_confirmed: Optional explicit cleanup verdict.
     :return TerminalReport: Immutable terminal outcome snapshot.
     """
     return TerminalReport(
         generation_id=generation_id,
         primary_error=primary_error,
-        cleanup_confirmed=(
-            cleanup.cleanup_confirmed if cleanup_confirmed is None else cleanup_confirmed
-        ),
+        cleanup_confirmed=cleanup.cleanup_confirmed,
         recovered_attempt_ids=frozenset(cleanup.recovered_attempt_ids),
         recovered_attempt_generations=MappingProxyType(dict(cleanup.recovered_attempt_generations)),
         uncertain_attempt_ids=frozenset(cleanup.uncertain_attempt_ids),

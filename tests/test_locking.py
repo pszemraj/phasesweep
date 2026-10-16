@@ -596,12 +596,14 @@ def test_private_open_closes_descriptor_on_shutdown_during_fdopen_handoff(
         os.fstat(opened_fd)
 
 
-def test_private_atomic_write_logs_directory_fsync_failure(
+@pytest.mark.parametrize("strict", [False, True], ids=["best-effort", "strict"])
+def test_private_atomic_write_directory_fsync_failure_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    strict: bool,
 ) -> None:
-    """A committed private write reports lost crash durability without failing."""
+    """Replacement stays published when directory fsync raises or logs its failure."""
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     state.chmod(0o700)
@@ -609,10 +611,14 @@ def test_private_atomic_write_logs_directory_fsync_failure(
     patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
     caplog.set_level("WARNING", logger="phasesweep.runtime.files")
 
-    runtime_files.private_atomic_write_text(path, "committed")
+    if strict:
+        with pytest.raises(OSError, match="simulated directory fsync failure"):
+            runtime_files.private_atomic_write_text(path, "committed", strict_dir_fsync=True)
+    else:
+        runtime_files.private_atomic_write_text(path, "committed")
 
     assert path.read_text() == "committed"
-    assert "Directory fsync failed after a private atomic write" in caplog.text
+    assert ("Directory fsync failed after a private atomic write" in caplog.text) is not strict
 
 
 @pytest.mark.parametrize("strict", [False, True], ids=["shared", "private-strict"])

@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypeAlias
 
@@ -731,18 +732,16 @@ def _persist_spawned_handle(
     pending = store.get(run_id)
     if pending is None:
         raise RuntimeError(f"cannot persist runner identity for unknown run {run_id!r}")
-    handle = RunHandle(
-        run_id=run_id,
+    handle = replace(
+        pending,
         experiment_id=experiment_id,
         config_sha256=config_sha256,
-        config_dir=pending.config_dir,
         pid=pid,
         pgid=pgid,
         pid_starttime=pid_starttime,
         started_at=started_at,
         launch_state="spawned",
         allow_cancel=allow_cancel,
-        visible_params_at_launch=pending.visible_params_at_launch,
         # Binds pid/pid_starttime to this boot: after a reboot the pair can
         # name an unrelated process, and a reader that knows the boot
         # differs can rule the runner dead without signalling anything.

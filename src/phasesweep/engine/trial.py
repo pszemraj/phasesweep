@@ -25,12 +25,6 @@ from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
 )
-from phasesweep.errors import (
-    ProcessCleanupUncertainError as ProcessCleanupUncertainError,
-)
-from phasesweep.errors import (
-    UnsafeProcessCleanupError as UnsafeProcessCleanupError,
-)
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     ExtractorError,
@@ -52,6 +46,7 @@ from phasesweep.runtime.commands import (
     compose_trainer_input,
     encode_overrides_json,
     render_command,
+    trial_substitutions,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
 from phasesweep.runtime.json import JsonObject
@@ -610,18 +605,12 @@ def prepare_trainer_input(
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
-    substitutions = {
-        "{trial_dir}": str(trial_dir),
-        "{trial_id}": str(trial_id),
-        "{phase}": phase_name,
-        "{run_name}": run_name,
-    }
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     composed = compose_trainer_input(
         experiment.trainer_config,
         overrides,
         experiment.override_format,
-        substitutions=substitutions,
+        substitutions=trial_substitutions(trial_dir, trial_id, phase_name, run_name),
     )
     text = composed if isinstance(composed, str) else encode_overrides_json(composed) + "\n"
 

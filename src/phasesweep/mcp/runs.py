@@ -18,8 +18,11 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal, NotRequired, TypeAlias, TypedDict, TypeGuard, cast
+from typing import IO, Annotated, Literal, NotRequired, TypeAlias, TypeGuard, cast
 from uuid import UUID, uuid4
+
+from pydantic import Field, TypeAdapter, ValidationError
+from typing_extensions import TypedDict
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.io import load_experiment_bytes
@@ -28,7 +31,6 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
     ensure_private_dir,
-    fsync_directory,
     open_directory_fd,
     open_lock_file,
     private_atomic_create_text,
@@ -64,7 +66,7 @@ RunnerVisibility: TypeAlias = Literal["observable", "absent", "gone", "unobserva
 
 # phasesweep.mcp.runner writes
 # LAUNCH_READY_BYTE once its process identity is durable, and
-# phasesweep.mcp.run_control writes LAUNCH_ACK_BYTE once it has recorded that
+# phasesweep.mcp.tools writes LAUNCH_ACK_BYTE once it has recorded that
 # receipt, settling ownership of the spawned process.
 LAUNCH_READY_BYTE = b"R"
 LAUNCH_ACK_BYTE = b"A"
@@ -209,17 +211,19 @@ class TerminalStatus(TypedDict):
     result_publication_state: NotRequired[Literal["prepared", "committed"] | None]
     result_publication_generation_id: NotRequired[str | None]
     result_snapshot_error: NotRequired[str | None]
-    recovered_attempt_ids: NotRequired[list[str] | None]
-    recovered_attempt_generations: NotRequired[dict[str, str] | None]
-    uncertain_attempt_ids: NotRequired[list[str] | None]
+    recovered_attempt_ids: NotRequired[list[Annotated[str, Field(min_length=1)]] | None]
+    recovered_attempt_generations: NotRequired[
+        dict[Annotated[str, Field(min_length=1)], Annotated[str, Field(min_length=1)]] | None
+    ]
+    uncertain_attempt_ids: NotRequired[list[Annotated[str, Field(min_length=1)]] | None]
 
 
 class RecoveredAttemptLocation(TypedDict):
     """Validated trial location named by operator cleanup evidence."""
 
-    phase: str
-    trial_number: int
-    generation_id: str
+    phase: Annotated[str, Field(min_length=1)]
+    trial_number: Annotated[int, Field(ge=0)]
+    generation_id: Annotated[str, Field(min_length=1)]
 
 
 class CleanupRecovery(TypedDict):
@@ -228,8 +232,12 @@ class CleanupRecovery(TypedDict):
     run_id: str
     config_sha256: str
     cleanup_confirmed: Literal[True]
-    reaped_attempt_ids: list[str]
-    reaped_attempt_locations: dict[str, RecoveredAttemptLocation]
+    reaped_attempt_ids: list[Annotated[str, Field(min_length=1)]]
+    reaped_attempt_locations: dict[Annotated[str, Field(min_length=1)], RecoveredAttemptLocation]
+
+
+_TERMINAL_STATUS_ADAPTER: TypeAdapter[TerminalStatus] = TypeAdapter(TerminalStatus)
+_CLEANUP_RECOVERY_ADAPTER: TypeAdapter[CleanupRecovery] = TypeAdapter(CleanupRecovery)
 
 
 @dataclass(frozen=True)
@@ -263,7 +271,7 @@ class RunHandle:
     pgid: int | None
     # /proc start time for PID-reuse-safe liveness. None only on the pre-spawn
     # "launching" placeholder: a spawned handle is never persisted without it
-    # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
+    # (see mcp/runner.py _persist_spawned_handle and mcp/tools.py _spawn).
     pid_starttime: int | None
     started_at: str  # ISO-8601 UTC
     visible_params_at_launch: Literal["none", "all"] | list[str]
@@ -271,12 +279,26 @@ class RunHandle:
     allow_cancel: bool = False
     # Boot that pid/pid_starttime belong to. None only on the pre-spawn
     # "launching" placeholder: a spawned handle is never persisted without it
-    # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
+    # (see mcp/runner.py _persist_spawned_handle and mcp/tools.py _spawn).
     boot_id: str | None = None
     # PID namespace that pid/pgid are numbered in, as its inode and the start
     # time of its PID 1. A reader in another namespace cannot probe them. None
     # only on the pre-spawn "launching" placeholder, like boot_id.
     pid_namespace: str | None = None
+
+    @property
+    def process_identity(self) -> ProcessIdentity:
+        """Return the process fields recorded by this run handle.
+
+        :return ProcessIdentity: Runner identity, including unset pre-spawn fields.
+        """
+        return ProcessIdentity(
+            pid=self.pid,
+            pgid=self.pgid,
+            pid_starttime=self.pid_starttime,
+            boot_id=self.boot_id,
+            pid_namespace=self.pid_namespace,
+        )
 
 
 @dataclass
@@ -794,8 +816,7 @@ class RunStore:
             raise ValueError(f"Run {handle.run_id!r} permits only a launching-to-spawned update.")
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
-        private_atomic_write_text(target, payload + "\n")
-        fsync_directory(target.parent, strict=True)
+        private_atomic_write_text(target, payload + "\n", strict_dir_fsync=True)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -882,19 +903,11 @@ class RunStore:
         :param str run_id: Candidate orphan run identity.
         :return bool: Whether the preparation is safe to remove automatically.
         """
-        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+        lease = self._claim_abandoned_launch_lease(run_id)
+        if lease is None:
             return False
-        lease_path = self.launch_lease_path(run_id)
-        if lease_path.exists() or lease_path.is_symlink():
-            if not lease_path.is_file() or lease_path.is_symlink():
-                return False
-            lease = self._claim_abandoned_launch_lease(run_id)
-            if lease is None:
-                return False
-            lease.close()
-            return True
-
-        return False
+        lease.close()
+        return True
 
     def _claim_abandoned_launch_lease(self, run_id: str) -> IO[str] | None:
         """Lock and revalidate one transactional pre-spawn preparation.
@@ -902,6 +915,8 @@ class RunStore:
         :param str run_id: Candidate prepared run identity.
         :return IO[str] | None: Held lease when the preparation is abandoned.
         """
+        if not SAFE_NAME_PATTERN.fullmatch(run_id):
+            return None
         lease_path = self.launch_lease_path(run_id)
         if not lease_path.is_file() or lease_path.is_symlink():
             return None
@@ -942,14 +957,10 @@ class RunStore:
         """
         recovered_log: Path | None = None
         with self.transition_lock(run_id):
-            lease: IO[str] | None = None
+            lease = self._claim_abandoned_launch_lease(run_id)
+            if lease is None:
+                raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
             try:
-                if self.launch_lease_path(run_id).is_file():
-                    lease = self._claim_abandoned_launch_lease(run_id)
-                    if lease is None:
-                        raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
-                elif not self.is_pre_spawn_orphan(run_id):
-                    raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
                 log_path = self.log_path(run_id)
                 archive_path = log_path.with_suffix(".log.recovered")
                 if log_path.exists() or log_path.is_symlink():
@@ -986,8 +997,7 @@ class RunStore:
                     with contextlib.suppress(FileNotFoundError):
                         _strict_unlink(path)
             finally:
-                if lease is not None:
-                    lease.close()
+                lease.close()
         return recovered_log
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
@@ -1036,7 +1046,7 @@ class RunStore:
             return None
         if not _valid_optional_boot_id(handle.boot_id):
             return None
-        if not _valid_optional_pid_namespace(handle.pid_namespace):
+        if handle.pid_namespace is not None and not is_pid_namespace(handle.pid_namespace):
             return None
         if handle.launch_state == "launching":
             if (
@@ -1205,13 +1215,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose cleanup is uncertain.
         """
         existing = self._read_cleanup_identity(handle)
-        candidate = ProcessIdentity(
-            pid=handle.pid,
-            pgid=handle.pgid,
-            pid_starttime=handle.pid_starttime,
-            boot_id=handle.boot_id,
-            pid_namespace=handle.pid_namespace,
-        )
+        candidate = handle.process_identity
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
         identity = existing if existing is not None and not candidate_has_identity else candidate
         payload = {
@@ -1262,13 +1266,7 @@ class RunStore:
             and (marker_identity.pid is not None or marker_identity.pgid is not None)
         ):
             return marker_identity
-        return ProcessIdentity(
-            pid=handle.pid,
-            pgid=handle.pgid,
-            pid_starttime=handle.pid_starttime,
-            boot_id=handle.boot_id,
-            pid_namespace=handle.pid_namespace,
-        )
+        return handle.process_identity
 
     def runner_view(self, handle: RunHandle) -> RunnerView:
         """Relate this run's strongest identity to the boot and PID namespace reading it.
@@ -1481,8 +1479,7 @@ class RunStore:
             return None
         if payload.get("run_id") != handle.run_id:
             return None
-        marker_hash = payload.get("config_sha256")
-        if marker_hash is not None and marker_hash != handle.config_sha256:
+        if payload.get("config_sha256") != handle.config_sha256:
             return None
         if payload.get("cleanup_confirmed") is not False:
             return None
@@ -1500,7 +1497,7 @@ class RunStore:
             return None
         if not _valid_optional_boot_id(boot_id):
             return None
-        if not _valid_optional_pid_namespace(pid_namespace):
+        if pid_namespace is not None and not is_pid_namespace(pid_namespace):
             return None
         # A PID means nothing without the namespace that numbers it.
         if (pid is None) != (pid_namespace is None):
@@ -1519,13 +1516,7 @@ class RunStore:
             pid_namespace=pid_namespace,
         )
         if handle.launch_state == "spawned":
-            durable_identity = ProcessIdentity(
-                pid=handle.pid,
-                pgid=handle.pgid,
-                pid_starttime=handle.pid_starttime,
-                boot_id=handle.boot_id,
-                pid_namespace=handle.pid_namespace,
-            )
+            durable_identity = handle.process_identity
             if any(
                 marker_value is not None and marker_value != durable_value
                 for marker_value, durable_value in zip(
@@ -1561,27 +1552,11 @@ def _valid_terminal_status(
     """
     if payload.get("run_id") != handle.run_id:
         return False
-    if type(payload.get("returncode")) is not int:
-        return False
-    cleanup_confirmed = payload.get("cleanup_confirmed")
-    if type(cleanup_confirmed) is not bool:
-        return False
-    error_class = payload.get("error_class")
-    if error_class is not None and not isinstance(error_class, str):
-        return False
-    failure = payload.get("failure")
-    if failure is not None and not isinstance(failure, dict):
-        return False
-    ended_at = payload.get("ended_at")
-    if ended_at is not None and not isinstance(ended_at, str):
+    try:
+        _TERMINAL_STATUS_ADAPTER.validate_python(payload, strict=True)
+    except ValidationError:
         return False
     result_snapshot_state = payload.get("result_snapshot_state")
-    if result_snapshot_state is not None and result_snapshot_state not in {
-        "pending",
-        "complete",
-        "failed",
-    }:
-        return False
     if result_snapshot_state == "complete" and not isinstance(payload.get("result_snapshot"), dict):
         return False
     result_publication_state = payload.get("result_publication_state")
@@ -1589,8 +1564,6 @@ def _valid_terminal_status(
     if (result_publication_state is None) != (result_publication_generation_id is None):
         return False
     if result_publication_state is not None:
-        if result_publication_state not in {"prepared", "committed"}:
-            return False
         if (
             not isinstance(result_publication_generation_id, str)
             or not SAFE_NAME_PATTERN.fullmatch(result_publication_generation_id)
@@ -1599,29 +1572,7 @@ def _valid_terminal_status(
             return False
         if result_publication_state == "prepared" and result_snapshot_state != "pending":
             return False
-    result_snapshot_error = payload.get("result_snapshot_error")
-    if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
-        return False
-    recovered_attempt_ids = payload.get("recovered_attempt_ids")
-    if recovered_attempt_ids is not None and (
-        not isinstance(recovered_attempt_ids, list)
-        or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
-    ):
-        return False
-    recovered_attempt_generations = payload.get("recovered_attempt_generations")
-    if recovered_attempt_generations is not None and (
-        not isinstance(recovered_attempt_generations, dict)
-        or any(
-            not isinstance(key, str) or not key or not isinstance(value, str) or not value
-            for key, value in recovered_attempt_generations.items()
-        )
-    ):
-        return False
-    uncertain_attempt_ids = payload.get("uncertain_attempt_ids")
-    return uncertain_attempt_ids is None or (
-        isinstance(uncertain_attempt_ids, list)
-        and all(isinstance(value, str) and bool(value) for value in uncertain_attempt_ids)
-    )
+    return True
 
 
 def _valid_cleanup_recovery(
@@ -1639,24 +1590,11 @@ def _valid_cleanup_recovery(
         and payload.get("cleanup_confirmed") is True
     ):
         return False
-    reaped_attempt_ids = payload.get("reaped_attempt_ids")
-    if not isinstance(reaped_attempt_ids, list) or any(
-        not isinstance(value, str) or not value for value in reaped_attempt_ids
-    ):
+    try:
+        _CLEANUP_RECOVERY_ADAPTER.validate_python(payload, strict=True)
+    except ValidationError:
         return False
-    locations = payload.get("reaped_attempt_locations")
-    return isinstance(locations, dict) and not any(
-        not isinstance(attempt_id, str)
-        or not attempt_id
-        or not isinstance(raw, dict)
-        or not isinstance(raw.get("phase"), str)
-        or not raw.get("phase")
-        or type(raw.get("trial_number")) is not int
-        or raw["trial_number"] < 0
-        or not isinstance(raw.get("generation_id"), str)
-        or not raw.get("generation_id")
-        for attempt_id, raw in locations.items()
-    )
+    return True
 
 
 def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
@@ -1675,15 +1613,6 @@ def _valid_config_dir(value: object) -> TypeGuard[str]:
     :return bool: Whether the value is an absolute path string without NUL.
     """
     return type(value) is str and "\0" not in value and Path(value).is_absolute()
-
-
-def _valid_optional_pid_namespace(value: object) -> TypeGuard[str | None]:
-    """Return whether ``value`` is ``None`` or a PID namespace as phasesweep records it.
-
-    :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or ``pid:[<inode>]@<PID 1 start time>``.
-    """
-    return value is None or is_pid_namespace(value)
 
 
 def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:

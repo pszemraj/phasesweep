@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runs as mcp_runs
+import phasesweep.mcp.tools as mcp_tools
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     PermissionDeniedError,
@@ -97,7 +97,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         return True
 
     monkeypatch.setattr(store, "observe", complete_launch_after_observation)
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", kill_runner)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", kill_runner)
 
     cancelled = app.cancel(pending.run_id)
 
@@ -131,7 +131,7 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
         signalled.append(args)
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", record_kill)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", record_kill)
     assert store.state(handle) == "running"
 
     result = app.cancel("srv-boot")
@@ -160,14 +160,14 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
     )
     store.create(handle)
     monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-    monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_tools, "read_boot_id", lambda: None)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:
         signalled.append((args, kwargs))
         return True
 
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", record_signal)
+    monkeypatch.setattr(mcp_tools, "kill_stale_group", record_signal)
 
     result = app.cancel(handle.run_id)
 
@@ -251,7 +251,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -328,7 +328,7 @@ def test_cancel_cleanup_confirmation_policy(
             )
         return runner_group_gone
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -377,7 +377,7 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
                 )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _index: app.cancel(run_id), range(2)))

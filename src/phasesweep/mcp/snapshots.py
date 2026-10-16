@@ -557,19 +557,7 @@ def capture_result_snapshot(
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
         status=StatusSnapshot.model_validate(
-            {
-                "current_generation_id": status["current_generation_id"],
-                "published_generation_id": status["published_generation_id"],
-                "represented_generation_id": status["represented_generation_id"],
-                "is_published": status["is_published"],
-                "publication_integrity": status["publication_integrity"],
-                "metric": status["metric"],
-                "phases": status["phases"],
-                "summary_present": status["summary_present"],
-                "result_context": status["result_context"],
-                "published_config_matches_current": status["published_config_matches_current"],
-                "result_phase_plan": status["result_phase_plan"],
-            }
+            {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
         ),
         winners=winner_snapshots,
         represented_config_fingerprint=(

@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -781,8 +782,8 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
         """,
     )
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
-        lambda: {"0": "GPU-test-0"},
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([], {"0": "GPU-test-0"}),
     )
     exp = make_experiment(
         experiment="abort_recheck",
@@ -841,30 +842,28 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real execution needs POSIX process groups and flock; dry-run does not."""
+    import sys
+
     from phasesweep.runtime import files as runtime_files
 
-    # macOS reports ``sys.platform == 'darwin'`` but still has POSIX features;
-    # the guard is intentionally feature-based instead of matching platform names.
-    assert runtime_files._supports_posix_runtime_features(
-        os_name="posix",
-        has_killpg=True,
-        has_fcntl=True,
-    )
-    assert not runtime_files._supports_posix_runtime_features(
-        os_name="nt",
-        has_killpg=True,
-        has_fcntl=True,
-    )
-    assert not runtime_files._supports_posix_runtime_features(
-        os_name="posix",
-        has_killpg=False,
-        has_fcntl=True,
-    )
-    assert not runtime_files._supports_posix_runtime_features(
-        os_name="posix",
-        has_killpg=True,
-        has_fcntl=False,
-    )
+    for os_name, has_killpg, has_fcntl in [
+        ("posix", True, True),
+        ("nt", True, True),
+        ("posix", False, True),
+        ("posix", True, False),
+    ]:
+        with monkeypatch.context() as patch:
+            host = SimpleNamespace(name=os_name)
+            if has_killpg:
+                host.killpg = lambda *_args: None
+            patch.setattr(runtime_files, "os", host)
+            if not has_fcntl:
+                patch.setitem(sys.modules, "fcntl", None)
+            if os_name == "posix" and has_killpg and has_fcntl:
+                runtime_files.require_posix_runtime()
+            else:
+                with pytest.raises(RuntimeError, match="requires a POSIX platform"):
+                    runtime_files.require_posix_runtime()
 
     exp = make_experiment(
         experiment="platform_check",
@@ -874,7 +873,7 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
         search_space={"x": IntParam(type="int", low=0, high=1)},
     )
 
-    monkeypatch.setattr(runtime_files, "_supports_posix_runtime_features", lambda: False)
+    monkeypatch.delattr(runtime_files.os, "killpg")
 
     with pytest.raises(RuntimeError, match="requires a POSIX platform"):
         run_experiment(exp)

@@ -1640,6 +1640,37 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
     assert handle.visible_params_at_launch == ["lr"]
 
 
+@pytest.mark.parametrize("field", ["experiment_id", "config_sha256", "started_at", "allow_cancel"])
+def test_runner_refuses_protocol_metadata_that_differs_from_launch_reservation(
+    tmp_path: Path, field: str
+) -> None:
+    """Process identity cannot replace the immutable metadata reserved by the server."""
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-identity-metadata"
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="a" * 64,
+        config_dir=tmp_path,
+        started_at=started_at,
+    )
+    pending = store.get(run_id)
+    assert pending is not None
+
+    with pytest.raises(ValueError, match=field):
+        mcp_runner._persist_spawned_handle(
+            state_dir=tmp_path / "state",
+            run_id=run_id,
+            experiment_id="other" if field == "experiment_id" else "srv",
+            config_sha256="b" * 64 if field == "config_sha256" else "a" * 64,
+            started_at="2026-06-25T00:00:00Z" if field == "started_at" else started_at,
+            allow_cancel=field == "allow_cancel",
+        )
+
+    assert store.get(run_id) == pending
+
+
 @pytest.mark.integration
 def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,

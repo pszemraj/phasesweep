@@ -198,11 +198,6 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
     return ids, uuid_map
 
 
-def _detect_gpu_uuid_map() -> dict[str, str]:
-    """Return the usable index-to-UUID portion of one GPU inventory probe."""
-    return _detect_gpu_inventory()[1]
-
-
 def _detect_mig_uuid_set() -> set[str]:
     """Return MIG instance UUIDs reported by ``nvidia-smi -L``.
 
@@ -247,7 +242,7 @@ def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
     index nor a ``GPU-``/``MIG-`` identity, so accepting one would hand a
     trial an empty visibility set while the real GPUs sit unlocked — the
     opaque-token equivalent of a nonexistent numeric index, which already
-    fails closed in :func:`_resolve_lock_identities`.
+    fails closed in :func:`_bind_lock_identities`.
 
     :param list[GpuDevice] devices: Devices built from configured or ambient tokens.
     :raises GpuConfigurationError: A token is neither numeric nor ``GPU-``/``MIG-`` shaped.
@@ -262,25 +257,6 @@ def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
             "holds no lock for any real GPU. Fix gpu_ids, gpu_devices, or "
             "CUDA_VISIBLE_DEVICES."
         )
-
-
-def _resolve_lock_identities(
-    devices: list[GpuDevice],
-    *,
-    uuid_map: dict[str, str] | None = None,
-) -> list[GpuDevice]:
-    """Bind each device to its canonical physical GPU and drop alias duplicates.
-
-    :param list[GpuDevice] devices: Devices built from configured, ambient, or
-        detected tokens.
-    :param dict[str, str] | None uuid_map: Already-probed index-to-UUID map,
-        when available.
-    :raises GpuConfigurationError: Propagated from
-        :func:`_bind_lock_identities` when the tokens cannot be validated.
-    :return list[GpuDevice]: The devices from :func:`_bind_lock_identities`, deduplicated by lock
-        identity so one physical device is never leased twice in one pool.
-    """
-    return _dedupe_by_lock_identity(_bind_lock_identities(devices, uuid_map=uuid_map))
 
 
 def _bind_lock_identities(
@@ -325,7 +301,7 @@ def _bind_lock_identities(
     mig_tokens = [device for device in devices if device.visible_token[:4].upper() == "MIG-"]
 
     if uuid_map is None and (numeric or gpu_tokens):
-        uuid_map = _detect_gpu_uuid_map()
+        uuid_map = _detect_gpu_inventory()[1]
     uuid_map = uuid_map or {}
     if mig_uuids is None and mig_tokens:
         mig_uuids = _detect_mig_uuid_set()
@@ -626,7 +602,9 @@ class GpuPool:
                 for device in devices
             )
             try:
-                devices = _resolve_lock_identities(devices, uuid_map=detected_uuid_map)
+                devices = _dedupe_by_lock_identity(
+                    _bind_lock_identities(devices, uuid_map=detected_uuid_map)
+                )
             except GpuConfigurationError:
                 if not ambient_cvd:
                     raise

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import stat
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -203,8 +204,6 @@ def _extract_json(
     ctx: TrialContext,
     cfg: JsonExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
     """Read a JSON file in the trial directory and extract a numeric value.
 
@@ -214,8 +213,6 @@ def _extract_json(
             dotted lookup key inside it.
         provenance: Optional sink that receives the frozen evidence ``source``
             payload on success.
-        deadline: Unused; accepted for parity with the shared extractor
-            dispatch signature.
 
     Returns:
         The numeric value at the configured key.
@@ -248,8 +245,6 @@ def _extract_json_envelope(
     ctx: TrialContext,
     cfg: JsonEnvelopeExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
     """Validate and extract an attempt-bound JSON result envelope.
 
@@ -258,8 +253,6 @@ def _extract_json_envelope(
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success.
-    :param float | None deadline: Unused; accepted for parity with the shared
-        extractor dispatch signature.
     :raises ExtractorError: If the envelope is missing, malformed, or belongs to
         another execution attempt.
     :return float: Validated objective value from the envelope.
@@ -358,8 +351,6 @@ def _extract_log_regex(
     ctx: TrialContext,
     cfg: LogRegexExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
     """Scan a log file line-by-line and return the value of a named regex group.
 
@@ -374,8 +365,6 @@ def _extract_log_regex(
             were examined. ``select: "first"`` stops *matching* at the first
             hit but still reads the remaining bytes so the digest always
             covers the full file.
-        deadline: Unused; accepted for parity with the shared extractor
-            dispatch signature.
 
     Returns:
         The selected numeric value across all matches.
@@ -481,8 +470,6 @@ def _capture_wandb(
         UnsafeProcessCleanupError: Worker cleanup is uncertain.
 
     """
-    import time
-
     if ctx.wandb_capture:
         return ctx.wandb_capture
     query = ctx.wandb_query or WandbQuery(
@@ -650,8 +637,6 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :return MlflowCapture: Shared frozen evidence.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
-    import time
-
     from phasesweep.evidence.mlflow import validate_capture
     from phasesweep.tracking.mlflow import request_operation
     from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
@@ -745,19 +730,6 @@ _DISPATCH: dict[type, Callable[..., float]] = {
 }
 
 
-def _remaining_budget_seconds(deadline: float | None) -> float | None:
-    """Return seconds until ``deadline``, or ``None`` when unbounded.
-
-    :param float | None deadline: Absolute ``time.monotonic()`` deadline.
-    :return float | None: Non-negative remaining budget, or ``None``.
-    """
-    if deadline is None:
-        return None
-    import time
-
-    return max(0.0, deadline - time.monotonic())
-
-
 def run_extractor(
     ctx: TrialContext,
     cfg: ObjectiveExtractor,
@@ -802,12 +774,14 @@ def run_extractor(
                 },
             }
         )
-    remaining = _remaining_budget_seconds(deadline)
-    if remaining is not None and remaining <= 0.0:
+    if deadline is not None and not (deadline > time.monotonic()):
         raise DeadlineExceededError(
             "Phase/run wallclock deadline exceeded before evidence extraction."
         )
-    value = fn(ctx, cfg, provenance, deadline=deadline)
+    if isinstance(cfg, WandbExtractor | MlflowExtractor):
+        value = fn(ctx, cfg, provenance, deadline=deadline)
+    else:
+        value = fn(ctx, cfg, provenance)
     if provenance is not None:
         provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value
@@ -1012,7 +986,7 @@ def _wandb_summary_required(
     )
 
 
-_GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
+_GATE_DISPATCH: dict[type, Callable[..., GateResult]] = {
     RequiredFileGate: _required_file,
     JsonEqualsGate: _json_equals,
     JsonScalarBoundGate: _json_scalar_bound,
@@ -1049,8 +1023,7 @@ def evaluate_gates(
             # aborts the whole phase mid-sweep.
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
-        remaining = _remaining_budget_seconds(deadline)
-        if remaining is not None and remaining <= 0.0:
+        if deadline is not None and not (deadline > time.monotonic()):
             results.append(
                 GateResult(
                     gate.type,
@@ -1061,10 +1034,8 @@ def evaluate_gates(
             )
             continue
         results.append(
-            _wandb_summary_required(ctx, gate, deadline=deadline)
-            if isinstance(gate, WandbSummaryRequiredGate)
-            else _mlflow_required(ctx, gate, deadline=deadline)
-            if isinstance(gate, MlflowRequiredGate)
+            fn(ctx, gate, deadline=deadline)
+            if isinstance(gate, WandbSummaryRequiredGate | MlflowRequiredGate)
             else fn(ctx, gate)
         )
     return results

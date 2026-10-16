@@ -295,7 +295,7 @@ def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
     "lease_kind",
     ["directory", "fifo", "live_symlink", "dangling_symlink"],
 )
-def test_malformed_launch_lease_cannot_enable_legacy_orphan_recovery(
+def test_malformed_launch_lease_cannot_authorize_orphan_recovery(
     tmp_path: Path,
     lease_kind: str,
 ) -> None:
@@ -324,7 +324,10 @@ def test_malformed_launch_lease_cannot_enable_legacy_orphan_recovery(
     assert lease.exists() or lease.is_symlink()
 
 
-def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fail_directory_fsync", [False, True], ids=["durable", "fsync-failure"])
+def test_update_allows_only_spawn_transition_and_idempotent_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_directory_fsync: bool
+) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(run_id="exp-1", launch_state="launching")
     spawned = replace(
@@ -338,7 +341,13 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
     )
     store.create(pending)
 
-    store.update(spawned)
+    if fail_directory_fsync:
+        with monkeypatch.context() as patch:
+            patch_directory_fsync_failure(patch, "injected update directory fsync failure")
+            with pytest.raises(OSError, match="update directory fsync failure"):
+                store.update(spawned)
+    else:
+        store.update(spawned)
     store.update(spawned)
 
     assert store.get("exp-1") == spawned
@@ -1004,48 +1013,50 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(
 @pytest.mark.parametrize(
     "payload",
     [
-        [],
-        {"run_id": "other", "returncode": 0},
-        {"run_id": "exp-1", "returncode": "0"},
-        {"run_id": "exp-1", "returncode": True},
-        {"run_id": "exp-1", "returncode": 0},
-        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": None},
-        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": "yes"},
-        {"run_id": "exp-1", "returncode": 0, "error_class": 3},
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "complete"},
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_publication_state": "prepared",
-        },
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_snapshot_state": "pending",
-            "result_snapshot": {},
-            "result_publication_state": "unknown",
-            "result_publication_generation_id": "exp-1",
-        },
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_snapshot_state": "complete",
-            "result_snapshot": {},
-            "result_publication_state": "prepared",
-            "result_publication_generation_id": "exp-1",
-        },
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": "attempt-1"},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": [""]},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_generations": []},
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "recovered_attempt_generations": {"attempt-1": ""},
-        },
-        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": "attempt-1"},
-        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": [""]},
+        pytest.param([], id="not-object"),
+        pytest.param({"run_id": "exp-1", "returncode": 0}, id="missing-cleanup"),
+        *[
+            pytest.param(
+                {**{"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": True}, **changes},
+                id=case,
+            )
+            for case, changes in [
+                ("wrong-run", {"run_id": "other"}),
+                ("string-returncode", {"returncode": "0"}),
+                ("boolean-returncode", {"returncode": True}),
+                ("null-cleanup", {"cleanup_confirmed": None}),
+                ("string-cleanup", {"cleanup_confirmed": "yes"}),
+                ("error-class", {"error_class": 3}),
+                ("snapshot-state", {"result_snapshot_state": "unknown"}),
+                ("missing-snapshot", {"result_snapshot_state": "complete"}),
+                ("missing-publication-generation", {"result_publication_state": "prepared"}),
+                (
+                    "publication-state",
+                    {
+                        "result_snapshot_state": "pending",
+                        "result_snapshot": {},
+                        "result_publication_state": "unknown",
+                        "result_publication_generation_id": "exp-1",
+                    },
+                ),
+                (
+                    "prepared-complete",
+                    {
+                        "result_snapshot_state": "complete",
+                        "result_snapshot": {},
+                        "result_publication_state": "prepared",
+                        "result_publication_generation_id": "exp-1",
+                    },
+                ),
+                ("snapshot-error", {"result_snapshot_error": 3}),
+                ("recovered-ids-type", {"recovered_attempt_ids": "attempt-1"}),
+                ("empty-recovered-id", {"recovered_attempt_ids": [""]}),
+                ("generation-map-type", {"recovered_attempt_generations": []}),
+                ("empty-generation-id", {"recovered_attempt_generations": {"attempt-1": ""}}),
+                ("uncertain-ids-type", {"uncertain_attempt_ids": "attempt-1"}),
+                ("empty-uncertain-id", {"uncertain_attempt_ids": [""]}),
+            ]
+        ],
     ],
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
@@ -1189,97 +1200,45 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
 @pytest.mark.parametrize(
     "payload",
     [
-        [],
-        {"run_id": "other", "cleanup_confirmed": False},
-        {"run_id": "exp-1", "config_sha256": "b" * 64, "cleanup_confirmed": False},
-        {"run_id": "exp-1", "cleanup_confirmed": True},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pid": "123"},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 0},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pid_starttime": True},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 4242},
-        {
-            "run_id": "exp-1",
-            "cleanup_confirmed": False,
-            "pid_starttime": 123,
-        },
-        {
-            "run_id": "exp-1",
-            "cleanup_confirmed": False,
-            "pid": 4242,
-            "pid_starttime": 123,
-        },
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": "",
-            },
-            id="boot_id_empty",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": "malformed",
-            },
-            id="boot_id_malformed",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": 12345,
-            },
-            id="boot_id_integer",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": True,
-            },
-            id="boot_id_boolean",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "",
-            },
-            id="pid_namespace_empty",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "malformed",
-            },
-            id="pid_namespace_malformed",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "pid:[4026539001]",
-            },
-            id="pid_namespace_without_pid_1_start_time",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": 4026531836,
-            },
-            id="pid_namespace_integer",
-        ),
+        pytest.param([], id="not-object"),
+        pytest.param({"run_id": "exp-1", "cleanup_confirmed": False}, id="missing-config-digest"),
+        *[
+            pytest.param(
+                {
+                    **{
+                        "run_id": "exp-1",
+                        "config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cleanup_confirmed": False,
+                    },
+                    **changes,
+                },
+                id=case,
+            )
+            for case, changes in [
+                ("wrong-run", {"run_id": "other"}),
+                (
+                    "wrong-digest",
+                    {
+                        "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    },
+                ),
+                ("cleanup-confirmed", {"cleanup_confirmed": True}),
+                ("pid-type", {"pid": "123"}),
+                ("pgid-zero", {"pgid": 0}),
+                ("starttime-boolean", {"pid_starttime": True}),
+                ("pgid-without-pid", {"pgid": 4242}),
+                ("starttime-without-pid", {"pid_starttime": 123}),
+                ("missing-pgid", {"pid": 4242, "pid_starttime": 123}),
+                ("boot_id_empty", {"boot_id": ""}),
+                ("boot_id_malformed", {"boot_id": "malformed"}),
+                ("boot_id_integer", {"boot_id": 12345}),
+                ("boot_id_boolean", {"boot_id": True}),
+                ("pid_namespace_empty", {"pid_namespace": ""}),
+                ("pid_namespace_malformed", {"pid_namespace": "malformed"}),
+                ("pid_namespace_without_pid_1_start_time", {"pid_namespace": "pid:[4026539001]"}),
+                ("pid_namespace_integer", {"pid_namespace": 4026531836}),
+            ]
+        ],
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:

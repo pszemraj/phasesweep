@@ -6,6 +6,7 @@ import math
 import re
 from pathlib import Path
 from typing import Annotated, TypeAlias, TypeGuard
+from urllib.parse import SplitResult, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -23,6 +24,24 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 #: Validation-context key holding the absolute directory of the config file
 #: being loaded. Relative path fields resolve against it.
 CONFIG_DIR_CONTEXT = "config_dir"
+
+
+def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
+    """Normalize an HTTP(S) endpoint without nonempty credentials, query, or fragment.
+
+    :param SplitResult parsed: Endpoint already parsed by ``urlsplit``.
+    :return str | None: Lowercase scheme and authority with trailing path slashes
+        removed, or ``None`` when the endpoint is invalid.
+    """
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+    ):
+        return None
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )
 
 
 def anchor_relative_path(value: str, info: ValidationInfo) -> str:

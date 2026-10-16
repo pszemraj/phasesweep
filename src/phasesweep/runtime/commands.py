@@ -16,10 +16,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+from pydantic import ConfigDict, TypeAdapter
+from pydantic import JsonValue as PydanticJsonValue
 
 from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
+_FILE_CONFIG_VALUE: TypeAdapter[PydanticJsonValue] = TypeAdapter(
+    PydanticJsonValue,
+    config=ConfigDict(strict=True, allow_inf_nan=False, hide_input_in_errors=True),
+)
 
 # The trainer-input file each ``override_format`` leaves in a trial directory.
 # The trial writer and the evidence verifier both read it; the names are part
@@ -35,20 +41,23 @@ TRAINER_INPUT_FILENAMES: dict[str, str] = {
 class _OverrideValueError(TypeError):
     """A value outside the scalar/list CLI override contract."""
 
-    def __init__(self, fmt: _CliOverrideFormat, value: Any, position: str) -> None:
+    def __init__(self, fmt: _CliOverrideFormat, value: object, position: str) -> None:
         """Describe the exact nested value the selected CLI wire cannot render.
 
         :param _CliOverrideFormat fmt: Selected CLI override grammar.
-        :param Any value: Unsupported value encountered while rendering.
+        :param object value: Unsupported value encountered while rendering.
         :param str position: Nested list position used in the diagnostic.
         """
-        self.value = value
-        self.position = position
         where = f" at position {position}" if position else ""
+        reason = (
+            "Hydra cannot pass literal strings containing '${' interpolation syntax or control characters. "
+            if fmt == "hydra" and isinstance(value, str)
+            else ""
+        )
         super().__init__(
             f"override_format={fmt!r} supports null, booleans, integers, finite "
             f"floats, strings, and lists of those; got{where} "
-            f"{type(value).__name__}: {value!r}. Use the default "
+            f"{type(value).__name__}: {value!r}. {reason}Use the default "
             "override_format='yaml_file' for structured trainer configuration."
         )
 
@@ -129,10 +138,9 @@ def dump_overrides_json(payload: Any) -> str:
 
     :param Any payload: JSON-compatible scalar, list, or string-keyed mapping.
     :return str: Deterministic JSON text.
-    :raises TypeError: A value is outside the JSON data model.
-    :raises ValueError: A value is non-finite or recursive.
+    :raises ValueError: A value is non-finite, recursive, or outside the strict JSON domain.
     """
-    _validate_trainer_config_value(payload, position="JSON overrides")
+    _FILE_CONFIG_VALUE.validate_python(payload)
     return encode_overrides_json(payload)
 
 
@@ -145,34 +153,6 @@ def encode_overrides_json(payload: object) -> str:
     :raises ValueError: A value is non-finite or recursive.
     """
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
-
-
-def dump_json_file_overrides(
-    overrides: dict[str, JsonValue],
-    *,
-    trainer_config: dict[str, JsonValue] | None = None,
-    substitutions: dict[str, str] | None = None,
-) -> str:
-    """Expand dotted keys into the base trainer config and serialize the trainer input.
-
-    :param dict[str, JsonValue] overrides: Resolved overrides.
-    :param dict[str, JsonValue] | None trainer_config: Operator-authored base the
-        overrides are composed into; ``None`` or empty leaves only the overrides.
-    :param dict[str, str] | None substitutions: Runtime placeholders expanded in
-        base-config string values before overrides are applied.
-    :return str: Exact text to write to ``overrides.json``.
-    :raises ValueError: A key collides with another key's namespace, or an
-        override must descend through a non-mapping base value.
-    :raises TypeError: A value cannot be represented as JSON.
-    """
-    for key in overrides:
-        parts = key.split(".")
-        if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
-            raise ValueError(f"Cannot expand override {key!r}: a parent key is also overridden.")
-    base: dict[str, JsonValue] = {} if trainer_config is None else trainer_config
-    if substitutions:
-        base = _substitute_trainer_config_placeholders(base, substitutions)
-    return dump_overrides_json(compose_trainer_config(base, overrides))
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
@@ -197,8 +177,11 @@ def format_argparse(overrides: dict[str, Any]) -> str:
 
 
 def compose_trainer_config(
-    trainer_config: dict[str, Any], overrides: dict[str, Any]
-) -> dict[str, Any]:
+    trainer_config: dict[str, JsonValue],
+    overrides: dict[str, JsonValue],
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> dict[str, JsonValue]:
     """Apply dotted PhaseSweep overrides to a complete trainer configuration.
 
     A dotted key descends through mappings, creating missing mappings as needed.
@@ -206,19 +189,28 @@ def compose_trainer_config(
     complete mapping or list. Descending through an existing non-mapping is an
     error because there is no unambiguous YAML result.
 
-    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
-    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
+    Runtime placeholders expand recursively in base-config strings before
+    overrides apply. Override strings remain literal trainer data.
+
+    :param dict[str, JsonValue] trainer_config: Operator-authored base trainer config.
+    :param dict[str, JsonValue] overrides: Composed inherited, fixed, and sampled values.
+    :param dict[str, str] | None substitutions: Runtime placeholder replacements.
     :raises ValueError: An override path must descend through a non-mapping value.
-    :return dict[str, Any]: Deep-copied complete configuration for one trial.
+    :return dict[str, JsonValue]: Deep-copied complete configuration for one trial.
     """
-    composed = deepcopy(trainer_config)
+    base: dict[str, JsonValue] = (
+        _substitute_trainer_config_placeholders(trainer_config, substitutions)
+        if substitutions
+        else trainer_config
+    )
+    composed = deepcopy(base)
     for key, value in overrides.items():
         current = composed
         parts = key.split(".")
         for index, part in enumerate(parts[:-1]):
             existing = current.get(part)
             if existing is None and part not in current:
-                child: dict[str, Any] = {}
+                child: dict[str, JsonValue] = {}
                 current[part] = child
                 current = child
                 continue
@@ -257,100 +249,6 @@ def _substitute_trainer_config_placeholders(value: Any, substitutions: dict[str,
             for key, item in value.items()
         }
     return value
-
-
-def _validate_trainer_config_value(
-    value: Any,
-    *,
-    position: str = "trainer_config",
-    _ancestors: set[int] | None = None,
-) -> None:
-    """Require deterministic, portable values in a generated trainer YAML.
-
-    :param Any value: Value to validate recursively.
-    :param str position: Human-readable path used in diagnostics.
-    :param set[int] | None _ancestors: Internal recursive-container guard.
-    :raises TypeError: A mapping key is not a string or a value is outside the
-        normal YAML configuration scalar/list/mapping domain.
-    :raises ValueError: A float is non-finite or a container is recursive.
-    """
-    if value is None or isinstance(value, (str, bool, int)):
-        return
-    if isinstance(value, float):
-        if math.isfinite(value):
-            return
-        raise ValueError(f"{position} must be finite; got {value!r}.")
-
-    if not isinstance(value, (dict, list)):
-        raise TypeError(
-            f"{position} has unsupported type {type(value).__name__}: {value!r}. "
-            "Use strings, booleans, integers, finite floats, null, lists, and "
-            "string-keyed mappings; quote YAML dates or timestamps to keep them strings."
-        )
-
-    ancestors = set() if _ancestors is None else _ancestors
-    if id(value) in ancestors:
-        raise ValueError(f"{position} contains a recursive YAML container.")
-    ancestors.add(id(value))
-    try:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if not isinstance(key, str):
-                    raise TypeError(
-                        f"{position} has non-string mapping key {key!r} "
-                        f"({type(key).__name__}). Trainer config keys must be strings."
-                    )
-                child_position = f"{position}.{key}" if position else key
-                _validate_trainer_config_value(
-                    item,
-                    position=child_position,
-                    _ancestors=ancestors,
-                )
-        else:
-            for index, item in enumerate(value):
-                _validate_trainer_config_value(
-                    item,
-                    position=f"{position}[{index}]",
-                    _ancestors=ancestors,
-                )
-    finally:
-        ancestors.remove(id(value))
-
-
-def dump_trainer_config_yaml(payload: dict[str, Any]) -> str:
-    """Serialize one complete trainer config to deterministic safe YAML.
-
-    :param dict[str, Any] payload: Fully composed trainer configuration.
-    :raises TypeError: The payload contains an unsupported value or mapping key.
-    :raises ValueError: The payload contains a non-finite float or recursive container.
-    :return str: Canonical YAML text with keys sorted at every mapping level.
-    """
-    _validate_trainer_config_value(payload)
-    return yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
-
-
-def dump_trial_trainer_config_yaml(
-    trainer_config: dict[str, Any],
-    overrides: dict[str, Any],
-    *,
-    substitutions: dict[str, str] | None = None,
-) -> str:
-    """Serialize the complete trainer YAML consumed by one trial.
-
-    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
-    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
-    :param dict[str, str] | None substitutions: Runtime placeholders expanded
-        recursively in base-config string values before overrides are applied.
-    :raises TypeError: The complete config contains an unsupported YAML value.
-    :raises ValueError: Override composition or YAML validation fails.
-    :return str: Exact UTF-8 text for ``trainer_config.yaml``.
-    """
-    base = (
-        trainer_config
-        if not substitutions
-        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
-    )
-    return dump_trainer_config_yaml(compose_trainer_config(base, overrides))
 
 
 def flatten_trainer_config(mapping: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
@@ -399,38 +297,6 @@ def _flatten_into(
             flat[path] = value
 
 
-def merged_cli_overrides(
-    trainer_config: dict[str, JsonValue],
-    overrides: dict[str, JsonValue],
-    *,
-    substitutions: dict[str, str] | None = None,
-) -> dict[str, JsonValue]:
-    """Merge the base trainer config and the overrides into one flat mapping.
-
-    The base is the lowest-priority layer, as in ``yaml_file``: placeholders in
-    its strings expand, overrides apply at their dotted paths, and the result is
-    flattened to dotted keys. Without a base the overrides pass through in
-    their own order.
-
-    :param dict[str, JsonValue] trainer_config: Operator-authored base trainer config.
-    :param dict[str, JsonValue] overrides: Composed inherited, fixed, and sampled values.
-    :param dict[str, str] | None substitutions: Runtime placeholders expanded in
-        base-config string values before overrides are applied.
-    :raises TypeError: A base mapping key is not a string.
-    :raises ValueError: An override must descend through a non-mapping base
-        value, or two paths flatten to one dotted key.
-    :return dict[str, JsonValue]: Dotted key to value for an argparse or hydra command.
-    """
-    if not trainer_config:
-        return dict(overrides)
-    base = (
-        trainer_config
-        if not substitutions
-        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
-    )
-    return flatten_trainer_config(compose_trainer_config(base, overrides))
-
-
 def compose_trainer_input(
     trainer_config: dict[str, JsonValue],
     overrides: dict[str, JsonValue],
@@ -442,27 +308,55 @@ def compose_trainer_input(
 
     File formats return their exact serialized text. CLI formats return the
     flattened values, preserving their order and their renderer's validation
-    and diagnostic policy. Runtime placeholders expand before overrides apply.
+    and diagnostic policy. An empty CLI base passes overrides through in their
+    original order, including tuple values supported by the CLI renderers.
+    Runtime placeholders expand in base strings before overrides apply.
 
     :param dict[str, JsonValue] trainer_config: Base trainer configuration.
     :param dict[str, JsonValue] overrides: Fully composed trial overrides.
     :param str fmt: One of the four supported override formats.
     :param dict[str, str] | None substitutions: Runtime placeholder replacements.
-    :raises ValueError: The format is unknown or configuration paths collide.
-    :raises TypeError: A file value cannot be serialized in its selected format.
-    :return str | dict[str, JsonValue]: File text or merged CLI values.
+    :raises ValueError: The format is unknown, configuration paths collide, or
+        a file value is outside the finite JSON domain.
+    :return str | dict[str, JsonValue]: Deterministic file text, or merged CLI values.
     """
-    if fmt == "yaml_file":
-        return dump_trial_trainer_config_yaml(
-            trainer_config, overrides, substitutions=substitutions
-        )
+    if fmt not in ("yaml_file", "json_file", "argparse", "hydra"):
+        raise ValueError(f"Unknown override_format: {fmt}")
+    if fmt in ("argparse", "hydra") and not trainer_config:
+        return dict(overrides)
     if fmt == "json_file":
-        return dump_json_file_overrides(
-            overrides, trainer_config=trainer_config, substitutions=substitutions
-        )
-    if fmt in ("argparse", "hydra"):
-        return merged_cli_overrides(trainer_config, overrides, substitutions=substitutions)
-    raise ValueError(f"Unknown override_format: {fmt}")
+        for key in overrides:
+            parts = key.split(".")
+            if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
+                raise ValueError(
+                    f"Cannot expand override {key!r}: a parent key is also overridden."
+                )
+    composed = compose_trainer_config(trainer_config, overrides, substitutions=substitutions)
+    if fmt == "yaml_file":
+        _FILE_CONFIG_VALUE.validate_python(composed)
+        return yaml.safe_dump(composed, sort_keys=True, allow_unicode=True)
+    if fmt == "json_file":
+        return dump_overrides_json(composed)
+    return flatten_trainer_config(composed)
+
+
+def trial_substitutions(
+    trial_dir: Path, trial_id: int, phase: str, run_name: str
+) -> dict[str, str]:
+    """Return the literal runtime bindings used in base trainer-config strings.
+
+    :param Path trial_dir: Trial directory, kept as literal text inside replacements.
+    :param int trial_id: Optuna trial number.
+    :param str phase: Phase name.
+    :param str run_name: Attempt-specific trainer run name.
+    :return dict[str, str]: The four runtime placeholder bindings.
+    """
+    return {
+        "{trial_dir}": str(trial_dir),
+        "{trial_id}": str(trial_id),
+        "{phase}": phase,
+        "{run_name}": run_name,
+    }
 
 
 def render_command(
@@ -518,12 +412,7 @@ def render_command(
     config_path = ""
     overrides_path = ""
     base = {} if trainer_config is None else trainer_config
-    config_substitutions = {
-        "{trial_dir}": str(trial_dir),
-        "{trial_id}": str(trial_id),
-        "{phase}": phase,
-        "{run_name}": run_name,
-    }
+    config_substitutions = trial_substitutions(trial_dir, trial_id, phase, run_name)
     if fmt in ("yaml_file", "json_file"):
         if materialized_input_path is None:
             compose_trainer_input(base, overrides, fmt, substitutions=config_substitutions)

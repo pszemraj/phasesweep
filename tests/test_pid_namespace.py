@@ -14,9 +14,9 @@ import pytest
 
 import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.registry as mcp_registry
-import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
+import phasesweep.mcp.tools as mcp_tools
 import phasesweep.runtime.reaper as reaper
 from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.mcp.audit import AuditLogger
@@ -756,7 +756,7 @@ def test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run(
 ) -> None:
     """The absence proof is not monotonic, so only recover-run settles, and its status outlives any later proof."""
     app, registry, store, handle, proc = _stage_absent_run(tmp_path, monkeypatch)
-    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_run_control, reaper)
+    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_tools, reaper)
 
     first = app.status(run_id=handle.run_id)["run"]
     _add_runner_blocker(proc, handle)
@@ -852,7 +852,7 @@ def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
     app, registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, allow_cancel=True)
     audit_path = registry.state_dir / "audit.jsonl"
     app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
-    _forbid_run_signals(monkeypatch, mcp_run_control)
+    _forbid_run_signals(monkeypatch, mcp_tools)
 
     with pytest.raises(RunNamespaceMismatchError, match="PID namespace") as caught:
         app.cancel(handle.run_id)
@@ -876,7 +876,7 @@ def test_cancel_of_an_absent_runner_signals_nothing(
         tmp_path, monkeypatch, allow_cancel=True
     )
     write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
-    _forbid_run_signals(monkeypatch, mcp_run_control)
+    _forbid_run_signals(monkeypatch, mcp_tools)
 
     result = app.cancel(handle.run_id)
 
@@ -916,7 +916,7 @@ def test_recover_run_settles_an_absent_runner_without_signalling(
     _app, registry, store, handle, _proc = _stage_absent_run(
         tmp_path, monkeypatch, cleanup_uncertain=True
     )
-    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_run_control, reaper)
+    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_tools, reaper)
     monkeypatch.setattr(
         mcp_recovery,
         "is_same_live_process",
@@ -945,9 +945,9 @@ def test_spawn_refuses_unreadable_pid_namespace_before_popen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, app, _registry, store = side_effect_app(tmp_path)
-    monkeypatch.setattr(mcp_run_control, "read_pid_namespace", lambda: None)
+    monkeypatch.setattr(mcp_tools, "read_pid_namespace", lambda: None)
     monkeypatch.setattr(
-        "phasesweep.mcp.run_control.subprocess.Popen",
+        "phasesweep.mcp.tools.subprocess.Popen",
         lambda *_args, **_kwargs: pytest.fail("no child may exist without a recorded namespace"),
     )
 
@@ -977,7 +977,7 @@ def test_runner_receipt_from_another_namespace_is_refused(
     _config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
     monkeypatch.setattr("tests.mcp_helpers.read_pid_namespace", lambda: RECORDED)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
 
     with pytest.raises(RuntimeError, match="did not match"):
         app.launch("srv")

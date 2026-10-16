@@ -1581,9 +1581,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
     assert store.cleanup_recovery_path(run_id).is_file()
     assert store.cleanup_uncertain_path(run_id).is_file()
-    monkeypatch.setattr(
-        "phasesweep.mcp.run_control.kill_stale_group", lambda *_args, **_kwargs: True
-    )
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", lambda *_args, **_kwargs: True)
     cancelled = app.cancel(run_id)
     assert cancelled["state"] == "running"
     assert cancelled["recovery_required"] is True

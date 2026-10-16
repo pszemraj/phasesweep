@@ -23,9 +23,8 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
-from phasesweep.mcp.run_control import _runner_protocol_argv
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
@@ -641,7 +640,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         captured["env"] = kwargs.get("env")
         return DummyProc()
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("phasesweep.mcp.tools.subprocess.Popen", fake_popen)
     return captured
 
 
@@ -649,7 +648,7 @@ def record_runner_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     *,
     confirmed: bool = True,
-    module: str = "phasesweep.mcp.run_control",
+    module: str = "phasesweep.mcp.tools",
 ) -> list[tuple[int | None, int | None, int | None]]:
     """Replace ``kill_stale_group`` with a stub that records the identity it is asked to clean up.
 

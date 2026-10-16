@@ -26,7 +26,6 @@ from phasesweep.runtime.gpu import (
     GpuLeaseTimeoutError,
     GpuPool,
     _detect_gpu_inventory,
-    _detect_gpu_uuid_map,
     _gpu_lock_path,
     _try_host_gpu_lease,
 )
@@ -35,23 +34,19 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown, _shutdown_handler
 
 # Bound before any monkeypatching so live tests can restore the real probe.
 _real_detect_gpu_inventory = _detect_gpu_inventory
-_real_detect_gpu_uuid_map = _detect_gpu_uuid_map
 _TEST_UUID_MAP = {str(index): f"GPU-test-{index}" for index in range(16)}
 
 
 @pytest.fixture(autouse=True)
-def deterministic_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default every test to a deterministic ``nvidia-smi`` UUID map.
+def deterministic_gpu_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep autodetection CPU-only while explicit GPU indices resolve deterministically.
 
-    Canonical lock identity is resolved from that map, so without this stub
-    the fixed device indices used throughout this file would resolve
-    differently — or fail closed as nonexistent — depending on which GPUs the
-    test host happens to have. Tests that exercise resolution re-patch the
-    probe themselves.
+    Tests that exercise inventory discovery replace this probe or restore the
+    real one.
     """
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
-        lambda: dict(_TEST_UUID_MAP),
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([], dict(_TEST_UUID_MAP)),
     )
 
 
@@ -98,7 +93,7 @@ def test_gpu_pool_normalizes_and_deduplicates_device_tokens(
     expected_tokens: list[str],
 ) -> None:
     """Equivalent device spellings become one canonical pool device."""
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
     if ambient_tokens is None:
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     else:
@@ -283,7 +278,7 @@ def test_ambient_cuda_visibility_fails_when_nvidia_smi_is_broken_on_gpu_host(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
     with pytest.raises(GpuConfigurationError, match="could not enumerate GPUs.*double-book"):
@@ -325,7 +320,7 @@ def test_single_job_uses_numeric_cuda_visible_devices(monkeypatch):
 def test_nonnumeric_cuda_visible_devices_is_leased_as_opaque_token(monkeypatch):
     uuid = "GPU-deadbeef"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", uuid)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     pool = GpuPool.create(n_jobs=1)
     with pool.acquire() as gid:
@@ -367,7 +362,7 @@ def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> N
     """Pool locks follow the trainer's configured environment override."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": "GPU-configured"}
+        "phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": "GPU-configured"})
     )
 
     pool = GpuPool.create(n_jobs=1, cuda_visible_devices="GPU-configured")
@@ -377,7 +372,9 @@ def test_configured_cuda_visibility_overrides_ambient_for_pool(monkeypatch) -> N
 
 
 def test_explicit_gpu_devices_preserve_tokens_and_dedupe(monkeypatch):
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": "GPU-a"})
+    monkeypatch.setattr(
+        "phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": "GPU-a"})
+    )
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: {"MIG-GPU-b/1/0"})
     pool = GpuPool.create(
         n_jobs=2,
@@ -524,7 +521,7 @@ def test_numeric_index_and_uuid_token_lock_the_same_physical_gpu(tmp_path, monke
     """gpu_ids=[0] and the UUID of GPU 0 must contend for one host lock, not two."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     by_index = GpuPool.create(n_jobs=1, explicit_ids=[0])
     by_uuid = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
@@ -564,7 +561,7 @@ def test_ambient_uuid_and_configured_index_share_one_lock(tmp_path, monkeypatch)
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     uuid = "GPU-deadbeef"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", uuid)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     ambient = GpuPool.create(n_jobs=1)
     configured = GpuPool.create(n_jobs=1, explicit_ids=[0])
@@ -582,7 +579,7 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
     """MIG instances lock on themselves; parent-GPU binding is a documented gap."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     uuid = "GPU-deadbeef"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
     mig_token = "MIG-GPU-deadbeef/3/0"
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: {mig_token})
 
@@ -631,7 +628,7 @@ def test_unreadable_uuid_map_rejects_unverified_tokens(
     policy: GpuPolicy,
 ) -> None:
     """Unverified numeric and opaque GPU tokens fail closed, not silently."""
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
 
     with pytest.raises(RuntimeError, match=error_match):
         GpuPool.create(
@@ -646,8 +643,8 @@ def test_unreadable_uuid_map_rejects_unverified_tokens(
 def test_unknown_numeric_index_fails_closed(monkeypatch) -> None:
     """A configured index nvidia-smi does not report is a nonexistent device."""
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
-        lambda: {"0": "GPU-deadbeef"},
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([], {"0": "GPU-deadbeef"}),
     )
 
     with pytest.raises(RuntimeError, match="index 3 does not exist"):
@@ -658,8 +655,8 @@ def test_resolved_uuid_lock_names_stay_path_safe(tmp_path, monkeypatch) -> None:
     """A resolved identity is sanitized and hashed exactly like an opaque token."""
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
-        lambda: {"0": "GPU-dead/beef:0"},
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([], {"0": "GPU-dead/beef:0"}),
     )
 
     pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
@@ -703,7 +700,7 @@ def test_uuid_spellings_share_the_full_uuid_lock(tmp_path, monkeypatch, spelling
     """CUDA UUID prefixes and lowercase full UUIDs share the full UUID's lock."""
     uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     spelled_pool = GpuPool.create(n_jobs=1, explicit_devices=[spelling])
     index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
@@ -756,7 +753,7 @@ def test_whole_node_rejects_physical_gpu_aliases(
     error_match: str,
 ) -> None:
     """Whole-node mode fails closed when tokens name one physical GPU."""
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     with pytest.raises(RuntimeError, match=error_match):
         GpuPool.create(n_jobs=1, explicit_devices=tokens, policy="whole_node")
@@ -765,7 +762,7 @@ def test_whole_node_rejects_physical_gpu_aliases(
 @pytest.mark.parametrize("prefix", ["GPU-", "MIG-"])
 def test_nonexistent_uuid_token_fails_closed(prefix: str, monkeypatch) -> None:
     token = f"{prefix}00000000-0000-0000-0000-000000000000"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: set())
 
     with pytest.raises(RuntimeError, match="no usable (?:GPU UUID|MIG)|matches no device"):
@@ -949,8 +946,7 @@ def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
         "phasesweep.runtime.gpu._detect_gpu_inventory",
         _real_detect_gpu_inventory,
     )
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", _real_detect_gpu_uuid_map)
-    uuid_map = _real_detect_gpu_uuid_map()
+    uuid_map = _real_detect_gpu_inventory()[1]
     if not uuid_map:
         pytest.skip("nvidia-smi is installed but reports no CUDA devices")
 
@@ -1073,7 +1069,7 @@ def test_single_per_trial_still_accepts_duplicate_device_tokens() -> None:
 
 def test_whole_node_accepts_distinct_physical_gpus(monkeypatch) -> None:
     uuid_map = {"0": "GPU-aaa11111", "1": "GPU-bbb22222"}
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: uuid_map)
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], uuid_map))
 
     pool = GpuPool.create(n_jobs=1, explicit_devices=["0", "1"], policy="whole_node")
 
@@ -1094,8 +1090,8 @@ def test_whole_node_rejects_multi_device_worlds_containing_mig(
 ) -> None:
     """MIG enumeration cannot guarantee that token count equals CUDA device count."""
     monkeypatch.setattr(
-        "phasesweep.runtime.gpu._detect_gpu_uuid_map",
-        lambda: {"1": "GPU-bbb22222"},
+        "phasesweep.runtime.gpu._detect_gpu_inventory",
+        lambda: ([], {"1": "GPU-bbb22222"}),
     )
     monkeypatch.setattr(
         "phasesweep.runtime.gpu._detect_mig_uuid_set",
@@ -1110,7 +1106,7 @@ def test_single_per_trial_still_dedupes_aliased_tokens_with_a_warning(monkeypatc
     """The same alias pair that fails closed under whole_node stays a pool
     convenience under single_per_trial."""
     uuid = "GPU-32ad40d6-019f-386a-321d-3901216c78ad"
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {"0": uuid}))
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
         pool = GpuPool.create(n_jobs=1, explicit_devices=["0", uuid])

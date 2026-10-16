@@ -290,7 +290,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.server_name == "phasesweep"
     assert initialization.server_version == __version__
-    assert initialization.instructions == agent_prompt_text(strip=True)
+    assert initialization.instructions == agent_prompt_text()
     for safety_contract in (
         "When `recovery_required` is true, stop",
         "When `publication_integrity` is `failed`, stop",

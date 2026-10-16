@@ -16,10 +16,9 @@ MCP_EXTRA_INSTALL_COMMAND = 'pip install "phasesweep[mcp]"'
 
 
 @functools.cache
-def agent_prompt_text(*, strip: bool = False) -> str:
+def agent_prompt_text() -> str:
     """Return the canonical packaged instructions for agents using the MCP server.
 
-    :param bool strip: Remove leading and trailing whitespace for MCP prompt responses.
     :return str: Contents of the packaged ``agent_prompt.md`` resource.
     """
     text = (
@@ -27,4 +26,4 @@ def agent_prompt_text(*, strip: bool = False) -> str:
         .joinpath("agent_prompt.md")
         .read_text(encoding="utf-8")
     )
-    return text.strip() if strip else text
+    return text.strip()

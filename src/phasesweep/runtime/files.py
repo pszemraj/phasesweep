@@ -101,42 +101,12 @@ def require_posix_runtime() -> None:
         ``os.killpg``/``fcntl``, so process groups and ``flock`` are
         unavailable.
     """
-    if not _supports_posix_runtime_features():
+    if os.name != "posix" or not hasattr(os, "killpg"):
         raise PlatformCapabilityError(POSIX_RUNTIME_ERROR)
-
-
-def _supports_posix_runtime_features(
-    *,
-    os_name: str | None = None,
-    has_killpg: bool | None = None,
-    has_fcntl: bool | None = None,
-) -> bool:
-    """Return whether the runtime has the Unix features phasesweep needs.
-
-    :param str | None os_name: Optional `os.name` override for tests.
-    :param bool | None has_killpg: Optional `os.killpg` availability override.
-    :param bool | None has_fcntl: Optional `fcntl` import availability override.
-    :return bool: Whether execution can rely on POSIX process groups and `flock`.
-    """
-    if os_name is None:
-        os_name = os.name
-    if has_killpg is None:
-        has_killpg = hasattr(os, "killpg")
-    if has_fcntl is None:
-        has_fcntl = _fcntl_available()
-    return os_name == "posix" and has_killpg and has_fcntl
-
-
-def _fcntl_available() -> bool:
-    """Return whether the Unix ``fcntl`` module can be imported.
-
-    :return bool: `True` when `fcntl` is importable in the current interpreter.
-    """
     try:
         import fcntl  # noqa: F401
     except ImportError:
-        return False
-    return True
+        raise PlatformCapabilityError(POSIX_RUNTIME_ERROR) from None
 
 
 def xdg_home(variable: str, fallback: Path) -> Path:
@@ -995,6 +965,7 @@ def _private_atomic_writer(
     path: Path,
     *,
     require_private_dir: bool = True,
+    strict_dir_fsync: bool = False,
 ) -> Iterator[IO[str]]:
     """Write to a private temporary file, then atomically replace a validated destination.
 
@@ -1006,7 +977,7 @@ def _private_atomic_writer(
     see :func:`_validate_private_destination`), and the temporary file is
     renamed onto ``path`` with :func:`os.replace` — atomic because both
     names resolve relative to the same open parent directory descriptor.
-    The parent directory is then best-effort ``fsync``ed. If the caller's
+    The parent directory is then ``fsync``ed under the selected failure policy. If the caller's
     block raises, or if any step before the rename fails, the temporary
     file is unlinked and ``path`` is left untouched.
 
@@ -1019,6 +990,8 @@ def _private_atomic_writer(
         note in ``docs/runtime.md``). The file is created ``0600`` and an
         existing destination is still refused unless it is a private, unshared
         regular file, either way.
+    :param bool strict_dir_fsync: Raise on directory-fsync failure after replacement.
+    :raises OSError: Staging or replacement failed, or strict directory fsync failed.
     :return Iterator[IO[str]]: Writable text handle on the temporary file,
         open for the caller to populate before the atomic replace.
     """
@@ -1042,6 +1015,8 @@ def _private_atomic_writer(
         try:
             os.fsync(parent_fd)
         except OSError:
+            if strict_dir_fsync:
+                raise
             log.warning(
                 "Directory fsync failed after a private atomic write in %s; the write is "
                 "committed but its durability across a crash is uncertain.",
@@ -1055,7 +1030,9 @@ def _private_atomic_writer(
         os.close(parent_fd)
 
 
-def private_atomic_write_text(path: Path, text: str, *, require_private_dir: bool = True) -> None:
+def private_atomic_write_text(
+    path: Path, text: str, *, require_private_dir: bool = True, strict_dir_fsync: bool = False
+) -> None:
     """Atomically replace a private UTF-8 text file.
 
     :param Path path: Destination path to replace.
@@ -1063,8 +1040,12 @@ def private_atomic_write_text(path: Path, text: str, *, require_private_dir: boo
     :param bool require_private_dir: Whether the destination directory must be
         owner-only too; pass ``False`` to write an owner-only file into an
         operator-trusted directory such as a trial directory.
+    :param bool strict_dir_fsync: Raise on directory-fsync failure after replacement.
+    :raises OSError: Writing failed; a strict directory-fsync failure leaves the replacement published.
     """
-    with _private_atomic_writer(path, require_private_dir=require_private_dir) as handle:
+    with _private_atomic_writer(
+        path, require_private_dir=require_private_dir, strict_dir_fsync=strict_dir_fsync
+    ) as handle:
         handle.write(text)
 
 
@@ -1217,33 +1198,6 @@ def local_storage_url(path: Path) -> str:
     return f"journal:///file:{quote(str(path.resolve()), safe='/')}?uri=true"
 
 
-def storage_backend(storage: str | None) -> str | None:
-    """Return the logical backend name for an Optuna storage URL.
-
-    Args:
-        storage: An Optuna storage URL (e.g. ``"journal:///x.journal"`` or
-            ``"postgresql://host/db"``), or ``None`` for in-memory storage.
-
-    Returns:
-        The URL's scheme with any ``+dialect`` suffix removed (e.g.
-        ``"journal"``, ``"postgresql"``), or ``None`` if ``storage`` is
-        ``None``.
-
-    Examples:
-        >>> storage_backend("journal:///x.journal")
-        'journal'
-        >>> storage_backend("postgresql://h/db")
-        'postgresql'
-        >>> storage_backend(None) is None
-        True
-
-    """
-    if storage is None:
-        return None
-    scheme = storage.split(":", 1)[0].lower()
-    return scheme.split("+", 1)[0]
-
-
 def file_url_path(storage: str) -> str:
     """Return the filesystem path component of a phasesweep file-style URL.
 
@@ -1268,7 +1222,7 @@ def file_url_path(storage: str) -> str:
         belong to URL grammar.
 
     """
-    rest = storage.split(":", 1)[1]
+    scheme, rest = storage.split(":", 1)
 
     if rest.startswith("////"):
         # POSIX absolute file path. The fourth slash IS the root ``/``.
@@ -1290,7 +1244,7 @@ def file_url_path(storage: str) -> str:
     # Auto journal storage uses an escaped file: URI convention. Ordinary
     # explicit journal paths keep their literal spelling.
     if (
-        storage_backend(storage) == "journal"
+        scheme.lower() == "journal"
         and path.startswith("file:")
         and options.get("uri") in {"1", "true", "yes", "on"}
     ):
@@ -1316,7 +1270,7 @@ def journal_file_path(storage: str) -> Path:
     :raises ValueError: ``storage`` does not name a journal file.
     :return Path: The journal file, with ``~`` expanded and symlinks resolved.
     """
-    backend = storage_backend(storage)
+    backend = storage.split(":", 1)[0].lower()
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     return Path(file_url_path(storage)).expanduser().resolve()
