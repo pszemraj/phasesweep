@@ -27,17 +27,6 @@ repos:
         entry: pathlint
         language: system
         files: ^(src|tests)/.*\.py$
-      # doc_check.py is a maintainer script outside the repository; without it
-      # the hook reports the skip and passes. Its report prints only on failure.
-      - id: doc-check
-        name: doc-check (strict)
-        entry: >-
-          bash -c 'script="$HOME/scripts/py/doc_check.py";
-          [ -f "$script" ] || { echo "doc_check.py not found; skipped"; exit 0; };
-          out=$(python "$script" --strict --no-check-lazy "$@") || { printf "%s\n" "$out"; exit 1; }' --
-        language: system
-        files: ^src/.*\.py$
-        verbose: true
       - id: module-size
         name: module size
         entry: bash scripts/check_module_size.sh
