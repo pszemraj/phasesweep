@@ -1013,7 +1013,7 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
 ) -> None:
     """The real sync retires a tracking entry in any generation scope, with its proof kept."""
     pytest.importorskip("mlflow")
-    from tests.test_mlflow_terminal_delivery import _remote_example
+    from tests.tracking_helpers import _remote_example
 
     config, _uploads = _remote_example(tmp_path, monkeypatch)
     config["storage"] = "journal:///" + str(tmp_path / "study.journal")
@@ -1066,7 +1066,7 @@ def test_sync_tracking_finishes_an_attempt_whose_cleanup_recover_run_confirmed(
     rewrites the trial, so the ledger is the only place sync can see the confirmation.
     """
     pytest.importorskip("mlflow")
-    from tests.test_mlflow_terminal_delivery import (
+    from tests.tracking_helpers import (
         _leave_cleanup_uncertain_attempt,
         _remote_example,
     )

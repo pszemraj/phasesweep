@@ -60,6 +60,7 @@ from tests.conftest import (
     write_constant_trainer,
 )
 from tests.ledger_fixtures import (
+    append_journal_tail,
     materialize,
     tree_snapshot,
 )
@@ -617,9 +618,7 @@ def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: s
         materialized = materialize("current-journal", tmp_path / label, mode="tree")
         experiment = materialized.experiment
         journal = materialized.ledger_path
-        complete = journal.read_bytes()
-        damaged = complete + _PARTIAL_FINAL_RECORDS[damage]
-        journal.write_bytes(damaged)
+        complete, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS[damage])
         return experiment, journal, complete, damaged
 
     def assert_repaired(journal: Path, complete: bytes, damaged: bytes) -> None:
@@ -663,8 +662,7 @@ def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
 
     real_acquire = engine_ledger._JournalLock.acquire
 
@@ -725,8 +723,7 @@ def test_repair_waits_for_a_journal_lock_another_writer_holds(
     """A journal lock held when the repair starts is awaited, then taken, not refused on sight."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     holder = engine_ledger._JournalLock(journal)
     holder.acquire()
     ledger = validate_ledger(materialized.experiment)
@@ -748,8 +745,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
     """Repair refuses bounded contention without releasing the writer's inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
-    journal.write_bytes(damaged)
+    _, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     holder = engine_ledger._JournalLock(journal)
     holder.acquire()
     ledger = validate_ledger(materialized.experiment)
@@ -806,8 +802,7 @@ def test_journal_writers_and_repair_lock_the_journals_real_path(
     monkeypatch.setattr(engine_ledger._JournalLock, "acquire", recording_acquire)
 
     optuna.create_study(study_name="s", storage=engine_ledger._resolve_storage(url))
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     engine_ledger._repair_incomplete_journal_record(url)
 
     assert acquired == [(journal, None), (journal, engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)]
@@ -831,8 +826,7 @@ def test_repair_through_a_symlink_alias_is_excluded_by_the_real_names_writer(
         study_name="s", storage=engine_ledger._resolve_storage(f"journal:///{real}")
     )
     alias.symlink_to(real)
-    in_flight = real.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
-    real.write_bytes(in_flight)
+    _, in_flight = append_journal_tail(real, _PARTIAL_FINAL_RECORDS["torn"])
     holder = engine_ledger._JournalLock(real)
     holder.acquire()
     _manual_lock_clock(monkeypatch)
@@ -854,8 +848,7 @@ def test_repair_truncates_only_while_holding_the_journal_lock(
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     real_truncate = engine_ledger._truncate_incomplete_journal_record
 
     def truncate_while_locked(lock: engine_ledger._JournalLock) -> tuple[Path, int] | None:
@@ -903,9 +896,7 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
     """Repair detects pathname replacement and never releases the successor's inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
-    journal.write_bytes(damaged)
+    complete, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     successor: list[engine_ledger._JournalLock] = []
 
     if taken_over == "before truncation":
@@ -950,8 +941,7 @@ def test_waiting_optuna_writer_never_takes_over_a_long_repairs_journal_lock(
     """A writer has no timeout or stale takeover while a repair holds the journal inode."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     monkeypatch.setattr(engine_ledger, "_JOURNAL_LOCK_WAIT_SECONDS", 0.01)
     waiter_lock = engine_ledger._JournalLock(journal)
     waiter_holds = threading.Event()
@@ -985,8 +975,7 @@ def test_journal_kernel_lock_is_released_when_its_owner_dies(tmp_path: Path) -> 
     """A killed writer leaves repair free to acquire its journal without stale-lock cleanup."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    complete, _ = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     worker = (
         "import signal,sys; from pathlib import Path; "
         "from phasesweep.engine.ledger import _JournalLock; "
@@ -1088,9 +1077,7 @@ def test_journal_hard_link_names_share_lock_and_repair(
     """Hard-linked journal names contend for the same inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
-    journal.write_bytes(damaged)
+    complete, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     alias = tmp_path / "other-name.journal"
     os.link(journal, alias)
     holder = engine_ledger._JournalLock(alias)
@@ -1121,9 +1108,7 @@ def test_repair_refuses_a_journal_that_grew_under_its_lock(
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
-    journal.write_bytes(damaged)
+    _, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     appended = b'{"op_code": 0}\n'
 
     real_fsync_directory = engine_ledger.fsync_directory
@@ -1153,9 +1138,7 @@ def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
     """Failure to open the journal for locking or create its backup preserves every byte."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    complete = journal.read_bytes()
-    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
-    journal.write_bytes(damaged)
+    _, damaged = append_journal_tail(journal, _PARTIAL_FINAL_RECORDS["torn"])
     ledger = validate_ledger(materialized.experiment)
     lock = engine_ledger._JournalLock(journal)
     if step == "backup":

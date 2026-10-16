@@ -9,7 +9,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from pathlib import Path
 
 import pytest
 import yaml
@@ -37,8 +36,7 @@ from phasesweep.config.reference import (
 )
 from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
 from phasesweep.runtime.json import JsonObject
-
-REPO = Path(__file__).resolve().parent.parent
+from tests.conftest import REPO
 
 
 def _type_signature(node: JsonObject) -> str:

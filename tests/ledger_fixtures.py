@@ -37,6 +37,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from phasesweep.runtime.json import JsonObject
 from tests.fixtures.make_ledger_fixtures import (
     FIXTURE_ENVIRONMENT,
     LEDGER_FILENAME,
@@ -51,6 +52,14 @@ LEDGER_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "ledgers"
 #: points the same ledger at a workdir that has never existed, which is what a
 #: fresh checkout reading an inherited ledger actually looks like.
 LEDGER_MODES = ("tree", "ledger-only")
+
+
+def append_journal_tail(path: Path, tail: bytes) -> tuple[bytes, bytes]:
+    """Append caller-supplied bytes and return the complete and damaged journal contents."""
+    complete = path.read_bytes()
+    damaged = complete + tail
+    path.write_bytes(damaged)
+    return complete, damaged
 
 
 #: One snapshot entry: ``st_mode`` file-type and permission bits, then the
@@ -359,6 +368,19 @@ def published_generation_id(
     return pointer.generation_id if pointer.state == "ok" else None
 
 
+def golden_publication(tmp_path: Path) -> tuple[Experiment, str]:
+    """Copy the golden one-generation publication for a test that needs a tree, not a sweep.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return tuple[Experiment, str]: The experiment reading the copy and its
+        published generation id.
+    """
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    return experiment, generation_id
+
+
 def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     """Point a publication pointer at ``summary_path``'s exact bytes."""
     pointer = yaml.safe_load(pointer_path.read_text())
@@ -366,6 +388,41 @@ def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     pointer["summary_size_bytes"] = len(content)
     pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
     pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+
+def reseal_winner(
+    experiment: Experiment,
+    generation_id: str,
+    winner: JsonObject,
+    *,
+    mirror_summary: bool = False,
+) -> None:
+    """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
+
+    The hashes then match, so only payload validation can refuse the winner.
+
+    :param Experiment experiment: Experiment whose golden publication is rewritten.
+    :param str generation_id: Published generation holding the winner.
+    :param JsonObject winner: Replacement winner payload for phase ``p``.
+    :param bool mirror_summary: Also write the winner's ``winner_source`` into the
+        summary's own per-phase copy, so the two copies agree and the summary
+        cross-check cannot be the reason the winner is refused.
+    """
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    artifact = next(
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    if mirror_summary:
+        winner_source = winner["winner_source"]
+        assert isinstance(winner_source, dict)
+        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+        phase_item["winner_source"] = dict(winner_source)
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
 
 def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:

@@ -80,9 +80,10 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import _write_config
+from tests.ledger_fixtures import _write_config, append_journal_tail
 from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
+    _new_phase_study,
     fabricate_registered_attempt,
     fabricate_stale_trial,
     stamp_artifact_root,
@@ -1224,12 +1225,7 @@ def _fabricate_registered_journal_attempt(
         workdir=tmp_path / "runs",
         storage=f"journal:///{ledger}",
     )
-    study = optuna.create_study(
-        study_name="journal-attempt::p",
-        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = _new_phase_study(experiment, "p")
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
@@ -1284,8 +1280,7 @@ def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path / "torn", attempt_id="journal-attempt"
     )
-    complete = ledger.read_bytes()
-    ledger.write_bytes(complete + tail)
+    complete, _ = append_journal_tail(ledger, tail)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 

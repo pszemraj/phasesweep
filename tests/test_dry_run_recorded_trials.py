@@ -39,13 +39,18 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
     Winner,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
-from tests.conftest import _bounded_metric, make_experiment, requires_nonroot, write_flaky_trainer
+from tests.conftest import (
+    _bounded_metric,
+    make_experiment,
+    requires_nonroot,
+    trial_outcome,
+    write_flaky_trainer,
+)
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
 from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
 
@@ -162,12 +167,7 @@ def _record(
             state, _OUTCOME.get(state)
         )
         if outcomes and outcome is not None:
-            attrs[TRIAL_OUTCOME_ATTR] = {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": sequence,
-                "outcome": outcome,
-                "cause": None,
-            }
+            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(sequence, outcome, cause=None)
         value = 1.0 if state == _STATE.COMPLETE else None
         study.add_trial(optuna.trial.create_trial(state=state, value=value, user_attrs=attrs))
 

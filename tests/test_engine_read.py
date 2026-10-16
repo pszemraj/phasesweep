@@ -29,7 +29,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, TRIAL_OUTCOME_SCHEMA_VERSION
+from phasesweep.engine.state import TRIAL_OUTCOME_ATTR
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
@@ -40,10 +40,12 @@ from phasesweep.evidence.models import (
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    trial_outcome,
     write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
+from tests.recovery_helpers import _new_phase_study
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -107,7 +109,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
     running.set_user_attr(
         TRIAL_OUTCOME_ATTR,
-        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+        trial_outcome(1, "failure"),
     )
     study.ask()
     mark_current_format(exp, study)
@@ -177,10 +179,7 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
     else:
         ledger = tmp_path / "study.journal"
         experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
-        study = optuna.create_study(
-            study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
-        )
-        mark_current_format(experiment, study)
+        _new_phase_study(experiment, "p")
         _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     return experiment, ledger, _experiment_dir(experiment)
 

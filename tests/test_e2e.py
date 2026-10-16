@@ -25,11 +25,16 @@ from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.phase import GpuPool
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
-from tests.conftest import copy_fake_train, make_experiment, write_constant_trainer, write_trainer
+from tests.conftest import (
+    REPO,
+    copy_fake_train,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+)
 
 pytestmark = pytest.mark.integration
 
-REPO = Path(__file__).resolve().parent.parent
 EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"
 
 

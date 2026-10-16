@@ -38,8 +38,7 @@ from phasesweep.engine.repeats import ReduceName, _validate_repeats_block, reduc
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_trainer
-from tests.ledger_fixtures import published_generation_id
-from tests.test_publication_transaction import _reseal_winner
+from tests.ledger_fixtures import published_generation_id, reseal_winner
 
 
 def _seed_trainer(tmp_path: Path) -> Path:
@@ -306,7 +305,7 @@ def test_group_winner_repeats_block_is_manifest_validated(
         repeats["spread"]["sd"] = 0.0
     else:
         del winner["repeats"]
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -378,7 +377,7 @@ def _publish_forgery(
     summary = yaml.safe_load(summary_path.read_text())
     next(item for item in summary["phases"] if item["name"] == "p")["metric"] = aggregate
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
 
 _AXIS_MISMATCHES = [

@@ -35,11 +35,16 @@ from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+)
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.files import file_url_path
-from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.reaper import _read_proc_stat
 
 # Repository root, derived from the conftest location. Tests that copy/edit
@@ -507,13 +512,7 @@ def make_experiment(
         experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=metric
-        or Metric(
-            extractor=LogRegexExtractor(
-                type="log_regex",
-                pattern=r"x=(?P<value>[0-9.eE+-]+)",
-            )
-        ),
+        metric=metric or _bounded_metric(),
         phases=phases,
     )
     if trainer_config is not None:
@@ -573,6 +572,22 @@ def invoke_cli_boundary(
         logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject:
+    """Build a current-schema outcome record.
+
+    :param int sequence: Completion sequence.
+    :param str outcome: Outcome label.
+    :param JsonValue extra: Further fields, such as ``cause`` or an abort record.
+    :return JsonObject: The record as the objective writes it.
+    """
+    return {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+        **extra,
+    }
 
 
 def log_regex_provenance() -> JsonObject:

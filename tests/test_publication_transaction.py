@@ -62,7 +62,6 @@ from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime import shutdown as runtime_shutdown
-from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
@@ -74,7 +73,12 @@ from tests.conftest import (
     write_param_echo_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import materialize, published_generation_id, reanchor_summary_pointer
+from tests.ledger_fixtures import (
+    golden_publication,
+    published_generation_id,
+    reanchor_summary_pointer,
+    reseal_winner,
+)
 
 
 def _fail_terminal_generation_state(original: Callable, error: BaseException):
@@ -104,19 +108,6 @@ def _stored_experiment(tmp_path: Path, *, env: dict[str, str] | None = None):
     return make_experiment(
         persistent=tmp_path, trainer=trainer, env=env, n_trials=1, fixed_overrides={"batch_size": 8}
     )
-
-
-def _golden_publication(tmp_path: Path) -> tuple[Experiment, str]:
-    """Copy the golden one-generation publication for a test that needs a tree, not a sweep.
-
-    :param Path tmp_path: Per-test temporary directory.
-    :return tuple[Experiment, str]: The experiment reading the copy and its
-        published generation id.
-    """
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    return experiment, generation_id
 
 
 def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:  # noqa: ANN001
@@ -519,7 +510,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
 
 def test_generation_record_is_write_once(tmp_path: Path) -> None:
     """A published generation's record can never be rewritten, even to the same state."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     first_content = _generation_record_path(experiment, generation_id).read_bytes()
 
     generation_ops._write_generation_state(
@@ -563,7 +554,7 @@ def test_record_refusal_logs_a_malformed_existing_record(
     contents: bytes,
 ) -> None:
     """A malformed existing record is refused and logged with no recorded state."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     record_path = _generation_record_path(experiment, generation_id)
     record_path.write_bytes(contents)
 
@@ -682,7 +673,7 @@ def test_replacing_the_pointer_never_rewrites_an_existing_record(
     contents: bytes | None,
 ) -> None:
     """A record of any state or condition is left as written, without a refusal warning."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     record_path = _generation_record_path(experiment, generation_id)
     if contents is not None:
         record_path.write_bytes(contents)
@@ -876,13 +867,13 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     with the mutated winner, so the summary cross-check passes and only the
     winner's payload validation can refuse it.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     if field == "phase_fingerprint":
         winner[field] = value
     else:
         winner["winner_source"][field] = value
-    _reseal_winner(experiment, generation_id, winner, mirror_summary=mirror_summary)
+    reseal_winner(experiment, generation_id, winner, mirror_summary=mirror_summary)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -892,44 +883,9 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     assert read_result(experiment, phase_names=["p"])[1] == []
 
 
-def _reseal_winner(
-    experiment: Experiment,
-    generation_id: str,
-    winner: JsonObject,
-    *,
-    mirror_summary: bool = False,
-) -> None:
-    """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
-
-    The hashes then match, so only payload validation can refuse the winner.
-
-    :param Experiment experiment: Experiment whose golden publication is rewritten.
-    :param str generation_id: Published generation holding the winner.
-    :param JsonObject winner: Replacement winner payload for phase ``p``.
-    :param bool mirror_summary: Also write the winner's ``winner_source`` into the
-        summary's own per-phase copy, so the two copies agree and the summary
-        cross-check cannot be the reason the winner is refused.
-    """
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    artifact = next(
-        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
-    )
-    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
-    if mirror_summary:
-        winner_source = winner["winner_source"]
-        assert isinstance(winner_source, dict)
-        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
-        phase_item["winner_source"] = dict(winner_source)
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
-
-
 def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
     """Strict resume rejects a linked winner from a current-format publication."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     preserved_winner_path = winner_path.with_name("winner.original.yaml")
@@ -957,7 +913,7 @@ def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) 
 )
 def test_manifest_rejects_a_malformed_phase_plan(tmp_path: Path, phase_plan: object) -> None:
     """Plan names become path components, so one bad entry fails the publication."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     summary_path = _generation_summary_path(experiment, generation_id)
     summary = yaml.safe_load(summary_path.read_text())
     summary["phase_plan"] = phase_plan
@@ -978,7 +934,7 @@ def test_published_reads_consume_the_bytes_validation_read(
     the file once it returns, so a consumer that reopened the winner by path
     would see the swapped metric.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     validated_bytes = winner_path.read_bytes()
     swapped = yaml.safe_load(validated_bytes)
@@ -1029,7 +985,7 @@ def test_published_reads_consume_the_bytes_validation_read(
 )
 def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
     """An invalid pointer is treated as nothing-published, not trusted for reads."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     _last_successful_generation_path(experiment).write_text(tamper.format(gid=generation_id))
 
@@ -1047,7 +1003,7 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     the (post-commit, best-effort) lifecycle record -- so tampering the record
     has no effect on publication status; tampering the summary does.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     summary_path = _generation_summary_path(experiment, generation_id)
     summary = yaml.safe_load(summary_path.read_text())
@@ -1067,7 +1023,7 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
 
 def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path: Path) -> None:
     """The record is informational only; publication status ignores its state entirely."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     record_path = _generation_record_path(experiment, generation_id)
     record = yaml.safe_load(record_path.read_text())
@@ -1089,7 +1045,7 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
 
 def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path) -> None:
     """A valid publication resolves ``ok`` with its generation id and no error."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     assert _resolve_publication_pointer(experiment) == PublicationPointer(
         state="ok", generation_id=generation_id, error=None
@@ -1103,7 +1059,7 @@ def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path
 
 def test_experiment_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
     """The commit record stores the byte length and SHA-256 of the validated summary."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     summary = _generation_summary_path(experiment, generation_id).read_bytes()
     pointer = yaml.safe_load(_last_successful_generation_path(experiment).read_text())
@@ -1116,7 +1072,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A pointer-backed summary with wrong bytes is rejected before YAML sees them."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     summary_path = _generation_summary_path(experiment, generation_id)
     original = summary_path.read_bytes()
@@ -1151,7 +1107,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     tamper: str,
 ) -> None:
     """Historical plan, metric/evidence, and config identity cannot self-authenticate."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     summary_path = _generation_summary_path(experiment, generation_id)
     summary = yaml.safe_load(summary_path.read_text())
@@ -1221,7 +1177,7 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
 
 
 def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
@@ -1256,7 +1212,7 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(
     tmp_path: Path, delete_current_pointer: bool
 ) -> None:
     """The pointer is the publication authority; an orphaned namespace is not one."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     _last_successful_generation_path(experiment).unlink()
     if delete_current_pointer:
@@ -1278,7 +1234,7 @@ def test_generation_loss_with_a_surviving_pointer_reports_failed(
     tmp_path: Path, damage: str
 ) -> None:
     """Losing published generation artifacts cannot authorize convenience-winner fallback."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     if damage == "deleted-target":
         shutil.rmtree(_generation_dir(experiment, generation_id))
     else:
@@ -1302,7 +1258,7 @@ def test_generation_loss_with_a_surviving_pointer_reports_failed(
 
 def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
     """The reporting verdict must not soften the raise the resume path depends on."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
@@ -1345,7 +1301,7 @@ def test_from_phase_preflight_validates_the_published_manifest_once(
 
 
 def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:
-    owner, _ = _golden_publication(tmp_path)
+    owner, _ = golden_publication(tmp_path)
     pointer_path = _last_successful_generation_path(owner)
     current_path = _generation_path(owner)
     current = current_path.read_bytes()
@@ -1381,7 +1337,7 @@ def test_summary_anchor_mismatch_raises_under_the_resume_flag(
     tmp_path: Path, tamper: str, match: str
 ) -> None:
     """A summary that disagrees with its pointer is a refusal, not a verdict, for a resume."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     summary_path = _generation_summary_path(experiment, generation_id)
     content = summary_path.read_bytes()
     summary_path.write_bytes(content + b"\n" if tamper == "append" else content[:-2] + b"#\n")
@@ -1399,7 +1355,7 @@ def test_unusable_publication_is_refused_for_resume_never_read_as_absent(
     tmp_path: Path, damage: str
 ) -> None:
     """A recorded publication that cannot be used refuses a resume instead of answering "no winner yet"."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     pointer_path = _last_successful_generation_path(experiment)
     if damage == "dangling_pointer":
         pointer_path.unlink()
@@ -1418,7 +1374,7 @@ def test_unusable_publication_is_refused_for_resume_never_read_as_absent(
 
 def test_absent_publication_is_still_nothing_published_for_resume(tmp_path: Path) -> None:
     """Only a tree that never published reads as absent."""
-    experiment, _ = _golden_publication(tmp_path)
+    experiment, _ = golden_publication(tmp_path)
     _last_successful_generation_path(experiment).unlink()
 
     assert _published_for_resume(experiment) is None
@@ -1427,7 +1383,7 @@ def test_absent_publication_is_still_nothing_published_for_resume(tmp_path: Path
 @requires_nonroot
 def test_unreadable_pointer_is_an_access_refusal_for_resume(tmp_path: Path) -> None:
     """A pointer this user may not read is a permission refusal, not an absent publication."""
-    experiment, _ = _golden_publication(tmp_path)
+    experiment, _ = golden_publication(tmp_path)
     pointer_path = _last_successful_generation_path(experiment)
     original_mode = stat.S_IMODE(pointer_path.stat().st_mode)
     pointer_path.chmod(0o000)
@@ -1442,7 +1398,7 @@ def test_unreadable_pointer_is_an_access_refusal_for_resume(tmp_path: Path) -> N
 
 
 def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:
-    experiment, _ = _golden_publication(tmp_path)
+    experiment, _ = golden_publication(tmp_path)
     assert read_result(experiment, phase_names=["p"])[1] != []
     _last_successful_generation_path(experiment).unlink()
     _generation_path(experiment).unlink()
@@ -1515,7 +1471,7 @@ def test_read_status_single_captures_the_published_pointer(
     means every field in one call is consistent with whichever id the *first*
     (and only) resolution returned.
     """
-    experiment, real_generation = _golden_publication(tmp_path)
+    experiment, real_generation = golden_publication(tmp_path)
 
     calls: list[int] = []
 
@@ -1659,7 +1615,7 @@ def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None
     Without this the publication validator would reject every new generation:
     the namespace may hold nothing the manifest does not list.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
 
     summary = yaml.safe_load(_generation_summary_path(experiment, generation_id).read_text())
@@ -1686,7 +1642,7 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     Same failure shape as tampering a winner: the manifest hash no longer
     matches, so the pointer target is not trusted.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     target = _generation_dir(experiment, generation_id) / filename
     original = target.read_bytes()
@@ -1727,7 +1683,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     unvalidatable tree is still not exposed as a published one), and the
     reason points at the publishing user.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     target = _generation_dir(experiment, generation_id) / filename
     original_mode = stat.S_IMODE(target.stat().st_mode)
@@ -1777,7 +1733,7 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
     The two files are written together at claim time, so a namespace that
     keeps one and drops the other must fail closed.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     _, repro_path = _provenance_paths(experiment, generation_id)
 
     summary_path = _generation_summary_path(experiment, generation_id)
@@ -1836,7 +1792,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     published record cannot be made to describe a different config or
     generation.
     """
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
 
     target = _generation_dir(experiment, generation_id) / filename
     if filename == _REPRODUCIBILITY_NAME:

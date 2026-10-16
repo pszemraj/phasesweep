@@ -67,7 +67,6 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
@@ -104,7 +103,7 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
 )
 from phasesweep.tracking.mlflow import require_mlflow_sdk
-from tests.conftest import make_experiment, requires_nonroot
+from tests.conftest import make_experiment, requires_nonroot, trial_outcome
 from tests.ledger_fixtures import (
     Materialized,
     materialize,
@@ -1216,11 +1215,7 @@ def _append_failure_outcomes(
     digest = trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     last = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials)
     for sequence in range(last + 1, last + count + 1):
-        outcome: dict[str, object] = {
-            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-            "sequence": sequence,
-            "outcome": "failure",
-        }
+        outcome = trial_outcome(sequence, "failure")
         if abort_for is not None and sequence == last + count:
             outcome[TRIAL_OUTCOME_ABORT_KEY] = _failure_policy_abort_record(
                 abort_for,

@@ -39,7 +39,6 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
 )
@@ -50,6 +49,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     single_trial_confound,
+    trial_outcome,
     write_constant_trainer,
     write_trainer,
 )
@@ -599,7 +599,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     # Its objective recorded a failure before the orchestrator died, so recovery keeps it.
     identified.set_user_attr(
         TRIAL_OUTCOME_ATTR,
-        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+        trial_outcome(1, "failure"),
     )
     # A RUNNING row written before attempt identity existed: reported with
     # null identity, never dropped, so the counts and the list agree. It

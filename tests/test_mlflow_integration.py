@@ -197,7 +197,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
-    from tests.test_mlflow import _binder, _identity, native_experiment
+    from tests.tracking_helpers import _binder, _identity, native_experiment
 
     calls = []
 
@@ -417,7 +417,7 @@ def test_blocked_tracking_worker_is_cleaned(tmp_path, monkeypatch):
     from phasesweep.engine.paths import _attempts_dir
     from phasesweep.runtime.process import read_attempt_lifecycle
     from phasesweep.tracking.session import call_tracking, tracking_root
-    from tests.test_mlflow import native_experiment
+    from tests.tracking_helpers import native_experiment
 
     sdk = tmp_path / "sdk/mlflow"
     sdk.mkdir(parents=True)

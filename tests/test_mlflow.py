@@ -6,7 +6,6 @@ import errno
 import json
 import os
 import runpy
-import shlex
 import sys
 import time
 from pathlib import Path
@@ -27,6 +26,15 @@ from phasesweep.tracking.mlflow import (
     _find,
 )
 from phasesweep.tracking.models import MlflowSettings
+from tests.tracking_helpers import (
+    _binder,
+    _binding,
+    _identity,
+    _run,
+    _scripted_response,
+    _WorkerProcess,
+    native_experiment,
+)
 
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
@@ -134,37 +142,6 @@ def test_selector_requires_explicit_step():
         spec("step")
     with pytest.raises(ValidationError):
         spec("last", step=2)
-
-
-def _binding():
-    return {
-        "schema_version": 1,
-        "tracking_uri": "http://localhost:5000",
-        "experiment_id": "1",
-        "run_id": "native-id",
-        "experiment": "test",
-        "phase": "p",
-        "generation_id": "a" * 32,
-        "attempt_id": "b" * 32,
-        "overrides_sha256": "c" * 64,
-        "run_mode": "managed",
-    }
-
-
-def _run(binding, *, status="FINISHED", metrics=None):
-    from phasesweep.tracking.mlflow import identity_tags
-
-    return SimpleNamespace(
-        info=SimpleNamespace(
-            run_id=binding["run_id"],
-            experiment_id=binding["experiment_id"],
-            lifecycle_stage="active",
-            status=status,
-        ),
-        data=SimpleNamespace(
-            tags=identity_tags(binding), params={}, metrics=metrics or {"loss": 2.0}
-        ),
-    )
 
 
 def test_shared_history_once():
@@ -320,12 +297,6 @@ def _timed_out():
     from mlflow.exceptions import MlflowException
 
     return MlflowException("API request to private-host failed with timeout exception.")
-
-
-def _identity(generation_id="a" * 32, attempt_id="b" * 32):
-    """Return the creation identity of one attempt, which names no native run yet."""
-    binding = {**_binding(), "generation_id": generation_id, "attempt_id": attempt_id}
-    return {k: v for k, v in binding.items() if k != "run_id"}
 
 
 _REJECTIONS = (
@@ -535,25 +506,6 @@ def test_no_cross_backend_publishing(tmp_path):
         Experiment.model_validate(config)
 
 
-def native_experiment(tmp_path):
-    """Build the complete native example in an isolated artifact namespace."""
-    from pathlib import Path
-
-    import yaml
-
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
-    config.update(workdir=str(tmp_path), storage=None)
-    return Experiment.model_validate(config)
-
-
-def _scripted_response(script, request):
-    """Consume the next response for an action, evaluating deferred responses."""
-    if not script.get(request["action"]):
-        pytest.fail(f"Unscripted {request['action']} request.")
-    response = script[request["action"]].pop(0)
-    return response() if callable(response) else response
-
-
 class _ScriptedWorker:
     """A stand-in for the supervised worker that answers each action from a script."""
 
@@ -574,32 +526,6 @@ class _ScriptedWorker:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
-
-
-def _binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
-    """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
-    from phasesweep.tracking import session
-
-    experiment = experiment or native_experiment(tmp_path)
-    identity = identity or _identity()
-    if slot == "attempt":
-        directory = directory or tmp_path
-        path, slot_arguments = directory / "mlflow-binding.json", {"attempt_directory": directory}
-    else:
-        path = (
-            session.tracking_root(experiment)
-            / identity["generation_id"]
-            / "generation-binding.json"
-        )
-        path.parent.mkdir(parents=True)
-        slot_arguments = {}
-
-    def bind(deadline=None):
-        return session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=deadline, **slot_arguments
-        )
-
-    return bind, path
 
 
 _ABSENT = {"found": False}
@@ -744,52 +670,6 @@ def test_unclassified_creation_failure_keeps_its_record_and_is_not_resent(
     assert bind() == binding
     assert worker.actions == ["create", "find", "find"]
     assert not pending.exists()
-
-
-class _WorkerProcess:
-    """A stand-in for the worker process behind the real controller and its response reader.
-
-    Each request is answered with the next scripted response for its action. The controller's
-    first read of the response to an action named in ``unreadable`` fails with EIO.
-    Callable responses are evaluated when requested; non-MLflow processes run normally.
-    """
-
-    def __init__(self, monkeypatch, *, unreadable=(), **script):
-        from phasesweep.runtime import process
-
-        self.script = {action: list(responses) for action, responses in script.items()}
-        self.unreadable = set(unreadable)
-        self.requests = []
-        self.real_supervised = process.run_supervised
-        real_read = Path.read_text
-
-        def read_text(path, *args, **kwargs):
-            if path.name == "response.json" and self.requests:
-                action = self.requests[-1]["action"]
-                if action in self.unreadable:
-                    self.unreadable.discard(action)
-                    raise OSError(errno.EIO, "injected response read failure", str(path))
-            return real_read(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "read_text", read_text)
-        monkeypatch.setattr(process, "run_supervised", self)
-
-    @property
-    def actions(self):
-        return [request["action"] for request in self.requests]
-
-    def __call__(self, command, **kwargs):
-        from phasesweep.runtime.process import ProcessResult
-
-        parts = shlex.split(command)
-        if not any(part.endswith("/tracking/mlflow.py") for part in parts):
-            return self.real_supervised(command, **kwargs)
-        request_path, response_path = (Path(part) for part in parts[-2:])
-        request = json.loads(request_path.read_text(encoding="utf-8"))
-        self.requests.append(request)
-        response = _scripted_response(self.script, request)
-        response_path.write_text(json.dumps(response), encoding="utf-8")
-        return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
 
 
 @pytest.mark.parametrize("recovery", ["bind", "sync"])

@@ -10,13 +10,12 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Metric, Phase
+from phasesweep.config.models import Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_OUTCOME_ATTR
-from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import _bounded_metric, make_experiment, write_trainer
 
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
@@ -56,10 +55,7 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-            max=50,
-        ),
+        metric=_bounded_metric(max=50),
         name="p",
         n_trials=4,
         sampler=Sampler(type="grid"),
@@ -144,9 +140,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_stderr_cause_trainer(tmp_path),
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
+        metric=_bounded_metric(),
         n_trials=4,
         sampler=Sampler(type="grid"),
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])},

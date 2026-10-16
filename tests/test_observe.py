@@ -21,7 +21,7 @@ from phasesweep.engine.read import _winner_view, read_result
 from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
 from tests.conftest import make_experiment, write_trainer
-from tests.test_publication_transaction import _golden_publication, _reseal_winner
+from tests.ledger_fixtures import golden_publication, reseal_winner
 
 
 def _log_observation(name: str, pattern: str) -> Observation:
@@ -156,14 +156,14 @@ def test_manifest_rejects_a_malformed_observed_block(
     tmp_path: Path, observed: object, reason: str
 ) -> None:
     """The published winner's observed field is validated, and absence is refused."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     assert winner["observed"] == {}
     if observed is None:
         del winner["observed"]
     else:
         winner["observed"] = observed
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -174,7 +174,7 @@ def test_manifest_rejects_a_malformed_observed_block(
 
 def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
     """The permissive reader carries observed values through and drops a malformed winner."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     bare = _winner_view(winner, "p")
     assert bare is not None
@@ -193,10 +193,10 @@ def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
 
 def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:
     """A resealed winner with finite values validates and reads back."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     winner["observed"] = {"peak": 7.5, "steps": 3}
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     assert _resolve_publication_pointer(experiment).state == "ok"
     _, (view,) = read_result(experiment, phase_names=["p"])

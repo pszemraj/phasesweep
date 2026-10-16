@@ -86,6 +86,7 @@ from tests.conftest import (
     make_trial_context,
     patch_rejected_trial_user_attr,
     requires_nonroot,
+    trial_outcome,
     write_constant_trainer,
     write_param_echo_trainer,
     write_trainer,
@@ -1408,11 +1409,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     for outcome in outcomes:
         trial = study.ask()
         abort = run.abort_decision(trial.number, outcome, cause=None, fatal_policy=None)
-        payload: dict[str, Any] = {
-            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-            "sequence": run.completion_sequence + 1,
-            "outcome": outcome,
-        }
+        payload = trial_outcome(run.completion_sequence + 1, outcome)
         if abort is not None:
             payload[TRIAL_OUTCOME_ABORT_KEY] = abort
         trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)

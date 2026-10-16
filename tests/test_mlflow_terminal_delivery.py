@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import shlex
 import signal
@@ -14,9 +13,6 @@ import pytest
 import yaml
 from optuna.trial import TrialState, create_trial
 
-import phasesweep.engine.attempts as attempts_module
-import phasesweep.engine.cleanup as cleanup_module
-import phasesweep.engine.phase as phase_module
 from phasesweep.config.models import Experiment
 from phasesweep.engine.generation import _recorded_generation_state
 from phasesweep.engine.ledger import (
@@ -40,14 +36,13 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     constraint_attr,
 )
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
-from phasesweep.tracking.mlflow import _capture, _publish
+from phasesweep.tracking.mlflow import _publish
 from phasesweep.tracking.session import (
     BINDING_FILE,
     INHERITS_FILE,
@@ -55,7 +50,15 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.test_mlflow import _binding, _run, _WorkerProcess, native_experiment
+from tests.conftest import trial_outcome
+from tests.tracking_helpers import (
+    _binding,
+    _leave_cleanup_uncertain_attempt,
+    _remote_example,
+    _run,
+    _WorkerProcess,
+    native_experiment,
+)
 
 
 @pytest.mark.parametrize("requested", ["FINISHED", "FAILED", "KILLED"])
@@ -273,7 +276,7 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
         attempt = digit * 32
-        record = {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": outcome}
+        record = trial_outcome(1, outcome)
         _add_bound_attempt(
             experiment,
             study,
@@ -347,42 +350,6 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     rate = [r for r in records if r["binding"]["phase"] == "rate"]
     depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
     assert all(r["projection"]["tags"]["phasesweep.inherits.depth"] in depth_runs for r in rate)
-
-
-def _leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
-    """Fail the one trial of ``depth`` with unconfirmed cleanup, recorded as recovered by nobody.
-
-    The trainer really exits. The launch result reports its cleanup unconfirmed, and the engine's
-    own reconciliation after the failure cannot prove the group gone, so the trial keeps its
-    uncertainty and its attempt-registry entry stays for a later pass. The injected faults are
-    undone before this returns.
-
-    :return str: The failed trial's attempt id.
-    """
-    original_launch = phase_module.launch_trial
-
-    def uncertain_launch(*args, **kwargs):
-        executed = original_launch(*args, **kwargs)
-        return dataclasses.replace(
-            executed, process=dataclasses.replace(executed.process, cleanup_confirmed=False)
-        )
-
-    def unproven(*args, **kwargs):
-        raise ProcessCleanupUncertainError("the process group may still be alive")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(phase_module, "launch_trial", uncertain_launch)
-        # The registry pass and the terminal-trial pass each resolve attempts through their own name.
-        patch.setattr(attempts_module, "_resolve_attempt", unproven)
-        patch.setattr(cleanup_module, "_resolve_attempt", unproven)
-        with pytest.raises(UnsafeProcessCleanupError):
-            run_experiment(experiment, **run_kwargs)
-    read = read_phase_trials(validate_ledger(experiment), "depth")
-    [trial] = read.trials
-    assert trial.state == TrialState.FAIL
-    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
-    assert trial.number not in read.cleanup_recovered
-    return trial.user_attrs[ATTEMPT_ID_ATTR]
 
 
 def test_sync_finishes_an_attempt_once_recovery_confirms_its_cleanup(tmp_path, monkeypatch):
@@ -588,36 +555,6 @@ def test_failure_publisher_preserves_historical_generation_outcome(
             "error_class": "RuntimeError",
         }
         assert publication.delivery_status(experiment, generation) == {"pending": 0, "delivered": 1}
-
-
-def _remote_example(tmp_path, monkeypatch):
-    """Run the native example against in-process MLflow answers and a no-op trainer."""
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
-    config.update(
-        workdir=str(tmp_path / "runs"),
-        storage=None,
-        trial_command=f"{sys.executable} -c pass {{config_path}}",
-    )
-    uploads = []
-
-    def respond(request, **kwargs):
-        if request["action"] == "resolve":
-            return {"experiment_id": "1"}
-        if request["action"] == "create":
-            return {**request["binding"], "run_id": "run-" + request["binding"]["attempt_id"]}
-        if request["action"] == "capture":
-            run = _run(request["binding"], metrics={"eval/loss": 1.0, "cost": 1.0})
-            run.data.params = {"depth": "1", "rate": "0"}
-            run.data.tags["trainer"] = "none"
-            point = SimpleNamespace(value=1.0, step=1, timestamp=1)
-            client = SimpleNamespace(get_run=lambda _: run, get_metric_history=lambda *_: [point])
-            return _capture(client, request)
-        uploads.append(request)
-        return {}
-
-    monkeypatch.setattr(session, "request_operation", respond)
-    monkeypatch.setattr(worker, "request_operation", respond)
-    return config, uploads
 
 
 def _fail_mirror(monkeypatch, failure):

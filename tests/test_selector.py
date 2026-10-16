@@ -20,11 +20,10 @@ from phasesweep.engine.state import (
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     constraint_attr,
 )
 from phasesweep.evidence.models import JsonExtractor
-from tests.conftest import log_regex_provenance, make_experiment
+from tests.conftest import log_regex_provenance, make_experiment, trial_outcome
 
 # Allocation writes both attrs on every trial before its trainer runs.
 _ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"schema_version": 1}}
@@ -197,13 +196,7 @@ def _add_interrupted(study, params: dict[str, int]) -> None:  # noqa: ANN001
                 name: optuna.distributions.IntDistribution(low=value, high=value)
                 for name, value in params.items()
             },
-            user_attrs={
-                TRIAL_OUTCOME_ATTR: {
-                    "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                    "sequence": len(study.trials) + 1,
-                    "outcome": "interrupted",
-                }
-            },
+            user_attrs={TRIAL_OUTCOME_ATTR: trial_outcome(len(study.trials) + 1, "interrupted")},
             state=optuna.trial.TrialState.FAIL,
         )
     )
