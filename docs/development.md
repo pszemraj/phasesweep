@@ -51,7 +51,9 @@ pre-commit install
 | whole-suite collection | commit | every commit, collecting the whole suite |
 | `mypy src` | push | the whole package |
 
-The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, and `tests/test_ledger_read_paths.py`. Whole-suite collection imports every test module without running tests. Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. The typing-escapes hook ([`scripts/check_typing_escapes.py`](../scripts/check_typing_escapes.py)) refuses `Any`, `typing.cast`, and `# type: ignore` on any line a commit adds or edits, including `Any` in a docstring `:param` or `:return` type. There is no exemption: narrow with `isinstance`, describe a known shape with a `TypedDict` and an external API with a `Protocol`, use `JsonValue`/`JsonObject` from `phasesweep.runtime.json` for open JSON, or `object` for an opaque value. Editing a line that already carries one of these means fixing it. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
+Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
+
+The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
 
@@ -159,7 +161,7 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
-- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. `runtime/supervisor.py` is the launch barrier every trial passes: a stdlib-only script started by path under `python -I -S` with only `PATH` in its environment, which receives the trainer's command and environment only after the trial's process identity is on disk, so nothing from the trainer environment runs before cleanup can find it. Keep its imports to the stdlib; [invariant 9](invariants.md#9-nothing-runs-before-its-process-identity-is-durable) has the whole rule.
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
@@ -180,7 +182,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
-The storage, publication and process-ordering rules are documented in [durability invariants](invariants.md), alongside the code and behavioral tests that implement them.
+See [durability invariants](invariants.md) for storage, publication, and process ordering.
 
 The ordinary control flow is:
 
