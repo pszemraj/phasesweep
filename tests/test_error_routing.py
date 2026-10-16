@@ -1068,6 +1068,14 @@ def _field_dropped(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
+def _locator_cleared(entry: Path) -> None:
+    """Leave a journal identity without the locator recovery requires."""
+    payload = json.loads(entry.read_text())
+    payload["storage_identity"] = "journal:////missing.journal"
+    payload["storage_locator"] = None
+    entry.write_text(json.dumps(payload))
+
+
 def _trial_dir_removed(entry: Path) -> None:
     """Remove the trial directory a registry entry names."""
     Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
@@ -1424,13 +1432,12 @@ ORIGIN_CASES = (
         message="Process identity is unknown.",
     ),
     RoutingCase(
-        # Either the ledger or the tree may be the side that changed, so the
-        # message names both and no one repair is the remedy.
+        # Either the ledger or the tree may be the side that changed.
         id="uncertain_trial_identity_files_mismatch",
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Restore the original storage ledger and this attempt's process-identity files",
+        message="durable process identity is missing, malformed, partial",
     ),
     RoutingCase(
         id="lock_dir_no_account_home",
@@ -1463,6 +1470,13 @@ ORIGIN_CASES = (
     RoutingCase(
         id="registry_entry_partial_schema",
         trigger=_scan_registry(damage=_field_dropped),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="has an unsupported or partial schema.",
+    ),
+    RoutingCase(
+        id="registry_identity_without_locator",
+        trigger=_scan_registry(damage=_locator_cleared),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="has an unsupported or partial schema.",
@@ -1503,7 +1517,7 @@ ORIGIN_CASES = (
         trigger=_reap_trial_with_foreign_lifecycle,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Restore the original storage ledger and this attempt's lifecycle record",
+        message="attempt lifecycle record is malformed or belongs to another attempt",
     ),
     RoutingCase(
         id="uncertain_trial_dir_missing",

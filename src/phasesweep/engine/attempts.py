@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import optuna
 
@@ -50,7 +50,6 @@ from phasesweep.runtime.json import JsonObject, strict_json_loads
 from phasesweep.runtime.process import AttemptLifecycle, read_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
-    StaleProcessIdentity,
     cleanup_stale_trial_process,
     read_stale_process_identity,
 )
@@ -484,10 +483,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             payload.get("storage_locator") is not None
             and not isinstance(payload.get("storage_locator"), str)
         )
-        or (
-            payload.get("storage_locator") is not None
-            and locator_identity != payload.get("storage_identity")
-        )
+        or locator_identity != payload.get("storage_identity")
         or not isinstance(payload.get("generation_id"), str)
         or not payload.get("generation_id")
         or type(payload.get("trial_number")) is not int
@@ -614,20 +610,13 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
 def _registry_attempt_fail_stale_trial(
     entry: dict[str, Any],
     entry_path: Path,
-    *,
-    current_storage: str | None,
 ) -> str:
-    """Mark the entry's Optuna trial FAIL through a matching storage locator.
+    """Mark the entry's Optuna trial FAIL through its saved storage locator.
 
-    The allocation-time locator remains the authority when the current config
-    names another target. When both credential-free identities match, the
-    current locator is preferred so credential rotation cannot strand a stale
-    trial behind an obsolete password or token. Phase rename/removal does not
-    affect this comparison because registry recovery is phase-graph-independent.
+    Recovery remains independent of current storage and phase configuration.
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
-    :param str | None current_storage: Current config's operational storage URL.
     :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger or the entry is a tracking operation
@@ -647,12 +636,7 @@ def _registry_attempt_fail_stale_trial(
     """
     if entry["kind"] == "tracking":
         return "recovered"
-    current_identity = canonical_storage_identity(current_storage)
-    storage_url = (
-        storage_recovery_locator(current_storage)
-        if current_identity == entry["storage_identity"]
-        else entry["storage_locator"]
-    )
+    storage_url = entry["storage_locator"]
     if storage_url is None:
         # In-memory storage died with its orchestrator; nothing to update.
         return "terminal"
@@ -767,16 +751,14 @@ def _preflight_active_attempts(
             try:
                 _resolve_attempt(
                     _registry_attempt_record(entry, entry_path),
-                    _RegistryEntryDiscovery(entry_path),
+                    context=f"Attempt registry entry {entry_path}",
+                    evidence_action=OperatorAction.RESTORE_TREE,
+                    lifecycle_settles=True,
                     confirm=confirm,
                 )
                 if not confirm:
                     continue
-                outcome = _registry_attempt_fail_stale_trial(
-                    entry,
-                    entry_path,
-                    current_storage=experiment.resolved_storage,
-                )
+                outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
             except ProcessCleanupUncertainError as exc:
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
@@ -831,235 +813,42 @@ class _AttemptRecord:
     trial_number: int | None
 
 
-@dataclass(frozen=True)
-class _RegistryEntryDiscovery:
-    """An attempt discovered through its entry in the attempt registry.
-
-    Every refusal names the entry file, which is what the operator repairs
-    or removes.
-    """
-
-    lifecycle_settles: ClassVar[bool] = True
-    entry_path: Path
-
-    def lifecycle_malformed(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse an entry whose lifecycle record is malformed.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Attempt registry entry {self.entry_path} has a malformed lifecycle record in "
-            f"{record.trial_dir}.",
-            action=OperatorAction.RESTORE_TREE,
-        )
-
-    def identity_unreadable(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse an entry whose process identity is missing or malformed.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Attempt registry entry {self.entry_path} has a missing or malformed "
-            f"process identity in {record.trial_dir}.",
-            action=OperatorAction.RESTORE_TREE,
-        )
-
-    def cleanup_unconfirmed(
-        self, record: _AttemptRecord, identity: StaleProcessIdentity
-    ) -> ProcessCleanupUncertainError:
-        """Refuse a registered attempt that may still have a live process group.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :param StaleProcessIdentity identity: The validated identity that was signalled.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Registered attempt {record.attempt_id} (phase {record.phase_name!r}, from "
-            f"{self.entry_path}) may still have a live process group. "
-            f"trial_dir={record.trial_dir} pid={identity.pid} pgid={identity.pgid}. "
-            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
-            "re-run phasesweep."
-        )
-
-    def settled(self, record: _AttemptRecord, lifecycle: AttemptLifecycle) -> None:
-        """Settle a registered attempt quietly; repairing its study reports the outcome.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param AttemptLifecycle lifecycle: The ``exited`` or ``allocated`` record.
-        """
-
-    def cleaned(self, record: _AttemptRecord, identity: StaleProcessIdentity) -> None:
-        """Log the cleared process group of a registered attempt.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param StaleProcessIdentity identity: The identity that was cleaned.
-        """
-        log.warning(
-            "Cleared orphaned group for registered attempt %s (pid=%s pgid=%s)",
-            record.attempt_id,
-            identity.pid,
-            identity.pgid,
-        )
-
-
-@dataclass(frozen=True)
-class _TrialDiscovery:
-    """An attempt discovered through its stale RUNNING trial in a phase study."""
-
-    lifecycle_settles: ClassVar[bool] = True
-    study_name: str
-
-    def lifecycle_malformed(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse a trial whose lifecycle record is malformed or another attempt's.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Refusing to recover trial {record.trial_number} in study {self.study_name}: its "
-            f"attempt lifecycle record is malformed or belongs to another attempt. "
-            f"trial_dir={record.trial_dir}. Restore the original storage ledger and this "
-            "attempt's lifecycle record before retrying recovery.",
-            action=OperatorAction.INSPECT_LOGS,
-        )
-
-    def identity_unreadable(self, record: _AttemptRecord) -> ProcessCleanupUncertainError:
-        """Refuse a trial whose process identity is unusable or another attempt's.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Refusing to recover trial {record.trial_number} in study {self.study_name}: its "
-            f"durable process identity is missing, malformed, partial, or belongs to another "
-            f"attempt. trial_dir={record.trial_dir}. Restore the original storage ledger and "
-            "this attempt's process-identity files before retrying recovery.",
-            action=OperatorAction.INSPECT_LOGS,
-        )
-
-    def cleanup_unconfirmed(
-        self, record: _AttemptRecord, identity: StaleProcessIdentity
-    ) -> ProcessCleanupUncertainError:
-        """Refuse to fail a RUNNING trial whose process group may still be alive.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :param StaleProcessIdentity identity: The validated identity that was signalled.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Refusing to mark RUNNING trial {record.trial_number}: stale process cleanup "
-            f"could not prove the process group is gone. trial_dir={record.trial_dir} "
-            f"pid={identity.pid} pgid={identity.pgid}. A leaked training "
-            "process may still be holding GPU memory. Investigate "
-            f"(e.g. `ps -o pid,pgid,cmd -p {identity.pid}` and "
-            f"`kill -9 -- -{identity.pgid}` if appropriate), then re-run "
-            "phasesweep."
-        )
-
-    def settled(self, record: _AttemptRecord, lifecycle: AttemptLifecycle) -> None:
-        """Log a RUNNING trial that is failed without signalling.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param AttemptLifecycle lifecycle: The ``exited`` or ``allocated`` record.
-        """
-        if lifecycle.state == "exited":
-            log.warning(
-                "Trial %d in study %s exited (rc=%s) before its terminal state was "
-                "committed; failing it without signalling.",
-                record.trial_number,
-                self.study_name,
-                lifecycle.return_code,
-            )
-        else:
-            log.warning(
-                "Trial %d in study %s was allocated but no process was ever launched "
-                "(orchestrator died while queued); failing it without signalling.",
-                record.trial_number,
-                self.study_name,
-            )
-
-    def cleaned(self, record: _AttemptRecord, identity: StaleProcessIdentity) -> None:
-        """Log the cleared process group of a stale RUNNING trial.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param StaleProcessIdentity identity: The identity that was cleaned.
-        """
-        log.warning(
-            "Cleared orphaned group for trial %d (pid=%s pgid=%s)",
-            record.trial_number,
-            identity.pid,
-            identity.pgid,
-        )
-
-
-@dataclass(frozen=True)
-class _CleanupUncertainTrialDiscovery(_TrialDiscovery):
-    """An attempt discovered through a terminal trial that recorded cleanup uncertainty.
-
-    The trial is already terminal, so no lifecycle record can settle it: only
-    a validated identity whose group is confirmed gone clears the uncertainty.
-    """
-
-    lifecycle_settles: ClassVar[bool] = False
-    experiment_name: str
-
-    def cleanup_unconfirmed(
-        self, record: _AttemptRecord, identity: StaleProcessIdentity
-    ) -> ProcessCleanupUncertainError:
-        """Refuse to clear the recorded uncertainty of a trial whose group may be alive.
-
-        :param _AttemptRecord record: Attempt being resolved.
-        :param StaleProcessIdentity identity: The validated identity that was signalled.
-        :return ProcessCleanupUncertainError: The refusal to raise.
-        """
-        return ProcessCleanupUncertainError(
-            f"Refusing to clear cleanup uncertainty for trial {record.trial_number} in "
-            f"study {self.study_name}: process cleanup could not be confirmed. "
-            f"experiment={self.experiment_name} phase={record.phase_name} "
-            f"trial_dir={record.trial_dir} pid={identity.pid} pgid={identity.pgid}. "
-            f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`)."
-        )
-
-    def cleaned(self, record: _AttemptRecord, identity: StaleProcessIdentity) -> None:
-        """Log the confirmed cleanup of a cleanup-uncertain terminal trial.
-
-        :param _AttemptRecord record: Attempt that was resolved.
-        :param StaleProcessIdentity identity: The identity that was cleaned.
-        """
-        log.warning(
-            "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
-            "(pid=%s pgid=%s)",
-            record.trial_number,
-            self.study_name,
-            identity.pid,
-            identity.pgid,
-        )
-
-
 def _resolve_attempt(
-    record: _AttemptRecord, discovery: _RegistryEntryDiscovery | _TrialDiscovery, *, confirm: bool
+    record: _AttemptRecord,
+    *,
+    context: str,
+    evidence_action: OperatorAction,
+    lifecycle_settles: bool,
+    confirm: bool,
 ) -> None:
     """Inspect or clean one attempt using its durable lifecycle and process identity.
 
-    Confirmed exited attempts and allocated attempts without identities need no signal.
-    All others require a valid identity, including discoveries whose lifecycle cannot
-    settle cleanup. Confirmed resolution cleans the identified process group.
+    Confirmed exited attempts and allocated attempts without identities need no signal
+    when ``lifecycle_settles`` is true. Terminal cleanup uncertainty requires a valid
+    identity regardless of lifecycle. Confirmed resolution cleans the identified group.
 
-    :param _AttemptRecord record: Attempt to resolve.
-    :param _RegistryEntryDiscovery | _TrialDiscovery discovery: Source-specific diagnostics.
+    :param _AttemptRecord record: Attempt identity and evidence directory to resolve.
+    :param str context: Discovery source, including its registry path or study and trial.
+    :param OperatorAction evidence_action: Remedy for invalid lifecycle or identity evidence.
+    :param bool lifecycle_settles: Whether lifecycle evidence can prove cleanup.
     :param bool confirm: Clean the process group; False validates evidence without signalling.
     :raises ProcessCleanupUncertainError: Invalid or mismatched lifecycle/identity,
         or unconfirmed process cleanup.
     """
-    if discovery.lifecycle_settles:
+    context = (
+        f"{context}: attempt={record.attempt_id} phase={record.phase_name!r} "
+        f"trial_dir={record.trial_dir}"
+    )
+    if lifecycle_settles:
         try:
             lifecycle = read_attempt_lifecycle(
                 record.trial_dir, expected_attempt_id=record.attempt_id
             )
         except ValueError as exc:
-            raise discovery.lifecycle_malformed(record) from exc
+            raise ProcessCleanupUncertainError(
+                f"{context}: attempt lifecycle record is malformed or belongs to another attempt.",
+                action=evidence_action,
+            ) from exc
         # Only allocated with an absent identity settles without a strict identity read.
         resolution = _attempt_process_resolution(
             lifecycle,
@@ -1067,19 +856,33 @@ def _resolve_attempt(
         )
         if resolution != "identity":
             assert lifecycle is not None
-            discovery.settled(record, lifecycle)
+            log.warning(
+                "%s: lifecycle=%s rc=%s confirms cleanup without signalling.",
+                context,
+                lifecycle.state,
+                lifecycle.return_code,
+            )
             return
     try:
         identity = read_stale_process_identity(
             record.trial_dir, expected_attempt_id=record.attempt_id
         )
     except (OSError, ValueError) as exc:
-        raise discovery.identity_unreadable(record) from exc
+        raise ProcessCleanupUncertainError(
+            f"{context}: durable process identity is missing, malformed, partial, "
+            "or belongs to another attempt.",
+            action=evidence_action,
+        ) from exc
     if not confirm:
         return
     if not cleanup_stale_trial_process(identity):
-        raise discovery.cleanup_unconfirmed(record, identity)
-    discovery.cleaned(record, identity)
+        raise ProcessCleanupUncertainError(
+            f"{context}: process cleanup could not be confirmed. "
+            f"pid={identity.pid} pgid={identity.pgid}."
+        )
+    log.warning(
+        "%s: confirmed process cleanup (pid=%s pgid=%s).", context, identity.pid, identity.pgid
+    )
 
 
 def _fail_stale_running_trial(

@@ -454,14 +454,14 @@ class GetRunStatusResult(_ToolPayload):
     )
     current_generation_id: str | None = Field(
         description=(
-            "Latest mutable generation known to this experiment; may be failed, in progress, "
-            "or differ from the queried run. Null before any generation starts."
+            "Current pointer at the live read or frozen snapshot capture, according to "
+            "result_source; may differ from this run. Null before any generation starts."
         )
     )
     published_generation_id: str | None = Field(
         description=(
-            "Last validated successful generation; null before the first success "
-            "and may differ from the represented generation."
+            "Validated last-success pointer at the live read or frozen snapshot capture, "
+            "according to result_source; null before the first success."
         )
     )
     represented_generation_id: str | None = Field(

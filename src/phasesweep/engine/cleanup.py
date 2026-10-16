@@ -11,7 +11,6 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _cleanup_recovered_trial_numbers,
-    _CleanupUncertainTrialDiscovery,
     _fail_stale_running_trial,
     _record_cleanup_recovery,
     _require_trial_attempt,
@@ -19,7 +18,6 @@ from phasesweep.engine.attempts import (
     _trial_attempt_record,
     _trial_dir_from_attr,
     _trial_requires_cleanup_recovery,
-    _TrialDiscovery,
 )
 from phasesweep.engine.paths import _trial_dir_for
 from phasesweep.engine.state import (
@@ -76,7 +74,6 @@ def _reap_stale_trials(
             "Restore the original complete storage ledger and access to it before retrying.",
             action=OperatorAction.RESTORE_LEDGER,
         ) from exc
-    discovery = _TrialDiscovery(study.study_name)
     for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
@@ -90,7 +87,13 @@ def _reap_stale_trials(
             )
             if TRIAL_DIR_ATTR in trial.user_attrs:
                 record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
-                _resolve_attempt(record, discovery, confirm=confirm)
+                _resolve_attempt(
+                    record,
+                    context=f"RUNNING trial {trial.number} in study {study.study_name!r}",
+                    evidence_action=OperatorAction.INSPECT_LOGS,
+                    lifecycle_settles=True,
+                    confirm=confirm,
+                )
             else:
                 # The launch path records the directory before any process can
                 # start, so this allocation launched nothing to resolve.
@@ -191,7 +194,6 @@ def _recover_cleanup_uncertain_trials(
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
     recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
-    discovery = _CleanupUncertainTrialDiscovery(study.study_name, experiment.experiment)
     count = 0
     for trial in study.get_trials(deepcopy=False):
         if not (
@@ -202,7 +204,16 @@ def _recover_cleanup_uncertain_trials(
             continue
         trial_dir = _trial_dir_from_attr(trial, study.study_name)
         record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
-        _resolve_attempt(record, discovery, confirm=confirm)
+        _resolve_attempt(
+            record,
+            context=(
+                f"Cleanup-uncertain terminal trial {trial.number} in study {study.study_name!r} "
+                f"experiment={experiment.experiment}"
+            ),
+            evidence_action=OperatorAction.INSPECT_LOGS,
+            lifecycle_settles=False,
+            confirm=confirm,
+        )
         if confirm:
             _record_cleanup_recovery(study, trial)
         if recovered_attempts is not None:

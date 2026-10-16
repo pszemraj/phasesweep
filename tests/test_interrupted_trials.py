@@ -15,7 +15,6 @@ import pytest
 from optuna.distributions import IntDistribution
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
@@ -50,7 +49,7 @@ from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
-from tests.conftest import make_experiment, write_param_echo_trainer, write_trainer
+from tests.conftest import _phase_trials, make_experiment, write_param_echo_trainer, write_trainer
 from tests.recovery_helpers import fabricate_stale_trial
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
@@ -335,16 +334,6 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
 
 
 _SIGINT_CAUSE = f"orchestrator interrupted by signal {int(signal.SIGINT)}"
-
-
-def _phase_trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
-    """Read the trials of the experiment's phase ``p``.
-
-    :param Experiment experiment: Experiment whose ledger is read.
-    :return list[optuna.trial.FrozenTrial]: Its trials in number order.
-    """
-    storage = _resolve_storage(experiment.resolved_storage)
-    return optuna.load_study(study_name="t::p", storage=storage).get_trials(deepcopy=False)
 
 
 def _cause(trial: optuna.trial.FrozenTrial) -> str | None:

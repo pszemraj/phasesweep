@@ -42,7 +42,6 @@ def _reject_constant(value: str) -> NoReturn:
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Build an object while rejecting duplicate member names.
 
-    :param list[tuple[str, Any]] pairs: Parsed members in source order.
     :return dict[str, Any]: Mapping containing each unique member.
     :raises ValueError: A member name repeats, which the standard ``json``
         parser would silently resolve last-wins.
@@ -60,7 +59,6 @@ def strict_json_loads(text: str) -> Any:
 
     Reject ``Infinity``, ``-Infinity`` and ``NaN``.
 
-    :param str text: Complete JSON document.
     :return Any: Parsed JSON value.
     """
     return json.loads(
@@ -77,7 +75,6 @@ def progress_position(value: Any) -> int | float | None:
     metric) an objective was measured: a finite, non-negative JSON number.
     Integers stay integers so step groups compare and render exactly.
 
-    :param Any value: Candidate position read from evidence.
     :return int | float | None: ``value`` when valid, else ``None``.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):

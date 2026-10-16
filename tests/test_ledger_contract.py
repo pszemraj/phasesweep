@@ -68,17 +68,6 @@ BANNED_EVERYWHERE: dict[str, frozenset[str]] = {
     "sqlite3": frozenset({"connect", "Connection"}),
 }
 
-#: Banned storage entry points still reachable outside the chokepoint.
-_LEGACY_SITES: dict[str, set[str]] = {}
-
-#: Private ledger helpers still imported outside the chokepoint.
-#:
-#: Read paths hold a :class:`ValidatedLedger`, the write side holds a
-#: :class:`ClaimedLedger`, and foreign-ledger recovery goes through
-#: ``open_registry_study``; nothing outside the ledger reaches past its public
-#: API.
-_LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {}
-
 
 def _source_files() -> list[Path]:
     """Return every Python module shipped under ``src/phasesweep``.
@@ -357,13 +346,9 @@ def test_storage_constructors_are_called_only_in_the_ledger_module() -> None:
         if references:
             found[relpath] = references
 
-    assert found == _LEGACY_SITES, (
-        "Storage constructors outside the ledger module changed.\n"
-        f"found:    {found}\n"
-        f"expected: {_LEGACY_SITES}\n"
-        "A new entry means a read path can build file-backed storage without "
-        "validating first: route it through the ledger module instead. A removed "
-        "entry means the ratchet must be tightened in the same commit."
+    assert not found, (
+        "Storage constructors outside the ledger module: "
+        f"{found}. Route storage construction through the ledger module."
     )
 
 
@@ -383,12 +368,9 @@ def test_ledger_private_names_are_not_imported_outside_the_ledger_module() -> No
         if references:
             found[relpath] = references
 
-    assert found == _LEGACY_PRIVATE_IMPORTS, (
-        "Private ledger helpers borrowed outside the ledger module changed.\n"
-        f"found:    {found}\n"
-        f"expected: {_LEGACY_PRIVATE_IMPORTS}\n"
-        "Reaching past the ledger's public API skips the validate-before-open "
-        "ordering the private helpers assume their caller already did."
+    assert not found, (
+        "Private ledger helpers imported outside the ledger module: "
+        f"{found}. Use the ledger's public API."
     )
 
 

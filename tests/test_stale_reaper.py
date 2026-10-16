@@ -401,7 +401,7 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
                 lambda *_args, **_kwargs: 0,
             )
             monkeypatch.setattr(
-                "phasesweep.engine.guards._validate_study_schema",
+                "phasesweep.engine.guards._initialize_study_schema",
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
             )
 
@@ -437,7 +437,7 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
 
     monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap)
     monkeypatch.setattr(
-        "phasesweep.engine.guards._validate_study_schema",
+        "phasesweep.engine.guards._initialize_study_schema",
         lambda _study: (_ for _ in ()).throw(RuntimeError("schema read failed")),
     )
 
@@ -551,7 +551,7 @@ def test_mixed_preflight_error_boundary(
             raise StudySchemaMismatchError("schema mismatch")
         raise secondary_error
 
-    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
+    monkeypatch.setattr("phasesweep.engine.guards._initialize_study_schema", reject_differently)
     with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
         _preflight_existing_studies(_claimed_over(experiment, studies))
     assert isinstance(exc_info.value, PhaseSweepError) is operational
@@ -1650,7 +1650,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
 
 
 def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) -> None:
-    """In-memory attempts have an identity but intentionally no recovery URL."""
+    """In-memory attempts have neither a storage identity nor a recovery locator."""
     experiment = make_experiment(
         experiment="memory-registry",
         workdir=tmp_path / "runs",

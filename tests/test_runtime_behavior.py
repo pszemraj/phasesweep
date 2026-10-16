@@ -79,6 +79,7 @@ from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    _bounded_metric,
     copy_fake_train,
     make_experiment,
     make_trial_context,
@@ -1846,14 +1847,6 @@ def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
             live[trial.number],
             surface=f"{sampler.type} FrozenTrial.params[{trial.number}]",
         )
-
-
-def _bounded_metric(**bounds: float) -> Metric:
-    """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
-    return Metric(
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-        **bounds,
-    )
 
 
 def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> None:

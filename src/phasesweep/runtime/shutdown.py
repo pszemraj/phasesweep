@@ -401,11 +401,13 @@ def defer_shutdown_signals() -> Iterator[None]:
             # Mask restoration delivers queued signals after deferral ends.
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
-            _service_deferred_shutdown()
+            service_pending_shutdown()
 
 
-def _service_deferred_shutdown() -> None:
-    """Run the shutdown handler for a signal recorded mid-critical-section.
+def service_pending_shutdown() -> None:
+    """Deliver a deferred shutdown signal before starting new work.
+
+    Does nothing when no signal is pending.
 
     Raises:
         PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup
@@ -417,19 +419,6 @@ def _service_deferred_shutdown() -> None:
     _deferred_shutdown_signum = None
     if signum is not None:
         _shutdown_handler(signum, None)
-
-
-def service_pending_shutdown() -> None:
-    """Deliver a shutdown signal absorbed by an earlier commit window.
-
-    Call before starting new work. Does nothing when no signal is pending.
-
-    Raises:
-        PhaseSweepShutdown: Via ``_shutdown_handler``, when an absorbed
-            shutdown signal is still pending.
-
-    """
-    _service_deferred_shutdown()
 
 
 @dataclass

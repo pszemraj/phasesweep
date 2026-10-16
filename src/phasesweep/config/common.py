@@ -29,7 +29,6 @@ CONFIG_DIR_CONTEXT = "config_dir"
 def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
     """Normalize an HTTP(S) endpoint without nonempty credentials, query, or fragment.
 
-    :param SplitResult parsed: Endpoint already parsed by ``urlsplit``.
     :return str | None: Lowercase scheme and authority with trailing path slashes
         removed, or ``None`` when the endpoint is invalid.
     """
@@ -69,7 +68,6 @@ _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 def is_sha256_hex(value: object) -> TypeGuard[str]:
     """Recognize a SHA-256 digest as written by PhaseSweep.
 
-    :param object value: Candidate digest to check.
     :return bool: Whether ``value`` is a lowercase 64-character hex digest.
     """
     return isinstance(value, str) and bool(_SHA256_HEX_PATTERN.fullmatch(value))
@@ -78,7 +76,6 @@ def is_sha256_hex(value: object) -> TypeGuard[str]:
 def _reject_boolean_number(value: object) -> object:
     """Reject YAML booleans before Pydantic coerces them to zero or one.
 
-    :param object value: Raw numeric config value.
     :raises ValueError: If the value is a boolean.
     :return object: The unchanged non-boolean value.
     """
@@ -91,13 +88,9 @@ ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
 ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
 
 StrictJsonScalar: TypeAlias = StrictBool | StrictInt | StrictFloat | StrictStr | None
-"""The exact set of values a JSON document can hold at a leaf position.
+"""Non-coercing JSON leaf scalars; reject booleans as integers and YAML dates.
 
-Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
-``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
-neighbouring type. Anything outside this union — a mapping, a sequence, a
-``datetime.date`` — is not representable in parsed JSON and is rejected at
-config load rather than normalized later.
+Mappings and sequences are not scalars.
 """
 
 
@@ -211,7 +204,6 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
 
     ``model`` conflicts with ``model.depth``; ``model.depths`` does not.
 
-    :param set[str] keys: Fixed, sampled, and inherited override keys.
     :return list[tuple[str, str]]: Lexically sorted ``(short, long)`` collisions.
     """
     parts_by_key = {key: tuple(key.split(".")) for key in keys}

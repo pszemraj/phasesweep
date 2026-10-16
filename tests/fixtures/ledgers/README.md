@@ -18,7 +18,7 @@ It is consumed by `tests/test_ledger_read_paths.py` through `tests/ledger_fixtur
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, which is the case no binding can answer and the ledger format scan must.
 
-`current-journal` uses the current journal format. Its `manifest.json` records `derivation: ""` because the generator does not transform that format. Its `produced_by` carries the phasesweep `git describe --tags --always --dirty`, Optuna, the interpreter's stdlib `sqlite3` module version (unrelated to the fixture's ledger backend -- the journal is the only backend this fixture produces), and Python versions, plus the directory the generator ran from.
+`current-journal` uses the current journal format. Its `manifest.json` records `derivation: ""` because the generator does not transform that format. Its `produced_by` carries the phasesweep `git describe --tags --always --dirty`, Optuna, the interpreter's stdlib `sqlite3` module version, Python version, and the directory the generator ran from.
 
 ## Regeneration
 

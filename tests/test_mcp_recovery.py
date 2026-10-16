@@ -720,7 +720,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     refused = recover_run_cli(registry.state_dir, run_id, confirm=True)
 
     assert refused.exit_code != 0
-    assert "may still have a live process group" in refused.output
+    assert "process cleanup could not be confirmed" in refused.output
     runner_cleanup.assert_called_once()
     trial_cleanup.assert_called_once()
     assert entry_path.is_file()

@@ -100,9 +100,12 @@ FIXTURE_TREE_GITIGNORE = (
     "!*\n"
 )
 
-#: Ledger file name, relative to a fixture's ``ledger/`` directory. The
-#: journal is the only backend this fixture set produces.
+#: Ledger file name, relative to the fixture's ``ledger/`` directory.
 LEDGER_FILENAME = "study.journal"
+FIXTURE_NAME = "current-journal"
+FIXTURE_MODES = ("tree", "ledger-only")
+FIXTURE_EXPECT = {"tree": "ok", "ledger-only": "ok"}
+FIXTURE_NOTES = "Unedited output of this release on the journal backend."
 
 
 def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
@@ -161,27 +164,12 @@ def storage_url(backend: str, ledger_dir: Path) -> str:
 
 
 @dataclass(frozen=True)
-class FixtureSpec:
-    """One golden ledger fixture: how to produce it and what readers owe it."""
-
-    name: str
-    group: str
-    backend: str
-    modes: tuple[str, ...]
-    expect: dict[str, str] | None
-    derivation: str
-    derived_from: str | None = None
-    notes: str = ""
-
-
-@dataclass(frozen=True)
 class FixturePaths:
-    """Resolved on-disk layout of one fixture under construction."""
+    """Resolved on-disk layout of the fixture under construction."""
 
     root: Path
     ledger_dir: Path
     artifact_root: Path
-    backend: str
 
     @property
     def ledger(self) -> Path:
@@ -206,41 +194,6 @@ class FixturePaths:
         :return Path: Absolute path to ``artifact_root_binding.json``.
         """
         return self.experiment_dir / BINDING_FILENAME
-
-
-#: The committed fixture set. ``expect`` is the verdict a read path owes the
-#: fixture in each mode; the generator recomputes it from the produced bytes and
-#: refuses to write a manifest that disagrees.
-FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
-    FixtureSpec(
-        name="current-journal",
-        group="current",
-        backend="journal",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "ok", "ledger-only": "ok"},
-        derivation="",
-        notes="Unedited output of this release on the journal backend.",
-    ),
-)
-
-
-def _select(only: str | None) -> list[FixtureSpec]:
-    """Select the specs to generate from a comma-separated name/group filter.
-
-    :param str | None only: Comma-separated fixture names or group names.
-    :return list[FixtureSpec]: Selected specs in declaration order.
-    :raises ValueError: A requested token matches no fixture name or group.
-    """
-    if not only:
-        return list(FIXTURE_SPECS)
-    wanted = [token.strip() for token in only.split(",") if token.strip()]
-    selected: list[FixtureSpec] = []
-    for token in wanted:
-        matches = [spec for spec in FIXTURE_SPECS if token in (spec.name, spec.group)]
-        if not matches:
-            raise ValueError(f"--only {token!r} matches no fixture name or group")
-        selected.extend(spec for spec in matches if spec not in selected)
-    return [spec for spec in FIXTURE_SPECS if spec in selected]
 
 
 def _isolate_environment(sandbox: Path) -> None:
@@ -362,7 +315,7 @@ def _binding_schema_version(paths: FixturePaths) -> int | None:
     return int(version) if isinstance(version, int) else None
 
 
-def _computed_expectations(paths: FixturePaths, modes: tuple[str, ...]) -> dict[str, str]:
+def _computed_expectations(paths: FixturePaths) -> dict[str, str]:
     """Derive the verdict each mode owes this fixture, from the produced bytes.
 
     The artifact-root binding is validated before the ledger is scanned, so a
@@ -371,11 +324,8 @@ def _computed_expectations(paths: FixturePaths, modes: tuple[str, ...]) -> dict[
     current.
 
     :param FixturePaths paths: Produced fixture.
-    :param tuple[str, ...] modes: Modes this fixture supports.
     :return dict[str, str]: Verdict per mode.
     """
-    if not modes:
-        return {}
     ledger_verdict = _ledger_verdict(paths)
     binding_version = _binding_schema_version(paths)
     has_durable_tree = (paths.experiment_dir / "generations").is_dir()
@@ -385,7 +335,7 @@ def _computed_expectations(paths: FixturePaths, modes: tuple[str, ...]) -> dict[
         tree_verdict = "root-conflict"
     else:
         tree_verdict = ledger_verdict
-    return {mode: tree_verdict if mode == "tree" else ledger_verdict for mode in modes}
+    return {"tree": tree_verdict, "ledger-only": ledger_verdict}
 
 
 def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
@@ -399,7 +349,7 @@ def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
     from phasesweep import load_experiment, run_experiment
 
     payload = experiment_payload(
-        storage_url=storage_url(paths.backend, paths.ledger_dir),
+        storage_url=storage_url("journal", paths.ledger_dir),
         workdir=paths.artifact_root,
     )
     config_path = scratch / "experiment.yaml"
@@ -429,35 +379,31 @@ def _produced_by(source_root: Path) -> dict[str, str]:
 
 
 def _write_manifest(
-    spec: FixtureSpec,
     paths: FixturePaths,
     *,
-    name: str,
     expect: dict[str, str],
     produced_by: dict[str, str],
     notes: str,
 ) -> None:
     """Write one fixture's manifest beside its ledger.
 
-    :param FixtureSpec spec: Spec the fixture was produced from.
     :param FixturePaths paths: Produced fixture layout.
-    :param str name: Fixture name.
     :param dict[str, str] expect: Verdict per supported mode.
     :param dict[str, str] produced_by: Toolchain identifiers.
     :param str notes: Human-readable description of what this fixture holds.
     """
     manifest = {
-        "name": name,
-        "backend": spec.backend if paths.ledger.is_file() else None,
-        "ledger": str(paths.ledger.relative_to(paths.root)) if paths.ledger.is_file() else None,
+        "name": FIXTURE_NAME,
+        "backend": "journal",
+        "ledger": str(paths.ledger.relative_to(paths.root)),
         "experiment": EXPERIMENT,
         "phases": [PHASE],
         "n_trials": N_TRIALS,
-        "modes": list(spec.modes),
+        "modes": list(FIXTURE_MODES),
         "binding_schema_version": _binding_schema_version(paths),
         "expect": expect,
-        "derived_from": spec.derived_from,
-        "derivation": spec.derivation,
+        "derived_from": None,
+        "derivation": "",
         "notes": notes,
         "produced_by": produced_by,
     }
@@ -467,48 +413,41 @@ def _write_manifest(
 
 
 def generate(
-    spec: FixtureSpec,
     out_dir: Path,
     *,
-    name: str,
     scratch: Path,
     produced_by: dict[str, str],
     notes: str | None = None,
 ) -> Path:
-    """Produce one golden ledger fixture from scratch.
+    """Produce the golden ledger fixture from scratch.
 
-    :param FixtureSpec spec: Fixture to produce.
     :param Path out_dir: Directory that holds every fixture.
-    :param str name: Name for this fixture.
     :param Path scratch: Throwaway directory for the generation-time config.
     :param dict[str, str] produced_by: Toolchain identifiers for the manifest.
-    :param str | None notes: Manifest note replacing the spec's own.
+    :param str | None notes: Optional replacement for the fixture's default note.
     :return Path: The produced fixture directory.
     :raises RuntimeError: The computed verdicts contradict the declared ones.
     """
-    root = out_dir / name
+    root = out_dir / FIXTURE_NAME
     if root.exists():
         shutil.rmtree(root)
     paths = FixturePaths(
         root=root,
         ledger_dir=root / "ledger",
         artifact_root=root / "artifact_root",
-        backend=spec.backend,
     )
     paths.ledger_dir.mkdir(parents=True)
     _run_experiment_into(paths, scratch)
-    expect = _computed_expectations(paths, spec.modes)
-    if spec.expect is not None and expect != spec.expect:
+    expect = _computed_expectations(paths)
+    if expect != FIXTURE_EXPECT:
         raise RuntimeError(
-            f"{name}: produced bytes imply {expect}, but the spec declares {spec.expect}"
+            f"{FIXTURE_NAME}: produced bytes imply {expect}, but expected {FIXTURE_EXPECT}"
         )
     _write_manifest(
-        spec,
         paths,
-        name=name,
         expect=expect,
         produced_by=produced_by,
-        notes=spec.notes if notes is None else notes,
+        notes=FIXTURE_NOTES if notes is None else notes,
     )
     logger.info("wrote %s (%s)", root, expect or "no read-path modes")
     return root
@@ -531,17 +470,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         type=Path,
         default=Path(__file__).resolve().parent / "ledgers",
-        help="directory that holds every fixture",
-    )
-    parser.add_argument(
-        "--only",
-        default=None,
-        help="comma-separated fixture names or groups to regenerate",
+        help="directory for the generated fixture",
     )
     parser.add_argument(
         "--notes",
         default=None,
-        help="replace the selected fixtures' manifest notes",
+        help="replace the fixture's manifest notes",
     )
     parser.add_argument(
         "-v",
@@ -554,7 +488,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Generate the selected golden ledger fixtures.
+    """Generate the golden ledger fixture.
 
     :param list[str] | None argv: Arguments after the program name.
     :return int: ``0`` on success, ``1`` on a generation failure, ``2`` on bad input.
@@ -565,12 +499,6 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(levelname)s: %(message)s",
     )
-    try:
-        specs = _select(args.only)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="phasesweep-golden-") as tmp:
@@ -581,19 +509,11 @@ def main(argv: list[str] | None = None) -> int:
         source_root = Path(phasesweep.__file__).resolve().parent.parent
         produced_by = _produced_by(source_root)
         try:
-            for spec in specs:
-                generate(
-                    spec,
-                    out_dir,
-                    name=spec.name,
-                    scratch=sandbox,
-                    produced_by=produced_by,
-                    notes=args.notes,
-                )
+            generate(out_dir, scratch=sandbox, produced_by=produced_by, notes=args.notes)
         except Exception as exc:  # noqa: BLE001
             print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
-    print(f"generated {len(specs)} fixture(s) under {out_dir}")
+    print(f"generated {FIXTURE_NAME} under {out_dir}")
     return 0
 
 

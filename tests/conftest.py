@@ -34,6 +34,7 @@ from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
@@ -259,6 +260,24 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     if _check_artifact_root_binding(experiment) == "unbound":
         _write_artifact_root_binding(experiment)
+
+
+def _bounded_metric(**bounds: float) -> Metric:
+    """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
+    return Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        **bounds,
+    )
+
+
+def _phase_trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
+    """Read the trials of the experiment's phase ``p``.
+
+    :param Experiment experiment: Experiment whose ledger is read.
+    :return list[optuna.trial.FrozenTrial]: Its trials in number order.
+    """
+    storage = _resolve_storage(experiment.resolved_storage)
+    return optuna.load_study(study_name="t::p", storage=storage).get_trials(deepcopy=False)
 
 
 @pytest.fixture(autouse=True)
