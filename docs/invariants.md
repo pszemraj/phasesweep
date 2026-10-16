@@ -27,7 +27,7 @@ flowchart TD
     handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
     handle -->|"run"| rescan
     subgraph claim["claim_ledger"]
-        rescan["strict rescan if the scan did not complete"] --> repair["cut a partial final journal record<br/>under Optuna's journal lock"]
+        rescan["strict rescan if the scan did not complete"] --> repair["cut a partial final journal record<br/>under the PhaseSweep inode lock"]
         repair --> discover["load every existing phase study"]
         discover --> roots["check every study's root, all phases before any write"]
         roots --> recheck["re-check the tree binding is unchanged"]

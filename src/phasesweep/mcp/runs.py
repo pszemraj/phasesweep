@@ -248,10 +248,7 @@ class RunHandle:
 
     @property
     def process_identity(self) -> ProcessIdentity:
-        """Return the process fields recorded by this run handle.
-
-        :return ProcessIdentity: Runner identity, including unset pre-spawn fields.
-        """
+        """Return the recorded runner identity, including unset pre-spawn fields."""
         return ProcessIdentity(
             pid=self.pid,
             pgid=self.pgid,
@@ -271,10 +268,7 @@ class PreparedRun:
 
     @property
     def lease_fd(self) -> int:
-        """Return the descriptor inherited by the blocked runner.
-
-        :return int: Open launch-lease file descriptor.
-        """
+        """Return the open launch lease descriptor inherited by the blocked runner."""
         return self.lease.fileno()
 
     def close(self) -> None:
@@ -574,45 +568,27 @@ class RunStore:
         return f"{experiment_id}-{uuid4().hex}"
 
     def log_path(self, run_id: str) -> Path:
-        """Path to the captured stdout/stderr log for a run.
-
-        :return: Operator-only runner log path.
-        """
+        """Return the operator-only captured stdout/stderr log path."""
         return self._logs_dir / f"{run_id}.log"
 
     def status_path(self, run_id: str) -> Path:
-        """Path to the runner-written terminal-cause ``status.json`` for a run.
-
-        :return: Operator-only status JSON path.
-        """
+        """Return the operator-only runner terminal-status path."""
         return self._logs_dir / f"{run_id}.status.json"
 
     def config_snapshot_path(self, run_id: str) -> Path:
-        """Path to the per-run config snapshot consumed by the detached runner.
-
-        :return: Operator-only config snapshot path.
-        """
+        """Return the operator-only immutable runner config path."""
         return self._logs_dir / f"{run_id}.config.yaml"
 
     def cleanup_uncertain_path(self, run_id: str) -> Path:
-        """Path to the server-owned marker for unconfirmed process cleanup.
-
-        :return: Operator-only cleanup uncertainty marker path.
-        """
+        """Return the operator-only unconfirmed-cleanup marker path."""
         return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
 
     def cleanup_recovery_path(self, run_id: str) -> Path:
-        """Path to the operator recovery evidence file for a run.
-
-        :return: Operator-only cleanup recovery JSON path.
-        """
+        """Return the operator-only cleanup recovery evidence path."""
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
     def launch_lease_path(self, run_id: str) -> Path:
-        """Path to the kernel-backed lease for a prepared launch.
-
-        :return: Private launch-lease path.
-        """
+        """Return the private kernel-backed launch lease path."""
         return self._logs_dir / f"{run_id}.launch.lock"
 
     def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
@@ -1388,29 +1364,17 @@ def _valid_cleanup_recovery(
 
 
 def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
-    """Return whether ``value`` is ``None`` or a positive non-bool ``int``.
-
-    :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or a positive non-bool integer.
-    """
+    """Accept None or a positive integer, excluding booleans."""
     return value is None or (type(value) is int and value > 0)
 
 
 def _valid_config_dir(value: object) -> TypeGuard[str]:
-    """Return whether ``value`` is an absolute directory path as a launch records it.
-
-    :param object value: Value to validate.
-    :return bool: Whether the value is an absolute path string without NUL.
-    """
+    """Accept absolute path strings without NUL."""
     return type(value) is str and "\0" not in value and Path(value).is_absolute()
 
 
 def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:
-    """Return whether ``value`` is ``None`` or a canonical Linux boot UUID.
-
-    :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or canonical lowercase UUID text.
-    """
+    """Accept None or canonical lowercase Linux boot UUID text."""
     if value is None:
         return True
     if type(value) is not str:
