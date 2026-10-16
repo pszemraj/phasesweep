@@ -15,7 +15,6 @@ from phasesweep.engine.state import (
 def _experiment_dir(experiment: Experiment) -> Path:
     """Return the artifact namespace for one experiment.
 
-    :param Experiment experiment: Experiment config with workdir and name.
     :return Path: Absolute directory for experiment artifacts.
     """
     return Path(experiment.workdir).expanduser().resolve() / experiment.experiment
@@ -24,8 +23,8 @@ def _experiment_dir(experiment: Experiment) -> Path:
 def _phase_dir(experiment: Experiment, phase_name: str) -> Path:
     """Return the artifact namespace for one phase.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name to append under the experiment directory.
+    :param Experiment experiment: Experiment config.
+    :param str phase_name: Phase name.
     :return Path: Directory for phase artifacts.
     """
     return _experiment_dir(experiment) / phase_name
@@ -34,8 +33,7 @@ def _phase_dir(experiment: Experiment, phase_name: str) -> Path:
 def _summary_path(experiment: Experiment) -> Path:
     """Return the experiment summary path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path: Path to the experiment summary YAML file.
+    :return Path: Experiment ``summary.yaml``.
     """
     return _experiment_dir(experiment) / "summary.yaml"
 
@@ -43,8 +41,7 @@ def _summary_path(experiment: Experiment) -> Path:
 def _run_log_path(experiment: Experiment) -> Path:
     """Path to the durable run log for one experiment.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path: Path to the experiment run log.
+    :return Path: Experiment ``run.log``.
     """
     return _experiment_dir(experiment) / "run.log"
 
@@ -59,8 +56,8 @@ def _trial_dir_for(
 ) -> Path:
     """Return a trial directory, uniquely scoped when execution ids are supplied.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name containing the trial.
+    :param Experiment experiment: Experiment config.
+    :param str phase_name: Owning phase.
     :param int trial_number: Optuna trial number.
     :param str | None generation_id: Current engine invocation id.
     :param str | None attempt_id: Current subprocess attempt id.
@@ -78,14 +75,8 @@ def _trial_dir_for(
 
 
 def _attempts_dir(experiment: Experiment) -> Path:
-    """Return the registry of trial and tracking attempts that may own a process.
+    """Return the trial and tracking attempt registry directory.
 
-    Entries are written at allocation. Trials retire after durable terminal state,
-    retaining entries until uncertain cleanup is recovered. Tracking entries retire
-    when their lifecycle proves no launch or confirmed cleanup. Recovery scans the
-    registry independently of the current phase graph.
-
-    :param Experiment experiment: Experiment config with artifact root details.
     :return Path: Directory containing active-attempt registry entries.
     """
     return _experiment_dir(experiment) / "attempts"
@@ -94,8 +85,7 @@ def _attempts_dir(experiment: Experiment) -> Path:
 def _artifact_root_binding_path(experiment: Experiment) -> Path:
     """Return the reverse artifact-root-to-storage ownership record.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path: Root binding JSON path inside the experiment namespace.
+    :return Path: Experiment ``artifact_root_binding.json``.
     """
     return _experiment_dir(experiment) / "artifact_root_binding.json"
 
@@ -103,8 +93,7 @@ def _artifact_root_binding_path(experiment: Experiment) -> Path:
 def _generation_path(experiment: Experiment) -> Path:
     """Return the current engine generation metadata path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path: Path to the current generation YAML file.
+    :return Path: Current ``generation.yaml`` pointer.
     """
     return _experiment_dir(experiment) / "generation.yaml"
 
@@ -112,7 +101,6 @@ def _generation_path(experiment: Experiment) -> Path:
 def _generations_dir(experiment: Experiment) -> Path:
     """Return the immutable generation-record root for an experiment.
 
-    :param Experiment experiment: Experiment config with artifact root details.
     :return Path: Directory containing all immutable per-generation namespaces.
     """
     return _experiment_dir(experiment) / "generations"
@@ -121,8 +109,8 @@ def _generations_dir(experiment: Experiment) -> Path:
 def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's immutable artifact namespace.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
     :return Path: Directory scoped to the given generation.
     """
     return _generations_dir(experiment) / generation_id
@@ -131,25 +119,22 @@ def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
 def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's lifecycle record path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :return Path: Path to the generation's lifecycle record YAML file.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
+    :return Path: Generation lifecycle ``generation.yaml``.
     """
     return _generation_dir(experiment, generation_id) / "generation.yaml"
 
 
-# A generation's summary is written only as the last step of a successful run,
-# so its presence is what separates a published generation from a claim-time
-# namespace whose run never got that far.
 GENERATION_SUMMARY_FILENAME = "summary.yaml"
 
 
 def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's summary path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :return Path: Path to the generation's summary YAML file.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
+    :return Path: Generation ``summary.yaml``.
     """
     return _generation_dir(experiment, generation_id) / GENERATION_SUMMARY_FILENAME
 
@@ -157,10 +142,10 @@ def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
     """Return one generation's phase-winner path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :param str phase_name: Phase name whose generation-scoped winner path is requested.
-    :return Path: Path to the phase's winner YAML file within the generation namespace.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
+    :param str phase_name: Owning phase.
+    :return Path: Generation-scoped phase winner YAML file.
     """
     return _generation_dir(experiment, generation_id) / "phases" / phase_name / WINNER_FILENAME
 
@@ -168,8 +153,7 @@ def _generation_winner_path(experiment: Experiment, generation_id: str, phase_na
 def _last_successful_generation_path(experiment: Experiment) -> Path:
     """Return the pointer to the last fully published generation.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :return Path: Path to the YAML file recording the last-successful generation id.
+    :return Path: ``last_successful_generation.yaml`` pointer.
     """
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
@@ -177,9 +161,9 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
 def _generation_config_snapshot_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's canonical config snapshot path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :return Path: Path to the generation's owner-only ``config.snapshot.yaml``.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
+    :return Path: Generation's owner-only ``config.snapshot.yaml``.
     """
     return _generation_dir(experiment, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
 
@@ -187,9 +171,9 @@ def _generation_config_snapshot_path(experiment: Experiment, generation_id: str)
 def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's shareable reproducibility-record path.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :return Path: Path to the generation's ``reproducibility.json``.
+    :param Experiment experiment: Experiment config.
+    :param str generation_id: Generation id.
+    :return Path: Generation ``reproducibility.json``.
     """
     return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
 
@@ -197,8 +181,8 @@ def _generation_reproducibility_path(experiment: Experiment, generation_id: str)
 def _winner_path(experiment: Experiment, phase_name: str) -> Path:
     """Return the path to a phase's persisted winner.
 
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name whose winner path is requested.
-    :return Path: Path to the persisted winner YAML file.
+    :param Experiment experiment: Experiment config.
+    :param str phase_name: Owning phase.
+    :return Path: Persisted phase winner YAML file.
     """
     return _phase_dir(experiment, phase_name) / WINNER_FILENAME

@@ -127,8 +127,6 @@ def _trial_dir_from_attr(
         return trial_dir
 
     stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    # recover-run reaps through here too, so it cannot repair the attribute;
-    # only the ledger that recorded it can.
     if not isinstance(stored, str) or not stored:
         if fallback is None:
             detail = (
@@ -191,7 +189,6 @@ def _require_trial_attempt(
         attempt id, so its process identity is unknown.
     """
     record = _trial_attempt_record(trial, phase_name, trial_dir)
-    # Recovery refusals must identify a remedy other than repeating recover-run.
     if record is None:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
@@ -414,8 +411,6 @@ def _open_attempt_registry(
     except FileNotFoundError:
         yield None, []
         return
-    # A missing platform capability is not a damaged registry, so it
-    # propagates with its own routing instead of this repair.
     except (OSError, UnsafePrivatePathError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry {attempts_dir} is not a real owner-only directory. "
@@ -427,7 +422,6 @@ def _open_attempt_registry(
         try:
             names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".json"))
         except OSError as exc:
-            # recover-run enumerates the same registry, so it cannot clear this.
             raise ProcessCleanupUncertainError(
                 f"Attempt registry {attempts_dir} cannot be enumerated safely. "
                 "Restore the original registry and access to it before retrying.",
@@ -447,8 +441,6 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
         — recovery cannot know whether a process from it is still alive.
     """
-    # recover-run loads every entry through here too, so it cannot clear a bad
-    # one: the entry file is what the operator repairs or removes.
     try:
         payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
     except (OSError, UnsafePrivatePathError, ValueError) as exc:
@@ -561,8 +553,6 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
         missing, so its process state cannot be verified.
     """
     trial_dir = Path(entry["trial_dir"])
-    # Inspection and confirmed recovery both stop at each evidence check, so
-    # recover-run cannot clear this entry; the operator repairs or removes it.
     if not trial_dir.is_dir():
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} points at a missing trial "
@@ -942,11 +932,7 @@ class _RegistryEntryDiscovery:
 
 @dataclass(frozen=True)
 class _TrialDiscovery:
-    """An attempt discovered through its stale RUNNING trial in a phase study.
-
-    ``mcp recover-run`` resolves trials this way too, so no refusal here
-    sends the operator back to recover-run.
-    """
+    """An attempt discovered through its stale RUNNING trial in a phase study."""
 
     lifecycle_settles: ClassVar[bool] = True
     study_name: str
@@ -962,7 +948,6 @@ class _TrialDiscovery:
             f"attempt lifecycle record is malformed or belongs to another attempt. "
             f"trial_dir={record.trial_dir}. Restore the original storage ledger and this "
             "attempt's lifecycle record before retrying recovery.",
-            # Either side may be the one that changed, so no one repair is the remedy.
             action=OperatorAction.INSPECT_LOGS,
         )
 
@@ -977,7 +962,6 @@ class _TrialDiscovery:
             f"durable process identity is missing, malformed, partial, or belongs to another "
             f"attempt. trial_dir={record.trial_dir}. Restore the original storage ledger and "
             "this attempt's process-identity files before retrying recovery.",
-            # Either side may be the one that changed, so no one repair is the remedy.
             action=OperatorAction.INSPECT_LOGS,
         )
 

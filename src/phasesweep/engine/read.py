@@ -417,9 +417,8 @@ def read_status(
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
 
-    Resolve the current and last-success pointers once each. Published winner and
-    summary facts come from that validation capture; a pinned unpublished generation
-    uses its own files. Pointer identities remain truthful even for a pinned read:
+    Resolve the current and last-success pointers once each. Published facts come
+    from that validation capture; pinned unpublished generations use their own files.
 
     - ``current_generation_id`` names the most recent invocation's mutable pointer.
     - ``published_generation_id`` names the validated last-success pointer.
@@ -429,63 +428,34 @@ def read_status(
       Failed validation exposes no published winner. Failure details are path-free;
       permission denial does not imply artifact corruption.
 
-    The ``phases`` progress view follows the current config. Metric labels and
-    ``result_phase_plan`` follow the represented generation. ``result_context`` and
-    ``published_config_matches_current`` report which semantics apply after config edits.
-    ``winner_present`` and ``summary_present`` refer to the represented generation.
+    Progress ``phases`` follow the current config. Metric labels and ``result_phase_plan``
+    use the represented summary's semantics, falling back to the current config when
+    absent; ``result_context`` identifies the source. ``published_config_matches_current``
+    compares semantic fingerprints, or is ``None`` without a recorded fingerprint.
+    Winner and summary presence refer to the represented generation.
 
     ``generation_trials`` counts the pinned generation, or the current generation in
     default mode. Other trial counts are cumulative. Counts and ``running_attempts``
     come from one storage capture. Absent studies have known zero counts; unreadable
     storage has ``trial_data_available=False`` and ``running_attempts=None``.
 
-    ``published_study_unavailable`` means a published phase's trial identity or
-    completion boundary could not be matched. With available trial data, history is
-    confirmed missing, replaced, or incomplete: execution is refused, although skipped
-    phases may load saved winners. With unavailable data, inspection was incomplete
-    and recovery may be required before further MCP launches. Artifact integrity is
-    reported separately.
-
-    MCP consumes this path-free payload; the CLI adds paths in its separate view.
+    ``published_study_unavailable`` marks unmatched published trial identities or
+    completion boundaries. Available trial data confirms missing/replaced/incomplete
+    history and refuses execution, although skipped phases may load saved winners.
+    Unavailable data means incomplete inspection and may require MCP recovery.
+    Artifact integrity is separate; the CLI adds paths in its own view.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
-    :param str | None generation_id: Optional invocation identity to pin the
-        read's *represented* generation: ``represented_generation_id`` and the
-        ``generation_trials``/winner/summary scope all equal this id, while
-        ``current_generation_id`` and ``published_generation_id`` remain the
-        actual (possibly different) pointers. Used by callers (e.g. MCP
-        per-run reads) that already know which generation they mean and want
-        its own view of itself. When omitted (the default),
-        ``represented_generation_id`` is the captured
-        ``published_generation_id`` and ``generation_trials`` scopes to the
-        captured ``current_generation_id``.
-    :param Experiment | None comparison_experiment: Optional current config to
-        use only for drift comparison and the no-result status semantics.
-        Artifact and trial reads still use ``experiment``. This lets a frozen
-        run config locate its own tree while a run-scoped MCP read compares the
-        represented result with the catalog config a future run would execute.
+    :param str | None generation_id: Pin represented artifacts and generation counts
+        without changing either pointer identity.
+    :param Experiment | None comparison_experiment: Current config for drift comparison
+        and no-result semantics; artifact and trial reads still use ``experiment``.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` is not a safe generation name.
-    :return EngineStatus: A mapping with the experiment name, the four
-        identity fields above, ``publication_integrity`` (plus
-        ``publication_error`` only when validation failed or was denied), the metric
-        descriptor, a per-phase list of trial counts plus winner presence, and
-        whether the represented summary has been written -- always path-free.
-        The metric descriptor is the *represented generation's own* recorded
-        metric whenever its summary declares one
-        (``result_context: "represented_generation"``), falling back to the
-        current config only when no summary semantics exist
-        (``result_context: "current_config"``) — a published x/minimize
-        result is never relabeled by a config edited to y/maximize.
-        ``result_phase_plan`` is likewise the represented generation's own
-        recorded phase plan, falling back to the current config's phase names
-        when no represented summary exists — it is the plan the publication's
-        winners must be enumerated under, and equals the ``phases`` list's
-        names whenever the config has not been edited since.
-        ``published_config_matches_current`` compares the summary's recorded
-        config fingerprint against the current config's semantic fingerprint;
-        ``None`` when the represented summary records no fingerprint.
+    :return EngineStatus: Path-free identities, integrity, metric/phase semantics,
+        trial counts, running attempts, and artifact presence. ``publication_error``
+        appears only for failed or permission-denied validation.
     """
     status, _publication = _read_status(
         experiment,
@@ -504,24 +474,20 @@ def read_result(
 ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
     """Read status and represented-generation winners from one pointer resolution.
 
-    Winners default to the recorded ``result_phase_plan``, preserving published names
-    after config edits. Published winners use validated bytes; other represented
-    generations are read permissively.
+    Identity and result semantics follow :func:`read_status`. Winners default to
+    ``result_phase_plan``; explicit ``phase_names`` filter winners without changing
+    status. Published winners use validated bytes; other generations are read permissively.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
-    :param str | None generation_id: Optional generation to represent, as for
-        :func:`read_status`.
-    :param Experiment | None comparison_experiment: Optional current config
-        for drift comparison, as for :func:`read_status`.
-    :param Sequence[str] | None phase_names: Optional safe phase names to select
-        winners in the supplied order; an empty sequence selects none. This
-        filters only winners, leaving status and its recorded phase plan intact.
+    :param str | None generation_id: Optional generation to represent.
+    :param Experiment | None comparison_experiment: Current config for drift comparison.
+    :param Sequence[str] | None phase_names: Safe phase names in output order;
+        an empty sequence selects none.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or an explicit phase name is not safe.
-    :return tuple[EngineStatus, list[PhaseWinnerView]]: The path-free
-        :func:`read_status` payload and one winner view per recorded phase
-        that has a usable winner.
+    :return tuple[EngineStatus, list[PhaseWinnerView]]: Status and usable winners
+        in the selected phase order.
     """
     names = (
         None

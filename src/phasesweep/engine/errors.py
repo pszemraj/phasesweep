@@ -25,10 +25,7 @@ class StudyContextConflictError(PhaseSweepError):
 
 
 class ArtifactRootConflictError(PhaseSweepError):
-    """Raised when a study or artifact tree names a different publication owner.
-
-    Reuse the original workdir or choose a fresh artifact root and local storage.
-    """
+    """Raised when a study or artifact tree names a different publication owner."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
@@ -36,8 +33,7 @@ class ArtifactRootConflictError(PhaseSweepError):
 class PublicationIntegrityError(PhaseSweepError):
     """Raised when a recorded publication exists but fails validation.
 
-    Readers distinguish this from an absent publication. Resume and forward runs
-    refuse it before replacing the last-success pointer.
+    This is distinct from an absent publication.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
@@ -46,19 +42,14 @@ class PublicationIntegrityError(PhaseSweepError):
 class PublicationAccessError(PhaseSweepError):
     """Raised when the current user cannot validate a publication.
 
-    Expose no published result without validation. Permission denial does not prove
-    corruption; the publishing user must validate the artifacts.
+    Permission denial does not establish corruption; no published result is exposed.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
 
 class PublicationCommitError(PhaseSweepError):
-    """Raised when a completed generation fails its pre-commit publication validation.
-
-    The new generation remains unpublished; read-side access and integrity verdicts
-    use their separate exception types.
-    """
+    """Raised when a completed generation fails its pre-commit publication validation."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
@@ -80,11 +71,7 @@ class RunRequestError(PhaseSweepError):
 
 
 class TrialEvidenceMissingError(PhaseSweepError):
-    """Raised when a selection-eligible trial lacks its recorded on-disk evidence.
-
-    Refuse selection rather than republishing unsupported results or dropping eligible
-    trials, which would change the ranked population.
-    """
+    """Raised to refuse selection of a trial whose recorded evidence is missing."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
@@ -115,9 +102,7 @@ class PublishedStudyMissingError(PhaseSweepError):
 class ActiveAttemptPersistenceError(PhaseSweepError):
     """Raised when required recovery state cannot persist before launch.
 
-    The allocated lifecycle marker proves no process started; the experiment registry
-    retains attempts across phase or storage changes. Failure to write either prevents
-    trainer launch and GPU acquisition. Restore access to the experiment tree.
+    Launch and GPU acquisition stop when recovery state cannot be persisted.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE

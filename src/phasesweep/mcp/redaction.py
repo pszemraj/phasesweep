@@ -162,15 +162,9 @@ def status_payload(
     result_source: ResultSource,
     elapsed_seconds: int | None,
 ) -> dict[str, Any]:
-    """Build the ``get_run_status`` payload from path-free trial and process state.
+    """Map ``read_status`` and detached-run state to the ``get_run_status`` payload.
 
-    Timing fields are durations in seconds. Trial progress belongs to the current or
-    pinned generation; winner and summary facts belong to ``represented_generation_id``.
-    ``is_published`` records whether that represented generation is published.
-
-    Forward publication integrity without its operator-only free-text error. Forward
-    result context, config agreement and recorded phase plan alongside the current
-    config's phase list.
+    Omit operator-only free-text publication errors.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.

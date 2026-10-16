@@ -814,7 +814,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         limit: ListLimit = DEFAULT_LIST_LIMIT,
         cursor: MaybeCursor = None,
     ) -> ListExperimentsResult:
-        """List cataloged experiments: ids, descriptions, phase names, and optimization metric. Use next_cursor to fetch more.
+        """Validate the paginated catalog result.
 
         :param ListLimit limit: Maximum catalog entries to return.
         :param MaybeCursor cursor: Optional pagination cursor from a prior result.
@@ -825,7 +825,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
-        """Explain a configuration key and everything below it, or list the top-level keys. Read-only; needs no catalog entry.
+        """Validate the configuration-reference result.
 
         :param ConfigKey key: Optional config key, such as ``phases[].sampler``.
         :return ExplainConfigResult: Matching reference entries, or the closest documented keys.
@@ -833,7 +833,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         return ExplainConfigResult.model_validate(app.explain_config(key))
 
     async def inspect_experiment(experiment_id: ExperimentId) -> InspectExperimentResult:
-        """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
+        """Validate the experiment inspection result.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
         :return InspectExperimentResult: Structured inspection payload.
@@ -843,7 +843,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
-        """Return the newest recorded MCP run for one experiment, already selected by launch time.
+        """Validate the latest-run result.
 
         :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
         :return GetLatestRunResult: One computed run handle or ``found=false``.
@@ -853,7 +853,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     async def get_run_status(run_id: RunId) -> GetRunStatusResult:
-        """Return per-phase trial counts, winner presence, and one run's process state.
+        """Validate the run-status result.
 
         :param RunId run_id: Detached run id returned by launch_run or get_latest_run.
         :return GetRunStatusResult: Structured status payload.
@@ -864,7 +864,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         run_id: RunId,
         timeout_seconds: AwaitTimeoutSeconds = AWAIT_DEFAULT_TIMEOUT_SECONDS,
     ) -> AwaitRunResult:
-        """Block until a launched run changes or the timeout elapses, then return its status. Read-only.
+        """Wait for a run update and validate the result.
 
         :param RunId run_id: Detached run id to wait on.
         :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current status.
@@ -876,7 +876,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         return result
 
     async def get_run_results(run_id: RunId) -> GetRunResultsResult:
-        """Return policy-filtered winning sampled hyperparameters for one run.
+        """Validate the run-results payload.
 
         :param RunId run_id: Detached run id returned by launch_run or get_latest_run.
         :return GetRunResultsResult: Structured results payload.
@@ -887,7 +887,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
     ) -> LaunchRunResult:
-        """Start the sweep for an experiment as a background run. Optionally resume from a phase whose earlier winners already exist. Returns a run_id.
+        """Launch a detached run and validate the result.
 
         :param ExperimentId experiment_id: Catalog experiment id to launch.
         :param MaybePhaseName from_phase: Optional phase to resume from.
@@ -898,7 +898,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     async def cancel_run(run_id: RunId) -> CancelRunResult:
-        """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
+        """Cancel a run and validate the result.
 
         :param RunId run_id: Detached run id to cancel.
         :return CancelRunResult: Structured cancellation result.

@@ -198,7 +198,6 @@ class EvidenceSource(Protocol):
 def repeat_axis(phase: Phase) -> RepeatAxis | None:
     """Return a phase's repeat axis, or ``None`` for a phase without repeats.
 
-    :param Phase phase: The phase.
     :return RepeatAxis | None: The axis, slotted by repeat count under seeded random.
     """
     repeats = phase.repeats

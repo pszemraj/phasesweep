@@ -933,13 +933,9 @@ def _private_atomic_writer(
 
     :param Path path: Destination path to replace.
     :param bool require_private_dir: Whether the destination directory must
-        itself be owner-only. ``True`` for the hardened namespaces (locks, MCP
-        ``state_dir``). ``False`` for an owner-only FILE inside an
-        operator-trusted directory — the experiment artifact tree, whose
-        directories are deliberately not owner-only (see the trust-boundary
-        note in ``docs/runtime.md``). The file is created ``0600`` and an
-        existing destination is still refused unless it is a private, unshared
-        regular file, either way.
+        itself be owner-only, as in lock and MCP state namespaces. ``False``
+        permits the operator-trusted experiment artifact tree. In either case,
+        an existing destination must be a private, unshared regular file.
     :param bool strict_dir_fsync: Raise on directory-fsync failure after replacement.
     :raises OSError: Staging or replacement failed, or strict directory fsync failed.
     :return Iterator[IO[str]]: Writable text handle on the temporary file,

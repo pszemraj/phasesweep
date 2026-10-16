@@ -332,25 +332,20 @@ def _publish_generation(
 ) -> None:
     """Commit a generation as the experiment's last successful publication.
 
-    Under an absorbed-shutdown-signal window:
+    Validate the immutable summary and manifest, record any missing prior publication
+    record, and durably prepare the detached-runner hook before atomically writing
+    ``last_successful_generation.yaml``. That pointer write is the commit: earlier
+    failures preserve the prior pointer, record ``publication_failed`` best-effort,
+    and reraise the original error.
 
-    1. Validate the already-written immutable summary and artifact manifest.
-    2. Record the prior pointer target as published if its lifecycle record is missing.
-    3. Require any detached-runner hook to durably prepare the frozen result.
-    4. Atomically commit ``last_successful_generation.yaml``.
+    After commit, sidecar notification, lifecycle recording, and current-pointer /
+    convenience-projection refresh run best-effort with logged failures. Readers
+    use immutable generation artifacts.
 
-    A failure before commit preserves the prior pointer, records ``publication_failed``
-    best-effort, and reraises the original error. The pointer write is the authoritative
-    publication event.
-
-    After commit, independently notify the sidecar, create the published lifecycle
-    record, refresh the current pointer, and project convenience root artifacts.
-    Each step logs its failures without failing the run or preventing subsequent
-    steps. Readers use immutable generation artifacts, not convenience projections.
-
-    A shutdown before this window cancels without publication. One received inside
-    is deferred until durable classification, then honored at the next launch or
-    runner-terminal checkpoint before further work starts.
+    Shutdown signals are absorbed during publication. A shutdown before this window
+    cancels without publication; one received inside is deferred until durable
+    classification, then honored at the next launch or runner-terminal checkpoint
+    before further work starts.
 
     :param Experiment experiment: Experiment whose generation is being published.
     :param str generation_id: Immutable generation namespace to publish.
@@ -358,14 +353,12 @@ def _publish_generation(
     :param Mapping[str, Winner] winners: Engine-selected winners to hand to a
         required publication sidecar.
     :param PublicationHook | None publication_hook: Optional detached-run sidecar.
-    :raises Exception: Whatever steps 2 through 5 raised, after best-effort
-        "publication_failed" bookkeeping.
+    :raises Exception: A pre-commit publication step failed, after best-effort
+        ``publication_failed`` bookkeeping.
     """
     with absorb_shutdown_signals() as absorbed:
         try:
             publication, summary_bytes = _validate_generation_publishable(experiment, generation_id)
-            # Before the pointer stops naming its current target, which may
-            # have no record yet if its invocation died after the commit.
             _record_superseded_publication(experiment, superseding_id=generation_id)
             if publication_hook is not None:
                 publication_hook.prepare(

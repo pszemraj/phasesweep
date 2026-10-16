@@ -237,8 +237,7 @@ CONSTRAINT_PREFIX = "constraint:"
 def constraint_attr(name: str) -> str:
     """Return the persisted user-attr key for a constraint value.
 
-    :param str name: Constraint name from the experiment config.
-    :return str: Optuna user-attr key used to store the constraint value.
+    :return str: ``constraint:`` key for ``name``.
     """
     return f"{CONSTRAINT_PREFIX}{name}"
 
@@ -249,8 +248,7 @@ OBSERVED_PREFIX = "observed:"
 def observed_attr(name: str) -> str:
     """Return the persisted user-attr key for a report-only observed value.
 
-    :param str name: Observation name from the experiment config.
-    :return str: Optuna user-attr key used to store the observed value.
+    :return str: ``observed:`` key for ``name``.
     """
     return f"{OBSERVED_PREFIX}{name}"
 

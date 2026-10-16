@@ -1,9 +1,4 @@
-"""Run one detached sweep and record its terminal cause in ``status.json``.
-
-The MCP server supplies a frozen config, captures stdout/stderr and starts a separate
-session in its state directory. The runner enters the project directory only after
-its process identity is durable.
-"""
+"""Run one detached sweep and persist its terminal status."""
 
 from __future__ import annotations
 
@@ -554,10 +549,6 @@ def _write_status(
     :return bool: Whether durable terminal evidence exists, i.e. some record
         (``pending``, ``complete``, or ``failed``) reached disk. ``False`` only
         when nothing could be persisted at all.
-    :raises RuntimeError: Raised and handled in-process when no snapshot was
-        captured; it never reaches the caller, because a missing snapshot is
-        recorded as ``result_snapshot_state="failed"`` instead of failing the
-        already-durable terminal evidence.
     """
     log = logging.getLogger("phasesweep.mcp.runner")
     # Defer shutdown through persistence, including signals absorbed during capture.

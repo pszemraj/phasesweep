@@ -2,12 +2,6 @@
 
 Trainers run in separate process groups tracked by :mod:`phasesweep.runtime.shutdown`.
 Probing and termination live in :mod:`phasesweep.runtime.reaper`.
-
-The stdlib-only supervisor starts directly under ``python -I -S`` with only
-``PATH`` in its environment. Its blocked child becomes the recorded group
-leader; only a durable ``process_identity.json`` permits delivery of the
-trainer command and environment. The supervisor remains outside that group
-and holds GPU leases until the group is gone.
 """
 
 from __future__ import annotations
