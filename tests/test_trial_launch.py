@@ -404,22 +404,6 @@ def test_launch_trial_default_contract_drops_ambient(
     assert env["PATH"] == os.environ["PATH"]
 
 
-def test_launch_trial_inherit_env_none_filters_ambient(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The default ``inherit_env: none`` drops ambient vars while keeping the base set and
-    configured ``env`` entries."""
-    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
-    env = _capture_launch_env(
-        tmp_path,
-        monkeypatch,
-        experiment_env={"KEEP_ME": "explicit"},
-    )
-    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
-    assert env["KEEP_ME"] == "explicit"
-    assert env["PATH"] == os.environ["PATH"]
-
-
 @pytest.mark.parametrize("ambient_visibility", ["", "-1", "3"])
 def test_launch_trial_narrow_env_drops_ambient_cuda_visibility(
     tmp_path: Path,

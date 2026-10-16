@@ -8,9 +8,8 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
-from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -173,22 +172,6 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
         assert signal.getsignal(sig) is sentinel_handlers[sig]
 
 
-def _worker_errors(operation: Callable[[], None]) -> list[BaseException]:
-    """Run one operation on a worker and return captured failures."""
-    errors: list[BaseException] = []
-
-    def worker() -> None:
-        try:
-            operation()
-        except BaseException as exc:  # noqa: BLE001 - returned for the main thread to assert on
-            errors.append(exc)
-
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join()
-    return errors
-
-
 def _enter_signal_handler_scope() -> None:
     """Enter and leave one signal-handler scope."""
     with signal_handler_scope():
@@ -206,10 +189,8 @@ def test_signal_handler_scope_raises_off_main_thread_without_prior_install() -> 
         if signal.getsignal(sig) is runtime_shutdown._shutdown_handler:
             signal.signal(sig, signal.SIG_DFL)
 
-    errors = _worker_errors(_enter_signal_handler_scope)
-
-    assert len(errors) == 1
-    assert isinstance(errors[0], SignalOwnershipUnavailableError)
+    with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(SignalOwnershipUnavailableError):
+        pool.submit(_enter_signal_handler_scope).result()
 
 
 def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals() -> None:
@@ -225,9 +206,8 @@ def test_signal_handler_scope_is_noop_once_process_lifetime_install_owns_signals
     for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
         assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
 
-    errors = _worker_errors(_enter_signal_handler_scope)
-
-    assert errors == []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(_enter_signal_handler_scope).result() is None
     # Entry-point ownership persists: the nested scope did not tear it down.
     for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
         assert signal.getsignal(sig) is runtime_shutdown._shutdown_handler
@@ -278,11 +258,13 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
         signal.signal(sig, host_handler)
 
     with signal_handler_scope():
-        errors = _worker_errors(install_signal_handlers)
+        with (
+            ThreadPoolExecutor(max_workers=1) as pool,
+            pytest.raises(SignalOwnershipUnavailableError),
+        ):
+            pool.submit(install_signal_handlers).result()
         assert not runtime_shutdown._process_lifetime_owner
 
-    assert len(errors) == 1
-    assert isinstance(errors[0], SignalOwnershipUnavailableError)
     assert not runtime_shutdown._process_lifetime_owner
     # The scope's exit restored the host's handlers because no legitimate
     # process-lifetime handover happened.
@@ -413,21 +395,49 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
 
 
 @pytest.mark.integration
-def test_install_signal_handlers_unblocks_inherited_shutdown_mask() -> None:
-    """Startup should recover if the orchestrator inherited blocked SIGTERM."""
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
-    code = r"""
-import os, signal
-from phasesweep.runtime.shutdown import install_signal_handlers, defer_shutdown_signals
-signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
-install_signal_handlers()
-with defer_shutdown_signals():
-    print("queued", flush=True)
-    os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-"""
+@pytest.mark.parametrize(
+    ("body", "marker"),
+    [
+        pytest.param(
+            "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
+            "install_signal_handlers()\n"
+            "with defer_shutdown_signals():\n"
+            "    print('queued', flush=True)\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n",
+            "queued",
+            id="inherited-shutdown-mask",
+            marks=pytest.mark.skipif(
+                not hasattr(signal, "pthread_sigmask"), reason="pthread_sigmask not available"
+            ),
+        ),
+        pytest.param(
+            "install_signal_handlers()\n"
+            "with defer_shutdown_signals(), _launch_lock:\n"
+            "    print('queued', flush=True)\n"
+            "    os.kill(os.getpid(), signal.SIGTERM)\n",
+            "queued",
+            id="launch-lock",
+        ),
+        pytest.param(
+            "install_signal_handlers()\n"
+            "with defer_shutdown_signals():\n"
+            "    with _lock:\n"
+            "        print('locked', flush=True)\n"
+            "        os.kill(os.getpid(), signal.SIGTERM)\n",
+            "locked",
+            id="registry-lock",
+        ),
+    ],
+)
+def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> None:
+    """Queued shutdown exits after restoring inherited masks or leaving held critical locks."""
+    code = (
+        "import os, signal\n"
+        "from phasesweep.runtime.shutdown import (install_signal_handlers, "
+        "defer_shutdown_signals, _launch_lock, _lock)\n"
+        + body
+        + "print('post-context', flush=True)\n"
+    )
     proc = subprocess.run(
         [sys.executable, "-c", code],
         text=True,
@@ -435,53 +445,8 @@ print("post-context", flush=True)
         timeout=5.0,
         check=False,
     )
-    assert "queued" in proc.stdout
+    assert marker in proc.stdout
     assert proc.returncode == 128 + signal.SIGTERM
-
-
-@pytest.mark.integration
-def test_pending_sigterm_inside_signal_deferred_sections_does_not_deadlock() -> None:
-    """Queued SIGTERM must not deadlock while launch or registry locks are held."""
-    cases = [
-        (
-            "launch_lock",
-            "queued",
-            r"""
-import os, signal
-from phasesweep.runtime.shutdown import install_signal_handlers, defer_shutdown_signals, _launch_lock
-install_signal_handlers()
-with defer_shutdown_signals(), _launch_lock:
-    print("queued", flush=True)
-    os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-""",
-        ),
-        (
-            "registry_lock",
-            "locked",
-            r"""
-import os, signal
-from phasesweep.runtime.shutdown import install_signal_handlers, defer_shutdown_signals, _lock
-install_signal_handlers()
-with defer_shutdown_signals():
-    with _lock:
-        print("locked", flush=True)
-        os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-""",
-        ),
-    ]
-
-    for case, marker, code in cases:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            text=True,
-            capture_output=True,
-            timeout=5.0,
-            check=False,
-        )
-        assert marker in proc.stdout, case
-        assert proc.returncode == 128 + signal.SIGTERM, case
 
 
 @pytest.mark.integration

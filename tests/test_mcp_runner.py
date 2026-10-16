@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import optuna
 import pytest
@@ -868,14 +868,8 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
     """Discovery failure during reconciliation cannot attest to unscanned attempts."""
     experiment = make_experiment(workdir=tmp_path / "runs")
     cleanup_error = error_type("artifact root cannot be inspected")
-    registry_scans = 0
-
-    def fail_discovery(*args: object, **kwargs: object) -> None:
-        raise cleanup_error
-
-    def scan_registry(*args: object, **kwargs: object) -> None:
-        nonlocal registry_scans
-        registry_scans += 1
+    scan_registry = Mock(return_value=None)
+    fail_discovery = Mock(side_effect=cleanup_error)
 
     def fail_run(*args: object, **kwargs: object) -> None:
         # Initial discovery and preflight succeeded. Only reconciliation loses
@@ -891,7 +885,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
-    assert registry_scans == 1
+    scan_registry.assert_called_once()
     assert len(captured) == 1
     assert isinstance(captured[0].primary_error, NoFeasibleTrialError)
     assert captured[0].cleanup_confirmed is False
@@ -1199,16 +1193,11 @@ def test_transient_terminal_status_write_failure_is_retried(
     """
     status_path = tmp_path / "status.json"
     monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
-    real_replace = os.replace
-    replacements: list[object] = []
-
-    def replace_failing_once(src: object, dst: object, **kwargs: object) -> None:
-        replacements.append(dst)
-        if len(replacements) == 1:
-            raise OSError("simulated transient atomic replace failure")
-        real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_failing_once)
+    replace_file = Mock(
+        wraps=os.replace,
+        side_effect=[OSError("simulated transient atomic replace failure"), DEFAULT, DEFAULT],
+    )
+    monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_file)
 
     assert (
         mcp_runner._write_status(
@@ -1221,7 +1210,7 @@ def test_transient_terminal_status_write_failure_is_retried(
     )
 
     # Failed pending write, its retry, then the complete write.
-    assert len(replacements) == 3
+    assert replace_file.call_count == 3
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "complete"
     assert final["result_snapshot"] == {"captured": True}
@@ -1266,13 +1255,8 @@ def test_exhausted_status_write_retries_report_missing_terminal_evidence(
 ) -> None:
     """When nothing can be persisted, say so instead of returning as if it were."""
     status_path = tmp_path / "status.json"
-    attempts: list[Path] = []
-
-    def refuse_every_write(path: Path, _payload: dict) -> None:
-        attempts.append(path)
-        raise OSError("simulated persistent status write failure")
-
-    monkeypatch.setattr(mcp_runner, "write_status_file", refuse_every_write)
+    write_status = Mock(side_effect=OSError("simulated persistent status write failure"))
+    monkeypatch.setattr(mcp_runner, "write_status_file", write_status)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
         assert (
@@ -1285,7 +1269,7 @@ def test_exhausted_status_write_retries_report_missing_terminal_evidence(
             is False
         )
 
-    assert len(attempts) == 3
+    assert write_status.call_count == 3
     assert not status_path.exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
 

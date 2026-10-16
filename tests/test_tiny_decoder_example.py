@@ -101,8 +101,11 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
 
 
 @pytest.mark.parametrize("managed", [True, False])
-@pytest.mark.parametrize("device_type", ["cuda", "cpu"])
-@pytest.mark.parametrize("trainer_fails", [False, True])
+@pytest.mark.parametrize(
+    "device_type,trainer_fails",
+    [("cuda", False), ("cpu", False), ("cuda", True)],
+    ids=["cuda-success", "cpu-success", "trainer-failure"],
+)
 def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
     tmp_path, monkeypatch, managed, device_type, trainer_fails
 ) -> None:

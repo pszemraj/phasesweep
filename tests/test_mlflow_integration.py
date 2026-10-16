@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -28,8 +29,8 @@ from phasesweep.tracking.publication import delivery_status, sync_tracking
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-def local_server(tmp_path):
+@contextmanager
+def _server(tmp_path):
     """Provision explicit SQLite and proxied artifact storage outside the tree."""
     pytest.importorskip("mlflow.server")
     from mlflow import MlflowClient
@@ -73,11 +74,31 @@ def local_server(tmp_path):
                         pytest.fail((tmp_path / "server.log").read_text())
                     time.sleep(0.1)
             client = MlflowClient(tracking_uri=uri)
-            experiment_id = client.create_experiment("phasesweep-native")
-            yield uri, client, experiment_id, process
+            yield uri, client, process
         finally:
             process.terminate()
             process.wait(timeout=15)
+
+
+@pytest.fixture(scope="module")
+def shared_server(tmp_path_factory):
+    """Keep one HTTP server for cases that leave its process running."""
+    with _server(tmp_path_factory.mktemp("mlflow-server")) as server:
+        yield server
+
+
+@pytest.fixture
+def local_server(shared_server, tmp_path):
+    """Give each case a fresh explicit experiment on the shared server."""
+    uri, client, process = shared_server
+    return uri, client, client.create_experiment(tmp_path.name), process
+
+
+@pytest.fixture
+def offline_server(tmp_path):
+    """Give an offline replay its own server process to terminate."""
+    with _server(tmp_path) as (uri, client, process):
+        yield uri, client, client.create_experiment("phasesweep-native"), process
 
 
 @pytest.fixture
@@ -198,6 +219,8 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
             "mlflow": experiment.mlflow.model_copy(
                 update={
                     "tracking_uri": server.uri,
+                    "experiment_id": server.experiment_id,
+                    "experiment_name": None,
                     "timeout_seconds": timeout_seconds,
                     "poll_seconds": 0.05,
                 }
@@ -272,9 +295,9 @@ def test_create_committing_after_the_controller_gave_up_is_bound_later(
 
 
 @pytest.mark.parametrize("mode", ["managed", "trainer"])
-def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch, mode):
+def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypatch, mode):
     """Both ownership modes publish four trials and replay without the SDK/server."""
-    uri, client, experiment_id, process = local_server
+    uri, client, experiment_id, process = offline_server
     config = yaml.safe_load((Path(__file__).parents[1] / "examples" / "mlflow.yaml").read_text())
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
@@ -437,7 +460,13 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = f"{sys.executable} {trainer} --config {{config_path}}"
-    config["mlflow"].update(tracking_uri=uri, timeout_seconds=15, poll_seconds=0.05)
+    config["mlflow"].update(
+        tracking_uri=uri,
+        experiment_id=experiment_id,
+        experiment_name=None,
+        timeout_seconds=15,
+        poll_seconds=0.05,
+    )
     config["phases"][0].update(max_consecutive_failures=1)
     experiment = Experiment.model_validate(config)
     actual_call = publication.call_tracking

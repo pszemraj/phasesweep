@@ -8,6 +8,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
+from unittest.mock import DEFAULT, Mock
 
 import optuna
 import pytest
@@ -89,16 +90,6 @@ from tests.recovery_helpers import (
     write_trial_identity,
     write_uncertain_failed_trial,
 )
-
-
-def _counting_success_callback(calls: list[None]) -> Callable[..., bool]:
-    """Return a permissive cleanup stub that records each invocation."""
-
-    def callback(*args: object, **kwargs: object) -> bool:
-        calls.append(None)
-        return True
-
-    return callback
 
 
 def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
@@ -456,20 +447,15 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
     monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
     monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
-    signalled: list[object] = []
-
-    def record_signal(*args: object, **kwargs: object) -> bool:
-        signalled.append((args, kwargs))
-        return True
-
-    monkeypatch.setattr(mcp_recovery, "kill_stale_group", record_signal)
+    signal_group = Mock(return_value=True)
+    monkeypatch.setattr(mcp_recovery, "kill_stale_group", signal_group)
 
     for confirmed in (False, True):
         result = recover_run_cli(registry.state_dir, run_id, confirm=confirmed)
         assert result.exit_code != 0
         assert "boot id" in f"{result.output} {result.exception}".lower()
 
-    assert signalled == []
+    signal_group.assert_not_called()
     assert store.cleanup_uncertain_path(run_id).is_file()
 
 
@@ -498,13 +484,8 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
 
-    signalled: list[object] = []
-
-    def spy_kill_stale_group(*args: object, **kwargs: object) -> bool:
-        signalled.append((args, kwargs))
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", spy_kill_stale_group)
+    signal_group = Mock(return_value=True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", signal_group)
 
     dry = recover_run_cli(registry.state_dir, run_id)
     assert dry.exit_code == 0, dry.output
@@ -513,7 +494,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
     assert confirmed.exit_code == 0, confirmed.output
     assert "Cleared cleanup uncertainty" in confirmed.output
-    assert signalled == []
+    signal_group.assert_not_called()
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
@@ -579,20 +560,14 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     reg = registry.get("srv")
     run_id = "srv-recovery-lock-contention"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
-    cleanup_calls = 0
-
-    def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
-        nonlocal cleanup_calls
-        cleanup_calls += 1
-        return True
-
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", unexpected_cleanup)
+    cleanup = Mock(return_value=True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", cleanup)
     with _experiment_lock(reg.experiment):
         result = recover_run_cli(registry.state_dir, run_id, confirm=True)
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
-    assert cleanup_calls == 0
+    cleanup.assert_not_called()
     assert store.cleanup_uncertain_path(run_id).is_file()
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
@@ -726,34 +701,24 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     )
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
 
-    runner_cleanup_calls: list[None] = []
-    trial_cleanup_allowed = False
-    trial_cleanup_calls = 0
-
-    def trial_cleanup(_identity: StaleProcessIdentity) -> bool:
-        nonlocal trial_cleanup_calls
-        trial_cleanup_calls += 1
-        return trial_cleanup_allowed
-
-    monkeypatch.setattr(
-        "phasesweep.mcp.recovery.kill_stale_group",
-        _counting_success_callback(runner_cleanup_calls),
-    )
+    runner_cleanup = Mock(return_value=True)
+    trial_cleanup = Mock(return_value=False)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", runner_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", trial_cleanup)
 
     dry = recover_run_cli(registry.state_dir, run_id)
 
     assert dry.exit_code == 0, dry.output
     assert "reconcile 1 registered attempt" in dry.output
-    assert len(runner_cleanup_calls) == 0
-    assert trial_cleanup_calls == 0
+    runner_cleanup.assert_not_called()
+    trial_cleanup.assert_not_called()
 
     refused = recover_run_cli(registry.state_dir, run_id, confirm=True)
 
     assert refused.exit_code != 0
     assert "may still have a live process group" in refused.output
-    assert len(runner_cleanup_calls) == 1
-    assert trial_cleanup_calls == 1
+    runner_cleanup.assert_called_once()
+    trial_cleanup.assert_called_once()
     assert entry_path.is_file()
     assert not store.status_path(run_id).exists()
     assert not store.cleanup_recovery_path(run_id).exists()
@@ -761,7 +726,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
-    trial_cleanup_allowed = True
+    trial_cleanup.return_value = True
     confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
 
     assert confirmed.exit_code == 0, confirmed.output
@@ -1445,8 +1410,8 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     cleanup or re-reaping the stale trial.
     """
     run_id = "srv-retry-result-repair"
-    runner_cleanup_calls: list[None] = []
-    trial_cleanup_calls: list[None] = []
+    runner_cleanup = Mock(return_value=True)
+    trial_cleanup = Mock(return_value=True)
 
     app, store, handle, attempt_id, recover = _stage_stale_running_recovery_scaffold(
         tmp_path,
@@ -1455,37 +1420,19 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         include_generation_record=True,
         mark_cleanup_uncertain=False,
         snapshot_bound_to_generation=True,
-        kill_stale_group_stub=_counting_success_callback(runner_cleanup_calls),
-        cleanup_trial_stub=_counting_success_callback(trial_cleanup_calls),
+        kill_stale_group_stub=runner_cleanup,
+        cleanup_trial_stub=trial_cleanup,
         monkeypatch=monkeypatch,
         earlier_boot=earlier_boot,
     )
     assert store.state(handle) == ("failed" if earlier_boot else "running")
     assert store.recovery_required(handle)
 
-    snapshot_calls = 0
-    snapshot_attempt_ids: list[set[str]] = []
-
-    def flaky_snapshot(
-        snapshot: dict,
-        *,
-        confirmed_attempt_ids=(),
-        confirmed_attempt_locations=None,
-    ) -> dict:
-        nonlocal snapshot_calls
-        snapshot_calls += 1
-        snapshot_attempt_ids.append(set(confirmed_attempt_ids))
-        if snapshot_calls == 1:
-            # An operator-repairable failure: recovery reports it as a refusal,
-            # whereas a defect would reach the internal-error boundary instead.
-            raise OSError("snapshot finalization failed")
-        return finalize_result_snapshot(
-            snapshot,
-            confirmed_attempt_ids=confirmed_attempt_ids,
-            confirmed_attempt_locations=confirmed_attempt_locations,
-        )
-
-    monkeypatch.setattr("phasesweep.mcp.recovery.finalize_result_snapshot", flaky_snapshot)
+    snapshot = Mock(
+        wraps=finalize_result_snapshot,
+        side_effect=[OSError("snapshot finalization failed"), DEFAULT],
+    )
+    monkeypatch.setattr("phasesweep.mcp.recovery.finalize_result_snapshot", snapshot)
 
     first = recover()
 
@@ -1499,17 +1446,20 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     frozen_status = app.status(run_id=run_id)
     assert frozen_status["result_source"] == "frozen_run_snapshot"
     assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
-    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
-    assert len(trial_cleanup_calls) == 1
+    assert runner_cleanup.call_count == (0 if earlier_boot else 1)
+    trial_cleanup.assert_called_once()
 
     retry = recover()
 
     assert retry.exit_code == 0, retry.output
     assert "Finalized stored terminal result snapshot" in retry.output
-    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
-    assert len(trial_cleanup_calls) == 1
-    assert snapshot_calls == 2
-    assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]
+    assert runner_cleanup.call_count == (0 if earlier_boot else 1)
+    trial_cleanup.assert_called_once()
+    assert snapshot.call_count == 2
+    assert [set(call.kwargs["confirmed_attempt_ids"]) for call in snapshot.call_args_list] == [
+        {attempt_id},
+        {attempt_id},
+    ]
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"
     phase = terminal["result_snapshot"]["status"]["phases"][0]

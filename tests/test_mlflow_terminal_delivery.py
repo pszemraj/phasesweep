@@ -55,7 +55,7 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.test_mlflow import _binding, _run, native_experiment
+from tests.test_mlflow import _binding, _run, _WorkerProcess, native_experiment
 
 
 @pytest.mark.parametrize("requested", ["FINISHED", "FAILED", "KILLED"])
@@ -823,44 +823,6 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
     ]
 
 
-def _stub_mlflow_worker_process(monkeypatch, reply, late, *, unreadable):
-    """Replace only the MLflow worker process behind the real controller and its response reader.
-
-    The worker answers every request with ``reply`` for the run ``late`` names: ``"ok"``
-    reports the run created and ``"unknown"`` reports that it may still be created. With
-    ``unreadable``, the controller's first read of a worker response fails with EIO. Trainer
-    processes still run for real.
-    """
-    import errno
-
-    from phasesweep.runtime import process
-    from phasesweep.runtime.process import ProcessResult
-
-    real_supervised = process.run_supervised
-    real_read = Path.read_text
-    faults = [OSError(errno.EIO, "injected worker response read failure")] if unreadable else []
-
-    def read_text(path, *args, **kwargs):
-        if path.name == "response.json" and faults:
-            raise faults.pop()
-        return real_read(path, *args, **kwargs)
-
-    def supervised(command, **kwargs):
-        parts = shlex.split(command)
-        if not any(part.endswith("/tracking/mlflow.py") for part in parts):
-            return real_supervised(command, **kwargs)
-        response = (
-            {"status": "ok", "result": dict(late)}
-            if reply == "ok"
-            else {"status": "unknown", "message": "Creation may still commit; reply unavailable."}
-        )
-        Path(parts[-1]).write_text(json.dumps(response), encoding="utf-8")
-        return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
-
-    monkeypatch.setattr(Path, "read_text", read_text)
-    monkeypatch.setattr(process, "run_supervised", supervised)
-
-
 @pytest.mark.parametrize(
     "reply,unreadable",
     [(None, False), ("unknown", False), ("unknown", True), ("ok", False), ("ok", True)],
@@ -886,7 +848,20 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     appeared = {"late": reply == "ok"}
     creations: list[str] = []
     if reply is not None:
-        _stub_mlflow_worker_process(monkeypatch, reply, late, unreadable=unreadable)
+        _WorkerProcess(
+            monkeypatch,
+            unreadable=["create"] if unreadable else [],
+            create=[
+                lambda: (
+                    {"status": "ok", "result": dict(late)}
+                    if reply == "ok"
+                    else {
+                        "status": "unknown",
+                        "message": "Creation may still commit; reply unavailable.",
+                    }
+                )
+            ],
+        )
 
     def first_attempt_creation(request, **kwargs):
         binding = request.get("binding", {})

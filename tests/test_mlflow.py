@@ -747,6 +747,7 @@ class _WorkerProcess:
 
     Each request is answered with the next scripted response for its action. The controller's
     first read of the response to an action named in ``unreadable`` fails with EIO.
+    Callable responses are evaluated when requested; non-MLflow processes run normally.
     """
 
     def __init__(self, monkeypatch, *, unreadable=(), **script):
@@ -755,6 +756,7 @@ class _WorkerProcess:
         self.script = {action: list(responses) for action, responses in script.items()}
         self.unreadable = set(unreadable)
         self.requests = []
+        self.real_supervised = process.run_supervised
         real_read = Path.read_text
 
         def read_text(path, *args, **kwargs):
@@ -775,12 +777,17 @@ class _WorkerProcess:
     def __call__(self, command, **kwargs):
         from phasesweep.runtime.process import ProcessResult
 
-        request_path, response_path = (Path(part) for part in shlex.split(command)[-2:])
+        parts = shlex.split(command)
+        if not any(part.endswith("/tracking/mlflow.py") for part in parts):
+            return self.real_supervised(command, **kwargs)
+        request_path, response_path = (Path(part) for part in parts[-2:])
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.requests.append(request)
         if not self.script.get(request["action"]):
             pytest.fail(f"Unscripted {request['action']} request.")
         response = self.script[request["action"]].pop(0)
+        if callable(response):
+            response = response()
         response_path.write_text(json.dumps(response), encoding="utf-8")
         return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
 

@@ -888,20 +888,16 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     """A failure or shutdown interrupt after spawn but before durable identity ends the runner."""
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
-    updated: list[RunHandle] = []
-
-    def fail_update(handle: RunHandle) -> None:
-        updated.append(handle)
-        raise error
-
+    update = Mock(side_effect=error)
     terminated = record_runner_cleanup(monkeypatch)
-    monkeypatch.setattr(store, "update", fail_update)
+    monkeypatch.setattr(store, "update", update)
 
     with pytest.raises(type(error), match=str(error) or None):
         app.launch("srv")
 
-    assert [handle.launch_state for handle in updated] == ["spawned"]
-    spawned = updated[0]
+    (update_call,) = update.call_args_list
+    spawned = update_call.args[0]
+    assert spawned.launch_state == "spawned"
     assert terminated == [(spawned.pid, spawned.pid_starttime, spawned.pgid)]
     assert terminated[0][1] is not None
     pending = store.get(spawned.run_id)
@@ -923,24 +919,17 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
 ) -> None:
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
-    updated: list[RunHandle] = []
-
-    def fail_update(handle: RunHandle) -> None:
-        updated.append(handle)
-        raise OSError("runs directory is not writable")
-
-    def fail_marker(_handle: RunHandle) -> None:
-        raise OSError("logs directory is not writable")
-
-    monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr(store, "mark_cleanup_uncertain", fail_marker)
+    update = Mock(side_effect=OSError("runs directory is not writable"))
+    marker = Mock(side_effect=OSError("logs directory is not writable"))
+    monkeypatch.setattr(store, "update", update)
+    monkeypatch.setattr(store, "mark_cleanup_uncertain", marker)
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", lambda *args, **kwargs: False)
     caplog.set_level(logging.ERROR, logger="phasesweep.mcp.server")
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
 
-    assert [handle.launch_state for handle in updated] == ["spawned"]
+    assert [call.args[0].launch_state for call in update.call_args_list] == ["spawned"]
     assert "failed to persist cleanup uncertainty marker" in caplog.text
     assert "original error" in caplog.text
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
@@ -954,17 +943,11 @@ def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_on
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
-    def fail_update(_handle: RunHandle) -> None:
-        raise OSError("runs directory is not writable")
-
-    clear_calls: list[RunHandle] = []
-
-    def track_clear(handle: RunHandle) -> None:
-        clear_calls.append(handle)
-        raise OSError("cleanup marker cannot be removed")
-
-    monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr(store, "clear_cleanup_uncertain", track_clear)
+    clear_marker = Mock(side_effect=OSError("cleanup marker cannot be removed"))
+    monkeypatch.setattr(
+        store, "update", Mock(side_effect=OSError("runs directory is not writable"))
+    )
+    monkeypatch.setattr(store, "clear_cleanup_uncertain", clear_marker)
     monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *args, **kwargs: True)
 
     with pytest.raises(OSError, match="runs directory"):
@@ -977,7 +960,7 @@ def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_on
     assert store.cleanup_uncertain(pending)
     assert store.state(pending) == "running"
     assert store.recovery_required(pending)
-    assert clear_calls == []
+    clear_marker.assert_not_called()
 
 
 def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(

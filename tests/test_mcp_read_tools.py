@@ -423,30 +423,11 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
     assert (status.metric.name, status.metric.goal) == (results.metric.name, results.metric.goal)
     assert results.result_context == "represented_generation"
+    assert results.result_source == "frozen_run_snapshot"
+    assert status.result_source == "frozen_run_snapshot"
     assert results.published_config_matches_current is False
     assert status.published_config_matches_current is False
     assert results.winner_count == 1
-
-
-@pytest.mark.integration
-def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
-    tmp_path: Path,
-) -> None:
-    run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    _write_experiment_config(
-        config,
-        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
-    )
-    app, _registry, _store = make_mcp_app(catalog)
-
-    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
-    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
-
-    assert status.result_source == "frozen_run_snapshot"
-    assert results.result_source == "frozen_run_snapshot"
-    assert status.published_config_matches_current is False
-    assert results.published_config_matches_current is False
-    assert (results.metric.name, results.metric.goal) == ("x", "minimize")
 
 
 def _overwrite_the_winner(experiment: Experiment, run_id: str) -> None:

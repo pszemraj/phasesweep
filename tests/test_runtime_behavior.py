@@ -587,24 +587,31 @@ def test_terminal_callback_reports_success_evidence(
 
 
 @pytest.mark.parametrize(
-    "callback_error_type",
+    ("primary_error", "callback_error_type"),
     [
-        pytest.param(RuntimeError, id="exception"),
+        pytest.param(NoFeasibleTrialError("phase failed"), RuntimeError, id="failed-exception"),
         # A diagnostic callback raising KeyboardInterrupt cannot mask the primary error.
-        pytest.param(KeyboardInterrupt, id="keyboard-interrupt"),
+        pytest.param(
+            NoFeasibleTrialError("phase failed"), KeyboardInterrupt, id="failed-keyboard-interrupt"
+        ),
+        pytest.param(None, RuntimeError, id="published-success"),
     ],
 )
-def test_terminal_callback_preserves_failure_when_callback_raises(
+def test_terminal_callback_failure_preserves_the_engine_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    primary_error: NoFeasibleTrialError | None,
     callback_error_type: type[BaseException],
 ) -> None:
+    """A callback failure cannot replace the engine's original error or published success."""
     experiment = make_experiment(workdir=tmp_path / "runs")
-    primary_error = NoFeasibleTrialError("phase failed")
     captured: list[TerminalReport] = []
 
-    def fail_run(*_args, **_kwargs):
-        raise primary_error
+    def run_outcome(*_args, **_kwargs):
+        if primary_error is not None:
+            raise primary_error
+        return {}
 
     def fail_callback(report: TerminalReport) -> None:
         captured.append(report)
@@ -614,48 +621,18 @@ def test_terminal_callback_preserves_failure_when_callback_raises(
         "phasesweep.engine.guards._preflight_existing_studies",
         lambda *_args, **_kwargs: {},
     )
-    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
-
-    with pytest.raises(NoFeasibleTrialError) as exc_info:
-        run_experiment(experiment, terminal_callback=fail_callback)
-
-    assert exc_info.value is primary_error
-    assert len(captured) == 1
-    assert captured[0].primary_error is primary_error
-    assert captured[0].failure_stage == "execution"
-
-
-def test_terminal_callback_failure_cannot_fail_published_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A reporting callback is a diagnostic consumer, never an outcome authority.
-
-    By the time the callback runs, a successful generation is already
-    published as the last successful result; raising would present that
-    committed success as a caller-visible failure.
-    """
-    experiment = make_experiment(workdir=tmp_path / "runs")
-
-    class CallbackError(RuntimeError):
-        pass
-
-    def fail_callback(_report: TerminalReport) -> None:
-        raise CallbackError("snapshot failed")
-
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._preflight_existing_studies",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.run._run_experiment_inner",
-        lambda *_args, **_kwargs: {},
-    )
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", run_outcome)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
-        assert run_experiment(experiment, terminal_callback=fail_callback) == {}
-
+        if primary_error is None:
+            assert run_experiment(experiment, terminal_callback=fail_callback) == {}
+        else:
+            with pytest.raises(NoFeasibleTrialError) as exc_info:
+                run_experiment(experiment, terminal_callback=fail_callback)
+            assert exc_info.value is primary_error
+    assert len(captured) == 1
+    assert captured[0].primary_error is primary_error
+    assert captured[0].failure_stage == (None if primary_error is None else "execution")
     assert any("terminal callback failed" in record.message for record in caplog.records)
 
 

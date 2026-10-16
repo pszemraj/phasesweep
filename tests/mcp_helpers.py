@@ -12,6 +12,7 @@ import threading
 import time
 import typing
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Required, TypedDict, Unpack
 
@@ -358,8 +359,7 @@ def earlier_boot_id() -> str:
 def live_runs(store: RunStore) -> list[RunHandle]:
     """Every currently-running handle across all experiments.
 
-    Scanning calls ``state`` on each handle, which also reaps any runner
-    that has since exited - so this doubles as the cleanup sweep.
+    Each handle's state is read without changing its durable records.
 
     :param RunStore store: Store whose handles are scanned.
     :return list[RunHandle]: All handles whose derived state is currently ``running``.
@@ -383,14 +383,11 @@ def claim_runner_handle(
     resolves the snapshot's relative paths against.
     """
     store.create(
-        RunHandle(
+        make_run_handle(
             run_id=run_id,
             experiment_id=experiment_id,
             config_sha256=config_sha256,
             config_dir=str(config_dir),
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
             started_at=started_at,
             launch_state="launching",
             visible_params_at_launch=visible_params_at_launch,
@@ -610,18 +607,12 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         pending = pending_store.get(run_id)
         assert pending is not None
         pending_store.update(
-            RunHandle(
-                run_id=run_id,
-                experiment_id=pending.experiment_id,
-                config_sha256=pending.config_sha256,
-                config_dir=pending.config_dir,
+            replace(
+                pending,
                 pid=DummyProc.pid,
                 pgid=DummyProc.pid,
                 pid_starttime=read_proc_starttime(DummyProc.pid),
-                started_at=pending.started_at,
                 launch_state="spawned",
-                allow_cancel=pending.allow_cancel,
-                visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=read_boot_id(),
                 pid_namespace=read_pid_namespace(),
             )
