@@ -122,11 +122,7 @@ class StatusSnapshot(_SnapshotModel):
     represented_generation_id: str | None = None
     is_published: bool = False
     publication_integrity: McpPublicationState
-    """Publication verdict at capture time.
-
-    This is captured explicitly, so a snapshot never invents a publication
-    verdict while being read.
-    """
+    """Publication verdict recorded at capture time."""
 
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
@@ -135,8 +131,6 @@ class StatusSnapshot(_SnapshotModel):
     result_context: ResultContext
     """Whether ``metric`` and ``result_phase_plan`` are the represented
     generation's own recorded semantics or the executing config's.
-
-    This is captured explicitly with the result labels.
     """
 
     published_config_matches_current: bool | None = None

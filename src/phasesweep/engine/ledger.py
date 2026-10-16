@@ -157,23 +157,14 @@ class ClaimedLedger(ValidatedLedger):
 
 
 def _resolve_storage(url: str | None) -> Any:
-    """Translate a resolved storage URL into an Optuna storage object.
+    """Construct journal storage, or return None for in-memory storage.
 
-    ``None`` selects non-resumable in-memory storage; ``journal:///path.journal``
-    selects ``JournalStorage(JournalFileBackend(path))`` for same-host parallel trials.
-    Journal URLs also accept escaped ``file:`` filenames with ``uri=true``.
-    ``Experiment.resolved_storage`` resolves ``storage: auto`` before this call.
+    ``auto`` must already be resolved. Directory creation belongs to :func:`claim_ledger`.
 
-    This function leaves directory creation to :func:`claim_ledger`.
-
-    Args:
-        url: The resolved journal storage URL, or ``None`` for in-memory.
-
-    Returns:
-        ``None`` for in-memory; a configured ``JournalStorage`` otherwise.
-
+    :param str | None url: Resolved journal URL, including escaped ``file:``
+        filenames with ``uri=true``, or None for in-memory storage.
+    :return: Configured JournalStorage, or None.
     :raises ValueError: ``url`` selects an unsupported local storage backend.
-
     """
     if url is None:
         return None

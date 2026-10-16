@@ -223,12 +223,6 @@ def _nvidia_driver_reports_gpus() -> bool:
 def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
     """Reject device tokens that cannot syntactically name a CUDA device.
 
-    CUDA silently exposes no device for a token that is neither a numeric
-    index nor a ``GPU-``/``MIG-`` identity, so accepting one would hand a
-    trial an empty visibility set while the real GPUs sit unlocked — the
-    opaque-token equivalent of a nonexistent numeric index, which already
-    fails closed in :func:`_bind_lock_identities`.
-
     :param list[GpuDevice] devices: Devices built from configured or ambient tokens.
     :raises GpuConfigurationError: A token is neither numeric nor ``GPU-``/``MIG-`` shaped.
     """
@@ -412,14 +406,10 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
 
 
 class GpuPool:
-    """Thread-safe pool of CUDA-visible device tokens.
+    """Lease CUDA device assignments and host locks across threads.
 
-    Usage:
-        pool = GpuPool.create(n_jobs=4)
-        with pool.acquire() as gpu_device:
-            if gpu_device is not None:
-                env["CUDA_VISIBLE_DEVICES"] = gpu_device
-            run_trial(...)
+    :meth:`acquire` yields a :class:`GpuAssignment` with visibility and lease FDs,
+    including an inactive assignment when no device is leased.
     """
 
     def __init__(
@@ -431,21 +421,11 @@ class GpuPool:
     ) -> None:
         """Build a pool from a fixed list of CUDA device tokens.
 
-        Args:
-            devices: The CUDA device tokens to manage. If empty, the pool is a
-                transparent no-op that always yields ``None`` (single-job
-                or CPU-only mode). Prefer :meth:`create` for the normal
-                construction path that handles auto-detection and policy.
-            whole_node: Whether each acquisition leases all devices as one
-                comma-joined CUDA_VISIBLE_DEVICES assignment.
-            pinned_visible_devices: CUDA_VISIBLE_DEVICES value every
-                acquisition yields when ``devices`` is empty. Set when the
-                pool leases nothing *because* a configured or ambient disable
-                sentinel (``""``/``-1``) says CUDA is off: the sentinel must
-                reach the trial environment even under a narrowed
-                ``inherit_env`` contract, or the trainer would see every host
-                GPU while phasesweep holds zero GPU locks.
-
+        :param list[GpuDevice] devices: Tokens to manage; empty means no GPU leases.
+            Prefer :meth:`create` for discovery and policy handling.
+        :param bool whole_node: Lease all devices as one comma-joined assignment.
+        :param str | None pinned_visible_devices: Visibility for an inactive pool,
+            including a CUDA-disable sentinel that must reach the trainer.
         """
         self._devices = devices
         self._whole_node = whole_node
@@ -472,33 +452,19 @@ class GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
 
         :param int n_jobs: Number of parallel trials.
-        :param list[int] | None explicit_ids: GPU indices from YAML config. If
-                ``None``, auto-detect
-                visible devices even for ``n_jobs == 1`` so independent
-                single-job phasesweep processes do not double-book cuda:0.
-        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens from
-                YAML config. Mutually exclusive with ``explicit_ids``.
-        :param bool allow_no_gpu: If ``True``, run without CUDA isolation when no numeric
-                GPU IDs can be resolved. Parallel auto-detected CPU-only sweeps
-                need this opt-in; an explicit CUDA-disable value does not.
-        :param GpuPolicy policy: CUDA visibility policy. ``single_per_trial`` leases one
-                token per trial. ``whole_node`` leases all tokens for one trial
-                and exposes them comma-joined. ``none`` disables CUDA isolation
-                and GPU locks.
-        :param str | None cuda_visible_devices: Configured trainer-environment override for
-                ``CUDA_VISIBLE_DEVICES``. When omitted, the ambient value is used.
-        :raises GpuConfigurationError: No GPUs are visible and ``n_jobs > 1`` without
-                ``allow_no_gpu``; the NVIDIA driver reports hardware that
-                ``nvidia-smi`` cannot enumerate without ``allow_no_gpu``; the
-                configured or ambient device tokens cannot be resolved to canonical
-                physical devices (see :func:`_bind_lock_identities`), or
-                ``policy='whole_node'`` and the configured tokens collapse to
-                fewer physical GPUs than the declared world size (see
-                :func:`_require_distinct_whole_node_devices`).
-        :return GpuPool: A configured pool. The pool leases devices iff a GPU
-            list is in play; an inactive pool built from a CUDA-disable
-            sentinel still yields that sentinel so trials inherit the
-            disable (see ``pinned_visible_devices``).
+        :param list[int] | None explicit_ids: GPU indices, or None for autodetection,
+            including single-job runs. Mutually exclusive with ``explicit_devices``.
+        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens.
+        :param bool allow_no_gpu: Allow unresolved inventory or auto-detected parallel
+            CPU-only work. An explicit CUDA-disable value needs no opt-in.
+        :param GpuPolicy policy: ``single_per_trial`` leases one token; ``whole_node``
+            leases all tokens together; ``none`` disables isolation and GPU locks.
+        :param str | None cuda_visible_devices: Configured visibility override;
+            None uses the ambient value.
+        :raises GpuConfigurationError: Parallel work has no GPUs without opt-in;
+            hardware inventory cannot be read without opt-in; tokens cannot resolve
+            to physical identities; or whole-node tokens collapse to fewer devices.
+        :return GpuPool: Configured pool; inactive acquisitions retain disable sentinels.
         """
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")
@@ -689,17 +655,10 @@ class GpuPool:
     def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
         """Block until a local slot and host-wide GPU lease are available.
 
-        Args:
-            deadline: Optional ``time.monotonic()`` deadline. When set, waiting
-                for a local slot or host-wide lock fails with ``TimeoutError``
-                instead of extending a phase/run wallclock budget.
-
-        Returns:
-            A one-device acquisition, or ``None`` if the pool is inactive.
-
-        Raises:
-            TimeoutError: ``deadline`` expired before a GPU could be leased.
-
+        :param float | None deadline: Optional monotonic deadline for slot and lock waits.
+        :return _GpuAcquisition | None: One-device acquisition, or None for an inactive pool.
+        :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """
         if not self._devices:
             return None
@@ -819,21 +778,11 @@ class GpuPool:
     def acquire(self, *, deadline: float | None = None) -> Generator[GpuAssignment, None, None]:
         """Block until a GPU is available and yield its visibility plus lease FDs.
 
-        Args:
-            deadline: Optional ``time.monotonic()`` deadline for the wait.
-
-        Yields:
-            A :class:`GpuAssignment` carrying the CUDA visibility token (the
-            pinned disable sentinel for explicit CPU isolation, or ``None``
-            for an inactive pool) and the host-lock descriptors the supervisor
-            guardian inherits so exclusion survives an orchestrator hard exit.
-            The trainer does not inherit them: the supervisor closes every
-            descriptor above stderr before it execs the trainer.
-
-        Raises:
-            GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
-            GpuLeaseCancelledError: The owning phase cancelled queued lease waits.
-
+        :param float | None deadline: Optional monotonic deadline for the wait.
+        :return: Context manager yielding GpuAssignment visibility and guardian-inherited lock FDs.
+            Inactive pools carry a configured disable sentinel or None visibility.
+        :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """
         acquired = self._acquire(deadline=deadline)
         try:
