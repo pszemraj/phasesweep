@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import stat
+import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import IO
 
 import optuna
 import pytest
-from optuna.storages.journal import JournalFileSymlinkLock
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
@@ -48,6 +51,7 @@ from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUnc
 from phasesweep.mcp.recovery import (
     _load_recovery_studies,
 )
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -587,7 +591,7 @@ def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: s
     """Every path that may write repairs a bad last journal line before it proceeds.
 
     Reads skip that line as Optuna does, so the format scan passes. A write
-    does not refuse on sight: under Optuna's own journal lock it backs the
+    does not refuse on sight: under the shared journal inode lock it backs the
     damaged bytes up beside the journal and truncates back to the last
     complete record, for ``claim_ledger``, ``open_registry_study``, and a
     confirmed recovery alike. Unconfirmed inspection does not check the tail
@@ -610,8 +614,7 @@ def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: s
         backups = sorted(journal.parent.glob(f"{journal.name}.*.bak"))
         assert len(backups) == 1
         assert backups[0].read_bytes() == damaged
-        assert not journal.with_name(f"{journal.name}.lock").exists()
-        assert not _staged_locks(journal)
+        _assert_journal_unlocked(journal)
 
     experiment, journal, complete, damaged = freshly_damaged("claim")
     claim_ledger(validate_ledger(experiment))
@@ -639,7 +642,7 @@ def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
     """A repair that finds the record complete once it holds the lock writes nothing.
 
     The scan before the lock may see a partial final line a concurrent append
-    is still writing. Optuna's own journal lock excludes every writer, so if
+    is still writing. The inode lock excludes every PhaseSweep writer, so if
     that append settles the journal back to fully complete before this
     repair's rescan runs under the lock, no offset from before the lock is
     ever used: nothing is truncated, and no backup is written.
@@ -652,9 +655,9 @@ def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
 
     real_acquire = engine_ledger._JournalLock.acquire
 
-    def finish_append_then_acquire(lock: engine_ledger._JournalLock) -> None:
+    def finish_append_then_acquire(lock: engine_ledger._JournalLock) -> bool:
         journal.write_bytes(complete)
-        real_acquire(lock)
+        return real_acquire(lock)
 
     monkeypatch.setattr(engine_ledger._JournalLock, "acquire", finish_append_then_acquire)
 
@@ -682,19 +685,25 @@ def _manual_lock_clock(
     return clock
 
 
-def _staged_locks(journal: Path) -> list[Path]:
-    """List the private names a repair's journal lock was staged under and left behind."""
-    return list(journal.parent.glob(f".{journal.name}.lock.*.tmp"))
+def _assert_journal_unlocked(journal: Path) -> None:
+    """Confirm another descriptor can acquire the journal inode immediately."""
+    lock = engine_ledger._JournalLock(journal, timeout=0)
+    try:
+        assert lock.acquire()
+        assert lock.held()
+    finally:
+        lock.release()
+    assert not lock.held()
 
 
-def _take_over_journal_lock(journal: Path) -> os.stat_result:
-    """Remove a journal's lock and take a new one, as a waiting Optuna writer does to a stale lock.
-
-    :return os.stat_result: The new lock symlink's own status.
-    """
-    JournalFileSymlinkLock(str(journal)).release()
-    JournalFileSymlinkLock(str(journal)).acquire()
-    return journal.with_name(f"{journal.name}.lock").lstat()
+def _replace_locked_journal(journal: Path) -> engine_ledger._JournalLock:
+    """Replace the journal pathname and hold the replacement's distinct inode."""
+    replacement = journal.with_suffix(".replacement")
+    replacement.write_bytes(journal.read_bytes())
+    replacement.replace(journal)
+    successor = engine_ledger._JournalLock(journal, timeout=0)
+    successor.acquire()
+    return successor
 
 
 def test_repair_waits_for_a_journal_lock_another_writer_holds(
@@ -705,39 +714,31 @@ def test_repair_waits_for_a_journal_lock_another_writer_holds(
     journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
-    lock_path = journal.with_name(f"{journal.name}.lock")
-    lock_path.symlink_to(journal)
+    holder = engine_ledger._JournalLock(journal)
+    holder.acquire()
     ledger = validate_ledger(materialized.experiment)
-    clock = _manual_lock_clock(monkeypatch, on_pause=lock_path.unlink)
-
-    repair_incomplete_journal_record(ledger)
+    clock = _manual_lock_clock(monkeypatch, on_pause=holder.release)
+    try:
+        repair_incomplete_journal_record(ledger)
+    finally:
+        holder.release()
 
     assert clock["pauses"] == 1
     assert journal.read_bytes() == complete
     assert len(list(journal.parent.glob(f"{journal.name}.*.bak"))) == 1
-    assert not lock_path.exists()
+    _assert_journal_unlocked(journal)
 
 
-@pytest.mark.parametrize("lock_target", ["journal", "dangling"])
 def test_repair_refuses_a_journal_lock_that_is_never_released(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_target: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A journal lock a killed writer left behind ends the repair in a bounded refusal.
-
-    Optuna retries forever when its symlink dangles, as a lock taken
-    through a nested relative journal path does, and waits out a grace
-    period before it takes over one that does not. The repair gives up once its wait has run
-    out, leaves the lock and the journal as they were, and names the lock to
-    remove. It runs in a thread so a wait that never ends fails the test
-    instead of hanging the suite.
-    """
+    """Repair refuses bounded contention without releasing the writer's inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
     damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
-    lock_path = journal.with_name(f"{journal.name}.lock")
-    target = str(journal) if lock_target == "journal" else f"ledger/{journal.name}"
-    lock_path.symlink_to(target)
+    holder = engine_ledger._JournalLock(journal)
+    holder.acquire()
     ledger = validate_ledger(materialized.experiment)
     clock = _manual_lock_clock(monkeypatch)
 
@@ -750,35 +751,28 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
             raised.append(exc)
 
     worker = threading.Thread(target=repair, daemon=True)
-    worker.start()
-    worker.join(timeout=10.0)
-
-    assert not worker.is_alive()
-    assert clock["now"] == pytest.approx(engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)
-    assert len(raised) == 1
-    assert isinstance(raised[0], IncompleteJournalRecordError)
-    assert raised[0].action == OperatorAction.RESTORE_LEDGER
-    assert f"remove {lock_path}" in str(raised[0])
-    assert journal.read_bytes() == damaged
-    assert os.readlink(lock_path) == target
-    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
-    assert not _staged_locks(journal)
+    try:
+        worker.start()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        assert clock["now"] == pytest.approx(engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)
+        assert len(raised) == 1
+        assert isinstance(raised[0], IncompleteJournalRecordError)
+        assert raised[0].action == OperatorAction.RESTORE_LEDGER
+        assert "Wait for the writer to finish" in str(raised[0])
+        assert journal.read_bytes() == damaged
+        assert holder.held()
+        assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+    finally:
+        holder.release()
+    _assert_journal_unlocked(journal)
 
 
 @pytest.mark.parametrize("spelling", ["nested-relative", "symlink-alias"])
 def test_journal_writers_and_repair_lock_the_journals_real_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
 ) -> None:
-    """Every journal lock is ``<real journal>.lock``, a symlink to the journal's real path.
-
-    Optuna's lock is a symlink named after, and pointing at, the path its
-    backend was given. A nested relative URL such as
-    ``journal:///ledger/study.journal`` would leave that symlink dangling, so
-    a stale lock could never be released. A file symlink to the journal
-    would name a second lock, so an append through one spelling and a repair
-    through the other would not exclude each other. Optuna's appends and the
-    repair both lock the resolved path instead.
-    """
+    """Live backend appends and repair both acquire the canonical journal inode."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "ledger").mkdir()
     journal = tmp_path.resolve() / "ledger" / "study.journal"
@@ -787,31 +781,25 @@ def test_journal_writers_and_repair_lock_the_journals_real_path(
     else:
         (tmp_path / "alias.journal").symlink_to("ledger/study.journal")
         url = f"journal:///{tmp_path}/alias.journal"
-    locks: set[tuple[str, str]] = set()
-    real_symlink = os.symlink
-    real_link = os.link
+    acquired: list[tuple[Path, float | None]] = []
+    real_acquire = engine_ledger._JournalLock.acquire
 
-    def recording_symlink(src: str, dst: str, *args: Any, **kwargs: Any) -> None:
-        if os.fspath(dst).endswith(".lock"):
-            locks.add((os.fspath(dst), os.fspath(src)))
-        real_symlink(src, dst, *args, **kwargs)
+    def recording_acquire(lock: engine_ledger._JournalLock) -> bool:
+        result = real_acquire(lock)
+        assert lock.held()
+        acquired.append((lock.path, lock._timeout))
+        return result
 
-    def recording_link(src: str, dst: str, *args: Any, **kwargs: Any) -> None:
-        # The repair links its staged symlink into place as the lock.
-        if os.fspath(dst).endswith(".lock"):
-            locks.add((os.fspath(dst), os.readlink(src)))
-        real_link(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "symlink", recording_symlink)
-    monkeypatch.setattr(os, "link", recording_link)
+    monkeypatch.setattr(engine_ledger._JournalLock, "acquire", recording_acquire)
 
     optuna.create_study(study_name="s", storage=engine_ledger._resolve_storage(url))
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
     engine_ledger._repair_incomplete_journal_record(url)
 
-    assert locks == {(f"{journal}.lock", str(journal))}
+    assert acquired == [(journal, None), (journal, engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)]
     assert journal.read_bytes() == complete
+    _assert_journal_unlocked(journal)
 
 
 def test_repair_through_a_symlink_alias_is_excluded_by_the_real_names_writer(
@@ -832,98 +820,87 @@ def test_repair_through_a_symlink_alias_is_excluded_by_the_real_names_writer(
     alias.symlink_to(real)
     in_flight = real.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
     real.write_bytes(in_flight)
-    real.with_name(f"{real.name}.lock").symlink_to(real)  # the appending writer's lock
+    holder = engine_ledger._JournalLock(real)
+    holder.acquire()
     _manual_lock_clock(monkeypatch)
-
-    with pytest.raises(IncompleteJournalRecordError, match="still held"):
-        engine_ledger._repair_incomplete_journal_record(f"journal:///{alias}")
+    try:
+        with pytest.raises(IncompleteJournalRecordError, match="still held"):
+            engine_ledger._repair_incomplete_journal_record(f"journal:///{alias}")
+        assert holder.held()
+    finally:
+        holder.release()
 
     assert real.read_bytes() == in_flight
-    assert not alias.with_name(f"{alias.name}.lock").exists()
+    _assert_journal_unlocked(real)
 
 
 def test_repair_truncates_only_while_holding_the_journal_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The truncation step only ever runs while this process holds Optuna's own journal lock."""
+    """The truncation step runs only while this process holds the shared journal inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
-    lock_path = journal.with_name(f"{journal.name}.lock")
-
     real_truncate = engine_ledger._truncate_incomplete_journal_record
 
     def truncate_while_locked(lock: engine_ledger._JournalLock) -> tuple[Path, int] | None:
-        assert lock_path.is_symlink()
         assert lock.held()
+        with pytest.raises(IncompleteJournalRecordError, match="still held"):
+            engine_ledger._JournalLock(journal, timeout=0).acquire()
         return real_truncate(lock)
 
     monkeypatch.setattr(engine_ledger, "_truncate_incomplete_journal_record", truncate_while_locked)
 
     repair_incomplete_journal_record(validate_ledger(experiment))
 
-    assert not lock_path.exists()
+    _assert_journal_unlocked(journal)
     assert journal.read_bytes() == complete
 
 
-def test_journal_lock_appears_only_after_the_journal_changes(
+def test_journal_writer_wait_is_unbounded_and_does_not_change_mtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The journal's modification time changes before the repair's lock appears.
-
-    An Optuna writer whose grace period ran out on a stale lock removes it,
-    then checks the next lock it meets against the modification time it
-    last saw. Had the journal not changed since, it would remove the
-    repair's lock too.
-    """
+    """A live append waits past the repair deadline without changing the journal while waiting."""
     journal = tmp_path / "study.journal"
     journal.write_bytes(b"")
     os.utime(journal, (0, 0))
-    seen: list[float] = []
-    real_link = os.link
+    holder = engine_ledger._JournalLock(journal)
+    holder.acquire()
 
-    def recording_link(src: str, dst: str, *args: Any, **kwargs: Any) -> None:
-        seen.append(journal.stat().st_mtime)
-        real_link(src, dst, *args, **kwargs)
+    def finish_writer() -> None:
+        assert journal.stat().st_mtime == 0
+        if clock["now"] > engine_ledger._JOURNAL_LOCK_WAIT_SECONDS:
+            holder.release()
 
-    monkeypatch.setattr(os, "link", recording_link)
-    lock = engine_ledger._JournalLock(journal)
-    lock.acquire()
-
-    assert lock.release()
-    assert seen
-    assert all(mtime > 0 for mtime in seen)
+    clock = _manual_lock_clock(monkeypatch, on_pause=finish_writer)
+    try:
+        optuna.create_study(study_name="s", storage=_resolve_storage(f"journal:///{journal}"))
+    finally:
+        holder.release()
+    assert clock["now"] > engine_ledger._JOURNAL_LOCK_WAIT_SECONDS
+    _assert_journal_unlocked(journal)
 
 
 @pytest.mark.parametrize("taken_over", ["before truncation", "after truncation"])
 def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_over(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, taken_over: str
 ) -> None:
-    """A repair whose journal lock was taken over stops, and leaves the new lock in place.
-
-    Optuna's lock records no owner, so a process that removes it and takes
-    its own leaves a lock indistinguishable by name. Found before
-    truncation, the repair refuses with the journal untouched. Found at
-    release, the truncation already ran under the repair's own lock, and
-    the repair still reports the takeover. Either way the successor's lock
-    survives, so the writer holding it stays excluded.
-    """
+    """Repair detects pathname replacement and never releases the successor's inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
     complete = journal.read_bytes()
     damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
-    lock_path = journal.with_name(f"{journal.name}.lock")
-    successor: list[os.stat_result] = []
+    successor: list[engine_ledger._JournalLock] = []
 
     if taken_over == "before truncation":
         real_fsync_directory = engine_ledger.fsync_directory
 
         def fsync_then_take_over(path: Path) -> None:
             real_fsync_directory(path)
-            successor.append(_take_over_journal_lock(journal))
+            successor.append(_replace_locked_journal(journal))
 
         monkeypatch.setattr(engine_ledger, "fsync_directory", fsync_then_take_over)
     else:
@@ -931,43 +908,39 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
 
         def truncate_then_take_over(lock: engine_ledger._JournalLock) -> tuple[Path, int] | None:
             repaired = real_truncate(lock)
-            successor.append(_take_over_journal_lock(journal))
+            successor.append(_replace_locked_journal(journal))
             return repaired
 
         monkeypatch.setattr(
             engine_ledger, "_truncate_incomplete_journal_record", truncate_then_take_over
         )
 
-    with pytest.raises(IncompleteJournalRecordError, match="removed or replaced") as excinfo:
-        repair_incomplete_journal_record(validate_ledger(materialized.experiment))
-
-    assert excinfo.value.action == OperatorAction.RETRY
-    assert journal.read_bytes() == (damaged if taken_over == "before truncation" else complete)
-    assert lock_path.lstat().st_ino == successor[0].st_ino
-    assert len(list(journal.parent.glob(f"{journal.name}.*.bak"))) == 1
-    assert not _staged_locks(journal)
+    try:
+        with pytest.raises(IncompleteJournalRecordError, match="removed or replaced") as excinfo:
+            repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+        assert excinfo.value.action == OperatorAction.RETRY
+        assert journal.read_bytes() == (damaged if taken_over == "before truncation" else complete)
+        assert successor[0].held()
+        with pytest.raises(IncompleteJournalRecordError, match="still held"):
+            engine_ledger._JournalLock(journal, timeout=0).acquire()
+        assert len(list(journal.parent.glob(f"{journal.name}.*.bak"))) == 1
+    finally:
+        for lock in successor:
+            lock.release()
+    _assert_journal_unlocked(journal)
 
 
 @pytest.mark.integration
 def test_waiting_optuna_writer_never_takes_over_a_long_repairs_journal_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A writer waiting out its grace period gets the lock only once the repair releases it.
-
-    Optuna removes a lock whose journal a waiting writer has
-    seen unchanged for its grace period, 30 seconds by default, and a
-    repair of a large journal can hold the lock longer. The repair
-    refreshes the journal's modification time while it holds the lock, so
-    a real Optuna writer with a one-second grace period, waiting through
-    three seconds of the repair, never takes it over.
-    """
+    """A writer has no timeout or stale takeover while a repair holds the journal inode."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
-    monkeypatch.setattr(engine_ledger, "_JOURNAL_LOCK_REFRESH_SECONDS", 0.1)
-    with pytest.warns(UserWarning, match="grace_period"):
-        waiter_lock = JournalFileSymlinkLock(str(journal), grace_period=1)
+    monkeypatch.setattr(engine_ledger, "_JOURNAL_LOCK_WAIT_SECONDS", 0.01)
+    waiter_lock = engine_ledger._JournalLock(journal)
     waiter_holds = threading.Event()
 
     def wait_for_lock() -> None:
@@ -980,15 +953,102 @@ def test_waiting_optuna_writer_never_takes_over_a_long_repairs_journal_lock(
     def hold_past_the_grace_period(path: Path) -> None:
         real_fsync_directory(path)
         waiter.start()
-        assert not waiter_holds.wait(3.0)
+        assert not waiter_holds.wait(0.1)
 
     monkeypatch.setattr(engine_ledger, "fsync_directory", hold_past_the_grace_period)
 
-    repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+    try:
+        repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+        assert journal.read_bytes() == complete
+        assert waiter_holds.wait(timeout=10.0)
+    finally:
+        waiter.join(timeout=10.0)
+        waiter_lock.release()
+    _assert_journal_unlocked(journal)
 
+
+@pytest.mark.integration
+def test_journal_kernel_lock_is_released_when_its_owner_dies(tmp_path: Path) -> None:
+    """A killed writer leaves repair free to acquire its journal without stale-lock cleanup."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = materialized.ledger_path
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    worker = (
+        "import signal,sys; from pathlib import Path; "
+        "from phasesweep.engine.ledger import _JournalLock; "
+        "lock=_JournalLock(Path(sys.argv[1])); lock.acquire(); "
+        "print('locked',flush=True); signal.pause()"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", worker, str(journal)], stdout=subprocess.PIPE, text=True
+    ) as owner:
+        try:
+            assert owner.stdout is not None
+            assert select.select([owner.stdout], [], [], 10.0)[0]
+            assert owner.stdout.readline().strip() == "locked"
+            with pytest.raises(IncompleteJournalRecordError, match="still held"):
+                engine_ledger._JournalLock(journal, timeout=0).acquire()
+            owner.kill()
+            owner.wait(timeout=10.0)
+            repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+                owner.wait(timeout=10.0)
     assert journal.read_bytes() == complete
-    assert waiter_holds.wait(timeout=10.0)
-    waiter_lock.release()
+    _assert_journal_unlocked(journal)
+
+
+@pytest.mark.integration
+@pytest.mark.signals_own_pid
+@pytest.mark.parametrize("stage", ["acquire", "release"])
+def test_journal_lock_shutdown_closes_the_acquired_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Shutdown arriving just after acquisition or during release leaves no held descriptor."""
+    journal = tmp_path / "study.journal"
+    journal.write_bytes(b"")
+    lock = engine_ledger._JournalLock(journal)
+    original_acquire = engine_ledger.try_flock
+    original_release = engine_ledger.unlock_file
+
+    def acquire_and_signal(handle: IO[str]) -> bool:
+        result = original_acquire(handle)
+        signal.raise_signal(signal.SIGTERM)
+        return result
+
+    def release_and_signal(handle: IO[str]) -> None:
+        original_release(handle)
+        assert handle.closed
+        signal.raise_signal(signal.SIGTERM)
+
+    target = "try_flock" if stage == "acquire" else "unlock_file"
+    callback = acquire_and_signal if stage == "acquire" else release_and_signal
+    monkeypatch.setattr(engine_ledger, target, callback)
+    with signal_handler_scope(), pytest.raises(PhaseSweepShutdown) as shutdown:
+        lock.acquire()
+        lock.release()
+    assert not lock.held(), str(shutdown.traceback)
+    monkeypatch.setattr(engine_ledger, "try_flock", original_acquire)
+    monkeypatch.setattr(engine_ledger, "unlock_file", original_release)
+    _assert_journal_unlocked(journal)
+
+
+def test_journal_lock_detects_a_symlink_replacing_its_path(tmp_path: Path) -> None:
+    """A symlink to the held inode still replaces the canonical journal pathname."""
+    journal = tmp_path / "study.journal"
+    retained = tmp_path / "retained.journal"
+    journal.write_bytes(b"")
+    lock = engine_ledger._JournalLock(journal)
+    lock.acquire()
+    try:
+        journal.rename(retained)
+        journal.symlink_to(retained)
+        assert not lock.held()
+    finally:
+        lock.release()
+    _assert_journal_unlocked(retained)
 
 
 def test_repair_backup_is_no_more_permissive_than_the_journal(tmp_path: Path) -> None:
@@ -1009,27 +1069,31 @@ def test_repair_backup_is_no_more_permissive_than_the_journal(tmp_path: Path) ->
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
 
 
-def test_repair_refuses_a_journal_with_another_hard_linked_name(tmp_path: Path) -> None:
-    """A journal reachable by a second hard-linked name is never truncated.
-
-    An append through the other name takes that name's own journal lock, so
-    holding this name's lock proves nothing about it. The repair refuses
-    before writing a backup, and the journal keeps every byte.
-    """
+def test_journal_hard_link_names_share_lock_and_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hard-linked journal names contend for the same inode lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
-    damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
+    complete = journal.read_bytes()
+    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
-    os.link(journal, tmp_path / "other-name.journal")
-
-    with pytest.raises(IncompleteJournalRecordError) as excinfo:
-        repair_incomplete_journal_record(validate_ledger(materialized.experiment))
-
-    assert excinfo.value.action == OperatorAction.RESTORE_LEDGER
-    assert "2 hard links" in str(excinfo.value)
-    assert journal.read_bytes() == damaged
-    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
-    assert not journal.with_name(f"{journal.name}.lock").exists()
+    alias = tmp_path / "other-name.journal"
+    os.link(journal, alias)
+    holder = engine_ledger._JournalLock(alias)
+    holder.acquire()
+    _manual_lock_clock(monkeypatch)
+    try:
+        with pytest.raises(IncompleteJournalRecordError, match="still held"):
+            repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+        assert journal.read_bytes() == damaged
+        assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+    finally:
+        holder.release()
+    repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+    assert journal.read_bytes() == alias.read_bytes() == complete
+    assert len(list(journal.parent.glob(f"{journal.name}.*.bak"))) == 1
+    _assert_journal_unlocked(journal)
 
 
 def test_repair_refuses_a_journal_that_grew_under_its_lock(
@@ -1073,13 +1137,7 @@ def test_repair_refuses_a_journal_that_grew_under_its_lock(
 def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
     tmp_path: Path, step: str
 ) -> None:
-    """A repair refused its lock or its backup leaves the journal exactly as it was.
-
-    A read-only journal directory refuses Optuna's lock symlink before
-    anything else. The backup is reached only by a caller that holds the lock
-    already, so that step takes the lock before the directory turns read-only
-    and is driven directly.
-    """
+    """Failure to open the journal for locking or create its backup preserves every byte."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = materialized.ledger_path
     complete = journal.read_bytes()
@@ -1089,8 +1147,9 @@ def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
     lock = engine_ledger._JournalLock(journal)
     if step == "backup":
         lock.acquire()
-    mode = journal.parent.stat().st_mode
-    journal.parent.chmod(0o555)
+    denied = journal if step == "lock" else journal.parent
+    mode = denied.stat().st_mode
+    denied.chmod(0o400 if step == "lock" else 0o555)
     try:
         with pytest.raises(IncompleteJournalRecordError) as excinfo:
             if step == "lock":
@@ -1098,12 +1157,11 @@ def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
             else:
                 engine_ledger._truncate_incomplete_journal_record(lock)
     finally:
-        journal.parent.chmod(mode)
+        denied.chmod(mode)
         lock.release()
 
     assert excinfo.value.action == OperatorAction.RESTORE_LEDGER
     assert "could not be repaired" in str(excinfo.value)
     assert journal.read_bytes() == damaged
     assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
-    assert not journal.with_name(f"{journal.name}.lock").exists()
-    assert not _staged_locks(journal)
+    _assert_journal_unlocked(journal)

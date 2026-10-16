@@ -363,20 +363,31 @@ def try_lock_file(path: Path) -> IO[str] | None:
     :param Path path: Lock file path to open or create.
     :return IO[str] | None: Open lock handle when acquired, otherwise ``None``.
     """
+    handle = open_lock_file(path)
+    if try_flock(handle):
+        return handle
+    handle.close()
+    return None
+
+
+def try_flock(handle: IO[str]) -> bool:
+    """Take an exclusive nonblocking flock on an already-open file.
+
+    :param IO[str] handle: File descriptor whose inode all contenders open.
+    :return bool: Whether the lock was acquired; the caller owns the handle.
+    """
     require_posix_runtime()
     import fcntl
 
-    handle = open_lock_file(path)
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        handle.close()
-        return None
-    return handle
+        return False
+    return True
 
 
 def unlock_file(handle: IO[str]) -> None:
-    """Release and close a handle returned by :func:`try_lock_file`."""
+    """Release a flock and close its file handle."""
     import fcntl
 
     with contextlib.suppress(OSError):

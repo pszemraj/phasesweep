@@ -420,19 +420,17 @@ def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 @contextmanager
 def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Let Optuna's journal lock succeed, then deny writes to the journal's directory.
+    """Acquire the journal inode, then deny creation of its repair backup.
 
-    The repair's backup lives beside the lock file, so a directory that never
-    allowed writes would refuse the lock itself. Revoking write access just
-    after the real lock is taken makes the backup the repair opens next fail.
-    The directory's mode is restored on exit so the tree can be cleaned up.
+    Restore the directory mode on exit so the tree can be cleaned up.
     """
     real_acquire = engine_ledger._JournalLock.acquire
     mode = journal.parent.stat().st_mode
 
-    def acquire_then_deny(lock: engine_ledger._JournalLock) -> None:
-        real_acquire(lock)
+    def acquire_then_deny(lock: engine_ledger._JournalLock) -> bool:
+        result = real_acquire(lock)
         journal.parent.chmod(0o555)
+        return result
 
     monkeypatch.setattr(engine_ledger._JournalLock, "acquire", acquire_then_deny)
     try:

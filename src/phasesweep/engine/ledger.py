@@ -14,25 +14,23 @@ ownership before reaping. Registry recovery validates its separately recorded le
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import json
 import logging
 import os
-import secrets
 import stat
-import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 import optuna
 from optuna.storages import JournalStorage
-from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
+from optuna.storages.journal import BaseJournalBackend
+from optuna.storages.journal._file import BaseJournalFileLock
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
@@ -70,7 +68,8 @@ from phasesweep.engine.state import (
     _study_schema_supported,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
-from phasesweep.runtime.files import fsync_directory, journal_file_path
+from phasesweep.runtime.files import fsync_directory, journal_file_path, try_flock, unlock_file
+from phasesweep.runtime.shutdown import defer_shutdown_signals
 
 __all__ = [
     "ClaimedLedger",
@@ -166,7 +165,7 @@ def _resolve_storage(url: str) -> JournalStorage:
     log.info("Using JournalFileStorage at %s", path)
     from optuna.storages.journal import JournalFileBackend
 
-    return JournalStorage(JournalFileBackend(str(path)))
+    return JournalStorage(JournalFileBackend(str(path), lock_obj=_JournalLock(path)))
 
 
 def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
@@ -322,14 +321,12 @@ def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
 def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] | None:
     """Back up a journal, then cut its incomplete final record; the caller holds its lock.
 
-    :param _JournalLock lock: The journal's Optuna journal lock, held by the caller.
+    :param _JournalLock lock: The journal inode lock held by the caller.
     :return tuple[Path, int] | None: The backup's path and the number of bytes
         removed, or ``None`` when the final record had completed by the time
         the lock was taken, so nothing needed repair.
-    :raises IncompleteJournalRecordError: The journal has another hard-linked
-        name, whose appends take a different lock; the backup or the
-        truncation failed; or, while the lock was held, another process
-        replaced it or the journal changed size.
+    :raises IncompleteJournalRecordError: The backup or truncation failed, or
+        the journal pathname or size changed while the lock was held.
     :raises StudyStorageUnavailableError: The journal could not be read, holds
         a malformed record before its last, or does not replay once repaired.
     """
@@ -341,41 +338,33 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     backup = path.with_name(f"{path.name}.{stamp}.bak")
     try:
-        with path.open("r+b") as journal:
-            source = os.fstat(journal.fileno())
-            if source.st_nlink != 1:
-                raise IncompleteJournalRecordError(
-                    f"Journal storage {path} has {source.st_nlink} hard links. An append "
-                    "through another of those names takes a different journal lock, so its "
-                    f"incomplete final record was not repaired. Make {path} the journal's "
-                    "only name, then retry. Nothing was written."
-                )
-            # The copy holds every study and trial attribute the journal does, so
-            # it is created no more permissive than the journal; the umask can
-            # only narrow it further.
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-            with os.fdopen(os.open(backup, flags, stat.S_IMODE(source.st_mode)), "wb") as copy:
-                copy.write(data)
-                copy.flush()
-                os.fsync(copy.fileno())
-            fsync_directory(path.parent)
-            if not lock.held():
-                raise IncompleteJournalRecordError(
-                    f"Journal storage {path}: another process removed or replaced its journal "
-                    "lock during the repair, so its incomplete final record was not truncated. "
-                    f"The journal as it was is saved at {backup}. "
-                    "Nothing was appended.",
-                    action=OperatorAction.RETRY,
-                )
-            if os.fstat(journal.fileno()).st_size != len(data):
-                raise IncompleteJournalRecordError(
-                    f"Journal storage {path} changed while its journal lock was held for "
-                    "repair, so it was not truncated. The journal as it was is saved at "
-                    f"{backup}. Nothing was appended.",
-                    action=OperatorAction.RETRY,
-                )
-            journal.truncate(end)
-            os.fsync(journal.fileno())
+        journal = lock._handle
+        assert journal is not None
+        source = os.fstat(journal.fileno())
+        # The backup carries the journal's permissions, narrowed by the umask.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        with os.fdopen(os.open(backup, flags, stat.S_IMODE(source.st_mode)), "wb") as copy:
+            copy.write(data)
+            copy.flush()
+            os.fsync(copy.fileno())
+        fsync_directory(path.parent)
+        if not lock.held():
+            raise IncompleteJournalRecordError(
+                f"Journal storage {path}: another process removed or replaced its pathname "
+                "during the repair, so its incomplete final record was not truncated. "
+                f"The journal as it was is saved at {backup}. "
+                "Nothing was appended.",
+                action=OperatorAction.RETRY,
+            )
+        if os.fstat(journal.fileno()).st_size != len(data):
+            raise IncompleteJournalRecordError(
+                f"Journal storage {path} changed while its journal lock was held for "
+                "repair, so it was not truncated. The journal as it was is saved at "
+                f"{backup}. Nothing was appended.",
+                action=OperatorAction.RETRY,
+            )
+        journal.truncate(end)
+        os.fsync(journal.fileno())
     except OSError as exc:
         raise IncompleteJournalRecordError(
             f"Journal storage {path} ends with an incomplete record that could not be "
@@ -397,119 +386,93 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
     return backup, len(data) - end
 
 
-#: Maximum wait for Optuna's journal lock during repair.
+#: Maximum wait for the journal inode lock during repair.
 _JOURNAL_LOCK_WAIT_SECONDS = 30.0
 
-#: How often a repair refreshes the journal's modification time while it
-#: holds Optuna's journal lock. Optuna force-releases a lock whose journal a
-#: waiting writer has seen unchanged for 30 seconds.
-_JOURNAL_LOCK_REFRESH_SECONDS = 1.0
 
+class _JournalLock(BaseJournalFileLock):
+    """Flock the journal inode for every append and repair.
 
-class _JournalLock:
-    """Hold Optuna's journal symlink lock for a bounded repair.
-
-    Acquisition waits at most :data:`_JOURNAL_LOCK_WAIT_SECONDS` without removing
-    another writer's lock. The journal mtime is refreshed during acquisition and
-    every :data:`_JOURNAL_LOCK_REFRESH_SECONDS` while held, preventing Optuna's
-    30-second stale-lock reclamation during a long repair.
-
-    A retained private hard link pins the acquired lock inode. Ownership checks
-    and release therefore distinguish it from a replacement lock.
+    Writers wait without a deadline; repair supplies a bounded timeout. The
+    descriptor pins ownership until release, including after pathname replacement.
     """
 
-    def __init__(self, path: Path) -> None:
-        """Name the lock on one journal without taking it.
+    def __init__(self, path: Path, *, timeout: float | None = None) -> None:
+        """Name the existing journal and the caller's acquisition deadline.
 
-        :param Path path: Journal to lock, as
-            :func:`~phasesweep.runtime.files.journal_file_path` returns it.
+        :param Path path: Canonical journal path.
+        :param float | None timeout: Repair wait budget, or unbounded for writers.
         """
         self.path = path
-        self.lock_file = Path(f"{path}.lock")  # Optuna's LOCK_FILE_SUFFIX
-        self._staged = path.with_name(f".{self.lock_file.name}.{secrets.token_hex(8)}.tmp")
-        self._releasing = threading.Event()
-        self._refresher = threading.Thread(
-            target=self._refresh, name=f"refresh {self.lock_file.name}", daemon=True
-        )
+        self._timeout = timeout
+        self._handle: IO[str] | None = None
 
-    def _refresh(self) -> None:
-        """Refresh the journal's modification time until the lock is released."""
-        while not self._releasing.wait(_JOURNAL_LOCK_REFRESH_SECONDS):
-            with contextlib.suppress(OSError):
-                os.utime(self.path)
+    def acquire(self) -> bool:
+        """Lock the journal, refusing a timed-out repair or replaced pathname.
 
-    def acquire(self) -> None:
-        """Take the lock, or refuse once the bounded wait runs out.
-
-        :raises IncompleteJournalRecordError: The lock was still held when the
-            wait ran out, or it could not be created.
+        :raises IncompleteJournalRecordError: The journal could not be locked.
+        :return bool: ``True`` once acquired.
         """
-        deadline = time.monotonic() + _JOURNAL_LOCK_WAIT_SECONDS
+        deadline = None if self._timeout is None else time.monotonic() + self._timeout
         delay = 0.001
+        handle: IO[str] | None = None
         try:
-            os.symlink(self.path, self._staged)
+            with defer_shutdown_signals():
+                handle = self.path.open("r+", encoding="utf-8")
             while True:
-                # First, so an Optuna writer whose grace period ran out on an
-                # earlier lock sees the journal change once this one appears.
-                os.utime(self.path)
-                try:
-                    os.link(self._staged, self.lock_file, follow_symlinks=False)
-                except FileExistsError:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise IncompleteJournalRecordError(
-                            f"Journal storage {self.path} ends with an incomplete record, and "
-                            f"its journal lock {self.lock_file} was still held after "
-                            f"{_JOURNAL_LOCK_WAIT_SECONDS:g} seconds, so the record was not "
-                            "repaired. If no "
-                            f"process is writing to this journal, remove {self.lock_file}, then "
-                            "retry. Nothing was written."
-                        ) from None
-                    time.sleep(min(delay, remaining))
-                    delay = min(delay * 2, 1.0)
-                else:
-                    self._refresher.start()
-                    return
+                with defer_shutdown_signals():
+                    acquired = try_flock(handle)
+                    if acquired:
+                        self._handle = handle
+                        if not self.held():
+                            raise IncompleteJournalRecordError(
+                                f"Journal storage {self.path} was removed or replaced while "
+                                "its journal lock was being taken. Nothing was written.",
+                                action=OperatorAction.RETRY,
+                            )
+                if acquired:
+                    return True
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise IncompleteJournalRecordError(
+                        f"Journal storage {self.path} ends with an incomplete record, and "
+                        f"its journal lock was still held after {self._timeout:g} seconds, "
+                        "so the record was not repaired. Wait for the writer to finish, "
+                        "then retry. Nothing was written."
+                    )
+                time.sleep(delay if remaining is None else min(delay, remaining))
+                delay = min(delay * 2, 1.0)
         except BaseException as exc:
-            self.release()
+            with defer_shutdown_signals():
+                self._handle = None
+                if handle is not None:
+                    unlock_file(handle)
             if isinstance(exc, OSError):
                 raise IncompleteJournalRecordError(
-                    f"Journal storage {self.path} ends with an incomplete record that could not "
-                    f"be repaired: its journal lock could not be taken: {exc}. Nothing was written."
+                    f"Journal storage {self.path} could not be repaired or appended: "
+                    f"its journal lock could not be taken: {exc}. Nothing was written."
                 ) from exc
             raise
 
     def held(self) -> bool:
-        """Report whether the lock in place is still the one this repair took.
+        """Return whether the pathname still names the locked journal inode.
 
-        :return bool: ``False`` when the lock is gone or another process's.
+        :return bool: ``False`` when unheld, removed, or replaced, including by a symlink.
         """
+        if self._handle is None:
+            return False
         try:
-            lock, staged = self.lock_file.lstat(), self._staged.lstat()
+            current, held = self.path.lstat(), os.fstat(self._handle.fileno())
         except OSError:
             return False
-        return (lock.st_dev, lock.st_ino) == (staged.st_dev, staged.st_ino)
+        return (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
 
-    def release(self) -> bool:
-        """Stop the refresh, and remove the lock only while it is this repair's.
-
-        :return bool: Whether the lock was removed. ``False`` means another
-            process had removed or replaced it, and its lock is left in place.
-        """
-        self._releasing.set()
-        if self._refresher.ident is not None:
-            self._refresher.join()
-        released = False
-        if self.held():
-            try:
-                JournalFileSymlinkLock(str(self.path)).release()
-            except RuntimeError:
-                pass
-            else:
-                released = True
-        with contextlib.suppress(OSError):
-            self._staged.unlink()
-        return released
+    def release(self) -> None:
+        """Close the held descriptor before servicing deferred shutdown."""
+        with defer_shutdown_signals():
+            handle, self._handle = self._handle, None
+            if handle is not None:
+                unlock_file(handle)
 
 
 def _repair_incomplete_journal_record(storage_url: str) -> None:
@@ -521,13 +484,13 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     the journal's, truncate to the complete prefix, fsync, and verify replay before
     releasing the lock. Never reuse the offset scanned before acquisition.
 
-    If the lock is replaced, neither truncate the journal nor remove the new lock.
+    If the pathname is replaced, leave the replacement untouched.
     Malformed records before the final line are refused without automatic repair.
 
     :param str storage_url: Journal storage URL a caller is about to write through.
     :raises IncompleteJournalRecordError: The record could not be repaired,
         the journal lock stayed held past the wait, or another process
-        removed or replaced the journal lock during the repair.
+        removed or replaced the journal pathname during the repair.
     :raises StudyStorageUnavailableError: The journal could not be read, holds
         a malformed record before its last, or did not replay once repaired.
     """
@@ -539,20 +502,19 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
         "Journal storage %s ends with an incomplete record; taking its journal lock to repair it.",
         path,
     )
-    lock = _JournalLock(path)
+    lock = _JournalLock(path, timeout=_JOURNAL_LOCK_WAIT_SECONDS)
     lock.acquire()
     try:
         repaired = _truncate_incomplete_journal_record(lock)
-    except BaseException:
+        if not lock.held():
+            raise IncompleteJournalRecordError(
+                f"Journal storage {path} was removed or replaced while its incomplete final "
+                "record was being repaired. The replacement was left in place. "
+                "Retry to check the journal again.",
+                action=OperatorAction.RETRY,
+            )
+    finally:
         lock.release()
-        raise
-    if not lock.release():
-        raise IncompleteJournalRecordError(
-            f"Journal storage {path}: another process removed or replaced its journal lock "
-            "while its incomplete final record was being repaired, so an append may have raced "
-            "the repair. That lock was left in place. Retry to check the journal again.",
-            action=OperatorAction.RETRY,
-        )
     if repaired is not None:
         backup, dropped = repaired
         log.warning(
