@@ -73,7 +73,6 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    assert_published_winner_evidence_local,
     copy_fake_train,
     drop_artifact_root_binding,
     make_experiment,
@@ -1156,8 +1155,6 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     storage = experiment.storage
-    root = _experiment_dir(experiment)
-    assert_published_winner_evidence_local(root)
     drop_artifact_root_binding(storage, "t::p")
 
     with pytest.raises(ArtifactRootConflictError) as excinfo:
@@ -1172,7 +1169,6 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     )
     # The refusal is not allowed to cost the tree its existing publication.
     assert published_generation_id(experiment) is not None
-    assert_published_winner_evidence_local(root)
 
 
 def _unbound_two_phase_studies(

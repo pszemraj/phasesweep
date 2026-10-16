@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 import statistics
 from dataclasses import replace
 from pathlib import Path
@@ -24,7 +25,12 @@ from phasesweep.config.search import (
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
-from phasesweep.engine.paths import _generation_summary_path, _generation_winner_path, _phase_dir
+from phasesweep.engine.paths import (
+    _generation_dir,
+    _generation_summary_path,
+    _generation_winner_path,
+    _phase_dir,
+)
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner
 from phasesweep.engine.read import _winner_view, read_result, read_status, read_trial_tables
@@ -489,25 +495,17 @@ def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
         ]
 
 
-def test_carried_group_winner_must_agree_on_repeats(tmp_path: Path) -> None:
-    """A carried group winner keeps its source generation's members verbatim."""
+def test_carried_repeat_winner_reads_without_older_publication(tmp_path: Path) -> None:
+    """A carried repeat group's current result embeds every member's identity."""
     experiment, source_generation = _repeats_publication(tmp_path)
-    run_experiment(experiment)
-    carrying_generation = published_generation_id(experiment)
-    assert carrying_generation not in (None, source_generation)
-    assert carrying_generation is not None
-    winner = _winner_payload(experiment, carrying_generation)
-    assert winner["generation_id"] == source_generation
-    assert winner["repeats"] == _winner_payload(experiment, source_generation)["repeats"]
-    # A non-representative member edit keeps the block self-consistent.
-    _members(winner)[0]["attempt_id"] = "a" * 32
-    _reseal_winner(experiment, carrying_generation, winner)
+    carried = run_experiment(experiment)["p"]
+    assert carried.generation_id == source_generation
+    assert carried.repeats is not None
+    expected = read_result(experiment)
+    shutil.rmtree(_generation_dir(experiment, source_generation))
 
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert "disagrees with the result recorded by its source generation" in pointer.error
-    assert "on repeats" in pointer.error
+    assert read_result(experiment) == expected
+    assert run_experiment(experiment)["p"].repeats == carried.repeats
 
 
 @pytest.mark.parametrize("reduce", ["mean", "median"])

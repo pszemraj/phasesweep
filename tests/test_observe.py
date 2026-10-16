@@ -22,7 +22,6 @@ from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
 from tests.conftest import make_experiment, write_trainer
 from tests.test_publication_transaction import _golden_publication, _reseal_winner
-from tests.test_trial_evidence import _tree_with_a_carried_winner
 
 
 def _log_observation(name: str, pattern: str) -> Observation:
@@ -203,20 +202,3 @@ def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:
     _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.observed == {"peak": 7.5, "steps": 3.0}
-
-
-def test_carried_winner_must_agree_with_its_source_on_observed(tmp_path: Path) -> None:
-    """Observed values belong to the cited source trial, so a carried winner cannot change them."""
-    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
-    winner = yaml.safe_load(
-        _generation_winner_path(experiment, carrying_generation, "p").read_text()
-    )
-    assert winner["generation_id"] == source_generation
-    winner["observed"] = {"peak": 9.0}
-    _reseal_winner(experiment, carrying_generation, winner)
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert "disagrees with the result recorded by its source generation" in pointer.error
-    assert "on observed" in pointer.error

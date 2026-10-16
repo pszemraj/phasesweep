@@ -1,22 +1,10 @@
-"""Selection may not rank or republish a trial whose evidence left the tree.
-
-Winner selection reads Optuna alone - state, value, feasibility, execution ids,
-constraint readings - so without this guard an experiment whose winning trial
-directory had been deleted would reselect that trial and republish its
-number, metric, and provenance from a tree holding nothing behind them, with
-``publication_integrity: ok``. These tests cover the three places that fail
-closed: the launch preflight over every selection-eligible candidate, the
-digest check on the trial that actually becomes the published winner, and the
-manifest rule that a winner carried from an earlier generation must find that
-generation in this same tree.
-"""
+"""Selection and resume require the winning trials' local evidence."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import shutil
-from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -25,7 +13,6 @@ import pytest
 import yaml
 
 import phasesweep.engine.evidence as evidence_ops
-import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
@@ -33,19 +20,13 @@ from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
-    _experiment_dir,
-    _generation_config_snapshot_path,
     _generation_path,
-    _generation_reproducibility_path,
-    _generation_summary_path,
-    _generation_winner_path,
     _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
     _trial_dir_for,
 )
-from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import read_status
+from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
@@ -53,15 +34,12 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
-    assert_published_winner_evidence_local,
     make_experiment,
     write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
 
-# Every test here drives a real sweep through external trainer processes before
-# it can check what selection published, so the whole module is integration tier.
 pytestmark = pytest.mark.integration
 
 
@@ -673,11 +651,8 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     second_generation = published_generation_id(topup)
     assert second_generation is not None
     assert second_generation != first_generation
-    # Constant objective: trial 0 still wins on the tie break, so this is also
-    # the ordinary carry-forward path the manifest rule below governs.
     assert winners["p"].trial_number == 0
     assert read_status(topup)["publication_integrity"] == "ok"
-    assert_published_winner_evidence_local(_experiment_dir(topup))
 
 
 def test_log_regex_evaluation_revision_change_blocks_study_reuse(
@@ -810,6 +785,10 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     """A carried winner's source must verify before the resumed phase can run."""
     original, marker = _from_phase_evidence_experiment(tmp_path)
     run_experiment(original)
+    source_generation = published_generation_id(original)
+    assert source_generation is not None
+    run_experiment(original)
+    shutil.rmtree(_generations_dir(original) / source_generation)
     marker.unlink()
     source = _sole_trial_dir(original)
     pointer_before = _pointer_bytes(original)
@@ -859,6 +838,9 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
     original = experiment(1)
     winner = run_experiment(original)["p"]
     assert winner.trial_number == 2
+    assert winner.generation_id is not None
+    run_experiment(original)
+    shutil.rmtree(_generations_dir(original) / winner.generation_id)
     marker.unlink()
     first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
     source = first_member / "stdout.log"
@@ -890,6 +872,10 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     """Winner serialization supplies enough evidence identity to skip a missing study."""
     experiment, _marker = _from_phase_evidence_experiment(tmp_path)
     run_experiment(experiment)
+    source_generation = published_generation_id(experiment)
+    assert source_generation is not None
+    run_experiment(experiment)
+    shutil.rmtree(_generations_dir(experiment) / source_generation)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     payload = yaml.safe_load(
@@ -913,283 +899,43 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     assert resumed["p"].trial_number == 0
 
 
-# --------------------------------------------------------------------------
-# Manifest rule: a winner carried from an earlier generation must find that
-# generation here. Fires pre-commit on the publish path and on every read.
-# --------------------------------------------------------------------------
-
-
-def _tree_with_a_carried_winner(tmp_path: Path) -> tuple[Experiment, str, str]:
-    """Publish twice so the second generation's winner cites the first.
-
-    :return tuple[Experiment, str, str]: The experiment plus the source and
-        carrying generation ids.
-    """
+@pytest.mark.parametrize(
+    "damage", ["deleted_generation", "missing_winner", "edited_winner", "invalid_summary"]
+)
+def test_carried_result_ignores_older_publication_files(tmp_path: Path, damage: str) -> None:
+    """Reading and republishing a carried result use its embedded winner and trial evidence."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
     source_generation = published_generation_id(experiment)
     assert source_generation is not None
     run_experiment(experiment)
-    carrying_generation = published_generation_id(experiment)
-    assert carrying_generation is not None
-    assert carrying_generation != source_generation
-    payload = _published_winner_payload(experiment, carrying_generation)
-    assert payload["winner_source"]["generation_id"] == source_generation
-    return experiment, source_generation, carrying_generation
-
-
-def _two_phase_evidence_experiment(tmp_path: Path) -> Experiment:
-    """Build a two-phase experiment on journal storage, both phases constant and seeded.
-
-    Both phases resolve the same constant trainer every trial, so a top-up
-    over persistent storage reselects each phase's trial 0 without launching
-    any new trial -- the shape needed for a later generation to carry both
-    phases' winners from the very same earlier generation.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    return make_experiment(
-        persistent=tmp_path,
-        trainer=trainer,
-        phases=[
-            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0)),
-            Phase(name="q", n_trials=1, sampler=Sampler(type="random", seed=1)),
-        ],
-    )
-
-
-def _tree_with_two_carried_winners_from_one_source(tmp_path: Path) -> tuple[Experiment, str, str]:
-    """Publish a two-phase experiment twice, so both phases carry from the first generation.
-
-    The second (top-up) generation reselects both phases' already-completed
-    trials without launching new ones, so both of its winners cite the same
-    earlier, published source generation.
-
-    :return tuple[Experiment, str, str]: The experiment plus the source and
-        carrying generation ids.
-    """
-    experiment = _two_phase_evidence_experiment(tmp_path)
-    run_experiment(experiment)
-    source_generation = published_generation_id(experiment)
-    assert source_generation is not None
-    run_experiment(experiment)
-    carrying_generation = published_generation_id(experiment)
-    assert carrying_generation is not None
-    assert carrying_generation != source_generation
-    for phase_name in ("p", "q"):
-        payload = yaml.safe_load(
-            _generation_winner_path(experiment, carrying_generation, phase_name).read_text()
-        )
-        assert payload["winner_source"]["generation_id"] == source_generation
-    return experiment, source_generation, carrying_generation
-
-
-def test_shared_source_generation_is_validated_once_per_top_level_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two carried winners citing the same published source share one validation pass.
-
-    Revalidating a shared ancestor once per path that reaches it grows
-    exponentially with top-up history, so one top-level check reads every
-    artifact exactly once, and the next check still sees later damage.
-    """
-    experiment, source_generation, _carrying = _tree_with_two_carried_winners_from_one_source(
-        tmp_path
-    )
-
-    reads: Counter[Path] = Counter()
-    original_read = validation_ops._read_unlinked_bytes
-
-    def _counting_read(path: Path, *, root: Path) -> bytes:
-        reads[path] += 1
-        return original_read(path, root=root)
-
-    monkeypatch.setattr(validation_ops, "_read_unlinked_bytes", _counting_read)
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "ok"
-    repeated = {path: count for path, count in reads.items() if count != 1}
-    assert not repeated, f"artifact(s) read more than once by one top-level check: {repeated}"
-
-    # The shared map is scoped to that one top-level call, not cached across
-    # independent reads: damaging the shared source afterward must still be
-    # seen by the next read.
-    source_winner_path = _generation_winner_path(experiment, source_generation, "p")
-    winner = yaml.safe_load(source_winner_path.read_text())
-    winner["params"]["x"] = 999
-    source_winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-
-    pointer_after_damage = _resolve_publication_pointer(experiment)
-    assert pointer_after_damage.state == "failed"
-
-
-def test_carried_winners_source_citing_the_carrying_generation_fails_without_recursion(
-    tmp_path: Path,
-) -> None:
-    """A tampered tree whose source cites its own carrier fails, instead of recursing forever.
-
-    Coherently rewrites the older (source) generation's own published winner
-    to claim it was itself carried from the newer generation that in fact
-    carries a winner from it -- a two-generation provenance cycle. The
-    manifest fails closed instead of recursing without bound.
-    """
-    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
-
-    winner_path = _generation_winner_path(experiment, source_generation, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["generation_id"] = carrying_generation
-    winner["winner_source"]["generation_id"] = carrying_generation
-    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-
-    summary_path = _generation_summary_path(experiment, source_generation)
-    summary = yaml.safe_load(summary_path.read_text())
-    phase_item = next(item for item in summary["phases"] if item["name"] == "p")
-    phase_item["generation_id"] = carrying_generation
-    phase_item["winner_source"]["generation_id"] = carrying_generation
-    artifact = next(
-        item
-        for item in summary["artifacts"]
-        if item.get("kind") == "winner" and item.get("phase") == "p"
-    )
-    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    status = read_status(experiment)
-    assert status["publication_integrity"] == "failed"
-    assert "provenance cycle" in str(status["publication_error"])
-
-
-def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
-    tmp_path: Path,
-) -> None:
-    """The cited generation holds the evidence, so its absence is corruption.
-
-    This is the tree ``assert_published_winner_evidence_local`` rejects, and
-    the manifest must report it as ``failed`` rather than ``ok``.
-    """
-    experiment, source_generation, _carrying = _tree_with_a_carried_winner(tmp_path)
-    shutil.rmtree(_generations_dir(experiment) / source_generation)
-
-    status = read_status(experiment)
-    assert status["publication_integrity"] == "failed"
-    assert source_generation in str(status["publication_error"])
-    assert "does not exist in this tree" in str(status["publication_error"])
-    with pytest.raises(AssertionError):
-        assert_published_winner_evidence_local(_experiment_dir(experiment))
-
-    pointer_before = _pointer_bytes(experiment)
-    with pytest.raises(RuntimeError, match="does not exist in this tree"):
-        run_experiment(_evidence_experiment(tmp_path))
-    assert _pointer_bytes(experiment) == pointer_before
-    assert published_generation_id(experiment) is None
-
-
-@pytest.mark.parametrize(
-    "damage",
-    ["missing", "edited", "coherently_changed", "invalid_winner_yaml", "invalid_summary_yaml"],
-)
-def test_published_source_generation_damage_fails_integrity(tmp_path: Path, damage: str) -> None:
-    """A carried result cannot outlive or contradict its published source."""
-    experiment, source_generation, _ = _tree_with_a_carried_winner(tmp_path)
+    assert published_generation_id(experiment) != source_generation
+    expected = read_result(experiment)[1]
+    assert expected[0].generation_id == source_generation
     source_dir = _generations_dir(experiment) / source_generation
-    winner_path = source_dir / "phases" / "p" / "winner.yaml"
-    if damage == "missing":
-        winner_path.unlink()
-        diagnostic = "published but holds no winner record"
-    elif damage == "invalid_winner_yaml":
-        winner_path.write_text("updated_at: 2026-99-99\n", encoding="utf-8")
-        # The cited payload comes from the source's validated manifest, whose
-        # hash check catches the swapped file before anything parses it.
-        diagnostic = "does not match its recorded hash"
-    elif damage == "invalid_summary_yaml":
-        (source_dir / "summary.yaml").write_text("updated_at: 2026-99-99\n", encoding="utf-8")
-        diagnostic = "summary is unreadable or invalid"
+    source_winner = source_dir / "phases" / "p" / "winner.yaml"
+    if damage == "deleted_generation":
+        shutil.rmtree(source_dir)
+    elif damage == "missing_winner":
+        source_winner.unlink()
+    elif damage == "edited_winner":
+        source_winner.write_text("unrelated: result\n")
     else:
-        winner = yaml.safe_load(winner_path.read_text())
-        winner["metric"][experiment.metric.name] = 0.9
-        winner["params"]["x"] = -1
-        winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-        if damage == "coherently_changed":
-            summary_path = source_dir / "summary.yaml"
-            summary = yaml.safe_load(summary_path.read_text())
-            summary["phases"][0]["metric"] = 0.9
-            summary["phases"][0]["params"] = {"x": -1}
-            artifact = next(
-                item
-                for item in summary["artifacts"]
-                if item.get("kind") == "winner" and item.get("phase") == "p"
-            )
-            artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
-            summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-            diagnostic = "disagrees with the result recorded"
-        else:
-            diagnostic = "source generation"
-    assert (source_dir / "summary.yaml").is_file()
+        (source_dir / "summary.yaml").write_text("[invalid YAML\n")
 
-    status = read_status(experiment)
-    assert status["publication_integrity"] == "failed"
-    assert diagnostic in str(status["publication_error"])
-
-    with pytest.raises(RuntimeError, match=diagnostic):
-        run_experiment(_evidence_experiment(tmp_path))
-
-
-@pytest.mark.parametrize("identity_field", ["experiment", "generation_id"])
-def test_carried_winner_rejects_reidentified_source_summary(
-    tmp_path: Path,
-    identity_field: str,
-) -> None:
-    """A carried winner's source must retain its experiment and generation identity."""
-    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
-    carried = yaml.safe_load(
-        _generation_winner_path(experiment, carrying_generation, "p").read_text()
-    )
-    assert carried["generation_id"] == source_generation
-
-    summary_path = _generation_summary_path(experiment, source_generation)
-    summary = yaml.safe_load(summary_path.read_text())
-    snapshot_path = _generation_config_snapshot_path(experiment, source_generation)
-    snapshot = yaml.safe_load(snapshot_path.read_text())
-    record_path = _generation_reproducibility_path(experiment, source_generation)
-    record = json.loads(record_path.read_text())
-    forged = f"forged-{identity_field}"
-
-    summary[identity_field] = forged
-    record[identity_field] = forged
-    if identity_field == "experiment":
-        snapshot["experiment"] = forged
-        snapshot_path.write_text(yaml.safe_dump(snapshot, sort_keys=False))
-        record["config_snapshot"]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
-    record_path.write_text(json.dumps(record))
-    for entry in summary["artifacts"]:
-        if entry.get("path") == "config.snapshot.yaml":
-            entry["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
-        elif entry.get("path") == "reproducibility.json":
-            entry["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert f"names a different {identity_field.removesuffix('_id')}" in pointer.error
+    status, winners = read_result(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert winners == expected
+    replayed = run_experiment(experiment)["p"]
+    assert replayed.trial_number == expected[0].trial_number
+    assert replayed.generation_id == source_generation
+    assert read_status(experiment)["publication_integrity"] == "ok"
 
 
 def test_winner_carried_from_a_generation_that_crashed_before_publication_publishes(
     tmp_path: Path,
 ) -> None:
-    """Control for the carve-out: an unpublished source namespace is legitimate.
-
-    Built entirely from the real flow, no fabrication. The first invocation's
-    trial 0 completes and trial 1 exits non-zero, tripping the consecutive
-    failure breaker; the phase raises before any winner is saved, so that
-    generation's namespace holds its claim-time provenance and *no* summary and
-    *no* winner record - exactly the shape a crash between trial completion and
-    publication leaves behind. The recovery run raises the trial target (which
-    starts a new recovery streak for a random sampler), completes, and
-    legitimately publishes trial 0, citing the crashed generation.
-
-    Requiring a winner record in every cited source generation would make this
-    ordinary recovery permanently unpublishable.
-    """
+    """Completed trials from an unpublished generation can still supply the winner."""
     recovery_marker = tmp_path / "recovered.txt"
     crashing = _evidence_experiment(
         tmp_path,
@@ -1225,4 +971,3 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
     payload = _published_winner_payload(recovering, published)
     assert payload["winner_source"]["generation_id"] == crashed_generation
     assert read_status(recovering)["publication_integrity"] == "ok"
-    assert_published_winner_evidence_local(_experiment_dir(recovering))

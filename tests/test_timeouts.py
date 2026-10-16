@@ -412,9 +412,7 @@ def test_group_completed_after_partial_timeout_publishes_from_completing_generat
     The first run stops on its phase deadline after trial 4, so it publishes the
     only complete group, [0, 1, 2], while [3, 4, 5] still lacks trial 5. The
     enlarged rerun runs trial 5 in a new generation, and that group wins. Its
-    winner cites trial 5, whose generation published this same winner, so the
-    carried-winner check passes although two of its members ran a generation
-    earlier.
+    winner cites trial 5 while retaining every member's execution identity.
     """
     import types
 
