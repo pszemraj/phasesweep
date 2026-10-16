@@ -274,7 +274,7 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     toward a new experiment name or archiving a healthy study; falling through to
     ``internal_error`` would report a plain misconfiguration as a bug.
     """
-    failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
 
     assert failure["code"] == code
     assert failure["stage"] == "preflight"
@@ -289,9 +289,10 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     Only persistent storage keeps the abort this refusal records, so raising
     n_trials is not a step every such raise requires; the message says when.
     """
-    failure = mcp_runner._safe_failure_payload(
+    failure = mcp_runner._terminal_failure_payload(
         ActiveAttemptPersistenceError("attempt registry is unwritable"),
         stage="execution",
+        cleanup_confirmed=True,
     )
 
     assert failure["code"] == "storage_unavailable"
@@ -722,10 +723,14 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "record_fail")
 
-    def fail_record_write(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated record write failure")
+    real_write = generation_ops.artifact_io._write_yaml_exclusive
 
-    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
+    def fail_record_write(path: Path, payload: object) -> bool:
+        if path.name == "generation.yaml":
+            raise OSError("simulated record write failure")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(generation_ops.artifact_io, "_write_yaml_exclusive", fail_record_write)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"

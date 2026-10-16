@@ -143,7 +143,6 @@ class Winner:
     # The tracked name -> value mapping stays on the trial attrs — the winner
     # file keeps the compact identity.
     trainer_env_digest: str | None = None
-    trainer_inherit_env: str | list[str] | None = None
     # Advisory verdicts on the population the source selection ranked, frozen
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.

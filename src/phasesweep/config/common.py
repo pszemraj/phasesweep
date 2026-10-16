@@ -177,9 +177,6 @@ def _validate_safe_name(kind: str, value: str) -> str:
     return value
 
 
-_OVERRIDE_KEY_SEGMENT = re.compile(r"^[A-Za-z0-9_\-]+$")
-
-
 def _validate_override_key(key: str, *, label: str) -> None:
     """Require nonempty dotted override keys with ``[A-Za-z0-9_-]`` segments.
 
@@ -201,7 +198,7 @@ def _validate_override_key(key: str, *, label: str) -> None:
                 f"position {i}. Use simple keys like 'lr' or dotted keys like "
                 f"'model.depth'; do not use leading/trailing dots or '..'."
             )
-        if not _OVERRIDE_KEY_SEGMENT.match(part):
+        if not SAFE_NAME_PATTERN.fullmatch(part):
             raise ValueError(
                 f"{label}: override key {key!r} segment {part!r} contains "
                 "invalid characters (allowed: alphanumerics, underscore, dash, "

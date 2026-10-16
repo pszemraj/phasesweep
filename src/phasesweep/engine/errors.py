@@ -2,8 +2,7 @@
 
 from typing import ClassVar
 
-from phasesweep.errors import OperatorAction as OperatorAction
-from phasesweep.errors import PhaseSweepError as PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):

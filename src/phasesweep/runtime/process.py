@@ -569,36 +569,23 @@ def _spawn_blocked_supervisor(
     Args:
         stdout: Already-open file handle that receives the subprocess stdout.
         stderr: Already-open file handle that receives the subprocess stderr.
-        deadline: Optional ``time.monotonic()`` launch deadline. When it
-            expires during the readiness wait, the spawn is aborted and
-            :class:`_LaunchDeadlineExpired` is raised so the caller reports a
-            timeout instead of a generic launch failure.
-        gpu_lease_fds: Open host GPU-lock descriptors deliberately inherited
-            by the trusted supervisor guardian so the kernel lease outlives an
-            orchestrator hard exit. The guardian does not pass them to the
-            trainer child.
+        deadline: Absolute ``time.monotonic()`` launch deadline, or ``None``.
+        gpu_lease_fds: Host GPU-lock descriptors inherited only by the guardian,
+            keeping leases held after an orchestrator exit until cleanup finishes.
 
     Returns:
-        A ``(proc, pgid, ack_write, status_read)`` tuple: the guardian's
-        ``Popen`` handle, the trainer's registered process-group id, the write
-        end of the acknowledgement pipe, and the read end of the guardian
-        status pipe. The caller owns both descriptors. It must send the framed
-        launch payload (see :func:`_encode_launch_payload`) and close
-        ``ack_write`` once the trainer identity is durably persisted.
-        ``status_read`` yields ``b"X"`` as soon as the trainer root exits and
-        then ``b"D"`` when the guardian had to reap descendants, otherwise
-        EOF. Waiting for descendant cleanup after ``b"X"`` is outside the
-        trainer wallclock budget.
+        ``(proc, pgid, ack_write, status_read)``: guardian process, registered trainer
+        group, launch pipe and status pipe. The caller owns both descriptors; after
+        persisting trainer identity, send the framed payload and close ``ack_write``.
+        ``status_read`` yields ``b"X"`` when the trainer root exits, then ``b"D"`` if
+        descendants were reaped or EOF otherwise. Cleanup after ``b"X"`` is outside
+        the trainer wallclock budget.
 
     Raises:
-        _LaunchDeadlineExpired: The launch deadline expired before the
-            supervisor became ready; the spawned group is already aborted and
-            the exception carries the cleanup confirmation.
-        RuntimeError: If the supervisor does not signal readiness within
-            ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
-            than ``_supervisor._READY_TAG``.
-        UnsafeProcessCleanupError: A supervisor was spawned, launch failed or
-            was interrupted, and terminating that process could not be confirmed.
+        _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group
+            was aborted and the exception carries cleanup confirmation.
+        RuntimeError: Supervisor readiness timed out or returned an unexpected tag.
+        UnsafeProcessCleanupError: Failed or interrupted launch left cleanup unconfirmed.
 
     """
     import time

@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import optuna
-import yaml
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
+from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import _confound_summary, _validate_confound_block
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
@@ -113,8 +113,6 @@ class PhaseWinnerView:
     effective_overrides: dict[str, Any]
     gates_passed: bool | None  # None when the phase declared no gates
     incomplete: bool  # True when a wallclock timeout produced a partial winner
-    generation_id: str | None = None
-    attempt_id: str | None = None
     source: WinnerSource | None = None
     # Path-free projection of the winner's confound block: verdicts, check
     # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
@@ -232,16 +230,6 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             effective_overrides=dict(effective_overrides),
             gates_passed=(all(bool(g.get("passed")) for g in gates) if gates else None),
             incomplete=bool(completion.get("incomplete", False)),
-            generation_id=(
-                str(data["generation_id"])
-                if isinstance(data.get("generation_id"), str) and data["generation_id"]
-                else None
-            ),
-            attempt_id=(
-                str(data["attempt_id"])
-                if isinstance(data.get("attempt_id"), str) and data["attempt_id"]
-                else None
-            ),
             source=source,
             confound=confound,
             observed=_validate_observed_block(data.get("observed")),
@@ -264,12 +252,7 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
     """
     if not path.is_file():
         return None
-    try:
-        loaded = yaml.safe_load(path.read_text())
-    except (OSError, ValueError, yaml.YAMLError):
-        # Partially-written or malformed file (or unlinked between the is_file
-        # check and the read): report as no-winner-yet rather than raising.
-        return None
+    loaded = read_yaml_or_none(path)
     if not isinstance(loaded, Mapping):
         return None
     return _winner_view(loaded, phase_name)
@@ -333,10 +316,7 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
     """
     if summary_path is None:
         return None
-    try:
-        payload = yaml.safe_load(summary_path.read_text())
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
+    payload = read_yaml_or_none(summary_path)
     if not isinstance(payload, Mapping):
         return None
     if payload.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
@@ -391,10 +371,7 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     :return str | None: The recorded ``generation_id``, or ``None`` when the
         pointer is missing, unreadable, malformed, or unsafely named.
     """
-    try:
-        generation = yaml.safe_load(_generation_path(experiment).read_text())
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
+    generation = read_yaml_or_none(_generation_path(experiment))
     if not isinstance(generation, Mapping):
         return None
     raw_generation_id = generation.get("generation_id")
@@ -711,7 +688,9 @@ def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
     """
     if winner is None:
         return {}
-    standing: dict[int, str | None] = {winner.trial_number: winner.attempt_id}
+    standing: dict[int, str | None] = {
+        winner.trial_number: winner.source.attempt_id if winner.source is not None else None
+    }
     if winner.repeats is not None:
         for number in winner.repeats["member_trials"]:
             standing.setdefault(number, None)

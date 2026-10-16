@@ -590,9 +590,7 @@ class Phase(_Frozen):
         if self.gpu_policy == "whole_node" and self.gpu_ids is None and self.gpu_devices is None:
             raise ValueError(
                 "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
-                "list: the whole-node device set is the trainer's world size — a "
-                "semantic input, not a throughput knob — so it cannot be left to "
-                "ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection."
+                "list because its device count defines the trainer's world size."
             )
         if self.gpu_policy == "whole_node":
             # Declared device count must match the pool's distinct normalized tokens.
@@ -602,12 +600,8 @@ class Phase(_Frozen):
             if duplicates:
                 field = "gpu_ids" if self.gpu_ids is not None else "gpu_devices"
                 raise ValueError(
-                    "gpu_policy='whole_node' requires unique device tokens because the "
-                    "effective device count is part of experiment semantics; "
-                    f"{field} repeats {duplicates}. The phase fingerprint records the "
-                    "declared device count as the trainer's world size, while the GPU "
-                    "pool leases each token once — so a duplicate would run a smaller "
-                    "world than the study identity claims. List each device once, or "
+                    "gpu_policy='whole_node' requires unique device tokens; "
+                    f"{field} repeats {duplicates}. List each device once, or "
                     "use gpu_policy='single_per_trial' if you meant a pool rather than "
                     "a world size."
                 )
@@ -914,6 +908,13 @@ class ExecutionContext(_Frozen):
         :return tuple[str, ...]: Sorted unique names inherited when set and never digested.
         """
         return tuple(sorted({*BUILTIN_PASSTHROUGH_ENV, *self.passthrough_env}))
+
+    def inherit_env_contract(self) -> str | list[str]:
+        """Return the environment inheritance contract in canonical persisted order.
+
+        :return str | list[str]: ``"all"``, ``"none"``, or the sorted name list.
+        """
+        return sorted(self.inherit_env) if isinstance(self.inherit_env, list) else self.inherit_env
 
     def tracked_env_names(self) -> tuple[str, ...]:
         """List the ambient variable names the environment cohort covers.

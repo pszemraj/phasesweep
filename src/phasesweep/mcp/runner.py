@@ -256,22 +256,6 @@ def _base_failure_payload(
     }
 
 
-def _safe_failure_payload(
-    error: BaseException,
-    *,
-    stage: str | None,
-) -> dict[str, object]:
-    """Map an error to one stable agent failure.
-
-    :param BaseException error: Primary exception to classify.
-    :param str | None stage: Stage forwarded to :func:`_base_failure_payload`
-        for ``error``.
-    :return dict[str, object]: The validated primary failure payload.
-    """
-    payload = _base_failure_payload(error, stage=stage)
-    return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
-
-
 def _cleanup_steps(
     primary: BaseException, cleanup_error: BaseException | None
 ) -> list[OperatorAction]:
@@ -375,7 +359,8 @@ def _terminal_failure_payload(
     """
     if not cleanup_confirmed:
         return _cleanup_failure_payload(error, cause_stage=stage, cleanup_error=cleanup_error)
-    return _safe_failure_payload(error, stage=stage)
+    payload = _base_failure_payload(error, stage=stage)
+    return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
 # Terminal persistence retries use a sub-second backoff budget.

@@ -13,7 +13,7 @@ import json
 import math
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
@@ -230,34 +230,10 @@ def group_key(position: int, params: Mapping[str, object], axis: RepeatAxis) -> 
     return json.dumps([slot, rest], sort_keys=True, separators=(",", ":"))
 
 
-def group_labels(
-    trials: Iterable[tuple[int, int, Mapping[str, object]]], axis: RepeatAxis
-) -> dict[int, int]:
-    """Label each trial of a repeats phase with the highest trial number of its group so far.
-
-    The groups are the ones selection ranks, by :func:`group_key`. An incomplete
-    group's label moves as more members are allocated. A trial without the
-    repeat key, which was stopped before sampling it, belongs to no group and
-    gets no label.
-
-    :param Iterable[tuple[int, int, Mapping[str, object]]] trials: ``(trial_number,
-        draw_position, params)`` of every trial of the phase.
-    :param RepeatAxis axis: The phase's repeat axis.
-    :return dict[int, int]: Group label by trial number, for the trials that have one.
-    """
-    keyed = {
-        number: group_key(position, params, axis)
-        for number, position, params in trials
-        if axis.key in params
-    }
-    last: dict[str, int] = {}
-    for number, key in keyed.items():
-        last[key] = max(last.get(key, number), number)
-    return {number: last[key] for number, key in keyed.items()}
-
-
 def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> dict[int, int]:
-    """Label recorded trials by their repeat groups, keeping reruns in their source slots.
+    """Label repeat groups by their highest trial number, keeping reruns in their source slots.
+
+    Trials without a sampled repeat key have no group label.
 
     :param Sequence[FrozenTrial] trials: Trials from one phase study.
     :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
@@ -266,11 +242,17 @@ def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> 
     from phasesweep.engine.optuna import _draw_positions
 
     positions = _draw_positions(trials)
-    return (
-        {}
-        if axis is None
-        else group_labels(((t.number, positions[t.number], t.params) for t in trials), axis)
-    )
+    if axis is None:
+        return {}
+    keyed = {
+        trial.number: group_key(positions[trial.number], trial.params, axis)
+        for trial in trials
+        if axis.key in trial.params
+    }
+    last: dict[str, int] = {}
+    for number, key in keyed.items():
+        last[key] = max(last.get(key, number), number)
+    return {number: last[key] for number, key in keyed.items()}
 
 
 def reduce_values(values: Sequence[float], reduce: ReduceName) -> float:

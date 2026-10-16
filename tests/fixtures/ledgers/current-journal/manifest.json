@@ -15,7 +15,7 @@
   ],
   "n_trials": 2,
   "name": "current-journal",
-  "notes": "Unedited output of this release on the journal backend.",
+  "notes": "Current-format journal fixture.",
   "phases": [
     "p"
   ],

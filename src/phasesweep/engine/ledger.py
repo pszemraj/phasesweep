@@ -44,7 +44,6 @@ from phasesweep.engine.artifact_roots import (
     BindingState,
     _artifact_root_binding_applies,
     _artifact_root_claim_needed,
-    _artifact_root_identity,
     _bind_study_artifact_root,
     _check_artifact_root_binding,
     _check_published_phase_studies,
@@ -65,6 +64,7 @@ from phasesweep.engine.optuna import (
     _trial_count_state,
     _TrialRef,
 )
+from phasesweep.engine.paths import _artifact_root_identity
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -156,18 +156,16 @@ class ClaimedLedger(ValidatedLedger):
     memory_storage: optuna.storages.InMemoryStorage | None
 
 
-def _resolve_storage(url: str | None) -> Any:
-    """Construct journal storage, or return None for in-memory storage.
+def _resolve_storage(url: str) -> JournalStorage:
+    """Construct journal storage from its resolved URL.
 
     ``auto`` must already be resolved. Directory creation belongs to :func:`claim_ledger`.
 
-    :param str | None url: Resolved journal URL, including escaped ``file:``
-        filenames with ``uri=true``, or None for in-memory storage.
-    :return: Configured JournalStorage, or None.
+    :param str url: Resolved journal URL, including escaped ``file:``
+        filenames with ``uri=true``.
+    :return JournalStorage: Configured journal storage.
     :raises ValueError: ``url`` selects an unsupported local storage backend.
     """
-    if url is None:
-        return None
     path = journal_file_path(url)
     log.info("Using JournalFileStorage at %s", path)
     from optuna.storages.journal import JournalFileBackend
@@ -1205,11 +1203,12 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
             f"{type(ledger).__name__}."
         )
     experiment = ledger.experiment
-    storage = (
-        ledger.memory_storage
-        if ledger.memory_storage is not None
-        else _resolve_storage(ledger.storage_url)
-    )
+    storage: optuna.storages.BaseStorage
+    if ledger.memory_storage is not None:
+        storage = ledger.memory_storage
+    else:
+        assert ledger.storage_url is not None
+        storage = _resolve_storage(ledger.storage_url)
     study = _build_phase_study(experiment, phase, storage)
     _bind_study_artifact_root(study, experiment)
     return study

@@ -136,20 +136,6 @@ _MISSING_ENVIRONMENT_STDERR = re.compile(
 )
 
 
-def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
-    """Return the ``inherit_env`` contract in its canonical persisted form.
-
-    A list contract is a *set* of names — order carries no meaning — so it is
-    sorted, matching how :func:`phasesweep.engine.fingerprints._execution_identity`
-    canonicalises the same field for fingerprints.
-
-    :param Experiment experiment: Parsed experiment supplying the contract.
-    :return str | list[str]: ``"all"``, ``"none"``, or the sorted name list.
-    """
-    contract = experiment.execution.inherit_env
-    return sorted(contract) if isinstance(contract, list) else contract
-
-
 @dataclass(frozen=True)
 class EnvironmentIdentity:
     """Trainer environment and its persistent-study identity.
@@ -262,7 +248,7 @@ def _record_trainer_environment(
         return
     payload = {
         "digest": identity.digest,
-        "inherit_env": _inherit_env_contract(experiment),
+        "inherit_env": experiment.execution.inherit_env_contract(),
         "passthrough_env": list(experiment.execution.effective_passthrough_env()),
         "env": identity.values,
     }
@@ -419,8 +405,7 @@ def _resolved_execution_cwd(experiment: Experiment) -> Path | None:
 class TrialExecutionError(RuntimeError):
     """Raised when a trial subprocess crashes or extraction fails.
 
-    Caught by study.optimize(catch=...) so Optuna marks the trial FAIL,
-    not COMPLETE with a sentinel value.
+    Caught by ``study.optimize`` to record the trial as FAIL.
     """
 
 
@@ -638,8 +623,6 @@ def launch_trial(
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 
-    # Orchestrator-created trial artifacts, not symlink-hardened by design
-    # (see the trust-boundary comment above).
     with (workdir / "stdout.log").open("w") as fout, (workdir / "stderr.log").open("w") as ferr:
         proc_result = run_supervised(
             cmd,

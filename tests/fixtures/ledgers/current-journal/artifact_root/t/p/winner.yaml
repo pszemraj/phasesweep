@@ -45,7 +45,6 @@ objective_provenance:
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
 trainer_env_digest: 1338386f7f8cdbfd4bdfc268ad6097810d7e41d44100270d843e81c446aa528e
-trainer_inherit_env: none
 confound:
   schema_version: 2
   ranked_trials:

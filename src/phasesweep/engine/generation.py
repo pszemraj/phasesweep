@@ -72,20 +72,6 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
 _TERMINAL_GENERATION_STATES = frozenset({"published", "publication_failed", "failed"})
 
 
-def _persist_terminal_failure(write_state: Callable[[], None]) -> None:
-    """Persist failure bookkeeping without replacing the propagating exception.
-
-    Log secondary failures, including control-flow exceptions, while preserving the
-    primary error's identity, cleanup semantics, and exit status.
-
-    :param Callable[[], None] write_state: Zero-argument persistence action.
-    """
-    try:
-        write_state()
-    except BaseException:  # noqa: BLE001
-        log.exception("failed to persist terminal failure state; preserving the original error")
-
-
 def _persist_failed_state_unless_recorded(
     record_path: Path, write_failed: Callable[[], None]
 ) -> None:
@@ -93,17 +79,19 @@ def _persist_failed_state_unless_recorded(
 
     :param Path record_path: Immutable per-generation record path to check.
     :param Callable[[], None] write_failed: Zero-argument "failed" state
-        persistence action, run via :func:`_persist_terminal_failure`.
+        persistence action, run via :func:`_log_on_failure`.
     """
     if not record_path.is_file():
-        _persist_terminal_failure(write_failed)
+        _log_on_failure(
+            write_failed,
+            "failed to persist terminal failure state; preserving the original error",
+        )
 
 
 def _log_on_failure(action: Callable[[], None], message: str) -> None:
-    """Run post-commit bookkeeping, logging any failure without propagating it.
+    """Run best-effort bookkeeping, logging any failure without propagating it.
 
-    Control-flow exceptions must not reclassify a committed result. The surrounding
-    publication transaction also absorbs shutdown signals until commit bookkeeping ends.
+    Preserve the primary error or committed outcome even for control-flow exceptions.
 
     :param Callable[[], None] action: Zero-argument best-effort action.
     :param str message: Message logged (with exception info) on failure.
@@ -121,47 +109,11 @@ def _recorded_generation_state(record_path: Path) -> str | None:
     :return str | None: The recorded ``state`` string, or ``None`` when the
         record is missing, unreadable, or malformed.
     """
-    try:
-        payload = yaml.safe_load(record_path.read_text())
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
+    payload = artifact_io.read_yaml_or_none(record_path)
     if not isinstance(payload, dict):
         return None
     state = payload.get("state")
     return state if isinstance(state, str) else None
-
-
-def _write_generation_record_once(
-    *,
-    record_path: Path,
-    generation_id: str,
-    state: str,
-    payload: dict[str, Any],
-    label: str,
-) -> None:
-    """Create an immutable terminal lifecycle record once.
-
-    Only ``published``, ``publication_failed``, and ``failed`` states are recorded.
-    Subsequent writes, including same-state rewrites, are refused and logged.
-
-    :param Path record_path: Immutable per-generation lifecycle record path.
-    :param str generation_id: Immutable generation namespace being recorded;
-        used only for the refusal log message.
-    :param str state: Terminal lifecycle state label being written.
-    :param dict[str, Any] payload: Full record payload to persist.
-    :param str label: Human label identifying the record kind in the refusal
-        log message.
-    """
-    if artifact_io._write_yaml_exclusive(record_path, payload):
-        return
-    existing_state = _recorded_generation_state(record_path)
-    log.warning(
-        "Refusing to rewrite terminal %s %s record (existing state %r, attempted %r)",
-        label,
-        generation_id,
-        existing_state,
-        state,
-    )
 
 
 def _write_generation_state(
@@ -178,6 +130,7 @@ def _write_generation_state(
 
     The current pointer accepts every state and may restart at ``preflighting`` for
     a new invocation. Per-generation records accept terminal states only, once.
+    Subsequent record writes, including same-state rewrites, are refused and logged.
 
     :param Experiment experiment: Experiment whose generation state is written.
     :param str generation_id: Immutable generation namespace being recorded.
@@ -203,13 +156,14 @@ def _write_generation_state(
         "phasesweep_version": __version__,
     }
     if write_record and state in _TERMINAL_GENERATION_STATES:
-        _write_generation_record_once(
-            record_path=path_ops._generation_record_path(experiment, generation_id),
-            generation_id=generation_id,
-            state=state,
-            payload=payload,
-            label="generation",
-        )
+        record_path = path_ops._generation_record_path(experiment, generation_id)
+        if not artifact_io._write_yaml_exclusive(record_path, payload):
+            log.warning(
+                "Refusing to rewrite terminal generation %s record (existing state %r, attempted %r)",
+                generation_id,
+                _recorded_generation_state(record_path),
+                state,
+            )
     if publish_current:
         artifact_io._write_yaml_atomic(path_ops._generation_path(experiment), payload)
 
@@ -379,7 +333,7 @@ def _publish_generation(
             )
         except BaseException as exc:
             error_class = type(exc).__name__
-            _persist_terminal_failure(
+            _log_on_failure(
                 lambda: _write_generation_state(
                     experiment,
                     generation_id=generation_id,
@@ -387,7 +341,8 @@ def _publish_generation(
                     from_phase=from_phase,
                     publish_current=True,
                     error_class=error_class,
-                )
+                ),
+                "failed to persist terminal failure state; preserving the original error",
             )
             raise
 

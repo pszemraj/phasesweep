@@ -399,35 +399,33 @@ def _dry_run_phase(
         "trial" if remaining == 1 else "trials",
         of_them,
     )
-    sampled: dict[str, object] | None = None
-    if remaining > 0:
-        sample_trial = study.ask()
-        sampled = {
-            name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
-        }
-        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
-        preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
-        cmd = render_command(
-            experiment.trial_command,
-            overrides,
-            experiment.override_format,
-            trial_dir=preview_dir,
-            trial_id=-1,
-            phase=phase.name,
-            run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
-            trainer_config=experiment.trainer_config,
+    sample_trial = study.ask()
+    sampled: dict[str, object] = {
+        name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
+    }
+    overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
+    preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
+    cmd = render_command(
+        experiment.trial_command,
+        overrides,
+        experiment.override_format,
+        trial_dir=preview_dir,
+        trial_id=-1,
+        phase=phase.name,
+        run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
+        trainer_config=experiment.trainer_config,
+    )
+    stand_ins = _inherited_placeholder_keys(
+        phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
+    )
+    note = ""
+    if stand_ins:
+        groups = "; ".join(
+            f"until {parent!r} publishes a winner: {', '.join(keys)}"
+            for parent, keys in stand_ins.items()
         )
-        stand_ins = _inherited_placeholder_keys(
-            phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
-        )
-        note = ""
-        if stand_ins:
-            groups = "; ".join(
-                f"until {parent!r} publishes a winner: {', '.join(keys)}"
-                for parent, keys in stand_ins.items()
-            )
-            note = f" (placeholders {groups})"
-        log.info("DRY RUN example command%s:\n  %s", note, cmd)
+        note = f" (placeholders {groups})"
+    log.info("DRY RUN example command%s:\n  %s", note, cmd)
 
     return _placeholder_winner(
         experiment,

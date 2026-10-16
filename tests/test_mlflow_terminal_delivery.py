@@ -783,7 +783,7 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
     first leave the record that keeps the generation published, so
     ``sync-tracking`` still rebuilds its winner and summary uploads.
     """
-    from phasesweep.engine import generation as generation_ops
+    from phasesweep.engine import artifacts as artifact_io
     from phasesweep.engine.paths import _last_successful_generation_path
 
     config, uploads = _remote_example(tmp_path, monkeypatch)
@@ -791,11 +791,15 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
     experiment = Experiment.model_validate(config)
     pointer_path = _last_successful_generation_path(experiment)
 
-    def die_before_record(**kwargs):
-        raise OSError("controller died after the pointer commit")
+    original = artifact_io._write_yaml_exclusive
+
+    def die_before_record(path: Path, payload: object) -> bool:
+        if path.name == "generation.yaml":
+            raise OSError("controller died after the pointer commit")
+        return original(path, payload)
 
     with monkeypatch.context() as crash:
-        crash.setattr(generation_ops, "_write_generation_record_once", die_before_record)
+        crash.setattr(artifact_io, "_write_yaml_exclusive", die_before_record)
         crash.setattr(publication, "publish_generation", lambda *args: None)
         run_experiment(experiment)
     first = yaml.safe_load(pointer_path.read_text())["generation_id"]

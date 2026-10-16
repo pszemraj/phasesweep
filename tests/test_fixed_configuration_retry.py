@@ -210,7 +210,9 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
     assert _call_count(calls) == 0
 
     # The MCP runner calls run_experiment, so this is the failure it records for a launch.
-    failure = mcp_runner._safe_failure_payload(launched.value, stage="preflight")
+    failure = mcp_runner._terminal_failure_payload(
+        launched.value, stage="preflight", cleanup_confirmed=True
+    )
     assert failure["code"] == "trial_target_refused"
     assert failure["actor"] == "operator"
 

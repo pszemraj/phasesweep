@@ -257,7 +257,8 @@ def test_publication_commit_failure_keeps_prior_publication(
     assert published_generation_id(experiment) == first_generation
     _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
-    assert published.generation_id == first_generation
+    assert published.source is not None
+    assert published.source.generation_id == first_generation
 
 
 @pytest.mark.integration
@@ -336,7 +337,7 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
 @pytest.mark.parametrize(
     "fault",
     [
-        pytest.param("_write_generation_record_once", id="immutable-record-write"),
+        pytest.param("_write_yaml_exclusive", id="immutable-record-write"),
         pytest.param("_copy_yaml_projection", id="convenience-projection"),
     ],
 )
@@ -351,13 +352,15 @@ def test_postcommit_write_failure_leaves_run_successful(
     run_experiment(experiment)
     first_generation = published_generation_id(experiment)
     assert first_generation is not None
-    record_write = fault == "_write_generation_record_once"
-    failure = "record write" if record_write else "projection"
+    record_write = fault == "_write_yaml_exclusive"
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
-        raise OSError(f"simulated {failure} failure")
+        raise OSError("simulated projection failure")
 
-    monkeypatch.setattr(generation_ops, fault, fail_write)
+    if record_write:
+        _lose_record_writes(monkeypatch)
+    else:
+        monkeypatch.setattr(generation_ops, fault, fail_write)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
@@ -386,7 +389,8 @@ def test_postcommit_write_failure_leaves_run_successful(
         assert published_winner_path.is_file()
         _, (published,) = read_result(experiment, phase_names=["p"])
         assert published is not None
-        assert published.generation_id == first_generation
+        assert published.source is not None
+        assert published.source.generation_id == first_generation
 
 
 @pytest.mark.integration
@@ -427,10 +431,14 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     """
     experiment = _stored_experiment(tmp_path)
 
-    def interrupt_record_write(*_args: object, **_kwargs: object) -> None:
-        raise KeyboardInterrupt
+    original = artifact_io._write_yaml_exclusive
 
-    monkeypatch.setattr(generation_ops, "_write_generation_record_once", interrupt_record_write)
+    def interrupt_record_write(path: Path, payload: object) -> bool:
+        if path.name == "generation.yaml":
+            raise KeyboardInterrupt
+        return original(path, payload)
+
+    monkeypatch.setattr(artifact_io, "_write_yaml_exclusive", interrupt_record_write)
 
     winners = run_experiment(experiment)
 
@@ -623,22 +631,14 @@ def test_successful_publication_never_logs_a_record_refusal(
 
 def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
     """Make writing an immutable record raise ``OSError``, for one record path or every one."""
-    original = generation_ops._write_generation_record_once
+    original = artifact_io._write_yaml_exclusive
 
-    def flaky(
-        *, record_path: Path, generation_id: str, state: str, payload: JsonObject, label: str
-    ) -> None:
-        if only is None or record_path == only:
+    def flaky(path: Path, payload: object) -> bool:
+        if path.name == "generation.yaml" and (only is None or path == only):
             raise OSError("simulated record write failure")
-        original(
-            record_path=record_path,
-            generation_id=generation_id,
-            state=state,
-            payload=payload,
-            label=label,
-        )
+        return original(path, payload)
 
-    monkeypatch.setattr(generation_ops, "_write_generation_record_once", flaky)
+    monkeypatch.setattr(artifact_io, "_write_yaml_exclusive", flaky)
 
 
 def _publish_without_record(

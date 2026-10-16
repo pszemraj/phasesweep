@@ -446,7 +446,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     winner_text = _winner_path(experiment, "p").read_text()
     winner = yaml.safe_load(winner_text)
     assert winner["trainer_env_digest"] == identity.digest
-    assert winner["trainer_inherit_env"] == ["PHASESWEEP_TEST_LISTED"]
+    assert "trainer_inherit_env" not in winner
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     attrs = study.get_trials(deepcopy=False)[0].user_attrs

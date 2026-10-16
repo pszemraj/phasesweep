@@ -179,14 +179,7 @@ def _validate_optuna_choices(choices: Sequence[object], *, label: str) -> None:
                 raise ValueError(
                     f"{label} must remain distinguishable after "
                     f"Optuna persistence; {c!r} at index {index} compares equal "
-                    f"to {earlier!r} at index {earlier_index}. Optuna records a "
-                    "sampled value as its `==` index into choices, so equal "
-                    "choices collapse onto the first of them in "
-                    "FrozenTrial.params, the published winner, and every "
-                    "inherited override. A repeat also inflates grid "
-                    "cardinality (the phase runs an extra trial on an "
-                    "assignment it already evaluated, yet still reports a "
-                    "complete grid) and doubles that value's sampling weight."
+                    f"to {earlier!r} at index {earlier_index}. Remove equal choices."
                 )
 
 

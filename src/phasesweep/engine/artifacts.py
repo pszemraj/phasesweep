@@ -41,6 +41,19 @@ from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 log = logging.getLogger(__name__)
 
 
+def read_yaml_or_none(path: Path) -> object:
+    """Read optional YAML without propagating read or decoding failures.
+
+    :param Path path: YAML artifact path to read with the platform-default encoding.
+    :return object: Decoded YAML value, or ``None`` when absent, unreadable, or malformed.
+    """
+    try:
+        value: object = yaml.safe_load(path.read_text())
+        return value
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+
+
 def _write_yaml_atomic(path: Path, payload: Any) -> None:
     """Atomically write a YAML document to ``path``.
 
@@ -197,7 +210,6 @@ def _save_winner(
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
-        "trainer_inherit_env": winner.trainer_inherit_env,
         "confound": winner.confound,
         "observed": winner.observed,
         "repeats": winner.repeats,
@@ -333,7 +345,6 @@ def _load_winner(
     try:
         source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
         stored_env_digest = data["trainer_env_digest"]
-        stored_inherit_env = data["trainer_inherit_env"]
         metric = float(data["metric"][experiment.metric.name])
         confound = _validate_confound_block(
             data["confound"], winner_trial=int(data["trial_number"])
@@ -357,11 +368,6 @@ def _load_winner(
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
-            trainer_inherit_env=(
-                [str(name) for name in stored_inherit_env]
-                if isinstance(stored_inherit_env, list)
-                else stored_inherit_env
-            ),
             confound=confound,
             observed=_validate_observed_block(data["observed"]),
             repeats=repeats,

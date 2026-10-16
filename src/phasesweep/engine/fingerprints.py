@@ -61,14 +61,13 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
-    contract = experiment.execution.inherit_env
     return {
         "cwd": str(
             Path(experiment.execution.cwd).expanduser().resolve()
             if experiment.execution.cwd is not None
             else Path.cwd().resolve()
         ),
-        "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
+        "inherit_env": experiment.execution.inherit_env_contract(),
         "passthrough_env": list(experiment.execution.effective_passthrough_env()),
     }
 

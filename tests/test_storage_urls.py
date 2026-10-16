@@ -88,12 +88,8 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
 
 
 def test_resolve_storage_urls(tmp_path: Path) -> None:
-    """None resolves to an in-memory study; a journal URL resolves to JournalStorage."""
-    import optuna
+    """A journal URL resolves to JournalStorage."""
     from optuna.storages import JournalStorage
-
-    assert _resolve_storage(None) is None
-    assert optuna.create_study(storage=_resolve_storage(None)).trials == []
 
     result = _resolve_storage(f"journal:///{tmp_path}/phases.journal")
     assert isinstance(result, JournalStorage)

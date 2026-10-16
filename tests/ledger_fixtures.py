@@ -27,10 +27,10 @@ from phasesweep import load_experiment
 from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_payload,
-    _artifact_root_identity,
 )
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
+    _artifact_root_identity,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,

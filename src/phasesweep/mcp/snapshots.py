@@ -7,10 +7,10 @@ from collections.abc import Collection, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config.models import Experiment, _metric_semantics_payload
+from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     ConfoundCheck,
     ConfoundVerdict,
@@ -338,8 +338,8 @@ def _winner_snapshot(
         params=dict(winner.params),
         gates_passed=gates_passed,
         incomplete=incomplete,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
+        generation_id=winner.generation_id if isinstance(winner, Winner) else source.generation_id,
+        attempt_id=winner.attempt_id if isinstance(winner, Winner) else source.attempt_id,
         source=WinnerSourceSnapshot.model_validate(asdict(source)),
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
@@ -399,8 +399,6 @@ class RunResultSnapshot(_SnapshotModel):
                 effective_overrides={},
                 gates_passed=winner.gates_passed,
                 incomplete=winner.incomplete,
-                generation_id=winner.generation_id,
-                attempt_id=winner.attempt_id,
                 source=WinnerSource(
                     kind=winner.source.kind,
                     phase=winner.source.phase,
@@ -480,12 +478,7 @@ def capture_result_snapshot(
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
     """
     if generation_id is not None:
-        try:
-            lifecycle = yaml.safe_load(
-                _generation_record_path(experiment, generation_id).read_text()
-            )
-        except (OSError, ValueError, yaml.YAMLError):
-            lifecycle = None
+        lifecycle = read_yaml_or_none(_generation_record_path(experiment, generation_id))
         if lifecycle is not None and (
             not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id
         ):

@@ -1790,7 +1790,9 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     errors = [cls("boom") for cls in _operator_error_classes()]
     errors += [case.raised("boom", action=case.action) for case in CASES]
     for error in errors:
-        failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+        failure = mcp_runner._terminal_failure_payload(
+            error, stage="preflight", cleanup_confirmed=True
+        )
         _assert_payload_follows(failure, [error.action])
     for primary, recorded, routed in _UNCONFIRMED_CLEANUPS:
         failure = mcp_runner._terminal_failure_payload(

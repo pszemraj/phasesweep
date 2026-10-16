@@ -82,14 +82,10 @@ def _construct_str_strict(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str
 
     :param yaml.SafeLoader loader: Active YAML loader.
     :param yaml.ScalarNode node: String node to construct.
-    :raises yaml.constructor.ConstructorError: The value is not a string or contains a lone surrogate.
+    :raises yaml.constructor.ConstructorError: The string contains a lone surrogate.
     :return str: Constructed UTF-8-compatible string.
     """
-    value = yaml.constructor.SafeConstructor.construct_yaml_str(loader, node)
-    if not isinstance(value, str):
-        raise yaml.constructor.ConstructorError(
-            None, None, f"expected a string, found {type(value).__name__}", node.start_mark
-        )
+    value = yaml.constructor.SafeConstructor.construct_scalar(loader, node)
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:

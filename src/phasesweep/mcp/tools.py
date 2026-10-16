@@ -893,12 +893,7 @@ class PhaseSweepMCP:
     def winners(self, run_id: str) -> dict[str, Any]:
         """Return winning sampled hyperparameters under the run's visibility policy.
 
-        Live reads use its saved config; terminal reads use its frozen snapshot. Metric labels,
-        objective evidence and the phase plan come from the represented generation.
-        ``result_context`` and ``published_config_matches_current`` disclose their source.
-
-        ``publication_integrity`` distinguishes absent, invalid and permission-denied results;
-        invalid or inaccessible publications expose no winners and require operator action.
+        Use the run's saved config for live results and its frozen snapshot after termination.
 
         :param str run_id: Detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
@@ -1604,7 +1599,8 @@ class PhaseSweepMCP:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
-        spawn_cwd = self._neutral_spawn_cwd()
+        spawn_cwd = self._registry.state_dir
+        ensure_private_dir(spawn_cwd)
         # Once Popen returns, interrupts also require cleanup of the owned child.
         proc: subprocess.Popen[bytes] | None = None
         handle: RunHandle | None = None
@@ -1695,15 +1691,6 @@ class PhaseSweepMCP:
                         os.close(fd)
         assert handle is not None
         return handle
-
-    def _neutral_spawn_cwd(self) -> Path:
-        """Revalidate the owner-only state directory used before the runner identity is durable.
-
-        :return Path: Private state directory used as the child's initial cwd.
-        """
-        state_dir = self._registry.state_dir
-        ensure_private_dir(state_dir)
-        return state_dir
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Require both launch-time and current cancellation permission.

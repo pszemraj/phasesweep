@@ -89,7 +89,6 @@ from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
     _environment_identity,
-    _inherit_env_contract,
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
@@ -1672,7 +1671,6 @@ def _select_phase_winner(
         trainer_input=dict(selected.trainer_input),
         # Preserve the winning trial's environment, including on no-op replay.
         trainer_env_digest=selected.trainer_env_digest,
-        trainer_inherit_env=_inherit_env_contract(experiment),
         confound=selected.confound,
         observed=selected.observed,
         repeats=selected.repeats,

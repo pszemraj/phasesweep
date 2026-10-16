@@ -621,14 +621,12 @@ def test_private_atomic_write_directory_fsync_failure_policy(
     assert ("Directory fsync failed after a private atomic write" in caplog.text) is not strict
 
 
-@pytest.mark.parametrize("strict", [False, True], ids=["shared", "private-strict"])
 def test_directory_fsync_failure_policy_closes_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    strict: bool,
 ) -> None:
-    """Both durability policies close their descriptor after a failed fsync."""
+    """Best-effort fsync logs the failure and closes its descriptor."""
     directory = tmp_path / "state"
     directory.mkdir(mode=0o700)
     synced_fd: int | None = None
@@ -640,31 +638,21 @@ def test_directory_fsync_failure_policy_closes_descriptor(
 
     monkeypatch.setattr(os, "fsync", fail_fsync)
     caplog.set_level("WARNING", logger="phasesweep.runtime.files")
-    if strict:
-        with pytest.raises(OSError, match="injected directory fsync failure"):
-            runtime_files.fsync_directory(directory, strict=True)
-        assert caplog.text == ""
-    else:
-        runtime_files.fsync_directory(directory)
-        assert "the write is committed" in caplog.text
+    runtime_files.fsync_directory(directory)
+    assert "the write is committed" in caplog.text
     assert synced_fd is not None
     with pytest.raises(OSError, match="Bad file descriptor"):
         os.fstat(synced_fd)
 
 
-@pytest.mark.parametrize("strict", [False, True], ids=["shared", "private-strict"])
-def test_directory_fsync_addressing_policy(tmp_path: Path, strict: bool) -> None:
-    """Shared paths permit links; strict private traversal refuses them."""
+def test_directory_fsync_addressing_policy(tmp_path: Path) -> None:
+    """Best-effort directory fsync follows symlinks."""
     directory = tmp_path / "state"
     directory.mkdir(mode=0o700)
     link = tmp_path / "linked-state"
     link.symlink_to(directory, target_is_directory=True)
 
-    if strict:
-        with pytest.raises(runtime_files.UnsafePrivatePathError):
-            runtime_files.fsync_directory(link, strict=True)
-    else:
-        runtime_files.fsync_directory(link)
+    runtime_files.fsync_directory(link)
 
 
 def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(

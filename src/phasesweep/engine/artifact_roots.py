@@ -23,7 +23,11 @@ from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_matches,
 )
-from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _artifact_root_identity,
+    _experiment_dir,
+)
 from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
@@ -42,15 +46,6 @@ log = logging.getLogger(__name__)
 #: a fresh tree that has never recorded a ledger; every other shape either
 #: matches exactly (``"bound"``) or is refused.
 BindingState = Literal["bound", "unbound"]
-
-
-def _artifact_root_identity(experiment: Experiment) -> str:
-    """Return the resolved artifact root derived from the shared engine path builder.
-
-    :param Experiment experiment: Parsed experiment supplying workdir and name.
-    :return str: Resolved ``<workdir>/<experiment>`` namespace as a string.
-    """
-    return str(_experiment_dir(experiment).resolve())
 
 
 def _artifact_root_binding_applies(experiment: Experiment) -> bool:

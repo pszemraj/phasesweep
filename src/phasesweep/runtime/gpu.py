@@ -88,18 +88,11 @@ class GpuAssignment:
 
 
 @dataclass
-class _HostGpuLease:
-    """Host-wide flock handle for one CUDA device token."""
-
-    handle: IO[str]
-
-
-@dataclass
 class _GpuAcquisition:
     """One local GPU assignment plus the host locks that back it."""
 
     devices: list[GpuDevice]
-    leases: list[_HostGpuLease]
+    leases: list[IO[str]]
     visible_devices: str
 
 
@@ -112,11 +105,11 @@ def _gpu_lock_path(device: GpuDevice) -> Path:
     return lock_dir() / f"gpu_{device.lock_name}.lock"
 
 
-def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
+def _try_host_gpu_lease(device: GpuDevice) -> IO[str] | None:
     """Try to acquire the per-GPU host lock without blocking.
 
     :param GpuDevice device: CUDA device token to lease.
-    :return _HostGpuLease | None: Acquired lease, or ``None`` if already locked.
+    :return IO[str] | None: Acquired lock handle, or ``None`` if already locked.
     """
     handle = try_lock_file(_gpu_lock_path(device))
     if handle is None:
@@ -131,21 +124,20 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
         # locked handle that would exclude every other run from this GPU.
         unlock_file(handle)
         raise
-    return _HostGpuLease(handle=handle)
+    return handle
 
 
-def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
+def _release_host_gpu_lease(lease: IO[str] | None) -> None:
     """Close this process's lease copy without unlocking guardian copies.
 
     ``flock(LOCK_UN)`` operates on the shared open-file description and would
-    release the supervisor guardian's inherited lock too. Closing only our descriptor
-    keeps the lock alive after an orchestrator crash or uncertain cleanup,
-    until the guardian exits with the trainer.
+    release the supervisor guardian's inherited lock too. The lock stays held
+    until the last descriptor closes.
     """
     if lease is None:
         return
     with suppress(OSError):
-        lease.handle.close()
+        lease.close()
 
 
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
@@ -712,7 +704,7 @@ class GpuPool:
             # ``_whole_node_in_use`` is already claimed: a lock-layer failure
             # that left it set (or leaked partial leases) would deadlock every
             # later acquisition, so failures must roll both back.
-            leases: list[_HostGpuLease] = []
+            leases: list[IO[str]] = []
             all_leased = False
             try:
                 for device in self._devices:
@@ -793,7 +785,7 @@ class GpuPool:
                     else self._pinned_visible_devices
                 ),
                 lease_fds=(
-                    tuple(lease.handle.fileno() for lease in acquired.leases)
+                    tuple(lease.fileno() for lease in acquired.leases)
                     if acquired is not None
                     else ()
                 ),
