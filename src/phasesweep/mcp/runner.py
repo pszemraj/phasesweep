@@ -187,31 +187,28 @@ def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, 
     :return dict[str, object]: A ``"timeout"`` or ``"cancelled"`` payload, or
         ``"internal_error"`` for any other exception.
     """
-    if isinstance(error, TimeoutError):
-        return {
-            "code": "timeout",
-            "stage": stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to review the configured wallclock budget before retrying."
-            ),
-        }
-    if isinstance(error, PhaseSweepShutdown):
-        return {
-            "code": "cancelled",
-            "stage": stage,
-            "retryable": True,
-            "actor": "agent",
-            "remediation": "Start a new run only if the user still wants the sweep to continue.",
-        }
-    return {
+    payload: dict[str, object] = {
         "code": "internal_error",
         "stage": stage,
         "retryable": False,
         "actor": "operator",
         "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
     }
+    if isinstance(error, TimeoutError):
+        payload.update(
+            code="timeout",
+            remediation=(
+                "Ask the operator to review the configured wallclock budget before retrying."
+            ),
+        )
+    elif isinstance(error, PhaseSweepShutdown):
+        payload.update(
+            code="cancelled",
+            retryable=True,
+            actor="agent",
+            remediation="Start a new run only if the user still wants the sweep to continue.",
+        )
+    return payload
 
 
 def _base_failure_payload(
