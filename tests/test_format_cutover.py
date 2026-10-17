@@ -17,12 +17,13 @@ from typing import IO
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment
 from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
-    ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
 )
 from phasesweep.engine.errors import (
@@ -43,7 +44,13 @@ from phasesweep.engine.ledger import (
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _experiment_dir,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+)
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
@@ -62,6 +69,9 @@ from tests.conftest import (
 from tests.ledger_fixtures import (
     append_journal_tail,
     materialize,
+    published_generation_id,
+    reanchor_summary_pointer,
+    reseal_winner,
     tree_snapshot,
 )
 from tests.recovery_helpers import load_only_recovery_needs
@@ -99,34 +109,34 @@ def test_unmarked_output_root_is_refused_before_mutation(
 def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     tmp_path: Path,
 ) -> None:
-    """An old binding marker cannot authorize a current-format artifact tree."""
-    experiment = _experiment(tmp_path, storage=None)
-    root = _experiment_dir(experiment)
+    """A publication with the preceding winner format is refused before any write."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
+    generation = published_generation_id(experiment)
+    assert generation is not None
+    winner_path = _generation_winner_path(experiment, generation, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    winner["trainer_inherit_env"] = "none"
+    reseal_winner(experiment, generation, winner)
+    summary_path = _generation_summary_path(experiment, generation)
+    summary = yaml.safe_load(summary_path.read_text())
+    summary["schema_version"] = 3
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
     binding_path = _artifact_root_binding_path(experiment)
-    binding_path.parent.mkdir(parents=True)
-    binding_path.write_text(
-        json.dumps(
-            {
-                "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1,
-                "experiment": experiment.experiment,
-                "artifact_root": str(root.resolve()),
-                "storage_key": None,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    before = tree_snapshot(root)
+    binding = json.loads(binding_path.read_text())
+    binding["schema_version"] = 6
+    binding_path.write_text(json.dumps(binding) + "\n")
+    before = tree_snapshot(materialized.root)
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=rf"unsupported PhaseSweep format {ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1}",
+        match="unsupported PhaseSweep format 6",
     ) as excinfo:
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert tree_snapshot(root) == before
+    assert tree_snapshot(materialized.root) == before
 
 
 @pytest.mark.parametrize(
@@ -923,6 +933,9 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
         with pytest.raises(IncompleteJournalRecordError, match="removed or replaced") as excinfo:
             repair_incomplete_journal_record(validate_ledger(materialized.experiment))
         assert excinfo.value.action == OperatorAction.RETRY
+        rendered = _operational_error_text(excinfo.value)
+        assert "retry the same operation once the reported blocker is resolved" in rendered
+        assert "start a new run" not in rendered
         assert journal.read_bytes() == (damaged if taken_over == "before truncation" else complete)
         assert successor[0].held()
         with pytest.raises(IncompleteJournalRecordError, match="still held"):

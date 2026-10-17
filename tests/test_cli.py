@@ -1718,12 +1718,12 @@ def test_cli_boundary_reports_expected_run_failure(
 @pytest.mark.parametrize(
     ("action", "remedy"),
     [
-        (OperatorAction.FRESH_NAMESPACE, "fresh artifact root and local storage"),
+        (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
         (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
         (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
-        (OperatorAction.RETRY, "Wait briefly, then start a new run"),
+        (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
         (OperatorAction.INSPECT_LOGS, "inspect the PhaseSweep run log"),
     ],
 )

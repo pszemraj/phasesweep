@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.evidence.evaluation import (
+    DeadlineExceededError,
     ExtractorError,
     evaluate_gates,
     extractor_config_fingerprint,
@@ -25,6 +26,8 @@ from phasesweep.evidence.models import (
     JsonEqualsGate,
     JsonExtractor,
     LogRegexExtractor,
+    MlflowExtractor,
+    MlflowRequiredGate,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
@@ -57,6 +60,55 @@ def test_json_float_overflow_is_invalid_evidence(tmp_path):
         run_extractor(
             make_trial_context(tmp_path), JsonExtractor(type="json", path="result.json", key="x")
         )
+
+
+@pytest.mark.parametrize("deadline", [None, 0.0])
+def test_unregistered_extractor_fails_before_deadline_or_provenance_changes(tmp_path, deadline):
+    class UnregisteredExtractor(JsonExtractor):
+        pass
+
+    provenance = {"retained": True}
+    with pytest.raises(ExtractorError, match="No extractor registered for UnregisteredExtractor"):
+        run_extractor(
+            make_trial_context(tmp_path),
+            UnregisteredExtractor(type="json", path="result.json", key="x"),
+            deadline=deadline,
+            provenance=provenance,
+        )
+    assert provenance == {"retained": True}
+
+
+@pytest.mark.parametrize("backend", ["wandb", "mlflow"])
+@pytest.mark.parametrize("consumer", ["extractor", "gate"])
+@pytest.mark.parametrize("failure", [ExtractorError, DeadlineExceededError])
+def test_remote_consumers_forward_deadline_and_preserve_failure_kind(
+    tmp_path, monkeypatch, backend, consumer, failure
+):
+    expected_deadline = time.monotonic() + 60.0
+
+    def capture(*args, deadline):
+        assert deadline == expected_deadline
+        raise failure("capture stopped")
+
+    monkeypatch.setattr(f"phasesweep.evidence.evaluation._capture_{backend}", capture)
+    if backend == "wandb":
+        extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+        gate = WandbSummaryRequiredGate(
+            type="wandb_summary_required", entity="e", project="p", keys=["done"]
+        )
+    else:
+        extractor = MlflowExtractor(type="mlflow", metric_key="loss", select="last")
+        gate = MlflowRequiredGate(type="mlflow_required", metrics=["loss"])
+    ctx = make_trial_context(tmp_path)
+    if consumer == "extractor":
+        with pytest.raises(failure, match="capture stopped") as stopped:
+            run_extractor(ctx, extractor, deadline=expected_deadline)
+        assert stopped.type is failure
+    else:
+        result = evaluate_gates(ctx, [gate], deadline=expected_deadline)[0]
+        assert result.passed is False
+        assert result.detail == "capture stopped"
+        assert result.deadline_exhausted is (failure is DeadlineExceededError)
 
 
 def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch):

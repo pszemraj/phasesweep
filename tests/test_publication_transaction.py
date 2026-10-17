@@ -1100,7 +1100,14 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
 
 @pytest.mark.parametrize(
     "tamper",
-    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint", "completion"],
+    [
+        "schema_version",
+        "phase_plan",
+        "metric_goal",
+        "objective_evidence",
+        "config_fingerprint",
+        "completion",
+    ],
 )
 def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     tmp_path: Path,
@@ -1111,7 +1118,10 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
 
     summary_path = _generation_summary_path(experiment, generation_id)
     summary = yaml.safe_load(summary_path.read_text())
-    if tamper == "phase_plan":
+    if tamper == "schema_version":
+        summary["schema_version"] = 3
+        semantic_error = "unsupported summary schema_version 3"
+    elif tamper == "phase_plan":
         summary["phase_plan"][0]["name"] = "q"
         semantic_error = "phase plan"
     elif tamper == "metric_goal":

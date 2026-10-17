@@ -232,7 +232,7 @@ def test_yaml_file_is_the_default_and_requires_config_path(tmp_path: Path) -> No
           extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
         phases: [{name: p, n_trials: 1}]
         """,
-            r"(?s)trainer_config.*dict\.cutoff.*invalid-json-value",
+            r"trainer_config\.cutoff.*unsupported type date:.*quote YAML dates or timestamps",
             id="nonportable-yaml-date",
         ),
     ],
@@ -370,24 +370,29 @@ def test_flatten_trainer_config_keeps_lists_and_empty_mappings_as_leaves() -> No
 
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])
 @pytest.mark.parametrize(
-    "leaf",
+    ("leaf", "hint"),
     [
-        pytest.param([{"x": 1}], id="list-of-mappings"),
-        pytest.param({}, id="empty-mapping"),
+        pytest.param(
+            [{"x": 1}], "Use the default override_format='yaml_file'", id="list-of-mappings"
+        ),
+        pytest.param({}, "Use the default override_format='yaml_file'", id="empty-mapping"),
+        pytest.param(datetime.date(2024, 1, 1), "Quote YAML dates or timestamps", id="date"),
+        pytest.param(float("inf"), 'quote it in YAML (e.g. "inf")', id="nonfinite"),
     ],
 )
 def test_cli_format_rejects_unrenderable_trainer_config_leaf(
-    override_format: str, leaf: object
+    override_format: str, leaf: object, hint: str
 ) -> None:
     with pytest.raises(
         ValidationError,
         match=rf"trainer_config key 'opt\.leaf': override_format='{override_format}' supports",
-    ):
+    ) as caught:
         make_experiment(
             override_format=override_format,
             trial_command="echo {overrides}",
             trainer_config={"opt": {"leaf": leaf}},
         )
+    assert hint in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -565,8 +570,18 @@ def test_json_file_rejects_dotted_collisions(overrides):
 
 
 @pytest.mark.parametrize("override_format", ["yaml_file", "json_file"])
-@pytest.mark.parametrize("problem", ["tuple", "date", "non-string-key", "nonfinite", "recursive"])
-def test_file_input_rejects_nonportable_values(override_format, problem):
+@pytest.mark.parametrize(
+    ("problem", "diagnostic"),
+    [
+        ("tuple", "unsupported type tuple"),
+        ("date", "unsupported type date"),
+        ("timestamp", "unsupported type datetime"),
+        ("non-string-key", "non-string mapping key 1 (int)"),
+        ("nonfinite", "must be finite; got float: inf"),
+        ("recursive", "contains a recursive YAML container"),
+    ],
+)
+def test_file_input_rejects_nonportable_values(override_format, problem, diagnostic):
     if problem == "recursive":
         value = []
         value.append(value)
@@ -574,11 +589,19 @@ def test_file_input_rejects_nonportable_values(override_format, problem):
         value = {
             "tuple": (1, 2),
             "date": datetime.date(2024, 1, 1),
+            "timestamp": datetime.datetime(2024, 1, 1, 12, 30),
             "non-string-key": {1: "x"},
             "nonfinite": float("inf"),
         }[problem]
-    with pytest.raises(ValueError, match="payload"):
-        compose_trainer_input({"payload": value}, {}, override_format)
+    with pytest.raises(ValueError, match="payload") as caught:
+        compose_trainer_input({"dict": [{"payload": {"[key]": value}}]}, {}, override_format)
+    message = str(caught.value)
+    root = "trainer_config" if override_format == "yaml_file" else "JSON overrides"
+    assert f"{root}.dict[0].payload.[key]" in message
+    assert diagnostic in message
+    assert "tagged-union" not in message
+    if problem in {"date", "timestamp"}:
+        assert "quote YAML dates or timestamps to keep them strings" in message
 
 
 @pytest.mark.parametrize("selector", ["hydra", "json_file"])
@@ -701,7 +724,7 @@ def test_packaged_fake_trainer_consumes_dotted_cli_overrides(
 
 def _override_yaml(tmp_path, override_format: str, body: str):
     """Write a minimal override config with caller-supplied phase/contract body."""
-    assert override_format == "argparse"
+    assert override_format in {"argparse", "hydra"}
     trial_command = "python train.py {overrides}"
     return write_yaml(
         tmp_path,
@@ -736,10 +759,13 @@ _UNRENDERABLE_ARGPARSE_VALUES = [
 
 
 @pytest.mark.parametrize(("value", "expected"), _UNRENDERABLE_ARGPARSE_VALUES)
-def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, expected):
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_validate_rejects_unrenderable_cli_fixed_override(
+    tmp_path, value, expected, override_format
+):
     p = _override_yaml(
         tmp_path,
-        "argparse",
+        override_format,
         "        phases:\n"
         "          - name: t\n"
         "            n_trials: 1\n"
@@ -749,8 +775,12 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
 
     with pytest.raises(ValidationError, match=expected) as caught:
         load_experiment(p)
-    assert "override_format='argparse' supports" in str(caught.value)
+    assert f"override_format='{override_format}' supports" in str(caught.value)
     assert "Use the default override_format='yaml_file'" in str(caught.value)
+    if "2024-01-01" in value:
+        assert "Quote YAML dates or timestamps to send them as strings" in str(caught.value)
+    if value == ".nan":
+        assert 'quote it in YAML (e.g. "inf")' in str(caught.value)
 
 
 def test_validate_rejects_argparse_categorical_wire_collision() -> None:

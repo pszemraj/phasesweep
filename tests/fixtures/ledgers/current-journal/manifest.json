@@ -1,6 +1,6 @@
 {
   "backend": "journal",
-  "binding_schema_version": 6,
+  "binding_schema_version": 7,
   "derivation": "",
   "derived_from": null,
   "expect": {
@@ -15,14 +15,14 @@
   ],
   "n_trials": 2,
   "name": "current-journal",
-  "notes": "Current-format journal fixture.",
+  "notes": "Golden journal fixture.",
   "phases": [
     "p"
   ],
   "produced_by": {
     "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.7-98-g2c8ce50-dirty",
+    "phasesweep_git": "v0.3.8-52-gd2b0cea-dirty",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }

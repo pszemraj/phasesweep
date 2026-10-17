@@ -345,7 +345,7 @@ def test_gate_results_mark_expired_local_gate(tmp_path: Path, deadline: float) -
 
 
 class _UnregisteredGate:
-    """Stand-in for a ``Gate`` union member with no ``_GATE_DISPATCH`` entry."""
+    """Stand-in for an unsupported gate kind."""
 
     type = "unregistered"
 
@@ -357,12 +357,7 @@ class _UnregisteredGate:
 def test_unregistered_gate_type_fails_instead_of_raising(
     tmp_path: Path, deadline: float | str | None
 ) -> None:
-    """An unhandled gate type degrades to one failing gate, never a KeyError.
-
-    A bare ``_GATE_DISPATCH[type(gate)]`` lookup raises ``KeyError``, which is
-    not an ``ExtractorError`` and is not in Optuna's ``catch=`` tuple, so it
-    would escape the objective and abort the entire phase and run mid-sweep.
-    """
+    """An unhandled gate type fails without aborting the remaining evaluations."""
     ctx = make_trial_context(tmp_path)
     resolved = time.monotonic() + 5.0 if deadline == "future" else deadline
     known = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)

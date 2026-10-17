@@ -260,7 +260,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "fresh artifact root and local storage",
+            "fresh namespace for the state identified in the error",
             id="artifact_root",
         ),
     ],
@@ -301,7 +301,7 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
-        "Ask the operator to repair the experiment tree's files and permissions, deleting a "
+        "Ask the operator to restore the files and permissions identified in the error, deleting a "
         "file only if certain nothing is running. The error in the PhaseSweep run log gives "
         "the details."
     )
@@ -708,7 +708,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "fresh artifact root and local storage" in remediation
+    assert "fresh namespace for the state identified in the error" in remediation
 
 
 @pytest.mark.integration

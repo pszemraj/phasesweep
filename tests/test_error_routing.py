@@ -26,6 +26,7 @@ import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam
 from phasesweep.engine import fingerprints, guards, study_policy, trial
@@ -1577,6 +1578,10 @@ def test_raise_sites_route_their_declared_action(
     if case.cause is not None:
         assert type(error.__cause__) is case.cause
     assert case.message in str(error)
+    if case.action is OperatorAction.RETRY:
+        rendered = _operational_error_text(error)
+        assert "retry the same operation once the reported blocker is resolved" in rendered
+        assert "start a new run" not in rendered
 
 
 def _defect_while_inspecting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1629,9 +1634,9 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
 
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.FRESH_NAMESPACE: "fresh artifact root and local storage",
+        OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
-        OperatorAction.RESTORE_TREE: "repair the experiment tree",
+        OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
         OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
@@ -1712,8 +1717,8 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         _assert_payload_follows(failure, routed)
     # The last, composed remediation, word for word.
     assert failure["remediation"] == (
-        "Ask the operator to restore or repair the storage ledger and access to it, and repair "
-        "the experiment tree's files and permissions, deleting a file only if certain nothing "
+        "Ask the operator to restore or repair the storage ledger and access to it, and restore "
+        "the files and permissions identified in the error, deleting a file only if certain nothing "
         "is running, then run phasesweep mcp recover-run before another launch. The error in "
         "the PhaseSweep run log gives the details."
     )

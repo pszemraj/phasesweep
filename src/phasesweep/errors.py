@@ -9,11 +9,11 @@ from typing import ClassVar, Self
 class OperatorAction(StrEnum):
     """Operator remediation category for routing expected failures.
 
-    FRESH_NAMESPACE starts a separate experiment namespace; RESTORE_LEDGER
-    repairs storage; RESTORE_TREE repairs artifacts or permissions.
+    FRESH_NAMESPACE starts a separate namespace for the affected state;
+    RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions.
     RUN_RECOVER_RUN retries process cleanup through the appropriate CLI or MCP
     recovery entry point. FIX_CONFIG corrects configuration or environment;
-    RETRY waits for the current holder; INSPECT_LOGS requires diagnosis.
+    RETRY repeats the operation after its blocker resolves; INSPECT_LOGS requires diagnosis.
     Defects do not inherit PhaseSweepError or an operator remediation.
     """
 
@@ -79,16 +79,16 @@ RERUN_CLEANUP_RECOVERY = (
 
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.FRESH_NAMESPACE: "use a fresh artifact root and local storage",
+    OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
     OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
     OperatorAction.RESTORE_TREE: (
-        "repair the experiment tree's files and permissions, deleting a file only if "
+        "restore the files and permissions identified in the error, deleting a file only if "
         "certain nothing is running"
     ),
     OperatorAction.RUN_RECOVER_RUN: RERUN_CLEANUP_RECOVERY,
     OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",
     OperatorAction.RETRY: (
-        "Wait briefly, then start a new run; another process currently holds this experiment"
+        "Wait briefly, then retry the same operation once the reported blocker is resolved"
     ),
     OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log and the logs its error points to",
 }

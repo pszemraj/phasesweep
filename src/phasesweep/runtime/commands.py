@@ -12,19 +12,18 @@ import re
 import shlex
 from collections.abc import Mapping
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import ConfigDict, TypeAdapter
-from pydantic import JsonValue as PydanticJsonValue
+from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from phasesweep.config.common import _find_prefix_collisions
-from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
-_FILE_CONFIG_VALUE: TypeAdapter[PydanticJsonValue] = TypeAdapter(
-    PydanticJsonValue,
+_FILE_CONFIG_VALUE: TypeAdapter[JsonValue] = TypeAdapter(
+    JsonValue,
     config=ConfigDict(strict=True, allow_inf_nan=False, hide_input_in_errors=True),
 )
 
@@ -55,6 +54,10 @@ class _OverrideValueError(TypeError):
             if fmt == "hydra" and isinstance(value, str)
             else ""
         )
+        if isinstance(value, float):
+            reason = 'Use a finite value, or quote it in YAML (e.g. "inf") to send it as text. '
+        elif isinstance(value, date):
+            reason = "Quote YAML dates or timestamps to send them as strings. "
         super().__init__(
             f"override_format={fmt!r} supports null, booleans, integers, finite "
             f"floats, strings, and lists of those; got{where} "
@@ -136,6 +139,39 @@ def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideForma
     )
 
 
+def _validate_file_config_value(payload: object, *, position: str) -> None:
+    """Report invalid trainer values with dotted keys and list indices."""
+    try:
+        _FILE_CONFIG_VALUE.validate_python(payload)
+    except ValidationError as exc:
+        error = exc.errors(include_url=False)[0]
+        location = error["loc"]
+        # JsonValue locations alternate union tags with mapping keys or indices.
+        path = location[1::2]
+        is_key = error["type"] == "string_type"
+        if is_key:
+            path = path[:-1]
+        for part in path:
+            position += f"[{part}]" if isinstance(part, int) else f".{part}"
+        value = error["input"]
+        if is_key:
+            message = (
+                f"{position} has non-string mapping key {value!r} "
+                f"({type(value).__name__}). Trainer config keys must be strings."
+            )
+        elif error["type"] == "finite_number":
+            message = f"{position} must be finite; got {type(value).__name__}: {value!r}."
+        elif error["type"] == "recursion_loop":
+            message = f"{position} contains a recursive YAML container."
+        else:
+            message = (
+                f"{position} has unsupported type {type(value).__name__}: {value!r}. "
+                "Use strings, booleans, integers, finite floats, null, lists, and "
+                "string-keyed mappings; quote YAML dates or timestamps to keep them strings."
+            )
+        raise ValueError(message) from exc
+
+
 def dump_overrides_json(payload: Any) -> str:
     """Encode only JSON-compatible values using the trainer's strict wire format.
 
@@ -143,7 +179,7 @@ def dump_overrides_json(payload: Any) -> str:
     :return str: Deterministic JSON text.
     :raises ValueError: A value is non-finite, recursive, or outside the strict JSON domain.
     """
-    _FILE_CONFIG_VALUE.validate_python(payload)
+    _validate_file_config_value(payload, position="JSON overrides")
     return encode_overrides_json(payload)
 
 
@@ -308,7 +344,7 @@ def compose_trainer_input(
                 )
     composed = compose_trainer_config(trainer_config, overrides, substitutions=substitutions)
     if fmt == "yaml_file":
-        _FILE_CONFIG_VALUE.validate_python(composed)
+        _validate_file_config_value(composed, position="trainer_config")
         return yaml.safe_dump(composed, sort_keys=True, allow_unicode=True)
     if fmt == "json_file":
         return dump_overrides_json(composed)

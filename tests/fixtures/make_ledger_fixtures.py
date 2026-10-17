@@ -67,7 +67,7 @@ FIXTURE_ENVIRONMENT: dict[str, str | None] = {
 TARGET_STUDY_SCHEMA_VERSION = 7
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
-TARGET_BINDING_SCHEMA_VERSION = 6
+TARGET_BINDING_SCHEMA_VERSION = 7
 #: Study user attribute holding the PhaseSweep study schema version.
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 #: Optuna journal op code for ``SET_STUDY_USER_ATTR``.
@@ -89,7 +89,7 @@ LEDGER_FILENAME = "study.journal"
 FIXTURE_NAME = "current-journal"
 FIXTURE_MODES = ("tree", "ledger-only")
 FIXTURE_EXPECT = {"tree": "ok", "ledger-only": "ok"}
-FIXTURE_NOTES = "Unedited output of this release on the journal backend."
+FIXTURE_NOTES = "Golden journal fixture."
 
 
 def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:

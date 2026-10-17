@@ -18,6 +18,7 @@ import optuna
 import pytest
 
 import phasesweep.engine.ledger as engine_ledger
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.attempts import (
@@ -1096,6 +1097,38 @@ def test_reaper_reports_storage_failures_after_cleanup(
 
     # The trial must NOT have been marked FAIL (because tell raised).
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
+
+
+def test_reaper_keeps_uncertain_cleanup_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unconfirmed cleanup retains the trial and names process inspection before recovery."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}"
+    )
+    stale = fabricate_stale_trial(experiment, "p", attempt_id="uncertain-attempt")
+    write_trial_identity(
+        stale.trial_dir, attempt_id="uncertain-attempt", pid=99999, pgid=99998, starttime=12345
+    )
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: False)
+    uncertain: set[str] = set()
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        _reap_stale_trials(
+            stale.study, experiment, "p", confirm=True, uncertain_attempt_ids=uncertain
+        )
+
+    text = _operational_error_text(excinfo.value)
+    assert "pid=99999 pgid=99998" in text
+    assert (
+        "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery"
+        in text
+    )
+    assert text.index("with ps") < text.index("fix:")
+    assert "recover-run" in text
+    assert uncertain == {"uncertain-attempt"}
+    assert stale.study.trials[stale.number].state == optuna.trial.TrialState.RUNNING
+    assert CLEANUP_RECOVERED_TRIALS_ATTR not in stale.study.user_attrs
 
 
 @pytest.mark.integration

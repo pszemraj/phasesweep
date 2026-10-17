@@ -52,7 +52,7 @@ from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import MCP_STATE_FORMAT_VERSION, RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import private_atomic_write_text
@@ -93,21 +93,20 @@ from tests.recovery_helpers import (
 )
 
 
-@pytest.mark.parametrize("action", [OperatorAction.RESTORE_TREE, OperatorAction.FRESH_NAMESPACE])
-def test_recovery_cli_renders_routed_operator_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: OperatorAction
-) -> None:
-    """Recovery preserves the routed remedy through Click's operator-error boundary."""
+def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
+    """An unsupported MCP store calls for a fresh state directory."""
+    _config, _app, registry, store = side_effect_app(tmp_path)
+    marker = store._format_marker_path
+    marker.write_text(json.dumps({"schema_version": MCP_STATE_FORMAT_VERSION + 1}))
+    before = marker.read_bytes()
 
-    def refuse_recovery(*_args: object, **_kwargs: object) -> None:
-        raise mcp_recovery.RunRecoveryError("study ownership differs", action=action)
-
-    monkeypatch.setattr("phasesweep.cli.recover_run", refuse_recovery)
-
-    result = recover_run_cli(tmp_path, "refused-run", confirm=True)
+    result = recover_run_cli(registry.state_dir, "refused-run", confirm=True)
 
     assert result.exit_code == 1
-    assert result.output == f"Error: study ownership differs\nfix: {OPERATOR_STEPS[action]}.\n"
+    assert "use a fresh MCP state directory" in result.output
+    assert f"fix: {OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE]}." in result.output
+    assert "artifact root" not in result.output
+    assert marker.read_bytes() == before
 
 
 def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
@@ -586,6 +585,8 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
+    assert "retry the same operation" in result.output
+    assert "start a new run" not in result.output
     cleanup.assert_not_called()
     assert store.cleanup_uncertain_path(run_id).is_file()
     assert not store.cleanup_recovery_path(run_id).exists()
@@ -673,6 +674,8 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     assert "launch outcome is unresolved" in result.output
     assert "remains reserved" in result.output
     assert "automated recovery cannot safely" in result.output
+    assert "retry the same operation" in result.output
+    assert "start a new run" not in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert not store.status_path(run_id).exists()
     observation = store.observe(handle)
@@ -1829,11 +1832,12 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
             "run snapshot hash mismatch",
             id="snapshot-hash-mismatch",
         ),
+        pytest.param(None, False, "run config snapshot is missing", id="snapshot-missing"),
     ],
 )
 def test_operator_recovery_refuses_unverifiable_run(
     tmp_path: Path,
-    snapshot_suffix: bytes,
+    snapshot_suffix: bytes | None,
     terminal_without_evidence: bool,
     expected_message: str,
 ) -> None:
@@ -1847,7 +1851,8 @@ def test_operator_recovery_refuses_unverifiable_run(
         config_sha256=reg.config_sha256,
     )
     store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + snapshot_suffix)
+    if snapshot_suffix is not None:
+        store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + snapshot_suffix)
     if terminal_without_evidence:
         write_unsafe_cleanup_status(store, run_id)
     else:
@@ -1857,6 +1862,9 @@ def test_operator_recovery_refuses_unverifiable_run(
 
     assert result.exit_code != 0
     assert expected_message in result.output
+    if not terminal_without_evidence:
+        assert "restore the files and permissions identified in the error" in result.output
+        assert "experiment tree" not in result.output
     assert not store.cleanup_recovery_path(run_id).exists()
     assert store.observe(handle).state == "running"
     if not terminal_without_evidence:

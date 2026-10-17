@@ -136,12 +136,7 @@ class Winner:
     # Persisted with the winner so --from-phase can verify carried evidence
     # even if the source study is no longer available.
     trainer_input: dict[str, Any] | None = None
-    # Identity of the semantic environment the winning trial ran under: the
-    # SHA-256 of its tracked trainer environment (the pass-through values,
-    # built-in ``TMPDIR`` and ``passthrough_env``, are not in it), plus the
-    # ``inherit_env`` contract.
-    # The tracked name -> value mapping stays on the trial attrs — the winner
-    # file keeps the compact identity.
+    # SHA-256 of the tracked name/value mapping stored on the source trial.
     trainer_env_digest: str | None = None
     # Advisory verdicts on the population the source selection ranked, frozen
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
@@ -483,7 +478,7 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 3
+GENERATION_SUMMARY_SCHEMA_VERSION = 4
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time. The
 # summary keeps only the config *fingerprint*: once the operator edits or loses

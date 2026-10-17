@@ -16,14 +16,14 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: 4bf7f38f30bf4c208abb7c2e6b4c42e9
-attempt_id: 81e84803826944e2b986076fe31cdd47
+generation_id: a31422f1dbb5433581e90b00da91911f
+attempt_id: 0adfa98c3e5b4cc78346e30d83009353
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: 4bf7f38f30bf4c208abb7c2e6b4c42e9
-  attempt_id: 81e84803826944e2b986076fe31cdd47
+  generation_id: a31422f1dbb5433581e90b00da91911f
+  attempt_id: 0adfa98c3e5b4cc78346e30d83009353
 trainer_input:
   schema_version: 1
   format: argparse
@@ -35,7 +35,7 @@ objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-14T22:04:06+00:00'
+  recorded_at: '2026-10-17T02:14:26+00:00'
   schema_version: 3
   source:
     kind: file

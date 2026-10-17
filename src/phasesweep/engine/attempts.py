@@ -877,7 +877,8 @@ def _resolve_attempt(
     if not cleanup_stale_trial_process(identity):
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed. "
-            f"pid={identity.pid} pgid={identity.pgid}."
+            f"pid={identity.pid} pgid={identity.pgid}. "
+            "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery."
         )
     log.warning(
         "%s: confirmed process cleanup (pid=%s pgid=%s).", context, identity.pid, identity.pgid

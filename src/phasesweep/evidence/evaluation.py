@@ -8,7 +8,7 @@ import math
 import os
 import stat
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -662,15 +662,6 @@ def _extract_mlflow(
     return float(point["value"])
 
 
-_DISPATCH: dict[type, Callable[..., float]] = {
-    JsonExtractor: _extract_json,
-    JsonEnvelopeExtractor: _extract_json_envelope,
-    LogRegexExtractor: _extract_log_regex,
-    WandbExtractor: _extract_wandb,
-    MlflowExtractor: _extract_mlflow,
-}
-
-
 def run_extractor(
     ctx: TrialContext,
     cfg: ObjectiveExtractor,
@@ -691,8 +682,13 @@ def run_extractor(
     :raises ExtractorError: The kind is unregistered or extraction fails.
     :return float: Extracted numeric value.
     """
-    fn = _DISPATCH.get(type(cfg))
-    if fn is None:
+    if type(cfg) not in (
+        JsonExtractor,
+        JsonEnvelopeExtractor,
+        LogRegexExtractor,
+        WandbExtractor,
+        MlflowExtractor,
+    ):
         raise ExtractorError(f"No extractor registered for {type(cfg).__name__}.")
     if provenance is not None:
         provenance.clear()
@@ -709,10 +705,16 @@ def run_extractor(
         raise DeadlineExceededError(
             "Phase/run wallclock deadline exceeded before evidence extraction."
         )
-    if isinstance(cfg, WandbExtractor | MlflowExtractor):
-        value = fn(ctx, cfg, provenance, deadline=deadline)
+    if isinstance(cfg, JsonExtractor):
+        value = _extract_json(ctx, cfg, provenance)
+    elif isinstance(cfg, JsonEnvelopeExtractor):
+        value = _extract_json_envelope(ctx, cfg, provenance)
+    elif isinstance(cfg, LogRegexExtractor):
+        value = _extract_log_regex(ctx, cfg, provenance)
+    elif isinstance(cfg, WandbExtractor):
+        value = _extract_wandb(ctx, cfg, provenance, deadline=deadline)
     else:
-        value = fn(ctx, cfg, provenance)
+        value = _extract_mlflow(ctx, cfg, provenance, deadline=deadline)
     if provenance is not None:
         provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value
@@ -914,17 +916,6 @@ def _wandb_summary_required(
     )
 
 
-_GATE_DISPATCH: dict[type, Callable[..., GateResult]] = {
-    RequiredFileGate: _required_file,
-    JsonEqualsGate: _json_equals,
-    JsonScalarBoundGate: _json_scalar_bound,
-    ArtifactSizeGate: _artifact_size,
-    Sha256Gate: _sha256,
-    WandbSummaryRequiredGate: _wandb_summary_required,
-    MlflowRequiredGate: _mlflow_required,
-}
-
-
 def evaluate_gates(
     ctx: TrialContext,
     gates: list[Gate],
@@ -942,8 +933,15 @@ def evaluate_gates(
     """
     results: list[GateResult] = []
     for gate in gates:
-        fn = _GATE_DISPATCH.get(type(gate))
-        if fn is None:
+        if type(gate) not in (
+            RequiredFileGate,
+            JsonEqualsGate,
+            JsonScalarBoundGate,
+            ArtifactSizeGate,
+            Sha256Gate,
+            WandbSummaryRequiredGate,
+            MlflowRequiredGate,
+        ):
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
         if deadline is not None and not (deadline > time.monotonic()):
@@ -956,9 +954,19 @@ def evaluate_gates(
                 )
             )
             continue
-        results.append(
-            fn(ctx, gate, deadline=deadline)
-            if isinstance(gate, WandbSummaryRequiredGate | MlflowRequiredGate)
-            else fn(ctx, gate)
-        )
+        if isinstance(gate, RequiredFileGate):
+            result = _required_file(ctx, gate)
+        elif isinstance(gate, JsonEqualsGate):
+            result = _json_equals(ctx, gate)
+        elif isinstance(gate, JsonScalarBoundGate):
+            result = _json_scalar_bound(ctx, gate)
+        elif isinstance(gate, ArtifactSizeGate):
+            result = _artifact_size(ctx, gate)
+        elif isinstance(gate, Sha256Gate):
+            result = _sha256(ctx, gate)
+        elif isinstance(gate, WandbSummaryRequiredGate):
+            result = _wandb_summary_required(ctx, gate, deadline=deadline)
+        else:
+            result = _mlflow_required(ctx, gate, deadline=deadline)
+        results.append(result)
     return results
