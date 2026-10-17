@@ -1,10 +1,7 @@
-"""Queryable view of the packaged configuration reference (SDK-free).
+"""Query the packaged configuration reference without importing tracker SDKs.
 
-``config_reference.yaml`` documents every key the experiment YAML accepts in
-signature form. This module parses it once into :class:`ReferenceEntry` rows and
-answers the lookups that CLI help and validation-error hints need: the entries
-below a key, the nearest documented keys to a typo, the documented key that a
-validation error location points into, and the general notes of the file header.
+Parse config_reference.yaml into entries for CLI help, typo suggestions,
+validation-error hints, and header notes.
 """
 
 from __future__ import annotations
@@ -133,10 +130,7 @@ def _reference_resource() -> Traversable:
 
 
 def _parse_notes(text: str) -> tuple[str, ...]:
-    """Return the general notes: the second comment block of the reference header.
-
-    The first block describes the file itself and is for its maintainers; the
-    block after the first blank line is what someone writing a config needs.
+    """Read the second comment block of the reference header as general config notes.
 
     :param str text: Contents of ``config_reference.yaml``.
     :raises ValueError: If the header holds fewer than two comment blocks.
@@ -304,6 +298,16 @@ def closest(key: str, limit: int = 3) -> tuple[str, ...]:
         if (display := by_segments[segments]) not in suggestions:
             suggestions.append(display)
     return tuple(suggestions[:limit])
+
+
+def lookup_or_suggest(key: str) -> tuple[tuple[ReferenceEntry, ...], tuple[str, ...]]:
+    """Find entries for a supplied key, suggesting alternatives only on a miss.
+
+    :param str key: User-typed key; an empty normalized path matches nothing.
+    :return tuple[tuple[ReferenceEntry, ...], tuple[str, ...]]: Entries and suggestions.
+    """
+    entries = lookup(key) if plain_path(key) else ()
+    return entries, () if entries else closest(key)
 
 
 def loc_to_path(loc: Sequence[int | str]) -> str | None:

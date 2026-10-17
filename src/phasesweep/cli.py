@@ -15,34 +15,26 @@ import click
 import optuna
 import yaml
 
-from phasesweep.config import ConfigError, Experiment, load_experiment
-from phasesweep.config.io import describe_validation_error
-from phasesweep.config.models import experiment_contract_lines, experiment_warnings
+from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
+from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
-    closest,
     first_sentence,
-    lookup,
-    plain_path,
+    lookup_or_suggest,
     reference_notes,
     sub_key_count,
     top_level_entries,
 )
-from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
-from phasesweep.engine import (
-    PhaseSweepError,
-    PublicationAccessError,
-    PublicationIntegrityError,
-    TrialTable,
-    TrialTables,
-    UnsafeProcessCleanupError,
-    experiment_status,
-    read_trial_tables,
-    run_experiment,
-)
+from phasesweep.config.search import phase_draws
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication import (
+    _resolve_publication_pointer,
+    raise_for_unusable_publication,
+)
+from phasesweep.engine.read import TrialTable, TrialTables, read_trial_tables
+from phasesweep.engine.run import experiment_status, run_experiment
+from phasesweep.errors import OPERATOR_STEPS, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -104,15 +96,15 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
+def _operational_error_text(exc: PhaseSweepError) -> str:
+    """Format an operational diagnosis with its routed operator step."""
+    return f"{exc}\nfix: {OPERATOR_STEPS[exc.action]}."
+
+
 def main() -> None:
     """Run the CLI behind a process-level error boundary.
 
-    The console entry point, so every failure reaches the operator as a
-    diagnostic rather than a traceback. Click runs in ``standalone_mode=False``
-    so its exceptions surface here instead of being converted inside Click;
-    it still returns the exit status for ``ctx.exit()`` paths, and commands
-    that call ``sys.exit`` themselves raise ``SystemExit``, which is a
-    ``BaseException`` and passes through untouched.
+    Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
@@ -132,7 +124,7 @@ def main() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(f"phasesweep: {exc}", err=True)
+        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
         # -v (see _configure_logging) means the operator asked for internals.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
@@ -411,8 +403,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
-    :raises UnsafeProcessCleanupError: A trial's cleanup was refused; the message gains
-        the ``phasesweep run`` retry advice.
     """
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
@@ -427,13 +417,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             sys.exit(2)
     try:
         run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-    except UnsafeProcessCleanupError as exc:
-        # A trial's cleanup refusal describes the leak, and the study keeps
-        # that text as the cause a later phase-abort refusal quotes, so the
-        # recovery a CLI operator runs is added here rather than at the raise.
-        raise UnsafeProcessCleanupError.rewrap(
-            exc, f"{exc} To retry its cleanup, run `phasesweep run` again with the same config."
-        ) from exc
     except PhaseSweepShutdown as exc:
         if exc.published_result_committed:
             click.echo(
@@ -453,8 +436,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 def validate(config_path: Path) -> None:
     """Validate static config in ``config_path`` without running anything.
 
-    This intentionally does not resolve the caller's ambient execution
-    environment; a non-dry ``run`` performs that preflight before it claims work.
+    A non-dry ``run`` checks the ambient execution environment before claiming work.
     """
     config = _load_cli_config(config_path)
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
@@ -467,19 +449,19 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
     """
-    for line in experiment_contract_lines(experiment):
-        click.echo(f"{indent}{line}")
-    for warning in experiment_warnings(experiment):
-        click.echo(f"{indent}warning: {warning}")
-    for p in experiment.phases:
-        deps = f" inherits={p.inherits}" if p.inherits else ""
-        sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
-        click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
-        # Capability disclosure: state the resume/reproduce contract before a trial runs.
-        click.echo(f"{indent}    {sampler_capability_line(p, experiment.resolved_storage)}")
-        for warning in sampler_warnings(p):
-            click.echo(f"{indent}    warning: {warning}")
-        _render_phase_comment(p.comment, prefix=f"{indent}    # ")
+    for phase, lines in experiment_disclosures(experiment):
+        prefix = indent
+        if phase is not None:
+            deps = f" inherits={phase.inherits}" if phase.inherits else ""
+            sampling = (
+                f"sampler={phase.sampler.type}" if phase_draws(phase) else "(fixed configuration)"
+            )
+            click.echo(f"{indent}- {phase.name}: n_trials={phase.n_trials} {sampling}{deps}")
+            prefix += "    "
+        for warning, line in lines:
+            click.echo(f"{prefix}{'warning: ' if warning else ''}{line}")
+        if phase is not None:
+            _render_phase_comment(phase.comment, prefix=f"{indent}    # ")
 
 
 def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
@@ -528,9 +510,8 @@ def explain(key: str | None, notes: bool) -> None:
     if key is None:
         _render_reference_index()
         return
-    entries = lookup(key) if plain_path(key) else ()
+    entries, near = lookup_or_suggest(key)
     if not entries:
-        near = closest(key)
         hint = (
             f"Closest: {', '.join(near)}."
             if near
@@ -571,79 +552,6 @@ def _render_reference_index() -> None:
     )
 
 
-def _publication_integrity_error(
-    subject: str,
-    detail: str,
-    namespace_root: Path,
-) -> PublicationIntegrityError:
-    """Build the one diagnostic every corrupt-publication read surface reports.
-
-    Carries the validation failure *and* the reason not to re-run: a
-    successful re-run publishes a new generation, the last-success pointer
-    advances past the corrupt one, and nothing reports the corruption
-    afterwards. The immutable namespace is still on disk until then, so
-    inspecting or restoring it first is the whole remedy.
-
-    :param str subject: Experiment the corrupt publication belongs to.
-    :param str detail: Validation error explaining why it no longer validates.
-        Punctuated here rather than at the raising site, since validators
-        return bare reason clauses.
-    :param Path namespace_root: Artifact root holding the generation namespaces
-        the operator must inspect.
-    :return PublicationIntegrityError: Complete single-line operator diagnostic.
-    """
-    detail = detail.rstrip()
-    if not detail.endswith((".", "!", "?")):
-        detail = f"{detail}."
-    return PublicationIntegrityError(
-        f"{subject} records a publication that no longer validates: {detail} "
-        f"Do not run anything over this tree until you have inspected or restored the "
-        f"generation namespace under {namespace_root} -- a successful run would advance the "
-        "last-success pointer past the corrupt generation and nothing would report it again."
-    )
-
-
-def _publication_access_error(subject: str, detail: str) -> PublicationAccessError:
-    """Build the diagnostic for a publication this user cannot validate.
-
-    :param str subject: Experiment the publication belongs to.
-    :param str detail: Path-free permission diagnostic from the validator.
-    :return PublicationAccessError: Complete single-line operator diagnostic.
-    """
-    detail = detail.rstrip()
-    if not detail.endswith((".", "!", "?")):
-        detail = f"{detail}."
-    return PublicationAccessError(
-        f"{subject} records a publication that cannot be validated as the current user: "
-        f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
-        "the publication as the publishing user or restore read permission before launching "
-        "another run."
-    )
-
-
-def _raise_on_failed_publication(
-    experiment: str, integrity: str, error: str | None, workdir: Path
-) -> None:
-    """Escalate an unusable publication verdict to its typed operator error.
-
-    Reads the verdict of the resolution that was just rendered rather than
-    re-resolving the pointer, so the exit status can never disagree with what
-    the operator was shown.
-
-    :param str experiment: Experiment the publication belongs to.
-    :param str integrity: ``publication_integrity`` of the rendered resolution.
-    :param str | None error: ``publication_error`` beside a ``failed`` or ``permission_denied`` verdict.
-    :param Path workdir: Artifact root holding the generation namespaces.
-    :raises PublicationAccessError: Publication validation was denied by permissions.
-    :raises PublicationIntegrityError: A reported publication no longer validates.
-    """
-    if integrity == "permission_denied":
-        raise _publication_access_error(f"Experiment {experiment!r}", str(error))
-    if integrity != "failed":
-        return
-    raise _publication_integrity_error(f"Experiment {experiment!r}", str(error), workdir)
-
-
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
@@ -652,40 +560,18 @@ def _raise_on_failed_publication(
 )
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
-    """Print winner files referenced by ``config_path``."""
-    _show_experiment_winners(_load_cli_config(config_path))
+    """Print winners using their generation's recorded phase plan and validated bytes.
 
-
-def _show_experiment_winners(experiment: Experiment) -> None:
-    """Print winner files for one experiment.
-
-    A published result is rendered against the phase plan recorded in its own
-    generation summary: old evidence must never be decorated with the current
-    config's annotations, and a config that has drifted since publication is
-    labeled historical instead of silently reinterpreted. Each winner prints
-    the exact bytes publication validation read, never a second read of the
-    file.
-
-    :param Experiment experiment: Experiment whose published winners are rendered.
+    :param config_path: Config used to locate the publication and label drift as historical.
     :raises PublicationAccessError: This user cannot validate the publication.
-    :raises PublicationIntegrityError: The last-success pointer names a
-        generation that no longer validates. Nothing is rendered in that case:
-        printing "(no winner yet)" beside a corrupt publication reads as a
-        phase that simply has not run.
+    :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     """
+    experiment = _load_cli_config(config_path)
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
-    if publication.state == "permission_denied":
-        raise _publication_access_error(
-            f"Experiment {experiment.experiment!r}",
-            str(publication.error),
-        )
-    if publication.state == "failed":
-        raise _publication_integrity_error(
-            f"Experiment {experiment.experiment!r}",
-            str(publication.error),
-            _experiment_dir(experiment),
-        )
+    raise_for_unusable_publication(
+        experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
+    )
     validated = publication.validated
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if validated is not None:
@@ -704,8 +590,6 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         winner = None if validated is None else validated.winners.get(name)
         if winner is not None:
             click.echo(f"=== {name} ===")
-            # Show design-intent before numerical results so the reader frames
-            # them against the original hypothesis instead of the other way around.
             _render_phase_comment(comment, prefix="# ")
             click.echo(winner.content.decode("utf-8"))
         else:
@@ -846,7 +730,7 @@ def status(config_path: Path, show_trials: bool) -> None:
     if show_trials:
         tables = read_trial_tables(config)
         click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
-        _raise_on_failed_publication(
+        raise_for_unusable_publication(
             tables.experiment,
             tables.publication_integrity,
             tables.publication_error,
@@ -855,7 +739,7 @@ def status(config_path: Path, show_trials: bool) -> None:
         return
     payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
-    _raise_on_failed_publication(
+    raise_for_unusable_publication(
         str(payload["experiment"]),
         str(payload["publication_integrity"]),
         None if payload.get("publication_error") is None else str(payload["publication_error"]),
@@ -904,12 +788,7 @@ def mcp() -> None:
 
 
 def _catalog_error_text(exc: CatalogError) -> str:
-    """Render a catalog error together with its actionable fix.
-
-    ``CatalogError`` carries the remediation in ``suggestion``; formatting the
-    exception alone silently drops it and leaves the operator with a diagnosis
-    but no instruction. Matches the ``fix:`` line ``mcp check`` prints per
-    entry. Operator-facing: messages and suggestions may include paths.
+    """Render a catalog error with its optional actionable fix; paths may be included.
 
     :param CatalogError exc: Raised catalog error to render.
     :return str: Message, plus a trailing ``fix:`` line when a suggestion exists.
@@ -969,7 +848,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     try:
         recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
     except RunRecoveryError as exc:
-        raise click.ClickException(str(exc)) from None
+        raise click.ClickException(_operational_error_text(exc)) from None
 
 
 @mcp.command(
@@ -988,9 +867,6 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
 @click.pass_context
 def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     """Serve the MCP server over stdio.
-
-    The MCP SDK import stays behind this command so the base CLI still works
-    without installing the ``mcp`` optional dependency.
 
     :param click.Context ctx: Active Click context used to exit with the server return code.
     :param Path catalog: Operator-authored MCP catalog to load.
@@ -1040,9 +916,6 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
 @click.pass_context
 def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path) -> None:
     """Call one MCP tool without a client, for scripting or debugging.
-
-    The MCP SDK import stays behind this command so the base CLI still works
-    without installing the ``mcp`` optional dependency.
 
     :param click.Context ctx: Active Click context used to exit with the call's return code.
     :param str tool: Tool name, such as ``list_experiments``.

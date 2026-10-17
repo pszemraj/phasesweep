@@ -15,9 +15,7 @@ import pytest
 from optuna.distributions import IntDistribution
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment
 from phasesweep.engine import phase as phase_module
-from phasesweep.engine import read_trial_tables
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
@@ -28,6 +26,7 @@ from phasesweep.engine.optuna import (
     _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
@@ -50,28 +49,17 @@ from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
-from tests.conftest import make_experiment, write_param_echo_trainer, write_trainer
+from tests.conftest import (
+    _phase_trials,
+    make_experiment,
+    trial_outcome,
+    write_param_echo_trainer,
+    write_trainer,
+)
 from tests.recovery_helpers import fabricate_stale_trial
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
 _UNCOMMITTED_CAUSE = "orchestrator stopped before Optuna committed the terminal trial state"
-
-
-def _outcome(sequence: int, outcome: str, **extra: str | JsonObject) -> JsonObject:
-    """Build a current-schema outcome record.
-
-    :param int sequence: Completion sequence.
-    :param str outcome: Outcome label.
-    :param str | JsonObject extra: Further fields, such as ``cause`` or an abort record.
-    :return JsonObject: The record as the objective writes it.
-    """
-    record: JsonObject = {
-        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-        "sequence": sequence,
-        "outcome": outcome,
-    }
-    record.update(extra)
-    return record
 
 
 def _abort(sequence: int) -> JsonObject:
@@ -93,15 +81,17 @@ def _abort(sequence: int) -> JsonObject:
     ("recorded", "expected"),
     [
         pytest.param(None, "interrupted", id="no-record"),
-        pytest.param(_outcome(1, "success"), "interrupted", id="uncommitted-success"),
-        pytest.param(_outcome(1, "interrupted"), "interrupted", id="interrupted"),
-        pytest.param(_outcome(1, "failure"), "failure", id="failure"),
+        pytest.param(trial_outcome(1, "success"), "interrupted", id="uncommitted-success"),
+        pytest.param(trial_outcome(1, "interrupted"), "interrupted", id="interrupted"),
+        pytest.param(trial_outcome(1, "failure"), "failure", id="failure"),
         pytest.param(
-            _outcome(1, "failure", **{TRIAL_OUTCOME_ABORT_KEY: _abort(1)}),
+            trial_outcome(1, "failure", **{TRIAL_OUTCOME_ABORT_KEY: _abort(1)}),
             "failure",
             id="failure-with-abort",
         ),
-        pytest.param(_outcome(1, "fatal", policy="unsafe_process_cleanup"), "fatal", id="fatal"),
+        pytest.param(
+            trial_outcome(1, "fatal", policy="unsafe_process_cleanup"), "fatal", id="fatal"
+        ),
     ],
 )
 def test_stale_recovery_keeps_failures_and_interrupts_everything_else(
@@ -115,8 +105,8 @@ def test_stale_recovery_keeps_failures_and_interrupts_everything_else(
 
 def test_the_outcome_parser_rejects_an_unknown_label_and_another_schema_version() -> None:
     """A label outside the outcome vocabulary, such as ``cancelled``, and any other schema version parse as nothing."""
-    assert _parsed_trial_outcome(_outcome(1, "cancelled")) is None
-    previous = _outcome(1, "interrupted")
+    assert _parsed_trial_outcome(trial_outcome(1, "cancelled")) is None
+    previous = trial_outcome(1, "interrupted")
     previous["schema_version"] = TRIAL_OUTCOME_SCHEMA_VERSION - 1
     assert _parsed_trial_outcome(previous) is None
 
@@ -148,7 +138,7 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
         optuna.trial.create_trial(
             state=state,
             value=0.0 if outcome == "success" else None,
-            user_attrs={TRIAL_OUTCOME_ATTR: _outcome(sequence, outcome)},
+            user_attrs={TRIAL_OUTCOME_ATTR: trial_outcome(sequence, outcome)},
         )
     )
 
@@ -156,30 +146,30 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
 @pytest.mark.parametrize(
     ("recorded", "expected"),
     [
-        pytest.param(None, _outcome(3, "interrupted", cause=_STALE_CAUSE), id="no-record"),
+        pytest.param(None, trial_outcome(3, "interrupted", cause=_STALE_CAUSE), id="no-record"),
         pytest.param(
-            _outcome(3, "success"),
-            _outcome(3, "interrupted", cause=_UNCOMMITTED_CAUSE),
+            trial_outcome(3, "success"),
+            trial_outcome(3, "interrupted", cause=_UNCOMMITTED_CAUSE),
             id="uncommitted-success",
         ),
         pytest.param(
-            _outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
-            _outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
+            trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
+            trial_outcome(3, "interrupted", cause="orchestrator interrupted by signal 2"),
             id="signal",
         ),
         pytest.param(
-            _outcome(3, "failure", cause="exit 1"),
-            _outcome(3, "failure", cause="exit 1"),
+            trial_outcome(3, "failure", cause="exit 1"),
+            trial_outcome(3, "failure", cause="exit 1"),
             id="failure",
         ),
         pytest.param(
-            _outcome(2, "interrupted"),
-            _outcome(3, "interrupted", cause=_STALE_CAUSE),
+            trial_outcome(2, "interrupted"),
+            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
             id="duplicate-sequence",
         ),
         pytest.param(
-            _outcome(2, "failure", cause="exit 1"),
-            _outcome(3, "interrupted", cause=_STALE_CAUSE),
+            trial_outcome(2, "failure", cause="exit 1"),
+            trial_outcome(3, "interrupted", cause=_STALE_CAUSE),
             id="duplicate-sequence-failure",
         ),
     ],
@@ -221,7 +211,7 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
 def test_a_running_trial_is_not_interrupted_until_it_is_terminal() -> None:
     """Only a terminal trial counts as interrupted, even when its objective already recorded the label."""
     study = optuna.create_study()
-    trial = _running_trial(study, _outcome(1, "interrupted"))
+    trial = _running_trial(study, trial_outcome(1, "interrupted"))
     assert _trial_interrupted(trial) is False
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     assert _trial_interrupted(study.trials[trial.number]) is True
@@ -239,7 +229,7 @@ def _interrupted(number_of_params: int = 0) -> optuna.trial.FrozenTrial:
         params={name: 1 for name in names},
         distributions={name: IntDistribution(0, 3) for name in names},
         system_attrs={"grid_id": 4},
-        user_attrs={TRIAL_OUTCOME_ATTR: _outcome(1, "interrupted")},
+        user_attrs={TRIAL_OUTCOME_ATTR: trial_outcome(1, "interrupted")},
     )
 
 
@@ -280,7 +270,7 @@ def test_an_interrupted_rerun_gets_its_own_rerun_and_its_source_is_not_reschedul
     study.add_trial(_interrupted(2))
     _record_reruns(study)
     rerun = study.ask()
-    rerun.set_user_attr(TRIAL_OUTCOME_ATTR, _outcome(2, "interrupted"))
+    rerun.set_user_attr(TRIAL_OUTCOME_ATTR, trial_outcome(2, "interrupted"))
     study.tell(rerun, state=optuna.trial.TrialState.FAIL)
 
     assert _record_reruns(study) == [(1, 2)]
@@ -303,12 +293,8 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     lines = [record.getMessage() for record in caplog.records]
     expected = run_experiment(control)["p"]
 
-    trials = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(exp.resolved_storage)
-    ).get_trials(deepcopy=False)
-    controls = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
-    ).get_trials(deepcopy=False)
+    trials = _phase_trials(exp)
+    controls = _phase_trials(control)
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert _trial_interrupted(trials[0])
     assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
@@ -335,16 +321,6 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
 
 
 _SIGINT_CAUSE = f"orchestrator interrupted by signal {int(signal.SIGINT)}"
-
-
-def _phase_trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
-    """Read the trials of the experiment's phase ``p``.
-
-    :param Experiment experiment: Experiment whose ledger is read.
-    :return list[optuna.trial.FrozenTrial]: Its trials in number order.
-    """
-    storage = _resolve_storage(experiment.resolved_storage)
-    return optuna.load_study(study_name="t::p", storage=storage).get_trials(deepcopy=False)
 
 
 def _cause(trial: optuna.trial.FrozenTrial) -> str | None:

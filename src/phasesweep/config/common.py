@@ -6,6 +6,7 @@ import math
 import re
 from pathlib import Path
 from typing import Annotated, TypeAlias, TypeGuard
+from urllib.parse import SplitResult, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -25,21 +26,28 @@ SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 CONFIG_DIR_CONTEXT = "config_dir"
 
 
+def _normalize_http_endpoint(parsed: SplitResult) -> str | None:
+    """Normalize an HTTP(S) endpoint, or return None when invalid.
+
+    Reject nonempty credentials, query or fragment; lowercase scheme and authority
+    and strip trailing path slashes.
+    """
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or any((parsed.username, parsed.password, parsed.query, parsed.fragment))
+    ):
+        return None
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )
+
+
 def anchor_relative_path(value: str, info: ValidationInfo) -> str:
-    """Resolve a relative config path against the loaded config file's directory.
+    """Anchor relative paths to the config file's directory in validation context.
 
-    Anchoring at load makes one config file name one set of paths from any
-    working directory. Without a config directory in the validation context
-    (an experiment built in Python, or a re-validation of already anchored
-    values) the value is returned unchanged and keeps working-directory
-    semantics. A leading ``~`` is left for consumers to expand, so it stays
-    home-relative.
-
-    :param str value: Nonempty configured path.
-    :param ValidationInfo info: Validation info whose context may carry
-        :data:`CONFIG_DIR_CONTEXT`.
-    :return str: ``value`` joined onto the config directory when it is relative,
-        otherwise ``value`` unchanged.
+    Absolute and home-relative paths stay unchanged. Without a config directory,
+    relative paths keep working-directory semantics.
     """
     context = info.context
     config_dir = context.get(CONFIG_DIR_CONTEXT) if isinstance(context, dict) else None
@@ -52,21 +60,12 @@ _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 def is_sha256_hex(value: object) -> TypeGuard[str]:
-    """Recognize a SHA-256 digest as written by PhaseSweep.
-
-    :param object value: Candidate digest to check.
-    :return bool: Whether ``value`` is a lowercase 64-character hex digest.
-    """
+    """Recognize lowercase, 64-character SHA-256 hex digests."""
     return isinstance(value, str) and bool(_SHA256_HEX_PATTERN.fullmatch(value))
 
 
 def _reject_boolean_number(value: object) -> object:
-    """Reject YAML booleans before Pydantic coerces them to zero or one.
-
-    :param object value: Raw numeric config value.
-    :raises ValueError: If the value is a boolean.
-    :return object: The unchanged non-boolean value.
-    """
+    """Reject YAML booleans with ValueError before numeric coercion."""
     if isinstance(value, bool):
         raise ValueError("numeric config values must be numbers, not booleans")
     return value
@@ -76,13 +75,9 @@ ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
 ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
 
 StrictJsonScalar: TypeAlias = StrictBool | StrictInt | StrictFloat | StrictStr | None
-"""The exact set of values a JSON document can hold at a leaf position.
+"""Non-coercing JSON leaf scalars; reject booleans as integers and YAML dates.
 
-Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
-``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
-neighbouring type. Anything outside this union — a mapping, a sequence, a
-``datetime.date`` — is not representable in parsed JSON and is rejected at
-config load rather than normalized later.
+Mappings and sequences are not scalars.
 """
 
 
@@ -101,33 +96,13 @@ class _Frozen(BaseModel):
 
 
 def _require_finite(label: str, value: float) -> None:
-    """Raise ``ValueError`` if ``value`` is NaN or +/-inf.
-
-    Used at config-load to keep silently-broken bounds out of the runtime: a
-    constraint with ``max: .nan`` would otherwise be vacuous because
-    ``x > nan`` is always ``False``.
-
-    Args:
-        label: Human-readable name of the field (e.g. ``"constraint.max"``);
-            included verbatim in the error message.
-        value: The numeric value to validate.
-
-    Raises:
-        ValueError: If ``value`` is not finite (``math.isfinite`` returns False).
-
-    """
+    """Reject NaN and infinity with a field-labeled ValueError."""
     if not math.isfinite(value):
         raise ValueError(f"{label} must be finite; got {value!r}")
 
 
 def check_bounds(value: float, *, min_value: float | None, max_value: float | None) -> bool:
-    """Return whether ``value`` is finite and inside optional numeric bounds.
-
-    :param float value: The numeric value to test.
-    :param float | None min_value: Optional inclusive lower bound.
-    :param float | None max_value: Optional inclusive upper bound.
-    :return bool: ``True`` when ``value`` is finite and within all supplied bounds.
-    """
+    """Test finiteness and optional inclusive bounds."""
     if not math.isfinite(value):
         return False
     if min_value is not None and value < min_value:
@@ -141,13 +116,7 @@ def _validate_optional_bounds(
     min_value: float | None,
     max_value: float | None,
 ) -> None:
-    """Reject empty, non-finite, or inverted optional bounds.
-
-    :param str label: Human-readable label included in validation errors.
-    :param float | None min_value: Optional inclusive lower bound.
-    :param float | None max_value: Optional inclusive upper bound.
-    :raises ValueError: If no bound is set, a bound is non-finite, or ``min > max``.
-    """
+    """Reject empty, non-finite or inverted inclusive bounds with ValueError."""
     if min_value is None and max_value is None:
         raise ValueError(f"{label} must define at least one of min/max.")
     if min_value is not None:
@@ -159,36 +128,14 @@ def _validate_optional_bounds(
 
 
 def _validate_safe_name(kind: str, value: str) -> str:
-    """Reject empty names and characters unsafe for path/study-name components.
-
-    :param str kind: Human-readable object kind included in validation errors.
-    :param str value: Candidate name to validate.
-    :raises ValueError: If ``value`` is empty or contains an unsafe character.
-    :return str: The validated name, unchanged.
-    """
+    """Require nonempty [A-Za-z0-9_-] path/study names, raising ValueError otherwise."""
     if not SAFE_NAME_PATTERN.fullmatch(value):
         raise ValueError(f"{kind} name {value!r} must be non-empty and [A-Za-z0-9_-] only.")
     return value
 
 
-_OVERRIDE_KEY_SEGMENT = re.compile(r"^[A-Za-z0-9_\-]+$")
-
-
 def _validate_override_key(key: str, *, label: str) -> None:
-    """Reject override keys that would render to ambiguous shell arguments.
-
-    Args:
-        key: The candidate key from ``fixed_overrides`` or ``search_space``.
-            Must be a non-empty string of dotted ``[A-Za-z0-9_-]`` segments.
-        label: Human-readable context prepended to any error message
-            (e.g. ``"phase 'lr' search_space"``).
-
-    Raises:
-        ValueError: ``key`` is empty; has leading/trailing or embedded
-            whitespace; or contains an empty dotted segment or a segment with
-            disallowed characters.
-
-    """
+    """Require nonempty dotted [A-Za-z0-9_-] segments, raising ValueError otherwise."""
     if not key:
         raise ValueError(f"{label}: override key cannot be empty.")
     if key != key.strip():
@@ -203,7 +150,7 @@ def _validate_override_key(key: str, *, label: str) -> None:
                 f"position {i}. Use simple keys like 'lr' or dotted keys like "
                 f"'model.depth'; do not use leading/trailing dots or '..'."
             )
-        if not _OVERRIDE_KEY_SEGMENT.match(part):
+        if not SAFE_NAME_PATTERN.fullmatch(part):
             raise ValueError(
                 f"{label}: override key {key!r} segment {part!r} contains "
                 "invalid characters (allowed: alphanumerics, underscore, dash, "
@@ -212,44 +159,15 @@ def _validate_override_key(key: str, *, label: str) -> None:
 
 
 def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
-    """Return pairs ``(short, long)`` where ``short`` is a strict path-prefix of ``long``.
+    """Return sorted pairs of override keys with a strict dotted-prefix collision.
 
-    Two keys collide when one's dot-path is a strict prefix of the other's.
-
-    Examples:
-        * ``model`` and ``model.depth`` collide — CLI formats render
-          contradictory arguments, and dotted override composition cannot represent both a
-          scalar and a nested object at the same key.
-        * ``model.depth`` and ``model.depths`` do **not** collide (different
-          siblings, same depth).
-        * ``a.b.c`` and ``a.b.c.d`` do collide.
-
-    Used in ``Experiment._validate_phase_graph``.
-
-    Args:
-        keys: The combined fixed-overrides / search-space / inherited key set
-            for one phase.
-
-    Returns:
-        Lexically-sorted ``(short, long)`` pairs where ``short`` is a strict
-        path-prefix of ``long``. Empty list when no collisions are present.
-
+    model conflicts with model.depth; model.depths does not.
     """
-    parts_by_key = {key: tuple(key.split(".")) for key in keys}
-    seen: set[tuple[str, str]] = set()
-
-    items = list(parts_by_key.items())
-    for i, (a, a_parts) in enumerate(items):
-        for b, b_parts in items[i + 1 :]:
-            if a_parts == b_parts:
-                continue
-            if len(a_parts) < len(b_parts):
-                shorter_parts, shorter_key, longer_key = a_parts, a, b
-                longer_parts = b_parts
-            else:
-                shorter_parts, shorter_key, longer_key = b_parts, b, a
-                longer_parts = a_parts
-            if longer_parts[: len(shorter_parts)] == shorter_parts:
-                seen.add((shorter_key, longer_key))
-
-    return sorted(seen)
+    collisions: list[tuple[str, str]] = []
+    for key in keys:
+        prefix = key
+        while "." in prefix:
+            prefix = prefix.rsplit(".", 1)[0]
+            if prefix in keys:
+                collisions.append((prefix, key))
+    return sorted(collisions)

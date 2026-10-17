@@ -8,10 +8,11 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, get_args
-from urllib.parse import urlsplit, urlunsplit
+from typing import Annotated, Literal, TypeAlias, get_args
+from urllib.parse import urlsplit
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     Field,
     field_validator,
@@ -23,6 +24,7 @@ from phasesweep.config.common import (
     ConfigInt,
     StrictJsonScalar,
     _Frozen,
+    _normalize_http_endpoint,
     _require_finite,
     _validate_optional_bounds,
 )
@@ -43,12 +45,9 @@ def _validate_trial_path(value: str) -> str:
 
 
 def _validate_trial_file_path(value: str) -> str:
-    """Require a trial-relative path that names a descendant file location.
+    """Require a descendant-file path relative to the trial directory.
 
-    ``.`` legitimately names the whole trial directory for an
-    ``artifact_size`` directory gate, but every extractor and file-backed gate
-    requires a file below that root. Rejecting the root at config load avoids
-    deferring an impossible file open to the first trial.
+    Unlike an artifact-size directory source, a file source cannot name the root.
 
     :param str value: Candidate trial-relative file path.
     :raises ValueError: If ``value`` violates the shared path contract or
@@ -78,62 +77,25 @@ def _validate_json_key(value: str | None) -> str | None:
     return value
 
 
-class _TrialPathModel(_Frozen):
-    """Mixin for config models containing trial-relative path fields."""
-
-    @field_validator("path", "file", check_fields=False)
-    @classmethod
-    def _trial_path_is_relative(cls, value: str) -> str:
-        """Validate trial-relative path fields.
-
-        :param str value: Candidate trial-relative path.
-        :return str: Validated trial-relative path.
-        """
-        return _validate_trial_path(value)
+_TrialFilePath: TypeAlias = Annotated[str, AfterValidator(_validate_trial_file_path)]
+"""A validated descendant-file path relative to the trial directory."""
+_JsonKey: TypeAlias = Annotated[str, AfterValidator(_validate_json_key)]
+"""A dotted JSON lookup key with nonempty segments."""
 
 
-class _TrialFilePathModel(_Frozen):
-    """Mixin for config models containing trial-relative file path fields."""
-
-    @field_validator("path", "file", check_fields=False)
-    @classmethod
-    def _trial_file_path_is_relative(cls, value: str) -> str:
-        """Validate trial-relative file path fields.
-
-        :param str value: Candidate trial-relative file path.
-        :raises ValueError: If the path is unsafe or names the trial root.
-        :return str: Validated descendant file path.
-        """
-        return _validate_trial_file_path(value)
-
-
-class _JsonKeyModel(_Frozen):
-    """Mixin for config models containing dotted JSON key fields."""
-
-    @field_validator("key", check_fields=False)
-    @classmethod
-    def _json_key_is_valid(cls, value: str | None) -> str | None:
-        """Validate dotted JSON key fields.
-
-        :param str | None value: Candidate dotted JSON key, or ``None``.
-        :return str | None: Validated JSON key, or ``None``.
-        """
-        return _validate_json_key(value)
-
-
-class JsonExtractor(_TrialFilePathModel, _JsonKeyModel):
+class JsonExtractor(_Frozen):
     """Extract a scalar from a JSON file via a dot-separated key path."""
 
     type: Literal["json"]
-    path: str = Field(description="Path relative to trial_dir, e.g. 'result.json'.")
-    key: str = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
+    path: _TrialFilePath = Field(description="Path relative to trial_dir, e.g. 'result.json'.")
+    key: _JsonKey = Field(description="Dot-separated key into the JSON, e.g. 'eval.loss'.")
 
 
-class JsonEnvelopeExtractor(_TrialFilePathModel):
+class JsonEnvelopeExtractor(_Frozen):
     """Extract a scalar from a versioned, attempt-bound result envelope."""
 
     type: Literal["json_envelope"]
-    path: str = Field(default="result.json", description="Path relative to trial_dir.")
+    path: _TrialFilePath = Field(default="result.json", description="Path relative to trial_dir.")
     objective_name: str = Field(min_length=1)
     split: str = Field(min_length=1)
     policy: str = Field(min_length=1)
@@ -151,11 +113,11 @@ class JsonEnvelopeExtractor(_TrialFilePathModel):
     )
 
 
-class LogRegexExtractor(_TrialFilePathModel):
+class LogRegexExtractor(_Frozen):
     """Extract a scalar from a log file via regex with a named 'value' group."""
 
     type: Literal["log_regex"]
-    file: str = Field(
+    file: _TrialFilePath = Field(
         default="stdout.log",
         description=(
             "File relative to trial_dir. 'stdout.log' and 'stderr.log' are written "
@@ -208,20 +170,12 @@ class _WandbSummarySource(_Frozen):
         :return str: URL with lowercase scheme and host and no trailing slash.
         """
         parsed = urlsplit(value)
-        if (
-            parsed.scheme not in {"https", "http"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
+        endpoint = _normalize_http_endpoint(parsed)
+        if endpoint is None or parsed.username is not None or parsed.password is not None:
             raise ValueError(
                 "W&B base_url requires an HTTP(S) endpoint without credentials, query, or fragment."
             )
-        return urlunsplit(
-            (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
-        )
+        return endpoint
 
 
 class WandbExtractor(_WandbSummarySource):
@@ -299,7 +253,6 @@ class MlflowRequiredGate(_Frozen):
 ObjectiveExtractor = (
     JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
 )
-Extractor = ObjectiveExtractor
 LocalExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor
 """The extractors that read a trial's own files. The remote kinds wait for every requested key."""
 
@@ -318,54 +271,19 @@ measured. ``json`` and ``log_regex`` objectives record no position, so selection
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
-    """Describe which objective-evidence identities the extractor genuinely enforces.
+    """Describe the identity checks enforced by an objective extractor.
 
-    Grounded in what ``phasesweep.evidence.evaluation._extract_json_envelope``
-    actually checks, not in the extractor's coarse type alone:
+    Local extractors are location-scoped. Only json_envelope checks the reported
+    attempt, generation, and override digest, plus the objective name, split,
+    and policy. It requires checkpoint and step metadata, but binds their values
+    only when the corresponding optional configuration fields are declared.
+    Remote extractors key evidence by target and run ID; W&B does not enforce
+    envelope metadata. Other kinds leave envelope assurance flags false.
 
-    - ``objective_name``, ``split``, ``policy`` are required
-      :class:`JsonEnvelopeExtractor` fields (``min_length=1``) and are
-      unconditionally checked against the envelope's own reported
-      ``objective.name`` / ``objective.split`` / ``evaluation.policy``. They
-      are bound whenever the extractor kind is ``json_envelope`` at all.
-    - ``checkpoint`` and ``expected_step`` are *optional* extractor fields.
-      The envelope must always structurally report a non-empty checkpoint and
-      a non-negative step (or extraction fails), but that value is compared
-      against the configured value only when the config declares one
-      (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``). Reporting
-      a coarse ``True`` regardless of whether either was declared overstates
-      what is actually enforced when they are left unset.
-    - ``log_regex`` extractors have no objective_name/split/
-      policy/checkpoint/expected_step concept at all, so every one of those
-      flags is ``False`` for them.
-    - Attempt binding is reported as three precise flags rather than one
-      coarse ``attempt_bound`` claim, which would overstate weak extractors:
-
-      - ``attempt_location_scoped`` is ``True`` for local extractors:
-        each reads evidence from a trial directory uniquely scoped to this
-        generation+attempt. Scoping alone is weak: nothing in a ``log_regex``
-        file's *contents* identifies the
-        attempt that produced it, so a file misplaced or symlinked into the
-        wrong trial directory would be read as gospel.
-      - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
-        the envelope structurally echoes ``generation_id``/``attempt_id``/
-        ``overrides_sha256`` in its own body, and
-        ``_extract_json_envelope`` cross-checks those reported values
-        against the runtime's own identity before accepting the result.
-        Other readers have no reported identity fields to check, so it is
-        ``False``.
-      - ``source_identity_keyed`` is ``True`` for W&B and MLflow: the target
-        and bound run ID identify their finished evidence. Local readers use
-        location-addressed files. W&B makes no envelope metadata assurances.
-
-    :param ObjectiveExtractor extractor: Configured objective extractor to describe.
-    :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
-        plus per-field boolean flags describing exactly what the runtime
-        enforces. ``checkpoint_declared``/``expected_step_declared`` report
-        whether the config pinned a value; ``checkpoint_value_bound``/
-        ``expected_step_value_bound`` report whether the runtime actually
-        validates the envelope against that declared value (``True`` only
-        when the corresponding ``*_declared`` flag is also ``True``).
+    :param ObjectiveExtractor extractor: Objective extractor to describe.
+    :return dict[str, str | bool]: Extractor kind and assurance flags.
+        *_declared marks an optional configured value; *_value_bound marks its
+        enforced equality with the envelope.
     """
     if isinstance(extractor, JsonEnvelopeExtractor):
         checkpoint_declared = extractor.checkpoint is not None
@@ -399,15 +317,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
 
 
 class _ObjectiveEvidenceFields(BaseModel):
-    """Assurance-flag field set shared by MCP result payloads and persisted snapshots.
+    """Assurance flags for the shared MCP objective-evidence model.
 
-    ``phasesweep.mcp.server.ObjectiveEvidencePayload`` and
-    ``phasesweep.mcp.snapshots.ObjectiveEvidenceSnapshot`` each subclass this
-    alongside their own strict base (``extra="forbid"``, and for snapshots also
-    ``allow_inf_nan=False``, inert here since every field below is a bool or
-    ``Literal``) so the identical field set is declared exactly once while each
-    site keeps its own class name and JSON schema entry. See
-    :func:`objective_evidence_assurance` for exactly what each flag means.
+    See :func:`objective_evidence_assurance` for each flag's meaning.
     """
 
     kind: ExtractorKind
@@ -423,52 +335,29 @@ class _ObjectiveEvidenceFields(BaseModel):
     expected_step_value_bound: bool
 
 
-class RequiredFileGate(_TrialFilePathModel):
+class RequiredFileGate(_Frozen):
     """Require a file to exist under the trial directory."""
 
     type: Literal["required_file"]
-    path: str
+    path: _TrialFilePath
 
 
-class JsonEqualsGate(_TrialFilePathModel, _JsonKeyModel):
-    """Require a JSON key to equal an expected JSON scalar.
+class JsonEqualsGate(_Frozen):
+    """Require exact JSON scalar type and value equality.
 
-    ``value`` must be a JSON scalar (``bool``, ``int``, ``float``, ``str``, or
-    ``null``) and is validated strictly, because *type identity is part of this
-    gate's semantics*: :func:`phasesweep.evidence.evaluation._json_equals`
-    compares with ``type(actual) is type(gate.value)``, so ``true``, ``1``, and
-    ``1.0`` are three different gates. Coercion would silently rewrite one into
-    another, so no member of the union coerces.
-
-    Non-scalars (mappings, sequences, YAML dates) are rejected outright rather
-    than merely never matching. The study fingerprint hashes
-    ``model_dump(mode="json")`` through ``json.dumps(..., default=str)``, which
-    normalizes exactly the values that strict JSON cannot hold: ``{1: "x"}``
-    and ``{"1": "x"}`` collapse to one digest, as do ``date(2024, 1, 1)`` and
-    ``"2024-01-01"``. Since parsed JSON never yields an int-keyed mapping or a
-    ``date``, those variants could never pass while their surviving twins
-    could — two configs that judge feasibility in mutually exclusive ways would
-    share one phase fingerprint and be allowed to reuse each other's study. Rejecting them at load keeps the fingerprint
-    faithful to runtime behaviour. Non-finite floats (``.nan``, ``.inf``) are
-    rejected for the same reason: JSON has no encoding for them.
+    Booleans, integers, and floats are distinct. Non-scalars and non-finite
+    floats are rejected at config load.
     """
 
     type: Literal["json_equals"]
-    path: str
-    key: str
+    path: _TrialFilePath
+    key: _JsonKey
     value: StrictJsonScalar
 
     @field_validator("value", mode="before")
     @classmethod
     def _value_is_json_scalar(cls, value: object) -> object:
-        """Reject values strict JSON cannot hold, naming the offending type.
-
-        Runs before the ``StrictJsonScalar`` union purely for the message: the
-        union alone reports one "input should be a valid <member>" error per
-        member, which never says *why* a mapping or a YAML date is wrong. The
-        union remains the authority on type identity (it is what refuses to
-        coerce ``1`` into ``1.0``); this validator only front-runs the cases a
-        config author actually hits.
+        """Reject unsupported scalar values with a diagnostic naming their type.
 
         :param object value: Raw expected value straight from the config.
         :raises ValueError: If ``value`` is not a JSON scalar, or is a
@@ -478,23 +367,20 @@ class JsonEqualsGate(_TrialFilePathModel, _JsonKeyModel):
         if not isinstance(value, (bool, int, float, str, type(None))):
             raise ValueError(
                 "json_equals gate value must be a JSON scalar (bool, int, float, str, or "
-                f"null); got {type(value).__name__}. Parsed JSON never produces that type, so "
-                "such a gate could never pass, and the study fingerprint would render it "
-                "identically to a value that can — silently sharing one study between two "
-                "configs that disagree on feasibility. YAML dates are the common case: quote "
-                "them ('2024-01-01') to compare against the JSON string."
+                f"null); got {type(value).__name__}. Quote YAML dates ('2024-01-01') "
+                "to compare against a JSON string."
             )
         if isinstance(value, float):
             _require_finite("json_equals gate value", value)
         return value
 
 
-class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
+class JsonScalarBoundGate(_Frozen):
     """Require a JSON key to be a finite scalar within optional bounds."""
 
     type: Literal["json_scalar_bound"]
-    path: str
-    key: str
+    path: _TrialFilePath
+    key: _JsonKey
     min: ConfigFloat | None = None
     max: ConfigFloat | None = None
 
@@ -512,7 +398,7 @@ class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
         return self
 
 
-class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
+class ArtifactSizeGate(_Frozen):
     """Require artifact bytes to fall inside optional bounds.
 
     Directory sources recursively count regular files and file-symlink targets,
@@ -522,9 +408,20 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
     type: Literal["artifact_size"]
     source: Literal["file", "directory", "json"]
     path: str
-    key: str | None = None
+    key: _JsonKey | None = None
     min_bytes: ConfigInt | None = Field(default=None, ge=0)
     max_bytes: ConfigInt | None = Field(default=None, ge=0)
+
+    @field_validator("path")
+    @classmethod
+    def _trial_path_is_relative(cls, value: str) -> str:
+        """Validate the trial-relative artifact path.
+
+        :param str value: Candidate trial-relative path.
+        :raises ValueError: The path is empty, absolute, escapes upward, or contains NUL.
+        :return str: Validated trial-relative path.
+        """
+        return _validate_trial_path(value)
 
     @model_validator(mode="after")
     def _validate_source_and_bounds(self) -> ArtifactSizeGate:
@@ -550,11 +447,11 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
         return self
 
 
-class Sha256Gate(_TrialFilePathModel):
+class Sha256Gate(_Frozen):
     """Require a file's SHA-256 digest to match an expected hex string."""
 
     type: Literal["sha256"]
-    path: str
+    path: _TrialFilePath
     sha256: str
 
     @field_validator("sha256")

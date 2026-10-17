@@ -1,4 +1,4 @@
-"""Storage URL parsing and canonicalization: backend detection, absolute vs. relative path preservation, and the same-host lock identity that equivalent URLs must share."""
+"""Storage URL parsing and canonicalization: absolute vs. relative path preservation, and the same-host lock identity that equivalent URLs must share."""
 
 from __future__ import annotations
 
@@ -6,24 +6,23 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    Sampler,
-)
-from phasesweep.engine import read_status, run_experiment
+from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.search import Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _run_lock_paths
+from phasesweep.engine.read import read_status
+from phasesweep.engine.run import run_experiment
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
-    storage_backend,
     storage_recovery_locator,
 )
-from tests.conftest import make_experiment, write_yaml
+from tests.conftest import make_experiment
+from tests.experiments import json_metric, phase_payload, write_experiment
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
@@ -39,7 +38,7 @@ def test_auto_storage_resolves_without_writing(
     assert url is not None
     assert experiment.storage == experiment.model_dump()["storage"] == "auto"
     assert "resolved_storage" not in experiment.model_dump()
-    assert storage_backend(url) == "journal"
+    assert url.startswith("journal:///")
     assert file_url_path(url) == str(tmp_path / "relative" / "t" / "study.journal")
     assert not (tmp_path / "relative").exists()
     explicit = experiment.model_copy(update={"storage": url})
@@ -91,12 +90,8 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
 
 
 def test_resolve_storage_urls(tmp_path: Path) -> None:
-    """None resolves to an in-memory study; a journal URL resolves to JournalStorage."""
-    import optuna
+    """A journal URL resolves to JournalStorage."""
     from optuna.storages import JournalStorage
-
-    assert _resolve_storage(None) is None
-    assert optuna.create_study(storage=_resolve_storage(None)).trials == []
 
     result = _resolve_storage(f"journal:///{tmp_path}/phases.journal")
     assert isinstance(result, JournalStorage)
@@ -108,33 +103,15 @@ def _storage_policy_config(
     storage: str,
     n_jobs: int,
 ) -> Path:
-    parallel = (
-        f"""
-            n_jobs: {n_jobs}
-            allow_no_gpu_isolation: true"""
-        if n_jobs > 1
-        else ""
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        storage: {storage}
-        provenance: {{revision: test-fixture-v1}}
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: p
-            n_trials: 1{parallel}
-            sampler: {{ type: random, seed: 0 }}
-            search_space:
-              x: {{ type: int, low: 0, high: 10 }}
-        """,
+    phase = phase_payload()
+    if n_jobs > 1:
+        phase.update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    return write_experiment(
+        tmp_path / "exp.yaml",
+        storage=yaml.safe_load(storage),
+        workdir=str(tmp_path / "runs"),
+        metric={"name": "x", "goal": "minimize", **json_metric(path="r.json")},
+        phases=[phase],
     )
 
 
@@ -208,7 +185,6 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     (relative paths, ``..`` segments) produce one stable lock identity. None
     in returns None out (in-memory has no shared backend to collide on).
 
-    This test pins only the path-resolution and None-handling contract.
     """
     # Journal path with `..` must be resolved away.
     journal_id = canonical_storage_identity(f"journal:///{tmp_path}/sub/../study.journal")
@@ -235,17 +211,10 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
 
     monkeypatch.chdir(recovery_cwd)
     assert locator is not None
-    assert storage_backend(locator) == "journal"
+    assert locator.startswith("journal:///")
     assert Path(file_url_path(locator)).is_absolute() or "file:/" in file_url_path(locator)
     assert "studies.journal" in locator
     assert str(registration_cwd) in locator
-
-
-def test_storage_backend_collapses_dialect_suffixes() -> None:
-    """A `+driver` suffix folds into its base scheme name; unset storage is None."""
-    assert storage_backend("journal:///x.journal") == "journal"
-    assert storage_backend("postgresql+psycopg2://h/db") == "postgresql"
-    assert storage_backend(None) is None
 
 
 def test_file_url_path_preserves_absolute_paths() -> None:

@@ -7,7 +7,9 @@ import json
 import math
 import os
 import stat
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
-    Extractor,
     Gate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
@@ -24,6 +25,7 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     MlflowExtractor,
     MlflowRequiredGate,
+    ObjectiveExtractor,
     RequiredFileGate,
     Sha256Gate,
     WandbExtractor,
@@ -46,23 +48,16 @@ if TYPE_CHECKING:
     from phasesweep.runtime.json import JsonObject
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
 
-# Version of the objective evidence provenance payload frozen alongside a
-# metric at extraction time.
+# Objective-evidence provenance schema version.
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
-# Bump when log-regex selection semantics change. The revision is frozen into
-# each trial's extractor contract, so selection and replay reject readings
-# made under an older interpretation even when the package version is absent.
+# Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 2
 
 
-def extractor_config_fingerprint(cfg: Extractor) -> str:
-    """Return the SHA-256 identity of an extractor's evaluation contract.
+def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
+    """Hash the extractor configuration and applicable evaluation revision.
 
-    Frozen into evidence provenance so a forensic review can prove which
-    extractor contract produced a published scalar even after the experiment
-    config changes.
-
-    :param Extractor cfg: Concrete extractor config to fingerprint.
+    :param ObjectiveExtractor cfg: Concrete extractor config to fingerprint.
     :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
         its evaluation revision.
     """
@@ -139,14 +134,37 @@ def json_float(value: Any, *, label: str) -> float:
 
 
 class ExtractorError(RuntimeError):
-    """Raised when an extractor cannot produce a value (file missing, key missing, etc).
-
-    The phase runner catches this and marks the trial as failed.
-    """
+    """An extraction failure that marks the trial failed."""
 
 
 class DeadlineExceededError(ExtractorError):
     """Raised when the phase/run deadline directly prevents extraction."""
+
+
+@contextmanager
+def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
+    """Translate file-read and JSON-decoding failures into extractor diagnostics.
+
+    :param Path target: Trial-relative file being read.
+    :param str noun: ``JSON`` or ``JSON envelope`` diagnostic label.
+    :raises ExtractorError: The file is missing, unreadable, or malformed.
+    :return Iterator[None]: Context covering the read and parse of the same bytes.
+    """
+    try:
+        yield
+    except FileNotFoundError as exc:
+        missing = (
+            f"JSON file not found: {exc.args[0]}"
+            if noun == "JSON"
+            else f"{noun} not found: {target}"
+        )
+        raise ExtractorError(missing) from exc
+    except UnicodeError as exc:
+        raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
+    except ValueError as exc:
+        raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
+    except OSError as exc:
+        raise ExtractorError(f"Could not read {noun} at {target}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -176,44 +194,21 @@ def _extract_json(
     ctx: TrialContext,
     cfg: JsonExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
-    """Read a JSON file in the trial directory and extract a numeric value.
+    """Read a trial-relative JSON file and extract its numeric value.
 
-    Args:
-        ctx: Trial context (used for ``trial_dir``).
-        cfg: ``JsonExtractor`` config naming the relative file path and the
-            dotted lookup key inside it.
-        provenance: Optional sink that receives the frozen evidence ``source``
-            payload on success.
-        deadline: Unused; accepted for parity with the shared extractor
-            dispatch signature.
-
-    Returns:
-        The numeric value at the configured key.
-
-    Raises:
-        ExtractorError: File missing, invalid JSON, key not found, or value
-            not coercible to ``float``.
-
+    :param TrialContext ctx: Trial output directory.
+    :param JsonExtractor cfg: Relative file path and dotted numeric key.
+    :param provenance: Optional source-evidence sink.
+    :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
+    :return float: Configured numeric value.
     """
     digest: dict[str, Any] = {}
+    target = ctx.trial_dir / cfg.path
     try:
-        target, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
-    except FileNotFoundError as exc:
-        raise ExtractorError(f"JSON file not found: {exc.args[0]}") from exc
-    except UnicodeError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"JSON at {target} is not valid UTF-8: {exc}") from exc
-    except ValueError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"Invalid JSON at {target}: {exc}") from exc
-    except OSError as exc:
-        target = ctx.trial_dir / cfg.path
-        raise ExtractorError(f"Could not read JSON at {target}: {exc}") from exc
+        with _trial_json_read_errors(target, noun="JSON"):
+            _, cur = load_json_value(ctx.trial_dir, cfg.path, cfg.key, digest=digest)
     except KeyError as exc:
-        target = ctx.trial_dir / cfg.path
         raise ExtractorError(
             f"Key {cfg.key!r} not found in {target} (failed at {exc.args[0]!r})."
         ) from exc
@@ -231,8 +226,6 @@ def _extract_json_envelope(
     ctx: TrialContext,
     cfg: JsonEnvelopeExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
     """Validate and extract an attempt-bound JSON result envelope.
 
@@ -241,24 +234,14 @@ def _extract_json_envelope(
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success.
-    :param float | None deadline: Unused; accepted for parity with the shared
-        extractor dispatch signature.
     :raises ExtractorError: If the envelope is missing, malformed, or belongs to
         another execution attempt.
     :return float: Validated objective value from the envelope.
     """
     target = ctx.trial_dir / cfg.path
-    try:
+    with _trial_json_read_errors(target, noun="JSON envelope"):
         raw = target.read_bytes()
         data = strict_json_loads(raw.decode("utf-8"))
-    except FileNotFoundError as exc:
-        raise ExtractorError(f"JSON envelope not found: {target}") from exc
-    except UnicodeError as exc:
-        raise ExtractorError(f"JSON envelope at {target} is not valid UTF-8: {exc}") from exc
-    except ValueError as exc:
-        raise ExtractorError(f"Invalid JSON envelope at {target}: {exc}") from exc
-    except OSError as exc:
-        raise ExtractorError(f"Could not read JSON envelope at {target}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise ExtractorError(f"JSON envelope at {target} must be an object.")
@@ -349,31 +332,18 @@ def _extract_log_regex(
     ctx: TrialContext,
     cfg: LogRegexExtractor,
     provenance: dict[str, Any] | None = None,
-    *,
-    deadline: float | None = None,
 ) -> float:
-    """Scan a log file line-by-line and return the value of a named regex group.
+    """Select a numeric regex match and digest the complete log file.
 
-    Args:
-        ctx: Trial context (used for ``trial_dir``).
-        cfg: ``LogRegexExtractor`` config; ``pattern`` must contain a named
-            group ``(?P<value>...)``, and ``select`` is one of
-            ``"first"``/``"last"``/``"min"``/``"max"``.
-        provenance: Optional sink that receives the frozen evidence ``source``
-            payload on success: whole-file digest, the 1-based line number
-            that supplied the selected value, and how many numeric matches
-            were examined. ``select: "first"`` stops *matching* at the first
-            hit but still reads the remaining bytes so the digest always
-            covers the full file.
-        deadline: Unused; accepted for parity with the shared extractor
-            dispatch signature.
+    First selection stops matching after its first hit but continues reading for
+    the digest. Provenance includes the selected 1-based line and numeric match count.
 
-    Returns:
-        The selected numeric value across all matches.
-
-    Raises:
-        ExtractorError: Log file missing or unreadable, or no numeric matches.
-
+    :param TrialContext ctx: Trial output directory.
+    :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
+    :param provenance: Optional source-evidence sink.
+    :raises ExtractorError: The log is missing, unreadable, has no numeric match,
+        or a line eligible for matching is invalid UTF-8.
+    :return float: Selected match value.
     """
     import re
 
@@ -383,11 +353,8 @@ def _extract_log_regex(
 
     pattern = re.compile(cfg.pattern)
 
-    # Stream with universal-newline boundaries while retaining each original
-    # terminator. ``surrogateescape`` lets us round-trip the exact source bytes
-    # into the evidence digest; lines that are still eligible for matching are
-    # then decoded strictly so invalid UTF-8 remains an evidence failure. This
-    # keeps CR-only tqdm progress output bounded to one logical line at a time.
+    # Preserve original bytes for hashing and universal-newline boundaries for matching.
+    # Only lines eligible for matching require strict UTF-8 decoding.
     hasher = hashlib.sha256()
     size_bytes = 0
     result: float | None = None
@@ -450,30 +417,16 @@ def _extract_log_regex(
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Obtain one accepted capture shared by all remote consumers of this attempt.
+    """Obtain and cache one accepted W&B capture for the attempt's consumers.
 
-    Args:
-        ctx: Trial context; ``wandb_capture`` caches the accepted capture and
-            ``wandb_query`` carries the phase's agreed query, if any.
-        cfg: W&B extractor or gate config used to build a one-off query when
-            the context carries none.
-        deadline: Optional absolute ``time.monotonic()`` phase/run deadline;
-            polling stops at the earlier of it and the source timeout.
-
-    Returns:
-        The shared capture: remote target, finished run state, requested
-        numeric values, present keys, and retrieval time.
-
-    Raises:
-        DeadlineExceededError: The phase/run deadline expired before an
-            accepted capture.
-        ExtractorError: The poll timed out, setup failed, the run ended
-            unsuccessfully, the SDK is missing, or the evidence is invalid.
-        UnsafeProcessCleanupError: Worker cleanup is uncertain.
-
+    :param TrialContext ctx: Trial identity and optional shared query/capture.
+    :param _WandbSummarySource cfg: Source for a one-off query if needed.
+    :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
+    :raises DeadlineExceededError: The execution deadline prevents capture.
+    :raises ExtractorError: Polling, authentication, SDK setup, run state, or evidence is invalid.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    :return: Finished run identity, numeric values, present keys, and retrieval time.
     """
-    import time
-
     if ctx.wandb_capture:
         return ctx.wandb_capture
     query = ctx.wandb_query or WandbQuery(
@@ -551,26 +504,17 @@ def _extract_wandb(
     *,
     deadline: float | None = None,
 ) -> float:
-    """Read an exact numeric key from the attempt's shared finished capture.
+    """Read one finite numeric key from the shared finished W&B capture.
 
-    Args:
-        ctx: Trial context whose shared W&B capture supplies the value.
-        cfg: ``WandbExtractor`` config naming the remote target and the exact
-            summary key.
-        provenance: Optional sink that receives the evidence ``source`` and the
-            shared ``remote_capture`` on success. Only the objective passes
-            one. Its position on ``evaluation_axis`` stays ``None`` until
-            :func:`locate_objective_position` reads it.
-        deadline: Optional absolute ``time.monotonic()`` phase/run deadline
-            for obtaining the capture.
+    Objective provenance includes the source and remote capture; its advisory
+    evaluation position remains unset until locate_objective_position runs.
 
-    Returns:
-        The finite numeric value of ``metric_key``.
-
-    Raises:
-        ExtractorError: The capture failed or its deadline expired, or the key
-            has no valid finite numeric value.
-
+    :param TrialContext ctx: Attempt whose shared capture supplies the value.
+    :param WandbExtractor cfg: Remote target and exact summary key.
+    :param provenance: Optional objective-evidence sink.
+    :param float | None deadline: Absolute monotonic deadline for capture.
+    :raises ExtractorError: Capture fails or the selected key is not finite numeric evidence.
+    :return float: Selected metric value.
     """
     capture = _capture_wandb(ctx, cfg, deadline=deadline)
     try:
@@ -591,28 +535,21 @@ def _extract_wandb(
 
 def locate_objective_position(
     ctx: TrialContext,
-    cfg: Extractor,
+    cfg: ObjectiveExtractor,
     provenance: dict[str, Any],
     *,
     deadline: float | None = None,
 ) -> None:
-    """Record where an accepted W&B objective was logged on its evaluation axis.
+    """Add an advisory W&B evaluation position after the objective is accepted.
 
-    Call only once the trial's result is accepted. The position is advisory,
-    so it gets whatever budget acceptance left: a read that fails or runs out
-    of time leaves the position ``None``, and the trial keeps its objective.
-    Other extractors record their position during extraction.
+    Failed or expired history reads leave the position unset and retain the
+    accepted objective. Other extractor kinds already record their position.
 
-    Args:
-        ctx: Trial context of the accepted attempt.
-        cfg: The objective's extractor config.
-        provenance: The objective provenance :func:`run_extractor` recorded,
-            updated in place.
-        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
-
-    Raises:
-        UnsafeProcessCleanupError: Worker cleanup is uncertain.
-
+    :param TrialContext ctx: Accepted attempt.
+    :param ObjectiveExtractor cfg: Objective extractor.
+    :param provenance: Objective evidence updated in place.
+    :param float | None deadline: Remaining absolute monotonic execution deadline.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
     if not isinstance(cfg, WandbExtractor):
         return
@@ -641,8 +578,6 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :return MlflowCapture: Shared frozen evidence.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
-    import time
-
     from phasesweep.evidence.mlflow import validate_capture
     from phasesweep.tracking.mlflow import request_operation
     from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
@@ -727,60 +662,33 @@ def _extract_mlflow(
     return float(point["value"])
 
 
-_DISPATCH: dict[type, Callable[..., float]] = {
-    JsonExtractor: _extract_json,
-    JsonEnvelopeExtractor: _extract_json_envelope,
-    LogRegexExtractor: _extract_log_regex,
-    WandbExtractor: _extract_wandb,
-    MlflowExtractor: _extract_mlflow,
-}
-
-
-def _remaining_budget_seconds(deadline: float | None) -> float | None:
-    """Return seconds until ``deadline``, or ``None`` when unbounded.
-
-    :param float | None deadline: Absolute ``time.monotonic()`` deadline.
-    :return float | None: Non-negative remaining budget, or ``None``.
-    """
-    if deadline is None:
-        return None
-    import time
-
-    return max(0.0, deadline - time.monotonic())
-
-
 def run_extractor(
     ctx: TrialContext,
-    cfg: Extractor,
+    cfg: ObjectiveExtractor,
     *,
     deadline: float | None = None,
     provenance: dict[str, Any] | None = None,
 ) -> float:
-    """Dispatch to the appropriate extractor for ``cfg``.
+    """Extract a trial value and optionally retain its exact source evidence.
 
-    Args:
-        ctx: Trial context passed through to the chosen extractor.
-        cfg: A concrete extractor config (one of :class:`JsonExtractor`,
-            :class:`JsonEnvelopeExtractor`, :class:`LogRegexExtractor`, or
-            :class:`WandbExtractor`).
-        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
-            Extraction fails before local evidence is read when the deadline
-            has already elapsed.
-        provenance: Optional sink that, on success, is filled with the frozen
-            evidence provenance record: schema version, the extractor's kind
-            and exact config fingerprint, the per-source evidence identity
-            (file digest or shared remote capture) and the capture timestamp.
+    An expired deadline prevents even local reads; remote polling also receives
+    the remaining execution deadline.
 
-    Returns:
-        The numeric value the extractor pulled from this trial's outputs.
-
-    Raises:
-        ExtractorError: No extractor is registered for the given config type,
-            or the chosen extractor failed.
-
+    :param TrialContext ctx: Trial identity, outputs, and shared remote captures.
+    :param ObjectiveExtractor cfg: Configured extractor.
+    :param float | None deadline: Absolute monotonic phase/run deadline.
+    :param provenance: Optional sink for the evidence schema,
+        extractor kind/fingerprint, file digest or remote capture, and capture timestamp.
+    :raises ExtractorError: The kind is unregistered or extraction fails.
+    :return float: Extracted numeric value.
     """
-    fn = _DISPATCH.get(type(cfg))
-    if fn is None:
+    if type(cfg) not in (
+        JsonExtractor,
+        JsonEnvelopeExtractor,
+        LogRegexExtractor,
+        WandbExtractor,
+        MlflowExtractor,
+    ):
         raise ExtractorError(f"No extractor registered for {type(cfg).__name__}.")
     if provenance is not None:
         provenance.clear()
@@ -793,12 +701,20 @@ def run_extractor(
                 },
             }
         )
-    remaining = _remaining_budget_seconds(deadline)
-    if remaining is not None and remaining <= 0.0:
+    if deadline is not None and not (deadline > time.monotonic()):
         raise DeadlineExceededError(
             "Phase/run wallclock deadline exceeded before evidence extraction."
         )
-    value = fn(ctx, cfg, provenance, deadline=deadline)
+    if isinstance(cfg, JsonExtractor):
+        value = _extract_json(ctx, cfg, provenance)
+    elif isinstance(cfg, JsonEnvelopeExtractor):
+        value = _extract_json_envelope(ctx, cfg, provenance)
+    elif isinstance(cfg, LogRegexExtractor):
+        value = _extract_log_regex(ctx, cfg, provenance)
+    elif isinstance(cfg, WandbExtractor):
+        value = _extract_wandb(ctx, cfg, provenance, deadline=deadline)
+    else:
+        value = _extract_mlflow(ctx, cfg, provenance, deadline=deadline)
     if provenance is not None:
         provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value
@@ -903,10 +819,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
                         try:
                             if entry.is_dir(follow_symlinks=False):
                                 directories.append(entry_path)
-                            # Preserve Path.rglob's file-link behavior: file
-                            # symlinks contribute their target size, while the
-                            # non-following directory check above prevents a
-                            # linked directory from being traversed.
+                            # Count file-symlink targets without traversing directory symlinks.
                             elif entry.is_file():
                                 size += entry_path.stat().st_size
                         except OSError as exc:
@@ -1003,17 +916,6 @@ def _wandb_summary_required(
     )
 
 
-_GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
-    RequiredFileGate: _required_file,
-    JsonEqualsGate: _json_equals,
-    JsonScalarBoundGate: _json_scalar_bound,
-    ArtifactSizeGate: _artifact_size,
-    Sha256Gate: _sha256,
-    WandbSummaryRequiredGate: _wandb_summary_required,
-    MlflowRequiredGate: _mlflow_required,
-}
-
-
 def evaluate_gates(
     ctx: TrialContext,
     gates: list[Gate],
@@ -1031,17 +933,18 @@ def evaluate_gates(
     """
     results: list[GateResult] = []
     for gate in gates:
-        fn = _GATE_DISPATCH.get(type(gate))
-        if fn is None:
-            # Unreachable from config today (``Gate`` is a closed pydantic
-            # union whose every member is registered above), but a new member
-            # added without a dispatch entry must degrade to one failing gate
-            # rather than raise a KeyError that escapes the objective and
-            # aborts the whole phase mid-sweep.
+        if type(gate) not in (
+            RequiredFileGate,
+            JsonEqualsGate,
+            JsonScalarBoundGate,
+            ArtifactSizeGate,
+            Sha256Gate,
+            WandbSummaryRequiredGate,
+            MlflowRequiredGate,
+        ):
             results.append(GateResult(type(gate).__name__, False, f"unknown gate: {gate!r}"))
             continue
-        remaining = _remaining_budget_seconds(deadline)
-        if remaining is not None and remaining <= 0.0:
+        if deadline is not None and not (deadline > time.monotonic()):
             results.append(
                 GateResult(
                     gate.type,
@@ -1051,11 +954,19 @@ def evaluate_gates(
                 )
             )
             continue
-        results.append(
-            _wandb_summary_required(ctx, gate, deadline=deadline)
-            if isinstance(gate, WandbSummaryRequiredGate)
-            else _mlflow_required(ctx, gate, deadline=deadline)
-            if isinstance(gate, MlflowRequiredGate)
-            else fn(ctx, gate)
-        )
+        if isinstance(gate, RequiredFileGate):
+            result = _required_file(ctx, gate)
+        elif isinstance(gate, JsonEqualsGate):
+            result = _json_equals(ctx, gate)
+        elif isinstance(gate, JsonScalarBoundGate):
+            result = _json_scalar_bound(ctx, gate)
+        elif isinstance(gate, ArtifactSizeGate):
+            result = _artifact_size(ctx, gate)
+        elif isinstance(gate, Sha256Gate):
+            result = _sha256(ctx, gate)
+        elif isinstance(gate, WandbSummaryRequiredGate):
+            result = _wandb_summary_required(ctx, gate, deadline=deadline)
+        else:
+            result = _mlflow_required(ctx, gate, deadline=deadline)
+        results.append(result)
     return results

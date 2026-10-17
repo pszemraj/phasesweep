@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -18,8 +18,6 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
-    OperatorAction,
-    PhaseSweepError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -28,13 +26,14 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
+    _initialize_study_schema,
     _load_accepted_partial_decision,
     _validate_environment_cohort,
     _validate_study_direction,
-    _validate_study_schema,
     _validate_trial_target,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 
 
 def _reconcile_existing_studies(
@@ -45,10 +44,8 @@ def _reconcile_existing_studies(
 ) -> dict[str, optuna.Study]:
     """Rediscover and reconcile every existing study after a run has ended.
 
-    Post-execution reconciliation cannot reuse the handle the run claimed
-    before it started: phases created studies since then, and those must be
-    reaped too. It therefore validates and claims the ledger afresh, then runs
-    the same preflight over what that discovery found.
+    Validate and claim a fresh ledger so post-run preflight includes studies
+    created during execution.
 
     :param Experiment experiment: Parsed experiment whose declared phases are inspected.
     :param _PreflightCleanupReport cleanup_report: Report the reconciliation's
@@ -174,7 +171,7 @@ def _preflight_existing_studies(
             continue
         try:
             _validate_study_direction(study, experiment.metric.goal)
-            _validate_study_schema(study)
+            _initialize_study_schema(study)
             if reached:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
@@ -193,11 +190,7 @@ def _preflight_existing_studies(
 
 
 def _raise_collected_errors(errors: Sequence[Exception]) -> None:
-    """Raise the one refusal a preflight collected, or one refusal that combines several.
-
-    The live preflight and the dry-run preview both collect a refusal per
-    study and report them through this, so a preview names the same studies,
-    in the same message and type, as the launch it previews.
+    """Raise one refusal, or an aggregate preserving the collected studies and remedies.
 
     :param Sequence[Exception] errors: Refusals collected across the studies, in
         phase order; nothing is raised when it is empty.

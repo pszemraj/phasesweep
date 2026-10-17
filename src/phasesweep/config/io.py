@@ -18,53 +18,23 @@ _MAX_HINTS = 3
 
 
 class ConfigError(ValueError):
-    """Raised when a config file cannot be read or parsed into a mapping.
-
-    The message always names the source, so the CLI reports it as one line and
-    exits without a traceback. Subclassing ``ValueError`` keeps every existing
-    ``except ValueError`` caller behaving as before.
-    """
+    """A source-labelled failure to read or parse experiment configuration."""
 
 
 class _StrictMappingLoader(yaml.SafeLoader):
-    """``yaml.SafeLoader`` subclass that rejects duplicate mapping keys.
-
-    Default ``yaml.safe_load`` silently keeps the last value for a duplicated
-    key. For experiment specs that's a footgun: a YAML like::
-
-        search_space:
-          lr: {type: float, low: 1e-5, high: 1e-3, log: true}
-          lr: {type: float, low: 1e-4, high: 1e-2, log: true}  # silently wins
-
-    would run a sweep against the *second* range with no warning. We override
-    the default mapping constructor to raise on collisions, mirroring how
-    ``Phase``'s collision validators behave for cross-phase keys. Strings that
-    are not encodable as UTF-8 are rejected too.
-    """
+    """Load safe YAML while rejecting duplicate keys and non-UTF-8 strings."""
 
 
 def _construct_mapping_strict(
     loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
-    """Construct a YAML mapping while rejecting duplicate keys.
+    """Construct a YAML mapping, rejecting unhashable or duplicate keys.
 
-    Used as :class:`_StrictMappingLoader`'s mapping constructor: replaces the
-    default constructor (which silently keeps the last value for duplicate
-    keys) with one that raises ``ConstructorError`` so misspelled or
-    copy-pasted duplicate keys surface at load time rather than after the
-    sweep finishes.
-
-    Args:
-        loader: The active YAML loader; used to construct nested objects.
-        node: The mapping node to construct.
-        deep: Whether to construct nested objects deeply (PyYAML contract).
-
-    Returns:
-        The constructed mapping.
-
-    Raises:
-        yaml.constructor.ConstructorError: A key is unhashable or duplicated.
-
+    :param yaml.SafeLoader loader: Active loader for nested values.
+    :param yaml.MappingNode node: Mapping node to construct.
+    :param bool deep: Whether to construct nested objects deeply.
+    :raises yaml.constructor.ConstructorError: A key is unhashable or duplicated.
+    :return: Constructed mapping.
     """
     literal_keys: dict[Any, None] = {}
     merge_key_seen = False
@@ -108,30 +78,14 @@ _StrictMappingLoader.add_constructor(
 
 
 def _construct_str_strict(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
-    r"""Construct a YAML string while rejecting text that is not encodable as UTF-8.
+    """Construct a YAML string that can be encoded as UTF-8.
 
-    The config bytes are strict UTF-8, but a double-quoted ``"\ud800"`` escape
-    still yields a lone surrogate. Such a string loads, then fails wherever it
-    is encoded: an ``env`` value at trainer launch, any field when the config
-    snapshot is written.
-
-    Args:
-        loader: The active YAML loader.
-        node: The scalar node to construct.
-
-    Returns:
-        The constructed string.
-
-    Raises:
-        yaml.constructor.ConstructorError: The scalar does not construct a string,
-            or the string contains a lone surrogate.
-
+    :param yaml.SafeLoader loader: Active YAML loader.
+    :param yaml.ScalarNode node: String node to construct.
+    :raises yaml.constructor.ConstructorError: The string contains a lone surrogate.
+    :return str: Constructed UTF-8-compatible string.
     """
-    value = yaml.constructor.SafeConstructor.construct_yaml_str(loader, node)
-    if not isinstance(value, str):
-        raise yaml.constructor.ConstructorError(
-            None, None, f"expected a string, found {type(value).__name__}", node.start_mark
-        )
+    value = yaml.constructor.SafeConstructor.construct_scalar(loader, node)
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -158,11 +112,6 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     try:
         data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
     except yaml.YAMLError as exc:
-        # Covers the strict loader's duplicate-key ConstructorError *and* the
-        # scanner/parser errors PyYAML raises for the two most common YAML
-        # mistakes (bad indentation, unclosed bracket). PyYAML labels those
-        # marks ``in "<unicode string>"``, so without this wrap the operator
-        # never learns which file failed.
         raise ConfigError(f"{source}: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: top level must be a mapping.")
@@ -170,13 +119,10 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
 
 
 def describe_validation_error(exc: ValidationError) -> str:
-    """Render a validation error followed by pointers into the configuration reference.
+    """Append up to three configuration-reference hints to a validation error.
 
-    Each error location maps to the deepest documented key it points into. The first
-    distinct keys, in error order, become ``see: phasesweep explain <key>`` lines, quoted
-    for a shell because reference paths contain ``[]`` and ``<>``. Errors without a
-    location, such as the experiment-level validators', and locations the reference does
-    not document add no line.
+    Hints name the deepest documented key for each distinct error location,
+    in error order, and are shell-quoted. Undocumented locations add no hint.
 
     :param ValidationError exc: Validation failure of an :class:`Experiment`.
     :return str: ``str(exc)`` plus up to three hint lines.
@@ -193,27 +139,16 @@ def describe_validation_error(exc: ValidationError) -> str:
 def load_experiment_bytes(
     data: bytes, source: str | Path = "<bytes>", *, config_dir: Path | None = None
 ) -> Experiment:
-    """Parse and validate a config from an already-read byte snapshot.
+    """Parse and validate an already-read UTF-8 YAML snapshot.
 
-    Args:
-        data: UTF-8 YAML bytes.
-        source: Human-readable source label used in validation errors.
-        config_dir: Absolute directory of the config file the bytes came from.
-            Relative ``workdir``, journal ``storage`` and ``execution.cwd``
-            paths resolve against it. ``None`` leaves them relative to the
-            process working directory.
-
-    Returns:
-        :class:`Experiment` parsed from exactly ``data``.
-
-    Raises:
-        ValueError: ``config_dir`` is not absolute.
-        ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
-            duplicate mapping keys rejected by the strict loader), or the top level
-            is not a mapping.
-        pydantic.ValidationError: The parsed mapping fails :class:`Experiment`
-            model validation.
-
+    :param bytes data: Exact configuration bytes.
+    :param str | Path source: Source label included in errors.
+    :param Path | None config_dir: Absolute source directory for resolving relative
+        workdir, storage, and execution.cwd paths; None keeps working-directory semantics.
+    :raises ValueError: The supplied config directory is relative.
+    :raises ConfigError: Invalid UTF-8, malformed YAML, duplicate keys, or a non-mapping root.
+    :raises pydantic.ValidationError: Experiment model or cross-phase validation fails.
+    :return Experiment: Validated experiment from exactly these bytes.
     """
     if config_dir is not None and not config_dir.is_absolute():
         raise ValueError(f"config_dir must be absolute; got {str(config_dir)!r}")
@@ -227,30 +162,16 @@ def load_experiment_bytes(
 
 
 def load_experiment(path: str | Path) -> Experiment:
-    """Parse and validate a single experiment YAML.
+    """Read and validate experiment YAML, rejecting duplicate keys.
 
-    Uses a strict loader that rejects duplicate mapping keys. PyYAML's default
-    ``safe_load`` silently keeps the last value for a duplicate key, which can
-    cause an experiment to silently use the wrong search range or fixed
-    override.
+    Relative workdir, journal storage, and execution.cwd paths resolve against
+    the source file's directory after symlink resolution.
 
-    Relative ``workdir``, journal ``storage`` and ``execution.cwd`` paths
-    resolve against the directory of the file after symlinks are resolved, so
-    the same file names the same artifact tree from any working directory.
-
-    Args:
-        path: Filesystem path to the experiment YAML file.
-
-    Returns:
-        A fully-validated :class:`Experiment` instance with all Pydantic and
-        cross-phase consistency checks applied.
-
-    Raises:
-        OSError: ``path`` cannot be read.
-        ConfigError: YAML parse error, top-level is not a mapping, or duplicate
-            mapping keys.
-        pydantic.ValidationError: Any Pydantic / cross-phase validation failure.
-
+    :param str | Path path: Experiment YAML file.
+    :raises OSError: The file cannot be read.
+    :raises ConfigError: Invalid YAML, duplicate keys, or a non-mapping root.
+    :raises pydantic.ValidationError: Model or cross-phase validation fails.
+    :return Experiment: Validated experiment.
     """
     path_obj = Path(path)
     return load_experiment_bytes(

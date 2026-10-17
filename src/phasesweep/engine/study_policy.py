@@ -8,10 +8,9 @@ from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
-from phasesweep.config import Phase
+from phasesweep.config.models import Phase
 from phasesweep.config.search import fixed_configuration_target_refusal
 from phasesweep.engine.errors import (
-    OperatorAction,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialTargetRefusedError,
@@ -39,9 +38,11 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _parsed_trial_outcome,
+    _study_schema_supported,
     _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
+from phasesweep.errors import OperatorAction
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -59,10 +60,7 @@ class _PhasePolicyState:
 
 
 def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
-    """Apply one terminal outcome to a running consecutive-failure count.
-
-    Shared by live recording and replay reconstruction so both apply the
-    same consecutive-failure policy transition.
+    """Apply a terminal outcome to the consecutive-failure count.
 
     :param int consecutive_failures: Count observed before ``outcome``.
     :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
@@ -78,12 +76,9 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 
 
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
-    """Return whether a phase's consecutive-failure abort threshold is met.
+    """Check the live or resumed failure count against the configured threshold.
 
-    Shared by the live per-outcome check and the check before a resumed
-    phase launches new work, so both compare the same count against the same
-    threshold. Replay never applies it to recorded outcomes: the abort each
-    outcome tripped is recorded with that outcome.
+    Replay uses the abort recorded with each outcome, not today's threshold.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.
@@ -102,7 +97,6 @@ class _AcceptedPartialDecision:
     finished_trials: int
     completed_trials: int
     timeout_scope: str
-    recovered_abort_sequence: int | None
 
 
 class _AllocationRecord(TypedDict):
@@ -129,8 +123,7 @@ def _load_accepted_partial_decision(
         return None
     if not isinstance(raw, dict):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}. "
-            "Use a new experiment name, or archive/delete the inconsistent study."
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r}={raw!r}."
         )
     trial_target = raw.get("trial_target")
     outcome_sequence = raw.get("outcome_sequence")
@@ -162,8 +155,7 @@ def _load_accepted_partial_decision(
         )
     ):
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: "
-            f"{raw!r}. Use a new experiment name, or archive/delete the inconsistent study."
+            f"Study {study.study_name!r} has malformed {PHASE_DECISION_ATTR!r} fields: {raw!r}."
         )
     return _AcceptedPartialDecision(
         trial_target=trial_target,
@@ -171,7 +163,6 @@ def _load_accepted_partial_decision(
         finished_trials=finished_trials,
         completed_trials=completed_trials,
         timeout_scope=timeout_scope,
-        recovered_abort_sequence=recovered_abort_sequence,
     )
 
 
@@ -181,14 +172,10 @@ def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaM
     :param optuna.Study study: Study whose durable state is inconsistent,
         used to name the study in the message.
     :param str detail: Specific description of the malformed state.
-    :return StudySchemaMismatchError: Constructed error for the caller to
-        raise, instructing them to use a new experiment name or
-        archive/delete the inconsistent study.
+    :return StudySchemaMismatchError: Diagnostic carrying the study's remediation action.
     """
     return StudySchemaMismatchError(
-        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}. "
-        "Use a new experiment name, or archive/delete the inconsistent study before "
-        "running again."
+        f"Study {study.study_name!r} has invalid durable failure-policy state: {detail}."
     )
 
 
@@ -303,15 +290,10 @@ def _record_recovery_boundary(
     phase: Phase,
     recovered_abort_sequence: int,
 ) -> None:
-    """Durably acknowledge one phase abort as recovered.
+    """Durably acknowledge an abort and accept the raised trial target in one write.
 
-    Outcomes recorded up to the study's current largest sequence stop counting
-    toward the consecutive-failure streak that :func:`_load_phase_policy_state`
-    replays, and an abort recorded with any of them stops being the phase's
-    active abort. The record names the consumed abort for the audit trail.
-    It also accepts ``phase.n_trials`` as the trial target
-    (:func:`_accepted_trial_target`), so the raised target that authorizes a
-    recovery and the recovery itself become durable in this one write.
+    Outcomes through the current maximum sequence no longer count toward the failure
+    streak or supply its active abort. Record the consumed abort and ``phase.n_trials``.
 
     :param optuna.Study study: Study whose recovery boundary is written.
     :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.
@@ -333,41 +315,46 @@ def _record_recovery_boundary(
 
 
 def _validate_study_schema(study: optuna.Study) -> None:
-    """Initialize an empty study or reject populated incompatible storage.
+    """Validate the recorded study schema and current failure-policy state without writing.
 
-    :param optuna.Study study: Study whose durable schema attr is stamped (when
-        empty and unstamped) or validated against the current schema version.
+    :param optuna.Study study: Study whose durable schema attr and policy state are checked.
     :raises StudySchemaMismatchError: The study already holds trials or a schema
         stamp from an unsupported version, or its durable failure-policy state
         is malformed.
     """
     trials = study.get_trials(deepcopy=False)
     version = study.user_attrs.get(STUDY_SCHEMA_ATTR)
-    if not trials and version is None:
-        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-        return
-    if version == STUDY_SCHEMA_VERSION:
-        _load_phase_policy_state(study)
+    if _study_schema_supported(version, bool(trials)):
+        if version is not None:
+            _load_phase_policy_state(study)
         return
 
     trial_numbers = [trial.number for trial in trials]
     detail = "missing" if version is None else repr(version)
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
-        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
-        "Use a fresh artifact root and fresh local storage with this PhaseSweep release.",
+        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}.",
     )
+
+
+def _initialize_study_schema(study: optuna.Study) -> None:
+    """Validate a live study and stamp an empty, unmarked allocation.
+
+    :param optuna.Study study: Live study being prepared for execution.
+    :raises StudySchemaMismatchError: The schema or current policy state is unsupported.
+    """
+    _validate_study_schema(study)
+    if study.user_attrs.get(STUDY_SCHEMA_ATTR) is None:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
 
 def _validate_study_direction(
     study: optuna.Study,
     goal: Literal["minimize", "maximize"],
 ) -> None:
-    """Reject a durable study whose objective direction differs from the config.
+    """Require stored objective direction to match config before trial launch.
 
-    Optuna's ``load_if_exists=True`` keeps the stored direction and silently
-    ignores the direction supplied by a later caller. PhaseSweep therefore
-    validates the durable value explicitly before any trial can be launched.
+    Optuna's ``load_if_exists`` retains the stored direction without checking the offered one.
 
     :param optuna.Study study: Existing or newly created single-objective study.
     :param Literal goal: Direction required by the experiment metric.
@@ -384,19 +371,15 @@ def _validate_study_direction(
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} optimizes {stored or 'no direction'}, but the current "
         f"config requires {goal}. Optuna does not change a persistent study's direction "
-        "when load_if_exists=True. Use a new experiment/phase name or remove the "
-        "incompatible study before running again."
+        "when load_if_exists=True."
     )
 
 
 def _accepted_trial_target(study: optuna.Study) -> int:
     """Return the durable target for a current-format study.
 
-    A recovery record accepts its target in the same write that retires an
-    abort (:func:`_record_recovery_boundary`), and that write lands before
-    ``TRIAL_TARGET_ATTR`` catches up. Reading both keeps a crash between the
-    two from dropping the recovery's authorization or letting the old target
-    run the recovered phase.
+    Recovery records advance before ``TRIAL_TARGET_ATTR``; use the larger target
+    to preserve the accepted budget across an interrupted recovery.
 
     :param optuna.Study study: Study whose accepted trial target is read.
     :return int: The larger of the stored ``phasesweep_trial_target`` user
@@ -412,14 +395,12 @@ def _accepted_trial_target(study: optuna.Study) -> int:
         if not study.get_trials(deepcopy=False):
             return 0
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
-            "Use a fresh local ledger and artifact root.",
+            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}.",
         )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-            f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
-            "the inconsistent study before running again."
+            f"for {finished} terminal trial(s)."
         )
     recovery = _load_recovery_record(study)
     return stored if recovery is None else max(stored, recovery.trial_target)
@@ -442,8 +423,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     if phase.n_trials < accepted_target:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
-            f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
-            "target or a new experiment name."
+            f"trial(s), but the current config requests {phase.n_trials}."
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
@@ -558,12 +538,7 @@ def _record_allocation_context(
 
 
 def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.trial.FrozenTrial]:
-    """Return the interrupted trials that still need a rerun, in trial-number order.
-
-    A source needs one exactly when it is interrupted and no trial names it
-    under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Both facts are fixed
-    once written, so the answer needs no "scheduled" flag and a crash between
-    two reruns loses or duplicates none.
+    """Return interrupted trials not yet named by a rerun, in trial-number order.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.
@@ -773,8 +748,7 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
     if missing:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated trial(s) without a "
-            f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
-            "which environment cohort owns those results. Use a new experiment name.",
+            f"semantic trainer-environment identity: {missing}.",
         )
     if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
@@ -782,9 +756,7 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
             f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
-            "No trial was allocated. Restore the original semantic environment, pin "
-            "the value under env, classify variables that may differ, such as "
-            "rotating credentials, under execution.passthrough_env, or use a new "
-            "experiment name.",
+            "No trial was allocated. Values under env are pinned; ambient variables under "
+            "execution.passthrough_env, such as rotating credentials, do not split cohorts.",
             action=OperatorAction.FIX_CONFIG,
         )

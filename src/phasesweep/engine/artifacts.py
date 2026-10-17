@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import csv
-import json
 import logging
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -15,31 +15,38 @@ import yaml
 
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
-from phasesweep.config import Experiment, Phase
-from phasesweep.engine.confound import _validate_confound_block
-from phasesweep.engine.errors import (
-    OperatorAction,
-    StudyFingerprintMismatchError,
-    WinnerIntegrityError,
-)
-from phasesweep.engine.optuna import _draw_positions, _trial_state_label
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
+from phasesweep.engine.optuna import _trial_state_label
+from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
-    _validate_repeats_block,
-    group_labels,
+    group_labels_for,
 )
 from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     Winner,
-    _parse_winner_source,
-    _validate_observed_block,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
+from phasesweep.errors import OperatorAction
+from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
+
+
+def read_yaml_or_none(path: Path) -> object:
+    """Read optional YAML without propagating read or decoding failures.
+
+    :param Path path: YAML artifact path to read with the platform-default encoding.
+    :return object: Decoded YAML value, or ``None`` when absent, unreadable, or malformed.
+    """
+    try:
+        value: object = yaml.safe_load(path.read_text())
+        return value
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
 
 
 def _write_yaml_atomic(path: Path, payload: Any) -> None:
@@ -51,40 +58,6 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
     text = yaml.safe_dump(payload, sort_keys=False)
     with atomic_text_writer(path, newline="") as handle:
         handle.write(text)
-
-
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    """Atomically write a JSON document to ``path`` with the artifact-tree mode.
-
-    :param Path path: Destination JSON path to replace.
-    :param Any payload: JSON-serializable value to write.
-    :raises TypeError: ``payload`` is not JSON-serializable.
-    :raises OSError: The document could not be staged, written, or renamed.
-    """
-    with atomic_text_writer(path) as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
-def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
-    """Create a YAML document at ``path`` exactly once, never overwriting it.
-
-    Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
-    pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records: a second call for an already-written
-    path can never clobber the first write, even a same-content rewrite.
-    Delegates to :func:`atomic_create_text`, so ``path`` is staged and fsynced
-    beside itself and only hard-linked into place once complete -- no reader
-    can ever observe a partial write.
-
-    :param Path path: Destination path to create; the parent directory is
-        created if missing.
-    :param Any payload: YAML-serializable value to write.
-    :return bool: ``True`` when this call created and wrote the file;
-        ``False`` when the destination already existed and nothing was
-        written.
-    """
-    text = yaml.safe_dump(payload, sort_keys=False)
-    return atomic_create_text(path, text)
 
 
 @contextlib.contextmanager
@@ -140,12 +113,7 @@ def _write_trials_csv(
         return
     param_names = sorted({n for t in trials for n in t.params})
     attr_names = sorted({n for t in trials for n in t.user_attrs} - {TRAINER_ENV_ATTR})
-    positions = _draw_positions(trials)
-    labels = (
-        {}
-        if repeats is None
-        else group_labels(((t.number, positions[t.number], t.params) for t in trials), repeats)
-    )
+    labels = group_labels_for(trials, repeats)
     fieldnames = [
         "number",
         "state",
@@ -188,17 +156,9 @@ def _save_winner(
 ) -> None:
     """Persist a phase winner into its immutable generation namespace.
 
-    The phase fingerprint is included so ``_load_winner`` can refuse stale
-    winners on ``--from-phase`` resume. Real winners always carry a
-    fingerprint by construction in ``_run_phase``; placeholder winners
-    (dry-run skip) are never saved.
-
-    ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
-    produced the winning trial. Neither ever carries ambient variable values. ``confound`` records the advisory
-    verdicts on the population the source selection ranked, ``observed`` the
-    report-only values the winning trial recorded, and ``repeats`` the winning
-    repeat group; like the provenance fields they are winner-only and never
-    enter ``summary.yaml``.
+    Real winners carry a phase fingerprint for resume validation; dry-run placeholders
+    are never saved. Environment identity excludes ambient values. Confound verdicts,
+    observations, repeats, and evidence provenance remain winner-only fields.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -217,7 +177,6 @@ def _save_winner(
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
-        "trainer_inherit_env": winner.trainer_inherit_env,
         "confound": winner.confound,
         "observed": winner.observed,
         "repeats": winner.repeats,
@@ -231,6 +190,8 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
     :param Winner winner: Winner whose common fields should be serialized.
     :return dict[str, Any]: Shared trial, parameter, evidence, identity, and source fields.
     """
+    source = winner.source
+    assert source is not None, "only the never-persisted dry-run placeholder has no source"
     payload = {
         "trial_number": winner.trial_number,
         "params": winner.params,
@@ -240,50 +201,23 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
-        "winner_source": _winner_source_payload(winner),
+        "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
     }
     return payload
 
 
-def _winner_source_payload(winner: Winner) -> dict[str, Any]:
-    """Serialize the concrete source trial for an exposed winner.
-
-    :param Winner winner: Winner whose recorded ``source`` is serialized.
-    :return dict[str, Any]: JSON-serializable winner-source payload with
-        ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
-        keys.
-    """
-    source = winner.source
-    assert source is not None, "only the never-persisted dry-run placeholder has no source"
-    return {
-        "kind": source.kind,
-        "phase": source.phase,
-        "trial_number": source.trial_number,
-        "generation_id": source.generation_id,
-        "attempt_id": source.attempt_id,
-    }
-
-
-# Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
-# same winner twice (preflight, then the run itself); the operator needs the
-# divergence once, not once per read.
-_ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
-
-
+# Resume preflight and execution can read the same winner; both use the same
+# warning identity so the environment divergence is reported once.
 def _warn_environment_drift(
     experiment: Experiment,
     phase_name: str,
     stored_digest: str,
 ) -> None:
-    """Warn once when a reused winner was produced under another environment.
+    """Warn once when result reuse crosses semantic environment cohorts.
 
-    Persistent-study preflight refuses to allocate a trial across semantic
-    environment cohorts, but two paths reuse a recorded result without
-    allocating: ``--from-phase`` loads a skipped phase's published winner, and
-    a replay re-selects from a study with no remaining trial slots. This
-    warning tells the operator that the result being built on came from
-    another cohort.
+    Skipped-phase loading and no-work replay reuse results without allocating trials;
+    ordinary top-ups refuse cohort drift before allocation.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
@@ -296,11 +230,9 @@ def _warn_environment_drift(
     ).digest
     if stored_digest == current_digest:
         return
-    key = (experiment.experiment, phase_name, stored_digest)
-    if key in _ENVIRONMENT_DRIFT_WARNED:
-        return
-    _ENVIRONMENT_DRIFT_WARNED.add(key)
-    log.warning(
+    _warn_once(
+        log,
+        ("environment-drift", experiment.experiment, phase_name, stored_digest),
         "[%s] reused winner ran under trainer environment %s..., but this process "
         "composes %s... under execution.inherit_env=%r. The recorded result is being "
         "reused across an environment change; confirm the difference is irrelevant to "
@@ -319,26 +251,12 @@ def _load_winner(
     *,
     publication: ValidatedPublication | None,
 ) -> Winner:
-    """Load a published phase winner and verify it matches the *current* config.
+    """Load validated winner bytes and check reuse against the current config.
 
-    ``--from-phase`` skips earlier phases by reading their persisted winners.
-    Without verification, editing a parent phase's YAML between runs leaves
-    the child phase silently inheriting the *old* winner against the *new*
-    parent config — a correctness bug, not just a performance one.
-
-    We re-compute the fingerprint of the current parent ``phase`` against the
-    currently-resolved ``inherited_winners`` and refuse the load if the
-    fingerprints disagree.
-
-    A recorded semantic environment digest that disagrees with this process is
-    a warning on this explicit skipped-phase path; ordinary study top-ups are
-    refused before allocation (see :func:`_warn_environment_drift`).
-
-    The winner is decoded from the bytes publication validation read, never
-    reread from disk, so what a resume builds on is exactly what was
-    validated. That validation already proved the winner's phase, generation
-    and attempt ids, fingerprint format, source, and completion shape; this
-    function checks only what depends on the current config.
+    Recompute the phase fingerprint with the current inherited overrides. A skipped
+    winner's recorded environment drift warns; ordinary top-ups refuse that drift.
+    Publication validation already checked persisted identities and structure, so
+    this function checks only current-config-dependent requirements.
 
     Args:
         experiment: Parsed experiment config.
@@ -392,40 +310,26 @@ def _load_winner(
         )
 
     try:
-        source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
         stored_env_digest = data["trainer_env_digest"]
-        stored_inherit_env = data["trainer_inherit_env"]
-        metric = float(data["metric"][experiment.metric.name])
-        confound = _validate_confound_block(
-            data["confound"], winner_trial=int(data["trial_number"])
-        )
-        repeats = _validate_repeats_block(
-            data, metric_value=metric, ranked_groups=confound["ranked_groups"]
-        )
-        _check_repeats_axis(repeats, phase.repeats)
+        _check_repeats_axis(validated.repeats, phase.repeats)
         winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
             effective_overrides=dict(data["effective_overrides"]),
-            metric=metric,
+            metric=validated.metric,
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
             phase_fingerprint=stored_fp,
             generation_id=data["generation_id"],
             attempt_id=data["attempt_id"],
-            source=source,
+            source=validated.source,
             objective_provenance=dict(data["objective_provenance"]),
             trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
-            trainer_inherit_env=(
-                [str(name) for name in stored_inherit_env]
-                if isinstance(stored_inherit_env, list)
-                else stored_inherit_env
-            ),
-            confound=confound,
-            observed=_validate_observed_block(data["observed"]),
-            repeats=repeats,
+            confound=dict(validated.confound),
+            observed=dict(validated.observed),
+            repeats=validated.repeats,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

@@ -15,7 +15,7 @@ from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
-from phasesweep.mcp.runs import RunStore, write_status_file
+from phasesweep.mcp.runs import RunState, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -56,37 +56,24 @@ def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
     assert 0 <= elapsed <= 5
 
 
-def test_elapsed_seconds_terminal_prefers_runner_stamp(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status_fields", "state", "expected"),
+    [
+        pytest.param(
+            {"ended_at": "2026-07-16T00:02:05+00:00"}, "succeeded", 125, id="runner-stamp"
+        ),
+        pytest.param({}, "succeeded", None, id="missing-ended-at"),
+        pytest.param(None, "failed", None, id="missing-status"),
+    ],
+)
+def test_elapsed_seconds_terminal(
+    tmp_path: Path, status_fields: dict[str, str] | None, state: RunState, expected: int | None
+) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="r1", started_at="2026-07-16T00:00:00+00:00")
-    write_status_file(
-        store.status_path("r1"),
-        {
-            "run_id": "r1",
-            "returncode": 0,
-            "error_class": None,
-            "cleanup_confirmed": True,
-            "ended_at": "2026-07-16T00:02:05+00:00",
-        },
-    )
-    assert _run_elapsed_seconds(store, handle, "succeeded") == 125
-
-
-def test_elapsed_seconds_none_without_terminal_timestamp(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="r1", started_at=utc_now_iso())
-    write_status_file(
-        store.status_path("r1"),
-        {"run_id": "r1", "returncode": 0, "error_class": None, "cleanup_confirmed": True},
-    )
-    assert _run_elapsed_seconds(store, handle, "succeeded") is None
-
-
-def test_elapsed_seconds_none_without_status(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    # Terminal with no status.json at all (e.g. SIGKILL before any write).
-    handle = make_dead_run_handle(run_id="r1", started_at=utc_now_iso())
-    assert _run_elapsed_seconds(store, handle, "failed") is None
+    if status_fields is not None:
+        write_run_status(store, "r1", returncode=0, error_class=None, **status_fields)
+    assert _run_elapsed_seconds(store, handle, state) == expected
 
 
 def test_status_floors_inconsistent_historical_terminal_count() -> None:
@@ -341,7 +328,7 @@ def _await_with_timed_reads(
 ) -> tuple[dict[str, object], list[float], float]:
     """Run one minimum-timeout wait against a manually timed status reader."""
     app, _registry, _store = _app_with_run(tmp_path)
-    clock = {"now": 0.0}
+    clock = _fake_clock(monkeypatch)
     read_starts: list[float] = []
     real_read = app._read_status_target
 
@@ -351,11 +338,6 @@ def _await_with_timed_reads(
         clock["now"] += read_seconds
         return result
 
-    async def advance(seconds: float) -> None:
-        clock["now"] += seconds
-
-    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", advance)
     monkeypatch.setattr(app, "_read_status_target", timed_read)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))

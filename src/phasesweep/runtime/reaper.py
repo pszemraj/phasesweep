@@ -30,11 +30,8 @@ PROCESS_IDENTITY_SCHEMA_VERSION = 2
 #: The kernel constant ``PROC_PID_INIT_INO``: the ``ns/pid`` link text of the
 #: initial PID namespace, fixed since Linux 3.8. That namespace is never freed.
 INITIAL_PID_NAMESPACE_LINK = "pid:[4026531836]"
-#: A PID namespace as phasesweep records it: its ``ns/pid`` link text, which
-#: names its inode, then ``@`` and the ``/proc`` start time of its PID 1. The
-#: kernel hands a freed namespace's inode to a new namespace within seconds,
-#: but that namespace's PID 1 starts after the old one's has exited, so the
-#: pair names one namespace per boot.
+#: Namespace identity: ``ns/pid`` inode text plus ``@`` and its PID 1 start
+#: time. The pair distinguishes namespace-inode reuse within one boot.
 _PID_NAMESPACE_PATTERN = re.compile(r"pid:\[[1-9][0-9]*\]@(?:0|[1-9][0-9]*)")
 _PROC = Path("/proc")
 
@@ -62,18 +59,10 @@ def read_boot_id() -> str | None:
 
 
 def identity_from_earlier_boot(boot_id: str | None, current_boot_id: str | None) -> bool:
-    """Return whether a recorded boot identity proves its process cannot exist.
+    """Return whether known, different boot IDs prove the recorded process gone.
 
-    PID plus ``/proc`` start time is unique only within one boot: after a
-    reboot the kernel restarts both counters, so a saved pair can match an
-    unrelated process. A recorded boot id that differs from the current one
-    settles the question in the safe direction - nothing launched under the
-    earlier boot survived it, so the process and every descendant it ever had
-    are conclusively gone and cleanup needs no signal. An unknown boot id on
-    either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
-    performing cleanup must separately refuse to signal when either boot id
-    is unknown, using the same ``current_boot_id`` read they pass here.
+    Unknown IDs return ``False``. Cleanup callers must separately refuse signaling
+    when either boot identity is unknown.
 
     :param str | None boot_id: Boot identity recorded when the process launched.
     :param str | None current_boot_id: This boot's identity, from :func:`read_boot_id`.
@@ -154,23 +143,12 @@ def same_pid_namespace(pid_namespace: str) -> bool:
 def recorded_process_blocker(
     pid_namespace: str, *, pids: Collection[int], pgids: Collection[int]
 ) -> str | None:
-    """Explain what stops this process from proving recorded processes of another namespace gone.
+    """Explain why recorded processes in another PID namespace cannot be proven gone.
 
-    Only the host's initial PID namespace sees every process, and the
-    world-readable ``NSpid``, ``NSpgid`` and ``NSsid`` lines of
-    ``/proc/<pid>/status`` give each one's PID, process group and session at
-    every nesting level, outermost first. One pass over ``/proc`` finds
-    candidates: a process whose group at some nested level is a recorded group
-    that also names its session there (runners and trials lead their own
-    sessions), which still finds a group whose leader has exited, or whose
-    innermost PID is a recorded PID. A candidate's ``ns/pid`` link breaks the
-    tie: a readable link to any other namespace rules it out, while a link to
-    the recorded namespace or an unreadable one blocks the proof. A group match
-    at an outer level puts the candidate in a namespace nested below the
-    matched one, which its link cannot name, so it blocks too. Start times are
-    never compared, because a time namespace shifts them. A process that has
-    left its recorded group is not seen, the same blind spot same-namespace
-    cleanup accepts.
+    Only the host's initial PID namespace can make this proof. Nested PID, group and
+    session IDs identify candidates; a matching or unreadable namespace blocks it.
+    Outer-level group matches also block it. Start times are not compared across time
+    namespaces. Processes that escaped their recorded group remain a blind spot.
 
     :param str pid_namespace: Namespace the processes were recorded in.
     :param Collection[int] pids: Recorded PIDs, numbered in that namespace.
@@ -382,14 +360,8 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
 def reap_child(pid: int) -> bool:
     """Best-effort non-blocking reap of one exited child.
 
-    A long-lived parent (the MCP server) that spawns detached runners and never
-    waits on them accumulates a zombie per runner as each one exits. Call this
-    for a known runner pid to reap it if it has already exited; it is a no-op if
-    the process is still running, was never our child, or has already been reaped.
-    This runs on status-read paths, so it must stay strictly non-blocking. A
-    single ``waitpid(WNOHANG)`` reduces zombie buildup; it does not guarantee
-    that a child exiting immediately after this call is reaped before the next
-    status scan.
+    Running processes, non-children and already-reaped children are unchanged.
+    A child exiting after this call waits for a later reap.
 
     Args:
         pid: PID of a runner this process spawned.
@@ -499,19 +471,11 @@ def cleanup_stale_trial_process(
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
 ) -> bool:
-    """Safely clean a stale trial group using boot-, namespace- and process-bound identity.
+    """Clean a stale trial group using boot, namespace and process identity.
 
-    When ``identity.boot_id`` differs from the current boot id, the host has
-    rebooted since launch, so no process from that boot can still be alive and
-    cleanup is trivially complete. An identity recorded in another PID
-    namespace is never probed or signalled, because its numbers name unrelated
-    processes here: from the host's initial namespace, the absence of its own
-    process and group (:func:`recorded_process_blocker`) settles it the same
-    way, and anything else refuses. Within this namespace, cleanup refuses to
-    act when ``identity`` lacks a recorded boot id or start time, or the
-    current boot id cannot be read, since PID-reuse safety cannot be verified
-    in that case, and otherwise delegates to :func:`kill_stale_group` with the
-    identity's ``pid``/``pgid``/starttime.
+    A different known boot proves cleanup complete. Foreign-namespace processes must
+    be proven absent without signaling. Same-namespace cleanup requires known boot
+    IDs and saved start time before delegating to :func:`kill_stale_group`.
 
     :param StaleProcessIdentity identity: Durable process identity read from
         ``process_identity.json``.
@@ -564,16 +528,7 @@ def cleanup_stale_trial_process(
 
 
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
-    """Send SIGTERM, wait, then SIGKILL — and confirm the group is actually gone.
-
-    Returns ``True`` only when the process group is confirmed gone. Returns
-    ``False`` when delivery fails (permission denied, OS error) or the group
-    is still alive after SIGKILL. Reporting ``True`` for a group that survived
-    SIGKILL would let callers mark the trial ``FAIL`` and proceed, potentially
-    launching new trials onto a GPU still held by the leaked process.
-
-    ``ProcessLookupError`` from ``killpg`` means the group is already gone, so
-    those branches return ``True``.
+    """Send SIGTERM, wait, then SIGKILL, confirming the group is gone.
 
     Args:
         pgid: Target process-group ID.
@@ -590,16 +545,10 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
 
 
 def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
-    """Escalate SIGTERM → SIGKILL across process groups with shared wait windows.
+    """Escalate SIGTERM to SIGKILL with shared wait windows across all groups.
 
-    Per-group semantics match :func:`_terminate_process_group`; the SIGTERM
-    grace and the post-SIGKILL confirmation window are shared across all
-    groups, so total worst-case latency stays roughly ``grace_seconds + 2``
-    seconds instead of scaling with the number of live groups. The shutdown
-    handler kills every active trial group of an ``n_jobs > 1`` phase through
-    this path — trainers that ignore SIGTERM fail correlated, not
-    independently, so a serial escalation would multiply the documented
-    worst case by the trial parallelism.
+    Per-group verdicts match :func:`_terminate_process_group`; all groups share one
+    SIGTERM grace and one post-SIGKILL confirmation window.
 
     Args:
         pgids: Target process-group IDs.
@@ -676,16 +625,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
 
 
 def _process_group_alive(pgid: int) -> bool:
-    """Check whether any non-zombie process in the group ``pgid`` is alive.
+    """Check whether any non-zombie member of ``pgid`` is alive.
 
-    ``os.killpg(pgid, 0)`` returns success for zombie processes too, because
-    they still occupy the PID table. For our purposes a zombie is dead — it
-    holds no GPU memory, no file descriptors, no shared resources. Skipping
-    zombies stops the cleanup escalation from looping after SIGKILL when the
-    parent hasn't reaped its child yet.
-
-    On non-Linux, ``/proc/<pid>/stat`` doesn't exist; we fall back to plain
-    ``killpg(0)`` semantics.
+    On non-Linux systems without procfs, fall back to ``killpg(0)`` existence checks.
 
     Args:
         pgid: Process-group ID to probe.
@@ -748,30 +690,19 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     proc_root = Path("/proc")
     if not proc_root.exists():
         return True
-    if member_pids is None:
-        scan = _group_member_pids(pgid)
-        if _member_pids_alive(pgid, scan.pids):
-            return True
-        if not scan.complete:
-            return True
-        if scan.all_members_terminal:
-            return False
-        # killpg proved the group existed, but a complete scan found no stable
-        # inspectable member. Re-check the kernel verdict; continued existence
-        # is uncertainty, not proof of death.
-        return _process_group_exists(pgid)
-    if _member_pids_alive(pgid, member_pids):
+    if member_pids is not None and _member_pids_alive(pgid, member_pids):
         return True
     scan = _group_member_pids(pgid)
-    refreshed = set(scan.pids)
-    member_pids.clear()
-    member_pids.update(refreshed)
-    if _member_pids_alive(pgid, member_pids):
+    if member_pids is not None:
+        member_pids.clear()
+        member_pids.update(scan.pids)
+    if _member_pids_alive(pgid, scan.pids if member_pids is None else member_pids):
         return True
     if not scan.complete:
         return True
     if scan.all_members_terminal:
         return False
+    # A kernel-visible group without inspectable members remains uncertain.
     return _process_group_exists(pgid)
 
 
@@ -796,10 +727,8 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
             stat, conclusive = _read_proc_stat_result(entry)
             pid = int(entry.name)
             if not conclusive:
-                # Hardened procfs mounts commonly hide processes owned by
-                # other users. An unreadable host-global entry is irrelevant
-                # when the kernel can still prove it belongs to another group;
-                # only a possibly-matching entry makes this scan incomplete.
+                # An unreadable entry blocks proof only when the kernel cannot exclude it
+                # from the target group.
                 try:
                     unreadable_pgid = os.getpgid(pid)
                 except ProcessLookupError:
@@ -853,34 +782,12 @@ def kill_stale_group(
     pgid: int | None = None,
     grace_seconds: float = _KILL_GRACE_SECONDS,
 ) -> bool:
-    """Terminate a stale trial process group, escalating SIGTERM -> SIGKILL.
+    """Terminate a stale trial group only when its process identity is safe to signal.
 
-    Returns ``True`` only when it is safe to mark the trial ``FAIL``: either
-    nothing was alive to clean up, or cleanup ran and the process group is
-    confirmed gone. Returns ``False`` when cleanup is uncertain — PID/PGID
-    identity was reused unsafely, permission was denied, or the group survived
-    SIGKILL. Callers must not advance state when this returns ``False``: a
-    leaked training process can still hold a GPU, scribble over W&B runs, or
-    starve the host scheduler.
-
-    Precondition: the caller has established that ``pid`` and ``pgid`` were
-    recorded in this process's PID namespace (:func:`same_pid_namespace`), or
-    that the identity is a child this process just spawned. In another
-    namespace the same numbers name unrelated processes.
-
-    Recovery order:
-
-    1. ``pid`` is alive AND saved starttime matches: derive PGID from the live
-       PID and kill the group. Starttime check guards against PID reuse.
-    2. ``pid`` is alive but starttime mismatches: this is PID reuse by an
-       unrelated process. If the stored PGID proves the old group is gone,
-       cleanup is complete. If the PGID still exists, use it only when the
-       reused PID is not the leader of that group; otherwise fail closed to
-       avoid killing an unrelated process group.
-    3. ``pid`` is dead but its verified same-boot identity includes ``pgid``:
-       use the group only when its leader identity has not been reused. The
-       root shell may have exited while descendants still hold GPU memory.
-    4. No PID and no PGID: nothing to clean up, return ``True``.
+    The caller must establish the recorded PID namespace or direct-child ownership.
+    Use a matching live PID; after PID reuse or root exit, use the saved PGID only
+    if its leader has not been reused. Missing PID and PGID
+    means no cleanup is needed; uncertain cleanup must block state advancement.
 
     Args:
         pid: Root PID from a durable process identity, or ``None`` if absent.
@@ -931,47 +838,16 @@ def kill_stale_group(
             except (PermissionError, OSError) as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
-        elif pid_alive:
-            # PID reuse detected. A persisted PGID can still prove cleanup is
-            # complete (group gone) or target original descendants (group alive
-            # but not led by the reused PID). Refuse only when the stored PGID
-            # itself appears to be a reused group leader.
-            if pgid is not None and not _process_group_exists(pgid):
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "PID was reused, but stored process group %d no longer "
-                    "exists.",
-                    pid,
-                    pgid,
-                )
-                return True
-            if pgid is None:
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "PID was reused and no stored PGID is available. Cleanup "
-                    "status is uncertain.",
-                    pid,
-                )
-                return False
-            pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
-            if pgid_reused is None:
-                log.warning(
-                    "Stored PGID %d has a live but unreadable leader; refusing "
-                    "PGID fallback because process identity is unknown.",
-                    pgid,
-                )
-                return False
-            if pgid_reused:
-                log.warning(
-                    "PID %d is alive but starttime does not match saved value; "
-                    "stored PGID %d is led by a different process. Refusing "
-                    "PGID fallback to avoid killing an unrelated process group.",
-                    pid,
-                    pgid,
-                )
-                return False
+        elif pid_alive and pgid is None:
+            log.warning(
+                "PID %d is alive but starttime does not match saved value; "
+                "PID was reused and no stored PGID is available. Cleanup "
+                "status is uncertain.",
+                pid,
+            )
+            return False
 
-    if target_pgid is None and pgid is not None and saved_starttime is not None:
+    if target_pgid is None and pgid is not None:
         if not _process_group_exists(pgid):
             return True
         pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)

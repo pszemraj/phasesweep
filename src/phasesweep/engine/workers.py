@@ -59,7 +59,7 @@ class _WorkerTrials:
     def wait_idle(self) -> frozenset[int]:
         """Block until no objective is running, then return the abandoned trials.
 
-        :return frozenset[int]: Trials whose objective left them ``RUNNING`` on purpose.
+        :return frozenset[int]: Trials whose objective left them ``RUNNING`` for recovery.
         """
         with self._condition:
             while self._running:

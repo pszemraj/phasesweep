@@ -8,74 +8,37 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import ExecutionContext, Experiment
 from phasesweep.config.io import load_experiment_bytes
+from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import file_url_path
 from tests.conftest import make_experiment
+from tests.experiments import project_directory, write_anchored_config
 from tests.mcp_helpers import claim_runner_handle, make_run_handle, runner_argv, runner_main
-
-
-def _write_config(path: Path, **fields: object) -> Path:
-    """Write a one-trial echo-trainer experiment to ``path`` with ``fields`` merged in.
-
-    :param Path path: Destination YAML file; its parent must exist.
-    :param fields: Top-level experiment keys added to, or replacing, the base config.
-    :return Path: ``path``.
-    """
-    payload: dict[str, object] = {
-        "experiment": "anchored",
-        "trial_command": "echo x=0.5 {overrides}",
-        "override_format": "argparse",
-        "metric": {
-            "extractor": {"type": "log_regex", "pattern": r"x=(?P<value>[0-9.eE+-]+)"},
-        },
-        "phases": [
-            {
-                "name": "p",
-                "n_trials": 1,
-                "sampler": {"type": "random", "seed": 0},
-                "search_space": {"x": {"type": "int", "low": 0, "high": 3}},
-            }
-        ],
-        **fields,
-    }
-    if payload.get("storage") is not None:
-        payload.setdefault("provenance", {"revision": "test-fixture-v1"})
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    return path
-
-
-def _project(tmp_path: Path) -> Path:
-    """Create and return the resolved directory that holds the config file."""
-    project = tmp_path / "project"
-    project.mkdir()
-    return project.resolve()
 
 
 def test_file_loaded_relative_paths_resolve_against_config_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = _project(tmp_path)
+    project = project_directory(tmp_path)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
 
     explicit = load_experiment(
-        _write_config(
+        write_anchored_config(
             project / "explicit.yaml",
             workdir="runs",
             storage="journal:///./ledgers/study.journal",
             execution={"cwd": "trainer"},
         )
     )
-    defaulted = load_experiment(_write_config(project / "defaulted.yaml", workdir="."))
-    omitted = load_experiment(_write_config(project / "omitted.yaml"))
+    defaulted = load_experiment(write_anchored_config(project / "defaulted.yaml", workdir="."))
+    omitted = load_experiment(write_anchored_config(project / "omitted.yaml"))
 
     assert explicit.workdir == str(project / "runs")
     assert explicit.storage == f"journal:///{project}/ledgers/study.journal"
@@ -101,7 +64,7 @@ def test_python_built_experiment_keeps_cwd_relative_paths() -> None:
 
 
 def test_bytes_without_a_config_directory_keep_cwd_relative_paths(tmp_path: Path) -> None:
-    config = _write_config(tmp_path / "exp.yaml", workdir="runs")
+    config = write_anchored_config(tmp_path / "exp.yaml", workdir="runs")
 
     assert load_experiment_bytes(config.read_bytes()).workdir == "runs"
     with pytest.raises(ValueError, match="config_dir must be absolute"):
@@ -112,11 +75,11 @@ def test_absolute_and_home_paths_are_not_anchored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    project = _project(tmp_path)
+    project = project_directory(tmp_path)
     absolute = tmp_path / "absolute-runs"
 
     experiment = load_experiment(
-        _write_config(
+        write_anchored_config(
             project / "exp.yaml",
             workdir=str(absolute),
             storage="journal:///~/study.journal",
@@ -132,11 +95,11 @@ def test_absolute_and_home_paths_are_not_anchored(
 def test_auto_storage_follows_anchored_workdir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = _project(tmp_path)
+    project = project_directory(tmp_path)
     monkeypatch.chdir(tmp_path)
 
     experiment = load_experiment(
-        _write_config(project / "exp.yaml", workdir="runs", storage="auto")
+        write_anchored_config(project / "exp.yaml", workdir="runs", storage="auto")
     )
 
     assert experiment.resolved_storage is not None
@@ -148,20 +111,20 @@ def test_auto_storage_follows_anchored_workdir(
 def test_relative_journal_refused_under_config_dir_with_query_char(tmp_path: Path) -> None:
     project = tmp_path / "a?b"
     project.mkdir()
-    config = _write_config(project / "exp.yaml", storage="journal:///study.journal")
+    config = write_anchored_config(project / "exp.yaml", storage="journal:///study.journal")
 
     with pytest.raises(ValidationError, match=r"contains \? or #"):
         load_experiment(config)
     # auto escapes the directory name, so the same location stays usable.
-    load_experiment(_write_config(project / "auto.yaml", storage="auto"))
+    load_experiment(write_anchored_config(project / "auto.yaml", storage="auto"))
 
 
 def test_revalidation_without_context_keeps_anchored_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = _project(tmp_path)
+    project = project_directory(tmp_path)
     loaded = load_experiment(
-        _write_config(
+        write_anchored_config(
             project / "exp.yaml",
             workdir="runs",
             storage="journal:///study.journal",
@@ -187,8 +150,8 @@ def test_file_loaded_relative_storage_is_bound_to_the_config_directory(
     ``execution.cwd: .`` pins the trainer to the config directory too; left
     unset it would be each invocation directory, which the fingerprint binds.
     """
-    project = _project(tmp_path)
-    config = _write_config(
+    project = project_directory(tmp_path)
+    config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",
@@ -219,9 +182,9 @@ def test_file_loaded_relative_storage_is_bound_to_the_config_directory(
 @pytest.mark.integration
 def test_runner_snapshot_resolves_against_recorded_config_dir(tmp_path: Path) -> None:
     """The runner anchors its state-directory snapshot to the recorded config directory."""
-    project = _project(tmp_path)
+    project = project_directory(tmp_path)
     (project / "trainer").mkdir()
-    config = _write_config(
+    config = write_anchored_config(
         project / "exp.yaml",
         workdir="runs",
         storage="journal:///study.journal",

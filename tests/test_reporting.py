@@ -11,7 +11,7 @@ from click.testing import CliRunner
 
 from phasesweep import report_objective
 from phasesweep.cli import cli as cli_main
-from phasesweep.evidence import ExtractorError, run_extractor
+from phasesweep.evidence.evaluation import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from tests.conftest import make_trial_context
 

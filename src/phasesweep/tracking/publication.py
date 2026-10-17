@@ -133,36 +133,8 @@ def _save_intent(
     return path
 
 
-def _enqueue(
-    experiment: Experiment,
-    generation_id: str,
-    name: str,
-    binding: RunBinding,
-    projection: Projection,
-    environment: Mapping[str, str],
-    *,
-    finish: str | None = None,
-) -> None:
-    """Save delivery intent, then try the upload once.
-
-    :param Experiment experiment: Configured target.
-    :param str generation_id: Producing generation.
-    :param str name: Stable projection identity.
-    :param RunBinding binding: Verified target run.
-    :param Projection projection: Frozen upload payload.
-    :param Mapping[str, str] environment: Composed credentials and transport.
-    :param str | None finish: Terminal status for a still-running managed run.
-    """
-    path = _save_intent(experiment, generation_id, name, binding, projection, finish=finish)
-    _deliver(experiment, path, environment)
-
-
 def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
-    """Freeze one accepted trial's result from its durable Optuna record.
-
-    Constraints and observed values come from the trial's own attributes rather
-    than the current config, so the projection can be rebuilt for any accepted
-    trial later.
+    """Freeze an accepted trial projection from its persisted values and attributes.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
@@ -240,80 +212,38 @@ def publish_trial(
     trial: FrozenTrial,
     environment: Mapping[str, str],
 ) -> None:
-    """Mirror an accepted Optuna trial to its native bound MLflow run.
+    """Mirror a terminal trial after confirmed process cleanup.
+
+    COMPLETE trials publish accepted evidence to their bound native run.
+    Failed or interrupted trials finish only managed runs; unbound attempts
+    and trainer-owned failed runs are left alone.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal accepted trial.
+    :param FrozenTrial trial: Locally terminal trial with confirmed cleanup.
     :param Mapping[str, str] environment: Composed authentication environment.
     """
+    from optuna.trial import TrialState
+
     from phasesweep.engine.state import TRIAL_DIR_ATTR
 
-    directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    if trial.state == TrialState.COMPLETE:
+        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    else:
+        stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+        if not isinstance(stored, str) or not (Path(stored) / BINDING_FILE).is_file():
+            return
+        directory = Path(stored)
     binding = read_binding(directory)
-    _enqueue(
+    paths = _save_attempt_intents(
         experiment,
         generation_id,
-        f"attempt-{binding['attempt_id']}",
-        binding,
-        _accepted_projection(trial, read_inherits(directory)),
-        environment,
+        [(directory, binding)],
+        {binding["attempt_id"]: _AttemptTrial(trial, cleanup_confirmed=True)},
+        ended=None,
     )
-
-
-def _finish_attempt(
-    experiment: Experiment,
-    generation_id: str,
-    binding: RunBinding,
-    status: str,
-    environment: Mapping[str, str],
-) -> None:
-    """Queue the end of a managed attempt run that produced no accepted result.
-
-    :param Experiment experiment: Configured experiment.
-    :param str generation_id: Producing generation.
-    :param RunBinding binding: The attempt's managed run binding.
-    :param str status: Terminal MLflow status for a still-running run.
-    :param Mapping[str, str] environment: Composed authentication environment.
-    """
-    _enqueue(
-        experiment,
-        generation_id,
-        f"attempt-{binding['attempt_id']}",
-        binding,
-        _unaccepted_projection(binding, status),
-        environment,
-        finish=status,
-    )
-
-
-def publish_unaccepted_trial(
-    experiment: Experiment,
-    generation_id: str,
-    trial: FrozenTrial,
-    environment: Mapping[str, str],
-) -> None:
-    """Finish the managed run of a failed or interrupted trial after confirmed cleanup.
-
-    No evidence capture ran to finish that run, so it would otherwise stay
-    RUNNING. An interrupted trial's run finishes ``KILLED``, a failed one's
-    ``FAILED``. Trainer-owned runs and attempts that never created a run are
-    left alone.
-
-    :param Experiment experiment: Configured experiment.
-    :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal FAIL trial, interrupted or not.
-    :param Mapping[str, str] environment: Composed authentication environment.
-    """
-    from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_interrupted
-
-    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
-    if not isinstance(directory, str) or not (Path(directory) / BINDING_FILE).is_file():
-        return
-    binding = read_binding(Path(directory))
-    if binding["run_mode"] == "managed":
-        status = "KILLED" if _trial_interrupted(trial) else "FAILED"
-        _finish_attempt(experiment, generation_id, binding, status, environment)
+    for path in paths:
+        _deliver(experiment, path, environment)
 
 
 def _unrecorded_attempts(
@@ -342,18 +272,16 @@ def _unrecorded_attempts(
 
 
 class _AttemptTrial(NamedTuple):
-    """An attempt's Optuna trial and whether its own study recorded the trial's cleanup recovery."""
+    """An attempt's trial and positive cleanup confirmation from its controller or study."""
 
     trial: FrozenTrial
-    cleanup_recovered: bool
+    cleanup_confirmed: bool
 
 
 def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, _AttemptTrial]:
-    """Index the ledger's trials of some phases by attempt id.
+    """Index readable study trials by attempt ID with study-local cleanup confirmation.
 
-    A phase whose study cannot be read contributes nothing, so its attempts
-    stay unresolved instead of being guessed. Trial numbers are study-local,
-    so each trial is paired with the recovery ledger of the study it came from.
+    Unreadable studies contribute no trials, leaving their attempts unresolved.
 
     :param ValidatedLedger ledger: Ledger the trials were recorded in.
     :param Iterable[str] phases: Phase names whose studies are read.
@@ -393,23 +321,17 @@ def _save_attempt_intents(
     *,
     ended: str | None,
 ) -> list[Path]:
-    """Save the delivery intent of each unrecorded attempt whose Optuna outcome settles it.
+    """Save unrecorded attempt projections according to their durable Optuna outcomes.
 
-    The trial's state decides what an attempt reports, never the absence of a
-    record: a COMPLETE trial whose callback saved nothing, because a write
-    failed or the controller died after Optuna committed it, gets its accepted
-    projection. A managed run of a trial that was not accepted is finished
-    once its cleanup is established, either by the trial's own positive
-    evidence or by a recovery its study recorded; cleanup recovery never
-    rewrites the trial's attributes, so the study's ledger is the only place
-    the second form is visible. An attempt without a readable trial stays
-    unresolved, as does one whose cleanup is still uncertain.
+    COMPLETE trials receive accepted projections. Unaccepted managed runs finish
+    only after cleanup is confirmed by the trial, live controller, or owning
+    study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
     :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
     :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
-        its study's recovery.
+        its controller's cleanup confirmation or its study's recovery.
     :param str | None ended: Status for every unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
         finish only trials Optuna failed with confirmed cleanup.
@@ -434,7 +356,7 @@ def _save_attempt_intents(
         if binding["run_mode"] != "managed":
             continue
         settled = trial.state.is_finished() and (
-            found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
+            found.cleanup_confirmed or not _trial_requires_cleanup_recovery(trial)
         )
         if settled and _trial_interrupted(trial):
             status = "KILLED"
@@ -452,14 +374,10 @@ def _save_attempt_intents(
 
 
 def _save_generation_intents(experiment: Experiment, generation_id: str) -> list[Path]:
-    """Save a published generation's winner references from its committed artifacts.
+    """Build winner projections from a generation's validated committed artifacts.
 
-    Reading the validated artifacts instead of in-memory winners lets
-    sync-tracking rebuild records that a failed write after publication never
-    saved. Phase membership, order, and lineage come from the generation's own
-    validated config snapshot, so a phase appended or rewired since cannot
-    change what an older generation reports. Every projection is built before
-    the first record is saved. Records that already exist are kept.
+    Its recorded phase order and lineage apply even if the current config differs.
+    Build every projection before saving records; preserve records already present.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Published generation that has a summary run.
@@ -537,11 +455,11 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
     :raises OSError: A delivery record cannot be read or written.
     :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
     """
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
 
     if not (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
         return  # No-work replay never imports the SDK or creates remote runs.
-    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    environment = _environment_identity(experiment, experiment.phases[0].name).values
     for path in _save_generation_intents(experiment, generation_id):
         _deliver(experiment, path, environment)
 
@@ -573,35 +491,26 @@ def publish_failed_generation(
     error: BaseException,
     ledger: ValidatedLedger,
 ) -> None:
-    """Finish a failed invocation's owned runs only after the engine confirms cleanup.
+    """Finish a failed invocation's owned runs after confirmed cleanup.
 
-    Covers the generation summary and every attempt whose post-trial callback
-    saved no record. Each attempt's Optuna outcome decides what it reports:
-    an accepted trial gets its accepted projection, and the managed run of
-    any other attempt is finished with the invocation's status.
+    Accepted trials keep accepted projections; other managed attempts finish with
+    the invocation's status. Committed generations remain untouched.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Failed invocation identity.
     :param BaseException error: Authoritative engine failure, without its private message.
     :param ValidatedLedger ledger: The invocation's ledger, holding its trials.
     """
-    from phasesweep.engine.paths import _last_successful_generation_path
-    from phasesweep.engine.publication_validation import _read_pointer_target
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import PhaseSweepShutdown
 
     parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
     if not parent_path.exists():
         return
-    # The pointer commits before the optional lifecycle record. A secondary
-    # error after that boundary must never turn committed success into failure.
-    target = _read_pointer_target(
-        _last_successful_generation_path(experiment), experiment_name=experiment.experiment
-    )
-    if target is not None and target.generation_id == generation_id:
+    if _published(experiment, generation_id):
         return
     status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
-    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    environment = _environment_identity(experiment, experiment.phases[0].name).values
     attempts = _unrecorded_attempts(experiment, generation_id)
     trials = _attempt_trials(ledger, {binding["phase"] for _, binding in attempts})
     paths = _save_attempt_intents(experiment, generation_id, attempts, trials, ended=status)
@@ -663,7 +572,7 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     :return dict[str, int]: Path-free pending and delivered counts.
     """
     counts = {"pending": 0, "delivered": 0}
-    for path in tracking_root(experiment).glob(_delivery_pattern(generation_id)):
+    for path in tracking_root(experiment).glob(f"{generation_id or '*'}/delivery/*.json"):
         state = json_text(read_record(path), "state")
         if state not in counts:
             raise ValueError(f"Tracking delivery record {path.name!r} has unknown state {state!r}.")
@@ -671,23 +580,11 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     return counts
 
 
-def _delivery_pattern(generation_id: str | None) -> str:
-    """Select one generation's delivery records, or every generation's.
-
-    :param str | None generation_id: Generation filter, or ``None`` for all.
-    :return str: Glob relative to the tracking root.
-    """
-    return f"{generation_id or '*'}/delivery/*.json"
-
-
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
-    """Retry result projections, without selecting or training.
+    """Retry pending result projections without selecting or training.
 
-    A run whose creation timed out is bound first if it has since appeared.
-    Records an invocation never saved, because a write failed or the
-    controller died, are then rebuilt: an attempt's from its trial in the
-    Optuna ledger, and a published generation's winner records from its
-    committed artifacts.
+    Reconcile unresolved creations first, then rebuild missing attempt records
+    from Optuna and winner records from committed generation artifacts.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -701,7 +598,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
     from phasesweep.engine.locking import _experiment_lock
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import signal_handler_scope
     from phasesweep.tracking.mlflow import require_mlflow_sdk
 
@@ -723,7 +620,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             and read_record(source)["source"] != experiment.mlflow.evidence_identity()
         ):
             raise ValueError("Tracking delivery belongs to a different target or generation.")
-        environment = _trainer_environment(experiment, experiment.phases[0].name)
+        environment = _environment_identity(experiment, experiment.phases[0].name).values
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
         parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
@@ -734,7 +631,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             ):
                 continue
             _save_generation_intents(experiment, parent.parent.name)
-        paths = sorted(root.glob(_delivery_pattern(generation_id)))
+        paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
         if not paths:
             raise ValueError("No tracking deliveries exist for this scope.")
         for path in paths:

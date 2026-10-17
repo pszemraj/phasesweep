@@ -20,10 +20,16 @@ import pytest
 
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
-from phasesweep.mcp.runs import RunStore, write_status_file
+from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
-from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
+from tests.conftest import (
+    file_mode,
+    is_pid_zombie,
+    patch_directory_fsync_failure,
+    reaped_pid,
+    requires_nonroot,
+)
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     earlier_boot_id,
@@ -67,8 +73,9 @@ def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: 
     loaded = store.get("exp-1")
 
     assert loaded == handle
-    assert store.state(loaded) == "running"
-    assert store.recovery_required(loaded)
+    observation = store.observe(loaded)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [loaded]
 
 
@@ -145,7 +152,7 @@ def test_prepare_launch_rolls_back_each_create_boundary(
     """Lease, snapshot, and handle create failures leave no capacity reservation."""
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id=f"exp-create-{failing_create}", launch_state="launching")
-    real_create = mcp_runs._strict_atomic_create_text
+    real_create = mcp_runs.private_atomic_create_text
     calls = 0
 
     def fail_one_create(path: Path, text: str) -> None:
@@ -155,7 +162,7 @@ def test_prepare_launch_rolls_back_each_create_boundary(
             raise OSError(f"injected create {failing_create} failure")
         real_create(path, text)
 
-    monkeypatch.setattr(mcp_runs, "_strict_atomic_create_text", fail_one_create)
+    monkeypatch.setattr(mcp_runs, "private_atomic_create_text", fail_one_create)
 
     with pytest.raises(OSError, match=f"create {failing_create}"):
         store.prepare_launch(handle, b"experiment: exp\n")
@@ -289,7 +296,7 @@ def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
     "lease_kind",
     ["directory", "fifo", "live_symlink", "dangling_symlink"],
 )
-def test_malformed_launch_lease_cannot_enable_legacy_orphan_recovery(
+def test_malformed_launch_lease_cannot_authorize_orphan_recovery(
     tmp_path: Path,
     lease_kind: str,
 ) -> None:
@@ -318,7 +325,10 @@ def test_malformed_launch_lease_cannot_enable_legacy_orphan_recovery(
     assert lease.exists() or lease.is_symlink()
 
 
-def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fail_directory_fsync", [False, True], ids=["durable", "fsync-failure"])
+def test_update_allows_only_spawn_transition_and_idempotent_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_directory_fsync: bool
+) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(run_id="exp-1", launch_state="launching")
     spawned = replace(
@@ -332,7 +342,13 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
     )
     store.create(pending)
 
-    store.update(spawned)
+    if fail_directory_fsync:
+        with monkeypatch.context() as patch:
+            patch_directory_fsync_failure(patch, "injected update directory fsync failure")
+            with pytest.raises(OSError, match="update directory fsync failure"):
+                store.update(spawned)
+    else:
+        store.update(spawned)
     store.update(spawned)
 
     assert store.get("exp-1") == spawned
@@ -374,22 +390,9 @@ def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A directory-fsync failure after the link unlinks the just-created status file.
-
-    ``write_status_file_if_absent`` now delegates to ``_strict_atomic_create_text``,
-    so it shares that helper's rollback: a durability failure discovered after the
-    file is already linked into place removes it again rather than leaving an
-    unsynced status file behind (accepted consolidation behavior change).
-    """
+    """A post-link directory-fsync failure removes the newly created status file."""
     status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
-    real_fsync = os.fsync
-
-    def fail_directory_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            raise OSError("injected directory fsync failure")
-        real_fsync(fd)
-
-    monkeypatch.setattr(mcp_runs.os, "fsync", fail_directory_fsync)
+    patch_directory_fsync_failure(monkeypatch, "injected directory fsync failure")
 
     with pytest.raises(OSError, match="directory fsync"):
         mcp_runs.write_status_file_if_absent(status_path, {"run_id": "exp-1"})
@@ -397,6 +400,28 @@ def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
     assert not status_path.exists()
     assert list(status_path.parent.glob("*.tmp")) == []
     assert list(status_path.parent.glob(".*.tmp")) == []
+
+
+def test_private_create_rolls_back_when_staging_unlink_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure removing the published staging link releases the new reservation."""
+    target = tmp_path / "state" / "identity.json"
+    real_unlink = os.unlink
+    failed = False
+
+    def fail_staging_unlink(path: str | Path, *, dir_fd: int | None = None) -> None:
+        nonlocal failed
+        if not failed and str(path).endswith(".tmp") and target.exists():
+            failed = True
+            raise OSError("injected staging unlink failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", fail_staging_unlink)
+    with pytest.raises(OSError, match="staging unlink failure"):
+        mcp_runs.private_atomic_create_text(target, "new")
+    assert failed
+    assert list(target.parent.iterdir()) == []
 
 
 def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> None:
@@ -541,7 +566,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
-    """Without a marker or run handles, the path names some other directory, not old state."""
+    """Without a marker or run handles, the path names some other directory."""
     state_dir = tmp_path / "state"
     RunStore(state_dir)
     (state_dir / ".phasesweep-format.json").unlink()
@@ -631,7 +656,6 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
         (_symlink_to_state_dir, "is not a real directory"),
-        # A readable marker naming another format is another release's state.
         (_marker_text('{"schema_version": 0}\n'), "declares unsupported format 0"),
         # No marker and no run handles: the path names some other directory,
         # whatever its layout or permissions, and no chmod turns it into state.
@@ -798,7 +822,7 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         assert store.launch_inventory() == ([], {f"run:{handle.run_id}"})
     elif record_kind == "status":
         assert store.recorded_terminal_status(handle) is None
-        assert store.state(handle) == "running"
+        assert store.observe(handle).state == "running"
     elif record_kind == "cleanup_uncertain":
         assert not store.cleanup_uncertain(handle)
     else:
@@ -866,6 +890,7 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
         ("boot_id", "11111111-1111-1111-1111-111111111111"),
         ("pid_namespace", "pid:[4026531836]@1"),
     ],
+    ids=["pid", "pgid", "boot-id", "pid-namespace"],
 )
 def test_launching_handle_cannot_have_process_identity(
     tmp_path: Path, field: str, value: object
@@ -920,7 +945,7 @@ def test_terminal_status_determines_state(
     handle = make_run_handle(run_id="exp-1")
     write_run_status(store, "exp-1", returncode=returncode, error_class=error_class)
 
-    assert store.state(handle) == expected_state
+    assert store.observe(handle).state == expected_state
 
 
 def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_path: Path) -> None:
@@ -944,7 +969,7 @@ def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_p
         result_snapshot_error="InterruptedFinalization",
     )
 
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 @pytest.mark.parametrize("runner_live", [True, False], ids=["live_runner", "dead_runner"])
@@ -965,9 +990,10 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(
         result_snapshot_state="pending",
     )
 
-    assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle) == (not runner_live)
-    assert store.recovery_required(handle) == (not runner_live)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.snapshot_recovery_required == (not runner_live)
+    assert observation.recovery_required == (not runner_live)
     assert live_runs(store) == [handle]
 
     write_run_status(
@@ -980,57 +1006,60 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(
         result_snapshot={},
     )
 
-    assert store.state(handle) == "succeeded"
-    assert not store.snapshot_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "succeeded"
+    assert not observation.snapshot_recovery_required
+    assert not observation.recovery_required
     assert live_runs(store) == []
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        [],
-        {"run_id": "other", "returncode": 0},
-        {"run_id": "exp-1", "returncode": "0"},
-        {"run_id": "exp-1", "returncode": True},
-        {"run_id": "exp-1", "returncode": 0},
-        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": None},
-        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": "yes"},
-        {"run_id": "exp-1", "returncode": 0, "error_class": 3},
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "complete"},
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_publication_state": "prepared",
-        },
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_snapshot_state": "pending",
-            "result_snapshot": {},
-            "result_publication_state": "unknown",
-            "result_publication_generation_id": "exp-1",
-        },
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "result_snapshot_state": "complete",
-            "result_snapshot": {},
-            "result_publication_state": "prepared",
-            "result_publication_generation_id": "exp-1",
-        },
-        {"run_id": "exp-1", "returncode": 0, "result_snapshot_error": 3},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": "attempt-1"},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_ids": [""]},
-        {"run_id": "exp-1", "returncode": 0, "recovered_attempt_generations": []},
-        {
-            "run_id": "exp-1",
-            "returncode": 0,
-            "recovered_attempt_generations": {"attempt-1": ""},
-        },
-        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": "attempt-1"},
-        {"run_id": "exp-1", "returncode": 0, "uncertain_attempt_ids": [""]},
+        pytest.param([], id="not-object"),
+        pytest.param({"run_id": "exp-1", "returncode": 0}, id="missing-cleanup"),
+        *[
+            pytest.param(
+                {**{"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": True}, **changes},
+                id=case,
+            )
+            for case, changes in [
+                ("wrong-run", {"run_id": "other"}),
+                ("string-returncode", {"returncode": "0"}),
+                ("boolean-returncode", {"returncode": True}),
+                ("null-cleanup", {"cleanup_confirmed": None}),
+                ("string-cleanup", {"cleanup_confirmed": "yes"}),
+                ("error-class", {"error_class": 3}),
+                ("snapshot-state", {"result_snapshot_state": "unknown"}),
+                ("missing-snapshot", {"result_snapshot_state": "complete"}),
+                ("missing-publication-generation", {"result_publication_state": "prepared"}),
+                (
+                    "publication-state",
+                    {
+                        "result_snapshot_state": "pending",
+                        "result_snapshot": {},
+                        "result_publication_state": "unknown",
+                        "result_publication_generation_id": "exp-1",
+                    },
+                ),
+                (
+                    "prepared-complete",
+                    {
+                        "result_snapshot_state": "complete",
+                        "result_snapshot": {},
+                        "result_publication_state": "prepared",
+                        "result_publication_generation_id": "exp-1",
+                    },
+                ),
+                ("snapshot-error", {"result_snapshot_error": 3}),
+                ("recovered-ids-type", {"recovered_attempt_ids": "attempt-1"}),
+                ("empty-recovered-id", {"recovered_attempt_ids": [""]}),
+                ("generation-map-type", {"recovered_attempt_generations": []}),
+                ("empty-generation-id", {"recovered_attempt_generations": {"attempt-1": ""}}),
+                ("uncertain-ids-type", {"uncertain_attempt_ids": "attempt-1"}),
+                ("empty-uncertain-id", {"uncertain_attempt_ids": [""]}),
+            ]
+        ],
     ],
 )
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
@@ -1039,7 +1068,7 @@ def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> N
     private_atomic_write_text(store.status_path("exp-1"), json.dumps(payload))
 
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 def test_status_read_failures_do_not_break_state_scans(
@@ -1053,21 +1082,21 @@ def test_status_read_failures_do_not_break_state_scans(
     store.status_path("exp-1").write_bytes(b"\xff")
     store.status_path("exp-1").chmod(0o600)
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
     private_atomic_write_text(store.status_path("exp-1"), '{"returncode": 0}')
-    real_read_text = mcp_runs.read_private_text_at
+    real_read_text = mcp_runs.read_private_text
 
-    def fail_status_read(parent_fd: int, leaf: str, path: Path) -> str:
+    def fail_status_read(path: Path, *, require_private_dir: bool = True) -> str:
         if path == store.status_path("exp-1"):
             raise OSError("status file temporarily unreadable")
-        return real_read_text(parent_fd, leaf, path)
+        return real_read_text(path, require_private_dir=require_private_dir)
 
-    monkeypatch.setattr(mcp_runs, "read_private_text_at", fail_status_read)
+    monkeypatch.setattr(mcp_runs, "read_private_text", fail_status_read)
 
     assert store.recorded_terminal_status(handle) is None
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
 
@@ -1083,14 +1112,14 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
         cleanup_confirmed=True,
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
     assert live_runs(store) == []
 
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1")
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
@@ -1099,8 +1128,9 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     store.create(handle)
     before = tree_snapshot(tmp_path / "state")
 
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [handle]
     assert not store.cleanup_uncertain(handle)
     assert tree_snapshot(tmp_path / "state") == before
@@ -1118,7 +1148,7 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
         ),
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
 
 
 def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
@@ -1155,7 +1185,7 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
 
     def read_state() -> None:
         started.set()
-        observed.append(store.state(handle))
+        observed.append(store.observe(handle).state)
         finished.set()
 
     with store.transition_lock(handle):
@@ -1174,97 +1204,45 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
 @pytest.mark.parametrize(
     "payload",
     [
-        [],
-        {"run_id": "other", "cleanup_confirmed": False},
-        {"run_id": "exp-1", "config_sha256": "b" * 64, "cleanup_confirmed": False},
-        {"run_id": "exp-1", "cleanup_confirmed": True},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pid": "123"},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 0},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pid_starttime": True},
-        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 4242},
-        {
-            "run_id": "exp-1",
-            "cleanup_confirmed": False,
-            "pid_starttime": 123,
-        },
-        {
-            "run_id": "exp-1",
-            "cleanup_confirmed": False,
-            "pid": 4242,
-            "pid_starttime": 123,
-        },
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": "",
-            },
-            id="boot_id_empty",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": "malformed",
-            },
-            id="boot_id_malformed",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": 12345,
-            },
-            id="boot_id_integer",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": True,
-            },
-            id="boot_id_boolean",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "",
-            },
-            id="pid_namespace_empty",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "malformed",
-            },
-            id="pid_namespace_malformed",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": "pid:[4026539001]",
-            },
-            id="pid_namespace_without_pid_1_start_time",
-        ),
-        pytest.param(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "pid_namespace": 4026531836,
-            },
-            id="pid_namespace_integer",
-        ),
+        pytest.param([], id="not-object"),
+        pytest.param({"run_id": "exp-1", "cleanup_confirmed": False}, id="missing-config-digest"),
+        *[
+            pytest.param(
+                {
+                    **{
+                        "run_id": "exp-1",
+                        "config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cleanup_confirmed": False,
+                    },
+                    **changes,
+                },
+                id=case,
+            )
+            for case, changes in [
+                ("wrong-run", {"run_id": "other"}),
+                (
+                    "wrong-digest",
+                    {
+                        "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    },
+                ),
+                ("cleanup-confirmed", {"cleanup_confirmed": True}),
+                ("pid-type", {"pid": "123"}),
+                ("pgid-zero", {"pgid": 0}),
+                ("starttime-boolean", {"pid_starttime": True}),
+                ("pgid-without-pid", {"pgid": 4242}),
+                ("starttime-without-pid", {"pid_starttime": 123}),
+                ("missing-pgid", {"pid": 4242, "pid_starttime": 123}),
+                ("boot_id_empty", {"boot_id": ""}),
+                ("boot_id_malformed", {"boot_id": "malformed"}),
+                ("boot_id_integer", {"boot_id": 12345}),
+                ("boot_id_boolean", {"boot_id": True}),
+                ("pid_namespace_empty", {"pid_namespace": ""}),
+                ("pid_namespace_malformed", {"pid_namespace": "malformed"}),
+                ("pid_namespace_without_pid_1_start_time", {"pid_namespace": "pid:[4026539001]"}),
+                ("pid_namespace_integer", {"pid_namespace": 4026531836}),
+            ]
+        ],
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
@@ -1276,9 +1254,10 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
     before = tree_snapshot(tmp_path / "state")
 
     assert not store.cleanup_uncertain(handle)
-    assert store.state(handle) == "running"
+    observation = store.observe(handle)
+    assert observation.state == "running"
     assert not store.cleanup_uncertain(handle)
-    assert store.recovery_required(handle)
+    assert observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1311,37 +1290,29 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
     assert (identity.pid, identity.pgid, identity.pid_starttime) == (runner_pid, runner_pid, 111)
 
 
-def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["boot_id", "pid_namespace"])
+def test_process_identity_roundtrips_through_handle_and_cleanup_marker(
+    tmp_path: Path, field: str
+) -> None:
     store = RunStore(tmp_path / "state")
-    boot_id = read_boot_id()
-    if boot_id is None:
+    value = read_boot_id() if field == "boot_id" else "pid:[4026539001]@100"
+    if value is None:
         pytest.skip("boot id unavailable on this platform")
-    handle = make_dead_run_handle(run_id="exp-1", boot_id=boot_id)
+    handle = (
+        make_dead_run_handle(run_id="exp-1", boot_id=value)
+        if field == "boot_id"
+        else make_dead_run_handle(run_id="exp-1", pid_namespace=value)
+    )
 
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
 
     loaded = store.get("exp-1")
     assert loaded == handle
-    assert loaded.boot_id == boot_id
-    assert json.loads(store.cleanup_uncertain_path("exp-1").read_text())["boot_id"] == boot_id
-    assert store.cleanup_identity(loaded).boot_id == boot_id
-
-
-def test_pid_namespace_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    namespace = "pid:[4026539001]@100"
-    handle = make_dead_run_handle(run_id="exp-1", pid_namespace=namespace)
-
-    store.create(handle)
-    store.mark_cleanup_uncertain(handle)
-
-    loaded = store.get("exp-1")
-    assert loaded == handle
-    assert loaded.pid_namespace == namespace
+    assert getattr(loaded, field) == value
     marker = json.loads(store.cleanup_uncertain_path("exp-1").read_text())
-    assert marker["pid_namespace"] == namespace
-    assert store.cleanup_identity(loaded).pid_namespace == namespace
+    assert marker[field] == value
+    assert getattr(store.cleanup_identity(loaded), field) == value
 
 
 def test_cleanup_marker_cannot_move_a_spawned_identity_to_another_namespace(
@@ -1384,8 +1355,9 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
     assert store.runner_may_be_alive(handle)
     assert not store.cleanup_uncertain(handle)
     assert store.cleanup_identity(handle).boot_id == handle.boot_id
-    assert store.state(handle) == "running"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert not observation.recovery_required
 
 
 def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) -> None:
@@ -1402,10 +1374,11 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
     )
     store.create(handle)
 
-    assert store.state(handle) == "failed"
+    observation = store.observe(handle)
+    assert observation.state == "failed"
     assert not store.cleanup_uncertain(handle)
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert live_runs(store) == []
 
 
@@ -1417,9 +1390,10 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     assert handle.boot_id is None
     store.create(handle)
 
-    assert store.state(handle) == "running"
+    observation = store.observe(handle)
+    assert observation.state == "running"
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.recovery_required(handle)
+    assert observation.recovery_required
 
 
 def test_terminal_status_written_during_liveness_check_does_not_require_recovery(
@@ -1440,8 +1414,9 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
         return False
 
     monkeypatch.setattr(mcp_runs, "is_same_live_process", runner_finishes)
-    assert store.state(handle) == "succeeded"
-    assert store.recovery_required(handle) is False
+    observation = store.observe(handle)
+    assert observation.state == "succeeded"
+    assert observation.recovery_required is False
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
@@ -1453,9 +1428,10 @@ def test_earlier_boot_supersedes_a_persisted_cleanup_uncertainty_marker(tmp_path
     before = tree_snapshot(tmp_path / "state")
 
     assert store.cleanup_uncertain(handle)
-    assert store.state(handle) == "failed"
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1467,9 +1443,10 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
     store.create(handle)
     write_unsafe_cleanup_status(store, "exp-1")
 
-    assert store.state(handle) == "failed"
-    assert store.cleanup_recovery_required(handle)
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert observation.cleanup_recovery_required
+    assert observation.recovery_required
 
 
 def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> None:
@@ -1485,8 +1462,8 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
     store.create(handle)
     write_run_status(store, "exp-1", returncode=0, result_snapshot_state="pending")
 
-    assert store.snapshot_recovery_required(handle)
-    assert not store.snapshot_recovery_required(replace(handle, boot_id=None))
+    assert store.observe(handle).snapshot_recovery_required
+    assert not store.observe(replace(handle, boot_id=None)).snapshot_recovery_required
 
 
 def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Path) -> None:
@@ -1503,10 +1480,11 @@ def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Pat
     )
     before = tree_snapshot(tmp_path / "state")
 
-    assert store.state(handle) == "cancelled"
+    observation = store.observe(handle)
+    assert observation.state == "cancelled"
     assert store.cleanup_uncertain_path("exp-1").exists()
-    assert not store.cleanup_recovery_required(handle)
-    assert not store.recovery_required(handle)
+    assert not observation.cleanup_recovery_required
+    assert not observation.recovery_required
     assert tree_snapshot(tmp_path / "state") == before
 
 
@@ -1518,7 +1496,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     store.create(handle)
     write_unsafe_cleanup_status(store, "exp-1")
 
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert live_runs(store) == [handle]
 
     private_atomic_write_text(
@@ -1534,7 +1512,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
         ),
     )
 
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
     assert live_runs(store) == []
 
 
@@ -1575,8 +1553,9 @@ def test_cleanup_recovery_rejects_records_that_cannot_release_the_reservation(
     )
 
     assert not store._cleanup_recovered(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
 
 
 def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
@@ -1644,8 +1623,9 @@ def test_state_reserves_recovery_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     # different process than the one we launched. The runner is gone, but its
     # separately-sessioned descendants are not proven gone, so fail closed.
     handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
@@ -1655,8 +1635,7 @@ def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path
         pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
     # Kill a child that is paused until signalled. As its unreaping parent, the
-    # PID lingers as a zombie that os.kill(pid, 0) still reports as alive -
-    # exactly the SIGKILL/OOM case that must report failed, not running.
+    # PID lingers as a zombie that os.kill(pid, 0) still reports as alive.
     proc = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
     try:
         starttime = read_proc_starttime(proc.pid)
@@ -1666,10 +1645,84 @@ def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path
             time.sleep(0.02)
         assert is_pid_zombie(proc.pid)
         handle = make_run_handle(run_id="zomb", pid=proc.pid, starttime=starttime)
-        assert store.state(handle) == "running"
-        assert store.recovery_required(handle)
+        observation = store.observe(handle)
+        assert observation.state == "running"
+        assert observation.recovery_required
         assert not store.cleanup_uncertain_path(handle.run_id).exists()
-        # state() reaped the child, so the zombie is gone, not merely filtered.
+        # observe() reaped the child, so the zombie is gone, not merely filtered.
         assert not is_pid_zombie(proc.pid)
     finally:
         proc.wait()
+
+
+def test_observation_uses_one_terminal_record_for_state_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent replacement cannot mix terminal cleanup facts within a decision."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-observation")
+    write_unsafe_cleanup_status(store, handle.run_id)
+    read_status = store._read_status
+    reads = 0
+
+    def read_then_replace(saved: RunHandle) -> TerminalStatus | None:
+        nonlocal reads
+        reads += 1
+        status = read_status(saved)
+        write_run_status(store, saved.run_id, returncode=0, cleanup_confirmed=True)
+        return status
+
+    monkeypatch.setattr(store, "_read_status", read_then_replace)
+    observation = store.observe(handle)
+
+    assert reads == 1
+    assert observation.state == "running"
+    assert observation.recovery_required
+    assert observation.cleanup_recovery_required
+    assert observation.terminal_status is not None
+    assert observation.terminal_status["cleanup_confirmed"] is False
+    assert store.observe(handle).state == "succeeded"
+
+
+def test_observation_rechecks_pending_snapshot_after_runner_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final status published during the dead-runner probe supersedes pending evidence."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-observation-race")
+    write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
+
+    def finish_snapshot(_pid: int | None, _starttime: int | None) -> bool:
+        write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="failed")
+        return False
+
+    monkeypatch.setattr(mcp_runs, "is_same_live_process", finish_snapshot)
+    observation = store.observe(handle)
+
+    assert observation.state == "succeeded"
+    assert not observation.recovery_required
+    assert not observation.snapshot_recovery_required
+    assert observation.terminal_status is not None
+    assert observation.terminal_status["result_snapshot_state"] == "failed"
+
+
+def test_terminal_record_preserves_optional_nulls_and_unknown_fields(tmp_path: Path) -> None:
+    """Field validation leaves unrelated current-format JSON and explicit nulls intact."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-terminal-extras")
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=0,
+        uncertain_attempt_ids=None,
+        recovered_attempt_ids=None,
+        recovered_attempt_generations=None,
+        diagnostic={"nested": [1, "two", None]},
+    )
+
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["uncertain_attempt_ids"] is None
+    assert terminal["recovered_attempt_ids"] is None
+    assert terminal["diagnostic"] == {"nested": [1, "two", None]}
+    assert store.cleanup_uncertain_attempt_ids(handle) == set()

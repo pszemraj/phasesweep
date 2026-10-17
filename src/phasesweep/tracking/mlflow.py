@@ -66,10 +66,7 @@ class OperationOutcomeUnknownError(RuntimeError):
 
 
 class OperationRejectedError(RuntimeError):
-    """The worker returned a well-formed error, the only positive evidence that a request failed.
-
-    For a creation, the server rejected the request or it failed before the create was sent.
-    """
+    """A confirmed request rejection, including creation refused before sending."""
 
 
 class _SdkExperiment(Protocol):
@@ -178,10 +175,7 @@ class _SdkClient(Protocol):
 
 
 def require_mlflow_sdk() -> None:
-    """Check that the optional SDK is installed before allocating tracked work.
-
-    The check locates the package without importing it: importing MLflow
-    starts its client telemetry, which belongs in the supervised workers.
+    """Locate the optional SDK without importing it or starting client telemetry.
 
     :raises PhaseSweepError: The MLflow client package is not installed.
     """
@@ -390,13 +384,10 @@ def _failure_cause(exc: BaseException) -> str:
 
 
 def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
-    """Bind the run carrying this exact identity, creating it only when none exists.
+    """Find or create the run carrying an exact identity, without SDK creation retries.
 
-    The creation request is sent at most once per call, with no SDK retry. A
-    failure of that request that is not a server rejection does not show
-    whether the run was created, so it is reported as an unknown outcome. So
-    is a run this call created that fails verification: it exists, but
-    nothing has bound it.
+    Unconfirmed creation failures and failed verification of a newly created
+    run report an unknown outcome rather than replaying the request.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CreateRequest request: Trusted target and identity.
@@ -440,11 +431,10 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
 
 
 def _find(client: _SdkClient, request: FindRequest) -> FindResult:
-    """Look for the run carrying this exact identity, without ever creating one.
+    """Poll for an identity's existing run without creating one.
 
-    Polls every ``poll_seconds`` until the run appears. The parent stops this
-    worker at ``timeout_at``, so the polling ends just before it, as a capture's
-    does, to report that no run was found; the first search always happens.
+    Always search once, then poll until just before timeout_at to report absence
+    before the parent deadline stops the worker.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param FindRequest request: Trusted target, identity, and polling bound.
@@ -561,12 +551,10 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
 
 
 def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
-    """Mirror one retained projection, then finish a still-running owned run.
+    """Upload a retained projection and finish a still-running owned run.
 
-    A run that is already terminal keeps its status, so a remote outcome is
-    never overwritten; the projection still records PhaseSweep's result. The
-    summary artifact is named after the projection, so a winner projection
-    never replaces its run's trial summary.
+    Terminal runs retain their status. Projection-specific artifact names keep
+    winner uploads distinct from trial summaries.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.

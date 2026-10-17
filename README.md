@@ -43,7 +43,7 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer reports through the optional `report_objective(...)` helper, which the `json_envelope` extractor reads. Your own trainer can report through that helper, W&B, MLflow, ordinary JSON, or logs.
+The packaged fake trainer uses [`report_objective(...)`](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective). Your own trainer can report through that helper, W&B, MLflow, ordinary JSON, or logs.
 
 ## Install and try it
 
@@ -56,12 +56,12 @@ phasesweep --version
 mkdir phasesweep-demo && cd phasesweep-demo
 phasesweep init                     # writes the starter template, starter.yaml
 phasesweep validate starter.yaml    # checks it without launching anything
-phasesweep run starter.yaml         # four tiny trials, a few seconds
+phasesweep run starter.yaml         # runs four tiny toy-trainer trials
 ```
 
-`phasesweep init` never overwrites an existing file. `phasesweep init --list` names the other templates, which cover a trainer that takes `--key=value` flags, one phase per architecture, a chained search and a [noisy objective](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets); `--template NAME` writes one, and `-o PATH` names the file or a directory that receives `NAME.yaml`. Every template runs as written on the packaged toy trainer, so replace its trainer command, keys and extractor with your own.
+`phasesweep init` never overwrites an existing file. Use `phasesweep init --list` to choose a [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates), `--template NAME` to write it, and `-o PATH` to choose its destination. The templates run on the packaged toy trainer; replace the command, keys, and extractor with your own.
 
-The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining directly and gains one `TRIAL` line per trial that ends; `tail -f` follows it while a sweep runs (abridged):
+The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged):
 
 ```text
 [depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
@@ -93,59 +93,33 @@ params:
 effective_overrides:
   model.n_layers: 8
   optimizer.lr: 0.0003
-# ... completion state, fingerprints, objective provenance, and confound
-# verdicts on the ranked population follow
+# ... completion state and evidence follow
 ```
 
-Every trial of the same run, with its state, value, sampled params, and a `*` on each published winner, is one read-only command away:
+Inspect recorded trials without launching work:
 
 ```bash
 phasesweep status starter.yaml --trials
 ```
 
-```text
-experiment phasesweep_starter: winner (*) marks published generation be4f520d0ec04175ac623ac6184d342e; it does not follow a later run until that run publishes
-
-=== depth === (2 trials)
-trial  state     value  params            duration_s  winner
-    0  COMPLETE    0.3  model.n_layers=8         0.6  *
-    1  COMPLETE    0.5  model.n_layers=6         0.5
-
-=== learning_rate === (2 trials)
-trial  state        value  params               duration_s  winner
-    0  COMPLETE       0.3  optimizer.lr=0.0003         0.6  *
-    1  COMPLETE  0.413822  optimizer.lr=0.0001         0.6
-```
-
-A run stopped by Ctrl-C or a kill resumes when you run the same config again: finished phases replay their winners, and a phase cut short reruns the trials the stop interrupted, with their parameters, before it draws anything new. An interrupted trial never counts toward `n_trials`, so under `grid` or seeded `random` the resumed phase evaluates what an uninterrupted run would at any `n_jobs`, and under seeded `tpe` or `cmaes` it does at `n_jobs: 1` given the same trial values ([interrupted trials rerun](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#interrupted-trials-rerun), [why TPE and CMA-ES need `n_jobs: 1`](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets)).
+Run the same config again to resume after an interruption. See [continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) for trial budgets and reproducibility, and [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for status and result views.
 
 ## Use your own trainer
 
-Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates) closest to your trainer, then choose the input interface it already accepts. `phasesweep explain KEY` prints the reference for one key, and a configuration error from `validate` or `run` ends with `see: phasesweep explain KEY` lines naming the keys involved.
-
-| Input | Command placeholder |
-| --- | --- |
-| Complete base-plus-overrides YAML (`yaml_file`, default) | `--config {config_path}` |
-| Command-line flags (`argparse`) | `{overrides}` produces `--key=value` for every `trainer_config` leaf and override |
-| Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` for every `trainer_config` leaf and override |
-| Nested JSON, base plus overrides (`json_file`) | `--overrides {overrides_path}` |
-
-`argparse` renders a boolean as `--key=true` or `--key=false`, which a plain `store_true` flag rejects; `validate` and `--dry-run` warn when a configured value would render that way. Write such a flag in `trial_command` instead, or have the trainer accept a value.
+Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates) closest to your trainer. Choose its existing [input interface](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-inputs): complete YAML, command-line flags, Hydra overrides, or nested JSON. `phasesweep explain KEY` prints the reference for one key; configuration errors name the relevant keys.
 
 > [!TIP]
-> `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects. A phase that inherits another that still has trials to run previews with stand-in values for the parent's winner, and its line names the inherited keys that hold them. Over an experiment that already has recorded trials it also reports how many trials each phase would still launch, reruns of interrupted trials included, refuses most of what a run would refuse over them, and says that a phase that has reached its `n_trials` would replay its existing result and launch nothing; the phases that inherit it preview with that result's winner. [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) lists the refusals it does and does not make.
+> `phasesweep run starter.yaml --dry-run` previews commands without launching work. Check it before a real run; [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) explains inherited placeholders and preview limitations.
 
-The trainer runs in `execution.cwd`, or in the directory you started PhaseSweep from when that is unset, with a minimal environment: `PATH`, `HOME`, `TMPDIR` and a few more, not the shell's `PYTHONPATH`, conda settings, caches or credentials. Name what it needs under `env` or `execution.inherit_env`; `validate` and `--dry-run` print the `environment:` and `trainer cwd:` lines, and a relative path in the config resolves against the config file's directory. The [trainer contract](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract) has the details.
+Set `execution.cwd`, `env`, and `execution.inherit_env` for the [trainer's working directory and environment](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract). `validate` and `--dry-run` print the launch contract so you can check it before training.
 
-For ordinary JSON output, pass an output path under `{trial_dir}` to your trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`. For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`, have the trainer honor the supplied W&B identity, and install the extra:
+Choose an [objective extractor](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates) for the trainer's output. For W&B, install the extra and follow the [W&B setup](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence):
 
 ```bash
 pip install "phasesweep[wandb]"
 ```
 
-For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
-
-Report through `phasesweep.report_objective(...)` and the `json_envelope` extractor when the checkpoint behind a value matters, as with Transformers' `load_best_model_at_end`; the same call can write report-only values with `extra=`. A top-level `observe:` list records such values per trial without ranking on them, for example a held-out test score, and `metric.min` / `metric.max` keep a collapsed run from winning. When the metric moves with the seed, spend trials on more distinct values and read the trend across neighbors; `repeats` ranks by a mean over seeds when you compare a few discrete finalists. [Noisy objectives and small budgets](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets) covers these together, and [objective evidence](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates) defines the extractors, bounds and `observe`.
+For MLflow, install `phasesweep[mlflow]` and follow the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md). Use [objective reporting](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective) when the checkpoint behind a value matters, and [small-budget advice and repeats](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets) for noisy measurements.
 
 ## Connect an agent
 

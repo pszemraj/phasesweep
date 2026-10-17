@@ -14,6 +14,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from unittest.mock import DEFAULT, Mock
 
 import optuna
 import pytest
@@ -22,23 +23,20 @@ import yaml
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.config import ExecutionContext, Experiment, Phase, load_experiment
-from phasesweep.engine import (
+from phasesweep.config.io import load_experiment
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.engine.artifact_roots import _bind_study_artifact_root
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    NoFeasibleTrialError,
-    ProcessCleanupUncertainError,
     PublishedStudyMissingError,
-    TerminalReport,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
     TrackingTargetUnavailableError,
     TrialTargetRefusedError,
-    read_status,
-    run_experiment,
 )
-from phasesweep.engine.artifact_roots import _bind_study_artifact_root
-from phasesweep.engine.attempts import _register_active_attempt
-from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
@@ -48,6 +46,9 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _trial_dir_for,
 )
+from phasesweep.engine.read import read_status
+from phasesweep.engine.run import TerminalReport, run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -55,7 +56,12 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     Winner,
 )
-from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
+from phasesweep.errors import (
+    OPERATOR_STEPS,
+    OperatorAction,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.registry import Registry
@@ -254,7 +260,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "fresh artifact root and local storage",
+            "fresh namespace for the state identified in the error",
             id="artifact_root",
         ),
     ],
@@ -270,7 +276,7 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     toward a new experiment name or archiving a healthy study; falling through to
     ``internal_error`` would report a plain misconfiguration as a bug.
     """
-    failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
 
     assert failure["code"] == code
     assert failure["stage"] == "preflight"
@@ -285,16 +291,17 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     Only persistent storage keeps the abort this refusal records, so raising
     n_trials is not a step every such raise requires; the message says when.
     """
-    failure = mcp_runner._safe_failure_payload(
+    failure = mcp_runner._terminal_failure_payload(
         ActiveAttemptPersistenceError("attempt registry is unwritable"),
         stage="execution",
+        cleanup_confirmed=True,
     )
 
     assert failure["code"] == "storage_unavailable"
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
-        "Ask the operator to repair the experiment tree's files and permissions, deleting a "
+        "Ask the operator to restore the files and permissions identified in the error, deleting a "
         "file only if certain nothing is running. The error in the PhaseSweep run log gives "
         "the details."
     )
@@ -342,7 +349,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     assert status["result_snapshot_state"] == "complete"
     handle = store.get(run_id)
     assert handle is not None
-    assert store.recovery_required(handle) is False
+    assert store.observe(handle).recovery_required is False
     assert _generation_path(experiment).read_bytes() == generation_before
     assert not (_experiment_dir(experiment) / "study.journal").exists()
 
@@ -358,10 +365,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
 ) -> None:
     """Repairing a pre-launch ledger failure must let operator recovery release its slot.
 
-    A torn or garbage *final* record is now self-repaired before a write, so
-    only damage a repair may never cut remains here: a malformed record
-    another record follows (never repaired, an interior corruption cannot be
-    an in-flight append) and a permission denial (the repair itself refused).
+    Torn or malformed final records are repaired before writes. Interior
+    corruption cannot be an in-flight append, and permission denial prevents
+    repair; both require operator restoration before recovery releases capacity.
     """
     published = history != "fresh"
     from_phase = "q" if history == "resume" else None
@@ -428,7 +434,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        assert "Restore the original complete storage ledger" in refused_run.stderr
+        assert "restore or repair the storage ledger and access to it" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -474,17 +480,15 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         assert status["failure"]["retryable"] is False
         assert status["failure"]["cause"]["code"] == "storage_unavailable"
         assert status["failure"]["cause"]["stage"] == "preflight"
-        # The cause routes a ledger restore, which only the operator can do;
-        # test_error_routing.py's routing sweep is the one owner of the
-        # composed remediation text for cleanup_uncertain + storage_unavailable.
         assert status["failure"]["cause"]["retryable"] is False
         assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
         assert str(ledger) not in json.dumps(status["failure"])
         assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
         handle = store.get(run_id)
         assert handle is not None
-        assert store.state(handle) == "running"
-        assert store.recovery_required(handle)
+        observation = store.observe(handle)
+        assert observation.state == "running"
+        assert observation.recovery_required
         with pytest.raises(ConcurrencyLimitError):
             app.launch("other")
 
@@ -493,7 +497,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             blocked = recover_run_cli(state_dir, run_id, confirm=confirm)
             assert blocked.exit_code != 0
             assert "could not be" in blocked.output
-            assert "Restore the original complete storage ledger" in blocked.output
+            assert f"fix: {OPERATOR_STEPS[OperatorAction.RESTORE_LEDGER]}." in blocked.output
+            assert "Retry phasesweep mcp recover-run after repairing" in blocked.output
             if damage == "permission-denied":
                 assert ledger.stat().st_mode & 0o777 == 0
             else:
@@ -525,11 +530,12 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     store.status_path(run_id).write_bytes(terminal_before)
     preflight = recover_run_cli(state_dir, run_id)
     assert preflight.exit_code == 0, preflight.output
-    assert store.recovery_required(handle)
+    assert store.observe(handle).recovery_required
     confirmed = recover_run_cli(state_dir, run_id, confirm=True)
     assert confirmed.exit_code == 0, confirmed.output
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
     assert live_runs(store) == []
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
@@ -702,7 +708,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert mcp_runner._OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE] in remediation
+    assert "fresh namespace for the state identified in the error" in remediation
 
 
 @pytest.mark.integration
@@ -720,10 +726,14 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "record_fail")
 
-    def fail_record_write(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated record write failure")
+    real_write = generation_ops.atomic_create_text
 
-    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
+    def fail_record_write(path: Path, text: str) -> bool:
+        if path.name == "generation.yaml":
+            raise OSError("simulated record write failure")
+        return real_write(path, text)
+
+    monkeypatch.setattr(generation_ops, "atomic_create_text", fail_record_write)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"
@@ -747,7 +757,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     assert [w["phase"] for w in terminal["result_snapshot"]["winners"]] == ["p"]
     handle = store.get(run_id)
     assert handle is not None
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 @pytest.mark.integration
@@ -867,14 +877,8 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
     """Discovery failure during reconciliation cannot attest to unscanned attempts."""
     experiment = make_experiment(workdir=tmp_path / "runs")
     cleanup_error = error_type("artifact root cannot be inspected")
-    registry_scans = 0
-
-    def fail_discovery(*args: object, **kwargs: object) -> None:
-        raise cleanup_error
-
-    def scan_registry(*args: object, **kwargs: object) -> None:
-        nonlocal registry_scans
-        registry_scans += 1
+    scan_registry = Mock(return_value=None)
+    fail_discovery = Mock(side_effect=cleanup_error)
 
     def fail_run(*args: object, **kwargs: object) -> None:
         # Initial discovery and preflight succeeded. Only reconciliation loses
@@ -890,7 +894,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
-    assert registry_scans == 1
+    scan_registry.assert_called_once()
     assert len(captured) == 1
     assert isinstance(captured[0].primary_error, NoFeasibleTrialError)
     assert captured[0].cleanup_confirmed is False
@@ -931,13 +935,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
             child_pgids=(1234,),
         ),
     )
-    preflight_calls = 0
-
-    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
-        nonlocal preflight_calls
-        del cleanup_report, from_phase
-        preflight_calls += 1
-        return {}
+    preflight = Mock(return_value={})
 
     def cancel_run(*args: object, **kwargs: object) -> None:
         raise shutdown
@@ -950,7 +948,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert exc_info.value is shutdown
-    assert preflight_calls == 2
+    assert preflight.call_count == 2
     assert len(captured) == 1
     report = captured[0]
     assert report.primary_error is shutdown
@@ -996,15 +994,7 @@ def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
             child_pgids=(),
         ),
     )
-    preflight_calls = 0
-
-    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
-        nonlocal preflight_calls
-        del cleanup_report, from_phase
-        preflight_calls += 1
-        if preflight_calls == 2:
-            raise shutdown
-        return {}
+    preflight = Mock(side_effect=[{}, shutdown])
 
     def fail_run(*args: object, **kwargs: object) -> None:
         raise initial_error
@@ -1166,6 +1156,18 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     )
 
 
+def _write_captured_terminal_status(
+    status_path: Path, snapshot: dict[str, object], *, run_id: str = "r0"
+) -> bool:
+    """Persist a successful terminal outcome and its captured result snapshot."""
+    return mcp_runner._write_status(
+        status_path,
+        {"run_id": run_id, "returncode": 0, "error_class": None, "cleanup_confirmed": True},
+        result_snapshot=snapshot,
+        result_snapshot_error=None,
+    )
+
+
 def test_runner_records_snapshot_serialization_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1176,30 +1178,12 @@ def test_runner_records_snapshot_serialization_failure(
         lambda *_args, **_kwargs: {"not_json": object()},
     )
 
-    mcp_runner._write_status(
-        status_path,
-        {
-            "run_id": "r0",
-            "returncode": 0,
-            "error_class": None,
-            "cleanup_confirmed": True,
-        },
-        result_snapshot={},
-        result_snapshot_error=None,
-    )
+    _write_captured_terminal_status(status_path, {})
 
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "failed"
     assert final["result_snapshot_error"] == "TypeError"
     assert "result_snapshot" not in final
-
-
-_TERMINAL_PAYLOAD: dict[str, object] = {
-    "run_id": "r0",
-    "returncode": 0,
-    "error_class": None,
-    "cleanup_confirmed": True,
-}
 
 
 def test_transient_terminal_status_write_failure_is_retried(
@@ -1212,29 +1196,16 @@ def test_transient_terminal_status_write_failure_is_retried(
     """
     status_path = tmp_path / "status.json"
     monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
-    real_replace = os.replace
-    replacements: list[object] = []
-
-    def replace_failing_once(src: object, dst: object, **kwargs: object) -> None:
-        replacements.append(dst)
-        if len(replacements) == 1:
-            raise OSError("simulated transient atomic replace failure")
-        real_replace(src, dst, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_failing_once)
-
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
+    replace_file = Mock(
+        wraps=os.replace,
+        side_effect=[OSError("simulated transient atomic replace failure"), DEFAULT, DEFAULT],
     )
+    monkeypatch.setattr("phasesweep.runtime.files.os.replace", replace_file)
+
+    assert _write_captured_terminal_status(status_path, {"captured": True}) is True
 
     # Failed pending write, its retry, then the complete write.
-    assert len(replacements) == 3
+    assert replace_file.call_count == 3
     final = json.loads(status_path.read_text())
     assert final["result_snapshot_state"] == "complete"
     assert final["result_snapshot"] == {"captured": True}
@@ -1258,15 +1229,7 @@ def test_transient_snapshot_state_write_failure_is_retried(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", write_failing_on_the_complete_transition)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"captured": True}) is True
 
     assert states == ["pending", "complete", "complete"]
     final = json.loads(status_path.read_text())
@@ -1279,26 +1242,13 @@ def test_exhausted_status_write_retries_report_missing_terminal_evidence(
 ) -> None:
     """When nothing can be persisted, say so instead of returning as if it were."""
     status_path = tmp_path / "status.json"
-    attempts: list[Path] = []
-
-    def refuse_every_write(path: Path, _payload: dict) -> None:
-        attempts.append(path)
-        raise OSError("simulated persistent status write failure")
-
-    monkeypatch.setattr(mcp_runner, "write_status_file", refuse_every_write)
+    write_status = Mock(side_effect=OSError("simulated persistent status write failure"))
+    monkeypatch.setattr(mcp_runner, "write_status_file", write_status)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"):
-        assert (
-            mcp_runner._write_status(
-                status_path,
-                dict(_TERMINAL_PAYLOAD),
-                result_snapshot={"captured": True},
-                result_snapshot_error=None,
-            )
-            is False
-        )
+        assert _write_captured_terminal_status(status_path, {"captured": True}) is False
 
-    assert len(attempts) == 3
+    assert write_status.call_count == 3
     assert not status_path.exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
 
@@ -1329,15 +1279,7 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", write_only_the_pending_record)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            {**_TERMINAL_PAYLOAD, "run_id": run_id},
-            result_snapshot={"captured": True},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"captured": True}, run_id=run_id) is True
 
     # Three exhausted complete attempts, and no downgrade write after them.
     assert states == ["pending", "complete", "complete", "complete"]
@@ -1345,8 +1287,9 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
     assert durable["result_snapshot_state"] == "pending"
     assert durable["result_snapshot"] == {"captured": True}
     assert "result_snapshot_error" not in durable
-    assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.snapshot_recovery_required
 
 
 def test_unserializable_captured_snapshot_still_records_terminal_evidence(
@@ -1367,15 +1310,7 @@ def test_unserializable_captured_snapshot_still_records_terminal_evidence(
 
     monkeypatch.setattr(mcp_runner, "write_status_file", counting_write)
 
-    assert (
-        mcp_runner._write_status(
-            status_path,
-            dict(_TERMINAL_PAYLOAD),
-            result_snapshot={"not_json": object()},
-            result_snapshot_error=None,
-        )
-        is True
-    )
+    assert _write_captured_terminal_status(status_path, {"not_json": object()}) is True
 
     assert writes == ["pending", "failed"]
     final = json.loads(status_path.read_text())
@@ -1390,7 +1325,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 ) -> None:
     """A sweep with no MCP-visible outcome is not a clean exit.
 
-    The required precommit snapshot write now fails the publication itself.
+    A failed required precommit snapshot write prevents publication.
     The process entry point converts this propagated error to a nonzero exit;
     an in-process invocation sees the original error and no pointer advances.
     """
@@ -1423,7 +1358,9 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
-    assert store.state(make_run_handle(run_id=run_id, experiment_id="no_status")) == "running"
+    assert (
+        store.observe(make_run_handle(run_id=run_id, experiment_id="no_status")).state == "running"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1464,7 +1401,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
     experiment = load_experiment(config_path)
-    original_stats = engine_ledger._trial_stats
+    original_stats = engine_ledger.read_trial_stats
 
     def unavailable_during_prepared_capture(
         ledger: engine_ledger.ValidatedLedger,
@@ -1481,7 +1418,9 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
 
         return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(engine_ledger, "_trial_stats", unavailable_during_prepared_capture)
+    monkeypatch.setattr(
+        "phasesweep.engine.read.read_trial_stats", unavailable_during_prepared_capture
+    )
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare
@@ -1651,6 +1590,37 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
     assert handle.visible_params_at_launch == ["lr"]
 
 
+@pytest.mark.parametrize("field", ["experiment_id", "config_sha256", "started_at", "allow_cancel"])
+def test_runner_refuses_protocol_metadata_that_differs_from_launch_reservation(
+    tmp_path: Path, field: str
+) -> None:
+    """Process identity cannot replace the immutable metadata reserved by the server."""
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-identity-metadata"
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="a" * 64,
+        config_dir=tmp_path,
+        started_at=started_at,
+    )
+    pending = store.get(run_id)
+    assert pending is not None
+
+    with pytest.raises(ValueError, match=field):
+        mcp_runner._persist_spawned_handle(
+            state_dir=tmp_path / "state",
+            run_id=run_id,
+            experiment_id="other" if field == "experiment_id" else "srv",
+            config_sha256="b" * 64 if field == "config_sha256" else "a" * 64,
+            started_at="2026-06-25T00:00:00Z" if field == "started_at" else started_at,
+            allow_cancel=field == "allow_cancel",
+        )
+
+    assert store.get(run_id) == pending
+
+
 @pytest.mark.integration
 def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,
@@ -1723,7 +1693,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
     assert handle.pid_starttime == read_proc_starttime(os.getpid())
     assert handle.started_at == started_at
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
     assert calls == [("srv", None, False)]
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None

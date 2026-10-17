@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping
+from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from phasesweep.config import Experiment
-from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine import PhaseWinnerView, read_result, read_status
+from phasesweep.config.models import Experiment, _metric_semantics_payload
+from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     ConfoundCheck,
     ConfoundVerdict,
@@ -21,14 +20,19 @@ from phasesweep.engine.confound import (
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
-from phasesweep.engine.read import ResultContext
-from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
+from phasesweep.engine.read import (
+    EngineStatus,
+    PhaseWinnerView,
+    ResultContext,
+    read_result,
+    read_status,
+)
+from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
     RecoveredTrialState,
     Winner,
-    WinnerSource,
     WinnerSourceKind,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
@@ -48,19 +52,24 @@ class _SnapshotModel(BaseModel):
 
 
 class ObjectiveEvidenceSnapshot(_SnapshotModel, _ObjectiveEvidenceFields):
-    """Assurance properties of the configured objective extractor.
+    """Identity checks enforced by the configured objective extractor.
 
-    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
-    exactly what each flag means and which runtime checks back it.
+    False means unenforced. ``*_declared`` marks configured expectations;
+    ``*_value_bound`` marks enforced equality with those expectations.
     """
 
 
 class MetricSnapshot(_SnapshotModel):
-    """Optimization metric stored with a terminal run snapshot."""
+    """Optimization metric and objective-evidence assurance."""
 
-    name: str
-    goal: Literal["minimize", "maximize"]
-    objective_evidence: ObjectiveEvidenceSnapshot
+    name: str = Field(description="Metric key extracted from trial output.")
+    goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
+    objective_evidence: ObjectiveEvidenceSnapshot = Field(
+        description=(
+            "False flags mean the identity is not enforced, not that it failed. kind names the "
+            "extractor. Only json_envelope, wandb and mlflow bind an evaluation position."
+        )
+    )
 
 
 class RunningAttemptSnapshot(_SnapshotModel):
@@ -85,63 +94,35 @@ class PhaseStatusSnapshot(_SnapshotModel):
     winner_present: bool
     trial_data_available: bool
     published_study_unavailable: bool | None = None
-    """Whether the published study was unavailable at capture time.
-
-    ``None`` means availability was not checked, as in pre-generation
-    placeholders. It is not evidence of study availability.
-    """
+    """Published study unavailable at capture; ``None`` means unchecked."""
     running_attempts: list[RunningAttemptSnapshot] | None = None
-    """RUNNING rows the frozen counts describe, or ``None`` when unknown.
+    """RUNNING rows behind the frozen counts; ``None`` means no trial data was read.
 
-    ``None`` means the capture read no trial data for this phase, i.e. it
-    pairs with ``trial_data_available: false`` -- an empty list would assert
-    there are no RUNNING rows. A phase with known trial counts always carries
-    a list, empty when nothing is RUNNING, including a confirmed absent study.
+    Known counts carry a list, empty when no row is RUNNING or the study is absent.
     """
 
 
 class StatusSnapshot(_SnapshotModel):
-    """Path-free terminal status view captured by the detached runner.
-
-    ``current_generation_id`` and ``published_generation_id`` record the
-    mutable/last-success pointers at capture time. Run-scoped MCP reads keep
-    them frozen so a later generation cannot rewrite
-    this run's historical result.
-    ``represented_generation_id`` is the generation whose winner/summary facts
-    this snapshot shows. ``is_published`` records that relationship at capture
-    time.
-    See :func:`phasesweep.engine.read.read_status`.
-    """
+    """Terminal status with generation identity and publication frozen at capture."""
 
     current_generation_id: str | None = None
     published_generation_id: str | None = None
     represented_generation_id: str | None = None
     is_published: bool = False
     publication_integrity: McpPublicationState
-    """Publication verdict at capture time.
-
-    This is captured explicitly, so a snapshot never invents a publication
-    verdict while being read.
-    """
+    """Publication verdict recorded at capture time."""
 
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
 
     result_context: ResultContext
-    """Whether ``metric`` and ``result_phase_plan`` are the represented
-    generation's own recorded semantics or the executing config's.
-
-    This is captured explicitly with the result labels.
-    """
+    """Source of ``metric`` and ``result_phase_plan``: represented generation or config."""
 
     published_config_matches_current: bool | None = None
-    """Whether the represented generation's config matched at capture time.
+    """Config agreement at capture, recomputed against the catalog on run-scoped reads.
 
-    Run-scoped MCP reads recompute this from the frozen represented-config
-    fingerprint and current catalog config; it is ``None`` when no comparison
-    config is available, or when the represented summary recorded no
-    fingerprint.
+    ``None`` means the comparison config or represented fingerprint was unavailable.
     """
 
     result_phase_plan: list[str]
@@ -267,21 +248,6 @@ class RepeatsSpread(_SnapshotModel):
         description="Trial numbers of the members, ascending; the last one is trial_number."
     )
 
-    def view(self) -> RepeatsSummary:
-        """Return the summary in the engine's read-view shape.
-
-        :return RepeatsSummary: The same reducer, spread and member trial numbers.
-        """
-        return {
-            "reduce": self.reduce,
-            "n": self.n,
-            "mean": self.mean,
-            "sd": self.sd,
-            "min": self.min,
-            "max": self.max,
-            "member_trials": list(self.member_trials),
-        }
-
 
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
@@ -298,27 +264,6 @@ class WinnerSnapshot(_SnapshotModel):
     confound: ConfoundSummary
     observed: dict[str, float]
     repeats: RepeatsSpread | None
-
-
-def _winner_source_snapshot(
-    winner: PhaseWinnerView | Winner,
-) -> WinnerSourceSnapshot:
-    """Return the concrete source model for a stored or engine-returned winner.
-
-    :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
-    :raises RuntimeError: The winner carries no source provenance.
-    :return WinnerSourceSnapshot: Concrete, validated source snapshot.
-    """
-    source = winner.source
-    if source is None:
-        raise RuntimeError("Current-format winner is missing source provenance.")
-    return WinnerSourceSnapshot(
-        kind=source.kind,
-        phase=source.phase,
-        trial_number=source.trial_number,
-        generation_id=source.generation_id,
-        attempt_id=source.attempt_id,
-    )
 
 
 def _winner_snapshot(
@@ -351,6 +296,9 @@ def _winner_snapshot(
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
         repeats = winner.repeats
+    source = winner.source
+    if source is None:
+        raise RuntimeError("Current-format winner is missing source provenance.")
     return WinnerSnapshot(
         phase=phase,
         trial_number=winner.trial_number,
@@ -358,9 +306,9 @@ def _winner_snapshot(
         params=dict(winner.params),
         gates_passed=gates_passed,
         incomplete=incomplete,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-        source=_winner_source_snapshot(winner),
+        generation_id=winner.generation_id if isinstance(winner, Winner) else source.generation_id,
+        attempt_id=winner.attempt_id if isinstance(winner, Winner) else source.attempt_id,
+        source=WinnerSourceSnapshot.model_validate(asdict(source)),
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
@@ -373,85 +321,46 @@ class RunResultSnapshot(_SnapshotModel):
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
-    """Semantic fingerprint of the represented result's config, when known.
+    """Represented config's semantic fingerprint, captured using the run's working directory."""
 
-    The runner computes this while executing from its frozen catalog working
-    directory. Keeping the digest in the terminal snapshot lets later MCP
-    reads compare against the current catalog without consulting the artifact
-    tree or resolving an omitted ``execution.cwd`` against the server's own
-    unrelated working directory.
-    """
-
-    def status_payload(self) -> dict[str, Any]:
+    def status_payload(self) -> EngineStatus:
         """Return the stored status in the engine reader's path-free shape.
 
-        :return dict[str, Any]: Status mapping accepted by the MCP payload builder.
+        :return EngineStatus: Status mapping accepted by the MCP payload builder.
         """
-        payload = self.status.model_dump(mode="json")
-        for phase in payload["phases"]:
-            phase.pop("running_attempts", None)
-        return payload
-
-    def winner_views(self) -> list[PhaseWinnerView]:
-        """Return stored winners as the engine view consumed by MCP redaction.
-
-        :return list[PhaseWinnerView]: Winner views with intentionally empty effective overrides.
-        """
-        return [
-            PhaseWinnerView(
-                phase=winner.phase,
-                trial_number=winner.trial_number,
-                metric=winner.metric,
-                params=winner.params,
-                effective_overrides={},
-                gates_passed=winner.gates_passed,
-                incomplete=winner.incomplete,
-                generation_id=winner.generation_id,
-                attempt_id=winner.attempt_id,
-                source=WinnerSource(
-                    kind=winner.source.kind,
-                    phase=winner.source.phase,
-                    trial_number=winner.source.trial_number,
-                    generation_id=winner.source.generation_id,
-                    attempt_id=winner.source.attempt_id,
-                ),
-                confound=winner.confound.model_dump(mode="json"),
-                observed=dict(winner.observed),
-                repeats=None if winner.repeats is None else winner.repeats.view(),
-            )
-            for winner in self.winners
-        ]
+        status = self.status
+        return {
+            "current_generation_id": status.current_generation_id,
+            "published_generation_id": status.published_generation_id,
+            "represented_generation_id": status.represented_generation_id,
+            "is_published": status.is_published,
+            "publication_integrity": status.publication_integrity,
+            "metric": status.metric.model_dump(mode="json"),
+            "phases": [
+                phase.model_dump(mode="json", exclude={"running_attempts"})
+                for phase in status.phases
+            ],
+            "summary_present": status.summary_present,
+            "result_context": status.result_context,
+            "published_config_matches_current": status.published_config_matches_current,
+            "result_phase_plan": list(status.result_phase_plan),
+        }
 
 
-def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, Any]:
-    """Freeze known config shape without reading mutable study or winner state.
+def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultSnapshot:
+    """Freeze config shape with zero trial counts, no winners and no generation ID.
 
-    Used when the engine crashed before ever claiming a generation, so no
-    lock-protected read of shared Optuna study/winner state is safe. Builds a
-    snapshot purely from the static experiment config: every phase's declared
-    ``n_trials`` with all trial-state counts at zero, no winners, and no
-    generation id.
+    Reads no mutable study or winner state; publication and trial availability are unknown.
 
     :param Experiment experiment: Exact config snapshot the detached runner
         attempted to execute.
-    :return dict[str, Any]: JSON-serializable placeholder result snapshot.
+    :return RunResultSnapshot: Validated placeholder result snapshot.
     """
     zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
-    snapshot = RunResultSnapshot(
+    return RunResultSnapshot(
         status=StatusSnapshot(
-            current_generation_id=None,
-            published_generation_id=None,
-            represented_generation_id=None,
-            is_published=False,
-            # Nothing was read from disk here. Calling that "absent" would
-            # falsely assert no publication exists and tell agents there is no
-            # operator problem; this placeholder can only report that the
-            # publication verdict is unknown.
             publication_integrity="unknown",
-            # No summary was read either, so these labels are the config's own
-            # and no drift verdict was reached.
             result_context="current_config",
-            published_config_matches_current=None,
             result_phase_plan=[phase.name for phase in experiment.phases],
             metric=MetricSnapshot.model_validate(_metric_semantics_payload(experiment.metric)),
             phases=[
@@ -464,17 +373,13 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
                     generation_trials={},
                     winner_present=False,
                     trial_data_available=False,
-                    # Nothing was read, so nothing is known about RUNNING rows.
-                    running_attempts=None,
                 )
                 for phase in experiment.phases
             ],
             summary_present=False,
         ),
         winners=[],
-        represented_config_fingerprint=None,
     )
-    return snapshot.model_dump(mode="json")
 
 
 def capture_result_snapshot(
@@ -483,35 +388,14 @@ def capture_result_snapshot(
     generation_id: str | None = None,
     engine_winners: Mapping[str, Winner] | None = None,
 ) -> dict[str, Any]:
-    """Capture one experiment's current path-free status and sampled winners.
+    """Capture path-free status and winners for the requested generation.
 
-    When ``generation_id`` is given (the detached runner always pins its own
-    generation), the captured status's ``represented_generation_id`` equals
-    it and the frozen winners are read from that exact generation, regardless
-    of whether it ever became the actual last-success pointer -- so a
-    failed-publication generation's terminal snapshot still reports its own
-    (unpublished) partial results, correctly flagged ``is_published: False``.
+    A pinned generation retains its own partial winners even if unpublished. One tolerant
+    status read supplies all counts and RUNNING identities; unreadable phases retain
+    ``trial_data_available: false``. Engine-supplied winners are authoritative; otherwise
+    read the generation's validated winner bytes and recorded phase plan.
 
-    The engine and this capture must agree about what a valid terminal
-    result is: the per-generation lifecycle record is an optional
-    post-commit diagnostic to the engine, so its absence is tolerated here
-    and only a mismatch is logged; storage reads only *enrich* the
-    snapshot (a phase whose counts are unreadable is frozen with
-    ``trial_data_available: false`` rather than failing the capture); and
-    when the engine hands over its own authoritative ``engine_winners``, the
-    frozen winners come from that exact in-memory outcome instead of a
-    second read of the winner files.
-
-    Exactly one storage read backs that agreement. Every trial fact frozen
-    here -- counts, generation counts, and the RUNNING identities later used
-    to reconcile cleanup evidence -- comes from the single tolerant
-    :func:`phasesweep.engine.read.read_status` call below. Reloading each
-    phase study afterwards to collect those identities would be an intolerant
-    read with no retry: one transient "database is locked" in that window
-    would fail the capture of an otherwise successful multi-hour run, and a
-    terminal snapshot that was never captured is unrecoverable by design
-    (see docs/mcp.md). Freezing a valid terminal result must not depend on a
-    second storage round trip.
+    An absent post-commit lifecycle record is tolerated; mismatches are logged.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
@@ -520,14 +404,7 @@ def capture_result_snapshot(
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
     """
     if generation_id is not None:
-        # Best-effort diagnostic cross-check only: the record is written
-        # post-commit and may legitimately be absent.
-        try:
-            lifecycle = yaml.safe_load(
-                _generation_record_path(experiment, generation_id).read_text()
-            )
-        except (OSError, ValueError, yaml.YAMLError):
-            lifecycle = None
+        lifecycle = read_yaml_or_none(_generation_record_path(experiment, generation_id))
         if lifecycle is not None and (
             not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id
         ):
@@ -536,40 +413,17 @@ def capture_result_snapshot(
                 "capturing the terminal snapshot from the authoritative artifacts anyway",
                 generation_id,
             )
-    # One tolerant read supplies every storage fact this snapshot freezes,
-    # including the RUNNING identities in each phase's ``running_attempts``
-    # (``None`` where ``trial_data_available`` is false). This capture must
-    # never reread a study afterwards.
     if engine_winners is not None:
         status = read_status(experiment, generation_id=generation_id)
-        # The engine's terminal report is the authority on a successful
-        # outcome; freeze exactly what it returned instead of re-reading the
-        # winner files.
         winner_snapshots = [
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
     else:
-        # One resolution supplies both the status and the winners of the
-        # generation this snapshot *represents*, not the (possibly different)
-        # true current pointer: a pinned capture wants exactly its own
-        # generation's winners even when a newer generation has since become
-        # current. A published generation's winners are the bytes its
-        # validation read, enumerated under its own recorded phase plan.
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
-        status=StatusSnapshot(
-            current_generation_id=status["current_generation_id"],
-            published_generation_id=status["published_generation_id"],
-            represented_generation_id=status["represented_generation_id"],
-            is_published=status["is_published"],
-            publication_integrity=status["publication_integrity"],
-            metric=status["metric"],
-            phases=status["phases"],
-            summary_present=status["summary_present"],
-            result_context=status["result_context"],
-            published_config_matches_current=status["published_config_matches_current"],
-            result_phase_plan=status["result_phase_plan"],
+        status=StatusSnapshot.model_validate(
+            {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
         ),
         winners=winner_snapshots,
         represented_config_fingerprint=(
@@ -587,13 +441,9 @@ def mark_result_snapshot_published(
     generation_id: str,
     published_summary: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind a prepared result snapshot to its completed publication commit.
+    """Bind a prepared snapshot to its committed publication and summary availability flags.
 
-    Detached MCP runs capture and persist their exact generation before the
-    engine advances the last-success pointer. Once that pointer commits, this
-    transition updates the frozen publication relationship and updates each
-    phase's storage-availability verdict to the committed summary. It never
-    rereads shared study state or reconstructs winner facts.
+    Preserve captured winner facts without rereading shared study state.
 
     :param Mapping[str, object] snapshot: Snapshot prepared under the experiment lock.
     :param str generation_id: Generation whose last-success pointer just committed.
@@ -612,10 +462,7 @@ def mark_result_snapshot_published(
         raise RuntimeError("prepared result snapshot has no generation summary")
     published_phases = set(_published_phase_trial_refs(published_summary))
     for phase in status.phases:
-        # The prepared snapshot describes the old pointer. Clear phases the new
-        # summary did not publish, flag every selected phase whose one capture
-        # read was unavailable, and retain a readable carried phase's prior
-        # unavailability verdict.
+        # Rebind selected phases to the committed summary; retain carried-phase availability.
         if phase.phase not in published_phases:
             phase.published_study_unavailable = False
         elif not phase.trial_data_available:
@@ -632,14 +479,10 @@ def finalize_result_snapshot(
     confirmed_attempt_ids: Collection[str] = (),
     confirmed_attempt_locations: Mapping[str, tuple[str, int, str]] | None = None,
 ) -> dict[str, Any]:
-    """Finalize a previously captured snapshot without rereading shared state.
+    """Reconcile captured RUNNING identities without rereading shared state.
 
-    A phase whose capture recorded no RUNNING identities (``running_attempts``
-    is ``None``, which pairs with ``trial_data_available: false``) is left
-    exactly as captured: there is nothing to reconcile the cleanup report
-    against, and its counts were never read either. Each reconciled attempt
-    moves from ``RUNNING`` to the state its capture recorded it recovers as,
-    ``INTERRUPTED`` or ``FAIL``.
+    Recovered attempts become their captured ``INTERRUPTED`` or ``FAIL`` state. Phases
+    with unavailable trial data and no RUNNING identities remain unchanged.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled by recovery.
@@ -664,10 +507,6 @@ def finalize_result_snapshot(
     }
     for phase in parsed.status.phases:
         if phase.running_attempts is None:
-            # The capture read no trial data for this phase, so it recorded no
-            # RUNNING identities to reconcile against. Its counts are equally
-            # unread, and inventing a reconciliation over them would fabricate
-            # states this snapshot never observed.
             continue
         recovered: list[tuple[RunningAttemptSnapshot, str | None]] = []
         for attempt in phase.running_attempts:
@@ -685,10 +524,7 @@ def finalize_result_snapshot(
         for attempt, _generation_id in recovered:
             phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
         phase.running = phase.trials["RUNNING"]
-        # generation_trials was captured scoped to represented_generation_id
-        # (the pinned id for a run snapshot), not current_generation_id, which
-        # is always the actual mutable pointer and may be unrelated to --
-        # or absent for -- this snapshot's own generation.
+        # Generation counts belong to represented_generation_id.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt

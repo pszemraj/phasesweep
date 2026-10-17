@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
     _check_study_artifact_root,
@@ -69,12 +69,7 @@ from phasesweep.runtime.time import utc_now_iso
 
 
 class RunRecoveryError(PhaseSweepError):
-    """An operator recovery request cannot be completed safely.
-
-    Every raise happens inside ``recover-run``, so the class default cannot be
-    that command: a raise whose remedy is a confirmed ``recover-run`` says so
-    explicitly or inherits it from its cause.
-    """
+    """An operator recovery request cannot be completed safely."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
@@ -278,7 +273,7 @@ def _recover_pre_spawn_orphan(
     with store.launch_lock() as acquired:
         if not acquired:
             raise RunRecoveryError(
-                "another MCP launch is in progress; wait for it to finish and retry",
+                "another MCP launch is in progress",
                 action=OperatorAction.RETRY,
             )
         if store.is_pre_spawn_orphan(run_id):
@@ -340,7 +335,7 @@ def _resolve_launch_state(
             raise RunRecoveryError(
                 "launch outcome is unresolved: the durable handle cannot distinguish a "
                 "pre-spawn failure from a child that has not persisted its process identity. "
-                "The run remains reserved. Wait briefly and retry; if this persists after a "
+                "The run remains reserved. If this persists after a "
                 "server crash, inspect the host because automated recovery cannot safely "
                 "declare that no runner was spawned.",
                 action=OperatorAction.RETRY,
@@ -366,8 +361,9 @@ def _recovery_needs(
     :raises RunRecoveryError: No immutable snapshot remains for a result that cannot be rebuilt.
     :return _RecoveryNeeds: Decisions and parsed terminal evidence used by later recovery steps.
     """
-    cleanup_required = store.cleanup_recovery_required(handle, view=view)
-    snapshot_recovery_required = store.snapshot_recovery_required(handle, view=view)
+    observation = store.observe(handle, view=view)
+    cleanup_required = observation.cleanup_recovery_required
+    snapshot_recovery_required = observation.snapshot_recovery_required
     terminal_cleanup_uncertain = (
         terminal_status is not None
         and terminal_status.get("cleanup_confirmed") is False
@@ -433,13 +429,10 @@ def _recovery_needs(
 def _require_dead_runner(
     identity: ProcessIdentity, *, view: RunnerView, cleanup_needed: bool
 ) -> None:
-    """Reject a live runner or an identity that cannot be checked safely.
+    """Reject live runners and identities without a safe process-visibility proof.
 
-    A prior boot proves the runner and its descendants gone, and a runner recorded in another PID
-    namespace was proven absent from the host without probing its numbers here. Otherwise, a
-    cleanup requiring a PID must include its Linux start time before the live-process check can
-    safely distinguish PID reuse. The caller has already refused a runner it can neither observe
-    nor prove absent.
+    Ended boots and host-proven foreign-namespace absence need no PID probe. Other cleanup
+    requires a recorded Linux start time before checking liveness.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
     :param RunnerView view: This recovery's one derivation of the runner.
@@ -476,7 +469,7 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
     snapshot = store.config_snapshot_path(handle.run_id)
     if not snapshot.is_file():
         raise RunRecoveryError(
-            f"run config snapshot is missing: {snapshot}. Restore it before retrying recovery.",
+            f"run config snapshot is missing: {snapshot}.",
             action=OperatorAction.RESTORE_TREE,
         )
     try:
@@ -488,14 +481,12 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
         )
     except OSError as exc:
         raise RunRecoveryError(
-            f"cannot read run config snapshot: {snapshot}. Restore it or access to it "
-            "before retrying recovery.",
+            f"cannot read run config snapshot: {snapshot}.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     except ValueError as exc:
         raise RunRecoveryError(
-            f"{exc}; refusing recovery. Restore the run's original config snapshot "
-            "before retrying recovery.",
+            f"{exc}; refusing recovery.",
             action=OperatorAction.RESTORE_TREE,
         ) from None
 
@@ -508,12 +499,9 @@ def _cleanup_runner(
     view: RunnerView,
     cleanup_recorded: bool,
 ) -> None:
-    """Re-check and, when confirmed, clean the recorded runner process group.
+    """Recheck the recorded runner group; confirmed cleanup holds the experiment lock.
 
-    For confirmed calls, the caller holds the experiment lock across this liveness re-check and
-    any signals so study recovery and recovery-state writes cannot race the runner. A runner from
-    an ended boot, or one proven absent from another PID namespace, is neither probed nor
-    signalled: its group is already proven gone, and a dead group never comes back.
+    Ended boots and host-proven absent groups are neither probed nor signalled.
 
     :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
@@ -566,8 +554,7 @@ def _publication_recovery_action(
             return "abort", None
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
-            "last-success publication is invalid or unreadable. Restore the "
-            "publication evidence or access to it before retrying recovery.",
+            "last-success publication is invalid or unreadable.",
             action=OperatorAction.RESTORE_TREE,
         )
     return None, None
@@ -576,25 +563,14 @@ def _publication_recovery_action(
 def _load_recovery_studies(
     config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
 ) -> dict[str, optuna.Study]:
-    """Load phase studies needed to inspect or reconcile trial cleanup evidence.
+    """Validate study ownership and load phases needed for trial cleanup recovery.
 
-    When ownership storage was unavailable during the run, verifies the published phase history
-    before allowing recovery to treat the run as having no owned trial.
+    Validate before opening or writing. Confirmed recovery holds the experiment lock and
+    repairs an incomplete final journal record; inspection leaves it unchanged. Reject
+    studies bound to another artifact root and leave unclaimed studies unclaimed.
 
-    Validation comes first and is read-only, so recovery refuses a tree bound
-    to another ledger, or an unsupported ledger, before it opens anything and
-    without changing a byte. A confirmed recovery holds the experiment lock
-    and is about to write, so it then repairs a journal whose final record a
-    crashed writer left partial; inspection reads past that record as Optuna
-    does and leaves it for the confirmed write. Each opened study then passes the read-only
-    ownership half of the check a run's claim applies, because recovery reaps
-    and tells trials through these live objects: a study bound to another
-    artifact root belongs to that root's runs, and recovering this tree must
-    not touch it. A study with no root claim yet is left unclaimed; recovery
-    never claims.
-    These refusals are rewrapped rather than rebuilt: the engine's own message
-    is already the operator's instruction, and ``rewrap`` carries its
-    remediation across the layer boundary intact.
+    When ownership storage was unavailable, verify published phase history before treating
+    the run as owning no trials. Preserve engine refusal messages and remediation.
 
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
@@ -607,10 +583,7 @@ def _load_recovery_studies(
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
-    unavailable_remedy = (
-        " Restore the original complete storage ledger and access "
-        "to it, then retry phasesweep mcp recover-run."
-    )
+    recovery_step = " Retry phasesweep mcp recover-run after repairing the storage ledger."
     try:
         ledger = validate_ledger(config)
         if confirm:
@@ -623,7 +596,7 @@ def _load_recovery_studies(
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
         raise RunRecoveryError(
-            f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+            f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
         ) from exc
     loaded_studies = {}
     for phase in config.phases:
@@ -631,7 +604,7 @@ def _load_recovery_studies(
             study = open_existing_study(ledger, phase)
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
-                f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+                f"{exc}{recovery_step}", action=OperatorAction.RESTORE_LEDGER
             ) from exc
         if study is not None:
             try:
@@ -658,9 +631,7 @@ def _load_recovery_studies(
             )
         except (PublishedStudyMissingError, StudyStorageUnavailableError) as exc:
             raise RunRecoveryError(
-                f"{exc} Restore the original complete storage ledger "
-                "and study with access to it, then retry "
-                "phasesweep mcp recover-run.",
+                f"{exc}{recovery_step}",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
     return loaded_studies

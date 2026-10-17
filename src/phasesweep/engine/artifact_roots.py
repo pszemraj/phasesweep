@@ -10,12 +10,9 @@ from typing import Any, Literal
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    OperatorAction,
-    PublicationAccessError,
-    PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
@@ -26,9 +23,17 @@ from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_matches,
 )
-from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _artifact_root_identity,
+    _experiment_dir,
+)
+from phasesweep.engine.publication import (
+    _resolve_publication_pointer,
+    raise_for_unusable_publication,
+)
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
@@ -43,20 +48,6 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-def _artifact_root_identity(experiment: Experiment) -> str:
-    """Return the single artifact root a persistent study is allowed to publish into.
-
-    Derived through :func:`phasesweep.engine.paths._experiment_dir` — the same
-    helper every artifact
-    path is built from — so the recorded binding and the namespace actually
-    written can never drift apart.
-
-    :param Experiment experiment: Parsed experiment supplying workdir and name.
-    :return str: Resolved ``<workdir>/<experiment>`` namespace as a string.
-    """
-    return str(_experiment_dir(experiment).resolve())
-
-
 def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     """Return whether the ledger can carry the reverse artifact-root binding.
 
@@ -68,20 +59,18 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 6
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 7
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
     """Return an opaque comparison key, or an explicit in-memory identity.
 
-    The canonical identity is credential-free but may contain other target
-    selectors from a query or nested connection string. The artifact tree is
-    intentionally shareable, so it stores only this digest while private
-    recovery state retains the operational URL.
+    The artifact tree stores only the identity digest. Private recovery state
+    retains the operational URL, including any target selectors and credentials.
 
     :param Experiment experiment: Experiment whose persistent ledger is identified.
     :return str | None: Full SHA-256 hex digest of the canonical persistent
-        storage identity, or ``None`` for deliberate no-ledger execution.
+        storage identity, or ``None`` for in-memory execution.
     """
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
     if storage_identity is None:
@@ -106,11 +95,7 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
 def _root_durable_state_entry(experiment: Experiment) -> str | None:
     """Return the first known PhaseSweep state entry in an unbound root.
 
-    Arbitrary operator files do not establish storage ownership. A note,
-    ``.DS_Store``, or other unrelated file may already live in a chosen output
-    directory before the first run, and treating it as PhaseSweep state makes
-    the experiment name unusable. Only paths PhaseSweep itself creates require
-    a format-boundary refusal.
+    Unrelated operator files do not establish ownership or require a format refusal.
 
     :param Experiment experiment: Experiment whose artifact root is inspected.
     :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
@@ -157,18 +142,10 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
 
 
 def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
-    """Classify an artifact tree's recorded ownership, writing nothing.
+    """Classify a tree's experiment and ledger ownership without reading the ledger.
 
-    Study attributes bind ledger to tree. This reverse record binds tree to
-    ledger, preventing a second database from combining its trial counts with
-    another database's publication. Existing unmarked PhaseSweep state is
-    refused as an unsupported format.
-
-    This is step one of the fixed ledger order, so it is strictly read-only: it
-    neither writes the record (:func:`_write_artifact_root_binding`) nor opens
-    or inspects the ledger itself
-    (:func:`phasesweep.engine.ledger._scan_ledger_format`). Separating the two
-    is what lets a pure read path classify a tree without touching a byte.
+    The tree-to-ledger record complements each study's tree binding. Refuse foreign
+    ownership and unmarked PhaseSweep state; do not write or scan storage here.
 
     :param Experiment experiment: Config whose root and storage must agree.
     :return BindingState: ``"bound"`` when the tree already records exactly
@@ -187,46 +164,36 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             raise ArtifactRootConflictError(
                 f"Artifact root {expected['artifact_root']!r} contains unmarked "
                 f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
-                "Use a fresh artifact root and fresh local storage with this PhaseSweep "
-                "release. Nothing was written.",
+                "Nothing was written.",
             ) from None
         return "unbound"
     except PermissionError as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} cannot be validated as the current user "
-            "(permission denied). Use the user that owns this artifact tree or restore "
-            "read permission before using this artifact root.",
+            "(permission denied).",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
-            f"Artifact-root binding {path} is unreadable or malformed: {exc}. Refusing "
-            "to combine this tree with an unverified storage ledger.",
+            f"Artifact-root binding {path} is unreadable or malformed: {exc}.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
-            f"format {raw.get('schema_version')!r}. Use a fresh artifact root and fresh "
-            "local storage with this PhaseSweep release. Nothing was written.",
+            f"format {raw.get('schema_version')!r}. Nothing was written.",
         )
     if raw != expected:
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-            f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
-            "this current-format tree, or use a fresh artifact root and local storage. "
-            "Nothing was written.",
+            f"ledger or experiment than {experiment.experiment!r}. Nothing was written.",
             action=OperatorAction.FIX_CONFIG,
         )
     return "bound"
 
 
 def _write_artifact_root_binding(experiment: Experiment) -> None:
-    """Record this experiment's ownership of a tree the caller already checked.
-
-    Callers reach here only after :func:`_check_artifact_root_binding` returned
-    ``"unbound"``, so this writes the first ownership record rather than
-    replacing one.
+    """Write the first ownership record after an unbound tree passes inspection.
 
     :param Experiment experiment: Experiment whose artifact root is claimed.
     :raises ArtifactRootConflictError: The record could not be written.
@@ -257,10 +224,9 @@ def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
 
 
 def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> bool:
-    """Decide, without writing anything, whether a study may claim the offered root.
+    """Check whether an empty study may claim the offered root, without writing.
 
-    The read-only half of the binding, split out so a multi-phase run can
-    check every declared phase before it claims any of them.
+    Multi-phase callers inspect every declared study before claiming any.
 
     :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
@@ -276,8 +242,7 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         if trial_count:
             raise ArtifactRootConflictError(
                 f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
-                "artifact root, which is unsupported PhaseSweep state. Use a fresh "
-                "artifact root and local storage with this release. Nothing was written.",
+                "artifact root, which is unsupported PhaseSweep state. Nothing was written.",
             )
         return True
     _check_study_artifact_root(study, experiment)
@@ -285,13 +250,10 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
 
 
 def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
-    """Refuse a study that records an artifact root other than this config's.
+    """Refuse an existing study bound to another root, without claiming it.
 
-    The ownership half of :func:`_artifact_root_claim_needed`, split out for
-    callers that use existing studies without ever claiming one (MCP recovery
-    reaps through them). A study that records no root passes, because it is
-    not bound to anyone else; whether it may be claimed is the claim's
-    question, not this one.
+    An unbound study passes; claimability is checked separately. Recovery callers
+    apply this ownership check before using a live study.
 
     :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
@@ -306,11 +268,7 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         return
     raise ArtifactRootConflictError(
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
-        f"config offers {offered!r}. One persistent study backs exactly one publication "
-        "root; running it against a second workdir would top up trials whose artifacts "
-        "live under the bound root and publish a divergent result tree. Restore the "
-        "original workdir, or use a fresh artifact root and local storage. No trial ran "
-        "and nothing was published.",
+        f"config offers {offered!r}. No trial ran and nothing was published.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -351,10 +309,9 @@ def _check_published_phase_studies(
     :raises StudyStorageUnavailableError: A published study's trials cannot be read.
     """
     publication = _resolve_publication_pointer(experiment)
-    if publication.state == "permission_denied":
-        raise PublicationAccessError(publication.error or "Published result is unreadable.")
-    if publication.state == "failed":
-        raise PublicationIntegrityError(publication.error or "Published result is invalid.")
+    raise_for_unusable_publication(
+        experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
+    )
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary
     )
@@ -407,9 +364,5 @@ def _check_published_phase_studies(
                         )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} records a selected trial for "
-            f"phase {phase_name!r}, but its persistent study {missing}. That publication "
-            "requires its original trial history; continuing could reuse incomplete or "
-            "unrelated trials and replace the current publication. Restore the "
-            "original complete storage ledger and study, or use a new experiment identity "
-            "for a fresh run. Nothing was written."
+            f"phase {phase_name!r}, but its persistent study {missing}. Nothing was written."
         )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import shlex
 import signal
 import stat
@@ -20,31 +19,21 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import (
-    CategoricalParam,
+from phasesweep.config.models import (
     ExecutionContext,
     Experiment,
-    FloatParam,
-    JsonEnvelopeExtractor,
-    LogRegexExtractor,
     Metric,
     Phase,
-    Repeats,
-    Sampler,
 )
-from phasesweep.config.models import _environment_contract_line
-from phasesweep.engine import (
+from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
+from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    NoFeasibleTrialError,
-    PhaseSweepError,
-    ProcessCleanupUncertainError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRefusedError,
-    UnsafeProcessCleanupError,
 )
 from phasesweep.engine.paths import (
     _generation_dir,
@@ -52,8 +41,16 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import (
+    GpuConfigurationError,
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    UnsafeProcessCleanupError,
+)
+from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -65,6 +62,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_param_echo_trainer,
 )
+from tests.experiments import write_experiment
 from tests.ledger_fixtures import materialize, published_generation_id
 from tests.recovery_helpers import recover_run_cli
 
@@ -144,7 +142,7 @@ from tests.recovery_helpers import recover_run_cli
 def test_validate_and_dry_run_explain_scoring_without_sdk(
     tmp_path, monkeypatch, caplog, extractor, details
 ):
-    from phasesweep.config import Metric
+    from phasesweep.config.models import Metric
     from phasesweep.tracking.models import MlflowSettings
 
     monkeypatch.setitem(sys.modules, "wandb", None)
@@ -180,7 +178,8 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Validation remains useful from a shell reserved for offline W&B work."""
-    from phasesweep.config import Metric, WandbExtractor
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -304,26 +303,6 @@ def test_dry_run_logs_environment_contract(
         r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN environment:")
     ]
     assert lines == [f"DRY RUN {expected}"]
-
-
-@pytest.mark.parametrize(("case", "expected"), _ENVIRONMENT_CONTRACT_CASES)
-def test_environment_contract_line_lists_each_variable_once(
-    tmp_path: Path, case: dict, expected: str
-) -> None:
-    """A variable is digested, set under ``env``, or passed through, never two of them."""
-    line = _environment_contract_line(_environment_contract_experiment(tmp_path, case))
-    assert line == expected
-    digested = re.search(r"digested: ([^)]*)\)", line)
-    env_keys = re.search(r"env keys: ([^;]*)", line)
-    passed = re.search(r"passthrough_env: ([^(;]*?)(?: \(|;|$)", line)
-    names = [
-        name
-        for match in (digested, env_keys, passed)
-        if match is not None
-        for name in re.split(r", | and built-in ", match.group(1))
-        if name != "none"
-    ]
-    assert len(names) == len(set(names)), line
 
 
 @pytest.mark.parametrize("configured", [False, True])
@@ -524,22 +503,19 @@ def test_run_installs_signal_handlers_before_config_load(
 def test_validate_cli_renders_comment(tmp_path: Path) -> None:
     """``phasesweep validate`` surfaces phase comments so the operator sees
     design intent next to the spec, with a ``#`` prefix to read as documentation."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: depth
-            comment: |
-              first phase: figure out the depth.
-              grid because we want every choice to actually run.
-            n_trials: 1
-            search_space: { x: { type: int, low: 0, high: 1 } }
-        """)
+    p = write_experiment(
+        tmp_path / "exp.yaml",
+        phases=[
+            {
+                "name": "depth",
+                "comment": (
+                    "first phase: figure out the depth.\n"
+                    "grid because we want every choice to actually run.\n"
+                ),
+                "n_trials": 1,
+                "search_space": {"x": {"type": "int", "low": 0, "high": 1}},
+            }
+        ],
     )
     runner = CliRunner()
     result = runner.invoke(cli_main, ["validate", str(p)])
@@ -552,43 +528,35 @@ def test_validate_cli_renders_comment(tmp_path: Path) -> None:
 
 
 def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
-    """``phasesweep validate`` states each phase's resume/reproduce contract up front.
-
-    The runtime guard rejects a mid-target TPE/CMA-ES resume, but only after the
-    operator has already been interrupted; the capability line puts the same
-    contract in front of them before any trial runs.
-    """
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent(f"""
-        experiment: t
-        storage: journal:///{tmp_path}/phases.journal
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: depth
-            n_trials: 2
-            sampler: {{ type: grid }}
-            search_space: {{ d: {{ type: categorical, choices: [4, 8] }} }}
-          - name: lr
-            n_trials: 2
-            sampler: {{ type: tpe, seed: 0 }}
-            search_space: {{ lr: {{ type: float, low: 0.1, high: 1.0 }} }}
-          - name: wd
-            n_trials: 2
-            sampler: {{ type: random, seed: 3 }}
-            search_space: {{ wd: {{ type: float, low: 0.0, high: 0.3 }} }}
-          - name: reg
-            n_trials: 2
-            n_jobs: 2
-            gpu_policy: none
-            allow_no_gpu_isolation: true
-            sampler: {{ type: cmaes, seed: 1 }}
-            search_space: {{ dropout: {{ type: float, low: 0.0, high: 0.3 }} }}
-        """)
+    """Validation reports sampler capabilities and identifies fixed configurations."""
+    p = _write_validation_config(
+        tmp_path,
+        """
+        - name: depth
+          n_trials: 2
+          sampler: { type: grid }
+          search_space: { d: { type: categorical, choices: [4, 8] } }
+        - name: lr
+          n_trials: 2
+          sampler: { type: tpe, seed: 0 }
+          search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
+        - name: wd
+          n_trials: 2
+          sampler: { type: random, seed: 3 }
+          search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
+        - name: reg
+          n_trials: 2
+          n_jobs: 2
+          gpu_policy: none
+          allow_no_gpu_isolation: true
+          sampler: { type: cmaes, seed: 1 }
+          search_space: { dropout: { type: float, low: 0.0, high: 0.3 } }
+        - name: baseline
+          n_trials: 1
+          fixed_overrides: { lr: 0.1 }
+        """,
+        persistent=True,
+        phase_name=None,
     )
 
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
@@ -600,57 +568,28 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
     # Under several workers a model sampler's draws depend on which trials have finished.
     assert "phase 'reg': sampler=cmaes seed=1 (resumable)" in result.output
-
-
-def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path) -> None:
-    """A phase with no search_space needs no seed and is reported as fixed."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent(f"""
-        experiment: t
-        storage: journal:///{tmp_path}/phases.journal
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: baseline
-            n_trials: 1
-            fixed_overrides: {{ lr: 0.1 }}
-        """)
-    )
-
-    result = CliRunner().invoke(cli_main, ["validate", str(p)])
-
-    assert result.exit_code == 0, result.output
     assert "- baseline: n_trials=1 (fixed configuration)" in result.output
     assert "phase 'baseline': fixed configuration, no sampler draws (resumable)" in result.output
-    assert "sampler=" not in result.output
+    assert all("sampler=" not in line for line in result.output.splitlines() if "baseline" in line)
 
 
 def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
     """Without persistent storage the study ends with the process, so no phase line claims a resume."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: lr
-            n_trials: 11
-            search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
-          - name: wd
-            n_trials: 2
-            sampler: { type: random, seed: 3 }
-            search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
-          - name: baseline
-            n_trials: 1
-            fixed_overrides: { lr: 0.1 }
-        """)
+    p = _write_validation_config(
+        tmp_path,
+        """
+        - name: lr
+          n_trials: 11
+          search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
+        - name: wd
+          n_trials: 2
+          sampler: { type: random, seed: 3 }
+          search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
+        - name: baseline
+          n_trials: 1
+          fixed_overrides: { lr: 0.1 }
+        """,
+        phase_name=None,
     )
 
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
@@ -690,29 +629,21 @@ _QUIET_TPE_BUDGETS = [
 ]
 
 
-def _write_tpe_budget_config(tmp_path: Path, phase_body: str) -> Path:
-    """Write an in-memory experiment whose single phase ``lr`` has ``phase_body``."""
-    path = tmp_path / "exp.yaml"
-    body = textwrap.indent(phase_body, "    ")
-    path.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: lr
-        """)
-        + body
-        + "\n"
-    )
-    return path
+def _write_validation_config(
+    tmp_path: Path, phases: str, *, persistent: bool = False, phase_name: str | None = "lr"
+) -> Path:
+    """Write an echo-trainer config from one phase body or a phase-list YAML."""
+    if phase_name is not None:
+        phases = f"- name: {phase_name}\n" + textwrap.indent(phases, "  ")
+    fields: dict[str, object] = {"phases": yaml.safe_load(textwrap.dedent(phases))}
+    if persistent:
+        fields["storage"] = f"journal:///{tmp_path}/phases.journal"
+    return write_experiment(tmp_path / "exp.yaml", **fields)
 
 
 def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
     """A tpe budget at or below its startup trials is random search; validate says so."""
-    path = _write_tpe_budget_config(tmp_path, f"n_trials: 5\nsearch_space: {_LR_SPACE}")
+    path = _write_validation_config(tmp_path, f"n_trials: 5\nsearch_space: {_LR_SPACE}")
 
     result = CliRunner().invoke(cli_main, ["validate", str(path)])
 
@@ -723,7 +654,7 @@ def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
 
 
 def test_validate_warns_at_the_startup_boundary(tmp_path: Path) -> None:
-    path = _write_tpe_budget_config(tmp_path, f"n_trials: 10\nsearch_space: {_LR_SPACE}")
+    path = _write_validation_config(tmp_path, f"n_trials: 10\nsearch_space: {_LR_SPACE}")
 
     result = CliRunner().invoke(cli_main, ["validate", str(path)])
 
@@ -733,7 +664,7 @@ def test_validate_warns_at_the_startup_boundary(tmp_path: Path) -> None:
 @pytest.mark.parametrize("phase_body", _QUIET_TPE_BUDGETS)
 def test_validate_does_not_warn_when_tpe_leaves_startup(tmp_path: Path, phase_body: str) -> None:
     result = CliRunner().invoke(
-        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, phase_body))]
+        cli_main, ["validate", str(_write_validation_config(tmp_path, phase_body))]
     )
 
     assert result.exit_code == 0, result.output
@@ -944,7 +875,7 @@ def test_validate_warns_when_one_configuration_can_exhaust_the_failure_budget(
     """A warning, never a refusal: the run is still the operator's call."""
     body = _REPEATS_BODY + f"max_consecutive_failures: {limit}"
     result = CliRunner().invoke(
-        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, body))]
+        cli_main, ["validate", str(_write_validation_config(tmp_path, body))]
     )
 
     assert result.exit_code == 0, result.output
@@ -980,9 +911,7 @@ def test_dry_run_warns_when_one_configuration_can_exhaust_the_failure_budget(
 
 
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
-    """``show-winners`` prints comment before the winner block so the reader
-    frames numerical results against intent. Also covers the no-winner-yet
-    branch — the comment is still surfaced even before a phase has run."""
+    """``show-winners`` prints phase comments before results and for phases without a winner."""
 
     def make_cfg(workdir: Path) -> Path:
         cfg = tmp_path / "exp.yaml"
@@ -1018,7 +947,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
-    """Mutable compatibility files must not outrank immutable generation results."""
+    """Root cache files must not outrank immutable generation results."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
     _winner_path(experiment, "p").write_text("trial_number: 99\n")
@@ -1641,9 +1570,11 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert captured.err.strip() == (
-        "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
-        "run `phasesweep run` again with the same config."
+        "phasesweep: Trial 0 cleanup could not be confirmed.\n"
+        "fix: run `phasesweep run` again with the same config for a CLI run, or "
+        "`phasesweep mcp recover-run` for an MCP run."
     )
+    assert str(refusal) == "Trial 0 cleanup could not be confirmed."
 
 
 @pytest.mark.parametrize(
@@ -1661,8 +1592,7 @@ def test_cli_boundary_reports_config_error_without_traceback(
 ) -> None:
     """A bad config is bad input: exit 2, the file named, no traceback.
 
-    Bad indentation is one of the two most common YAML mistakes, and PyYAML
-    labels it ``in "<unicode string>"``; without the config loader's own source
+    PyYAML labels bad indentation ``in "<unicode string>"``; without the config loader's own source
     label the operator cannot tell which file failed. A schema validation error
     must name the file the same way.
     """
@@ -1786,6 +1716,49 @@ def test_cli_boundary_reports_expected_run_failure(
 
 
 @pytest.mark.parametrize(
+    ("action", "remedy"),
+    [
+        (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
+        (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
+        (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
+        (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
+        (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
+        (OperatorAction.INSPECT_LOGS, "inspect the PhaseSweep run log"),
+    ],
+)
+def test_cli_boundary_renders_action_once(
+    action: OperatorAction,
+    remedy: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Action advice is printed once without becoming part of translated diagnostics."""
+    diagnostic = "required state is unavailable"
+    original = PhaseSweepError(diagnostic, action=action)
+    translated = PhaseSweepError.rewrap(original, str(original))
+    translated = PhaseSweepError.rewrap(translated, str(translated))
+    assert translated.args == (diagnostic,)
+    assert str(translated) == diagnostic
+
+    def fail(**_kwargs: object) -> None:
+        raise translated
+
+    monkeypatch.setattr(cli_main, "main", fail)
+    assert invoke_cli_boundary([], monkeypatch) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    diagnostic_line, fix_line = captured.err.splitlines()
+    assert diagnostic_line == f"phasesweep: {diagnostic}"
+    assert fix_line.startswith("fix: ")
+    assert fix_line.count(remedy) == 1
+    if action is OperatorAction.FRESH_NAMESPACE:
+        assert "new experiment name" not in fix_line
+    if action is OperatorAction.RUN_RECOVER_RUN:
+        assert "`phasesweep mcp recover-run` for an MCP run" in fix_line
+
+
+@pytest.mark.parametrize(
     ("env_name", "env_value"),
     [("WANDB_MODE", "offline"), ("WANDB_DISABLED", "true")],
 )
@@ -1796,7 +1769,8 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from phasesweep.config import Metric, WandbExtractor
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",

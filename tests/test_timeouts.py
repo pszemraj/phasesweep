@@ -4,28 +4,31 @@ from __future__ import annotations
 
 import signal
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Metric, Phase, Repeats, Sampler
-from phasesweep.engine import PhaseSweepError, read_status
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.read import read_status
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
-from phasesweep.evidence import TrialContext
+from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
+    make_trial_context,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -66,6 +69,19 @@ def _sleeping_score_experiment(
     ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
+def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
+    """Attach the standard trial context to a process result for extraction checks."""
+    return ExecutedTrial(
+        ctx=replace(
+            make_trial_context(tmp_path),
+            overrides_sha256="0" * 64,
+            return_code=process.return_code,
+            duration_seconds=process.duration_seconds,
+        ),
+        process=process,
+    )
+
+
 @pytest.mark.integration
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -80,17 +96,20 @@ def test_runtime_rejects_unexplained_trial_budget_shortfall(
 
 
 @pytest.mark.integration
-def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
-    """A phase wallclock timeout must not bless the best partial trial by default."""
+@pytest.mark.parametrize("guard", ["phase", "run"], ids=["phase-guard", "run-guard"])
+def test_wallclock_timeout_refuses_incomplete_winner(tmp_path: Path, guard: str) -> None:
+    """A phase or run wallclock timeout must not bless the best partial trial by default."""
     exp = _sleeping_score_experiment(
         tmp_path,
-        experiment="phase_timeout",
-        timeout_seconds_per_phase=0.2,
+        experiment=f"{guard}_timeout",
+        **{f"timeout_seconds_per_{guard}": 0.2},
     )
 
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner",
+        match=r"timed out via phase guard .*Refusing to select a winner"
+        if guard == "phase"
+        else "run guard",
     ):
         run_experiment(exp)
 
@@ -410,9 +429,7 @@ def test_group_completed_after_partial_timeout_publishes_from_completing_generat
     The first run stops on its phase deadline after trial 4, so it publishes the
     only complete group, [0, 1, 2], while [3, 4, 5] still lacks trial 5. The
     enlarged rerun runs trial 5 in a new generation, and that group wins. Its
-    winner cites trial 5, whose generation published this same winner, so the
-    carried-winner check passes although two of its members ran a generation
-    earlier.
+    winner cites trial 5 while retaining every member's execution identity.
     """
     import types
 
@@ -603,10 +620,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     Phase attribution narrows on the dedicated subclass. A plain
     ``TimeoutError`` escaping the lock layer is an infrastructure failure: it
     must surface as a fatal abort, never let ``allow_incomplete_on_timeout``
-    publish a partial winner off broken infrastructure. This pins the
-    ``except GpuLeaseTimeoutError`` contract in ``engine/phase.py`` — widening
-    it to ``TimeoutError`` or raising the plain superclass from the pool fails
-    one side of this parametrization.
+    publish a partial winner off broken infrastructure.
     """
     import contextlib
 
@@ -658,18 +672,6 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     assert completion["reason"] == "timeout"
 
 
-@pytest.mark.integration
-def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
-    exp = _sleeping_score_experiment(
-        tmp_path,
-        experiment="run_timeout",
-        timeout_seconds_per_run=0.2,
-    )
-
-    with pytest.raises(TimeoutError, match="run guard"):
-        run_experiment(exp)
-
-
 def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """A successful trainer whose evidence lands past the deadline cannot count.
 
@@ -679,20 +681,9 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """
     experiment = make_experiment(workdir=tmp_path)
     (tmp_path / "r.json").write_text('{"x": 1.0}')
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=0,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
+    executed = _executed_trial(
+        tmp_path,
+        ProcessResult(
             return_code=0,
             timed_out=False,
             pid=123,
@@ -726,8 +717,8 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     from types import SimpleNamespace
 
     public = pytest.importorskip("wandb.apis.public")
-    from phasesweep.config import WandbExtractor
     from phasesweep.evidence import wandb as wandb_evidence
+    from phasesweep.evidence.models import WandbExtractor
 
     clock = [100.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
@@ -750,7 +741,7 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
 
     monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: Run()))
 
-    def in_process_worker(request, *, deadline, **_):
+    def in_process_worker(request, _worker_path, _backend, *, deadline, **_):
         # The supervised worker, run in-process; the parent stops it at its deadline.
         request = dict(request)
         if request.pop("task") == "summary":
@@ -765,25 +756,13 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
             }
         return SimpleNamespace(timed_out=clock[0] >= deadline), response, None
 
-    monkeypatch.setattr(wandb_evidence, "_run_worker", in_process_worker)
+    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
     objective = WandbExtractor(
         type="wandb", entity="e", project="p", metric_key="eval/loss", evaluation_axis="eval/step"
     )
     experiment = make_experiment(workdir=tmp_path, metric=Metric(extractor=objective))
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=0,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    executed = _executed_trial(
+        tmp_path, ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1)
     )
 
     result = extract_trial_result(experiment=experiment, executed=executed, deadline=150.0)
@@ -815,20 +794,9 @@ def test_trainer_timeout_attribution_follows_wallclock_cap(
     """A killed trainer is deadline-attributed only when its cap was the deadline."""
     experiment = make_experiment(workdir=tmp_path)
     failure = "timed out after 1.0s" if timed_out else "trainer failed"
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=1,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
+    executed = _executed_trial(
+        tmp_path,
+        ProcessResult(
             return_code=1,
             timed_out=timed_out,
             pid=123,

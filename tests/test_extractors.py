@@ -13,17 +13,24 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from phasesweep.config import (
+from phasesweep.evidence.evaluation import (
+    DeadlineExceededError,
+    ExtractorError,
+    evaluate_gates,
+    extractor_config_fingerprint,
+    run_extractor,
+)
+from phasesweep.evidence.models import (
     ArtifactSizeGate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
     JsonExtractor,
     LogRegexExtractor,
+    MlflowExtractor,
+    MlflowRequiredGate,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
-from phasesweep.evidence.evaluation import extractor_config_fingerprint
 from tests.conftest import make_trial_context
 
 
@@ -53,6 +60,55 @@ def test_json_float_overflow_is_invalid_evidence(tmp_path):
         run_extractor(
             make_trial_context(tmp_path), JsonExtractor(type="json", path="result.json", key="x")
         )
+
+
+@pytest.mark.parametrize("deadline", [None, 0.0])
+def test_unregistered_extractor_fails_before_deadline_or_provenance_changes(tmp_path, deadline):
+    class UnregisteredExtractor(JsonExtractor):
+        pass
+
+    provenance = {"retained": True}
+    with pytest.raises(ExtractorError, match="No extractor registered for UnregisteredExtractor"):
+        run_extractor(
+            make_trial_context(tmp_path),
+            UnregisteredExtractor(type="json", path="result.json", key="x"),
+            deadline=deadline,
+            provenance=provenance,
+        )
+    assert provenance == {"retained": True}
+
+
+@pytest.mark.parametrize("backend", ["wandb", "mlflow"])
+@pytest.mark.parametrize("consumer", ["extractor", "gate"])
+@pytest.mark.parametrize("failure", [ExtractorError, DeadlineExceededError])
+def test_remote_consumers_forward_deadline_and_preserve_failure_kind(
+    tmp_path, monkeypatch, backend, consumer, failure
+):
+    expected_deadline = time.monotonic() + 60.0
+
+    def capture(*args, deadline):
+        assert deadline == expected_deadline
+        raise failure("capture stopped")
+
+    monkeypatch.setattr(f"phasesweep.evidence.evaluation._capture_{backend}", capture)
+    if backend == "wandb":
+        extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+        gate = WandbSummaryRequiredGate(
+            type="wandb_summary_required", entity="e", project="p", keys=["done"]
+        )
+    else:
+        extractor = MlflowExtractor(type="mlflow", metric_key="loss", select="last")
+        gate = MlflowRequiredGate(type="mlflow_required", metrics=["loss"])
+    ctx = make_trial_context(tmp_path)
+    if consumer == "extractor":
+        with pytest.raises(failure, match="capture stopped") as stopped:
+            run_extractor(ctx, extractor, deadline=expected_deadline)
+        assert stopped.type is failure
+    else:
+        result = evaluate_gates(ctx, [gate], deadline=expected_deadline)[0]
+        assert result.passed is False
+        assert result.detail == "capture stopped"
+        assert result.deadline_exhausted is (failure is DeadlineExceededError)
 
 
 def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch):
@@ -789,42 +845,25 @@ def _assert_log_regex_provenance(
         assert source["match_count"] == expected_count, select
 
 
-def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
-    cases = [
-        ("missing_file", None, JsonExtractor(type="json", path="nope.json", key="x"), "not found"),
-        (
-            "missing_key",
-            {"result.json": {"a": {"b": 1}}},
-            JsonExtractor(type="json", path="result.json", key="a.c"),
-            "not found",
-        ),
-        (
-            "non_numeric",
-            {"result.json": {"x": "abc"}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-        (
-            "numeric_string",
-            {"result.json": {"x": "1.25"}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-        (
-            "boolean",
-            {"result.json": {"x": True}},
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not a JSON number",
-        ),
-    ]
-
-    for case, files, cfg, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        for filename, data in (files or {}).items():
-            (case_dir / filename).write_text(json.dumps(data))
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+@pytest.mark.parametrize(
+    "filename,key,payload,match",
+    [
+        ("nope.json", "x", None, "not found"),
+        ("result.json", "a.c", {"a": {"b": 1}}, "not found"),
+        ("result.json", "x", {"x": "abc"}, "not a JSON number"),
+        ("result.json", "x", {"x": "1.25"}, "not a JSON number"),
+        ("result.json", "x", {"x": True}, "not a JSON number"),
+    ],
+    ids=["missing_file", "missing_key", "non_numeric", "numeric_string", "boolean"],
+)
+def test_json_extractor_reports_missing_or_nonnumeric_values(
+    tmp_path, filename, key, payload, match
+):
+    if payload is not None:
+        (tmp_path / filename).write_text(json.dumps(payload))
+    cfg = JsonExtractor(type="json", path=filename, key=key)
+    with pytest.raises(ExtractorError, match=match):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 @pytest.mark.parametrize(
@@ -843,26 +882,19 @@ def test_json_extractor_rejects_ambiguous_nonstandard_json(tmp_path, payload):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path):
-    cases = [
+@pytest.mark.parametrize(
+    "filename,cfg",
+    [
+        ("result.json", JsonExtractor(type="json", path="result.json", key="x")),
         (
-            "json",
-            "result.json",
-            JsonExtractor(type="json", path="result.json", key="x"),
-            "not valid UTF-8",
-        ),
-        (
-            "log",
             "stdout.log",
             LogRegexExtractor(
                 type="log_regex",
                 file="stdout.log",
                 pattern=r"value=(?P<value>[0-9.]+)",
             ),
-            "not valid UTF-8",
         ),
         (
-            "envelope",
             "result.json",
             JsonEnvelopeExtractor(
                 type="json_envelope",
@@ -870,19 +902,45 @@ def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path)
                 split="validation",
                 policy="final_checkpoint",
             ),
-            "not valid UTF-8",
         ),
-    ]
+    ],
+    ids=["json", "log", "envelope"],
+)
+def test_file_extractors_report_invalid_utf8_as_trial_evidence_failure(tmp_path, filename, cfg):
+    (tmp_path / filename).write_bytes(b"\xff\xfe")
+    with pytest.raises(ExtractorError, match="not valid UTF-8"):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
-    for case, filename, cfg, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / filename).write_bytes(b"\xff\xfe")
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+
+@pytest.mark.parametrize("kind", ["json", "json_envelope"])
+def test_json_extractors_preserve_read_failure_diagnostics(tmp_path, monkeypatch, kind):
+    target = tmp_path / "result.json"
+    target.write_text("{}")
+    failure = PermissionError("read denied")
+    original = Path.read_bytes
+
+    def unreadable(path):
+        if path == target:
+            raise failure
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+    cfg = (
+        JsonExtractor(type="json", path="result.json", key="x")
+        if kind == "json"
+        else JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="final"
+        )
+    )
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(make_trial_context(tmp_path), cfg)
+    noun = "JSON" if kind == "json" else "JSON envelope"
+    assert str(caught.value) == f"Could not read {noun} at {target}: read denied"
+    assert caught.value.__cause__ is failure
 
 
-def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
+@pytest.fixture
+def envelope_evidence():
     payload = {
         "schema_version": 1,
         "status": "complete",
@@ -896,16 +954,20 @@ def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
             "step": 1000,
         },
     }
-    (tmp_path / "result.json").write_text(json.dumps(payload))
     cfg = JsonEnvelopeExtractor(
         type="json_envelope",
         path="result.json",
         objective_name="val_loss",
         split="validation",
         policy="final_checkpoint",
-        checkpoint="final.pt",
-        expected_step=1000,
     )
+    return payload, cfg
+
+
+def test_json_envelope_binds_objective_to_current_attempt(tmp_path, envelope_evidence):
+    payload, cfg = envelope_evidence
+    (tmp_path / "result.json").write_text(json.dumps(payload))
+    cfg = cfg.model_copy(update={"checkpoint": "final.pt", "expected_step": 1000})
 
     assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.25)
 
@@ -922,34 +984,16 @@ def test_json_envelope_binds_objective_to_current_attempt(tmp_path):
         (("evaluation", "step"), 900, "step 1000"),
     ],
 )
-def test_json_envelope_rejects_mismatched_provenance(tmp_path, path, value, match):
-    payload = {
-        "schema_version": 1,
-        "status": "complete",
-        "generation_id": "generation-test",
-        "attempt_id": "attempt-test",
-        "overrides_sha256": "a" * 64,
-        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "evaluation": {
-            "policy": "final_checkpoint",
-            "checkpoint": "final.pt",
-            "step": 1000,
-        },
-    }
+def test_json_envelope_rejects_mismatched_provenance(
+    tmp_path, envelope_evidence, path, value, match
+):
+    payload, cfg = envelope_evidence
     target = payload
     for part in path[:-1]:
         target = target[part]
     target[path[-1]] = value
     (tmp_path / "result.json").write_text(json.dumps(payload))
-    cfg = JsonEnvelopeExtractor(
-        type="json_envelope",
-        path="result.json",
-        objective_name="val_loss",
-        split="validation",
-        policy="final_checkpoint",
-        checkpoint="final.pt",
-        expected_step=1000,
-    )
+    cfg = cfg.model_copy(update={"checkpoint": "final.pt", "expected_step": 1000})
 
     with pytest.raises(ExtractorError, match=match):
         run_extractor(make_trial_context(tmp_path), cfg)
@@ -1042,8 +1086,6 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
 
     other = JsonExtractor(type="json", path="result.json", key="eval.acc")
     assert extractor_config_fingerprint(other) != extractor_config_fingerprint(cfg)
-    # Unchanged JSON provenance keeps its old identity; changed log-regex
-    # interpretation must be distinguishable even under identical YAML.
     legacy_json = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     assert extractor_config_fingerprint(cfg) == hashlib.sha256(legacy_json.encode()).hexdigest()
     log = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)")
@@ -1059,29 +1101,11 @@ def test_provenance_absent_when_extraction_fails(tmp_path):
     assert "source" not in provenance
 
 
-def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
-    payload = {
-        "schema_version": 1,
-        "status": "complete",
-        "generation_id": "generation-test",
-        "attempt_id": "attempt-test",
-        "overrides_sha256": "a" * 64,
-        "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
-        "evaluation": {
-            "policy": "final_checkpoint",
-            "checkpoint": "step_1000.pt",
-            "step": 1000,
-        },
-    }
+def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path, envelope_evidence):
+    payload, cfg = envelope_evidence
+    payload["evaluation"]["checkpoint"] = "step_1000.pt"
     raw = json.dumps(payload).encode("utf-8")
     (tmp_path / "result.json").write_bytes(raw)
-    cfg = JsonEnvelopeExtractor(
-        type="json_envelope",
-        path="result.json",
-        objective_name="val_loss",
-        split="validation",
-        policy="final_checkpoint",
-    )
 
     provenance: dict = {}
     run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)

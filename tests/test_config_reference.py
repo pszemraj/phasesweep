@@ -1,9 +1,7 @@
 """Guard documented config paths/signatures and load the starting configurations.
 
-These checks detect inventory, type and default drift. They do not prove the
-reference's behavioral comments, bounds, precedence or cross-field rules. The
-one comment check is structural: every ``Conflicts with`` and ``Overrides``
-line must have its counterpart on the key it names.
+Every ``Conflicts with`` and ``Overrides`` line must have its counterpart on
+the key it names.
 """
 
 from __future__ import annotations
@@ -11,16 +9,17 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-import phasesweep.config as config_models
-from phasesweep.config import Experiment, load_experiment
-from phasesweep.config.io import describe_validation_error, load_experiment_bytes
+import phasesweep.config.models as config_models
+import phasesweep.config.search as search_models
+import phasesweep.evidence.models as evidence_models
+import phasesweep.tracking.models as tracking_models
+from phasesweep.config.io import describe_validation_error, load_experiment, load_experiment_bytes
+from phasesweep.config.models import Experiment
 from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
@@ -37,8 +36,7 @@ from phasesweep.config.reference import (
 )
 from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
 from phasesweep.runtime.json import JsonObject
-
-REPO = Path(__file__).resolve().parent.parent
+from tests.conftest import REPO
 
 
 def _type_signature(node: JsonObject) -> str:
@@ -111,7 +109,11 @@ def _schema_inventory() -> dict[str, str]:
         :param str prefix: Inventory path of the model, with its variant tag if any.
         """
         name = node["title"]
-        model_type = getattr(config_models, name)
+        model_type = next(
+            getattr(module, name)
+            for module in (config_models, search_models, evidence_models, tracking_models)
+            if hasattr(module, name)
+        )
         tag = node["properties"].get("type", {}).get("const")
         if tag is not None:
             prefix += f"[type={tag}]"
@@ -479,51 +481,33 @@ def test_closest_suggests_the_documented_key_for_a_partial_or_misspelled_one() -
     assert all("[type=" not in suggestion for suggestion in closest("type"))
 
 
-def _error_locs(change: Callable[[dict], None]) -> list[tuple[int | str, ...]]:
-    """Validate the minimal starting example after a change and return its error locations.
-
-    :param Callable[[dict], None] change: Edit applied to the loaded example mapping.
-    :return list[tuple[int | str, ...]]: The ``loc`` of every validation error.
-    """
+@pytest.mark.parametrize(
+    "path,value,expected",
+    [
+        (("phases", 0, "sampler"), {"type": "bogus"}, "phases[].sampler.type"),
+        (("metric", "extractor", "path"), 3, "metric.extractor.path"),
+        (
+            ("phases", 0, "search_space"),
+            {"lr": {"type": "float", "low": "x", "high": 1}},
+            "phases[].search_space.<key>.low",
+        ),
+        (("phases", 0, "gates"), [{"type": "sha256", "path": "a"}], "phases[].gates[].sha256"),
+        (("execution",), {"inherit_env": 3}, "execution.inherit_env"),
+        (("env",), {"A": 1}, "env"),
+    ],
+    ids=["sampler", "extractor-path", "search-bound", "gate-digest", "inherit-env", "env-value"],
+)
+def test_loc_to_path_maps_variant_and_search_key_segments(path, value, expected) -> None:
+    """Indexes and variant tags drop out, and a user-chosen search key maps to ``<key>``."""
     data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
-    change(data)
+    target = data
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
-    return [error["loc"] for error in caught.value.errors(include_input=False)]
-
-
-def test_loc_to_path_maps_variant_and_search_key_segments() -> None:
-    """Indexes and variant tags drop out, and a user-chosen search key maps to ``<key>``."""
-
-    def bad_sampler(data: dict) -> None:
-        data["phases"][0]["sampler"] = {"type": "bogus"}
-
-    def bad_extractor_path(data: dict) -> None:
-        data["metric"]["extractor"]["path"] = 3
-
-    def bad_search_bound(data: dict) -> None:
-        data["phases"][0]["search_space"] = {"lr": {"type": "float", "low": "x", "high": 1}}
-
-    def bad_gate_digest(data: dict) -> None:
-        data["phases"][0]["gates"] = [{"type": "sha256", "path": "a"}]
-
-    def bad_inherit_env(data: dict) -> None:
-        data["execution"] = {"inherit_env": 3}
-
-    def bad_env_value(data: dict) -> None:
-        data["env"] = {"A": 1}
-
-    cases = [
-        (bad_sampler, "phases[].sampler.type"),
-        (bad_extractor_path, "metric.extractor.path"),
-        (bad_search_bound, "phases[].search_space.<key>.low"),
-        (bad_gate_digest, "phases[].gates[].sha256"),
-        (bad_inherit_env, "execution.inherit_env"),
-        (bad_env_value, "env"),
-    ]
-    for change, expected in cases:
-        locs = _error_locs(change)
-        assert {loc_to_path(loc) for loc in locs} == {expected}, locs
+    locs = [error["loc"] for error in caught.value.errors(include_input=False)]
+    assert {loc_to_path(loc) for loc in locs} == {expected}, locs
 
 
 def test_describe_validation_error_adds_distinct_quoted_hints() -> None:

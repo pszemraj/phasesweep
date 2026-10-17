@@ -18,21 +18,9 @@ import optuna
 import pytest
 
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import (
-    Experiment,
-    IntParam,
-    Phase,
-    Sampler,
-)
-from phasesweep.engine import (
-    ActiveAttemptPersistenceError,
-    ArtifactRootConflictError,
-    NoFeasibleTrialError,
-    PhaseSweepError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    run_experiment,
-)
+from phasesweep.cli import _operational_error_text
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -41,10 +29,18 @@ from phasesweep.engine.attempts import (
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.errors import (
+    ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -61,7 +57,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.process import write_attempt_lifecycle
@@ -84,9 +81,10 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import _write_config
+from tests.ledger_fixtures import _write_config, append_journal_tail
 from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
+    _new_phase_study,
     fabricate_registered_attempt,
     fabricate_stale_trial,
     stamp_artifact_root,
@@ -200,8 +198,6 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     t = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     # Don't call study.tell — leave it RUNNING.
 
-    # The reaper is replaced below; the directory only makes the historical
-    # workdir shape explicit for the fingerprint-order assertion.
     trial_dir = tmp_path / "runs" / "a" / f"trial_{t.number:05d}"
     trial_dir.mkdir(parents=True)
 
@@ -407,7 +403,7 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
                 lambda *_args, **_kwargs: 0,
             )
             monkeypatch.setattr(
-                "phasesweep.engine.guards._validate_study_schema",
+                "phasesweep.engine.guards._initialize_study_schema",
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
             )
 
@@ -443,7 +439,7 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
 
     monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap)
     monkeypatch.setattr(
-        "phasesweep.engine.guards._validate_study_schema",
+        "phasesweep.engine.guards._initialize_study_schema",
         lambda _study: (_ for _ in ()).throw(RuntimeError("schema read failed")),
     )
 
@@ -557,7 +553,7 @@ def test_mixed_preflight_error_boundary(
             raise StudySchemaMismatchError("schema mismatch")
         raise secondary_error
 
-    monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
+    monkeypatch.setattr("phasesweep.engine.guards._initialize_study_schema", reject_differently)
     with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
         _preflight_existing_studies(_claimed_over(experiment, studies))
     assert isinstance(exc_info.value, PhaseSweepError) is operational
@@ -588,7 +584,6 @@ def test_kill_stale_group_escalates_to_sigkill():
         st = read_proc_starttime(proc.pid)
         assert st is not None
 
-        # Use a short grace window so the test runs fast.
         sent = kill_stale_group(proc.pid, st, grace_seconds=1.5)
         assert sent is True
 
@@ -653,7 +648,7 @@ def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
         try:
             os.kill(child_pid, 0)
         except ProcessLookupError:
-            return  # PASS
+            return
         time.sleep(0.05)
     pytest.fail(f"Descendant child {child_pid} survived pgid-based kill")
 
@@ -1104,6 +1099,38 @@ def test_reaper_reports_storage_failures_after_cleanup(
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
 
+def test_reaper_keeps_uncertain_cleanup_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unconfirmed cleanup retains the trial and names process inspection before recovery."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}"
+    )
+    stale = fabricate_stale_trial(experiment, "p", attempt_id="uncertain-attempt")
+    write_trial_identity(
+        stale.trial_dir, attempt_id="uncertain-attempt", pid=99999, pgid=99998, starttime=12345
+    )
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: False)
+    uncertain: set[str] = set()
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        _reap_stale_trials(
+            stale.study, experiment, "p", confirm=True, uncertain_attempt_ids=uncertain
+        )
+
+    text = _operational_error_text(excinfo.value)
+    assert "pid=99999 pgid=99998" in text
+    assert (
+        "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery"
+        in text
+    )
+    assert text.index("with ps") < text.index("fix:")
+    assert "recover-run" in text
+    assert uncertain == {"uncertain-attempt"}
+    assert stale.study.trials[stale.number].state == optuna.trial.TrialState.RUNNING
+    assert CLEANUP_RECOVERED_TRIALS_ATTR not in stale.study.user_attrs
+
+
 @pytest.mark.integration
 def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
     """A worker killed while queued for a GPU leaves 'allocated' and no identity.
@@ -1193,13 +1220,9 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     """
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
-    owner = _write_config(
-        tmp_path / "b.yaml", backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "b"
-    )
+    owner = _write_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
     config_a = tmp_path / "a.yaml"
-    recovering = _write_config(
-        config_a, backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "a"
-    )
+    recovering = _write_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
     study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.journal"
@@ -1235,12 +1258,7 @@ def _fabricate_registered_journal_attempt(
         workdir=tmp_path / "runs",
         storage=f"journal:///{ledger}",
     )
-    study = optuna.create_study(
-        study_name="journal-attempt::p",
-        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = _new_phase_study(experiment, "p")
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
@@ -1295,8 +1313,7 @@ def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path / "torn", attempt_id="journal-attempt"
     )
-    complete = ledger.read_bytes()
-    ledger.write_bytes(complete + tail)
+    complete, _ = append_journal_tail(ledger, tail)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
@@ -1390,12 +1407,9 @@ def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreati
 
 
 def test_registry_refuses_a_foreign_ledger_holding_unsupported_state(tmp_path: Path) -> None:
-    """A registry entry cannot reap through a ledger this release refuses.
+    """A registry entry cannot reap through a ledger with unsupported state.
 
-    This release wrote the entry, so the ledger it names was current-format
-    when the attempt registered. Unsupported state there now means the locator
-    no longer names that ledger, so the run stops with the entry and the
-    foreign ledger's bytes both intact instead of marking a trial FAIL in it.
+    Refusal preserves both the registry entry and the foreign ledger's bytes.
     """
 
     def _exp(db_name: str) -> Experiment:
@@ -1505,8 +1519,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     elif identity_change in {"missing-attempt", "missing-generation"}:
         with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
             _preflight_active_attempts(experiment, report, confirm=True)
-        assert "Restore the original storage ledger" in str(exc_info.value)
-        assert "before retrying recovery" in str(exc_info.value)
+        assert exc_info.value.action == OperatorAction.RESTORE_LEDGER
         assert report.uncertain_attempt_ids == {"old-attempt"}
     else:
         _preflight_active_attempts(experiment, report, confirm=True)
@@ -1527,7 +1540,11 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
             _recover_cleanup_uncertain_trials(
                 study, experiment, experiment.phases[0].name, confirm=False
             )
-        assert "Restore the original storage ledger" in str(exc_info.value)
+        assert exc_info.value.action is (
+            OperatorAction.RESTORE_LEDGER
+            if identity_change == "missing-attempt"
+            else OperatorAction.INSPECT_LOGS
+        )
     assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
         identity_change in {"generation", "missing-attempt", "missing-generation"}
     )
@@ -1657,7 +1674,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
 
 
 def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) -> None:
-    """In-memory attempts have an identity but intentionally no recovery URL."""
+    """In-memory attempts have neither a storage identity nor a recovery locator."""
     experiment = make_experiment(
         experiment="memory-registry",
         workdir=tmp_path / "runs",
@@ -1837,8 +1854,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     Losing the registry makes a trainer undiscoverable after a phase rename;
     losing the allocated lifecycle marker makes a queued pre-launch crash
     indistinguishable from a torn process-identity write. Both failures must
-    stop before the GPU lease and subprocess. The successful discovery path is
-    covered by ``test_renamed_phase_cannot_hide_stale_trainer_from_recovery``.
+    stop before the GPU lease and subprocess.
     """
     launched = tmp_path / "trainer_ran"
     trainer = write_trainer(
@@ -1891,7 +1907,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert "No trainer was started" in message
     # The refusal routes only the workdir repair; its message says when the
     # durable abort also needs a higher target, as the rerun below shows.
-    assert "n_trials raised above its accepted target" in message
+    assert "n_trials" in message and "accepted target" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"

@@ -14,9 +14,9 @@ import pytest
 
 import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.registry as mcp_registry
-import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
+import phasesweep.mcp.tools as mcp_tools
 import phasesweep.runtime.reaper as reaper
 from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.mcp.audit import AuditLogger
@@ -135,16 +135,6 @@ def _identity(
     )
 
 
-def _forbid_signals(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        reaper,
-        "kill_stale_group",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a process outside this PID namespace must never be signalled")
-        ),
-    )
-
-
 def test_read_pid_namespace_names_this_process_namespace() -> None:
     namespace = read_pid_namespace()
     if namespace is None:
@@ -212,7 +202,7 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
     reused = f"{_link(RECORDED)}@200"
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reused)
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     assert same_pid_namespace(reused)
     assert not same_pid_namespace(RECORDED)
@@ -220,13 +210,9 @@ def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
 
     _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, reader=reused)
-    monkeypatch.setattr(
-        mcp_runs,
-        "reap_child",
-        lambda _pid: pytest.fail("a PID from another namespace must never be waited on"),
-    )
+    _forbid_reaping(monkeypatch)
     assert store.runner_view(handle).visibility == "unobservable"
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
 
 
 # The absence proof: from the host's initial PID namespace only, a recorded
@@ -252,29 +238,24 @@ def test_absence_proof_needs_the_initial_namespace(
     assert recorded_process_blocker(other_clock, pids=(7,), pgids=(7,)) is not None
 
 
-def test_absence_proof_finds_a_recorded_process_in_its_namespace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("pid", "nspid", "nspgid"),
+    [
+        pytest.param(500, [500, 7], None, id="recorded-process"),
+        pytest.param(501, [501, 9], [480, 7], id="group-leader-exited"),
+    ],
+)
+def test_absence_proof_finds_a_recorded_process_or_surviving_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int, nspid, nspgid
 ) -> None:
+    """The recorded PID or a remaining member of its group and session blocks absence."""
     proc = _fake_proc(tmp_path, monkeypatch)
-    _write_process(proc, 500, nspid=[500, 7], namespace=RECORDED)
+    _write_process(proc, pid, nspid=nspid, nspgid=nspgid, namespace=RECORDED)
 
     blocker = recorded_process_blocker(RECORDED, pids=(7,), pgids=(7,))
 
     assert blocker is not None
-    assert "500" in blocker
-
-
-def test_absence_proof_finds_a_group_whose_leader_exited(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No process has the recorded PID any more, but a member of its group and session remains."""
-    proc = _fake_proc(tmp_path, monkeypatch)
-    _write_process(proc, 501, nspid=[501, 9], nspgid=[480, 7], namespace=RECORDED)
-
-    blocker = recorded_process_blocker(RECORDED, pids=(7,), pgids=(7,))
-
-    assert blocker is not None
-    assert "501" in blocker
+    assert str(pid) in blocker
 
 
 def test_a_readable_link_to_another_namespace_rules_a_candidate_out(
@@ -459,7 +440,7 @@ def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signallin
 ) -> None:
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError) as caught:
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
@@ -479,7 +460,7 @@ def test_cleanup_stale_trial_process_settles_an_absent_trial_without_signalling(
     proc = _fake_proc(tmp_path, monkeypatch)
     # A process in another sandbox reusing the trial's numbers is ruled out by its link.
     _write_process(proc, 700, nspid=[700, 4242], namespace=OTHER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     assert cleanup_stale_trial_process(_identity(pid_namespace=RECORDED)) is True
 
@@ -490,7 +471,7 @@ def test_cleanup_stale_trial_process_names_what_blocks_the_absence_proof(
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     proc = _fake_proc(tmp_path, monkeypatch)
     _write_process(proc, 701, nspid=[701, 4242], namespace=RECORDED)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError) as caught:
         cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
@@ -523,7 +504,7 @@ def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_
     """An identity without boot id or start time is refused as foreign, never with kill advice for its numbers."""
     monkeypatch.setattr(reaper, "read_boot_id", lambda: None)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
-    _forbid_signals(monkeypatch)
+    _forbid_run_signals(monkeypatch, reaper)
 
     with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
         cleanup_stale_trial_process(
@@ -703,9 +684,10 @@ def test_foreign_namespace_runner_reads_running_and_writes_nothing(
     assert view.reason is not None
     assert RECORDED in view.reason
     assert store.runner_may_be_alive(handle)
-    assert store.state(handle) == "running"
-    assert not store.recovery_required(handle)
-    assert not store.snapshot_recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert not observation.recovery_required
+    assert not observation.snapshot_recovery_required
     assert live_runs(store) == [handle]
     assert tree_snapshot(registry.state_dir) == before
 
@@ -717,7 +699,7 @@ def test_foreign_namespace_terminal_status_still_settles(
     _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch)
     _write_finished_status(store, handle.run_id)
 
-    assert store.state(handle) == "succeeded"
+    assert store.observe(handle).state == "succeeded"
 
 
 def test_foreign_namespace_runner_holds_its_concurrency_slot(
@@ -741,8 +723,9 @@ def test_absent_runner_reads_as_a_dead_runner_that_needs_recovery(
 
     assert store.runner_view(handle).visibility == "absent"
     assert not store.runner_may_be_alive(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "running"
+    assert observation.recovery_required
     assert live_runs(store) == [handle]
     run = app.status(run_id=handle.run_id)["run"]
     assert run["state"] == "running"
@@ -756,7 +739,7 @@ def test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run(
 ) -> None:
     """The absence proof is not monotonic, so only recover-run settles, and its status outlives any later proof."""
     app, registry, store, handle, proc = _stage_absent_run(tmp_path, monkeypatch)
-    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_run_control, reaper)
+    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_tools, reaper)
 
     first = app.status(run_id=handle.run_id)["run"]
     _add_runner_blocker(proc, handle)
@@ -772,7 +755,7 @@ def test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run(
 
     shutil.rmtree(proc / "900")
     recover_run(registry.state_dir, handle.run_id, confirm=True, emit=lambda _m: None)
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"
 
     _add_runner_blocker(proc, handle)
     settled = app.status(run_id=handle.run_id)["run"]
@@ -852,7 +835,7 @@ def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
     app, registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, allow_cancel=True)
     audit_path = registry.state_dir / "audit.jsonl"
     app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
-    _forbid_run_signals(monkeypatch, mcp_run_control)
+    _forbid_run_signals(monkeypatch, mcp_tools)
 
     with pytest.raises(RunNamespaceMismatchError, match="PID namespace") as caught:
         app.cancel(handle.run_id)
@@ -861,7 +844,7 @@ def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
     assert "await_run" in str(caught.value)
     assert str(registry.state_dir) not in str(caught.value)
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     events = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [(event["tool"], event["outcome"], event["error_type"]) for event in events] == [
         (TOOL_CANCEL_RUN, "error", "RunNamespaceMismatchError")
@@ -876,7 +859,7 @@ def test_cancel_of_an_absent_runner_signals_nothing(
         tmp_path, monkeypatch, allow_cancel=True
     )
     write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
-    _forbid_run_signals(monkeypatch, mcp_run_control)
+    _forbid_run_signals(monkeypatch, mcp_tools)
 
     result = app.cancel(handle.run_id)
 
@@ -916,7 +899,7 @@ def test_recover_run_settles_an_absent_runner_without_signalling(
     _app, registry, store, handle, _proc = _stage_absent_run(
         tmp_path, monkeypatch, cleanup_uncertain=True
     )
-    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_run_control, reaper)
+    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_tools, reaper)
     monkeypatch.setattr(
         mcp_recovery,
         "is_same_live_process",
@@ -937,17 +920,18 @@ def test_recover_run_settles_an_absent_runner_without_signalling(
     assert terminal["error_class"] == "RunnerExitedWithoutStatus"
     assert terminal["cleanup_confirmed"] is True
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    observation = store.observe(handle)
+    assert observation.state == "failed"
+    assert not observation.recovery_required
 
 
 def test_spawn_refuses_unreadable_pid_namespace_before_popen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _config, app, _registry, store = side_effect_app(tmp_path)
-    monkeypatch.setattr(mcp_run_control, "read_pid_namespace", lambda: None)
+    monkeypatch.setattr(mcp_tools, "read_pid_namespace", lambda: None)
     monkeypatch.setattr(
-        "phasesweep.mcp.run_control.subprocess.Popen",
+        "phasesweep.mcp.tools.subprocess.Popen",
         lambda *_args, **_kwargs: pytest.fail("no child may exist without a recorded namespace"),
     )
 
@@ -977,7 +961,7 @@ def test_runner_receipt_from_another_namespace_is_refused(
     _config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
     monkeypatch.setattr("tests.mcp_helpers.read_pid_namespace", lambda: RECORDED)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
 
     with pytest.raises(RuntimeError, match="did not match"):
         app.launch("srv")

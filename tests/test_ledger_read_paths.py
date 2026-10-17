@@ -20,7 +20,6 @@ verdict over the current ledger a refusal where every pure read says ``ok``.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +30,7 @@ from phasesweep import run_experiment
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
-from phasesweep.engine.read import read_status, read_trial_tables, read_winners
+from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
@@ -43,7 +42,6 @@ from tests.ledger_fixtures import (
     discover_ledger_fixtures,
     fixture_by_name,
     forbid_file_backed_storage,
-    ledger_file,
     materialize,
     tree_changes,
     tree_snapshot,
@@ -57,7 +55,7 @@ REQUIRED_FIXTURES = ("current-journal",)
 #: Read paths that must not construct file-backed storage at all.
 PURE_READ_PATHS = (
     "engine-read_status",
-    "engine-read_winners",
+    "engine-read_result",
     "engine-read_trial_tables",
     "ledger-read_phase_trials",
     "cli-status",
@@ -98,16 +96,6 @@ def _classify_message(message: str) -> str:
     return f"unclassified: {message}"
 
 
-def _engine_verdict(call: Callable[[], object]) -> str:
-    """Run one in-process read path and report that it completed.
-
-    :param Callable[[], object] call: Read path invocation.
-    :return str: ``"ok"``.
-    """
-    call()
-    return "ok"
-
-
 def _cli_verdict(
     argv: list[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -136,8 +124,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
     as a change to the fixture's bytes; it is snapshotted on its own once
     built, because preflight must leave it untouched too. The handle names a
     long-dead PID with a mismatched start time and is marked cleanup-uncertain,
-    which is the state that makes preflight load the phase studies (mirrors
-    ``tests/test_mcp_recovery.py::test_operator_recovery_clears_no_status_cleanup_uncertainty``).
+    which is the state that makes preflight load the phase studies.
 
     :param Materialized materialized: Copied fixture and its config.
     :param Path tmp_path: Per-test temporary directory.
@@ -178,25 +165,8 @@ def _mode_cells() -> list[Any]:
     ]
 
 
-def _matrix() -> list[Any]:
-    """Build the fixture x mode x read-path matrix.
-
-    :return list[pytest.param]: One parameter set per cell.
-    """
-    return [
-        pytest.param(
-            fixture.name,
-            mode,
-            read_path,
-            id=f"{fixture.name}-{mode}-{read_path}",
-        )
-        for fixture in discover_ledger_fixtures()
-        for mode in fixture.modes
-        for read_path in READ_PATHS
-    ]
-
-
-@pytest.mark.parametrize(("fixture_name", "mode", "read_path"), _matrix())
+@pytest.mark.parametrize("read_path", READ_PATHS)
+@pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
 def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     fixture_name: str,
     mode: str,
@@ -219,19 +189,22 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         attempts = forbid_file_backed_storage(
             monkeypatch, allow_memory_studies=read_path in DRY_RUN_READ_PATHS
         )
+        verdict = "ok"
         if read_path == "engine-read_status":
-            verdict = _engine_verdict(lambda: read_status(materialized.experiment))
-        elif read_path == "engine-read_winners":
-            verdict = _engine_verdict(lambda: read_winners(materialized.experiment))
+            read_status(materialized.experiment)
+        elif read_path == "engine-read_result":
+            read_result(
+                materialized.experiment,
+                phase_names=[phase.name for phase in materialized.experiment.phases],
+            )
         elif read_path == "engine-read_trial_tables":
-            verdict = _engine_verdict(lambda: read_trial_tables(materialized.experiment))
+            read_trial_tables(materialized.experiment)
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
-            verdict = _engine_verdict(
-                lambda: [read_phase_trials(ledger, p) for p in materialized.experiment.phases]
-            )
+            for phase in materialized.experiment.phases:
+                read_phase_trials(ledger, phase)
         elif read_path == "mcp-snapshot":
-            verdict = _engine_verdict(lambda: capture_result_snapshot(materialized.experiment))
+            capture_result_snapshot(materialized.experiment)
         elif read_path == "cli-status":
             verdict = _cli_verdict(["status", str(materialized.config_path)], monkeypatch, capsys)
         elif read_path == "cli-status-trials":
@@ -243,7 +216,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
                 ["show-winners", str(materialized.config_path)], monkeypatch, capsys
             )
         elif read_path == "engine-run_dry_run":
-            verdict = _engine_verdict(lambda: run_experiment(materialized.experiment, dry_run=True))
+            run_experiment(materialized.experiment, dry_run=True)
         elif read_path == "cli-run-dry-run":
             verdict = _cli_verdict(
                 ["run", str(materialized.config_path), "--dry-run"], monkeypatch, capsys
@@ -263,11 +236,7 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
 def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The dry run replays the fixture's finished phase and hands out its real winner.
-
-    The matrix above asserts only the verdict, which a placeholder winner satisfies as well, so
-    this pins the replay itself: a stand-in winner has trial number -1.
-    """
+    """The dry run replays the fixture's finished phase and hands out its real winner."""
     materialized = materialize("current-journal", tmp_path, mode=mode)
     attempts = forbid_file_backed_storage(monkeypatch, allow_memory_studies=True)
 
@@ -278,33 +247,12 @@ def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
     assert materialized.unchanged(), materialized.changes()
 
 
-@pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
-def test_recovery_inspect_never_writes_to_a_golden_ledger(
-    fixture_name: str, mode: str, tmp_path: Path
-) -> None:
-    """Recovery preflight leaves a golden ledger and its run store untouched, whatever it decides.
-
-    The matrix above owns the verdict. This isolates the bytes half so it is
-    asserted on its own, for every cell, by a test that can only fail for that
-    one reason.
-    """
-    materialized = materialize(fixture_name, tmp_path, mode=mode)
-    _, state_changes = _recover_inspect(materialized, tmp_path)
-    assert materialized.unchanged(), (
-        f"recovery preflight over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
-    )
-    assert state_changes == {}, (
-        f"recovery preflight over {fixture_name} ({mode}) changed the MCP state "
-        f"directory: {state_changes}"
-    )
-
-
 def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
     """The reference fixture still declares the schema versions this release writes."""
     fixture_name = "current-journal"
     fixture = fixture_by_name(fixture_name)
     materialized = materialize(fixture_name, tmp_path, mode="tree")
-    ledger = ledger_file(materialized, "journal")
+    ledger = materialized.ledger_path
 
     stamps = [
         record["user_attr"][STUDY_SCHEMA_ATTR]
@@ -325,22 +273,14 @@ def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
     )
 
 
-def _fixtures_from_this_generator() -> list[str]:
-    """Name every published fixture the working tree's generator produces.
-
-    The ``release-*`` fixtures are the old release's own output: they carry its
-    fingerprints, and every read path refuses them before comparing one.
-
-    :return list[str]: Fixture names with a ledger and a current-generator origin.
-    """
-    return [
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
         fixture.name
         for fixture in discover_ledger_fixtures()
-        if fixture.manifest["backend"] is not None and not fixture.name.startswith("release-")
-    ]
-
-
-@pytest.mark.parametrize("fixture_name", _fixtures_from_this_generator())
+        if fixture.manifest["backend"] is not None
+    ],
+)
 def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
     fixture_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -365,7 +305,7 @@ def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
 
 
 def test_required_ledger_fixtures_are_present() -> None:
-    """Every fixture the matrix depends on is committed."""
+    """Every fixture the matrix depends on is present."""
     present = tuple(fixture.name for fixture in discover_ledger_fixtures())
     assert present == REQUIRED_FIXTURES
 
@@ -373,10 +313,7 @@ def test_required_ledger_fixtures_are_present() -> None:
 def test_every_ledger_fixture_is_documented() -> None:
     """Each fixture records its provenance and read modes and appears in the inventory README.
 
-    A ``release-<version>-*`` fixture claims to be the old release's own
-    output, so it must name exactly that tag: ``unknown``, a ``-dirty``
-    checkout, or commits past the tag all mean the claim is unproven. A
-    fixture with a ledger must declare a read mode, or the matrix silently
+    A fixture with a ledger must declare a read mode, or the matrix silently
     drops it; one without a ledger has nothing to read.
     """
     readme = (Path(__file__).resolve().parent / "fixtures" / "ledgers" / "README.md").read_text(
@@ -387,12 +324,6 @@ def test_every_ledger_fixture_is_documented() -> None:
         assert isinstance(produced_by, dict) and produced_by.get("phasesweep_git"), (
             f"{fixture.name} has no produced_by provenance"
         )
-        if fixture.name.startswith("release-"):
-            version = fixture.name.removeprefix("release-").rpartition("-")[0]
-            assert produced_by["phasesweep_git"] == f"v{version}", (
-                f"{fixture.name} was produced by {produced_by['phasesweep_git']!r}, "
-                f"not a clean checkout of v{version}"
-            )
         assert fixture.name in readme, f"{fixture.name} is missing from the fixture README"
 
         modes = fixture.modes

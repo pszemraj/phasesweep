@@ -10,14 +10,14 @@ from pathlib import Path
 
 import pytest
 
-import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runs as mcp_runs
+import phasesweep.mcp.tools as mcp_tools
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import RunHandle, RunnerView, RunState
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
 from phasesweep.runtime.reaper import (
     read_boot_id,
     read_pid_namespace,
@@ -63,7 +63,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         app.cancel(pending.run_id)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
-    assert store.recovery_required(pending)
+    assert store.observe(pending).recovery_required
 
     runner_pid = reaped_pid()
     spawned = replace(
@@ -75,18 +75,18 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         boot_id=read_boot_id(),
         pid_namespace=read_pid_namespace(),
     )
-    original_state = store.state
+    original_observe = store.observe
     first_read = True
 
-    def complete_launch_after_state_read(
+    def complete_launch_after_observation(
         saved: RunHandle, *, view: RunnerView | None = None
-    ) -> RunState:
+    ) -> RunObservation:
         nonlocal first_read
-        state = original_state(saved, view=view)
+        observation = original_observe(saved, view=view)
         if first_read:
             first_read = False
             store.update(spawned)
-        return state
+        return observation
 
     signalled: list[tuple[int | None, int | None, int | None]] = []
 
@@ -96,8 +96,8 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         signalled.append((pid, starttime, pgid))
         return True
 
-    monkeypatch.setattr(store, "state", complete_launch_after_state_read)
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", kill_runner)
+    monkeypatch.setattr(store, "observe", complete_launch_after_observation)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", kill_runner)
 
     cancelled = app.cancel(pending.run_id)
 
@@ -131,8 +131,8 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
         signalled.append(args)
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", record_kill)
-    assert store.state(handle) == "running"
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", record_kill)
+    assert store.observe(handle).state == "running"
 
     result = app.cancel("srv-boot")
 
@@ -160,14 +160,14 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
     )
     store.create(handle)
     monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-    monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_tools, "read_boot_id", lambda: None)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:
         signalled.append((args, kwargs))
         return True
 
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", record_signal)
+    monkeypatch.setattr(mcp_tools, "kill_stale_group", record_signal)
 
     result = app.cancel(handle.run_id)
 
@@ -238,7 +238,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     )
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
-    assert store.state(handle) == "running"
+    assert store.observe(handle).state == "running"
     assert store.cleanup_uncertain_path(run_id).is_file()
 
     def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
@@ -251,7 +251,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -328,7 +328,7 @@ def test_cancel_cleanup_confirmation_policy(
             )
         return runner_group_gone
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -377,7 +377,7 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
                 )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _index: app.cancel(run_id), range(2)))
@@ -417,19 +417,21 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
 
     read_running = threading.Event()
     recovery_done = threading.Event()
-    original_state = store.state
+    original_observe = store.observe
     first_cancel_read = True
 
-    def pause_cancel_state(saved: RunHandle, *, view: RunnerView | None = None) -> RunState:
+    def pause_cancel_observation(
+        saved: RunHandle, *, view: RunnerView | None = None
+    ) -> RunObservation:
         nonlocal first_cancel_read
-        state = original_state(saved, view=view)
+        observation = original_observe(saved, view=view)
         if threading.current_thread() is not threading.main_thread() and first_cancel_read:
             first_cancel_read = False
             read_running.set()
             assert recovery_done.wait(timeout=10)
-        return state
+        return observation
 
-    monkeypatch.setattr(store, "state", pause_cancel_state)
+    monkeypatch.setattr(store, "observe", pause_cancel_observation)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         cancelling = pool.submit(app.cancel, run_id)
         assert read_running.wait(timeout=10)
@@ -441,4 +443,4 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     assert result["state"] == "failed"
     assert result["recovery_required"] is False
     assert not store.cleanup_uncertain_path(run_id).exists()
-    assert store.state(handle) == "failed"
+    assert store.observe(handle).state == "failed"

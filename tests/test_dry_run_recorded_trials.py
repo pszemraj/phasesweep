@@ -3,9 +3,7 @@
 A real run judges a phase by the trials its study holds: it refuses what its rules refuse, replays
 a phase whose target is met, and launches what the target still lacks. The preview has to say the
 same, so it reads the ledger through the write-nothing door and applies the run's own rules to
-what it read, in the run's order. The integration tests compare its claims with what a real run
-then launches; the fast ones build the recorded studies by hand and compare its refusals with a
-real run's, message for message.
+what it read, in the run's order.
 """
 
 from __future__ import annotations
@@ -18,9 +16,9 @@ import pytest
 
 import phasesweep.engine.ledger as ledger_module
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
-from phasesweep.engine import (
-    NoFeasibleTrialError,
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyContextConflictError,
@@ -33,6 +31,7 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.phase import _placeholder_winner
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -40,15 +39,20 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
     Winner,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
-from tests.conftest import make_experiment, mark_current_format, write_trainer
+from tests.conftest import (
+    _bounded_metric,
+    make_experiment,
+    requires_nonroot,
+    trial_outcome,
+    write_flaky_trainer,
+)
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import stamp_artifact_root
+from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
@@ -104,10 +108,7 @@ def _persistent(
     tmp_path: Path, *phases: Phase, trainer: Path | None = None, maximize: bool = False
 ) -> Experiment:
     """Build an experiment whose ledger lives beside its workdir under ``tmp_path``."""
-    metric = Metric(
-        goal="maximize" if maximize else "minimize",
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-    )
+    metric = _bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=list(phases), metric=metric)
 
 
@@ -148,12 +149,7 @@ def _record(
     as an objective that recorded its outcome just before its orchestrator died. Its
     COMPLETE trials hold no objective evidence, so selecting a winner from them fails.
     """
-    study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase}",
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
+    study = _new_phase_study(experiment, phase)
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)
@@ -171,12 +167,7 @@ def _record(
             state, _OUTCOME.get(state)
         )
         if outcomes and outcome is not None:
-            attrs[TRIAL_OUTCOME_ATTR] = {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": sequence,
-                "outcome": outcome,
-                "cause": None,
-            }
+            attrs[TRIAL_OUTCOME_ATTR] = trial_outcome(sequence, outcome, cause=None)
         value = 1.0 if state == _STATE.COMPLETE else None
         study.add_trial(optuna.trial.create_trial(state=state, value=value, user_attrs=attrs))
 
@@ -236,32 +227,6 @@ def _refusals_match(
     assert str(dry.value) == str(real.value)
 
 
-def _flaky_trainer(tmp_path: Path, *, failures: int) -> tuple[Path, Path]:
-    """Write a trainer that fails its first ``failures`` calls, then logs ``x=1``.
-
-    :param Path tmp_path: Directory holding the trainer and its call log.
-    :param int failures: How many leading invocations exit nonzero.
-    :return tuple[Path, Path]: The trainer script and the log that gains one line per call.
-    """
-    calls = tmp_path / "calls.log"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import sys
-        from pathlib import Path
-
-        calls = Path({str(calls)!r})
-        seen = len(calls.read_text().splitlines()) if calls.exists() else 0
-        with calls.open("a") as log:
-            log.write("run\\n")
-        if seen < {failures}:
-            sys.exit(1)
-        print("x=1")
-        """,
-    )
-    return trainer, calls
-
-
 @pytest.mark.integration
 def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -314,7 +279,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failure abort at 2 of 4 refuses a rerun; a target raised to 6 previews the 4 it launches."""
-    trainer, calls = _flaky_trainer(tmp_path, failures=2)
+    trainer, calls = write_flaky_trainer(tmp_path, failures=2, value=1)
 
     def attempt(n_trials: int) -> Experiment:
         phase = _phase("a", n_trials, max_consecutive_failures=2)
@@ -419,27 +384,28 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
         run_experiment(accepting)
 
 
+@pytest.mark.parametrize(
+    ("target", "remaining", "expected_launch"),
+    [
+        pytest.param(4, 2, "DRY RUN phase=a would launch 2 trials", id="plural-two-remaining"),
+        pytest.param(3, 1, "DRY RUN phase=a would launch 1 trial", id="singular-one-remaining"),
+    ],
+)
 def test_dry_run_counts_a_failed_attempt_as_spent(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    target: int,
+    remaining: int,
+    expected_launch: str,
 ) -> None:
-    """A failed attempt uses up one trial of the target, so a phase at 2 of 4 launches 2."""
-    experiment = _persistent(tmp_path, _phase("a", 4))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
+    """Failed attempts consume the target; the remaining-work sentence uses matching grammar."""
+    experiment = _persistent(tmp_path, _phase("a", target))
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=target)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
-        "DRY RUN phase=a would launch 2 trials",
+        f"phase=a study=t::a finished=2 remaining={remaining} reruns=0 n_jobs=1",
+        expected_launch,
     ]
-
-
-def test_one_remaining_trial_reads_in_the_singular(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The launch sentence says "1 trial", not "1 trials"."""
-    experiment = _persistent(tmp_path, _phase("a", 3))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=3)
-
-    assert _preview(experiment, tmp_path, caplog)[-1] == "DRY RUN phase=a would launch 1 trial"
 
 
 def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
@@ -553,10 +519,17 @@ def test_met_target_without_a_feasible_trial_is_refused_as_a_run_refuses(
     _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No feasible completed trials")
 
 
-def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
-    """A target below the one the study accepted gives the real run's refusal."""
-    experiment = _persistent(tmp_path, _phase("a", 2))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
+@pytest.mark.parametrize(
+    "case", ["populated-target", "first-refusal-before-fixed-phase", "target-only-empty-study"]
+)
+def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -> None:
+    """An accepted target binds empty and populated studies, before later phase refusals."""
+    phases = [_phase("a", 2)]
+    if case == "first-refusal-before-fixed-phase":
+        phases.append(_phase("b", 3, fixed=True))
+    experiment = _persistent(tmp_path, *phases)
+    states = () if case == "target-only-empty-study" else (_STATE.COMPLETE, _STATE.FAIL)
+    _record(experiment, "a", *states, target=4)
 
     _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
@@ -594,6 +567,7 @@ def test_fresh_experiment_previews_every_phase_as_before(
     assert not (tmp_path / "runs").exists()
 
 
+@requires_nonroot
 def test_unreadable_trial_data_previews_a_fresh_phase_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -626,6 +600,7 @@ def test_unreadable_trial_data_previews_a_fresh_phase_and_says_so(
     assert _PLACEHOLDERS in _commands(caplog)[-1]
 
 
+@requires_nonroot
 def test_uninspectable_ledger_on_an_unbound_tree_previews_fresh_phases_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -697,14 +672,6 @@ def test_publication_the_ledger_cannot_back_is_refused_as_a_run_refuses(
     _refusals_match(experiment, tmp_path, error, match)
 
 
-def test_first_refusal_is_the_one_a_run_gives(tmp_path: Path) -> None:
-    """A lowered target and a later oversized fixed configuration: the run names the lowered target."""
-    experiment = _persistent(tmp_path, _phase("a", 2), _phase("b", 3, fixed=True))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
-
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
-
-
 def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
     tmp_path: Path,
 ) -> None:
@@ -719,14 +686,6 @@ def test_several_refused_studies_are_reported_together_as_a_run_reports_them(
         TrialTargetRefusedError,
         r"multiple unsafe studies: Phase 'a' .*; Phase 'b' ",
     )
-
-
-def test_study_holding_only_an_accepted_target_still_refuses_a_lowered_one(tmp_path: Path) -> None:
-    """A study that recorded its target before its first trial still binds the phase to it."""
-    experiment = _persistent(tmp_path, _phase("a", 2))
-    _record(experiment, "a", target=4)
-
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
 
 def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:

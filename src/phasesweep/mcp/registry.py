@@ -1,10 +1,7 @@
-"""Catalog parsing and the id -> config trust boundary.
+"""Load an operator-authored experiment catalog.
 
-The agent only ever names an experiment id. This module is the sole component
-that maps an id to a config path, and it does so from a catalog file the
-operator authored out of band (same trust as the experiment YAML). Paths are
-resolved and frozen at load; configs are validated at load; anything invalid
-fails server startup.
+Experiment IDs map to validated configs and frozen absolute paths. Invalid entries
+refuse server startup.
 """
 
 from __future__ import annotations
@@ -21,15 +18,14 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import (
     _load_yaml_mapping_from_text,
     describe_validation_error,
     load_experiment_bytes,
 )
-from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.paths import _experiment_dir
+from phasesweep.config.models import Experiment, _metric_semantics_payload
+from phasesweep.engine.paths import _artifact_root_identity
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -75,12 +71,7 @@ class _CatalogModel(BaseModel):
 
 
 class _Allow(_CatalogModel):
-    """Per-experiment permission flags.
-
-    Side effects are opt-in: omitting ``allow`` leaves the experiment
-    read-only. Safety waivers are intentionally not expressible here - they are
-    not config the agent may touch.
-    """
+    """Opt-in per-experiment permissions; omitted ``allow`` keeps the entry read-only."""
 
     launch: bool = False
     cancel: bool = False
@@ -114,8 +105,6 @@ class _Entry(_CatalogModel):
         :return str: The validated id.
         :raises ValueError: If the id is not ``[A-Za-z0-9_-]+``.
         """
-        # The id appears in run ids and handle filenames, so keep it path-safe
-        # even though the operator writes it.
         if not SAFE_NAME_PATTERN.fullmatch(value):
             raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
         return value
@@ -145,9 +134,6 @@ class _Catalog(_CatalogModel):
     """Top-level catalog file: a server state dir plus one or more entries."""
 
     state_dir: Path
-    # Cap on simultaneously-running sweeps across ALL experiments. Defaults to 1
-    # because the common deployment is a single GPU, where a second concurrent
-    # sweep would contend for the device. Raise it on multi-GPU hosts.
     max_concurrent_runs: ConfigInt = Field(default=1, ge=1)
     experiments: list[_Entry] = Field(min_length=1)
 
@@ -246,14 +232,9 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
 
 
 def _state_dir_remediation(state_dir: Path) -> str:
-    """Return an exact mode fix when an existing private directory is repairable.
+    """Suggest an exact ``chmod`` for an owned state, runs or logs directory with a wrong mode.
 
-    Checks ``state_dir`` and its ``runs``/``logs`` subdirectories for one this
-    process owns whose mode is not ``0700``, and if found, suggests the exact
-    ``chmod`` command to fix it. Falls back to a generic suggestion when none
-    of those directories exist, none are owned by this process, or the
-    problem is something other than permissions (e.g. a file or symlink in
-    place of a directory).
+    Return generic remediation for missing paths, other owners or non-permission failures.
 
     :param Path state_dir: Operator-configured MCP state directory root.
     :return str: Operator-facing suggestion for ``phasesweep mcp check``.
@@ -274,10 +255,6 @@ def _state_dir_remediation(state_dir: Path) -> str:
 
 def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> None:
     """Reject MCP configs whose study cannot outlive the process that runs it.
-
-    Relative paths need no check here: config load already resolved them
-    against the config file's directory, so they name the same targets for
-    the server, the detached runner and a CLI operator.
 
     :param str experiment_id: Catalog id being validated, used in operator-facing errors.
     :param Experiment experiment: Parsed experiment config registered for MCP access.
@@ -341,10 +318,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
     _require_persistent_storage(entry.id, config)
     if config.execution.cwd is None:
-        # The detached runner enters the catalog entry's cwd before invoking
-        # the engine. Materialize that effective trainer cwd in the in-memory
-        # registry config so server-side fingerprints and drift comparisons
-        # describe the same execution context as the runner.
+        # Server fingerprints use the runner's effective trainer cwd.
         config = config.model_copy(
             update={"execution": config.execution.model_copy(update={"cwd": str(cwd)})}
         )
@@ -375,7 +349,7 @@ def _claim_catalog_entry_identity(
     :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
     :raises CatalogError: If another catalog id already governs either namespace.
     """
-    namespace = str(_experiment_dir(loaded.experiment).resolve())
+    namespace = _artifact_root_identity(loaded.experiment)
     other = namespace_owners.get(namespace)
     if other is not None:
         raise CatalogError(
@@ -452,9 +426,7 @@ def _load_catalog_entries(
     items: dict[str, RegisteredExperiment] = {}
     verdicts: list[CatalogCheckEntry] = []
     seen: set[str] = set()
-    # Two catalog ids must never govern one engine experiment: the MCP busy
-    # guard keys on the id string while the engine's locks key on the output
-    # namespace and storage identity.
+    # Catalog IDs cannot share an engine namespace or storage identity.
     namespace_owners: dict[str, str] = {}
     storage_owners: dict[str, str] = {}
     for entry in catalog.experiments:
@@ -486,14 +458,10 @@ def _load_catalog_entries(
 
 
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
-    """Validate every catalog entry, collecting per-entry verdicts.
+    """Validate all catalog entries and report each verdict.
 
-    Runs the same validation as :meth:`Registry.load` (shared per-entry code
-    path) but does not stop at the first failure, so ``phasesweep mcp check``
-    can report a full ok/FAIL table. Once every entry passes, it also runs the
-    exact state-directory provisioning and write probe used at server startup.
-    Catalog-level problems (unreadable file, schema errors, or unusable state)
-    still raise :class:`CatalogError`.
+    If every entry passes, provision and probe the state directory as server startup does.
+    Catalog-level schema, file and state failures raise :class:`CatalogError`.
 
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
@@ -528,13 +496,9 @@ class Registry:
 
     @classmethod
     def load(cls, catalog_path: Path) -> Registry:
-        """Parse and validate a catalog file.
+        """Load validated experiments with persistent local journal storage.
 
-        Every problem is reported as ``CatalogError`` so the server refuses to
-        start with a bad catalog. Per entry: the config path exists,
-        ``load_experiment_bytes`` accepts it, it is an :class:`Experiment` (suites
-        are out of scope for v1), and its storage is a persistent local journal
-        file (the MCP layer is local-node only in this version).
+        Any invalid catalog, config or state directory raises ``CatalogError``.
 
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :return Registry: Immutable registry of validated catalog entries.

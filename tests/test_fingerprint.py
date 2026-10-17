@@ -13,40 +13,24 @@ import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.artifacts as artifacts_module
 from phasesweep import __version__, run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    ExecutionContext,
-    Experiment,
-    FloatParam,
-    IntParam,
-    JsonEqualsGate,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Sampler,
-    WandbExtractor,
-)
-from phasesweep.engine import (
-    ArtifactRootConflictError,
-    NoFeasibleTrialError,
-    PublishedStudyMissingError,
-    RunRequestError,
-    StudyFingerprintMismatchError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    TrialTargetRefusedError,
-    read_status,
-    read_winner,
-    read_winners,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _check_artifact_root_binding,
 )
 from phasesweep.engine.artifacts import _load_winner, _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    PublishedStudyMissingError,
+    RunRequestError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    TrialTargetRefusedError,
+)
 from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
@@ -65,7 +49,9 @@ from phasesweep.engine.paths import (
     _summary_path,
     _winner_path,
 )
+from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.resume import _published_for_resume, _reject_bound_descendant_topups
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -77,7 +63,9 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
 )
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
     file_url_path,
@@ -85,7 +73,6 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    assert_published_winner_evidence_local,
     copy_fake_train,
     drop_artifact_root_binding,
     make_experiment,
@@ -95,9 +82,6 @@ from tests.conftest import (
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
 
-#: Optuna journal op code for ``SET_TRIAL_USER_ATTR``. Mirrors
-#: ``optuna.storages.journal._storage.JournalOperation`` and
-#: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
 _JOURNAL_SET_TRIAL_USER_ATTR = 8
 
 
@@ -105,8 +89,7 @@ def _drop_trial_user_attr_records(storage: str, key: str) -> None:
     """Rewrite a journal ledger, dropping every trial user-attribute record for ``key``.
 
     The journal equivalent of ``DELETE FROM trial_user_attributes WHERE key = ?``:
-    every trial in the ledger loses the attribute, not just one study's. Mirrors
-    ``tests/fixtures/make_ledger_fixtures.py``'s journal-record-editing approach.
+    every trial in the ledger loses the attribute, not just one study's.
 
     :param str storage: ``journal:///`` storage URL for the ledger.
     :param str key: Trial user-attribute key to drop everywhere it is set.
@@ -317,7 +300,12 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     # The first (arch) convenience copy completed before the injected failure; the
     # second one (lr, or the summary) did not. Either way, reads resolve via
     # the generation-scoped artifact once any generation has published.
-    assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
+    assert {
+        view.phase
+        for view in read_result(
+            experiment, phase_names=[phase.name for phase in experiment.phases]
+        )[1]
+    } == {"arch", "lr"}
     assert (
         _load_winner(
             experiment,
@@ -396,120 +384,100 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
     assert "lr" in lr_eff
 
 
-def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
-    """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
-    cases = [
-        (
-            "n_trials_top_up",
-            lambda: (make_experiment(n_trials=4), make_experiment(n_trials=64)),
+@pytest.mark.parametrize(
+    "before,after,expected_equal",
+    [
+        pytest.param({"n_trials": 4}, {"n_trials": 64}, True, id="n_trials_top_up"),
+        pytest.param(
+            {"n_jobs": 1},
+            {
+                "n_jobs": 4,
+                "gpu_devices": ["GPU-deadbeef"],
+                "allow_no_gpu_isolation": True,
+                "allow_incomplete_on_timeout": True,
+            },
             True,
+            id="throughput_run_control",
         ),
-        (
-            "throughput_run_control",
-            lambda: (
-                make_experiment(n_jobs=1),
-                make_experiment(
-                    n_jobs=4,
-                    gpu_devices=["GPU-deadbeef"],
-                    allow_no_gpu_isolation=True,
-                    allow_incomplete_on_timeout=True,
-                ),
-            ),
-            True,
-        ),
-        (
-            "env",
-            lambda: (
-                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}),
-                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"}),
-            ),
+        pytest.param(
+            {"n_trials": 4, "env": {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}},
+            {"n_trials": 4, "env": {"CUBLAS_WORKSPACE_CONFIG": ":16:8"}},
             False,
+            id="env",
         ),
-        (
-            "provenance",
-            lambda: (
-                make_experiment(provenance={"revision": "trainer-v1"}),
-                make_experiment(provenance={"revision": "trainer-v2"}),
-            ),
+        pytest.param(
+            {"provenance": {"revision": "trainer-v1"}},
+            {"provenance": {"revision": "trainer-v2"}},
             False,
+            id="provenance",
         ),
-        (
-            "trainer_config",
-            lambda: (
-                make_experiment(
-                    trial_command="echo {config_path}",
-                    override_format="yaml_file",
-                    trainer_config={"model": {"depth": 4}},
-                ),
-                make_experiment(
-                    trial_command="echo {config_path}",
-                    override_format="yaml_file",
-                    trainer_config={"model": {"depth": 8}},
-                ),
-            ),
+        pytest.param(
+            {
+                "trial_command": "echo {config_path}",
+                "override_format": "yaml_file",
+                "trainer_config": {"model": {"depth": 4}},
+            },
+            {
+                "trial_command": "echo {config_path}",
+                "override_format": "yaml_file",
+                "trainer_config": {"model": {"depth": 8}},
+            },
             False,
+            id="trainer_config",
         ),
-        (
-            "search_space",
-            lambda: (
-                make_experiment(search_space={"x": IntParam(type="int", low=0, high=10)}),
-                make_experiment(search_space={"x": IntParam(type="int", low=0, high=20)}),
-            ),
+        pytest.param(
+            {"search_space": {"x": IntParam(type="int", low=0, high=10)}},
+            {"search_space": {"x": IntParam(type="int", low=0, high=20)}},
             False,
+            id="search_space",
         ),
-        (
-            "timeout_seconds_per_trial",
-            lambda: (
-                make_experiment(timeout_seconds_per_trial=60.0),
-                make_experiment(timeout_seconds_per_trial=3600.0),
-            ),
+        pytest.param(
+            {"timeout_seconds_per_trial": 60.0},
+            {"timeout_seconds_per_trial": 3600.0},
             False,
+            id="timeout_seconds_per_trial",
         ),
-        (
-            "gpu_policy",
-            lambda: (
-                make_experiment(gpu_policy="single_per_trial"),
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
-            ),
+        pytest.param(
+            {"gpu_policy": "single_per_trial"},
+            {"gpu_policy": "whole_node", "gpu_ids": [0]},
             False,
+            id="gpu_policy",
         ),
         # Under whole_node the device-set SIZE is the trainer's world size —
         # semantic — while its spelling stays run-control, and under
         # single_per_trial the whole list stays run-control.
-        (
-            "whole_node_device_count",
-            lambda: (
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0]),
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1, 2, 3]),
-            ),
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_ids": [0]},
+            {"gpu_policy": "whole_node", "gpu_ids": [0, 1, 2, 3]},
             False,
+            id="whole_node_device_count",
         ),
-        (
-            "whole_node_device_spelling",
-            lambda: (
-                make_experiment(gpu_policy="whole_node", gpu_ids=[0, 1]),
-                make_experiment(gpu_policy="whole_node", gpu_devices=["GPU-a", "GPU-b"]),
-            ),
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_ids": [0, 1]},
+            {"gpu_policy": "whole_node", "gpu_devices": ["GPU-a", "GPU-b"]},
             True,
+            id="whole_node_device_spelling",
         ),
-        (
-            "single_per_trial_gpu_ids_are_run_control",
-            lambda: (
-                make_experiment(gpu_ids=[0]),
-                make_experiment(gpu_ids=[0, 1, 2, 3]),
-            ),
+        pytest.param(
+            {"gpu_ids": [0]},
+            {"gpu_ids": [0, 1, 2, 3]},
             True,
+            id="single_per_trial_gpu_ids_are_run_control",
         ),
-    ]
-
-    for case, build_pair, expected_equal in cases:
-        exp_a, exp_b = build_pair()
-        fp_a = _phase_fingerprint(exp_a, exp_a.phases[0], {})
-        fp_b = _phase_fingerprint(exp_b, exp_b.phases[0], {})
-        if expected_equal:
-            assert fp_a == fp_b, case
-        else:
-            assert fp_a != fp_b, case
+    ],
+)
+def test_fingerprint_includes_semantic_fields_but_ignores_run_control(
+    before, after, expected_equal
+) -> None:
+    """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
+    exp_a = make_experiment(**before)
+    exp_b = make_experiment(**after)
+    fp_a = _phase_fingerprint(exp_a, exp_a.phases[0], {})
+    fp_b = _phase_fingerprint(exp_b, exp_b.phases[0], {})
+    if expected_equal:
+        assert fp_a == fp_b
+    else:
+        assert fp_a != fp_b
 
 
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
@@ -525,7 +493,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     """
     from phasesweep.engine.fingerprints import (
         _experiment_semantic_fingerprint,
-        _phase_semantic_payload,
+        _phase_fingerprint_payload,
     )
 
     invocation_a = tmp_path / "invocation-a"
@@ -568,7 +536,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
 
     # The phase payload carries the same resolved contract as the experiment one.
     cwd_exp = variants["cwd"]
-    payload = _phase_semantic_payload(cwd_exp, cwd_exp.phases[0], {})
+    payload = _phase_fingerprint_payload(cwd_exp, cwd_exp.phases[0], {})
     assert payload["execution"] == {
         "cwd": str(tmp_path.resolve()),
         "inherit_env": "none",
@@ -635,7 +603,7 @@ def test_replay_under_changed_environment_warns_about_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A no-op replay allocates nothing, so only the drift warning names the change."""
-    monkeypatch.setattr(artifacts_module, "_ENVIRONMENT_DRIFT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     caplog.set_level(logging.WARNING, logger="phasesweep")
     trainer = write_constant_trainer(tmp_path)
     experiment = _environment_cohort_experiment(
@@ -724,7 +692,9 @@ def test_populated_study_without_environment_identity_fails_closed(
     assert experiment.storage is not None
     _drop_trial_user_attr_records(experiment.storage, TRAINER_ENV_DIGEST_ATTR)
 
-    with pytest.raises(StudySchemaMismatchError, match="cannot guess.*environment cohort"):
+    with pytest.raises(
+        StudySchemaMismatchError, match="without a semantic trainer-environment identity"
+    ):
         run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
@@ -800,19 +770,19 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     """An aborted TPE phase continues when its target rises, drawing from TPE's model what one run with the same outcomes draws."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
         n_trials=3,
         max_consecutive_failures=1,
         sampler=Sampler(type="tpe", seed=0, n_startup_trials=0),  # all draws from the model
-        search_space={"x": IntParam(type="int", low=0, high=10)},
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    phase = experiment.phases[0]
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
     write_constant_trainer(tmp_path)
-    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
+    top_up = _with_trial_target(experiment, 4)
     run_experiment(top_up)
     # One uninterrupted run whose trial 0 fails as the aborted one did.
     control_trainer = write_trainer(
@@ -846,13 +816,9 @@ def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
     """A TPE study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
-        n_trials=2,
-        sampler=_SEEDED_TPE,
-        search_space={"x": IntParam(type="int", low=0, high=10)},
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=2, sampler=_SEEDED_TPE
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)
 
@@ -867,17 +833,13 @@ def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
 def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(
-        name="p",
-        n_trials=3,
-        sampler=Sampler(type="random", seed=0),
-        search_space={"x": IntParam(type="int", low=0, high=10)},
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=3, sampler=Sampler(type="random", seed=0)
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winners = run_experiment(experiment)
     winner_before = _winner_path(experiment, "p").read_bytes()
 
-    lowered = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 1})]})
+    lowered = _with_trial_target(experiment, 1)
     with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
         run_experiment(lowered)
 
@@ -964,10 +926,12 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     with pytest.raises(ArtifactRootConflictError) as excinfo:
         run_experiment(moved)
 
+    assert type(excinfo.value) is ArtifactRootConflictError
     message = str(excinfo.value)
+    assert "publishes into artifact root" in message
     assert str(bound_root) in message
     assert str(_experiment_dir(moved)) in message
-    assert "fresh artifact root and local storage" in message
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
@@ -980,9 +944,7 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
-    topped_up = experiment.model_copy(
-        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
-    )
+    topped_up = _with_trial_target(experiment, 2)
     run_experiment(topped_up)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
@@ -1063,16 +1025,19 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert all(character in "0123456789abcdef" for character in binding["storage_key"])
 
     foreign = owner.model_copy(update={"storage": f"journal:///{tmp_path / 'foreign.journal'}"})
-    with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
+    with pytest.raises(ArtifactRootConflictError, match="different storage ledger") as excinfo:
         run_experiment(foreign)
+    assert type(excinfo.value) is ArtifactRootConflictError
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
+    assert "bound to a different storage ledger or experiment" in str(excinfo.value)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winner(foreign, "p")
+        read_result(foreign, phase_names=["p"])
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winner(foreign, "p", generation_id=published)
+        read_result(foreign, generation_id=published, phase_names=["p"])
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        read_winners(foreign)
+        read_result(foreign, phase_names=[phase.name for phase in foreign.phases])[1]
 
     assert not (tmp_path / "foreign.journal").exists()
     assert published_generation_id(owner) == published
@@ -1167,15 +1132,14 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     storage = experiment.storage
-    root = _experiment_dir(experiment)
-    assert_published_winner_evidence_local(root)
     drop_artifact_root_binding(storage, "t::p")
 
     with pytest.raises(ArtifactRootConflictError) as excinfo:
         run_experiment(experiment)
 
     message = str(excinfo.value)
-    assert "fresh artifact root" in message
+    assert "records no artifact root" in message
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert "nothing was written" in message.lower()
     assert (
         ARTIFACT_ROOT_ATTR
@@ -1183,7 +1147,6 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     )
     # The refusal is not allowed to cost the tree its existing publication.
     assert published_generation_id(experiment) is not None
-    assert_published_winner_evidence_local(root)
 
 
 def _unbound_two_phase_studies(
@@ -1263,14 +1226,14 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
             study_name=f"t::{phase.name}", storage=_resolve_storage(storage), direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    real_loader = ledger._load_existing_phase_study
+    real_loader = ledger.open_existing_study
 
     def _fail_for_lr(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
         return real_loader(handle, phase)
 
-    monkeypatch.setattr(ledger, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr(ledger, "open_existing_study", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1511,7 +1474,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = ledger._load_existing_phase_study
+    real_loader = ledger.open_existing_study
     calls = {"count": 0}
 
     def _fail_first_read(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
@@ -1521,7 +1484,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         return real_loader(handle, phase)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(ledger, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr(ledger, "open_existing_study", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 
@@ -1633,12 +1596,12 @@ def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     """
     from importlib.metadata import version as pkg_version
 
-    from phasesweep.engine.fingerprints import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_fingerprint_payload
 
     assert __version__ == pkg_version("phasesweep")
 
     exp = make_experiment()
-    payload = _phase_semantic_payload(exp, exp.phases[0], {})
+    payload = _phase_fingerprint_payload(exp, exp.phases[0], {})
     assert payload["fingerprint_schema_version"] == FINGERPRINT_SCHEMA_VERSION
     assert "phasesweep_version" not in payload
 
@@ -1687,8 +1650,11 @@ def test_from_phase_rejects_stale_parent_winner(
     run_experiment(exp_v1)
 
     exp_v2 = _two_phase_experiment(workdir=workdir, trainer=trainer, **after)
-    with pytest.raises(RuntimeError, match="different phase config"):
+    with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as excinfo:
         run_experiment(exp_v2, from_phase="lr")
+    assert type(excinfo.value) is StudyFingerprintMismatchError
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
+    assert "or restore the matching config before resuming." in str(excinfo.value)
 
 
 @pytest.mark.integration

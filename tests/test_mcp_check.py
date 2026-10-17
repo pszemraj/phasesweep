@@ -39,7 +39,6 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
-    # The shared provisioning path means a green report implies a bootable server.
     Registry.load(catalog)
 
 

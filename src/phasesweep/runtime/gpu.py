@@ -1,23 +1,11 @@
-"""GPU pool: hands out CUDA device tokens and prevents double-booking.
+"""Lease CUDA devices and prevent double-booking through host lock files.
 
-Every trial subprocess gets at most one visible CUDA device when phasesweep can
-resolve CUDA device tokens. If no GPUs are visible, single-job CPU work remains
-a transparent no-op; parallel CPU work requires an explicit opt-in.
+Numeric indices and GPU UUID spellings bind to one canonical GPU UUID.
+Single-job CPU work needs no pool; parallel CPU work requires an explicit opt-in.
+MIG tokens lock individual instances and do not exclude their parent GPU.
 
-Host locks key on a *canonical physical device identity*, not on the spelling of
-the configured token: at pool construction every numeric index is resolved to
-the GPU UUID ``nvidia-smi`` reports for it, so ``gpu_ids: [0]`` in one run and
-``gpu_devices: ["GPU-<uuid of 0>"]`` in another contend for one lock file
-instead of double-booking the card.
-
-MIG limitation: a ``MIG-...`` token locks on the MIG instance itself. phasesweep
-does not bind a MIG instance to its parent GPU, so a run holding a MIG instance
-and a run holding the whole parent device do not exclude each other.
-
-Scope caveat: "host-wide" throughout this module means "every orchestrator that
-resolves the same phasesweep lock directory". The default lock directory is
-per-user (``.cache/phasesweep/locks`` under the OS account home); coordinating
-across users requires a shared ``PHASESWEEP_LOCK_DIR``.
+Locks coordinate orchestrators using the same directory. The default is per-user;
+cross-user coordination requires a shared ``PHASESWEEP_LOCK_DIR``.
 """
 
 from __future__ import annotations
@@ -100,18 +88,11 @@ class GpuAssignment:
 
 
 @dataclass
-class _HostGpuLease:
-    """Host-wide flock handle for one CUDA device token."""
-
-    handle: IO[str]
-
-
-@dataclass
 class _GpuAcquisition:
     """One local GPU assignment plus the host locks that back it."""
 
     devices: list[GpuDevice]
-    leases: list[_HostGpuLease]
+    leases: list[IO[str]]
     visible_devices: str
 
 
@@ -124,11 +105,11 @@ def _gpu_lock_path(device: GpuDevice) -> Path:
     return lock_dir() / f"gpu_{device.lock_name}.lock"
 
 
-def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
+def _try_host_gpu_lease(device: GpuDevice) -> IO[str] | None:
     """Try to acquire the per-GPU host lock without blocking.
 
     :param GpuDevice device: CUDA device token to lease.
-    :return _HostGpuLease | None: Acquired lease, or ``None`` if already locked.
+    :return IO[str] | None: Acquired lock handle, or ``None`` if already locked.
     """
     handle = try_lock_file(_gpu_lock_path(device))
     if handle is None:
@@ -143,21 +124,20 @@ def _try_host_gpu_lease(device: GpuDevice) -> _HostGpuLease | None:
         # locked handle that would exclude every other run from this GPU.
         unlock_file(handle)
         raise
-    return _HostGpuLease(handle=handle)
+    return handle
 
 
-def _release_host_gpu_lease(lease: _HostGpuLease | None) -> None:
+def _release_host_gpu_lease(lease: IO[str] | None) -> None:
     """Close this process's lease copy without unlocking guardian copies.
 
     ``flock(LOCK_UN)`` operates on the shared open-file description and would
-    release the supervisor guardian's inherited lock too. Closing only our descriptor
-    keeps the lock alive after an orchestrator crash or uncertain cleanup,
-    until the guardian exits with the trainer.
+    release the supervisor guardian's inherited lock too. The lock stays held
+    until the last descriptor closes.
     """
     if lease is None:
         return
     with suppress(OSError):
-        lease.handle.close()
+        lease.close()
 
 
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
@@ -189,18 +169,10 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
         index, uuid = index.strip(), uuid.strip()
         if index.isdigit():
             ids.append(int(index))
-        # Require a real device-identity shape. Restricted drivers (vGPU,
-        # locked-down containers) report "[N/A]"/"[Not Supported]" for every
-        # index; accepting those would map ALL indices to one identity and
-        # silently collapse a multi-GPU pool to a single lock.
+        # Ignore driver placeholders; only GPU-/MIG- identities can bind lock tokens.
         if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
     return ids, uuid_map
-
-
-def _detect_gpu_uuid_map() -> dict[str, str]:
-    """Return the usable index-to-UUID portion of one GPU inventory probe."""
-    return _detect_gpu_inventory()[1]
 
 
 def _detect_mig_uuid_set() -> set[str]:
@@ -243,12 +215,6 @@ def _nvidia_driver_reports_gpus() -> bool:
 def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
     """Reject device tokens that cannot syntactically name a CUDA device.
 
-    CUDA silently exposes no device for a token that is neither a numeric
-    index nor a ``GPU-``/``MIG-`` identity, so accepting one would hand a
-    trial an empty visibility set while the real GPUs sit unlocked — the
-    opaque-token equivalent of a nonexistent numeric index, which already
-    fails closed in :func:`_resolve_lock_identities`.
-
     :param list[GpuDevice] devices: Devices built from configured or ambient tokens.
     :raises GpuConfigurationError: A token is neither numeric nor ``GPU-``/``MIG-`` shaped.
     """
@@ -264,47 +230,17 @@ def _validate_device_token_shapes(devices: list[GpuDevice]) -> None:
         )
 
 
-def _resolve_lock_identities(
-    devices: list[GpuDevice],
-    *,
-    uuid_map: dict[str, str] | None = None,
-) -> list[GpuDevice]:
-    """Bind each device to its canonical physical GPU and drop alias duplicates.
-
-    :param list[GpuDevice] devices: Devices built from configured, ambient, or
-        detected tokens.
-    :param dict[str, str] | None uuid_map: Already-probed index-to-UUID map,
-        when available.
-    :raises GpuConfigurationError: Propagated from
-        :func:`_bind_lock_identities` when the tokens cannot be validated.
-    :return list[GpuDevice]: The devices from :func:`_bind_lock_identities`, deduplicated by lock
-        identity so one physical device is never leased twice in one pool.
-    """
-    return _dedupe_by_lock_identity(_bind_lock_identities(devices, uuid_map=uuid_map))
-
-
 def _bind_lock_identities(
     devices: list[GpuDevice],
     *,
     uuid_map: dict[str, str] | None = None,
     mig_uuids: set[str] | None = None,
 ) -> list[GpuDevice]:
-    """Bind each device to the canonical physical GPU its host lock keys on.
+    """Bind CUDA tokens to canonical GPU or MIG lock identities.
 
-    Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
-    same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two. Every ``GPU-`` token, including a full-length
-    or lowercase spelling, resolves through the readable inventory; abbreviated
-    UUID prefixes resolve only when exactly one card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
-    This both canonicalizes case and rejects a UUID that CUDA would turn into an
-    empty visibility set while phasesweep held no real-device lock.
-
-    Binding is kept separate from deduplication so a caller that must fail
-    closed on aliasing can see which tokens collapsed onto one card before they
-    are silently dropped (:func:`_require_distinct_whole_node_devices`). Every
-    token fails closed when its required ``nvidia-smi`` inventory cannot be
-    read: accepting an unverified index or UUID could expose no CUDA device or
-    split the host lock namespace between index and UUID spellings.
+    Indices and unique UUID prefixes resolve through the NVIDIA inventory. Missing or
+    unreadable identities are refused. Preserve aliases and order so whole-node
+    validation can detect a declared world size larger than the physical device set.
 
     :param list[GpuDevice] devices: Devices built from configured, ambient, or
         detected tokens.
@@ -325,7 +261,7 @@ def _bind_lock_identities(
     mig_tokens = [device for device in devices if device.visible_token[:4].upper() == "MIG-"]
 
     if uuid_map is None and (numeric or gpu_tokens):
-        uuid_map = _detect_gpu_uuid_map()
+        uuid_map = _detect_gpu_inventory()[1]
     uuid_map = uuid_map or {}
     if mig_uuids is None and mig_tokens:
         mig_uuids = _detect_mig_uuid_set()
@@ -412,20 +348,10 @@ def _dedupe_by_lock_identity(devices: list[GpuDevice]) -> list[GpuDevice]:
 
 
 def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDevice]) -> None:
-    """Fail closed when a whole-node device set collapses to fewer physical GPUs.
+    """Refuse whole-node tokens that name fewer devices than the declared world size.
 
-    Under ``gpu_policy='whole_node'`` the configured token list *declares* the
-    trainer's world size, and that declared count is what the phase fingerprint
-    records (``whole_node_device_count``). Deduplication is therefore not a
-    convenience here: dropping an aliased token would run a 1-GPU world under a
-    2-GPU study identity, and the two runs would be indistinguishable
-    afterwards. ``single_per_trial`` is unaffected — there the list is a pool
-    whose size is pure throughput, so dedupe with a warning stays correct.
-
-    Only *actual* collapses are reported. A collapse is visible either as a
-    token that :func:`_normalize_devices` removed (an exact repeat, or an empty
-    token) or as two bound devices sharing one ``lock_identity``. Failed
-    inventory resolution raises before this check.
+    Exact repeats, empty tokens and shared bound identities count as collapses.
+    Single-per-trial pool deduplication is handled separately.
 
     :param list[str] requested: Stripped device tokens exactly as configured,
         before normalization dropped anything.
@@ -472,14 +398,10 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
 
 
 class GpuPool:
-    """Thread-safe pool of CUDA-visible device tokens.
+    """Lease CUDA device assignments and host locks across threads.
 
-    Usage:
-        pool = GpuPool.create(n_jobs=4)
-        with pool.acquire() as gpu_device:
-            if gpu_device is not None:
-                env["CUDA_VISIBLE_DEVICES"] = gpu_device
-            run_trial(...)
+    :meth:`acquire` yields a :class:`GpuAssignment` with visibility and lease FDs,
+    including an inactive assignment when no device is leased.
     """
 
     def __init__(
@@ -491,21 +413,11 @@ class GpuPool:
     ) -> None:
         """Build a pool from a fixed list of CUDA device tokens.
 
-        Args:
-            devices: The CUDA device tokens to manage. If empty, the pool is a
-                transparent no-op that always yields ``None`` (single-job
-                or CPU-only mode). Prefer :meth:`create` for the normal
-                construction path that handles auto-detection and policy.
-            whole_node: Whether each acquisition leases all devices as one
-                comma-joined CUDA_VISIBLE_DEVICES assignment.
-            pinned_visible_devices: CUDA_VISIBLE_DEVICES value every
-                acquisition yields when ``devices`` is empty. Set when the
-                pool leases nothing *because* a configured or ambient disable
-                sentinel (``""``/``-1``) says CUDA is off: the sentinel must
-                reach the trial environment even under a narrowed
-                ``inherit_env`` contract, or the trainer would see every host
-                GPU while phasesweep holds zero GPU locks.
-
+        :param list[GpuDevice] devices: Tokens to manage; empty means no GPU leases.
+            Prefer :meth:`create` for discovery and policy handling.
+        :param bool whole_node: Lease all devices as one comma-joined assignment.
+        :param str | None pinned_visible_devices: Visibility for an inactive pool,
+            including a CUDA-disable sentinel that must reach the trainer.
         """
         self._devices = devices
         self._whole_node = whole_node
@@ -532,33 +444,19 @@ class GpuPool:
         """Build a pool, applying phasesweep's GPU isolation policy.
 
         :param int n_jobs: Number of parallel trials.
-        :param list[int] | None explicit_ids: GPU indices from YAML config. If
-                ``None``, auto-detect
-                visible devices even for ``n_jobs == 1`` so independent
-                single-job phasesweep processes do not double-book cuda:0.
-        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens from
-                YAML config. Mutually exclusive with ``explicit_ids``.
-        :param bool allow_no_gpu: If ``True``, run without CUDA isolation when no numeric
-                GPU IDs can be resolved. Parallel auto-detected CPU-only sweeps
-                need this opt-in; an explicit CUDA-disable value does not.
-        :param GpuPolicy policy: CUDA visibility policy. ``single_per_trial`` leases one
-                token per trial. ``whole_node`` leases all tokens for one trial
-                and exposes them comma-joined. ``none`` disables CUDA isolation
-                and GPU locks.
-        :param str | None cuda_visible_devices: Configured trainer-environment override for
-                ``CUDA_VISIBLE_DEVICES``. When omitted, the ambient value is used.
-        :raises GpuConfigurationError: No GPUs are visible and ``n_jobs > 1`` without
-                ``allow_no_gpu``; the NVIDIA driver reports hardware that
-                ``nvidia-smi`` cannot enumerate without ``allow_no_gpu``; the
-                configured or ambient device tokens cannot be resolved to canonical
-                physical devices (see :func:`_bind_lock_identities`), or
-                ``policy='whole_node'`` and the configured tokens collapse to
-                fewer physical GPUs than the declared world size (see
-                :func:`_require_distinct_whole_node_devices`).
-        :return GpuPool: A configured pool. The pool leases devices iff a GPU
-            list is in play; an inactive pool built from a CUDA-disable
-            sentinel still yields that sentinel so trials inherit the
-            disable (see ``pinned_visible_devices``).
+        :param list[int] | None explicit_ids: GPU indices, or None for autodetection,
+            including single-job runs. Mutually exclusive with ``explicit_devices``.
+        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens.
+        :param bool allow_no_gpu: Allow unresolved inventory or auto-detected parallel
+            CPU-only work. An explicit CUDA-disable value needs no opt-in.
+        :param GpuPolicy policy: ``single_per_trial`` leases one token; ``whole_node``
+            leases all tokens together; ``none`` disables isolation and GPU locks.
+        :param str | None cuda_visible_devices: Configured visibility override;
+            None uses the ambient value.
+        :raises GpuConfigurationError: Parallel work has no GPUs without opt-in;
+            hardware inventory cannot be read without opt-in; tokens cannot resolve
+            to physical identities; or whole-node tokens collapse to fewer devices.
+        :return GpuPool: Configured pool; inactive acquisitions retain disable sentinels.
         """
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")
@@ -569,11 +467,8 @@ class GpuPool:
         if explicit is not None:
             bound = _bind_lock_identities(_normalize_devices(explicit))
             if policy == "whole_node":
-                # Config validation rejects exactly-repeated tokens, but physical
-                # aliasing (index vs UUID for one card) can only be seen once
-                # nvidia-smi has been probed — which happens here, after the
-                # no-op-republish early return in the phase runner. Fail closed
-                # rather than lease a smaller world than the fingerprint claims.
+                # Only the probed inventory exposes physical aliases. Reject a smaller world
+                # than the declared whole-node device count.
                 _require_distinct_whole_node_devices(
                     [str(token).strip() for token in explicit], bound
                 )
@@ -626,7 +521,9 @@ class GpuPool:
                 for device in devices
             )
             try:
-                devices = _resolve_lock_identities(devices, uuid_map=detected_uuid_map)
+                devices = _dedupe_by_lock_identity(
+                    _bind_lock_identities(devices, uuid_map=detected_uuid_map)
+                )
             except GpuConfigurationError:
                 if not ambient_cvd:
                     raise
@@ -750,17 +647,10 @@ class GpuPool:
     def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
         """Block until a local slot and host-wide GPU lease are available.
 
-        Args:
-            deadline: Optional ``time.monotonic()`` deadline. When set, waiting
-                for a local slot or host-wide lock fails with ``TimeoutError``
-                instead of extending a phase/run wallclock budget.
-
-        Returns:
-            A one-device acquisition, or ``None`` if the pool is inactive.
-
-        Raises:
-            TimeoutError: ``deadline`` expired before a GPU could be leased.
-
+        :param float | None deadline: Optional monotonic deadline for slot and lock waits.
+        :return _GpuAcquisition | None: One-device acquisition, or None for an inactive pool.
+        :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """
         if not self._devices:
             return None
@@ -772,11 +662,7 @@ class GpuPool:
                 candidates = list(self._available)
                 self._available.clear()
 
-            # This thread owns every candidate until it hands them back. A
-            # lock-layer failure that skipped the hand-back would shrink the
-            # pool permanently: later acquires would block forever (or report
-            # a lease timeout that phase attribution mistakes for wallclock
-            # exhaustion), so the hand-back must survive any exception.
+            # Return all candidates on failure so later acquires cannot lose pool capacity.
             acquired: _GpuAcquisition | None = None
             try:
                 for device in candidates:
@@ -818,28 +704,24 @@ class GpuPool:
             # ``_whole_node_in_use`` is already claimed: a lock-layer failure
             # that left it set (or leaked partial leases) would deadlock every
             # later acquisition, so failures must roll both back.
-            leases: list[_HostGpuLease] = []
-            all_leased = True
+            leases: list[IO[str]] = []
+            all_leased = False
             try:
                 for device in self._devices:
                     lease = _try_host_gpu_lease(device)
                     if lease is None:
-                        all_leased = False
                         break
                     leases.append(lease)
-            except BaseException:
-                for lease in leases:
-                    _release_host_gpu_lease(lease)
-                with self._condition:
-                    self._whole_node_in_use = False
-                    self._condition.notify_all()
-                raise
+                else:
+                    all_leased = True
+            finally:
+                if not all_leased:
+                    for lease in leases:
+                        _release_host_gpu_lease(lease)
+                    with self._condition:
+                        self._whole_node_in_use = False
+                        self._condition.notify_all()
             if not all_leased:
-                for lease in leases:
-                    _release_host_gpu_lease(lease)
-                with self._condition:
-                    self._whole_node_in_use = False
-                    self._condition.notify_all()
                 self._wait_for_retry(deadline)
                 continue
 
@@ -888,21 +770,11 @@ class GpuPool:
     def acquire(self, *, deadline: float | None = None) -> Generator[GpuAssignment, None, None]:
         """Block until a GPU is available and yield its visibility plus lease FDs.
 
-        Args:
-            deadline: Optional ``time.monotonic()`` deadline for the wait.
-
-        Yields:
-            A :class:`GpuAssignment` carrying the CUDA visibility token (the
-            pinned disable sentinel for explicit CPU isolation, or ``None``
-            for an inactive pool) and the host-lock descriptors the supervisor
-            guardian inherits so exclusion survives an orchestrator hard exit.
-            The trainer does not inherit them: the supervisor closes every
-            descriptor above stderr before it execs the trainer.
-
-        Raises:
-            GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
-            GpuLeaseCancelledError: The owning phase cancelled queued lease waits.
-
+        :param float | None deadline: Optional monotonic deadline for the wait.
+        :return: Context manager yielding GpuAssignment visibility and guardian-inherited lock FDs.
+            Inactive pools carry a configured disable sentinel or None visibility.
+        :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """
         acquired = self._acquire(deadline=deadline)
         try:
@@ -913,7 +785,7 @@ class GpuPool:
                     else self._pinned_visible_devices
                 ),
                 lease_fds=(
-                    tuple(lease.handle.fileno() for lease in acquired.leases)
+                    tuple(lease.fileno() for lease in acquired.leases)
                     if acquired is not None
                     else ()
                 ),

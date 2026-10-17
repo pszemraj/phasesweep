@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -39,11 +38,11 @@ from phasesweep.mcp.tools import (
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     DEFAULT_LIST_LIMIT,
-    PhaseSweepMCP,
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
+    call_mcp_tool,
     cancel_mcp_run_quietly,
     make_mcp_app,
     slow_mcp_config_text,
@@ -51,13 +50,6 @@ from tests.mcp_helpers import (
     write_mcp_config_catalog,
 )
 
-if TYPE_CHECKING:
-    from mcp.types import CallToolResult
-
-# Hard ceilings for the monitoring loops below. Both are far above the real
-# cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
-# tool dispatch), so they only trip on a regression that would otherwise hang
-# pytest indefinitely instead of failing.
 MONITOR_DEADLINE_SECONDS = 300.0
 DISPATCH_DEADLINE_SECONDS = 30.0
 
@@ -103,17 +95,7 @@ phases:
 
 
 def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
-    """Exercise the real list -> validate -> launch -> poll -> winners pipeline.
-
-    Exact payload shapes are pinned by cheaper unit tests, not here: the
-    ``metric.objective_evidence`` dict shape by
-    tests/test_engine_read.py::test_objective_evidence_assurance_json_envelope_checkpoint_binding,
-    and the ``all_phases_have_winners``/``missing_phases``/``winner_generation``
-    computation by
-    tests/test_mcp_redaction.py::test_winners_payload_computes_phase_completeness_and_provenance.
-    This test only asserts structural wiring: winners are non-empty, phases are
-    complete and in order, expected keys are present, and redaction is applied.
-    """
+    """Exercise the real list -> validate -> launch -> poll -> winners pipeline."""
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"e2e_lm": _chained_config(tmp_path)},
@@ -138,8 +120,6 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     run_id = app.launch("e2e_lm")["run_id"]
     try:
-        # Bounded: a run that never reaches a terminal state must fail this
-        # test with the last state it reported, not hang pytest forever.
         deadline = time.monotonic() + MONITOR_DEADLINE_SECONDS
         state = "unobserved"
         while state not in {"succeeded", "failed", "cancelled"}:
@@ -265,9 +245,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
 def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     # Holding the launch lock stands in for a concurrent launch mid-decision.
     # The cap check and spawn are serialized under it, so a second launch is
-    # told to retry rather than racing past the cap. The refused path spawns
-    # nothing (it raises before _spawn), so no real sweep is needed and the
-    # test stays deterministic. White-box: reach for the store's lock directly.
+    # told to retry rather than racing past the cap.
     from phasesweep.runtime.files import try_lock_file, unlock_file
 
     trainer = copy_fake_train(tmp_path)
@@ -312,7 +290,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.server_name == "phasesweep"
     assert initialization.server_version == __version__
-    assert initialization.instructions == agent_prompt_text(strip=True)
+    assert initialization.instructions == agent_prompt_text()
     for safety_contract in (
         "When `recovery_required` is true, stop",
         "When `publication_integrity` is `failed`, stop",
@@ -322,8 +300,17 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         "Never open W&B dashboards",
         "`winner_generation`",
         "call `explain_config`",
+        "phasesweep status CONFIG --trials",
+        "tail -f run.log",
+        "cp LEDGER COPY && optuna-dashboard COPY",
+        "Never point a dashboard at the live ledger",
+        "phasesweep init --list",
+        "phasesweep init --template NAME",
+        "Default `inherit_env: none` drops ambient `PYTHONPATH`",
+        "https://github.com/pszemraj/phasesweep/blob/main/docs/",
     ):
         assert safety_contract in initialization.instructions
+    assert "../../../docs/" not in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
@@ -362,7 +349,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
 
     # The _safe_tool wrapper (functools.wraps + *args/**kwargs) must not erase
     # the parameter schema FastMCP derives from each signature, or the agent
-    # could not call the tools. Lock the shapes in.
+    # could not call the tools.
     schemas = {t.name: t.inputSchema for t in tools}
     assert all(schema.get("additionalProperties") is False for schema in schemas.values())
     assert sorted(schemas[TOOL_LAUNCH_RUN]["properties"]) == ["experiment_id", "from_phase"]
@@ -544,8 +531,6 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     async def quick_await(_run_id: str, timeout_seconds: int = 120) -> dict:
         del timeout_seconds
-        # Bounded: if the blocking tool never reaches its blocking section the
-        # regression must surface as a failure, not as a pytest hang.
         deadline = time.monotonic() + DISPATCH_DEADLINE_SECONDS
         while not clock.blocking_started.is_set():
             if time.monotonic() > deadline:
@@ -612,48 +597,13 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     assert blocking_result.isError is False
 
 
-def _call_tool(app: PhaseSweepMCP, tool_name: str, arguments: dict[str, object]) -> CallToolResult:
-    """Dispatch one tool call through the FastMCP request handler.
-
-    :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
-    :param str tool_name: Registered tool to call.
-    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
-    :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
-    """
-    from mcp import types
-
-    from phasesweep.mcp.server import build_server
-
-    server = build_server(app)
-    handler = server._mcp_server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        params=types.CallToolRequestParams(name=tool_name, arguments=arguments)
-    )
-    result = asyncio.run(handler(request)).root
-    if not isinstance(result, types.CallToolResult):
-        raise TypeError(f"A tool call answered with {type(result).__name__}, not CallToolResult.")
-    return result
-
-
-def _call_inspect_experiment_tool(
-    app: PhaseSweepMCP, arguments: dict[str, object]
-) -> CallToolResult:
-    """Dispatch one ``inspect_experiment`` call through the FastMCP request handler.
-
-    :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
-    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
-    :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
-    """
-    return _call_tool(app, TOOL_INSPECT_EXPERIMENT, arguments)
-
-
 def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Path) -> None:
     """The tool answers through the real SDK dispatch, with structured content and no paths."""
     pytest.importorskip("mcp")
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
-    found = _call_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "phases.0.sampler.type"})
+    found = call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "phases.0.sampler.type"})
     assert found.isError is False
     assert found.structuredContent is not None
     assert found.structuredContent["found"] is True
@@ -663,7 +613,7 @@ def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Pa
     ]
     assert str(tmp_path) not in json.dumps(found.structuredContent)
 
-    top_level = _call_tool(app, TOOL_EXPLAIN_CONFIG, {})
+    top_level = call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, {})
     assert top_level.isError is False
     assert top_level.structuredContent is not None
     assert top_level.structuredContent["key"] is None
@@ -674,7 +624,7 @@ def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Pa
     assert "YAML scalars follow PyYAML" in top_level.structuredContent["notes"]
     assert found.structuredContent["notes"] == ""
 
-    missing = _call_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "inherit_env"})
+    missing = call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "inherit_env"})
     assert missing.isError is False
     assert missing.structuredContent is not None
     assert missing.structuredContent["found"] is False
@@ -698,7 +648,7 @@ def test_fastmcp_explain_config_rejects_malformed_input(
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
-    assert _call_tool(app, TOOL_EXPLAIN_CONFIG, arguments).isError is True
+    assert call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, arguments).isError is True
 
 
 @pytest.mark.parametrize(
@@ -722,7 +672,7 @@ def test_fastmcp_tool_errors_are_is_error_results(
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
-    result = _call_inspect_experiment_tool(app, arguments)
+    result = call_mcp_tool(app, TOOL_INSPECT_EXPERIMENT, arguments)
 
     assert result.isError is True
     assert expected_text in result.content[0].text
@@ -742,7 +692,7 @@ def test_fastmcp_unexpected_errors_do_not_leak_internal_details(
         ),
     )
 
-    leaked = _call_inspect_experiment_tool(app, {"experiment_id": "e2e_lm"})
+    leaked = call_mcp_tool(app, TOOL_INSPECT_EXPERIMENT, {"experiment_id": "e2e_lm"})
 
     assert leaked.isError is True
     assert "internal server error" in leaked.content[0].text

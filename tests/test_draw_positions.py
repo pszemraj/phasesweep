@@ -11,7 +11,14 @@ import optuna
 import pytest
 from optuna.samplers._lazy_random_state import LazyRandomState
 
-from phasesweep.config import CategoricalParam, FloatParam, IntParam, Repeats, Sampler, SearchParam
+from phasesweep.config.search import (
+    CategoricalParam,
+    FloatParam,
+    IntParam,
+    Repeats,
+    Sampler,
+    SearchParam,
+)
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.optuna import (
     _build_sampler,
@@ -433,20 +440,6 @@ def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
         "cma:optimizer",
     )
     assert list(inspect.signature(cma._restore_optimizer).parameters) == ["completed_trials"]
-    # The position copy of the trial reaches only the ask seed, and a worker thread's
-    # reseed leaves the thread-local ask stream alone.
-    assert _code_of(optuna.samplers.CmaEsSampler.sample_relative).count("trial.number") == 1
-    assert "_cma_rng" not in _code_of(optuna.samplers.CmaEsSampler.reseed_rng)
-
-
-def _code_of(function: Callable[..., object]) -> str:
-    """Return a function's source with its comments removed.
-
-    :param Callable[..., object] function: Function to read.
-    :return str: Its source lines, each cut at its first ``#``.
-    """
-    return "\n".join(line.split("#", 1)[0] for line in inspect.getsource(function).splitlines())
-
     grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
     assert grid._search_space == {"x": [0, 1]}
     assert len(grid._all_grids) == 2
