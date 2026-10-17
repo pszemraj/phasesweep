@@ -11,11 +11,13 @@ from __future__ import annotations
 import fnmatch
 import importlib
 import importlib.resources
+import re
 import stat
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -70,6 +72,15 @@ def test_package_data_covers_shipped_resources() -> None:
             assert any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns), (
                 f"{package}: {relative} matches no declared package-data pattern {patterns}"
             )
+
+
+def test_readme_links_do_not_depend_on_a_checkout_path() -> None:
+    """Packaged README links and images retain their targets when rendered on PyPI."""
+    readme = PYPROJECT_PATH.parent / _pyproject()["project"]["readme"]
+    targets = re.findall(r"\]\(([^)]+)\)", readme.read_text(encoding="utf-8"))
+    assert targets
+    for target in targets:
+        assert target.startswith("#") or urlsplit(target).scheme, target
 
 
 @pytest.mark.integration

@@ -46,7 +46,7 @@ PROSE_RULES = (
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the source directory, sample count, and audit mode."""
+    """Parse the source directory, sampling options, and audit mode."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -58,6 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Python source directory",
     )
     parser.add_argument("-n", "--count", type=int, default=10, help="Maximum docstrings to sample")
+    parser.add_argument("--seed", type=int, help="Seed for repeatable docstring sampling")
     parser.add_argument(
         "--audit",
         action="store_true",
@@ -152,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             for path, line, text, reasons in findings:
                 print(f"--- {path}:{line} ---\nFlags: {'; '.join(reasons)}\n{text}\n")
         else:
-            sample = random.sample(docstrings, min(args.count, len(docstrings)))
+            sample = random.Random(args.seed).sample(docstrings, min(args.count, len(docstrings)))
             print(f"Sampled {len(sample)} of {len(docstrings)} docstrings", file=sys.stderr)
             for path, line, docstring in sample:
                 print(f"--- {path}:{line} ---\n{docstring}\n")

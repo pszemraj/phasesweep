@@ -18,9 +18,7 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 
 ## Quality gates
 
-During iteration, run the mandatory checks and tests for the changed subsystem.
-Use the parallel fast lane below for broader coverage; reserve the complete suite
-for qualification. Run the repository checks sequentially:
+During iteration, run the mandatory checks and tests for the changed subsystem. Use the parallel fast lane below for broader coverage; reserve the complete suite for qualification. Run the repository checks sequentially:
 
 ```bash
 pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
@@ -60,7 +58,7 @@ The [module-size hook](../scripts/check_module_size.sh) limits each touched sour
 ### Source prose review
 
 ```bash
-python scripts/sample_docstrings.py -n 30
+python scripts/sample_docstrings.py -n 30 --seed 42
 python scripts/sample_docstrings.py --audit > prose-review.txt
 ```
 
@@ -68,17 +66,14 @@ The audit scans every source docstring (including attribute documentation) and c
 
 ### Test tiers
 
-Plain `pytest` runs the complete non-live qualification suite. For broader checks
-while iterating, use two process workers for the fast lane:
+Plain `pytest` runs the complete non-live qualification suite. For broader checks while iterating, use two process workers for the fast lane:
 
 ```bash
 pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid" \
   --durations=25 --durations-min=1
 ```
 
-`loadfile` keeps each test module in one worker. Test homes, caches, journals and
-host-lock directories use per-test temporary paths. Keep the worker count bounded;
-`-n auto` can overload process-launch and deadline checks.
+`loadfile` keeps each test module in one worker. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks.
 
 Run the complementary lane serially, after the workers have exited:
 
@@ -86,11 +81,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Together these lanes cover the same cases as plain `pytest`. The serial lane
-retains integration timing checks and every test that signals its own process,
-including self-signalling cases outside the integration tier. Run both lanes
-without concurrent lint, type checks or other validation. CI and mandatory hooks
-retain their existing serial collection and contract-test scope.
+Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation. CI and mandatory hooks retain their existing serial collection and contract-test scope.
 
 To inspect the cost of a qualification run:
 
@@ -122,13 +113,7 @@ The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decodi
 
 ### Shared test setup
 
-Use `tests/conftest.py` for isolation fixtures, model builders and trial records;
-`tests/experiments.py` for dictionary-based YAML configuration;
-`tests/ledger_fixtures.py` for golden publications and journal mutations;
-`tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup;
-and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup.
-Import shared setup from these support modules rather than another test module.
-Keep assertions and scenario-specific malformed input or trainer programs with their tests.
+Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests.
 
 ## PyPI releases
 

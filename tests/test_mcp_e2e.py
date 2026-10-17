@@ -300,8 +300,17 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         "Never open W&B dashboards",
         "`winner_generation`",
         "call `explain_config`",
+        "phasesweep status CONFIG --trials",
+        "tail -f run.log",
+        "cp LEDGER COPY && optuna-dashboard COPY",
+        "Never point a dashboard at the live ledger",
+        "phasesweep init --list",
+        "phasesweep init --template NAME",
+        "Default `inherit_env: none` drops ambient `PYTHONPATH`",
+        "https://github.com/pszemraj/phasesweep/blob/main/docs/",
     ):
         assert safety_contract in initialization.instructions
+    assert "../../../docs/" not in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
