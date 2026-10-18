@@ -11,21 +11,20 @@ from __future__ import annotations
 import fnmatch
 import importlib
 import importlib.resources
+import re
 import stat
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
 
-import phasesweep.engine as engine
-import phasesweep.evidence as evidence
-from phasesweep.engine import errors as engine_errors
-from phasesweep.engine import run_experiment
+import phasesweep
 from phasesweep.engine.paths import _generation_dir
-from phasesweep.evidence import evaluation as evidence_evaluation
+from phasesweep.engine.run import run_experiment
 from tests.conftest import make_experiment, write_constant_trainer
 from tests.ledger_fixtures import published_generation_id
 
@@ -73,6 +72,15 @@ def test_package_data_covers_shipped_resources() -> None:
             assert any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns), (
                 f"{package}: {relative} matches no declared package-data pattern {patterns}"
             )
+
+
+def test_readme_links_do_not_depend_on_a_checkout_path() -> None:
+    """Packaged README links and images retain their targets when rendered on PyPI."""
+    readme = PYPROJECT_PATH.parent / _pyproject()["project"]["readme"]
+    targets = re.findall(r"\]\(([^)]+)\)", readme.read_text(encoding="utf-8"))
+    assert targets
+    for target in targets:
+        assert target.startswith("#") or urlsplit(target).scheme, target
 
 
 @pytest.mark.integration
@@ -172,20 +180,31 @@ with patch.object(PathFinder, "find_spec", side_effect=without_mcp):
     assert result.stdout == ""
 
 
-def test_engine_exports_all_typed_preflight_errors() -> None:
-    """Engine callers can catch every typed preflight failure from the public API."""
-    names = (
-        "ExperimentLockBusyError",
-        "StudyContextConflictError",
-        "StudyFingerprintMismatchError",
-        "StudySchemaMismatchError",
-        "StudyStorageUnavailableError",
-        "PublishedStudyMissingError",
-        "TrialTargetRefusedError",
-    )
+def test_root_facade_exports_definition_objects() -> None:
+    """The root facade keeps its supported API bound to the defining modules."""
+    from phasesweep._metadata import __version__
+    from phasesweep.config.io import load_experiment
+    from phasesweep.config.models import Experiment
+    from phasesweep.engine.run import experiment_status
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.engine.state import Winner
+    from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+    from phasesweep.reporting import report_objective
 
-    assert set(names).issubset(engine.__all__)
-    assert all(getattr(engine, name) is getattr(engine_errors, name) for name in names)
+    expected = {
+        "Experiment": Experiment,
+        "NoFeasibleTrialError": NoFeasibleTrialError,
+        "ProcessCleanupUncertainError": ProcessCleanupUncertainError,
+        "UnsafeProcessCleanupError": UnsafeProcessCleanupError,
+        "Winner": Winner,
+        "__version__": __version__,
+        "experiment_status": experiment_status,
+        "load_experiment": load_experiment,
+        "report_objective": report_objective,
+        "run_experiment": run_experiment,
+    }
+    assert set(phasesweep.__all__) == expected.keys()
+    assert all(getattr(phasesweep, name) is value for name, value in expected.items())
 
 
 def test_published_generation_metadata_never_exposes_configured_secrets(
@@ -223,17 +242,8 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
     assert stat.S_IMODE((generation_dir / "config.snapshot.yaml").stat().st_mode) == 0o600
 
 
-def test_evidence_exports_deadline_exceeded_error() -> None:
-    """Custom extractor authors catch the deadline failure from the package namespace.
+def test_deadline_exceeded_error_is_an_extractor_failure() -> None:
+    """Extractor callers can distinguish deadline exhaustion from other failures."""
+    from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError
 
-    ``DeadlineExceededError`` is the one extractor failure a caller may want
-    to distinguish (the trial ran out of wallclock, the extractor itself is
-    fine), so it must not require importing the private
-    ``phasesweep.evidence.evaluation`` module path its sibling
-    ``ExtractorError`` never did.
-    """
-    from phasesweep.evidence import DeadlineExceededError, ExtractorError
-
-    assert DeadlineExceededError is evidence_evaluation.DeadlineExceededError
     assert issubclass(DeadlineExceededError, ExtractorError)
-    assert "DeadlineExceededError" in evidence.__all__

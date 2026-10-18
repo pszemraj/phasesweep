@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
-from phasesweep.config.common import ConfigFloat, _Frozen
+from phasesweep.config.common import ConfigFloat, _Frozen, _normalize_http_endpoint
 from phasesweep.tracking.records import MlflowTarget, RunMode, SourceIdentity
 
 
@@ -42,14 +42,8 @@ class MlflowSettings(_Frozen):
                 )
             ):
                 return value
-        elif (
-            parsed.scheme in {"http", "https"}
-            and parsed.hostname
-            and not any((parsed.username, parsed.password, parsed.query, parsed.fragment))
-        ):
-            return urlunsplit(
-                (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
-            )
+        elif (endpoint := _normalize_http_endpoint(parsed)) is not None:
+            return endpoint
         raise ValueError(
             "MLflow tracking_uri requires HTTP(S), databricks, or databricks://profile (no spaces in the profile name) without embedded credentials, query, or fragment."
         )

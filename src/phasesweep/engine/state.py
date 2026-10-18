@@ -8,6 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
+from phasesweep.config.common import _validate_safe_name
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
@@ -57,21 +58,9 @@ class WinnerSource:
 
 
 def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
-    """Validate and reconstruct a persisted ``winner_source`` mapping.
+    """Parse the exact winner-source key set, recognized kind, and execution identity.
 
-    Owns every well-formedness check a caller needs before trusting a
-    ``winner_source`` block: that it is a mapping, that its ``kind`` is a
-    recognized :data:`WinnerSourceKind`, that it has exactly the five
-    required keys, and that its ``phase`` agrees with ``expected_phase`` (the
-    phase the caller is reading a winner *for* — a mismatch means the winner
-    was copied or misattributed across phases). Shared by
-    :func:`phasesweep.engine.artifacts._load_winner`,
-    :func:`phasesweep.engine.read.read_winner`, and
-    :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
-    which differ only in what they do when this raises: the first two wrap it
-    as :class:`phasesweep.engine.errors.WinnerIntegrityError` or treat the
-    winner as absent, respectively, while the manifest validator wraps it as
-    :class:`phasesweep.engine.errors.PublicationIntegrityError`.
+    Require its phase to match ``expected_phase``. Callers apply their own error policy.
 
     :param object data: Parsed ``winner_source`` block from a persisted
         ``winner.yaml``.
@@ -79,7 +68,7 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
         name.
     :raises ValueError: ``data`` is not a mapping, its ``kind`` is not a
         recognized :data:`WinnerSourceKind`, it is missing a required key or
-        carries an extra one, a field cannot be coerced to its expected
+        carries an extra one, a field does not have its expected
         type, or its ``phase`` disagrees with ``expected_phase``.
     :return WinnerSource: The reconstructed source.
     """
@@ -99,12 +88,12 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
     phase = data.get("phase")
     if not isinstance(phase, str) or not phase:
         raise ValueError("invalid winner_source phase")
+    _validate_safe_name("winner_source phase", phase)
     if phase != expected_phase:
         raise ValueError(f"winner_source names phase {phase!r}, expected {expected_phase!r}")
-    try:
-        trial_number = int(data["trial_number"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid winner_source trial_number") from exc
+    trial_number = data["trial_number"]
+    if not isinstance(trial_number, int) or isinstance(trial_number, bool):
+        raise ValueError("invalid winner_source trial_number")
     generation_id = data["generation_id"]
     attempt_id = data["attempt_id"]
     if not isinstance(generation_id, str) or not generation_id:
@@ -122,17 +111,10 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
 
 @dataclass
 class Winner:
-    """Phase winner: sampled params, full effective overrides, and metric value.
+    """Phase winner with sampled params, composed overrides, metric, and retained evidence.
 
-    ``phase_fingerprint`` is the SHA-256 of the phase's semantic execution
-    context at the time the winner was selected. Persisted into ``winner.yaml``
-    and re-checked when ``--from-phase`` skips earlier phases — without that
-    check, editing a parent phase's search space, fixed overrides, env, metric,
-    or trial command and then resuming would silently inherit the *old* winner
-    against the *new* parent config.
-
-    Every optional field is ``None`` only on placeholder winners produced for
-    the dry-run skip path, which never get persisted.
+    The semantic phase fingerprint is verified when a resume loads skipped winners.
+    Dry-run placeholders lack execution evidence and are never persisted.
     """
 
     trial_number: int
@@ -152,16 +134,10 @@ class Winner:
     objective_provenance: dict[str, Any] | None = None
     # Versioned identity of the generated input consumed by the source trial.
     # Persisted with the winner so --from-phase can verify carried evidence
-    # even if the older Optuna ledger is no longer available.
+    # even if the source study is no longer available.
     trainer_input: dict[str, Any] | None = None
-    # Identity of the semantic environment the winning trial ran under: the
-    # SHA-256 of its tracked trainer environment (the pass-through values,
-    # built-in ``TMPDIR`` and ``passthrough_env``, are not in it), plus the
-    # ``inherit_env`` contract.
-    # The tracked name -> value mapping stays on the trial attrs — the winner
-    # file keeps the compact identity.
+    # SHA-256 of the tracked name/value mapping stored on the source trial.
     trainer_env_digest: str | None = None
-    trainer_inherit_env: str | list[str] | None = None
     # Advisory verdicts on the population the source selection ranked, frozen
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.
@@ -212,9 +188,7 @@ RERUN_OF_ATTR = "phasesweep_rerun_of"
 # later failures form the new recovery streak.
 PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
-# Terminal decision recorded before selecting/publishing a winner from an
-# intentionally incomplete timeout. It makes selection crash-replayable
-# without silently scheduling the trial slots the timeout deliberately left.
+# Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
 PHASE_DECISION_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"
@@ -253,11 +227,22 @@ ARTIFACT_ROOT_ATTR = "phasesweep_artifact_root_v1"
 CONSTRAINT_PREFIX = "constraint:"
 
 
+def _study_schema_supported(version: object, has_trials: bool) -> bool:
+    """Accept the current integer stamp or an empty, unmarked allocation.
+
+    :param object version: Decoded study schema attr, or None when absent.
+    :param bool has_trials: Whether the study contains any trials.
+    :return bool: Whether the study's schema is supported.
+    """
+    return (type(version) is int and version == STUDY_SCHEMA_VERSION) or (
+        version is None and not has_trials
+    )
+
+
 def constraint_attr(name: str) -> str:
     """Return the persisted user-attr key for a constraint value.
 
-    :param str name: Constraint name from the experiment config.
-    :return str: Optuna user-attr key used to store the constraint value.
+    :return str: ``constraint:`` key for ``name``.
     """
     return f"{CONSTRAINT_PREFIX}{name}"
 
@@ -268,8 +253,7 @@ OBSERVED_PREFIX = "observed:"
 def observed_attr(name: str) -> str:
     """Return the persisted user-attr key for a report-only observed value.
 
-    :param str name: Observation name from the experiment config.
-    :return str: Optuna user-attr key used to store the observed value.
+    :return str: ``observed:`` key for ``name``.
     """
     return f"{OBSERVED_PREFIX}{name}"
 
@@ -335,6 +319,37 @@ def _valid_abort_record(value: object, *, sequence: int) -> bool:
     )
 
 
+def _trial_outcome_payload(
+    sequence: int,
+    outcome: str,
+    *,
+    cause: str | None = None,
+    policy: str | None = None,
+    abort: JsonObject | None = None,
+) -> JsonObject:
+    """Serialize one ordered outcome and its optional diagnostics and abort.
+
+    :param int sequence: Completion sequence assigned under the outcome lock.
+    :param str outcome: Terminal outcome category.
+    :param str | None cause: Failure explanation when present.
+    :param str | None policy: Fatal policy when present.
+    :param JsonObject | None abort: Phase abort tripped by this outcome.
+    :return JsonObject: Current-format outcome ready for the trial user attribute.
+    """
+    payload: JsonObject = {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+    }
+    if cause is not None:
+        payload["cause"] = cause
+    if policy is not None:
+        payload["policy"] = policy
+    if abort is not None:
+        payload[TRIAL_OUTCOME_ABORT_KEY] = abort
+    return payload
+
+
 def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
     """Return the ordered outcome fields when a trial attr is well formed.
 
@@ -385,12 +400,10 @@ def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
 
 
 def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
-    """Return the outcome stale recovery records for a RUNNING trial whose orchestrator stopped.
+    """Return the durable outcome to record when recovering a RUNNING trial.
 
-    A failure or fatal error the objective already recorded stands, and so does an
-    interruption; anything else, including a success Optuna never committed and
-    no record at all, becomes ``interrupted``. Shared by recovery and the dry run, so the
-    preview predicts what recovery writes.
+    Preserve recorded failure, fatal, or interrupted outcomes. Missing or uncommitted
+    success outcomes recover as interrupted. Preview uses the same rule.
 
     :param _ParsedTrialOutcome | None parsed: The trial's valid, unduplicated recorded
         outcome, or ``None`` when it has none.
@@ -437,11 +450,7 @@ def _unduplicated_outcome(
 def _recovered_trial_state(
     trial: FrozenTrial, sequence_counts: Counter[int]
 ) -> RecoveredTrialState:
-    """Predict the counted state stale recovery leaves a RUNNING trial in.
-
-    Read from the outcome the trial's objective recorded, which nothing changes
-    once its orchestrator has stopped, so a dry run or a frozen snapshot can
-    count the trial as recovery will.
+    """Predict the counted state stale recovery derives from a RUNNING trial's outcome.
 
     :param FrozenTrial trial: RUNNING trial to predict for.
     :param Counter[int] sequence_counts: The study's
@@ -469,7 +478,7 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 3
+GENERATION_SUMMARY_SCHEMA_VERSION = 4
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time. The
 # summary keeps only the config *fingerprint*: once the operator edits or loses

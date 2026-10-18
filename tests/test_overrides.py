@@ -12,22 +12,14 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    FloatParam,
-    Phase,
-    Sampler,
-)
+from phasesweep.config.models import Phase
+from phasesweep.config.search import CategoricalParam, FloatParam, Sampler
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     compose_trainer_config,
-    dump_json_file_overrides,
-    dump_trainer_config_yaml,
-    dump_trial_trainer_config_yaml,
+    compose_trainer_input,
     flatten_trainer_config,
-    format_argparse,
-    format_hydra,
-    merged_cli_overrides,
+    format_cli_overrides,
     render_command,
 )
 from tests.conftest import (
@@ -40,7 +32,7 @@ from tests.conftest import (
 
 
 def test_argparse():
-    s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
+    s = format_cli_overrides({"lr": 3e-4, "weight_decay": 0.05}, "argparse")
     assert s == "--lr=0.0003 --weight_decay=0.05"
 
 
@@ -50,7 +42,9 @@ def test_argparse_round_trips_option_like_values(tag):
     parser.add_argument("--offset", type=float)
     parser.add_argument("--tag")
 
-    parsed = parser.parse_args(shlex.split(format_argparse({"offset": -1e-5, "tag": tag})))
+    parsed = parser.parse_args(
+        shlex.split(format_cli_overrides({"offset": -1e-5, "tag": tag}, "argparse"))
+    )
 
     assert parsed.offset == -1e-5
     assert parsed.tag == tag
@@ -58,7 +52,7 @@ def test_argparse_round_trips_option_like_values(tag):
 
 def test_argparse_renders_the_documented_wire_forms():
     """The accepted value set renders exactly what config_reference.yaml promises."""
-    s = format_argparse(
+    s = format_cli_overrides(
         {
             "none": None,
             "flag": True,
@@ -66,7 +60,8 @@ def test_argparse_renders_the_documented_wire_forms():
             "ratio": 2.5,
             "tag": "s",
             "items": [1, "a", False],
-        }
+        },
+        "argparse",
     )
 
     assert shlex.split(s) == [
@@ -89,11 +84,9 @@ def test_argparse_renders_the_documented_wire_forms():
     ],
 )
 def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
-    """Defense in depth behind the config validator: str()-ing a mapping or a
-    date into a command line is how two different commands end up sharing one
-    fingerprint."""
+    """Unsupported literals fail before a command can be rendered."""
     with pytest.raises(TypeError, match="yaml_file"):
-        format_argparse({"model": value})
+        format_cli_overrides({"model": value}, "argparse")
 
 
 def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
@@ -118,19 +111,19 @@ def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> N
     }
 
     config_path = trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"]
-    config_path.write_text(
-        dump_trial_trainer_config_yaml(
-            base,
-            overrides,
-            substitutions={
-                "{trial_dir}": str(trial_dir),
-                "{trial_id}": "3",
-                "{phase}": "depth",
-                "{run_name}": "x-depth-3",
-            },
-        ),
-        encoding="utf-8",
+    config_text = compose_trainer_input(
+        base,
+        overrides,
+        "yaml_file",
+        substitutions={
+            "{trial_dir}": str(trial_dir),
+            "{trial_id}": "3",
+            "{phase}": "depth",
+            "{run_name}": "x-depth-3",
+        },
     )
+    assert isinstance(config_text, str)
+    config_path.write_text(config_text, encoding="utf-8")
 
     command = render_command(
         "python train.py {config_path}",
@@ -159,7 +152,9 @@ def test_yaml_file_dump_is_deterministic_across_mapping_order() -> None:
     left = {"z": 1, "nested": {"b": 2, "a": [True, None]}, "a": "first"}
     right = {"a": "first", "nested": {"a": [True, None], "b": 2}, "z": 1}
 
-    assert dump_trainer_config_yaml(left) == dump_trainer_config_yaml(right)
+    assert compose_trainer_input(left, {}, "yaml_file") == compose_trainer_input(
+        right, {}, "yaml_file"
+    )
 
 
 def test_compose_trainer_config_replaces_exact_leaf_but_rejects_scalar_descent() -> None:
@@ -237,7 +232,7 @@ def test_yaml_file_is_the_default_and_requires_config_path(tmp_path: Path) -> No
           extractor: {type: json_envelope, objective_name: loss, split: test, policy: test}
         phases: [{name: p, n_trials: 1}]
         """,
-            r"trainer_config.cutoff.*type date",
+            r"trainer_config\.cutoff.*unsupported type date:.*quote YAML dates or timestamps",
             id="nonportable-yaml-date",
         ),
     ],
@@ -295,18 +290,19 @@ def test_trainer_config_is_the_base_for_every_format(tmp_path: Path) -> None:
         ]
     )
 
-    assert json.loads(
-        dump_json_file_overrides(
-            _CLI_OVERRIDES,
-            trainer_config=_CLI_BASE,
-            substitutions={
-                "{trial_dir}": str(trial_dir),
-                "{trial_id}": "3",
-                "{phase}": "depth",
-                "{run_name}": "x-depth-3",
-            },
-        )
-    ) == {
+    json_input = compose_trainer_input(
+        _CLI_BASE,
+        _CLI_OVERRIDES,
+        "json_file",
+        substitutions={
+            "{trial_dir}": str(trial_dir),
+            "{trial_id}": "3",
+            "{phase}": "depth",
+            "{run_name}": "x-depth-3",
+        },
+    )
+    assert isinstance(json_input, str)
+    assert json.loads(json_input) == {
         "model": {"name": "tiny", "depth": 8},
         "optimizer": {"lr": 3e-4},
         "layers": [1, 2],
@@ -321,8 +317,12 @@ def test_empty_trainer_config_leaves_overrides_untouched() -> None:
     """Without a base the overrides pass through in their own order, as a json_file base-less dump."""
     overrides = {"a.x": 1, "b": 2, "a.y": 3}
 
-    assert list(merged_cli_overrides({}, overrides)) == ["a.x", "b", "a.y"]
-    assert json.loads(dump_json_file_overrides(overrides)) == {"a": {"x": 1, "y": 3}, "b": 2}
+    cli_input = compose_trainer_input({}, overrides, "argparse")
+    assert isinstance(cli_input, dict)
+    assert list(cli_input) == ["a.x", "b", "a.y"]
+    json_input = compose_trainer_input({}, overrides, "json_file")
+    assert isinstance(json_input, str)
+    assert json.loads(json_input) == {"a": {"x": 1, "y": 3}, "b": 2}
 
 
 @pytest.mark.parametrize(
@@ -337,9 +337,13 @@ def test_flattened_merge_agrees_with_the_nested_json_composition(
     trainer_config: dict, overrides: dict
 ) -> None:
     """argparse and hydra see the same values json_file nests, only dotted."""
-    nested = json.loads(dump_json_file_overrides(overrides, trainer_config=trainer_config))
+    json_input = compose_trainer_input(trainer_config, overrides, "json_file")
+    assert isinstance(json_input, str)
+    nested = json.loads(json_input)
 
-    assert merged_cli_overrides(trainer_config, overrides) == flatten_trainer_config(nested)
+    assert compose_trainer_input(trainer_config, overrides, "argparse") == flatten_trainer_config(
+        nested
+    )
 
 
 @pytest.mark.parametrize(
@@ -366,24 +370,29 @@ def test_flatten_trainer_config_keeps_lists_and_empty_mappings_as_leaves() -> No
 
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])
 @pytest.mark.parametrize(
-    "leaf",
+    ("leaf", "hint"),
     [
-        pytest.param([{"x": 1}], id="list-of-mappings"),
-        pytest.param({}, id="empty-mapping"),
+        pytest.param(
+            [{"x": 1}], "Use the default override_format='yaml_file'", id="list-of-mappings"
+        ),
+        pytest.param({}, "Use the default override_format='yaml_file'", id="empty-mapping"),
+        pytest.param(datetime.date(2024, 1, 1), "Quote YAML dates or timestamps", id="date"),
+        pytest.param(float("inf"), 'quote it in YAML (e.g. "inf")', id="nonfinite"),
     ],
 )
 def test_cli_format_rejects_unrenderable_trainer_config_leaf(
-    override_format: str, leaf: object
+    override_format: str, leaf: object, hint: str
 ) -> None:
     with pytest.raises(
         ValidationError,
         match=rf"trainer_config key 'opt\.leaf': override_format='{override_format}' supports",
-    ):
+    ) as caught:
         make_experiment(
             override_format=override_format,
             trial_command="echo {overrides}",
             trainer_config={"opt": {"leaf": leaf}},
         )
+    assert hint in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -471,7 +480,7 @@ def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
     from hydra.core.override_parser.overrides_parser import OverridesParser
     from omegaconf import OmegaConf
 
-    argument = shlex.split(format_hydra({"value": value}))[0]
+    argument = shlex.split(format_cli_overrides({"value": value}, "hydra"))[0]
     parsed = OverridesParser.create().parse_override(argument)
     assert not parsed.is_sweep_override()
     actual = OmegaConf.to_container(OmegaConf.create({"value": parsed.value()}), resolve=True)[
@@ -557,25 +566,50 @@ def test_yaml_exponent_scalars_preserve_declared_types(tmp_path):
 @pytest.mark.parametrize("overrides", [{"x": 1, "x.y": 2}, {"x.y": 2, "x": 1}, {"x": {}, "x.y": 2}])
 def test_json_file_rejects_dotted_collisions(overrides):
     with pytest.raises(ValueError, match="parent key"):
-        dump_json_file_overrides(overrides)
+        compose_trainer_input({}, overrides, "json_file")
 
 
-@pytest.mark.parametrize("value", [float("inf"), datetime.date(2024, 1, 1), {1: "value"}, (1, 2)])
-def test_json_file_rejects_non_json_values(value):
-    with pytest.raises((TypeError, ValueError)):
-        dump_json_file_overrides({"value": value})
+@pytest.mark.parametrize("override_format", ["yaml_file", "json_file"])
+@pytest.mark.parametrize(
+    ("problem", "diagnostic"),
+    [
+        ("tuple", "unsupported type tuple"),
+        ("date", "unsupported type date"),
+        ("timestamp", "unsupported type datetime"),
+        ("non-string-key", "non-string mapping key 1 (int)"),
+        ("nonfinite", "must be finite; got float: inf"),
+        ("recursive", "contains a recursive YAML container"),
+    ],
+)
+def test_file_input_rejects_nonportable_values(override_format, problem, diagnostic):
+    if problem == "recursive":
+        value = []
+        value.append(value)
+    else:
+        value = {
+            "tuple": (1, 2),
+            "date": datetime.date(2024, 1, 1),
+            "timestamp": datetime.datetime(2024, 1, 1, 12, 30),
+            "non-string-key": {1: "x"},
+            "nonfinite": float("inf"),
+        }[problem]
+    with pytest.raises(ValueError, match="payload") as caught:
+        compose_trainer_input({"dict": [{"payload": {"[key]": value}}]}, {}, override_format)
+    message = str(caught.value)
+    root = "trainer_config" if override_format == "yaml_file" else "JSON overrides"
+    assert f"{root}.dict[0].payload.[key]" in message
+    assert diagnostic in message
+    assert "tagged-union" not in message
+    if problem in {"date", "timestamp"}:
+        assert "quote YAML dates or timestamps to keep them strings" in message
 
 
 @pytest.mark.parametrize("selector", ["hydra", "json_file"])
 @pytest.mark.integration
 def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
-    from phasesweep.config import (
-        CategoricalParam,
-        ExecutionContext,
-        LogRegexExtractor,
-        Metric,
-        Sampler,
-    )
+    from phasesweep.config.models import ExecutionContext, Metric
+    from phasesweep.config.search import CategoricalParam, Sampler
+    from phasesweep.evidence.models import LogRegexExtractor
 
     trainer = tmp_path / "trainer.py"
     if selector == "hydra":
@@ -690,7 +724,7 @@ def test_packaged_fake_trainer_consumes_dotted_cli_overrides(
 
 def _override_yaml(tmp_path, override_format: str, body: str):
     """Write a minimal override config with caller-supplied phase/contract body."""
-    assert override_format == "argparse"
+    assert override_format in {"argparse", "hydra"}
     trial_command = "python train.py {overrides}"
     return write_yaml(
         tmp_path,
@@ -712,23 +746,26 @@ def _override_yaml(tmp_path, override_format: str, body: str):
 # keys, and a YAML-native date/non-finite float has no canonical rendering at
 # all.
 _UNRENDERABLE_ARGPARSE_VALUES = [
-    pytest.param("{1: x}", r"Phase 't'.*'knob'.*type dict", id="int-keyed-mapping"),
-    pytest.param('{1: x, "1": y}', r"Phase 't'.*'knob'.*type dict", id="mixed-key-mapping"),
-    pytest.param("2024-01-01", r"Phase 't'.*'knob'.*type date", id="yaml-date"),
-    pytest.param(".nan", r"Phase 't'.*'knob'.*type float", id="non-finite-float"),
+    pytest.param("{1: x}", r"Phase 't'.*'knob'.*dict:", id="int-keyed-mapping"),
+    pytest.param('{1: x, "1": y}', r"Phase 't'.*'knob'.*dict:", id="mixed-key-mapping"),
+    pytest.param("2024-01-01", r"Phase 't'.*'knob'.*date:", id="yaml-date"),
+    pytest.param(".nan", r"Phase 't'.*'knob'.*float:", id="non-finite-float"),
     pytest.param(
         "[2024-01-01]",
-        r"Phase 't'.*'knob'.*at position \[0\].*type date",
+        r"Phase 't'.*'knob'.*at position \[0\].*date:",
         id="nested-date-in-list",
     ),
 ]
 
 
 @pytest.mark.parametrize(("value", "expected"), _UNRENDERABLE_ARGPARSE_VALUES)
-def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, expected):
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_validate_rejects_unrenderable_cli_fixed_override(
+    tmp_path, value, expected, override_format
+):
     p = _override_yaml(
         tmp_path,
-        "argparse",
+        override_format,
         "        phases:\n"
         "          - name: t\n"
         "            n_trials: 1\n"
@@ -736,8 +773,14 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
         f"              knob: {value}\n",
     )
 
-    with pytest.raises(ValidationError, match=expected):
+    with pytest.raises(ValidationError, match=expected) as caught:
         load_experiment(p)
+    assert f"override_format='{override_format}' supports" in str(caught.value)
+    assert "Use the default override_format='yaml_file'" in str(caught.value)
+    if "2024-01-01" in value:
+        assert "Quote YAML dates or timestamps to send them as strings" in str(caught.value)
+    if value == ".nan":
+        assert 'quote it in YAML (e.g. "inf")' in str(caught.value)
 
 
 def test_validate_rejects_argparse_categorical_wire_collision() -> None:
@@ -754,7 +797,6 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
     """With the value contract enforced, distinct Python values always produce
     distinct JSON-mode dumps — so no two configs that render different commands
     can share a study identity."""
-    # Import only: the fingerprint code itself is deliberately untouched.
     from phasesweep.engine.fingerprints import _phase_fingerprint
 
     fingerprints: dict[str, str] = {}
@@ -763,9 +805,6 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
         fingerprints[label] = _phase_fingerprint(exp, exp.phases[0], {})
 
     assert len(set(fingerprints.values())) == len(fingerprints)
-
-
-# ---- migrated from version-named files ----
 
 
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])

@@ -1,23 +1,49 @@
-"""The run.log progress lines a phase writes: its header, one RERUN line per rerun, one TRIAL line per trial."""
+"""Engine progress lines and process-scoped warnings.
+
+A phase writes its header, one RERUN line per rerun and one TRIAL line per trial.
+"""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Hashable, Sequence
 
 import optuna
 
-from phasesweep.config import Phase
+from phasesweep.config.models import Phase
 from phasesweep.engine.optuna import _trial_state_label
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
 
 # The lines keep the phase channel that docs and run.log readers match on.
 log = logging.getLogger("phasesweep.engine.phase")
+_WARNED: set[Hashable] = set()
+
+
+def _warn_once(logger: logging.Logger, key: Hashable, message: str, *args: object) -> None:
+    """Log a warning once per process for its namespaced identity.
+
+    Callers include the warning kind in ``key`` so separate diagnostics never
+    suppress one another. The supplied logger retains each diagnostic's channel.
+
+    :param logging.Logger logger: Logger that emits the warning.
+    :param Hashable key: Warning kind and the identities defining its scope.
+    :param str message: Logging format string.
+    :param object args: Values substituted into the format string.
+    """
+    if key not in _WARNED:
+        _WARNED.add(key)
+        logger.warning(message, *args)
 
 
 def _log_phase_header(
-    phase: Phase, study_name: str, *, finished: int, remaining: int, reruns: int
+    phase: Phase,
+    study_name: str,
+    *,
+    finished: int,
+    remaining: int,
+    reruns: int,
+    logger: logging.Logger = log,
 ) -> None:
     """Log the line that opens a phase's work in run.log.
 
@@ -26,8 +52,9 @@ def _log_phase_header(
     :param int finished: Trials that count toward its target.
     :param int remaining: Trials still needed to reach ``phase.n_trials``.
     :param int reruns: Reruns it owes for interrupted trials.
+    :param logging.Logger logger: Progress channel for a live phase or its preview.
     """
-    log.info(
+    logger.info(
         "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
         phase.name,
         study_name,
@@ -39,15 +66,10 @@ def _log_phase_header(
 
 
 def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished: int) -> None:
-    """Log one INFO line for a finished trial, the progress stream a ``tail -f`` follows.
+    """Log one finished trial's state, outcome reason, and duration.
 
-    A COMPLETE trial that is infeasible, whether by a constraint or by the
-    metric's bounds, reports ``INFEASIBLE`` in place of its Optuna state, as
-    selection treats it, and an interrupted trial reports ``INTERRUPTED``. The
-    reason is the first line of the recorded outcome cause. A repeats phase adds
-    the trial's repeat value so a reader can see which seed ran, and a rerun
-    names the interrupted trial it reran. Params stay out of the line; the
-    phase's WINNER line carries the winner's.
+    Use ``INFEASIBLE`` or ``INTERRUPTED`` where applicable. Repeat values and rerun
+    sources are included; params remain on the phase's WINNER line.
 
     :param Phase phase: The phase the trial belongs to.
     :param optuna.trial.FrozenTrial trial: The just-finished trial.

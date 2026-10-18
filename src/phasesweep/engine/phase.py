@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
@@ -26,12 +26,11 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
-    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.evidence import _verify_winner_objective_evidence
+from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
@@ -61,11 +60,10 @@ from phasesweep.engine.state import (
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
-    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
+    _trial_outcome_payload,
     constraint_attr,
     observed_attr,
 )
@@ -73,6 +71,7 @@ from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
     _consecutive_failure_threshold_tripped,
+    _initialize_study_schema,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
     _next_consecutive_failures,
@@ -84,22 +83,21 @@ from phasesweep.engine.study_policy import (
     _record_trial_target,
     _validate_environment_cohort,
     _validate_study_direction,
-    _validate_study_schema,
     _validate_trial_target,
 )
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
-    UnsafeProcessCleanupError,
     _environment_identity,
-    _inherit_env_contract,
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
+from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -165,8 +163,7 @@ def _partial_completion_for_replay(
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
-            "decision was committed. Use a new experiment name, or archive/delete "
-            "the inconsistent study."
+            "decision was committed."
         )
     return _winner_completion(
         requested_trials=decision.trial_target,
@@ -194,31 +191,14 @@ _UNLAUNCHED_ABORT_CAUSE = "phase aborted before this trial's trainer launched"
 
 
 class _TrialOutcomeUnrecordedAbort(BaseException):
-    """Control-flow abort for a trial whose outcome record could not be written.
+    """Keep a trial RUNNING when its outcome cannot be persisted.
 
-    Derives directly from :class:`BaseException` on purpose, and must keep
-    doing so. Optuna's ``_run_trial`` catches ``(Exception, KeyboardInterrupt)``
-    around the objective and then calls ``_tell_with_warning`` unconditionally,
-    so *any* ``Exception`` leaving the objective commits that trial's terminal
-    state. A terminal row whose ``TRIAL_OUTCOME_ATTR`` is missing cannot be
-    repaired afterwards - Optuna raises ``UpdateFinishedTrialError`` for
-    user-attr writes on a finished trial - and permanently wedges the study,
-    because every later invocation rejects it in ``_load_phase_policy_state``.
-    Raising from outside Optuna's catch set is what keeps the trial ``RUNNING``
-    instead, where the standard stale-attempt recovery writes the outcome
-    *before* the terminal transition.
-
-    Deliberately not a :class:`PhaseSweepError`: it never reaches an operator.
-    ``_run_phase`` converts it into :class:`StudyStorageUnavailableError` once
-    the optimize loop has drained.
+    Optuna does not catch this BaseException subclass. After workers drain,
+    ``_run_phase`` converts it to ``StudyStorageUnavailableError``; stale
+    recovery records the outcome before committing the trial's terminal state.
     """
 
 
-# Delays between the bounded retries of the per-trial outcome write. The write
-# is a single small user-attr row, so a transient backend fault (a locked
-# journal ledger, a momentary connection drop) usually clears within a few
-# hundred milliseconds; anything longer is an outage the phase must not
-# outrun. len() + 1 total attempts.
 _OUTCOME_WRITE_RETRY_DELAYS = (0.05, 0.25)
 _OUTCOME_WRITE_ATTEMPTS = len(_OUTCOME_WRITE_RETRY_DELAYS) + 1
 
@@ -353,7 +333,7 @@ def _failure_policy_abort_record(
     consecutive_failures: int,
     completion_sequence: int,
     trial_target: int,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Build a durable consecutive-failure abort record.
 
     :param Phase phase: Phase supplying ``max_consecutive_failures`` for the
@@ -364,40 +344,41 @@ def _failure_policy_abort_record(
         the trip was observed.
     :param int trial_target: Durable accepted ``n_trials`` target to attach
         to the record.
-    :return dict[str, Any]: A ``schema_version=1`` abort record ready to
+    :return JsonObject: A ``schema_version=1`` abort record ready to
         record with the tripping outcome.
     """
     return {
-        "schema_version": 1,
-        "policy": "max_consecutive_failures",
+        **_abort_record(
+            policy="max_consecutive_failures",
+            completion_sequence=completion_sequence,
+            trial_target=trial_target,
+            cause=(
+                f"{consecutive_failures} consecutive failed/infeasible trials reached "
+                f"max_consecutive_failures={phase.max_consecutive_failures}."
+            ),
+        ),
         "threshold": phase.max_consecutive_failures,
         "consecutive_failures": consecutive_failures,
-        "completion_sequence": completion_sequence,
-        "trial_target": trial_target,
-        "cause": (
-            f"{consecutive_failures} consecutive failed/infeasible trials reached "
-            f"max_consecutive_failures={phase.max_consecutive_failures}."
-        ),
     }
 
 
-def _fatal_abort_record(
+def _abort_record(
     *,
     policy: str,
     completion_sequence: int,
     trial_target: int,
     cause: str,
-) -> dict[str, Any]:
-    """Build a durable fatal-outcome abort record.
+) -> JsonObject:
+    """Build the common fields of a durable phase abort record.
 
-    :param str policy: Fatal policy that stopped the phase, such as
+    :param str policy: Policy that stopped the phase, such as
         ``"unsafe_process_cleanup"``.
-    :param int completion_sequence: Completion sequence of the fatal outcome.
+    :param int completion_sequence: Completion sequence of the tripping outcome.
     :param int trial_target: Durable accepted ``n_trials`` target to attach
         to the record.
     :param str cause: Explanation the operator reads.
-    :return dict[str, Any]: A ``schema_version=1`` abort record ready to
-        record with the fatal outcome.
+    :return JsonObject: A ``schema_version=1`` abort record ready to
+        record with the tripping outcome.
     """
     return {
         "schema_version": 1,
@@ -423,7 +404,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
         f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
         f"successful phase. Increase n_trials above {trial_target} to explicitly schedule "
-        "new recovery attempts, or use a new experiment name.",
+        "new recovery attempts.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -442,8 +423,8 @@ def _raise_streak_at_limit(phase: Phase, consecutive_failures: int, trial_target
         f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
         f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
         f"it launches no more trials at its accepted n_trials={trial_target}. Increase "
-        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, raise "
-        "max_consecutive_failures, or use a new experiment name.",
+        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, or raise "
+        "max_consecutive_failures.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -498,7 +479,7 @@ def _resume_phase(
         accepted partial-timeout decision replays.
     """
     _validate_study_direction(study, experiment.metric.goal)
-    _validate_study_schema(study)
+    _initialize_study_schema(study)
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
     policy_state = _load_phase_policy_state(study)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
@@ -510,6 +491,19 @@ def _resume_phase(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,
         verify_evidence=True,
+    )
+
+
+def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> TimeoutError:
+    """Describe a deadline that prevented the phase from producing a feasible winner.
+
+    :param str phase_name: Phase whose winner cannot be selected.
+    :param str timeout_scope: Deadline responsible for exhausting feasible work.
+    :return TimeoutError: Refusal shared by live completion and recorded-result replay.
+    """
+    return TimeoutError(
+        f"Phase {phase_name!r} hit its {timeout_scope} deadline "
+        "before any feasible trial could complete; no winner can be selected."
     )
 
 
@@ -525,10 +519,9 @@ def _judge_recorded_phase(
 ) -> _PhaseResume | Winner:
     """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
 
-    The one place these rules live, shared by the live resume and the dry-run
-    preview. It never writes the study. A replayed winner is evidence-verified
-    only with ``verify_evidence``, which reads trial directories, may query W&B
-    or MLflow, and records the environment-drift warning once per process.
+    Replays the study without writing it. When ``verify_evidence`` is true,
+    the selected winner is checked against its frozen evidence and its
+    environment is compared with the current run.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being judged.
@@ -557,13 +550,7 @@ def _judge_recorded_phase(
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
     if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
-        # This terminal decision is the authority even if a crash landed
-        # before the timeout's recovery boundary consumed a recorded abort.
-        # Replay deterministic selection; never reinterpret the timeout's
-        # unused slots as permission to launch more trainers. The opt-in is a
-        # run control outside the fingerprint, so the current config must
-        # still accept an incomplete result, as it must for a skipped phase's
-        # incomplete winner.
+        # Replay the accepted timeout boundary only while incomplete results remain enabled.
         if not phase.allow_incomplete_on_timeout:
             raise WinnerIntegrityError(
                 f"Phase {phase.name!r} accepted an incomplete result when its "
@@ -590,13 +577,8 @@ def _judge_recorded_phase(
                 verify_evidence=verify_evidence,
             )
         except NoFeasibleTrialError as exc:
-            raise TimeoutError(
-                f"Phase {phase.name!r} hit its {partial_decision.timeout_scope} deadline "
-                "before any feasible trial could complete; no winner can be selected."
-            ) from exc
-    # An abort is the decision recorded with the outcome that tripped it, so a
-    # later success resetting the streak, or a changed max_consecutive_failures,
-    # never undoes it.
+            raise _no_feasible_before_deadline(phase.name, partial_decision.timeout_scope) from exc
+    # A later success or changed failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
     if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
         _raise_prior_phase_abort(phase, active_abort)
@@ -605,11 +587,7 @@ def _judge_recorded_phase(
         and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
         and _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
     ):
-        # The current limit governs new work only. A replayed streak that
-        # already meets it (failures recovered from a stopped orchestrator, or
-        # a lowered limit) launches nothing until n_trials is raised. Nothing is
-        # recorded here, so a phase with no work left publishes, and restoring
-        # the limit restores the phase.
+        # A replayed streak at the current limit requires a raised target for new work.
         accepted_target = _accepted_trial_target(study)
         if phase.n_trials <= accepted_target:
             _raise_streak_at_limit(phase, policy_state.consecutive_failures, accepted_target)
@@ -697,10 +675,7 @@ class _PhaseExecution:
     # Set once an outcome carrying this execution's abort record is durable.
     abort_recorded: bool = False
     deadline_exhausted: bool = False
-    # Optuna's threaded optimize path can log an uncaught objective exception,
-    # mark that one trial FAIL, and still return normally. The first fatal
-    # exception is kept here so every n_jobs setting presents the same failure
-    # to the caller after workers drain.
+    # Retain the first fatal worker exception for propagation after all workers drain.
     fatal_error: BaseException | None = None
     csv_throttle: CsvSnapshotThrottle = field(default_factory=CsvSnapshotThrottle)
     outcome_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -723,7 +698,7 @@ class _PhaseExecution:
         *,
         cause: str | None,
         fatal_policy: str | None,
-    ) -> dict[str, Any] | None:
+    ) -> JsonObject | None:
         """Return the abort record that recording ``outcome`` next would trip.
 
         Changes nothing: the caller holds ``outcome_lock`` and writes the
@@ -735,14 +710,14 @@ class _PhaseExecution:
         :param str outcome: The terminal outcome about to be recorded.
         :param str | None cause: The outcome's recorded cause, if any.
         :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
-        :return dict[str, Any] | None: The abort record for the outcome's
+        :return JsonObject | None: The abort record for the outcome's
             completion sequence, or ``None`` when it trips nothing new.
         """
         if self.abort_recorded:
             return None
         sequence = self.completion_sequence + 1
         if outcome == "fatal":
-            return _fatal_abort_record(
+            return _abort_record(
                 policy=fatal_policy or "fatal_trial_exception",
                 completion_sequence=sequence,
                 trial_target=self.phase.n_trials,
@@ -863,54 +838,22 @@ def _record_outcome(
     cause: str | None = None,
     fatal_policy: str | None = None,
 ) -> None:
-    """Persist one terminal trial outcome in orchestrator completion order.
+    """Persist an outcome and its abort decision before the trial becomes terminal.
 
-    "Consecutive" means consecutive in the order outcomes are recorded
-    here — the order objective threads pass through ``run.outcome_lock`` —
-    not trial-number order. The per-trial outcome is written before the
-    counter changes or the objective returns, so a restarted process can
-    reconstruct the same streak. An outcome that trips the phase's first
-    abort carries that abort record in the same write, so the decision is
-    exactly as durable as the outcome: a later peer success resets the
-    streak but never the recorded abort. Any persistence failure aborts this
-    invocation; it is never downgraded to a warning.
+    Sequence numbers follow lock-acquisition order, independent of trial number.
+    Retries rebuild the payload under the lock; backoff releases the lock.
+    Already-recorded trials are ignored. A later success cannot clear an abort.
 
-    A no-op if ``trial.number`` is already in ``run.recorded_outcomes``.
-    Advances ``run`` through :meth:`_PhaseExecution.advance` and, once a
-    threshold or fatal outcome trips, stops launches.
-
-    Args:
-        run: The phase execution the outcome belongs to.
-        trial: The Optuna trial whose terminal outcome is being recorded.
-        outcome: One of ``"success"``, ``"failure"``, ``"interrupted"``, or
-            ``"fatal"``.
-        cause: Optional human-readable explanation stored on the outcome
-            payload.
-        fatal_policy: Optional policy name stored on the outcome payload
-            and, when ``outcome`` is ``"fatal"``, on the resulting abort
-            record.
-
-    Raises:
-        _TrialOutcomeUnrecordedAbort: The per-trial outcome row could not
-            be persisted, even after ``_OUTCOME_WRITE_ATTEMPTS`` tries.
-            The fatal-abort slot is set first, and the trial is left
-            ``RUNNING`` for stale-attempt recovery.
-
+    :param run: Phase execution whose counters advance after the durable write.
+    :param trial: Trial receiving the outcome record.
+    :param outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
+    :param cause: Optional explanation stored in the outcome.
+    :param fatal_policy: Optional policy stored in the outcome and fatal abort.
+    :raises _TrialOutcomeUnrecordedAbort: Retries exhausted; leave the trial RUNNING
+        and stop launches for stale-attempt recovery.
     """
-    # INVARIANT: no terminal Optuna row may exist without its outcome
-    # record. Optuna refuses user-attr writes on a finished trial
-    # (UpdateFinishedTrialError), so a FAIL committed after this write
-    # failed could never be repaired. Retry any Exception first — storage
-    # backends signal transient faults with assorted types — but never a
-    # BaseException, which is a shutdown/control-flow abort of its own.
-    #
-    # The sequencing lock covers each write attempt and the state update it
-    # authorizes, but not retry backoff. A worker waiting for storage must
-    # not prevent a peer from durably recording an independent outcome.
-    # Because a peer may advance the completion sequence during that wait,
-    # every retry rebuilds its payload from the then-current sequence.
     write_error: Exception | None = None
-    abort_record: dict[str, Any] | None = None
+    abort_record: JsonObject | None = None
     for attempt_index in range(_OUTCOME_WRITE_ATTEMPTS):
         if attempt_index:
             time.sleep(_OUTCOME_WRITE_RETRY_DELAYS[attempt_index - 1])
@@ -920,17 +863,13 @@ def _record_outcome(
             abort_record = run.abort_decision(
                 trial.number, outcome, cause=cause, fatal_policy=fatal_policy
             )
-            payload: dict[str, Any] = {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": run.completion_sequence + 1,
-                "outcome": outcome,
-            }
-            if cause is not None:
-                payload["cause"] = cause
-            if fatal_policy is not None:
-                payload["policy"] = fatal_policy
-            if abort_record is not None:
-                payload[TRIAL_OUTCOME_ABORT_KEY] = abort_record
+            payload = _trial_outcome_payload(
+                run.completion_sequence + 1,
+                outcome,
+                cause=cause,
+                policy=fatal_policy,
+                abort=abort_record,
+            )
             try:
                 trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
             except Exception as exc:
@@ -988,16 +927,14 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             could not be persisted; nothing was launched and no GPU lease
             was consumed.
         _TrialOutcomeUnrecordedAbort: A successful trial's terminal
-            outcome could not be persisted, so the trial is deliberately
+            outcome could not be persisted, so the trial is
             left ``RUNNING`` for stale-attempt recovery.
 
     """
     experiment = run.experiment
     phase = run.phase
 
-    # Stamp the environment as the first durable fact of allocation. Even
-    # a peer abort or failure creating lifecycle/registry metadata must remain in
-    # the study's known semantic cohort on the next invocation.
+    # Record the allocation cohort even if preparation or a peer abort prevents launch.
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, run.environment_identity.digest)
     trial.set_user_attr(TRAINER_ENV_ATTR, dict(run.environment_identity.tracked))
 
@@ -1008,11 +945,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
-    # Persist the resolved trial directory BEFORE launching the subprocess
-    # so a later reaper can locate identity files even if the user moved
-    # workdir or invoked phasesweep from a different cwd. Setting this
-    # attribute is what binds the trial in Optuna storage to a known
-    # directory.
     attempt_id = uuid4().hex
     trial_dir = _trial_dir_for(
         experiment,
@@ -1021,14 +953,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         generation_id=run.generation_id,
         attempt_id=attempt_id,
     )
-    # Durable 'allocated' marker BEFORE the trial's attrs make it
-    # discoverable and BEFORE the (arbitrarily long) GPU wait. A worker
-    # killed while queued leaves a RUNNING trial with this marker and no
-    # process identity; recovery can then prove no process was ever
-    # created instead of failing closed forever. This is a pre-launch
-    # durability requirement: a write failure would otherwise create an
-    # attempt that recovery can never distinguish from a process whose
-    # identity write was torn.
+    # Persist allocated before discovery and GPU waiting; no identity then means no launch.
     try:
         trial_dir.mkdir(parents=True, exist_ok=True)
         write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
@@ -1036,20 +961,10 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise ActiveAttemptPersistenceError(
             f"Could not persist the allocated lifecycle marker for trial "
             f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
-            "No trainer was started and no GPU lease was consumed. Restore "
-            "write access to the experiment workdir, then run again. With persistent "
-            "storage this refusal durably aborts the phase, so that run also needs "
-            "n_trials raised above its accepted target, or a new experiment name."
+            "No trainer was started and no GPU lease was consumed. With persistent "
+            "storage, retry requires n_trials above its accepted target."
         ) from exc
-    # Experiment-level registration is what keeps this attempt visible to
-    # recovery even if the phase is later renamed/removed or the storage
-    # URL changes. Retired by the post-trial callback once Optuna's terminal
-    # state is durable; preflight GCs entries the callback never reached. It
-    # raises rather than warns, and deliberately runs here — before the GPU
-    # lease and the launch — so a trainer PhaseSweep could not record is
-    # never started. Unsafe-cleanup entries deliberately survive the
-    # callback until preflight positively resolves the process and commits
-    # the cleanup-recovery ledger.
+    # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
     _register_active_attempt(
         experiment,
         attempt_id=attempt_id,
@@ -1100,14 +1015,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     raise _DeadlineTrialExecutionError(reason) from exc
                 raise TrialExecutionError(reason) from exc
         with run.gpu_pool.acquire(deadline=run.optimize_deadline) as gpu_assignment:
-            # Re-check abort flags inside the lease, fatal objective errors
-            # included. Without this, queued objective threads that passed
-            # the outer check before a peer flipped the flag would still
-            # launch trials after the abort fires — defeating
-            # max_consecutive_failures whenever n_jobs exceeds the GPU-pool
-            # size, and defeating unsafe-cleanup abort whenever any sibling
-            # thread is between launch_trial() return and the
-            # cleanup_confirmed check.
+            # Queued workers must observe aborts that occurred while waiting for the lease.
             if run.aborted:
                 raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
             # A shutdown's kill sweep frees leases; a queued worker that takes
@@ -1129,17 +1037,13 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     gpu_id=gpu_assignment.visible_devices,
                     gpu_lease_fds=gpu_assignment.lease_fds,
                     prepared_input=prepared_input,
+                    environment_identity=run.environment_identity,
                 )
             except ShutdownLaunchRefusedError as exc:
                 # The shutdown began between the check above and the launch lock.
                 raise TrialExecutionError(str(exc)) from exc
 
-            # CRITICAL: this check must happen INSIDE the GPU lease.
-            # Releasing the lease before observing ``cleanup_confirmed=False``
-            # lets a queued worker acquire the GPU and launch a new trial
-            # onto the still-leaked process group. ``run.record_fatal`` sets
-            # ``run.aborted`` while we still hold the lease, so the next
-            # thread to enter sees the flag and stops before launch.
+            # Block queued launches before releasing a GPU whose process cleanup is uncertain.
             if not executed.process.cleanup_confirmed:
                 message = (
                     f"Trial {trial.number} cleanup could not be confirmed. "
@@ -1151,10 +1055,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 cleanup_error = UnsafeProcessCleanupError(message)
                 run.record_fatal(cleanup_error)
 
-                # Best-effort forensic attrs. A storage write failure here
-                # must not mask the safety-critical state: the fatal error
-                # is already recorded and ``run.raise_if_fatal`` will fire
-                # after ``study.optimize`` returns regardless.
+                # Diagnostic writes must not mask the fatal cleanup error already recorded.
                 with contextlib.suppress(Exception):
                     trial.set_user_attr(
                         FAILURE_REASON_ATTR,
@@ -1169,9 +1070,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _refuse_launch_during_shutdown()
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
-    # Extraction happens outside GPU lease but INSIDE the phase/run
-    # wallclock budget: the configured timeouts bound the whole trial,
-    # not just the trainer.
+    # Extraction releases the GPU but still consumes the phase/run budget.
     result = extract_trial_result(
         experiment=experiment,
         executed=executed,
@@ -1179,10 +1078,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         deadline=run.optimize_deadline,
     )
     if result.deadline_exhausted:
-        # Preserve causal attribution carried by the result: a trainer
-        # killed by the wallclock-capped budget, extraction, or gate
-        # enforcement. Merely observing another failure after the clock
-        # elapsed must not relabel it as a timeout.
+        # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
 
     trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
@@ -1234,111 +1130,76 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     return result.metric
 
 
-def _tracked_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
-    """Run :func:`_objective` while the phase's worker tracker counts it.
+def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
+    """Record each objective outcome before returning or re-raising its exception.
 
-    :param _PhaseExecution run: The phase execution the trial belongs to.
-    :param optuna.Trial trial: The active Optuna trial being evaluated.
-    :return float: The metric :func:`_objective` returns.
+    :param run: Phase execution receiving the outcome and any fatal error.
+    :param trial: Active Optuna trial.
+    :return float: Extracted metric.
     """
     with run.workers.track(trial.number):
-        return _objective(run, trial)
-
-
-def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
-    """Classify and durably order every terminal objective outcome.
-
-    Delegates to ``_execute_objective``, then routes any exception it
-    raises through ``_record_outcome`` (and, for fatal cases,
-    ``run.record_fatal``) before re-raising the original exception
-    unchanged.
-
-    Args:
-        run: The phase execution the trial belongs to.
-        trial: The active Optuna trial being evaluated.
-
-    Returns:
-        The metric from ``_execute_objective`` when the trial completes
-        without raising.
-
-    """
-    try:
-        return _execute_objective(run, trial)
-    except _TrialOutcomeUnrecordedAbort:
-        # Must stay first. Every handler below answers by calling
-        # ``_record_outcome``, which is exactly what just failed, and the
-        # catch-all would additionally relabel this as an unexpected
-        # objective exception. Re-raising it untouched is what keeps the
-        # trial RUNNING for stale-attempt recovery. Only the direct call path
-        # from ``_execute_objective`` needs the guard: the same abort raised
-        # from inside a sibling handler already bypasses the rest.
-        raise
-    except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
-        _record_outcome(run, trial, "interrupted", cause=str(exc))
-        raise
-    except TrialExecutionError as exc:
-        signum = servicing_shutdown_signal()
-        if signum is None:
-            _record_outcome(run, trial, "failure", cause=str(exc))
-        else:
-            # Under n_jobs > 1 the shutdown handler runs in the main thread and
-            # kills this worker's trainer, which ends here as a trainer error.
+        try:
+            return _execute_objective(run, trial)
+        except _TrialOutcomeUnrecordedAbort:
+            # Do not retry outcome recording through a later exception handler.
+            raise
+        except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
+            _record_outcome(run, trial, "interrupted", cause=str(exc))
+            raise
+        except TrialExecutionError as exc:
+            signum = servicing_shutdown_signal()
+            if signum is None:
+                _record_outcome(run, trial, "failure", cause=str(exc))
+            else:
+                # Under n_jobs > 1 the shutdown handler runs in the main thread and
+                # kills this worker's trainer, which ends here as a trainer error.
+                _record_outcome(
+                    run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
+                )
+            raise
+        except UnsafeProcessCleanupError as exc:
+            run.record_fatal(exc)
+            # Both trainer and evidence-worker cleanup failures retain this
+            # diagnostic; the fatal policy below remains the recovery authority.
+            with contextlib.suppress(Exception):
+                trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
             _record_outcome(
-                run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
+                run,
+                trial,
+                "fatal",
+                cause=str(exc),
+                fatal_policy="unsafe_process_cleanup",
             )
-        raise
-    except UnsafeProcessCleanupError as exc:
-        run.record_fatal(exc)
-        # Both trainer and evidence-worker cleanup failures retain this
-        # diagnostic; the fatal policy below remains the recovery authority.
-        with contextlib.suppress(Exception):
-            trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=str(exc),
-            fatal_policy="unsafe_process_cleanup",
-        )
-        raise
-    except ActiveAttemptPersistenceError as exc:
-        # Named rather than left to the catch-all below: the durable abort
-        # record is the operator's only account of why the phase stopped,
-        # and "unexpected_objective_exception" would point them at a
-        # PhaseSweep bug instead of at their unwritable workdir.
-        run.record_fatal(exc)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=str(exc),
-            fatal_policy="active_attempt_persistence",
-        )
-        raise
-    except PhaseSweepShutdown as exc:
-        # A host shutdown cancels the orchestration attempt; it is not a
-        # trainer failure or an internal objective bug. Optuna propagates
-        # SystemExit without promising a terminal trial transition, so the
-        # durable outcome is the recovery authority: a later stale-attempt
-        # pass may close the row, but must not turn the interruption into a
-        # failure streak or durable phase abort.
-        _record_outcome(
-            run,
-            trial,
-            "interrupted",
-            cause=f"orchestrator interrupted by signal {exc.signum}",
-        )
-        raise
-    except BaseException as exc:
-        run.record_fatal(exc)
-        _record_outcome(
-            run,
-            trial,
-            "fatal",
-            cause=f"{type(exc).__name__}: {exc}",
-            fatal_policy="unexpected_objective_exception",
-        )
-        raise
+            raise
+        except ActiveAttemptPersistenceError as exc:
+            run.record_fatal(exc)
+            _record_outcome(
+                run,
+                trial,
+                "fatal",
+                cause=str(exc),
+                fatal_policy="active_attempt_persistence",
+            )
+            raise
+        except PhaseSweepShutdown as exc:
+            # Preserve shutdown as an interruption for stale recovery and failure-streak replay.
+            _record_outcome(
+                run,
+                trial,
+                "interrupted",
+                cause=f"orchestrator interrupted by signal {exc.signum}",
+            )
+            raise
+        except BaseException as exc:
+            run.record_fatal(exc)
+            _record_outcome(
+                run,
+                trial,
+                "fatal",
+                cause=f"{type(exc).__name__}: {exc}",
+                fatal_policy="unexpected_objective_exception",
+            )
+            raise
 
 
 def _after_trial(
@@ -1373,33 +1234,21 @@ def _settle_finished_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Log the trial's line, retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
+    """Log a finished trial, retire cleaned attempts, mirror MLflow, and snapshot CSV.
 
-    The threshold decision itself lives in ``_record_outcome``, inside the
-    objective's completion-order critical section — a callback observing a
-    mutable aggregate counter is race-prone under ``n_jobs > 1``. This
-    callback repeats ``study.stop()`` in case the tripping thread's stop call
-    failed transiently. The trial's line comes before the MLflow
-    publication, which can raise, so a trial that finished is always on
-    record in ``run.log``.
+    Repeat ``study.stop()`` after an abort; the objective owns the abort decision.
+    Write the log before attempting MLflow publication.
 
-    Args:
-        run: The phase execution the trial belongs to.
-        study: The running Optuna study (used to call ``study.stop``).
-        trial: The just-finished trial; supplies the attempt id whose
-            registry entry is retired.
-
+    :param run: Phase execution.
+    :param study: Running study to stop after an abort.
+    :param trial: Finished trial whose attempt may be retired.
     """
     if run.aborted:
         with contextlib.suppress(Exception):
             study.stop()
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     _log_finished_trial(run.phase, trial, finished)
-    # Terminal state alone is insufficient for an unsafe-cleanup trial: its
-    # registry entry is the cross-phase/storage recovery locator and must
-    # survive until preflight durably consumes cleanup evidence.
-    # Optuna skips callbacks for uncaught objective errors; the enclosing
-    # run's reconciliation retires those attempts after checking cleanup.
+    # Keep unsafe-cleanup entries until recovery. Run reconciliation handles skipped callbacks.
     finished_attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if (
         isinstance(finished_attempt, str)
@@ -1407,16 +1256,13 @@ def _settle_finished_trial(
         and not _trial_requires_cleanup_recovery(trial)
     ):
         _retire_active_attempt(run.experiment, finished_attempt)
-    if run.experiment.mlflow is not None and trial.state == optuna.trial.TrialState.COMPLETE:
+    if run.experiment.mlflow is not None and (
+        trial.state == optuna.trial.TrialState.COMPLETE
+        or not _trial_requires_cleanup_recovery(trial)
+    ):
         from phasesweep.tracking.publication import publish_trial
 
         publish_trial(run.experiment, run.generation_id, trial, run.environment_identity.values)
-    elif run.experiment.mlflow is not None and not _trial_requires_cleanup_recovery(trial):
-        from phasesweep.tracking.publication import publish_unaccepted_trial
-
-        publish_unaccepted_trial(
-            run.experiment, run.generation_id, trial, run.environment_identity.values
-        )
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):
         with contextlib.suppress(Exception):
@@ -1447,16 +1293,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
     completed_after = _completed_trial_count(trials_after)
-    # Scheduler-level deadline causality: the phase is short of its trial
-    # target and the clock is spent, so the budget — not the observation order
-    # — is what left work undone. Being short of the target is the whole test:
-    # a phase whose every requested trial is terminal is not relabelled just
-    # because the clock happened to elapse before the last one was observed.
-    # A tripped ``run.aborted`` deliberately does NOT veto this. When a
-    # wallclock timeout and ``max_consecutive_failures`` become true in the
-    # same phase, timeout handling takes precedence (docs/runtime.md), which is
-    # what lets ``allow_incomplete_on_timeout`` publish the partial winner the
-    # earlier successful trials already earned instead of discarding it.
+    # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
         and finished_after < phase.n_trials
@@ -1491,10 +1328,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         recovered_abort_sequence = (
             recorded_abort["completion_sequence"] if recorded_abort is not None else None
         )
-        # This is the terminal-decision transaction boundary. If the write
-        # fails, selection/publication never starts and a retry may spend a
-        # fresh timeout budget. Once it succeeds, identical retries replay
-        # selection from this frozen trial boundary without launching work.
+        # Persist the frozen timeout boundary before selection; retries replay it without launch.
         study.set_user_attr(
             PHASE_DECISION_ATTR,
             {
@@ -1509,11 +1343,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             },
         )
     if recorded_abort is not None and timed_out_incomplete:
-        # A deadline takes precedence over a failure streak whether or not the
-        # operator accepts a partial winner. Record that the timeout consumed
-        # this exact abort before either selection or TimeoutError: otherwise
-        # the documented remedy for a refused partial result (retry with a
-        # larger timeout) would replay the recorded failure abort.
+        # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
         raise TimeoutError(
@@ -1541,13 +1371,8 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         )
     except NoFeasibleTrialError as exc:
         if run.deadline_exhausted:
-            # The deadline (not the trainer) is what prevented feasible work
-            # — e.g. every launch was refused or cut short after the budget
-            # expired. Reporting this as "no feasible trial" would misdirect
-            # operators at trainer logs.
-            raise TimeoutError(
-                f"Phase {phase.name!r} hit its {run.timeout_source or 'wallclock'} deadline "
-                "before any feasible trial could complete; no winner can be selected."
+            raise _no_feasible_before_deadline(
+                phase.name, run.timeout_source or "wallclock"
             ) from exc
         raise
 
@@ -1632,10 +1457,7 @@ def _run_phase(
             experiment, phase, inherited_winners, study, resume, verify_evidence=True
         )
 
-    # Compose and validate the launch environment only after recovery proves
-    # this phase has work remaining. Published/no-op replay must not require an
-    # online W&B environment, while every new allocation still joins the
-    # study's established semantic environment cohort.
+    # No-op replay needs no launch environment; new allocations must match the cohort.
     environment_identity = _environment_identity(experiment, phase.name)
     _validate_environment_cohort(study, environment_identity)
 
@@ -1679,17 +1501,9 @@ def _run_phase(
         timeout_source=budget.source,
     )
     run.resume_from(resume.policy_state)
-    # Accept the (possibly larger) durable target only after every launch
-    # prerequisite above (environment, tracking target, GPU discovery, and the
-    # wallclock budget) has passed. Recording it earlier would strand the
-    # study at a target no invocation ever launched work toward, making the
-    # previously working config a rejected regression.
+    # Accept the target only after environment, tracking, GPU, and budget checks pass.
     if resume.recovery_abort is not None:
-        # The recovery record accepts the raised target in the same write that
-        # retires the abort and starts a new streak, so this execution's own
-        # first abort is recorded afresh. Because it lands before the target
-        # attr, a crash between the two keeps the authorization the raised
-        # target granted, and the old target still cannot run the recovery.
+        # Atomically accept the recovery target and retire the abort before updating the target attr.
         _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
         run.resume_from(_load_phase_policy_state(study))
     _record_trial_target(study, phase)
@@ -1697,9 +1511,6 @@ def _run_phase(
         resume.partial_decision is not None
         and phase.n_trials > resume.partial_decision.trial_target
     ):
-        # Raising n_trials is the explicit authorization to resume work after
-        # a terminal partial decision. The old record is no longer actionable
-        # once the larger target is durable.
         study.set_user_attr(PHASE_DECISION_ATTR, None)
     try:
         try:
@@ -1708,13 +1519,11 @@ def _run_phase(
                 generation_id=generation_id,
                 trainer_environment=environment_identity.digest,
             )
-            # Optuna's ask pops WAITING trials before it creates new ones, so
-            # every interrupted trial reruns with its own params before any new
-            # draw, and the allocation context above covers the reruns.
+            # WAITING reruns precede new draws and share the allocation context.
             _log_reruns(phase, study, _record_reruns(study))
             try:
                 study.optimize(
-                    functools.partial(_tracked_objective, run),
+                    functools.partial(_objective, run),
                     n_trials=remaining,
                     n_jobs=phase.n_jobs,
                     timeout=budget.timeout,
@@ -1723,18 +1532,12 @@ def _run_phase(
                     catch=(TrialExecutionError,),
                 )
             except BaseException:
-                # A shutdown can raise here while Optuna's worker threads are
-                # still finishing their trials; the run's reconciliation must
-                # not reap a trial a live worker is about to record.
+                # Drain workers before run reconciliation can reap their trials.
                 if phase.n_jobs > 1:
                     _await_worker_trials(run.workers, study)
                 raise
         finally:
-            # Always snapshot trials.csv, even if ``study.optimize`` raises
-            # (n_jobs=1 fatal-objective path) or some other transient backend
-            # error escapes. Forensic data must survive every exit path.
-            # Best-effort: a write failure here must not mask the actual
-            # exception from ``study.optimize``.
+            # Snapshot CSV on every exit without masking the optimize error.
             with contextlib.suppress(Exception):
                 _write_trials_csv(
                     study,
@@ -1742,19 +1545,9 @@ def _run_phase(
                     repeats=repeat_axis(phase),
                 )
 
-        # Optuna's threaded path can absorb any uncaught objective exception
-        # after marking that trial FAIL, and any callback exception in its
-        # final batch. Re-raise the first one before timeout,
-        # soft abort, completeness, or winner-selection logic can relabel it.
+        # Propagate swallowed worker/callback errors before selection or timeout classification.
         run.raise_if_fatal()
     except _TrialOutcomeUnrecordedAbort as exc:
-        # The single conversion site for the outcome-write abort, covering
-        # both routes out of the optimize loop: n_jobs=1 propagates it
-        # straight through ``study.optimize``, while n_jobs>1 may swallow the
-        # worker's exception and leave ``run.raise_if_fatal`` to re-raise it
-        # from the fatal-abort slot. Operators and the MCP runner see a
-        # retryable storage outage, which is what it is; the affected trial is
-        # still RUNNING and recovers on the next run.
         raise StudyStorageUnavailableError(str(exc)) from exc
 
     return _finish_phase(run, phase_fingerprint=resume.phase_fingerprint)
@@ -1793,8 +1586,7 @@ def _replay_met_target(
     if resume.recovery_abort is not None:
         raise StudySchemaMismatchError(
             f"Phase {phase.name!r} accepted an abort recovery target but has no "
-            "remaining trial slots. Use a new experiment name rather than reusing "
-            "this inconsistent study."
+            "remaining trial slots."
         )
     trials = study.get_trials(deepcopy=False)
     return _select_phase_winner(
@@ -1825,7 +1617,7 @@ def _select_phase_winner(
     completion: dict[str, Any],
     verify_evidence: bool = True,
 ) -> Winner:
-    """Select the phase winner and bind it to its verified execution identity.
+    """Select the phase winner and preserve its execution identity.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: Phase whose winner is selected.
@@ -1833,11 +1625,8 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose terminal trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
-    :param bool verify_evidence: Whether to re-prove the selected trial and warn about
-        environment drift. The proof reads the trial directories and may query W&B or
-        MLflow, and the drift warning consumes a process-global warn-once key
-        (``_ENVIRONMENT_DRIFT_WARNED``), so a dry run turns both off and leaves them
-        to the launch.
+    :param bool verify_evidence: Whether to verify the selected trial against its
+        frozen evidence and warn if its environment differs from the current run.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
@@ -1847,15 +1636,9 @@ def _select_phase_winner(
     :return Winner: The selected winner with composed overrides and source identity.
     """
     selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
-    # The evidence behind the number about to be published is re-proved here,
-    # digest and all. Selection itself reads only Optuna, so nothing before
-    # this point has looked at whether the winning trial's directory still
-    # holds the bytes its metric came from.
     if verify_evidence:
-        _verify_winner_objective_evidence(experiment, phase.name, selected)
-        # A replay allocates nothing, so the cohort check never runs and the
-        # winning trial may come from an environment this process no longer
-        # composes. After fresh allocation the digests match and this is silent.
+        _verify_winner_evidence(experiment, phase, selected)
+        # Replayed winners may predate the current environment cohort.
         _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
     effective = _winner_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
@@ -1878,12 +1661,8 @@ def _select_phase_winner(
         ),
         objective_provenance=selected.objective_provenance,
         trainer_input=dict(selected.trainer_input),
-        # The digest comes from the winning TRIAL — a no-op replay under a
-        # changed environment re-selects a trial an earlier invocation ran —
-        # while the environment contract is config, identical for every trial
-        # in the study because it is fingerprinted.
+        # Preserve the winning trial's environment, including on no-op replay.
         trainer_env_digest=selected.trainer_env_digest,
-        trainer_inherit_env=_inherit_env_contract(experiment),
         confound=selected.confound,
         observed=selected.observed,
         repeats=selected.repeats,
@@ -1897,28 +1676,16 @@ def _placeholder_winner(
     *,
     sampled_params: dict[str, Any] | None = None,
 ) -> Winner:
-    """Synthesize a placeholder winner for dry-run mode.
+    """Build a dry-run winner from preview samples or deterministic parameter defaults.
 
-    A phase whose command was previewed reuses that command's sampled values so
-    downstream previews inherit one coherent hypothetical chain. A skipped
-    phase without a preview uses each parameter's low bound or first choice.
-    Both paths include inherited effective overrides and, like a real winner,
-    drop the repeat key. ``placeholder_keys`` names the overrides that hold
-    stand-in values: the phase's own searched keys and those it carries from
-    placeholder parents, unless its fixed overrides replace them.
+    Carry inherited overrides, omit the repeat key, and mark searched or inherited
+    stand-in keys unless fixed overrides replace them.
 
-    Args:
-        experiment: Parsed experiment config; its phase graph names the keys an
-            ancestor sampled.
-        phase: The phase whose placeholder winner is needed.
-        inherited_winners: Winners from earlier phases in the chain.
-        sampled_params: Values used in the displayed preview command, or
-            ``None`` to synthesize deterministic placeholder values.
-
-    Returns:
-        A :class:`Winner` with ``trial_number=-1`` and ``metric=NaN`` so any
-        accidental use in non-dry contexts surfaces obviously.
-
+    :param experiment: Experiment defining the phase graph.
+    :param phase: Phase needing a placeholder.
+    :param inherited_winners: Winners from earlier phases.
+    :param sampled_params: Preview samples, or None for low bounds and first choices.
+    :return Winner: Placeholder with trial number -1 and a NaN metric.
     """
     placeholder_params = (
         _placeholder_values_for(phase.search_space)
@@ -1936,8 +1703,6 @@ def _placeholder_winner(
         effective_overrides=effective,
         placeholder_keys=frozenset(stand_ins & effective.keys()),
         metric=float("nan"),
-        constraints={},
-        gates=[],
         completion=_winner_completion(
             requested_trials=phase.n_trials,
             finished_trials=0,

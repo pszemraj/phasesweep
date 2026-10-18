@@ -8,28 +8,53 @@ from pathlib import Path
 
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.state import PublicationState
 
 log = logging.getLogger(__name__)
 
 
+def raise_for_unusable_publication(
+    experiment_name: str, state: str, error: str | None, namespace_root: Path
+) -> None:
+    """Refuse an unusable publication with its typed operator diagnostic.
+
+    :param str experiment_name: Experiment named by the captured publication verdict.
+    :param str state: Publication integrity state from that verdict.
+    :param str | None error: Validation diagnostic from the same verdict.
+    :param Path namespace_root: Artifact namespace to inspect for integrity failures.
+    :raises PublicationAccessError: Read permission prevents publication validation.
+    :raises PublicationIntegrityError: The recorded publication no longer validates.
+    """
+    if state not in {"permission_denied", "failed"}:
+        return
+    detail = str(error).rstrip()
+    if not detail.endswith((".", "!", "?")):
+        detail += "."
+    subject = f"Experiment {experiment_name!r}"
+    if state == "permission_denied":
+        raise PublicationAccessError(
+            f"{subject} records a publication that cannot be validated as the current user: "
+            f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
+            "the publication as the publishing user or restore read permission before launching "
+            "another run."
+        )
+    raise PublicationIntegrityError(
+        f"{subject} records a publication that no longer validates: {detail} "
+        "Do not run anything over this tree until you have inspected or restored the "
+        f"generation namespace under {namespace_root} -- a successful run would advance the "
+        "last-success pointer past the corrupt generation and nothing would report it again."
+    )
+
+
 @dataclass(frozen=True)
 class PublicationPointer:
-    """Four-state resolution of one last-success publication pointer.
+    """Four-state resolution of a last-success publication pointer.
 
-    "Nothing was ever published" and "the recorded publication no longer
-    validates" are different operational facts with opposite remedies, and
-    collapsing both into ``None`` would make a corrupt result tree
-    indistinguishable from a fresh one. Every non-``ok`` state means the same
-    thing to a consumer of published results: nothing may be read as
-    published, so ``validated`` is ``None``.
-
-    ``error`` is deliberately path-free: it names artifacts by role rather than
-    location, so any reporting surface could quote it safely -- though the MCP
-    layer forwards only the ``publication_integrity`` enum and leaves the
-    free-text detail to the operator-facing CLI.
+    Only ``ok`` exposes a validated result. ``absent`` means no publication pointer;
+    ``failed`` and ``permission_denied`` mean an existing result could not be validated.
+    ``error`` is path-free operator detail; MCP exposes the integrity enum only.
     """
 
     state: PublicationState
@@ -47,11 +72,7 @@ class PublicationPointer:
 
 
 def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
-    """Classify a pointer whose own payload could not be resolved to a target.
-
-    A pointer file is written once, atomically, after its target validates, so
-    a file that exists but does not name a target this owner published is
-    tampering or corruption -- not an owner that has published nothing.
+    """Classify an existing pointer that cannot identify a published target as failed.
 
     :param Path pointer_path: Last-success pointer whose read just failed.
     :param str owner_label: Human-readable owner for the diagnostic text.
@@ -86,29 +107,16 @@ def _resolve_publication_pointer(
     *,
     raise_on_manifest_error: bool = False,
 ) -> PublicationPointer:
-    """Resolve the last-success pointer to its four-state validation verdict.
+    """Resolve the last-success pointer and validate its current-format result graph.
 
-    The pointer is authoritative only when its target's own immutable summary
-    parses and names this exact experiment and generation -- not when the
-    per-generation lifecycle record says so, since that record is written
-    *after* this pointer commits and would otherwise create a crash window
-    where a committed publication reads as nothing-published.
+    Summary byte anchors and experiment/generation identity establish the pointer's
+    target. Lifecycle records follow commit and do not determine publication authority.
+    Validate all manifest artifacts on each authoritative read, retaining one captured
+    result for consumers.
 
-    The target's current-format complete artifact manifest is always
-    validated -- every listed winner artifact plus the
-    claim-time provenance files must exist, hash to their recorded content,
-    and cross-check against the summary. Validation runs on every
-    authoritative read: generation directories are write-once by PhaseSweep
-    convention, but the filesystem does not enforce immutability and a
-    long-lived reader must notice later corruption or operator edits. A
-    summary in any format other than the current one is rejected.
-
-    Every validation refusal resolves to an unusable state, never ``absent``:
-    structural or content failures become ``failed``, while an actual
-    permission denial becomes ``permission_denied``. The pointer's existence
-    is durable evidence that this tree once held a result, and a caller told
-    "nothing published" could otherwise re-run over it and advance the pointer
-    past evidence that still needs operator attention.
+    A missing pointer is ``absent``. Structural or content failure is ``failed``;
+    permission denial is ``permission_denied``. Neither failure exposes published
+    results or permits treating existing publication evidence as a fresh tree.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a publication's
@@ -184,21 +192,3 @@ def _resolve_publication_pointer(
     return PublicationPointer(
         state="ok", generation_id=generation_id, error=None, validated=validated
     )
-
-
-def _published_winner_path_for(
-    experiment: Experiment,
-    published_generation_id: str | None,
-    phase_name: str,
-) -> Path | None:
-    """Resolve one authoritative current-format winner path.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str | None published_generation_id: Already-resolved last-success id.
-    :param str phase_name: Phase name whose published winner path is requested.
-    :return Path | None: The immutable generation-scoped winner path, or
-        ``None`` when no last-success generation was resolved.
-    """
-    if published_generation_id is None:
-        return None
-    return path_ops._generation_winner_path(experiment, published_generation_id, phase_name)

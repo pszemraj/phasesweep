@@ -9,10 +9,9 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.registry import RegisteredExperiment, Registry
+from tests.conftest import REPO
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
-
-REPO = Path(__file__).resolve().parents[1]
 
 
 def _write(path: Path, body: str) -> Path:
@@ -133,9 +132,9 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
 def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     import yaml
 
-    from phasesweep.config import Experiment
+    from phasesweep.config.models import Experiment
     from phasesweep.mcp.runs import load_experiment_snapshot
-    from phasesweep.runtime.files import canonical_storage_identity, file_sha256, storage_backend
+    from phasesweep.runtime.files import canonical_storage_identity, file_sha256
 
     payload = yaml.safe_load(_experiment_yaml(tmp_path))
     payload["storage"] = "auto"
@@ -143,7 +142,9 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", yaml.safe_dump(payload))
     registered = Registry.load(write_mcp_catalog(tmp_path, {"auto": config})).get("auto")
     assert registered.experiment.storage == "auto"
-    assert storage_backend(registered.experiment.resolved_storage) == "journal"
+    resolved_storage = registered.experiment.resolved_storage
+    assert resolved_storage is not None
+    assert resolved_storage.startswith("journal:///")
     assert not Path(registered.experiment.workdir).exists()
     snapshot = load_experiment_snapshot(
         config, file_sha256(config), source="test", config_dir=config.resolve().parent
@@ -277,44 +278,38 @@ def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
         )
 
 
-def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+def _registered_nested_config(tmp_path: Path, body: str) -> tuple[RegisteredExperiment, Path]:
+    """Register an experiment whose configuration lives below the catalog directory."""
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    config = _write(config_dir / "exp.yaml", body)
+    return Registry.load(_catalog(tmp_path, config)).get("reg_ok"), config_dir
+
+
+def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/runs/reg_ok", "workdir: runs"),
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
-
     assert registered.experiment.workdir == str(config_dir.resolve() / "runs")
 
 
 def test_relative_execution_cwd_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
     """A relative trainer cwd names one directory for the CLI and the detached runner."""
-    config_dir = tmp_path / "configs"
-    config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
-
     assert registered.experiment.execution.cwd == str(config_dir.resolve() / "trainer")
 
 
 def test_relative_journal_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
-    config_dir = tmp_path / "configs"
-    config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path).replace(
             f"journal:///{tmp_path}/reg_ok.journal", '"journal:///relative.journal"'
         ),
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
 
     assert registered.experiment.storage == f"journal:///{config_dir.resolve()}/relative.journal"
 
@@ -334,12 +329,6 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("storage", "error_match"),
     [
-        # Config load itself refuses any non-journal backend now, so the
-        # registry's own MCP-specific storage checks never run for these; an
-        # external DB, an old SQLite URL, and the bare ``:memory:`` shorthand
-        # all surface as the same config-load refusal, wrapped as a
-        # CatalogError (they don't need one case each -- the wire text is
-        # identical up to the echoed value).
         pytest.param(
             '"postgresql://host/db"',
             "storage must be null, auto, or a journal",
@@ -438,7 +427,7 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     ("old", "new"),
     [
         ("goal: minimize", "goal: sideways"),
-        ("sampler: { type: random, seed: 0 }", "sampler: { type: nope }"),
+        ("sampler:\n    type: random\n    seed: 0", "sampler:\n    type: nope"),
     ],
     ids=["invalid_goal", "unknown_sampler"],
 )
@@ -452,7 +441,7 @@ def test_invalid_config_raises_catalog_error(tmp_path: Path, old: str, new: str)
 def test_invalid_config_error_points_at_the_reference(tmp_path: Path) -> None:
     """An operator authoring a catalog config is told which key to explain."""
     bad = _experiment_yaml(tmp_path).replace(
-        "sampler: { type: random, seed: 0 }", "sampler: { type: nope }", 1
+        "sampler:\n    type: random\n    seed: 0", "sampler:\n    type: nope", 1
     )
     config = _write(tmp_path / "exp.yaml", bad)
     with pytest.raises(CatalogError, match="invalid config") as caught:

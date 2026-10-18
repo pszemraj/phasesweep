@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing import Annotated, Literal, NotRequired, TypeAlias
+
+from pydantic import Field, TypeAdapter, ValidationError
+from typing_extensions import TypedDict
 
 from phasesweep.config.common import is_sha256_hex
 from phasesweep.runtime.json import JsonObject
 
 RunMode: TypeAlias = Literal["managed", "trainer"]
 """Whether PhaseSweep creates the attempt's MLflow run or the trainer does."""
+IdentityText: TypeAlias = Annotated[str, Field(min_length=1)]
 
 
 class SourceIdentity(TypedDict):
@@ -32,12 +36,12 @@ class RunIdentity(TypedDict):
     """The exact attempt a native run must carry, known before the run exists."""
 
     schema_version: Literal[1]
-    tracking_uri: str
-    experiment_id: str
-    experiment: str
-    phase: str
-    generation_id: str
-    attempt_id: str
+    tracking_uri: IdentityText
+    experiment_id: IdentityText
+    experiment: IdentityText
+    phase: IdentityText
+    generation_id: IdentityText
+    attempt_id: IdentityText
     overrides_sha256: str
     run_mode: RunMode
     parent_run_id: NotRequired[str]
@@ -138,12 +142,6 @@ TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishA
 """A controller request before the configured target is attached."""
 
 
-class ResolveRequest(ResolveAction):
-    """A resolve action with its target."""
-
-    settings: MlflowTarget
-
-
 class CreateRequest(CreateAction):
     """A create action with its target."""
 
@@ -192,18 +190,7 @@ class PublishRequest(TypedDict):
     finish: str | None
 
 
-def _identity_text(record: Mapping[str, object], key: str) -> str:
-    """Read one required, non-empty identity string.
-
-    :param Mapping[str, object] record: Decoded identity or binding.
-    :param str key: Identity field.
-    :raises ValueError: The field is absent, not a string, or empty.
-    :return str: The field's value.
-    """
-    value = record.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError("MLflow binding lacks a valid source/attempt identity.")
-    return value
+_IDENTITY_ADAPTER: TypeAdapter[RunIdentity] = TypeAdapter(RunIdentity)
 
 
 def _parse_identity(value: object) -> tuple[RunIdentity, Mapping[str, object]]:
@@ -216,34 +203,20 @@ def _parse_identity(value: object) -> tuple[RunIdentity, Mapping[str, object]]:
     """
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise ValueError("Invalid MLflow run binding format.")
-    record: Mapping[str, object] = value
-    run_mode: RunMode
-    if record.get("run_mode") == "managed":
-        run_mode = "managed"
-    elif record.get("run_mode") == "trainer":
-        run_mode = "trainer"
-    else:
+    if not is_sha256_hex(value.get("overrides_sha256")):
         raise ValueError("MLflow binding lacks a valid source/attempt identity.")
-    overrides_sha256 = record.get("overrides_sha256")
-    if not is_sha256_hex(overrides_sha256):
-        raise ValueError("MLflow binding lacks a valid source/attempt identity.")
-    identity: RunIdentity = {
-        "schema_version": 1,
-        "tracking_uri": _identity_text(record, "tracking_uri"),
-        "experiment_id": _identity_text(record, "experiment_id"),
-        "experiment": _identity_text(record, "experiment"),
-        "phase": _identity_text(record, "phase"),
-        "generation_id": _identity_text(record, "generation_id"),
-        "attempt_id": _identity_text(record, "attempt_id"),
-        "overrides_sha256": overrides_sha256,
-        "run_mode": run_mode,
-    }
-    parent_run_id = record.get("parent_run_id")
-    if isinstance(parent_run_id, str):
-        identity["parent_run_id"] = parent_run_id
-    elif parent_run_id is not None:
-        raise ValueError("MLflow binding lacks a valid source/attempt identity.")
-    return identity, record
+    try:
+        identity = _IDENTITY_ADAPTER.validate_python(
+            {
+                key: item
+                for key, item in value.items()
+                if key != "parent_run_id" or item is not None
+            },
+            strict=True,
+        )
+    except ValidationError:
+        raise ValueError("MLflow binding lacks a valid source/attempt identity.") from None
+    return identity, value
 
 
 def validate_identity(identity: object) -> RunIdentity:
@@ -264,4 +237,7 @@ def validate_binding(binding: object) -> RunBinding:
     :return RunBinding: The narrowed binding.
     """
     identity, record = _parse_identity(binding)
-    return {**identity, "run_id": _identity_text(record, "run_id")}
+    run_id = record.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("MLflow binding lacks a valid source/attempt identity.")
+    return {**identity, "run_id": run_id}

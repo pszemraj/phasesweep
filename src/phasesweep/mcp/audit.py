@@ -1,10 +1,7 @@
-"""Structured audit logging for state-changing MCP tool calls.
+"""Operator-facing JSONL audit records for state-changing MCP calls.
 
-Audit records are operator-facing JSON lines written under ``state_dir``. They
-intentionally log identifiers, counts, outcomes, and state transitions instead
-of result payloads, paths, commands, env, logs, or sampled parameters. Each
-record names the transport the call arrived on, so an operator can tell a
-connected client's call from one made by ``phasesweep mcp call``.
+Records contain identifiers, counts, outcomes, transitions and transport; they exclude
+result payloads, paths, commands, environment values, logs and sampled parameters.
 """
 
 from __future__ import annotations
@@ -82,12 +79,7 @@ class AuditLogger:
         error_type: str | None = None,
         error: str | None = None,
     ) -> None:
-        """Write one audit event.
-
-        Audit failure is logged to stderr but does not change the tool result:
-        a successful side effect should not be reported to the agent as failed
-        solely because post-action audit append hit an operator filesystem
-        problem.
+        """Write one audit event, logging append failures without changing the tool result.
 
         :param str tool: MCP tool name being audited.
         :param dict[str, Any] | None args: Agent-supplied safe arguments to record.

@@ -25,18 +25,12 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import (
-    CategoricalParam,
-    ExecutionContext,
-    Experiment,
-    Metric,
-    Phase,
-    Sampler,
-    WandbExtractor,
-)
-from phasesweep.engine import read_winners
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.read import read_result
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, OBJECTIVE_PROVENANCE_ATTR, TRIAL_DIR_ATTR
+from phasesweep.evidence.models import WandbExtractor
 
 pytestmark = pytest.mark.live
 
@@ -152,7 +146,10 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
             else:
                 assert receipt["learning_rate"] == trial.params["learning_rate"]
     assert len({attempt for ids in attempts.values() for attempt in ids}) == 4
-    assert len(read_winners(experiment)) == 2
+    assert (
+        len(read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1])
+        == 2
+    )
 
     # A no-op replay needs no SDK, contacts no W&B server, and launches no trainer.
     with (

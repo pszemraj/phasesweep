@@ -9,22 +9,84 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
-from phasesweep.config import (
-    ConfigError,
+from phasesweep.config.io import ConfigError
+from phasesweep.config.models import (
     Constraint,
     ExecutionContext,
     Experiment,
-    JsonEnvelopeExtractor,
     Metric,
     Observation,
     Phase,
-    Sampler,
+)
+from phasesweep.config.search import Sampler, sampler_capability_line
+from phasesweep.evidence.models import (
+    JsonEnvelopeExtractor,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from phasesweep.config.search import sampler_capability_line
 from phasesweep.runtime.json import JsonObject, JsonValue
+from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import make_experiment, write_yaml
+
+
+@pytest.mark.parametrize(
+    ("field", "model", "extra", "message"),
+    [
+        (
+            "base_url",
+            WandbExtractor,
+            {"type": "wandb", "entity": "e", "project": "p", "metric_key": "loss"},
+            "W&B base_url requires an HTTP(S) endpoint without credentials, query, or fragment.",
+        ),
+        (
+            "tracking_uri",
+            MlflowSettings,
+            {"experiment_name": "existing"},
+            "MLflow tracking_uri requires HTTP(S), databricks, or databricks://profile (no spaces in the profile name) without embedded credentials, query, or fragment.",
+        ),
+    ],
+    ids=["wandb", "mlflow"],
+)
+@pytest.mark.parametrize(
+    ("endpoint", "wandb_expected", "mlflow_expected"),
+    [
+        ("HTTPS://EXAMPLE.TEST/Path///", "https://example.test/Path", "https://example.test/Path"),
+        ("http://@EXAMPLE.TEST/path/", None, "http://@example.test/path"),
+        ("http://:@EXAMPLE.TEST/path/", None, "http://:@example.test/path"),
+        ("http://user:password@example.test", None, None),
+        ("ftp://example.test", None, None),
+        ("http://", None, None),
+        ("http://example.test?key=value", None, None),
+        ("http://example.test#part", None, None),
+        (
+            "https://example.test:service/",
+            "https://example.test:service",
+            "https://example.test:service",
+        ),
+    ],
+    ids=[
+        "normalization",
+        "empty-user",
+        "empty-user-password",
+        "credentials",
+        "scheme",
+        "missing-host",
+        "query",
+        "fragment",
+        "unparsed-port",
+    ],
+)
+def test_remote_http_endpoint_contracts(
+    field, model, extra, message, endpoint, wandb_expected, mlflow_expected
+):
+    expected = wandb_expected if field == "base_url" else mlflow_expected
+    arguments = {field: endpoint, **extra}
+    if expected is None:
+        with pytest.raises(ValidationError) as caught:
+            model(**arguments)
+        assert str(caught.value.errors()[0]["ctx"]["error"]) == message
+    else:
+        assert getattr(model(**arguments), field) == expected
 
 
 @pytest.mark.parametrize(
@@ -606,9 +668,6 @@ def test_inherit_env_naming_tmpdir_is_refused(passthrough: list[str]) -> None:
     """``TMPDIR`` is always inherited and never digested, so an ``inherit_env`` list may not name it."""
     with pytest.raises(ValidationError, match=r"inherit_env must not name \['TMPDIR'\].*remove it"):
         ExecutionContext(inherit_env=["TMPDIR", "HF_HOME"], passthrough_env=passthrough)
-
-
-# ---- migrated from version-named files ----
 
 
 @pytest.mark.parametrize(

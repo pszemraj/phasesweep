@@ -10,9 +10,8 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import is_sha256_hex
-from phasesweep.config.models import _wandb_query
+from phasesweep.config.models import Experiment, Phase, _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
@@ -38,9 +37,7 @@ from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import (
     EXTRACTOR_KINDS,
     JsonExtractor,
-    ObjectiveExtractor,
     WandbExtractor,
-    WandbQuery,
     _validate_trial_file_path,
     _WandbSummarySource,
 )
@@ -55,13 +52,6 @@ from phasesweep.runtime.process import (
 
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
-    from phasesweep.tracking.records import MlflowQuery, SourceIdentity
-
-_TRIAL_EVIDENCE_REMEDY = (
-    "PhaseSweep will not select or republish a result whose evidence is gone: restore the "
-    "artifact tree from a backup, or start a new experiment name so nothing ranks against "
-    "trials that can no longer be inspected."
-)
 
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no
@@ -70,20 +60,11 @@ _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 
 
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
-    """Return a trial's execution identity when it could win winner selection.
+    """Return execution identity for COMPLETE, finite, feasible trials with nonempty ids.
 
-    The shared eligibility prefix used directly by both this module's
-    preflight and :func:`phasesweep.engine.selection.select_winner`: COMPLETE
-    state, a finite value, a truthy feasibility attr, and nonempty
-    generation/attempt ids. A trial that fails any of these can never be
-    selected, so declining to verify its evidence here is not result-biasing
-    - unlike skipping an eligible trial, which would change which trial wins.
-
-    ``select_winner`` applies its own constraint-bounds filter on top of this
-    prefix; this function deliberately does not: constraint bounds are
-    config-mutable, so a trial outside today's bounds can re-enter the
-    candidate set under a later config and its evidence must still be there
-    when it does.
+    Selection additionally applies current constraint bounds. Evidence preflight
+    excludes that mutable filter, preserving evidence for trials that may become
+    eligible after a bounds edit. Ineligible trials cannot affect winner selection.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
     :return tuple[str, str] | None: ``(generation_id, attempt_id)`` for a
@@ -114,8 +95,7 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, An
     """
     if OBJECTIVE_PROVENANCE_ATTR not in trial.user_attrs:
         raise TrialEvidenceMissingError(
-            f"Trial {trial.number} has no {OBJECTIVE_PROVENANCE_ATTR!r} evidence. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"Trial {trial.number} has no {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
         )
     raw = trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR]
     if not isinstance(raw, str) or not raw:
@@ -150,8 +130,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         :raises TrialEvidenceMissingError: Always, naming ``subject`` and ``reason``.
         """
         raise TrialEvidenceMissingError(
-            f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence "
-            f"({reason}). {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence ({reason})."
         )
 
     if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
@@ -299,14 +278,12 @@ def _verify_objective_source_evidence(
     :param str subject: Caller-built label naming the study, phase, and trial.
     :param bool verify_digest: Also re-hash the source and compare it against
         the recorded ``sha256``. Reserved for the winner (see
-        :func:`_verify_winner_objective_evidence`).
+        :func:`_verify_winner_evidence`).
     :raises TrialEvidenceMissingError: The record is absent or malformed, or
         its file source is missing, unreadable, or no longer the recorded bytes.
     """
     if provenance is None:
-        raise TrialEvidenceMissingError(
-            f"{subject} has no objective provenance record. {_TRIAL_EVIDENCE_REMEDY}"
-        )
+        raise TrialEvidenceMissingError(f"{subject} has no objective provenance record.")
     _validate_objective_provenance(provenance, subject=subject)
     source = provenance["source"]
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
@@ -320,14 +297,13 @@ def _verify_objective_source_evidence(
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, which is missing or "
-            f"unreadable at {str(source_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"unreadable at {str(source_path)!r}."
         ) from exc
     recorded_size = int(source["size_bytes"])
     if stat_result.st_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} as "
-            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes."
         )
     if not verify_digest:
         return
@@ -337,13 +313,13 @@ def _verify_objective_source_evidence(
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r}, which could not be "
-            f"read back for verification at {str(source_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"read back for verification at {str(source_path)!r}."
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} with sha256 "
             f"{recorded_digest}, but that file now hashes to {actual_digest}: the bytes behind "
-            f"the published metric have changed. {_TRIAL_EVIDENCE_REMEDY}"
+            f"the published metric have changed."
         )
 
 
@@ -353,12 +329,9 @@ def _verify_trainer_input_evidence(
     *,
     subject: str,
 ) -> None:
-    """Content-verify the historical generated input one trainer consumed.
+    """Verify the generated input recorded by a trial, independently of current config.
 
-    The filename comes from the trial's versioned record, not the current
-    experiment config. Validating the format/filename pair keeps that
-    historical path trial-relative and prevents a malformed ledger value from
-    redirecting verification outside the evidence directory.
+    Require the versioned format/filename pair to identify a trial-relative file.
 
     :param Path trial_dir: Structurally translated trial evidence directory.
     :param Any record: Raw ``TRAINER_INPUT_ATTR`` Optuna user attribute.
@@ -369,7 +342,7 @@ def _verify_trainer_input_evidence(
     if not isinstance(record, Mapping):
         raise TrialEvidenceMissingError(
             f"{subject} has no valid {TRAINER_INPUT_ATTR!r} record, so its historical "
-            f"trainer input cannot be verified. {_TRIAL_EVIDENCE_REMEDY}"
+            f"trainer input cannot be verified."
         )
     input_format = record.get("format")
     filename = record.get("filename")
@@ -383,8 +356,7 @@ def _verify_trainer_input_evidence(
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has a malformed or unsupported {TRAINER_INPUT_ATTR!r} record "
-            f"{dict(record)!r}, so its historical trainer input cannot be located safely. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            f"{dict(record)!r}, so its historical trainer input cannot be located safely."
         )
     recorded_size = record.get("size_bytes")
     recorded_digest = record.get("sha256")
@@ -396,39 +368,55 @@ def _verify_trainer_input_evidence(
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has an invalid size or content identity in its "
-            f"{TRAINER_INPUT_ATTR!r} record. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{TRAINER_INPUT_ATTR!r} record."
         )
 
     input_path = trial_dir / filename
     if not input_path.is_file():
         raise TrialEvidenceMissingError(
             f"{subject} is missing its recorded trainer input {filename!r} under "
-            f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{str(trial_dir)!r}."
         )
     try:
         actual_size = input_path.stat().st_size
     except OSError as exc:
         raise TrialEvidenceMissingError(
-            f"{subject} cannot read its recorded trainer input {filename!r} at "
-            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} cannot read its recorded trainer input {filename!r} at {str(input_path)!r}."
         ) from exc
     if actual_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} as {recorded_size} bytes, but "
-            f"that file is now {actual_size} bytes. {_TRIAL_EVIDENCE_REMEDY}"
+            f"that file is now {actual_size} bytes."
         )
     try:
         actual_digest = file_sha256(input_path)
     except OSError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} cannot content-verify its recorded trainer input {filename!r} at "
-            f"{str(input_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{str(input_path)!r}."
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded trainer input {filename!r} with sha256 {recorded_digest}, "
             f"but that file now hashes to {actual_digest}: the exact trainer input bytes "
-            f"have changed. {_TRIAL_EVIDENCE_REMEDY}"
+            f"have changed."
+        )
+
+
+class _EvidenceVerification:
+    """Phase evidence bindings shared by all trial-directory checks."""
+
+    def __init__(self, experiment: Experiment, phase: Phase) -> None:
+        """Compile the exposed phase's evidence requirements.
+
+        :param Experiment experiment: Configured primary extractor and remote target.
+        :param Phase phase: Exposed phase supplying its constraint and gate requirements.
+        """
+        self.extractor = experiment.metric.extractor
+        self.wandb_query = _wandb_query(experiment, phase.gates)
+        self.mlflow_query = compile_mlflow_query(experiment, phase.gates)
+        self.mlflow_target = (
+            None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
         )
 
 
@@ -440,25 +428,14 @@ def _verify_trial_evidence_dir(
     provenance: Mapping[str, Any] | None,
     trainer_input: Any,
     verify_objective_digest: bool,
-    extractor: ObjectiveExtractor,
+    verification: _EvidenceVerification,
     metric_value: float,
-    wandb_query: WandbQuery | None,
     constraints: Mapping[str, Any],
-    mlflow_query: MlflowQuery | None = None,
-    mlflow_target: SourceIdentity | None = None,
 ) -> None:
-    """Require one trial's evidence directory and audit artifacts to still exist.
+    """Require a trial's translated evidence directory and its recorded artifacts.
 
-    The single per-trial check shared by the launch preflight
-    (:func:`_validate_selection_evidence`) and the selection-time winner check
-    (:func:`_verify_winner_objective_evidence`), so the two can never drift
-    apart on what "this trial's evidence is intact" means.
-
-    ``trial_dir`` is always the structurally translated directory: the current
-    config's phase directory plus the trial's own directory name. A lifecycle
-    record is required, but its ``state`` is deliberately not constrained: the
-    transition to ``exited`` is best-effort, so an ``allocated`` record is an
-    ordinary outcome for a completed trial.
+    A lifecycle record must belong to the attempt. Its state is not constrained:
+    writing ``exited`` is best-effort, so completed trials may retain ``launching``.
 
     :param Path trial_dir: Translated evidence directory for the trial.
     :param str subject: Caller-built label naming the study, phase, and trial.
@@ -466,36 +443,30 @@ def _verify_trial_evidence_dir(
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param Any trainer_input: Versioned historical generated-input record.
     :param bool verify_objective_digest: Re-hash the objective source as well.
-    :param ObjectiveExtractor extractor: Configured primary evidence reader.
+    :param _EvidenceVerification verification: Phase evidence bindings.
     :param float metric_value: Selected scalar recorded by the study or winner.
-    :param WandbQuery | None wandb_query: Shared remote evidence binding for this phase.
     :param Mapping[str, Any] constraints: Saved constraint measurements.
-    :param MlflowQuery | None mlflow_query: Shared native metric selections and gates.
-    :param SourceIdentity | None mlflow_target: Configured native target and ownership mode.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
     """
     if not trial_dir.is_dir():
         raise TrialEvidenceMissingError(
-            f"{subject} has no evidence directory at {str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+            f"{subject} has no evidence directory at {str(trial_dir)!r}."
         )
     try:
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
     except ValueError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} has an attempt lifecycle record that is malformed or belongs to "
-            f"another attempt ({exc}). {_TRIAL_EVIDENCE_REMEDY}"
+            f"another attempt ({exc})."
         ) from exc
     if lifecycle is None:
-        raise TrialEvidenceMissingError(
-            f"{subject} has no attempt lifecycle record. {_TRIAL_EVIDENCE_REMEDY}"
-        )
+        raise TrialEvidenceMissingError(f"{subject} has no attempt lifecycle record.")
     for filename in _REQUIRED_TRIAL_EVIDENCE_FILES:
         if not (trial_dir / filename).is_file():
             raise TrialEvidenceMissingError(
-                f"{subject} is missing its {filename!r} audit artifact under "
-                f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
+                f"{subject} is missing its {filename!r} audit artifact under {str(trial_dir)!r}."
             )
     _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
@@ -506,39 +477,38 @@ def _verify_trial_evidence_dir(
     )
     assert provenance is not None
     recorded_extractor = provenance["extractor"]
-    if recorded_extractor["kind"] != extractor.type or recorded_extractor[
+    if recorded_extractor["kind"] != verification.extractor.type or recorded_extractor[
         "config_sha256"
-    ] != extractor_config_fingerprint(extractor):
+    ] != extractor_config_fingerprint(verification.extractor):
         raise TrialEvidenceMissingError(
             f"{subject} objective evidence no longer matches its configured extractor "
             "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
+            "changed after this trial ran, or the saved provenance was altered."
         )
     capture = provenance.get("remote_capture")
     if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
         raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
-    if wandb_query is not None:
+    if verification.wandb_query is not None:
         if (
             capture is None
             or any(
-                capture[field] != getattr(wandb_query.source, field)
+                capture[field] != getattr(verification.wandb_query.source, field)
                 for field in ("base_url", "entity", "project")
             )
-            or set(capture["values"]) != set(wandb_query.numeric_keys)
-            or capture.get("constraint_keys") != dict(wandb_query.constraint_keys)
+            or set(capture["values"]) != set(verification.wandb_query.numeric_keys)
+            or capture.get("constraint_keys") != dict(verification.wandb_query.constraint_keys)
             or capture.get("gate_keys")
-            != {identity: list(keys) for identity, keys in wandb_query.gate_keys}
+            != {identity: list(keys) for identity, keys in verification.wandb_query.gate_keys}
             or any(
                 capture["values"].get(key) != constraints.get(name)
-                for name, key in wandb_query.constraint_keys
+                for name, key in verification.wandb_query.constraint_keys
             )
-            or not set(wandb_query.presence_keys).issubset(capture["present_keys"])
+            or not set(verification.wandb_query.presence_keys).issubset(capture["present_keys"])
         ):
             raise TrialEvidenceMissingError(
                 f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
             )
-    elif mlflow_query is not None:
+    elif verification.mlflow_query is not None:
         from phasesweep.evidence.mlflow import observation_id
         from phasesweep.evidence.models import MlflowExtractor
         from phasesweep.tracking.session import read_binding, read_record
@@ -550,26 +520,26 @@ def _verify_trial_evidence_dir(
                 capture is None
                 or capture.get("kind") != "mlflow"
                 or capture["binding"] != binding
-                or capture["query"] != mlflow_query
+                or capture["query"] != verification.mlflow_query
                 or binding["attempt_id"] != attempt_id
                 or binding["overrides_sha256"] != trainer_input["sha256"]
                 or any(binding.get(k) != v for k, v in expected.items())
-                or mlflow_target is None
-                or binding["tracking_uri"] != mlflow_target["tracking_uri"]
-                or binding["run_mode"] != mlflow_target["run_mode"]
+                or verification.mlflow_target is None
+                or binding["tracking_uri"] != verification.mlflow_target["tracking_uri"]
+                or binding["run_mode"] != verification.mlflow_target["run_mode"]
                 or (
-                    mlflow_target["experiment_id"] is not None
-                    and binding["experiment_id"] != mlflow_target["experiment_id"]
+                    verification.mlflow_target["experiment_id"] is not None
+                    and binding["experiment_id"] != verification.mlflow_target["experiment_id"]
                 )
             ):
                 raise ValueError("binding, target, or shared query differs")
-            for name, specification in mlflow_query["constraints"].items():
+            for name, specification in verification.mlflow_query["constraints"].items():
                 point = capture["observations"][
                     observation_id(MlflowExtractor.model_validate(specification))
                 ]
                 if point["value"] != constraints.get(name):
                     raise ValueError("constraint selection differs")
-            spec = MlflowExtractor.model_validate(mlflow_query["objective"])
+            spec = MlflowExtractor.model_validate(verification.mlflow_query["objective"])
             identity = observation_id(spec)
             if (
                 capture["observations"][identity]["value"] != metric_value
@@ -583,24 +553,24 @@ def _verify_trial_evidence_dir(
             ) from exc
     elif capture is not None:
         raise TrialEvidenceMissingError(f"{subject} has undeclared remote evidence.")
-    if isinstance(extractor, WandbExtractor):
+    if isinstance(verification.extractor, WandbExtractor):
         source = provenance["source"]
         if (
             capture is None
             or any(
-                capture[field] != getattr(extractor, field)
+                capture[field] != getattr(verification.extractor, field)
                 for field in ("base_url", "entity", "project")
             )
-            or source.get("metric_key") != extractor.metric_key
-            or source["evaluation"]["progress"]["axis"] != extractor.evaluation_axis
-            or capture["values"].get(extractor.metric_key) != metric_value
+            or source.get("metric_key") != verification.extractor.metric_key
+            or source["evaluation"]["progress"]["axis"] != verification.extractor.evaluation_axis
+            or capture["values"].get(verification.extractor.metric_key) != metric_value
         ):
             raise TrialEvidenceMissingError(
                 f"{subject} W&B evidence disagrees with its configured source or selected scalar."
             )
-    if isinstance(extractor, JsonExtractor) and (
-        provenance["source"].get("path") != extractor.path
-        or provenance["source"].get("key") != extractor.key
+    if isinstance(verification.extractor, JsonExtractor) and (
+        provenance["source"].get("path") != verification.extractor.path
+        or provenance["source"].get("key") != verification.extractor.key
     ):
         raise TrialEvidenceMissingError(
             f"{subject} JSON evidence disagrees with its configured path/key."
@@ -611,24 +581,13 @@ def _validate_selection_evidence(
     experiment: Experiment,
     studies: Mapping[str, optuna.Study],
 ) -> None:
-    """Require every trial that could win to still have its evidence on disk.
+    """Require on-disk evidence for every trial that could win before new execution.
 
-    Winner selection consults Optuna alone - state, value, feasibility,
-    execution ids, constraint readings - and never touches the filesystem, so
-    an experiment whose winning trial directory was deleted would reselect
-    that trial and republish its number, metric, and provenance from a tree
-    holding nothing behind them. This runs on the launch path before any
-    generation claim or trial work, so a tree that cannot honestly be ranked
-    is refused before it is added to.
-
-    Only selection-eligible trials are candidates
-    (:func:`_selection_candidate_identity`); the rest can never win, so passing
-    over them cannot bias the result. Every candidate's small generated trainer
-    input is content-verified. The potentially unbounded objective source is
-    checked for existence and recorded size only, because re-hashing every
-    candidate's ``stdout.log`` on every top-up would cost the whole study's log
-    volume per resume. The winning objective source is digest-verified at
-    selection time instead (:func:`_verify_winner_objective_evidence`).
+    Check selection eligibility through :func:`_selection_candidate_identity`.
+    Content-verify each candidate's generated input and check its objective source's
+    existence and recorded size. Digest-verify the winning objective at selection
+    through :func:`_verify_winner_evidence`. Missing eligible evidence
+    refuses the run without dropping trials from the ranked population.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
     :param Mapping[str, optuna.Study] studies: Existing phase studies keyed by
@@ -640,6 +599,8 @@ def _validate_selection_evidence(
     """
     for phase_name, study in studies.items():
         phase_dir = _phase_dir(experiment, phase_name)
+        phase = experiment.phase(phase_name)
+        verification = _EvidenceVerification(experiment, phase)
         for trial in study.get_trials(deepcopy=False):
             identity = _selection_candidate_identity(trial)
             if identity is None:
@@ -654,7 +615,7 @@ def _validate_selection_evidence(
             if not isinstance(stored, str) or not stored or not Path(stored).is_absolute():
                 raise TrialEvidenceMissingError(
                     f"{subject} records an invalid {TRIAL_DIR_ATTR!r} user attribute "
-                    f"{stored!r}, so its evidence cannot be located. {_TRIAL_EVIDENCE_REMEDY}"
+                    f"{stored!r}, so its evidence cannot be located."
                 )
             # Identity binding: the persisted directory name must be exactly the
             # one _trial_dir_for builds for this trial's number, generation, and
@@ -671,7 +632,7 @@ def _validate_selection_evidence(
                 raise TrialEvidenceMissingError(
                     f"{subject} records evidence directory {Path(stored).name!r}, which does "
                     f"not name this trial's own generation/attempt identity (expected "
-                    f"{expected_name!r}). {_TRIAL_EVIDENCE_REMEDY}"
+                    f"{expected_name!r})."
                 )
             _verify_trial_evidence_dir(
                 phase_dir / expected_name,
@@ -680,19 +641,8 @@ def _validate_selection_evidence(
                 provenance=_trial_objective_provenance(trial),
                 trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
                 verify_objective_digest=False,
-                extractor=experiment.metric.extractor,
+                verification=verification,
                 metric_value=float(trial.value),
-                wandb_query=_wandb_query(
-                    experiment,
-                    next(phase.gates for phase in experiment.phases if phase.name == phase_name),
-                ),
-                mlflow_query=compile_mlflow_query(
-                    experiment,
-                    next(phase.gates for phase in experiment.phases if phase.name == phase_name),
-                ),
-                mlflow_target=None
-                if experiment.mlflow is None
-                else experiment.mlflow.evidence_identity(),
                 constraints={
                     c.name: trial.user_attrs.get(constraint_attr(c.name))
                     for c in experiment.constraints
@@ -700,38 +650,34 @@ def _validate_selection_evidence(
             )
 
 
-def _verify_winner_objective_evidence(
+def _verify_winner_evidence(
     experiment: Experiment,
-    phase_name: str,
-    selected: SelectedTrial,
+    phase: Phase,
+    winner: SelectedTrial | Winner,
 ) -> None:
-    """Digest-verify the evidence behind a trial that is about to be published.
+    """Digest-verify a selected or carried winner against each member's own evidence.
 
-    The launch preflight content-verifies every candidate's small generated
-    trainer input and proves its objective source still exists; this additionally
-    proves the winning objective source is byte-for-byte the evidence its frozen
-    provenance recorded. The split is deliberate: the default objective source
-    is an uncapped trainer log, so hashing every candidate on every top-up is
-    O(total trainer log bytes) per resume - potentially tens of gigabytes -
-    while hashing only the published winner is bounded by one trial's log and
-    still catches every deletion and every result-affecting edit, including a
-    tamper that preserves byte length.
-
-    It runs on every selection, so a deadline-truncated partial publication is
-    covered on the same terms as a complete one. A repeats winner stands on
-    every member of its group, so each member is verified against its own
-    metric and provenance (:func:`phasesweep.engine.repeats.evidence_members`).
+    Carried winners use their recorded source phase without loading its study.
+    Scalar winners require only their source trial; repeat winners require every member.
 
     :param Experiment experiment: Parsed experiment naming the artifact tree.
-    :param str phase_name: Phase whose winner was just selected.
-    :param SelectedTrial selected: The winning trial and its frozen provenance.
+    :param Phase phase: Phase whose winner is selected or carried into the publication.
+    :param SelectedTrial | Winner winner: Selected trial or authenticated carried winner.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
         generated trainer input, or objective source of the winner or of any
         member of its group are missing, foreign, or altered.
     """
-    gates = next(phase.gates for phase in experiment.phases if phase.name == phase_name)
-    label = "winner trial" if selected.repeats is None else "winner group member trial"
-    for member in evidence_members(selected):
+    if isinstance(winner, Winner):
+        source = winner.source
+        assert source is not None
+        phase_name = source.phase
+        subject = f"Skipped phase {phase.name!r} winner source phase {phase_name!r} trial"
+    else:
+        phase_name = phase.name
+        label = "winner trial" if winner.repeats is None else "winner group member trial"
+        subject = f"Phase {phase_name!r} {label}"
+    verification = _EvidenceVerification(experiment, phase)
+    for member in evidence_members(winner):
         _verify_trial_evidence_dir(
             _trial_dir_for(
                 experiment,
@@ -741,72 +687,14 @@ def _verify_winner_objective_evidence(
                 attempt_id=member.attempt_id,
             ),
             subject=(
-                f"Phase {phase_name!r} {label} {member.trial_number} "
+                f"{subject} {member.trial_number} "
                 f"(generation {member.generation_id!r}, attempt {member.attempt_id!r})"
             ),
             attempt_id=member.attempt_id,
             provenance=member.objective_provenance,
             trainer_input=member.trainer_input,
             verify_objective_digest=True,
-            extractor=experiment.metric.extractor,
+            verification=verification,
             metric_value=member.metric,
-            wandb_query=_wandb_query(experiment, gates),
-            mlflow_query=compile_mlflow_query(experiment, gates),
-            mlflow_target=(
-                None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
-            ),
-            constraints=member.constraints,
-        )
-
-
-def _verify_skipped_winner_evidence(
-    experiment: Experiment,
-    phase: Phase,
-    winner: Winner,
-) -> None:
-    """Content-verify a skipped winner against its concrete source trial.
-
-    ``--from-phase`` has no reason to require the prior phase's Optuna study:
-    the authenticated winner artifact contains the source phase, trial,
-    generation, attempt, objective provenance, and generated-input identity
-    needed to inspect the source tree directly, and for a repeats winner the
-    same identity for every member of its group.
-
-    :param Experiment experiment: Experiment owning the artifact tree.
-    :param Phase phase: Exposed skipped phase whose winner is being carried.
-    :param Winner winner: Authenticated winner loaded from the prior publication.
-    :raises TrialEvidenceMissingError: The evidence of the source trial, or of
-        any member of its group, has been removed or changed.
-    """
-    # Publication validation already bound the source to this phase and to the
-    # winner's own trial, generation, and attempt, and the group's last member
-    # to that same source.
-    source = winner.source
-    assert source is not None
-    for member in evidence_members(winner):
-        _verify_trial_evidence_dir(
-            _trial_dir_for(
-                experiment,
-                source.phase,
-                member.trial_number,
-                generation_id=member.generation_id,
-                attempt_id=member.attempt_id,
-            ),
-            subject=(
-                f"Skipped phase {phase.name!r} winner source phase {source.phase!r} trial "
-                f"{member.trial_number} (generation {member.generation_id!r}, attempt "
-                f"{member.attempt_id!r})"
-            ),
-            attempt_id=member.attempt_id,
-            provenance=member.objective_provenance,
-            trainer_input=member.trainer_input,
-            verify_objective_digest=True,
-            extractor=experiment.metric.extractor,
-            metric_value=member.metric,
-            wandb_query=_wandb_query(experiment, phase.gates),
-            mlflow_query=compile_mlflow_query(experiment, phase.gates),
-            mlflow_target=(
-                None if experiment.mlflow is None else experiment.mlflow.evidence_identity()
-            ),
             constraints=member.constraints,
         )

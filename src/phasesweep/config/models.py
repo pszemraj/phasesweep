@@ -31,11 +31,12 @@ from phasesweep.config.search import (
     _validate_sampler_search_space,
     fixed_configuration_target_refusal,
     phase_draws,
+    sampler_capability_line,
     sampler_search_space,
+    sampler_warnings,
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
-    Extractor,
     Gate,
     JsonEnvelopeExtractor,
     JsonExtractor,
@@ -52,11 +53,9 @@ from phasesweep.evidence.models import (
 from phasesweep.runtime.commands import (
     _OverrideValueError,
     _render_override_value,
-    dump_json_file_overrides,
+    compose_trainer_input,
     dump_overrides_json,
-    dump_trial_trainer_config_yaml,
     flatten_trainer_config,
-    merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import (
@@ -150,11 +149,7 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
 
 
 def experiment_warnings(experiment: Experiment) -> list[str]:
-    """List the advisory warnings about the experiment as a whole.
-
-    Shared by ``validate`` and ``run --dry-run`` beside
-    :func:`phasesweep.config.search.sampler_warnings`, which covers one phase. A
-    warning never blocks a run.
+    """List experiment-wide advisory warnings; none blocks a run.
 
     :param Experiment experiment: Loaded experiment.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
@@ -176,6 +171,36 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "execution.passthrough_env, which is inherited without being recorded or compared."
         )
     return warnings
+
+
+def experiment_disclosures(
+    experiment: Experiment,
+) -> Iterator[tuple[Phase | None, list[tuple[bool, str]]]]:
+    """Yield shared contract and warning lines in their display order.
+
+    The experiment block comes first, followed by one block per configured
+    phase. The phase context lets callers insert their own phase headings;
+    each line's boolean marks advisory warnings without prescribing a sink.
+
+    :param Experiment experiment: Loaded experiment to describe.
+    :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
+        ordered warning/content pairs; ``None`` identifies the experiment block.
+    """
+    yield (
+        None,
+        [
+            *((False, line) for line in experiment_contract_lines(experiment)),
+            *((True, line) for line in experiment_warnings(experiment)),
+        ],
+    )
+    for phase in experiment.phases:
+        yield (
+            phase,
+            [
+                (False, sampler_capability_line(phase, experiment.resolved_storage)),
+                *((True, line) for line in sampler_warnings(phase)),
+            ],
+        )
 
 
 _CREDENTIAL_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
@@ -224,10 +249,7 @@ def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
 
 
 def _observation_line(observation: Observation) -> str:
-    """Name one report-only observation and what its extractor reads.
-
-    The line lets a mistyped path or key show before a run, since a value the
-    trainer never wrote is only logged as a warning once a trial finishes.
+    """Describe one report-only observation's name and scalar source.
 
     :param Observation observation: One configured ``observe`` entry.
     :return str: One line with the observation's name, its source and a report-only marker.
@@ -248,10 +270,7 @@ def _observation_line(observation: Observation) -> str:
 
 
 def _evaluation_point_line(metric: Metric) -> str:
-    """Say whether selection can check that ranked objectives share an evaluation position.
-
-    The check runs only for extractors whose evidence names a position, so the
-    other kinds would otherwise report ``n/a`` on every winner without saying why.
+    """Describe whether the objective source binds a comparable evaluation position.
 
     :param Metric metric: Configured optimization metric.
     :return str: One line naming the support, the axis and what binds the position.
@@ -334,11 +353,10 @@ def _environment_contract_line(experiment: Experiment) -> str:
 
 
 def _trainer_cwd_line(experiment: Experiment) -> str:
-    """Describe the trainer's working directory, which is part of every study's identity.
+    """Describe the trainer working directory included in study identity.
 
-    An unset ``execution.cwd`` is the one input the config file does not pin:
-    the line says what it follows instead of printing a directory that
-    depends on the shell ``validate`` happened to run from.
+    An unset execution.cwd is described by its resolution rule, independent of
+    the shell running validation.
 
     :param Experiment experiment: Loaded experiment.
     :return str: One line naming the resolved ``execution.cwd``, or what an unset one follows.
@@ -349,8 +367,10 @@ def _trainer_cwd_line(experiment: Experiment) -> str:
             "trainer cwd: follows the directory phasesweep runs from (the catalog cwd under "
             "MCP) and is part of the study identity; set execution.cwd to pin it"
         )
-    resolved = Path(configured).expanduser().resolve()
-    return f"trainer cwd: {resolved} (execution.cwd; part of the study identity)"
+    return (
+        f"trainer cwd: {experiment.execution.resolved_cwd()} "
+        "(execution.cwd; part of the study identity)"
+    )
 
 
 class _NamedExtractor(_Frozen):
@@ -359,7 +379,7 @@ class _NamedExtractor(_Frozen):
     _label: ClassVar[str]
 
     name: str
-    extractor: Extractor = Field(discriminator="type")
+    extractor: ObjectiveExtractor = Field(discriminator="type")
 
     @model_validator(mode="after")
     def _validate_evaluation_axis_unused(self) -> Self:
@@ -392,11 +412,10 @@ class Constraint(_NamedExtractor):
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> Constraint:
-        """Reject empty/non-finite bounds and ``min > max`` (Pydantic post-init hook).
+        """Require finite, ordered constraint bounds with at least one endpoint.
 
-        Returns:
-            Self, unchanged. Pydantic ``mode='after'`` validator protocol.
-
+        :raises ValueError: Bounds are absent, non-finite, or inverted.
+        :return Constraint: Validated constraint.
         """
         _validate_optional_bounds(
             label=f"Constraint {self.name!r}",
@@ -508,19 +527,11 @@ class Phase(_Frozen):
     @field_validator("gpu_ids")
     @classmethod
     def _gpu_ids_non_negative(cls, value: list[int] | None) -> list[int] | None:
-        """Reject negative GPU indices, which would silently disable isolation.
+        """Require a nonempty list of non-negative GPU indices when configured.
 
-        Args:
-            value: The candidate ``gpu_ids`` list, or ``None``.
-
-        Returns:
-            The same value, unchanged.
-
-        Raises:
-            ValueError: ``value`` is an empty list, or any element is negative
-                (``CUDA_VISIBLE_DEVICES=-1`` hides all devices and would silently
-                disable GPU isolation).
-
+        :param list[int] | None value: Configured GPU indices.
+        :raises ValueError: The list is empty or contains a negative index.
+        :return list[int] | None: Validated indices, unchanged.
         """
         if value is None:
             return None
@@ -581,30 +592,18 @@ class Phase(_Frozen):
         if self.gpu_policy == "whole_node" and self.gpu_ids is None and self.gpu_devices is None:
             raise ValueError(
                 "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
-                "list: the whole-node device set is the trainer's world size — a "
-                "semantic input, not a throughput knob — so it cannot be left to "
-                "ambient CUDA_VISIBLE_DEVICES or nvidia-smi detection."
+                "list because its device count defines the trainer's world size."
             )
         if self.gpu_policy == "whole_node":
-            # The phase fingerprint records the DECLARED token count as the
-            # trainer's world size, but the runtime pool normalizes and dedupes
-            # tokens before leasing. A repeated token therefore promises a
-            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity.
-            # Tokens are stripped defensively: ``_gpu_devices_non_empty_tokens``
-            # already strips ``gpu_devices``, but this validator must not depend
-            # on that to see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
+            # Declared device count must match the pool's distinct normalized tokens.
             declared = self.gpu_ids if self.gpu_ids is not None else self.gpu_devices
             tokens = [str(token).strip() for token in declared or []]
             duplicates = sorted({token for token in tokens if tokens.count(token) > 1})
             if duplicates:
                 field = "gpu_ids" if self.gpu_ids is not None else "gpu_devices"
                 raise ValueError(
-                    "gpu_policy='whole_node' requires unique device tokens because the "
-                    "effective device count is part of experiment semantics; "
-                    f"{field} repeats {duplicates}. The phase fingerprint records the "
-                    "declared device count as the trainer's world size, while the GPU "
-                    "pool leases each token once — so a duplicate would run a smaller "
-                    "world than the study identity claims. List each device once, or "
+                    "gpu_policy='whole_node' requires unique device tokens; "
+                    f"{field} repeats {duplicates}. List each device once, or "
                     "use gpu_policy='single_per_trial' if you meant a pool rather than "
                     "a world size."
                 )
@@ -670,18 +669,11 @@ class Phase(_Frozen):
     @field_validator("name")
     @classmethod
     def _name_is_safe(cls, v: str) -> str:
-        """Reject unsafe names and reserved experiment-root directory names.
+        """Require a safe phase name distinct from engine-managed directory names.
 
-        Args:
-            v: The candidate phase name.
-
-        Returns:
-            The same name, unchanged.
-
-        Raises:
-            ValueError: Any character is disallowed, or the name collides with
-                engine-managed records.
-
+        :param str v: Configured phase name.
+        :raises ValueError: The name contains disallowed characters or is reserved.
+        :return str: Validated phase name.
         """
         v = _validate_safe_name("Phase", v)
         if v.casefold() == "attempts":
@@ -696,20 +688,12 @@ class Phase(_Frozen):
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Phase:
-        r"""Reject malformed override keys before they hit the override renderer.
+        """Validate fixed and sampled override keys as nonempty dotted paths.
 
-        CLI override rendering quotes values shell-safely, but a malformed
-        *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
-        produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
-        treat surface noise (whitespace) as part of the key.
+        Each segment must match ``[A-Za-z0-9_-]+`` without whitespace.
 
-        Permissible keys: dotted paths whose every segment is non-empty and
-        matches ``[A-Za-z0-9_\-]+``. This covers ``lr``, ``model.depth``,
-        ``trainer.run.dir``, ``data.train_path``, ``optim.weight-decay``.
-
-        Returns:
-            Self, unchanged. Pydantic post-init validator protocol.
-
+        :raises ValueError: An override key has an invalid segment.
+        :return Phase: Validated phase.
         """
         for key in self.fixed_overrides:
             _validate_override_key(key, label=f"phase {self.name!r} fixed_overrides")
@@ -777,11 +761,7 @@ class Phase(_Frozen):
 
 
 def _is_environment_name(name: str) -> bool:
-    """Return whether ``name`` can be the name of a process environment variable.
-
-    ``os.execve`` raises ``ValueError`` for an empty name, a name containing
-    ``=``, and any name or value containing NUL, and no ambient variable can
-    carry such a name.
+    """Check whether a name is nonempty and contains neither ``=`` nor NUL.
 
     :param str name: Candidate environment variable name.
     :return bool: ``True`` when the name is nonempty and holds no ``=`` or NUL.
@@ -789,39 +769,21 @@ def _is_environment_name(name: str) -> bool:
     return bool(name) and "=" not in name and "\x00" not in name
 
 
-# Minimal environment base used when the execution contract narrows
-# inheritance below "all": enough for a shell + interpreter to start and
-# write temp files, nothing that can carry semantic configuration.
-#
-# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
-# trains on CPU or GPU, so admitting the ambient value would let two operators
-# running the identical config from differently-exported shells write
-# CPU-trained and GPU-trained evaluations into one study under one semantic
-# fingerprint — exactly the unfingerprinted ambient input the narrowed
-# contracts exist to exclude (the fingerprint covers the contract's mode/names
-# and configured ``env``, never ambient values). Bind trainer visibility with
-# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
-# also drives GPU pool discovery, or name the variable in an ``inherit_env``
-# list to opt its ambient value in explicitly.
+# Base inherited variables support shell/interpreter startup and temporary files.
+# GPU visibility requires configured env.CUDA_VISIBLE_DEVICES or explicit inheritance.
 BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
-# Pass-through names every config has, listed or not: inherited when set and never
-# digested. TMPDIR is a scratch location, not a scientific input, and a sandboxed
-# shell sets its own. PATH stays digested: it decides which interpreter and tools
-# run. ``execution.passthrough_env`` adds names to this set.
+# Built-in pass-through names are inherited when set and never digested.
+# PATH remains tracked because it selects executable tools.
 BUILTIN_PASSTHROUGH_ENV = ("TMPDIR",)
 
 
 class ExecutionContext(_Frozen):
-    """Explicit trainer execution-context contract.
+    """Configure trainer working-directory and environment inheritance.
 
-    The ambient environment and the current working directory are two unbounded
-    implicit semantic inputs that never contribute to study identity, so one
-    persistent study could silently mix evaluations from different trainers,
-    datasets, or credentials. This contract makes both explicit: the default
-    passes the trainer only :data:`BASE_INHERITED_ENV` plus configured ``env``
-    values, ``inherit_env`` widens that on purpose, and the choices bind into
-    the semantic fingerprint.
+    The default inherits BASE_INHERITED_ENV plus configured env entries.
+    Inheritance and pass-through settings determine the environment cohort
+    recorded with the study.
     """
 
     cwd: str | None = Field(
@@ -942,12 +904,26 @@ class ExecutionContext(_Frozen):
                 )
         return self
 
+    def resolved_cwd(self) -> Path | None:
+        """Resolve the configured trainer directory through home and symlink expansion.
+
+        :return: Absolute directory, or ``None`` to inherit the invocation directory.
+        """
+        return None if self.cwd is None else Path(self.cwd).expanduser().resolve()
+
     def effective_passthrough_env(self) -> tuple[str, ...]:
         """List every pass-through name: the built-in ones plus ``passthrough_env``.
 
         :return tuple[str, ...]: Sorted unique names inherited when set and never digested.
         """
         return tuple(sorted({*BUILTIN_PASSTHROUGH_ENV, *self.passthrough_env}))
+
+    def inherit_env_contract(self) -> str | list[str]:
+        """Return the environment inheritance contract in canonical persisted order.
+
+        :return str | list[str]: ``"all"``, ``"none"``, or the sorted name list.
+        """
+        return sorted(self.inherit_env) if isinstance(self.inherit_env, list) else self.inherit_env
 
     def tracked_env_names(self) -> tuple[str, ...]:
         """List the ambient variable names the environment cohort covers.
@@ -1046,6 +1022,14 @@ class Experiment(_Frozen):
             return self.storage
         root = Path(self.workdir).expanduser().resolve() / self.experiment
         return local_storage_url(root / "study.journal")
+
+    def phase(self, name: str) -> Phase:
+        """Look up a configured phase by its unique name.
+
+        :return: The matching configured phase.
+        :raises StopIteration: No phase has that name.
+        """
+        return next(phase for phase in self.phases if phase.name == name)
 
     def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
         """Yield the phases a run resuming at ``from_phase`` reaches, in order.
@@ -1207,11 +1191,7 @@ class Experiment(_Frozen):
 
     @model_validator(mode="after")
     def _validate_trainer_config_wire(self) -> Experiment:
-        """Require the embedded trainer config to have a wire form in the selected format.
-
-        ``yaml_file`` validates the base together with each phase's overrides.
-        The other formats carry the base too, so its keys and leaves must
-        render on their wire before any phase composes into it.
+        """Require the trainer base and phase overrides to render in the selected format.
 
         :raises ValueError: ``trainer_config`` holds a key or value that the
             selected ``override_format`` cannot carry.
@@ -1245,16 +1225,11 @@ class Experiment(_Frozen):
     @field_validator("experiment")
     @classmethod
     def _experiment_name_is_safe(cls, v: str) -> str:
-        """Experiment name is used as a filesystem path component (lock files, study names).
+        """Require an experiment name matching ``[A-Za-z0-9_-]+``.
 
-        Same constraint as phase names: ``[A-Za-z0-9_-]`` only. Without this,
-        names like ``../../etc/evil`` could escape the configured lock-file
-        directory and the experiment::phase study name.
-
-        Returns:
-            The validated experiment name, unchanged. Raises ``ValueError``
-            on any disallowed character.
-
+        :param str v: Configured experiment name.
+        :raises ValueError: The name is empty or contains disallowed characters.
+        :return str: Validated experiment name.
         """
         return _validate_safe_name("Experiment", v)
 
@@ -1265,7 +1240,7 @@ class Experiment(_Frozen):
         Each exported override key carries its producing phase as its origin.
         Re-exporting preserves that origin, making a same-origin diamond valid.
         Different origins for one inherited key require a child fixed override;
-        a fixed child key deliberately establishes a new origin. A key is locked
+        a fixed child key establishes a new origin. A key is locked
         for a child only when some inherited origin sampled it; keys the
         inherited phases only fixed may be searched.
 
@@ -1429,22 +1404,10 @@ def _sampled_locked_origins(inherited: Mapping[str, set[str]]) -> dict[str, set[
 
 
 def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None:
-    """Require an explicit seed for a stochastic sampler on persistent storage.
+    """Require a seed for persistent phases that draw from stochastic samplers.
 
-    A persistent study outlives the process that created it. An unseeded
-    ``tpe``/``random``/``cmaes`` phase draws a different sequence on every
-    invocation, so the durable trials it accumulates cannot be reproduced or
-    explained afterwards, and a resumed or enlarged study could draw a
-    configuration it already ran. A seed keys every draw by its position in
-    the study, so an interruption repeats no draw: ``random`` then draws what
-    an uninterrupted run would at any ``n_jobs``, and ``tpe`` and ``cmaes`` do
-    at ``n_jobs`` 1 given the same trial values.
-
-    ``grid`` is exempt: it enumerates a fixed matrix. A phase with an empty
-    ``search_space`` is exempt too, whatever its sampler: it draws nothing.
-    In-memory storage (``storage: null``, the only in-memory spelling) is
-    exempt entirely — there is no durable study to reproduce or resume, so the
-    ``sampler`` block stays optional and the ``tpe`` default remains fine.
+    Seeded random draws reproduce at any n_jobs; TPE and CMA-ES require n_jobs=1
+    and the same trial outcomes. Grid, fixed phases, and in-memory storage are exempt.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose sampler contract is checked.
@@ -1466,14 +1429,10 @@ def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None
 
 
 def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
-    """Require ``n_trials: 1`` for a fixed configuration that has no durable study.
+    """Require one trial for a fixed configuration on in-memory storage.
 
-    Every invocation on in-memory storage (``storage: null``) starts a fresh
-    study, so a fixed configuration there has nothing to retry and
-    :func:`phasesweep.config.search.fixed_configuration_target_refusal` would
-    demand one trial at every launch; the config says so at load. A persistent
-    study may hold failed attempts for a larger ``n_trials`` to replace, which
-    only a launch can see, so persistent storage is checked there.
+    A fresh study has no failures to retry. Persistent retry targets are checked
+    against the existing study at launch.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose trial target is checked.
@@ -1488,13 +1447,10 @@ def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
-    """Reject scalar/list CLI override values with no faithful wire form.
+    """Validate CLI fixed values, categorical choices, and wire-form uniqueness.
 
-    Config load delegates to the same recursive renderer used at trial launch,
-    so the accepted values cannot drift between preflight and execution. The
-    supported domain is ``None``, ``bool``, ``int``, finite ``float``, ``str``,
-    and lists/tuples of those. Structured trainer configuration belongs in the
-    default ``yaml_file`` mode.
+    The launch renderer accepts null, booleans, integers, finite floats, strings,
+    and nested lists/tuples. Structured configuration uses yaml_file.
 
     :param Experiment experiment: Experiment being validated; supplies
         ``override_format``.
@@ -1519,54 +1475,6 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
         "hydra" if experiment.override_format == "hydra" else "argparse"
     )
 
-    def validation_error(location: str, exc: _OverrideValueError) -> ValueError:
-        """Build the load-time error for one value the CLI renderer rejected.
-
-        :param str location: Where the offending value sits in the phase config.
-        :param _OverrideValueError exc: Renderer rejection carrying the offending
-            value and its nested position.
-        :return ValueError: Error naming the phase, location, and value, with a
-            hint for the offending value's kind.
-        """
-        offender = exc.value
-        if isinstance(offender, Mapping):
-            hint = (
-                f"A mapping has no {override_format} wire form the fingerprint "
-                "preserves faithfully. Use the default override_format='yaml_file' "
-                "for structured trainer configuration."
-            )
-        elif isinstance(offender, float):
-            hint = (
-                "JSON has no representation for non-finite floats; use a finite "
-                'value, or quote it in YAML (e.g. "inf") if the trial command '
-                "should receive it as text."
-            )
-        elif isinstance(offender, (list, tuple)):
-            hint = "Override lists cannot recursively contain themselves."
-        elif isinstance(offender, str) and override_format == "hydra":
-            hint = (
-                "Hydra cannot pass literal strings containing '${' interpolation syntax or "
-                "control characters. Use the default override_format='yaml_file' if the "
-                "trainer needs that literal value."
-            )
-        else:
-            hint = (
-                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
-                "into Python date/datetime objects; quote the value in YAML "
-                '(e.g. "2024-01-01") to send it as text, or use '
-                "the default override_format='yaml_file' if the trainer needs a "
-                "structured value."
-            )
-        where = f" at position {exc.position}" if exc.position else ""
-        return ValueError(
-            f"Phase {phase.name!r}: override_format={override_format!r} but "
-            f"{location} holds a value{where} that {override_format} cannot render "
-            f"faithfully (type {type(offender).__name__}): {offender!r}. "
-            f"{override_format} override values must have one canonical wire form "
-            "the JSON-mode fingerprint preserves faithfully: null, booleans, "
-            f"integers, finite floats, strings, and lists of those. {hint}"
-        )
-
     repeat_key = None if phase.repeats is None else phase.repeats.key
     for key, param in sampler_search_space(phase).items():
         if not isinstance(param, CategoricalParam):
@@ -1579,7 +1487,9 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
             try:
                 wire = _render_override_value(choice, override_format)
             except _OverrideValueError as exc:
-                raise validation_error(f"{axis} choice at index {index}", exc) from exc
+                raise ValueError(
+                    f"Phase {phase.name!r}: {axis} choice at index {index}: {exc}"
+                ) from exc
             earlier = rendered.get(wire)
             if earlier is not None:
                 earlier_index, earlier_choice = earlier
@@ -1596,18 +1506,14 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
         try:
             _render_override_value(value, override_format)
         except _OverrideValueError as exc:
-            raise validation_error(f"fixed_overrides key {key!r}", exc) from exc
+            raise ValueError(f"Phase {phase.name!r}: fixed_overrides key {key!r}: {exc}") from exc
 
 
 def _format_field_names(template: str) -> set[str]:
-    """Return the *real* ``str.format`` field names referenced by ``template``.
+    """Collect str.format fields, including nested format specifications.
 
-    ``string.Formatter().parse()`` walks the template the same way
-    ``str.format`` does and reports only true field references, with escaped
-    braces handled correctly. Fields nested inside a format spec, as in
-    ``{trial_dir:{phase}}``, are included. Names are returned as written, so a
-    field with an attribute or index accessor (``{m.name}``, ``{a[0]}``) keeps
-    its accessor and the caller can refuse it.
+    Escaped braces are excluded. Attribute and index accessors remain intact
+    for the caller to reject.
 
     :param str template: A ``str.format``-style template string.
     :raises ValueError: The template has unbalanced braces.
@@ -1628,78 +1534,33 @@ def _validate_trial_command_template(
     phase: Phase,
     inherited_keys: frozenset[str],
 ) -> None:
-    """Preflight the trial command with its inherited keys.
+    """Preflight command placeholders and composed trainer input for one phase.
 
-    :param Experiment experiment: Experiment containing the command template.
-    :param Phase phase: Phase whose candidate execution is being checked.
-    :param frozenset[str] inherited_keys: Keys inherited from direct parents.
-    :raises ValueError: The trial command cannot render or reach the trainer.
+    Inherited, fixed, sampled, and repeat keys supply placeholder values.
+    Only actual format fields count; escaped braces do not deliver input.
 
-    Render ``trial_command`` once per phase with placeholder overrides.
-
-    Catches at config-load (not at trial-launch, three minutes into a sweep):
-
-    * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
-    * Attribute or index access on a placeholder (``{trial_dir.name}``,
-      ``{trial_dir[0]}``), which ``str.format`` would apply to the rendered string.
-    * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
-    * The primary ``yaml_file`` mode missing ``{config_path}``.
-    * Phases using a non-YAML format with overrides or a ``trainer_config`` but
-      a template missing the format's placeholder, the same silent-no-op
-      failure mode.
-    * A ``trainer_config`` and composed overrides that cannot be merged for
-      the selected format.
-
-    Both placeholder checks parse real ``str.format`` field names so that an
-    escaped ``{{overrides}}`` (rendered as the literal string ``{overrides}``)
-    correctly does *not* count as referencing the placeholder.
-
-    The rendered command is then discarded — this is preflight only.
-
-    Args:
-        experiment: The :class:`Experiment` being validated.
-        phase: The specific phase whose ``trial_command`` is being rendered.
-        inherited_keys: Locked keys inherited from parents — used to decide
-            whether ``{overrides}`` is required for scalar/list CLI formats.
-
-    Raises:
-        ValueError: Any of the failure modes listed above (typo, attribute or
-            index access, unbalanced braces, missing required placeholder for
-            the chosen ``override_format``).
-
+    :param Experiment experiment: Experiment containing the command and format.
+    :param Phase phase: Phase whose command is rendered.
+    :param frozenset[str] inherited_keys: Override keys supplied by direct parents.
+    :raises ValueError: The template has unknown fields, accessors, malformed braces,
+        a missing input placeholder, or trainer configuration that cannot be composed.
     """
-    # Build a synthetic override dict: one value per locked or sampled key.
-    # Inherited keys are present in the real call too (they come from parent
-    # winners), so the placeholder set must include them or render_command
-    # could miss a key the trainer expects.
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
     overrides.update(phase.fixed_overrides)
     overrides.update(_placeholder_values_for(sampler_search_space(phase)))
 
-    # Every format delivers the base trainer_config, so a nonempty one needs the
-    # format's placeholder just as an override does.
     has_overrides = bool(overrides) or (
         experiment.override_format != "yaml_file" and bool(experiment.trainer_config)
     )
 
     placeholder_dir = Path("__phasesweep_validate_trial_dir__")
     try:
-        if experiment.override_format == "yaml_file":
-            dump_trial_trainer_config_yaml(experiment.trainer_config, overrides)
-        elif experiment.override_format == "json_file":
-            dump_json_file_overrides(overrides, trainer_config=experiment.trainer_config)
-        else:
-            merged_cli_overrides(experiment.trainer_config, overrides)
+        compose_trainer_input(experiment.trainer_config, overrides, experiment.override_format)
     except (ValueError, TypeError) as exc:
         raise ValueError(
             f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
             f"{type(exc).__name__}: {exc}."
         ) from exc
-    # Parse the template once so we can both (a) preflight-render below and
-    # (b) check that the documented placeholders are actually referenced.
-    # Both arms surface the same "failed to render" wrapping for unbalanced
-    # braces so the user sees one consistent error message regardless of
-    # which check happens to detect the problem first.
     try:
         fields = _format_field_names(experiment.trial_command)
     except (ValueError, TypeError, IndexError) as exc:
@@ -1729,7 +1590,6 @@ def _validate_trial_command_template(
             trainer_config=experiment.trainer_config,
         )
     except KeyError as exc:
-        # str.format raises KeyError(name) for unknown placeholders.
         bad = exc.args[0] if exc.args else "<unknown>"
         raise ValueError(
             f"Phase {phase.name!r}: trial_command references unknown placeholder "
@@ -1774,11 +1634,7 @@ def _validate_trial_command_template(
             raise ValueError("{overrides_path} is only available with json_file.")
         required_placeholder = "overrides"
 
-    # When a phase has no overrides at all (no inherited, fixed, sampled, or
-    # repeat keys) and no trainer_config to deliver, a constant trial_command
-    # is legitimate: the phase is one fixed run of a trainer that takes no
-    # input. Only a failed attempt is run again; repeated runs that all count
-    # carry a repeat key.
+    # An input-free fixed phase may use a constant command.
     if not has_overrides:
         return
 

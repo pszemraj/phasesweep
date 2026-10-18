@@ -10,21 +10,20 @@ import pytest
 from optuna.exceptions import ExperimentalWarning
 from pydantic import ValidationError
 
-from phasesweep.config import (
+from phasesweep.config.common import _find_prefix_collisions, check_bounds, is_sha256_hex
+from phasesweep.config.models import Constraint, Phase
+from phasesweep.config.search import (
     CategoricalParam,
-    Constraint,
     FloatParam,
     IntParam,
-    JsonExtractor,
-    Phase,
     Repeats,
     Sampler,
-    check_bounds,
+    _placeholder_values_for,
+    grid_search_space,
     sampler_search_space,
 )
-from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
-from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler, _suggest
+from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment
 
 
@@ -178,6 +177,25 @@ def test_validate_rejects_incompatible_phase_settings() -> None:
         )
 
 
+def test_grid_config_validation_does_not_enumerate_parameter_lists(monkeypatch) -> None:
+    """Validation counts the full matrix without calling the value-list builder."""
+
+    def refuse_enumeration(*args, **kwargs):
+        pytest.fail("config validation materialized the grid")
+
+    monkeypatch.setattr("phasesweep.config.search.grid_search_space", refuse_enumeration)
+    experiment = make_experiment(
+        n_trials=12,
+        sampler=Sampler(type="grid"),
+        search_space={
+            "width": IntParam(type="int", low=1, high=3),
+            "scale": FloatParam(type="float", low=0.0, high=0.5, step=0.5),
+            "model": CategoricalParam(type="categorical", choices=["a", "b"]),
+        },
+    )
+    assert experiment.phases[0].n_trials == 12
+
+
 def test_validate_rejects_invalid_grid_configs() -> None:
     """Grid sampler configs must be exactly enumerable and complete by default."""
     cases = [
@@ -290,6 +308,13 @@ def test_validate_accepts_divisible_grid_float() -> None:
                 "right": CategoricalParam(type="categorical", choices=list(range(64))),
             },
             id="product-of-small-dimensions",
+        ),
+        pytest.param(
+            {
+                "wide": IntParam(type="int", low=0, high=4_096),
+                "tiny": FloatParam(type="float", low=0.0, high=1.0e-12, step=1.0e-13),
+            },
+            id="cardinality-cap-precedes-float-collapse",
         ),
     ],
 )
@@ -468,7 +493,6 @@ def test_categorical_rejects_equal_but_distinct_choices(
 
 
 def test_categorical_config_error_uses_only_the_selected_union_branch() -> None:
-    """The ``type`` discriminator keeps upgrade errors focused on categorical choices."""
     with pytest.raises(ValidationError) as exc_info:
         make_experiment(
             n_trials=2,
@@ -825,18 +849,18 @@ def test_extreme_float_bounds_load_under_every_override_format(
     assert exp.override_format == override_format
 
 
-def test_placeholder_value_for_stepped_int_is_on_the_lattice() -> None:
+def test_placeholder_values_for_stepped_int_is_on_the_lattice() -> None:
     """The placeholder for a stepped IntParam is a point on its step lattice."""
     param = IntParam(type="int", low=0, high=6, step=2)
-    value = _placeholder_value_for(param)
+    value = _placeholder_values_for({"x": param})["x"]
     assert value == param.low
     assert (value - param.low) % param.step == 0
 
 
-def test_placeholder_value_for_categorical_is_first_choice() -> None:
+def test_placeholder_values_for_categorical_is_first_choice() -> None:
     """The placeholder for a categorical param is its first listed choice."""
     param = CategoricalParam(type="categorical", choices=["b", "a", "c"])
-    assert _placeholder_value_for(param) == "b"
+    assert _placeholder_values_for({"x": param})["x"] == "b"
 
 
 def test_grid_repeat_axis_visits_each_configuration_once_per_value() -> None:

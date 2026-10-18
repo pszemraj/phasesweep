@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -19,17 +20,17 @@ from urllib.parse import urlsplit
 import pytest
 import yaml
 
-from phasesweep.config import Experiment
-from phasesweep.engine import run_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.read import read_status, read_winners
+from phasesweep.engine.read import read_result, read_status
+from phasesweep.engine.run import run_experiment
 from phasesweep.tracking.publication import delivery_status, sync_tracking
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-def local_server(tmp_path):
+@contextmanager
+def _server(tmp_path):
     """Provision explicit SQLite and proxied artifact storage outside the tree."""
     pytest.importorskip("mlflow.server")
     from mlflow import MlflowClient
@@ -73,11 +74,31 @@ def local_server(tmp_path):
                         pytest.fail((tmp_path / "server.log").read_text())
                     time.sleep(0.1)
             client = MlflowClient(tracking_uri=uri)
-            experiment_id = client.create_experiment("phasesweep-native")
-            yield uri, client, experiment_id, process
+            yield uri, client, process
         finally:
             process.terminate()
             process.wait(timeout=15)
+
+
+@pytest.fixture(scope="module")
+def shared_server(tmp_path_factory):
+    """Keep one HTTP server for cases that leave its process running."""
+    with _server(tmp_path_factory.mktemp("mlflow-server")) as server:
+        yield server
+
+
+@pytest.fixture
+def local_server(shared_server, tmp_path):
+    """Give each case a fresh explicit experiment on the shared server."""
+    uri, client, process = shared_server
+    return uri, client, client.create_experiment(tmp_path.name), process
+
+
+@pytest.fixture
+def offline_server(tmp_path):
+    """Give an offline replay its own server process to terminate."""
+    with _server(tmp_path) as (uri, client, process):
+        yield uri, client, client.create_experiment("phasesweep-native"), process
 
 
 @pytest.fixture
@@ -176,7 +197,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
-    from tests.test_mlflow import _binder, _identity, native_experiment
+    from tests.tracking_helpers import _binder, _identity, native_experiment
 
     calls = []
 
@@ -198,6 +219,8 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
             "mlflow": experiment.mlflow.model_copy(
                 update={
                     "tracking_uri": server.uri,
+                    "experiment_id": server.experiment_id,
+                    "experiment_name": None,
                     "timeout_seconds": timeout_seconds,
                     "poll_seconds": 0.05,
                 }
@@ -272,9 +295,9 @@ def test_create_committing_after_the_controller_gave_up_is_bound_later(
 
 
 @pytest.mark.parametrize("mode", ["managed", "trainer"])
-def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch, mode):
+def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypatch, mode):
     """Both ownership modes publish four trials and replay without the SDK/server."""
-    uri, client, experiment_id, process = local_server
+    uri, client, experiment_id, process = offline_server
     config = yaml.safe_load((Path(__file__).parents[1] / "examples" / "mlflow.yaml").read_text())
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
@@ -362,7 +385,10 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     assert all(point["step"] == 1 for point in rate_capture["observations"].values())
     process.terminate()
     process.wait(timeout=15)
-    before = [(w.phase, w.metric, w.params) for w in read_winners(experiment)]
+    before = [
+        (w.phase, w.metric, w.params)
+        for w in read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1]
+    ]
     original_import = builtins.__import__
 
     def no_sdk(name, *args, **kwargs):
@@ -379,7 +405,10 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     monkeypatch.setattr(transport, "request_operation", no_network)
     replay = run_experiment(experiment)
     assert {k: w.metric for k, w in replay.items()} == {k: w.metric for k, w in winners.items()}
-    assert [(w.phase, w.metric, w.params) for w in read_winners(experiment)] == before
+    assert [
+        (w.phase, w.metric, w.params)
+        for w in read_result(experiment, phase_names=[phase.name for phase in experiment.phases])[1]
+    ] == before
     assert all(p["trials"]["COMPLETE"] == 2 for p in read_status(experiment)["phases"])
 
 
@@ -388,7 +417,7 @@ def test_blocked_tracking_worker_is_cleaned(tmp_path, monkeypatch):
     from phasesweep.engine.paths import _attempts_dir
     from phasesweep.runtime.process import read_attempt_lifecycle
     from phasesweep.tracking.session import call_tracking, tracking_root
-    from tests.test_mlflow import native_experiment
+    from tests.tracking_helpers import native_experiment
 
     sdk = tmp_path / "sdk/mlflow"
     sdk.mkdir(parents=True)
@@ -413,8 +442,8 @@ def test_blocked_tracking_worker_is_cleaned(tmp_path, monkeypatch):
 @pytest.mark.parametrize("outage", ["none", "before_upload", "lost_ack"])
 def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, monkeypatch, outage):
     """A real failed trainer leaves no score and a retryable failed summary projection."""
-    from phasesweep.engine import NoFeasibleTrialError
     from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.tracking import publication
     from phasesweep.tracking.session import read_record, tracking_root
 
@@ -431,7 +460,13 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = f"{sys.executable} {trainer} --config {{config_path}}"
-    config["mlflow"].update(tracking_uri=uri, timeout_seconds=15, poll_seconds=0.05)
+    config["mlflow"].update(
+        tracking_uri=uri,
+        experiment_id=experiment_id,
+        experiment_name=None,
+        timeout_seconds=15,
+        poll_seconds=0.05,
+    )
     config["phases"][0].update(max_consecutive_failures=1)
     experiment = Experiment.model_validate(config)
     actual_call = publication.call_tracking

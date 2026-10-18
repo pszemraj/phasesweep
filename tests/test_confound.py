@@ -13,8 +13,8 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config import IntParam, Phase, Sampler
-from phasesweep.engine import TrialEvidenceMissingError, read_status
+from phasesweep.config.models import Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
@@ -24,10 +24,12 @@ from phasesweep.engine.confound import (
     _flagged_checks,
     _validate_confound_block,
 )
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.read import read_status
 from phasesweep.engine.repeats import ReduceName, ranked_group
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
@@ -41,7 +43,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.runtime.json import JsonObject
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import log_regex_provenance, make_experiment, write_constant_trainer
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
 _FAIL = optuna.trial.TrialState.FAIL
@@ -130,19 +132,9 @@ def test_wandb_provenance_may_lack_a_position_but_not_its_axis_record():
         _validate_objective_provenance(missing, subject="Trial 0")
 
 
-def _log_regex() -> dict[str, Any]:
-    """Return a current-format ``log_regex`` objective provenance record."""
-    return {
-        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
-        "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
-        "recorded_at": "2026-01-01T00:00:00+00:00",
-        "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},
-    }
-
-
 def _json() -> JsonObject:
     """Return a current-format ``json`` objective provenance record."""
-    return {**_log_regex(), "extractor": {"kind": "json", "config_sha256": "0" * 64}}
+    return {**log_regex_provenance(), "extractor": {"kind": "json", "config_sha256": "0" * 64}}
 
 
 def _trials(*specs: tuple[optuna.trial.TrialState, float | None, int]) -> list[Any]:
@@ -168,7 +160,7 @@ def _assess(
 ) -> dict[str, Any]:
     """Assess ``ranked`` with the lowest value winning, as minimize selection does."""
     winner = min(ranked, key=lambda trial: (trial.value, trial.number))
-    records = provenance or {trial.number: _log_regex() for trial in ranked}
+    records = provenance or {trial.number: log_regex_provenance() for trial in ranked}
     return _assess_population(trials, ranked, winner, provenance=records)
 
 
@@ -404,7 +396,7 @@ def _assess_groups(
         trials,
         ranked,
         by_number[best.representative],
-        provenance={trial.number: _log_regex() for trial in ranked},
+        provenance={trial.number: log_regex_provenance() for trial in ranked},
         groups=ranked_groups,
         incomplete_group=incomplete,
     )

@@ -14,17 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from phasesweep.config import (
-    IntParam,
-    Phase,
-    Sampler,
-)
-from phasesweep.engine import run_experiment
+from phasesweep.config.models import Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
 )
+from phasesweep.engine.run import run_experiment
 from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
@@ -465,9 +462,11 @@ def test_private_atomic_write_rejects_intermediate_directory_swap(
     assert not (moved / "status.json").exists()
 
 
+@pytest.mark.parametrize("writer_name", ["private_atomic_write_text", "private_atomic_create_text"])
 def test_private_atomic_write_keeps_opened_parent_during_path_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
 ) -> None:
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -479,26 +478,38 @@ def test_private_atomic_write_keeps_opened_parent_during_path_swap(
     outside_status = outside / "status.json"
     outside_status.write_text("outside")
     outside_status.chmod(0o600)
-    original_new_temp = runtime_files._new_private_temp_fd
+    original_new_temp = runtime_files._new_exclusive_temp_fd
 
-    def swap_parent(parent_fd: int, leaf: str) -> tuple[int, str]:
+    def swap_parent(path: Path, mode: int, *, directory_fd: int | None = None) -> tuple[int, Path]:
         state.rename(moved)
         state.symlink_to(outside, target_is_directory=True)
-        return original_new_temp(parent_fd, leaf)
+        return original_new_temp(path, mode, directory_fd=directory_fd)
 
-    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", swap_parent)
+    monkeypatch.setattr(runtime_files, "_new_exclusive_temp_fd", swap_parent)
 
-    runtime_files.private_atomic_write_text(state / "status.json", "inside")
+    getattr(runtime_files, writer_name)(state / "status.json", "inside")
 
     assert (moved / "status.json").read_text() == "inside"
     assert outside_status.read_text() == "outside"
 
 
+@pytest.mark.parametrize(
+    "writer_name",
+    [
+        "atomic_write_text",
+        "atomic_create_text",
+        "private_atomic_write_text",
+        "private_atomic_create_text",
+    ],
+)
+@pytest.mark.parametrize("failure_boundary", ["fdopen", "file_fsync"])
 def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer_name: str,
+    failure_boundary: str,
 ) -> None:
-    """A shutdown after the stream is created must leave one descriptor owner."""
+    """Shutdown during staging closes its raw descriptor once and removes partial bytes."""
 
     class InjectedShutdown(BaseException):
         """Stand in for ``PhaseSweepShutdown`` at the fd-to-stream boundary."""
@@ -506,15 +517,17 @@ def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     state.chmod(0o700)
-    real_new_temp = runtime_files._new_private_temp_fd
+    real_new_temp = runtime_files._new_exclusive_temp_fd
     real_fdopen = os.fdopen
     real_close = os.close
     temporary_fd: int | None = None
     temporary_close_count = 0
 
-    def capture_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
+    def capture_temp_fd(
+        path: Path, mode: int, *, directory_fd: int | None = None
+    ) -> tuple[int, Path]:
         nonlocal temporary_fd
-        temporary_fd, temporary = real_new_temp(parent_fd, leaf)
+        temporary_fd, temporary = real_new_temp(path, mode, directory_fd=directory_fd)
         return temporary_fd, temporary
 
     def shutdown_after_wrap(fd: int, *args: object, **kwargs: object) -> None:
@@ -528,12 +541,18 @@ def test_private_atomic_writer_shutdown_during_fdopen_does_not_double_close(
             temporary_close_count += 1
         real_close(fd)
 
-    monkeypatch.setattr(runtime_files, "_new_private_temp_fd", capture_temp_fd)
-    monkeypatch.setattr(os, "fdopen", shutdown_after_wrap)
+    def shutdown_during_fsync(_fd: int) -> None:
+        raise InjectedShutdown
+
+    monkeypatch.setattr(runtime_files, "_new_exclusive_temp_fd", capture_temp_fd)
+    if failure_boundary == "fdopen":
+        monkeypatch.setattr(os, "fdopen", shutdown_after_wrap)
+    else:
+        monkeypatch.setattr(os, "fsync", shutdown_during_fsync)
     monkeypatch.setattr(os, "close", count_temp_close)
 
     with pytest.raises(InjectedShutdown):
-        runtime_files.private_atomic_write_text(state / "status.json", "replacement")
+        getattr(runtime_files, writer_name)(state / "status.json", "replacement")
 
     assert temporary_close_count == 1
     assert list(state.iterdir()) == []
@@ -577,12 +596,14 @@ def test_private_open_closes_descriptor_on_shutdown_during_fdopen_handoff(
         os.fstat(opened_fd)
 
 
-def test_private_atomic_write_logs_directory_fsync_failure(
+@pytest.mark.parametrize("strict", [False, True], ids=["best-effort", "strict"])
+def test_private_atomic_write_directory_fsync_failure_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    strict: bool,
 ) -> None:
-    """A committed private write reports lost crash durability without failing."""
+    """Replacement stays published when directory fsync raises or logs its failure."""
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     state.chmod(0o700)
@@ -590,10 +611,48 @@ def test_private_atomic_write_logs_directory_fsync_failure(
     patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
     caplog.set_level("WARNING", logger="phasesweep.runtime.files")
 
-    runtime_files.private_atomic_write_text(path, "committed")
+    if strict:
+        with pytest.raises(OSError, match="simulated directory fsync failure"):
+            runtime_files.private_atomic_write_text(path, "committed", strict_dir_fsync=True)
+    else:
+        runtime_files.private_atomic_write_text(path, "committed")
 
     assert path.read_text() == "committed"
-    assert "Directory fsync failed after a private atomic write" in caplog.text
+    assert ("Directory fsync failed after a private atomic write" in caplog.text) is not strict
+
+
+def test_directory_fsync_failure_policy_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Best-effort fsync logs the failure and closes its descriptor."""
+    directory = tmp_path / "state"
+    directory.mkdir(mode=0o700)
+    synced_fd: int | None = None
+
+    def fail_fsync(fd: int) -> None:
+        nonlocal synced_fd
+        synced_fd = fd
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    caplog.set_level("WARNING", logger="phasesweep.runtime.files")
+    runtime_files.fsync_directory(directory)
+    assert "the write is committed" in caplog.text
+    assert synced_fd is not None
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(synced_fd)
+
+
+def test_directory_fsync_addressing_policy(tmp_path: Path) -> None:
+    """Best-effort directory fsync follows symlinks."""
+    directory = tmp_path / "state"
+    directory.mkdir(mode=0o700)
+    link = tmp_path / "linked-state"
+    link.symlink_to(directory, target_is_directory=True)
+
+    runtime_files.fsync_directory(link)
 
 
 def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
@@ -633,14 +692,9 @@ def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
 ) -> None:
     """A SIGTERM during the walk is deferred and no descriptor leaks.
 
-    Without ``defer_shutdown_signals`` around the walk, the handler's
-    ``PhaseSweepShutdown`` could land on the bytecode boundary between the
-    descriptor-handoff store and the close of the previous descriptor,
-    stranding an open fd until process exit — invisible in one-shot
-    processes, an accumulating leak for a long-running embedder now that
-    ``open_directory_fd`` is public API. The signal must queue until the
-    walk finishes and the completed final descriptor must be closed before
-    the shutdown propagates to the caller.
+    Shutdown must not interrupt between storing the next descriptor and closing
+    the previous one. It queues until the walk finishes, and the completed
+    directory descriptor closes before shutdown propagates to the caller.
     """
     from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 
@@ -800,7 +854,7 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
                 "-c",
                 """
 import sys
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.errors import ExperimentLockBusyError
 try:

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.runtime.files import atomic_write_text
+from phasesweep.runtime.json import nonempty_text, progress_position
 
 _IDENTITY_ENV = (
     "PHASESWEEP_GENERATION_ID",
@@ -41,19 +42,6 @@ def _required_trial_environment(name: str) -> str:
             f"report_objective() requires {name}; call it from a PhaseSweep trial "
             "using a json_envelope metric extractor."
         )
-    return value
-
-
-def _nonempty_string(value: str, *, label: str) -> str:
-    """Require a nonempty string used to describe an evaluation.
-
-    :param str value: Candidate string.
-    :param str label: Argument name used in the error.
-    :raises ValueError: If ``value`` is not a nonempty string.
-    :return str: The validated value.
-    """
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be a nonempty string.")
     return value
 
 
@@ -96,12 +84,8 @@ def _progress_values(progress: Mapping[str, Any]) -> dict[str, int | float]:
                 f"progress names must be nonempty and not 'step' (the envelope's own "
                 f"step), got {axis!r}."
             )
-        number = _json_number(position)
-        try:
-            valid = number is not None and math.isfinite(number) and number >= 0
-        except OverflowError:
-            valid = False
-        if number is None or not valid:
+        number = progress_position(_json_number(position))
+        if number is None:
             raise ValueError(
                 f"progress[{axis!r}] must be a finite non-negative number, got {position!r}."
             )
@@ -120,14 +104,11 @@ def report_objective(
     progress: Mapping[str, int | float] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Atomically publish this trial's objective as a PhaseSweep result envelope.
+    """Atomically publish this attempt's objective as a result envelope.
 
-    The destination and attempt identity come from environment variables injected
-    for a ``json_envelope`` metric extractor. ``extra`` may add top-level JSON
-    fields for constraint extractors, report-only ``observe`` entries (read with a
-    ``json`` extractor) or evidence gates, but cannot replace the envelope fields
-    managed by this helper. Missing parent directories in a
-    nested configured destination are created by the atomic artifact writer.
+    The managed trial environment supplies destination and attempt identity.
+    Extra JSON fields may serve constraints, observations, or gates but cannot
+    replace envelope fields. Missing destination parent directories are created.
 
     :param float value: Finite objective value produced by the evaluation. Here
         and in ``step`` and ``progress``, NumPy scalars count as numbers;
@@ -163,8 +144,8 @@ def report_objective(
     if not isinstance(step_number, int) or step_number < 0:
         raise ValueError(f"step must be a non-negative integer, got {step!r}.")
     evaluation: dict[str, Any] = {
-        "policy": _nonempty_string(policy, label="policy"),
-        "checkpoint": _nonempty_string(checkpoint, label="checkpoint"),
+        "policy": nonempty_text(policy, label="policy"),
+        "checkpoint": nonempty_text(checkpoint, label="checkpoint"),
         "step": step_number,
     }
     if progress is not None:
@@ -185,8 +166,8 @@ def report_objective(
         "attempt_id": identity["PHASESWEEP_ATTEMPT_ID"],
         "overrides_sha256": identity["PHASESWEEP_OVERRIDES_SHA256"],
         "objective": {
-            "name": _nonempty_string(name, label="name"),
-            "split": _nonempty_string(split, label="split"),
+            "name": nonempty_text(name, label="name"),
+            "split": nonempty_text(split, label="split"),
             "value": numeric_value,
         },
         "evaluation": evaluation,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import os
@@ -9,30 +10,29 @@ import subprocess
 import sys
 import threading
 import time
+import typing
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Required, TypedDict, Unpack
 
 import pytest
 import yaml
 
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-    Sampler,
-)
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
+from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
-from phasesweep.mcp.run_control import _runner_protocol_argv
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
+from tests.experiments import experiment_yaml, json_metric, phase_payload
+
+if typing.TYPE_CHECKING:
+    from mcp.types import CallToolResult
 
 # Persistent storage rejects an unseeded stochastic sampler.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
@@ -97,6 +97,13 @@ def write_mcp_config_catalog(
     )
 
 
+def _mcp_phase() -> dict[str, object]:
+    """Build the learning-rate phase shared by MCP experiment fixtures."""
+    return phase_payload(
+        search_space={"lr": {"type": "float", "low": 1.0e-5, "high": 1.0e-2, "log": True}}
+    )
+
+
 def mcp_experiment_config_text(
     tmp_path: Path,
     *,
@@ -104,32 +111,16 @@ def mcp_experiment_config_text(
     phases: str | None = None,
     with_storage: bool = True,
 ) -> str:
-    if phases is None:
-        # Seeded random: reproducible and resumable, so it satisfies the
-        # persistent-storage sampler policy without an acknowledgement.
-        phases = """\
-  - name: p
-    n_trials: 1
-    sampler: { type: random, seed: 0 }
-    search_space:
-      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
-"""
-    storage = (
-        f"storage: journal:///{tmp_path}/{name}.journal\nprovenance: {{revision: test-fixture-v1}}\n"
-        if with_storage
-        else ""
-    )
-    return f"""\
-experiment: {name}
-{storage}workdir: {tmp_path}/runs/{name}
-trial_command: "python train.py --out {{trial_dir}}/r.json {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
-phases:
-{phases}"""
+    fields: dict[str, object] = {
+        "experiment": name,
+        "workdir": str(tmp_path / "runs" / name),
+        "trial_command": "python train.py --out {trial_dir}/r.json {overrides}",
+        "metric": {"name": "loss", "goal": "minimize", **json_metric("loss", path="r.json")},
+        "phases": [_mcp_phase()] if phases is None else yaml.safe_load(phases),
+    }
+    if with_storage:
+        fields["storage"] = f"journal:///{tmp_path}/{name}.journal"
+    return experiment_yaml(**fields)
 
 
 def slow_mcp_config_text(
@@ -139,24 +130,18 @@ def slow_mcp_config_text(
     name: str = "slow",
     sleep: float = 30.0,
 ) -> str:
-    return f"""\
-experiment: {name}
-storage: journal:///{tmp_path}/{name}.journal
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs/{name}
-trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: p
-    n_trials: 1
-    sampler: {{ type: random, seed: 0 }}
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-"""
+    return experiment_yaml(
+        experiment=name,
+        storage=f"journal:///{tmp_path}/{name}.journal",
+        workdir=str(tmp_path / "runs" / name),
+        trial_command=f"{sys.executable} {trainer} --sleep {sleep} {{overrides}}",
+        metric={
+            "name": "eval_loss",
+            "goal": "minimize",
+            **json_metric("eval_loss", path="result.json", split="validation", policy="synthetic"),
+        },
+        phases=[_mcp_phase()],
+    )
 
 
 def write_slow_mcp_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
@@ -182,6 +167,30 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     return PhaseSweepMCP(registry, store), registry, store
+
+
+def call_mcp_tool(
+    app: PhaseSweepMCP, tool_name: str, arguments: dict[str, object]
+) -> CallToolResult:
+    """Dispatch raw arguments through the FastMCP request handler.
+
+    :param PhaseSweepMCP app: Server whose tools the handler exposes.
+    :param str tool_name: Registered tool to call.
+    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
+    :return CallToolResult: Client-visible error, content and structured result.
+    """
+    from mcp import types
+
+    from phasesweep.mcp.server import build_server
+
+    handler = build_server(app)._mcp_server.request_handlers[types.CallToolRequest]
+    request = types.CallToolRequest(
+        params=types.CallToolRequestParams(name=tool_name, arguments=arguments)
+    )
+    result = asyncio.run(handler(request)).root
+    if not isinstance(result, types.CallToolResult):
+        raise TypeError(f"A tool call answered with {type(result).__name__}, not CallToolResult.")
+    return result
 
 
 def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: float) -> str:
@@ -336,13 +345,12 @@ def earlier_boot_id() -> str:
 def live_runs(store: RunStore) -> list[RunHandle]:
     """Every currently-running handle across all experiments.
 
-    Scanning calls ``state`` on each handle, which also reaps any runner
-    that has since exited - so this doubles as the cleanup sweep.
+    Each handle's state is read without changing its durable records.
 
     :param RunStore store: Store whose handles are scanned.
     :return list[RunHandle]: All handles whose derived state is currently ``running``.
     """
-    return [handle for handle in store.list_handles() if store.state(handle) == "running"]
+    return [handle for handle in store.list_handles() if store.observe(handle).state == "running"]
 
 
 def claim_runner_handle(
@@ -361,14 +369,11 @@ def claim_runner_handle(
     resolves the snapshot's relative paths against.
     """
     store.create(
-        RunHandle(
+        make_run_handle(
             run_id=run_id,
             experiment_id=experiment_id,
             config_sha256=config_sha256,
             config_dir=str(config_dir),
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
             started_at=started_at,
             launch_state="launching",
             visible_params_at_launch=visible_params_at_launch,
@@ -588,18 +593,12 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         pending = pending_store.get(run_id)
         assert pending is not None
         pending_store.update(
-            RunHandle(
-                run_id=run_id,
-                experiment_id=pending.experiment_id,
-                config_sha256=pending.config_sha256,
-                config_dir=pending.config_dir,
+            replace(
+                pending,
                 pid=DummyProc.pid,
                 pgid=DummyProc.pid,
                 pid_starttime=read_proc_starttime(DummyProc.pid),
-                started_at=pending.started_at,
                 launch_state="spawned",
-                allow_cancel=pending.allow_cancel,
-                visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=read_boot_id(),
                 pid_namespace=read_pid_namespace(),
             )
@@ -618,7 +617,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         captured["env"] = kwargs.get("env")
         return DummyProc()
 
-    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("phasesweep.mcp.tools.subprocess.Popen", fake_popen)
     return captured
 
 
@@ -626,7 +625,7 @@ def record_runner_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     *,
     confirmed: bool = True,
-    module: str = "phasesweep.mcp.run_control",
+    module: str = "phasesweep.mcp.tools",
 ) -> list[tuple[int | None, int | None, int | None]]:
     """Replace ``kill_stale_group`` with a stub that records the identity it is asked to clean up.
 

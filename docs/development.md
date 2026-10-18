@@ -8,7 +8,7 @@ cd phasesweep
 pip install -e ".[dev,wandb,mlflow]"
 ```
 
-The development extra includes MCP and Hydra for integration checks and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
 
 To install unreleased `main` without an editable checkout:
 
@@ -18,10 +18,11 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 
 ## Quality gates
 
-Run the repository checks sequentially:
+During iteration, run the mandatory checks and tests for the changed subsystem. Use the parallel fast lane below for broader coverage; reserve the complete suite for qualification. Run the repository checks sequentially:
 
 ```bash
-pytest
+pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
+pytest --collect-only
 ruff check .
 ruff format --check .
 mypy src
@@ -42,24 +43,50 @@ pre-commit install
 | --- | --- | --- |
 | `ruff check --fix`, `ruff format` | commit | changed Python files |
 | `pathlint` | commit | changed `src/` and `tests/` Python files |
-| `doc-check` | commit | changed `src/` Python files, with `--strict` |
 | module size | commit | changed `src/` and `tests/` Python files |
 | typing escapes | commit | lines the commit adds to `src/` and `tests/` Python files |
 | contract tests | commit | every commit |
-| tier guard | commit | every commit, collecting the whole suite |
+| whole-suite collection | commit | every commit, collecting the whole suite |
 | `mypy src` | push | the whole package |
 
-The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, `tests/test_tier_guard.py`, and `tests/test_ledger_read_paths.py`. The tier guard collects the whole suite without running it, which applies the [integration-marker guard](#test-tiers) to every test module. `doc-check` runs the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the hook prints that it skipped. It is a maintainer-local check, and CI does not run it. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. The typing-escapes hook ([`scripts/check_typing_escapes.py`](../scripts/check_typing_escapes.py)) refuses `Any`, `typing.cast`, and `# type: ignore` on any line a commit adds or edits, including `Any` in a docstring `:param` or `:return` type. There is no exemption: narrow with `isinstance`, describe a known shape with a `TypedDict` and an external API with a `Protocol`, use `JsonValue`/`JsonObject` from `phasesweep.runtime.json` for open JSON, or `object` for an opaque value. Editing a line that already carries one of these means fixing it. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
+Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
+
+The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
 
-### Test tiers
-
-Plain `pytest` above is the authoritative suite and stays the merge and release check. While iterating, two subsets are available:
+### Source prose review
 
 ```bash
-pytest -m "not live and not integration"   # fast review tier
-pytest -m "integration and not live"       # integration tier only
+python scripts/sample_docstrings.py -n 30 --seed 42
+python scripts/sample_docstrings.py --audit > prose-review.txt
+```
+
+The audit scans every source docstring (including attribute documentation) and comment, reporting narrative wording, repeated paragraphs of at least 20 words, and prose blocks of at least 120 words before API sections. It reports every candidate with its location and reason; it does not edit files or fail because of findings. Review the context before removing text: emphasis and length can describe useful contracts, and stale behavior claims require checking the implementation. Runtime strings such as field descriptions, CLI help and error messages are outside this scan. This is an optional local review tool, not a hook or CI check.
+
+### Test tiers
+
+Plain `pytest` runs the complete non-live qualification suite. For broader checks while iterating, use two process workers for the fast lane:
+
+```bash
+pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid" \
+  --durations=25 --durations-min=1
+```
+
+`loadfile` keeps each test module in one worker. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks.
+
+Run the complementary lane serially, after the workers have exited:
+
+```bash
+pytest -m "not live and (integration or signals_own_pid)"
+```
+
+Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation. CI and mandatory hooks retain their existing serial collection and contract-test scope.
+
+To inspect the cost of a qualification run:
+
+```bash
+pytest --durations=25 --durations-min=1
 ```
 
 > [!NOTE]
@@ -72,19 +99,21 @@ PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
   pytest -m live tests/test_wandb_live.py
 ```
 
-A test is `@pytest.mark.integration` when it manages real processes, waits on wall-clock time, drives a multi-step durable recovery workflow, or is otherwise slow: its call phase takes at least `SLOW_CALL_SECONDS` from `tests/tiers.py`. Everything else stays in the fast tier, including engine runs with quick trainers, such as `run_experiment` over an `echo` trainer, which spawn their subprocess inside the package.
+A test is `@pytest.mark.integration` when it manages real processes, waits on wall-clock time, drives a multi-step durable recovery workflow, or is otherwise slow: its call phase takes at least one second. Everything else stays in the fast tier, including engine runs with quick trainers, such as `run_experiment` over an `echo` trainer, which spawn their subprocess inside the package.
 
-The guard enforces only what a test's source shows: `tests/conftest.py` fails collection when a test manages processes or waits on the clock *directly*, in its body or a same-module helper or fixture, without the marker (`tests/tiers.py` lists the primitives). A test that is slow for any other reason is marked by the classification rule above. To keep one visible, a run that excludes `integration` ends with a list of unmarked tests at or over the threshold. The list is a report, not a failure, because timing thresholds flake on loaded hosts.
-
-The scanner cannot follow a call into another module, so a helper shared from a non-test module under `tests/` that spawns or waits is registered by name in `PROCESS_DRIVER_CALLS` or `WALLCLOCK_HELPER_CALLS` in `tests/tiers.py`, and a test that calls it, or requests it as a fixture, is classified as if it did the work itself. `test_shared_helpers_that_spawn_or_wait_are_registered` in `tests/test_tier_guard.py` scans those modules and fails until every such helper is registered. `reaped_pid` is deliberately not registered: its child has exited before it returns, so its caller neither manages a live process nor waits.
+Mark tests explicitly according to the rules above, including tests that call shared helpers. Use pytest's built-in duration report to identify slow cases. Durations are advisory; timing thresholds do not fail a run.
 
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
+GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, whole-suite collection, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
 The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
 The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decoding and error behavior with controlled responses, plus supervised worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B round trip reaches the service. Input tests use the real Hydra 1.3 parser and entrypoint; rendering itself has no Hydra runtime dependency.
+
+### Shared test setup
+
+Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests.
 
 ## PyPI releases
 
@@ -117,11 +146,11 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
-- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. `runtime/supervisor.py` is the launch barrier every trial passes: a stdlib-only script started by path under `python -I -S` with only `PATH` in its environment, which receives the trainer's command and environment only after the trial's process identity is on disk, so nothing from the trainer environment runs before cleanup can find it. Keep its imports to the stdlib; [invariant 9](invariants.md#9-nothing-runs-before-its-process-identity-is-durable) has the whole rule.
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
+Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are defined in `phasesweep.config.models` and `phasesweep.config.search`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
 
 Within `phasesweep.engine`, module ownership is intentionally direct:
 
@@ -138,7 +167,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
-The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md). `tests/test_invariants_doc.py` holds that file to the code: every `Held by` symbol must import, every cited test must exist, and every numbered reference to an invariant in `src/`, `tests/`, or `docs/` must carry the rule's title in quotes, as in `invariant 2 ("Validation writes nothing")`, or link to its heading, so a renumbering cannot silently repoint it. It cannot notice a missing rule: a new ordering rule or ledger entry point needs its own entry, citing the code and the test that hold it.
+See [durability invariants](invariants.md) for storage, publication, and process ordering.
 
 The ordinary control flow is:
 
@@ -168,7 +197,7 @@ flowchart TD
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
 - `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
-- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing, and the integration-marker guard.
+- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and result rendering.
 

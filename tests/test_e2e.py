@@ -18,19 +18,23 @@ import pytest
 import yaml
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import IntParam, Phase, Sampler
-from phasesweep.engine import read_winner
+from phasesweep.config.models import Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.phase import GpuPool
+from phasesweep.engine.read import read_result
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
-from tests.conftest import copy_fake_train, make_experiment, write_constant_trainer, write_trainer
+from tests.conftest import (
+    REPO,
+    copy_fake_train,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+)
 
-# A full three-phase sweep against the real fake trainer: every test here spawns
-# trainer subprocesses and runs for seconds, not milliseconds.
 pytestmark = pytest.mark.integration
 
-REPO = Path(__file__).resolve().parent.parent
 EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"
 
 
@@ -160,7 +164,6 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     assert child_study.get_trials(deepcopy=False) == []
     assert isinstance(child_study.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
 
-    # No GpuPool patch here: the parent top-up must succeed outright now.
     topped_up = experiment.model_copy(
         update={"phases": [parent.model_copy(update={"n_trials": 2}), child]}
     )
@@ -228,6 +231,6 @@ def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Pa
     storage = _resolve_storage(both.storage)
     assert len(optuna.load_study(study_name="t::first", storage=storage).trials) == 3
     assert len(optuna.load_study(study_name="t::later", storage=storage).trials) == 2
-    published = read_winner(both, "later")
+    _, (published,) = read_result(both, phase_names=["later"])
     assert published is not None
     assert published.params == winners["later"].params

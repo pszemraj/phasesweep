@@ -9,8 +9,8 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment
-from phasesweep.engine import StudySchemaMismatchError, TrialTargetRefusedError
+from phasesweep.config.models import Experiment
+from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -18,12 +18,12 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.study_policy import _ALLOCATION_CONTEXT_ATTR, _load_phase_policy_state
 from tests.conftest import (
     make_experiment,
+    trial_outcome,
     write_flag_gated_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -106,12 +106,9 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
                 state=optuna.trial.TrialState.FAIL,
                 user_attrs={
                     TRAINER_ENV_DIGEST_ATTR: cohort_digest,
-                    TRIAL_OUTCOME_ATTR: {
-                        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                        "sequence": sequence,
-                        "outcome": "failure",
-                        "cause": "simulated external terminal row",
-                    },
+                    TRIAL_OUTCOME_ATTR: trial_outcome(
+                        sequence, "failure", cause="simulated external terminal row"
+                    ),
                 },
             )
         )
@@ -122,12 +119,11 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
 
 
 @pytest.mark.integration
-def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
-    """Raising n_trials after an abort is the explicit resume path.
-
-    The top-up schedules genuinely new attempts; reaching a successful winner
-    selection consumes the durable abort record.
-    """
+@pytest.mark.parametrize("interrupt_selection", [False, True], ids=["normal", "selection-crash"])
+def test_topup_after_abort_runs_new_work_and_clears_durable_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt_selection: bool
+) -> None:
+    """A raised target retires the durable abort before selection and survives replay."""
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
     db = tmp_path / "abort.journal"
@@ -146,6 +142,26 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
         run_experiment(_exp(3))
 
     flag.touch()
+    if interrupt_selection:
+        import phasesweep.engine.phase as phase_module
+
+        def crash_in_selection(*args: object, **kwargs: object) -> None:
+            study = optuna.load_study(
+                study_name="t::p", storage=_resolve_storage(f"journal:///{db}")
+            )
+            assert _load_phase_policy_state(study).abort is None
+            raise RuntimeError("simulated crash during winner selection")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(phase_module, "_select_phase_winner", crash_in_selection)
+            with pytest.raises(
+                RuntimeError, match="simulated crash during winner selection"
+            ) as caught:
+                run_experiment(_exp(6))
+            assert type(caught.value) is RuntimeError
+        study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
+        assert _load_phase_policy_state(study).abort is None
+
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)

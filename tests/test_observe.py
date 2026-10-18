@@ -13,16 +13,15 @@ from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor, Observation
-from phasesweep.engine import read_winner
+from phasesweep.config.models import Observation
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import _winner_view
+from phasesweep.engine.read import _winner_view, read_result
 from phasesweep.engine.state import observed_attr
+from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
 from tests.conftest import make_experiment, write_trainer
-from tests.test_publication_transaction import _golden_publication, _reseal_winner
-from tests.test_trial_evidence import _tree_with_a_carried_winner
+from tests.ledger_fixtures import golden_publication, reseal_winner
 
 
 def _log_observation(name: str, pattern: str) -> Observation:
@@ -80,7 +79,7 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
     assert winners["p"].trial_number == 0
     assert winners["p"].observed == {"mem": 3.0}
     assert yaml.safe_load(_winner_path(experiment, "p").read_text())["observed"] == {"mem": 3.0}
-    published = read_winner(experiment, "p")
+    _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
     assert published.observed == {"mem": 3.0}
 
@@ -157,14 +156,14 @@ def test_manifest_rejects_a_malformed_observed_block(
     tmp_path: Path, observed: object, reason: str
 ) -> None:
     """The published winner's observed field is validated, and absence is refused."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     assert winner["observed"] == {}
     if observed is None:
         del winner["observed"]
     else:
         winner["observed"] = observed
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -175,7 +174,7 @@ def test_manifest_rejects_a_malformed_observed_block(
 
 def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
     """The permissive reader carries observed values through and drops a malformed winner."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     bare = _winner_view(winner, "p")
     assert bare is not None
@@ -194,29 +193,12 @@ def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
 
 def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:
     """A resealed winner with finite values validates and reads back."""
-    experiment, generation_id = _golden_publication(tmp_path)
+    experiment, generation_id = golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     winner["observed"] = {"peak": 7.5, "steps": 3}
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     assert _resolve_publication_pointer(experiment).state == "ok"
-    view = read_winner(experiment, "p")
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.observed == {"peak": 7.5, "steps": 3.0}
-
-
-def test_carried_winner_must_agree_with_its_source_on_observed(tmp_path: Path) -> None:
-    """Observed values belong to the cited source trial, so a carried winner cannot change them."""
-    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
-    winner = yaml.safe_load(
-        _generation_winner_path(experiment, carrying_generation, "p").read_text()
-    )
-    assert winner["generation_id"] == source_generation
-    winner["observed"] = {"peak": 9.0}
-    _reseal_winner(experiment, carrying_generation, winner)
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert "disagrees with the result recorded by its source generation" in pointer.error
-    assert "on observed" in pointer.error

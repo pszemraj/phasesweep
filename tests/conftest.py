@@ -1,8 +1,4 @@
-"""Shared test fixtures and helpers for phasesweep tests.
-
-One experiment factory to replace the 5+ near-identical _minimal_experiment /
-_exp / _make_exp helpers scattered across test files. Tests that need specialized construction can pass explicit phases or phase keyword overrides.
-"""
+"""Shared test fixtures and helpers for phasesweep tests."""
 
 from __future__ import annotations
 
@@ -21,32 +17,35 @@ from typing import Any, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
-import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import (
+from phasesweep.config.models import (
     Constraint,
     ExecutionContext,
     Experiment,
-    IntParam,
-    JsonEnvelopeExtractor,
-    LogRegexExtractor,
     Metric,
     Observation,
     Phase,
-    Sampler,
 )
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.evidence import TrialContext
+from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+)
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
+from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.files import file_url_path
+from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.reaper import _read_proc_stat
-from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -59,71 +58,6 @@ _R = TypeVar("_R")
 requires_nonroot = pytest.mark.skipif(
     os.geteuid() == 0, reason="root bypasses file permissions, so no denial can be provoked"
 )
-
-
-def pytest_collection_modifyitems(session, config, items) -> None:
-    """Refuse collection when a test manages processes or sleeps directly without the marker.
-
-    The fast review tier is a marker expression, so it is only trustworthy if
-    every test that manages a real process or waits on the wall clock itself
-    carries ``@pytest.mark.integration``. ``tests/tiers.py`` recognizes those
-    primitives statically in a test's own module; this hook applies it to
-    whatever was collected and fails loudly. There is no escape hatch: a test
-    that matches the rules is an integration test, and a test that should not
-    match should stop using the primitive. Engine runs that spawn a quick
-    trainer inside the package are out of its reach by design, and
-    :func:`pytest_terminal_summary` reports any unmarked test that turns out
-    slow.
-    """
-    scanned: dict[Path, dict[str, str]] = {}
-    offenders: dict[tuple[Path, str], str] = {}
-    for item in items:
-        if item.get_closest_marker("integration") or item.get_closest_marker("live"):
-            continue
-        module_path = getattr(item, "path", None)
-        if module_path is None or module_path.suffix != ".py":
-            continue
-        if module_path not in scanned:
-            scanned[module_path] = flagged_tests(module_path)
-        test_name = getattr(item, "originalname", None) or item.name
-        reason = scanned[module_path].get(test_name)
-        if reason is not None:
-            offenders.setdefault((module_path, test_name), f"{item.nodeid}: {reason}")
-    if offenders:
-        listed = "\n  ".join(offenders[key] for key in sorted(offenders))
-        raise pytest.UsageError(
-            "unmarked integration tests:\n  "
-            + listed
-            + "\n\nAdd @pytest.mark.integration (see docs/development.md, "
-            "'Quality gates') or stop using the primitive."
-        )
-
-
-def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
-    """List unmarked slow tests in a run that leaves the integration tier out.
-
-    The collection guard cannot see a test that is slow for reasons its source
-    does not show, so this makes such a test visible where it lands: in the
-    fast tier. It is a report, not a failure, because a timing threshold would
-    flake on a loaded host.
-    """
-    if not excludes_integration(config.option.markexpr):
-        return
-    reports = [
-        report
-        for group in terminalreporter.stats.values()
-        for report in group
-        if isinstance(report, pytest.TestReport)
-    ]
-    slow = slow_unmarked(reports)
-    if not slow:
-        return
-    terminalreporter.write_sep(
-        "=",
-        f"unmarked tests at or over {SLOW_CALL_SECONDS:g}s: classify them (docs/development.md)",
-    )
-    for nodeid, seconds in slow:
-        terminalreporter.write_line(f"{seconds:6.2f}s {nodeid}")
 
 
 def raise_after_first_successful_call(
@@ -246,8 +180,7 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
     id assignment the same way Optuna's journal replay does -- sequentially,
     in ``CREATE_STUDY`` record order -- then rewrites the ledger without the
     ``SET_STUDY_USER_ATTR`` record(s) that set ``ARTIFACT_ROOT_ATTR`` for that
-    study id. Mirrors ``tests/fixtures/make_ledger_fixtures.py``'s
-    ``_drop_journal_schema_attr``.
+    study id.
 
     :param str storage: ``journal:///`` storage URL for the study's ledger.
     :param str study_name: Study whose artifact-root user attribute is dropped.
@@ -278,14 +211,13 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
 
 
 def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
-    """Make hand-built test state look like this release wrote it.
+    """Stamp hand-built test studies and claim their artifact tree.
 
     A test that constructs studies through Optuna directly skips the engine's
     own create path, so nothing stamps the study schema and nothing records the
     tree's ownership. Every read path then correctly refuses the state as
-    unmarked. This is the one place that repairs both halves, so the
-    equivalence between "the engine wrote it" and "the test built it" is
-    asserted once instead of drifting across six copies.
+    unmarked. This helper stamps the current study schema and records tree
+    ownership before read paths inspect the state.
 
     The tree is only claimed when it has no owner yet, matching what the engine
     does: an already-bound tree is verified and left alone.
@@ -297,6 +229,27 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     if _check_artifact_root_binding(experiment) == "unbound":
         _write_artifact_root_binding(experiment)
+
+
+def _bounded_metric(**bounds: float) -> Metric:
+    """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
+    return Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        **bounds,
+    )
+
+
+def _phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
+    """Read one phase's trials from the experiment's ledger.
+
+    :param Experiment experiment: Experiment whose ledger is read.
+    :param str phase_name: Phase whose study is read.
+    :return list[optuna.trial.FrozenTrial]: Its trials in number order.
+    """
+    storage = _resolve_storage(experiment.resolved_storage)
+    return optuna.load_study(
+        study_name=f"{experiment.experiment}::{phase_name}", storage=storage
+    ).get_trials(deepcopy=False)
 
 
 @pytest.fixture(autouse=True)
@@ -559,13 +512,7 @@ def make_experiment(
         experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=metric
-        or Metric(
-            extractor=LogRegexExtractor(
-                type="log_regex",
-                pattern=r"x=(?P<value>[0-9.eE+-]+)",
-            )
-        ),
+        metric=metric or _bounded_metric(),
         phases=phases,
     )
     if trainer_config is not None:
@@ -615,14 +562,42 @@ def invoke_cli_boundary(
     # ``CliRunner`` invokes the Click group directly and so bypasses the
     # process-level error boundary under test; a patched ``sys.argv`` reaches it.
     monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
-    # ``debug`` mirrors what ``-v`` sets in a real process. ``_configure_logging``
-    # cannot, because ``logging.basicConfig`` is a no-op once pytest's own root
-    # handler is installed.
-    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
-    with pytest.raises(SystemExit) as excinfo:
-        cli_boundary()
+    logger = logging.getLogger()
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            cli_boundary()
+    finally:
+        logger.setLevel(previous_level)
     code = excinfo.value.code
     return 0 if code is None else int(code)
+
+
+def trial_outcome(sequence: int, outcome: str, **extra: JsonValue) -> JsonObject:
+    """Build a current-schema outcome record.
+
+    :param int sequence: Completion sequence.
+    :param str outcome: Outcome label.
+    :param JsonValue extra: Further fields, such as ``cause`` or an abort record.
+    :return JsonObject: The record as the objective writes it.
+    """
+    return {
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+        "sequence": sequence,
+        "outcome": outcome,
+        **extra,
+    }
+
+
+def log_regex_provenance() -> JsonObject:
+    """Return a current-format ``log_regex`` objective provenance record."""
+    return {
+        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+        "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},
+    }
 
 
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
@@ -659,6 +634,33 @@ def write_trainer(path: Path, body: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
     path.chmod(0o755)
     return path
+
+
+def write_flaky_trainer(tmp_path: Path, *, failures: int, value: float = 1.0) -> tuple[Path, Path]:
+    """Write a trainer that fails its first ``failures`` calls, then logs ``x=<value>``.
+
+    :param Path tmp_path: Directory holding the trainer and its call log.
+    :param int failures: How many leading invocations exit nonzero.
+    :param float value: The objective value every later invocation logs.
+    :return tuple[Path, Path]: The trainer script and the log that gains one line per call.
+    """
+    calls = tmp_path / "calls.log"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+
+        calls = Path({str(calls)!r})
+        seen = len(calls.read_text().splitlines()) if calls.exists() else 0
+        with calls.open("a") as log:
+            log.write("run\\n")
+        if seen < {failures}:
+            sys.exit(1)
+        print("x={value}")
+        """,
+    )
+    return trainer, calls
 
 
 def write_constant_trainer(tmp_path: Path, *, key: str = "x", value: float = 0.5) -> Path:
@@ -725,37 +727,6 @@ def write_flag_gated_trainer(tmp_path: Path, flag: Path) -> Path:
         print("x=0.5")
         """,
     )
-
-
-def assert_published_winner_evidence_local(experiment_dir: Path) -> None:
-    """Assert every published winner's source generation exists in this same tree.
-
-    The invariant a second, divergent artifact tree breaks: a published
-    winner's ``winner_source.generation_id`` names the immutable generation
-    namespace holding the evidence behind that number, so it must resolve
-    *inside the tree the reader is reading*. When one study is allowed to back
-    two roots, both report ``publication_integrity: ok`` while the winner in
-    one of them cites a generation that only exists in the other.
-
-    :param Path experiment_dir: Experiment artifact namespace to check, i.e.
-        ``<workdir>/<experiment>``.
-    """
-    pointer = experiment_dir / "last_successful_generation.yaml"
-    assert pointer.is_file(), f"{experiment_dir} has never published"
-    published = yaml.safe_load(pointer.read_text())["generation_id"]
-    generations = experiment_dir / "generations"
-    assert (generations / published).is_dir(), (
-        f"published generation {published!r} is missing from {generations}"
-    )
-    winners = sorted((generations / published / "phases").glob("*/winner.yaml"))
-    assert winners, f"published generation {published!r} exposes no winner"
-    for winner_path in winners:
-        source = yaml.safe_load(winner_path.read_text())["winner_source"]
-        source_generation = source["generation_id"]
-        assert (generations / source_generation).is_dir(), (
-            f"{winner_path} cites generation {source_generation!r}, which does not exist "
-            f"under {generations}: its evidence lives in another artifact tree"
-        )
 
 
 def make_trial_context(

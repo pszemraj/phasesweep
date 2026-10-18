@@ -18,7 +18,7 @@ from optuna.storages.journal import JournalFileBackend
 from phasesweep import load_experiment
 from phasesweep.cli import _template_names, _template_purpose
 from phasesweep.cli import cli as cli_main
-from phasesweep.engine import run_experiment
+from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.registry import Registry
 from phasesweep.runtime.files import file_url_path

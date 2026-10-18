@@ -10,9 +10,10 @@ from typing import Any
 
 import optuna
 
-from phasesweep.config import Experiment, Phase
-from phasesweep.engine.errors import OperatorAction, StudyFingerprintMismatchError
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
+from phasesweep.errors import OperatorAction
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)
@@ -38,45 +39,24 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_partial_grid",
     }
 )
-# Bump on any change to what a fingerprint covers. The covered inputs include
-# the complete trainer_config, the metric with its min/max viability bounds,
-# each phase's repeats block, and the effective execution.cwd: an omitted cwd
-# contributes the invocation directory, so one persistent study cannot launch
-# its relative commands from two directories. whole_node phases also cover
-# their configured device-set size, the trainer's world size. A populated study
-# stamped with another schema fails the fingerprint check on resume, and the
-# refusal names the operator's options.
+# Increment the schema versions when their fingerprint payloads change.
 FINGERPRINT_SCHEMA_VERSION = 7
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
-    """Return the execution contract's contribution to semantic fingerprints.
+    """Return execution-context semantics for fingerprinting.
 
-    The trainer's working directory and ambient-environment inheritance are
-    semantic inputs: two invocations differing in either can evaluate
-    different code or data under one study. A configured cwd contributes its
-    RESOLVED path — a relative cwd invoked from two directories is two
-    different execution contexts and must not share a study. An unconfigured
-    cwd contributes the resolved invocation directory because that is where
-    the trainer actually runs. Ambient variable *values* are enforced through
-    the trial environment cohort rather than embedded in this config digest.
-    The effective pass-through names (the built-in ``TMPDIR`` plus the
-    configured ``passthrough_env``) and their classification are config
-    semantics, but their values may change. Put fixed semantic values in
-    ``env``, which is fingerprinted.
+    Include the resolved trainer cwd, inheritance policy,
+    and effective pass-through names. Ambient tracked values are checked by the trial
+    cohort; pass-through values may change without altering semantics.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
-    contract = experiment.execution.inherit_env
     return {
-        "cwd": str(
-            Path(experiment.execution.cwd).expanduser().resolve()
-            if experiment.execution.cwd is not None
-            else Path.cwd().resolve()
-        ),
-        "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
+        "cwd": str(experiment.execution.resolved_cwd() or Path.cwd().resolve()),
+        "inherit_env": experiment.execution.inherit_env_contract(),
         "passthrough_env": list(experiment.execution.effective_passthrough_env()),
     }
 
@@ -116,17 +96,10 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
 
 
 def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
-    """Hash the experiment semantics that give a published result its meaning.
+    """Hash the experiment semantics recorded with each published result.
 
-    Stamped into each generation's summary manifest so reads can tell
-    whether the config supplied *today* still matches the config that
-    produced a published result — metric name/goal/extractor, constraints,
-    trial command, env, provenance, and every phase's ordered semantic
-    identity all contribute. Run-control
-    fields (``n_trials`` top-ups, throughput knobs, comments) are excluded
-    for the same reason :data:`_RUN_CONTROL_KEYS` excludes them from phase
-    fingerprints: they never change what the published numbers mean, so they
-    must not flag a published result as reinterpreted.
+    Include metric/extractor, constraints, command, environment, provenance, and
+    ordered phase semantics. Exclude run-control targets, throughput, and comments.
 
     :param Experiment experiment: Parsed experiment config to fingerprint.
     :return str: SHA-256 hex digest (64 characters) of the canonicalised
@@ -144,14 +117,10 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
-    """Return one phase's model dump reduced to execution and output semantics.
+    """Return phase execution and output semantics, excluding run control.
 
-    ``gpu_ids``/``gpu_devices`` are run-control (which card runs a trial does
-    not change its meaning) — except under ``whole_node``, where the configured
-    device-set SIZE is the trainer's world size and therefore semantic: a
-    4-GPU DDP evaluation and a 1-GPU evaluation of the same phase must not
-    share a study. Only the count joins the fingerprint, so respelling the
-    same set (indices vs UUIDs) or moving hosts does not invalidate a study.
+    GPU identities are excluded. Under ``whole_node``, their count defines trainer
+    world size and is included; equivalent index and UUID spellings retain identity.
 
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
@@ -163,24 +132,21 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
-def _phase_semantic_payload(
+def _phase_fingerprint_payload(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
-) -> dict[str, Any]:
-    """Return a dict capturing only fields that change *trial meaning*.
+) -> JsonObject:
+    """Return canonical JSON fields that change the meaning of a trial.
 
-    Excludes run-control fields so that bumping ``n_trials`` to top up a study
-    is a compatible operation. Includes ``experiment.env``: env vars like
-    ``CUBLAS_WORKSPACE_CONFIG`` or ``MY_TRAINER_SEED`` change training
-    behavior and must invalidate reuse.
+    Run-control fields such as ``n_trials`` are excluded, allowing study top-ups.
 
     :param Experiment experiment: Experiment supplying command, input format,
         environment, metric, constraints, and provenance.
     :param Phase phase: Phase whose run-control keys are excluded.
     :param dict[str, Winner] inherited_winners: Parent winners whose effective
         overrides contribute to identity.
-    :return dict[str, Any]: JSON-serializable configured trial semantics.
+    :return: Configured trial semantics normalized to the JSON representation being hashed.
     """
     semantic_phase = _semantic_phase_dump(phase)
     payload = {
@@ -191,7 +157,7 @@ def _phase_semantic_payload(
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
         },
     }
-    return payload
+    return json_object(json.loads(json.dumps(payload, default=str)))
 
 
 def _phase_fingerprint(
@@ -200,10 +166,6 @@ def _phase_fingerprint(
     inherited_winners: dict[str, Winner],
 ) -> str:
     """Hash the semantic execution context for resume-compatibility checks.
-
-    Uses the full SHA-256 hex digest. Truncating to 16 hex chars (64 bits)
-    would be defensible against accidental collision but is no reason to
-    leave the door open in scientific-workflow metadata.
 
     :param Experiment experiment: Experiment forwarded to
         :func:`_phase_fingerprint_payload`.
@@ -215,27 +177,6 @@ def _phase_fingerprint(
     return _semantic_payload_digest(
         _phase_fingerprint_payload(experiment, phase, inherited_winners)
     )
-
-
-def _phase_fingerprint_payload(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-) -> JsonObject:
-    """Return the canonical payload a phase fingerprint is the digest of.
-
-    The semantic payload is normalised to plain JSON data before it is hashed,
-    so the mapping a study stores is exactly what its stored digest covers.
-
-    :param Experiment experiment: Experiment forwarded to
-        :func:`_phase_semantic_payload`.
-    :param Phase phase: Phase being fingerprinted.
-    :param dict[str, Winner] inherited_winners: Parent winners contributing
-        effective overrides to identity.
-    :return JsonObject: The semantic payload as JSON data.
-    """
-    payload = _phase_semantic_payload(experiment, phase, inherited_winners)
-    return json_object(json.loads(json.dumps(payload, default=str)))
 
 
 _ABSENT = object()
@@ -371,8 +312,7 @@ def _verify_fingerprint(
         if trials:
             raise StudyFingerprintMismatchError(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
-                "fingerprint. Its populated state is unsupported by this release. Use a "
-                "fresh local ledger and artifact root.",
+                "fingerprint. Its populated state is unsupported by this release.",
             )
         _stamp_fingerprint(study, fp, payload)
     elif existing != fp:
@@ -397,8 +337,7 @@ def _verify_fingerprint(
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}"
-            f"{_CWD_FOLLOWS_INVOCATION + ' ' if cwd_unset else ''}"
-            "Use a new experiment name, delete the old study, or rename the phase.",
+            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else ''}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
         )

@@ -1,10 +1,7 @@
 """Contract tests for the operator action every PhaseSweepError carries.
 
 ``action`` routes a failure to the remediation an operator should carry out, without parsing
-prose; the message stays authoritative about what went wrong, and routing never edits it. The class
-walk imports the whole package, so a subclass is covered the moment it exists. The routing table
-drives real raise and wrap sites and pins the action each routes, and the MCP runner's failure
-payload, where routing reaches an agent, must say exactly those steps.
+prose; the message stays authoritative about what went wrong, and routing never edits it.
 """
 
 from __future__ import annotations
@@ -29,28 +26,10 @@ import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import (
-    ExecutionContext,
-    Experiment,
-    IntParam,
-    Phase,
-    WandbSummaryRequiredGate,
-)
-from phasesweep.engine import (
-    ArtifactRootConflictError,
-    IncompleteJournalRecordError,
-    NoFeasibleTrialError,
-    ProcessCleanupUncertainError,
-    StudyFingerprintMismatchError,
-    StudySchemaMismatchError,
-    StudyStorageUnavailableError,
-    WinnerIntegrityError,
-    fingerprints,
-    guards,
-    run_experiment,
-    study_policy,
-    trial,
-)
+from phasesweep.cli import _operational_error_text
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.search import IntParam
+from phasesweep.engine import fingerprints, guards, study_policy, trial
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.attempts import (
@@ -59,6 +38,14 @@ from phasesweep.engine.attempts import (
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncertain_trials
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    IncompleteJournalRecordError,
+    StudyFingerprintMismatchError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    WinnerIntegrityError,
+)
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -67,6 +54,8 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.phase import _failure_policy_abort_record
 from phasesweep.engine.resume import _published_for_resume
+from phasesweep.engine.run import run_experiment
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -79,11 +68,16 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
-    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    ForeignPidNamespaceError,
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+)
+from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
@@ -110,10 +104,9 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
 )
 from phasesweep.tracking.mlflow import require_mlflow_sdk
-from tests.conftest import make_experiment, requires_nonroot
+from tests.conftest import make_experiment, requires_nonroot, trial_outcome
 from tests.ledger_fixtures import (
     Materialized,
-    ledger_file,
     materialize,
     pin_fixture_environment,
     published_generation_id,
@@ -122,8 +115,6 @@ from tests.ledger_fixtures import (
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
 from tests.recovery_helpers import load_only_recovery_needs
 
-# Classes proving the module sweep reached past the error modules themselves.
-# If an import ever stops happening, these vanish from the walk and say so.
 _SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError"})
 
 
@@ -177,7 +168,7 @@ def test_every_operator_error_declares_its_action():
         assert plain.action is cls.default_action
         assert routed.action is OperatorAction.RETRY
 
-        # The action is a routing attribute, never part of what the operator reads.
+        # Boundaries render actions; the exception itself retains its diagnostic.
         assert str(routed) == str(plain)
         assert plain.args == routed.args
 
@@ -212,11 +203,11 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     assert foreign.action is RunRecoveryError.default_action
 
 
-_UNMARKED_STUDY_REMEDY_MARKERS = {
-    "study schema": "fresh artifact root",
-    "trial target": "fresh local ledger",
-    "environment cohort": "new experiment name",
-    "phase fingerprint": "fresh local ledger",
+_UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
+    "study schema": "unsupported phasesweep storage schema",
+    "trial target": "has trial state but no",
+    "environment cohort": "without a semantic trainer-environment identity",
+    "phase fingerprint": "has no semantic fingerprint",
 }
 
 
@@ -249,8 +240,7 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
-    # The routed action is additional to, not a replacement for, the remedy prose.
-    assert _UNMARKED_STUDY_REMEDY_MARKERS[label] in str(excinfo.value), label
+    assert _UNMARKED_STUDY_DIAGNOSTIC_MARKERS[label] in str(excinfo.value), label
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
@@ -265,7 +255,7 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "offline")
 
     with pytest.raises(PhaseSweepError) as excinfo:
-        trial._trainer_environment(experiment, "p")
+        trial._environment_identity(experiment, "p")
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert str(excinfo.value) == (
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
@@ -289,13 +279,6 @@ class RoutingCase:
     #: Exact ``__cause__`` type, pinned only where the runner routes by it.
     cause: type[BaseException] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
-
-
-# A wrap translates one failure into another at a layer boundary. Each row below drives a real wrap
-# site through its real entry point, faulting only the call beneath it, and pins what the operator
-# receives: the raised type, the action it routes to, and a stable piece of today's message. A row
-# whose action differs from its raised class default is the evidence that the site preserves or
-# composes the remediation rather than replacing it.
 
 
 def _raiser(error: BaseException) -> Callable[..., object]:
@@ -334,9 +317,8 @@ def _trials_deleted(path: Path) -> None:
 
     Every trial-scoped journal record (``CREATE_TRIAL`` and later) carries an
     ``op_code`` of 4 or above; study-level records (create study, study user
-    attrs) are 0-3. Keeping only the low op codes reproduces exactly what the
-    old ``DELETE FROM trials`` did for the SQLite backend: the study, its
-    schema stamp, and its other attributes survive, but every trial is gone.
+    attrs) are 0-3. Keeping only the low op codes preserves the study, its
+    schema stamp, and its other attributes while deleting every trial.
     """
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     kept = [line for line in lines if json.loads(line).get("op_code", 0) < 4]
@@ -348,7 +330,7 @@ def _materialize_damaged(
 ) -> Materialized:
     """Copy a current golden ledger and apply ``damage`` to its ledger file."""
     materialized = materialize(fixture, tmp_path, mode=mode)
-    damage(ledger_file(materialized, fixture.removeprefix("current-")))
+    damage(materialized.ledger_path)
     return materialized
 
 
@@ -432,25 +414,23 @@ def _recovery_studies_damaged(
 def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run over the current golden ledger whose phase study cannot be read."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    monkeypatch.setattr(engine_ledger, "_load_existing_phase_study", _raiser(_storage_gone()))
+    monkeypatch.setattr(engine_ledger, "open_existing_study", _raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
 
 
 @contextmanager
 def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Let Optuna's journal lock succeed, then deny writes to the journal's directory.
+    """Acquire the journal inode, then deny creation of its repair backup.
 
-    The repair's backup lives beside the lock file, so a directory that never
-    allowed writes would refuse the lock itself. Revoking write access just
-    after the real lock is taken makes the backup the repair opens next fail.
-    The directory's mode is restored on exit so the tree can be cleaned up.
+    Restore the directory mode on exit so the tree can be cleaned up.
     """
     real_acquire = engine_ledger._JournalLock.acquire
     mode = journal.parent.stat().st_mode
 
-    def acquire_then_deny(lock: engine_ledger._JournalLock) -> None:
-        real_acquire(lock)
+    def acquire_then_deny(lock: engine_ledger._JournalLock) -> bool:
+        result = real_acquire(lock)
         journal.parent.chmod(0o555)
+        return result
 
     monkeypatch.setattr(engine_ledger._JournalLock, "acquire", acquire_then_deny)
     try:
@@ -462,7 +442,7 @@ def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> It
 def _run_over_unbackuppable_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run whose journal repair can lock its torn record but not back it up."""
     materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
-    with _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch):
+    with _read_only_once_locked(materialized.ledger_path, monkeypatch):
         return run_experiment(materialized.experiment)
 
 
@@ -474,7 +454,7 @@ def _recovery_studies_confirmed_over_unbackuppable_repair(
     needs = load_only_recovery_needs()
     with (
         _experiment_lock(materialized.experiment),
-        _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch),
+        _read_only_once_locked(materialized.ledger_path, monkeypatch),
     ):
         return _load_recovery_studies(materialized.experiment, needs, confirm=True)
 
@@ -497,20 +477,8 @@ def _regular_file(tmp_path: Path) -> Path:
     return blocker
 
 
-def _unwritable_directory(tmp_path: Path) -> Path:
-    """Return a directory this user may read but not create entries in."""
-    parent = tmp_path / "read-only"
-    parent.mkdir()
-    parent.chmod(0o555)
-    return parent
-
-
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Fail a run, then lose the root before reconciliation can confirm cleanup.
-
-    Mirrors
-    ``tests/test_mcp_runner.py::test_terminal_report_marks_failed_root_discovery_uncertain``.
-    """
+    """Fail a run, then lose the root before reconciliation can confirm cleanup."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
     def fail_run(*_args: object, **_kwargs: object) -> None:
@@ -586,7 +554,9 @@ def _recover_pending_snapshot_while(failing: str, error: Exception) -> Trigger:
             RunStore.open_existing(state_dir),
             run_id,
             returncode=1,
-            result_snapshot=capture_pre_generation_result_snapshot(materialized.experiment),
+            result_snapshot=capture_pre_generation_result_snapshot(
+                materialized.experiment
+            ).model_dump(mode="json"),
             result_snapshot_state="pending",
         )
         monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
@@ -601,7 +571,9 @@ def _finalize_complete_snapshot_while(failing: str, error: Exception) -> Trigger
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         terminal_status = {
             "run_id": "wrap-recover",
-            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()),
+            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()).model_dump(
+                mode="json"
+            ),
             "result_snapshot_state": "complete",
         }
         monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
@@ -726,7 +698,7 @@ def _preflight(
         if after_claim is not None:
             after_claim(experiment)
         if schema_check is not None:
-            monkeypatch.setattr(guards, "_validate_study_schema", schema_check)
+            monkeypatch.setattr(guards, "_initialize_study_schema", schema_check)
         return guards._preflight_existing_studies(
             replace(claimed, studies=MappingProxyType(dict(studies())))
         )
@@ -774,7 +746,7 @@ _PREFLIGHT_AGGREGATE = "Experiment recovery preflight found multiple unsafe stud
 WRAP_CASES = (
     RoutingCase(
         id="claim_ledger_discovery_preserves_override",
-        trigger=_claim_while(engine_ledger, "_load_existing_phase_study", _ledger_busy),
+        trigger=_claim_while(engine_ledger, "open_existing_study", _ledger_busy),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
         message="Could not inspect persistent study storage for phase 'p'.",
@@ -810,7 +782,7 @@ WRAP_CASES = (
         trigger=_run_fails_then_registry_turns_shared,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original registry with mode 0700 before retrying.",
+        message="is not a real owner-only directory (mode 0700)",
     ),
     RoutingCase(
         # Negative: unconfirmed cleanup deliberately replaces the run's own remedy.
@@ -825,10 +797,7 @@ WRAP_CASES = (
         trigger=_recovery_studies_damaged("tree", _garbage),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message=(
-            "Restore the original complete storage ledger and access to it, then retry "
-            "phasesweep mcp recover-run."
-        ),
+        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
     ),
     RoutingCase(
         id="recovery_published_missing",
@@ -837,10 +806,7 @@ WRAP_CASES = (
         ),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message=(
-            "Restore the original complete storage ledger and study with access to it, "
-            "then retry phasesweep mcp recover-run."
-        ),
+        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
     ),
     RoutingCase(
         id="recover_run_lock_busy",
@@ -901,7 +867,7 @@ WRAP_CASES = (
         trigger=_recover_over_malformed_registry_entry,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="delete the entry file if you are certain nothing is running.",
+        message="Investigate the attempt's trial directory.",
     ),
     RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,
@@ -910,7 +876,7 @@ WRAP_CASES = (
         trigger=_recover_through_retargeted_workdir,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original workdir, or use a fresh artifact root",
+        message="publishes into artifact root",
     ),
     RoutingCase(
         id="journal_garbage",
@@ -985,11 +951,6 @@ WRAP_CASES = (
 )
 
 
-# An origin raise states its remedy in its own message, so its action has to
-# name that same remedy rather than whatever its class defaults to. Each row
-# drives the real code path to one such raise and pins the pair together.
-
-
 def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Claim a ledger whose tree another process bound after it was validated."""
     experiment = make_experiment(workdir=tmp_path / "runs")
@@ -1017,11 +978,7 @@ def _reconcile_prepared_over_damaged_publication(
 def _preflight_registered_trial_without_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
-    """Scan a registry entry whose terminal trial lost its durable attempt id.
-
-    Mirrors the ``missing-attempt`` case of
-    ``tests/test_stale_reaper.py::test_registry_terminal_cleanup_requires_matching_attempt_identity``.
-    """
+    """Scan a registry entry whose terminal trial lost its durable attempt id."""
     experiment = make_experiment(
         workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}"
     )
@@ -1092,6 +1049,14 @@ def _field_dropped(entry: Path) -> None:
     """Drop a field every current registry entry carries, keeping its owner-only file."""
     payload = json.loads(entry.read_text())
     del payload["generation_id"]
+    entry.write_text(json.dumps(payload))
+
+
+def _locator_cleared(entry: Path) -> None:
+    """Leave a journal identity without the locator recovery requires."""
+    payload = json.loads(entry.read_text())
+    payload["storage_identity"] = "journal:////missing.journal"
+    payload["storage_locator"] = None
     entry.write_text(json.dumps(payload))
 
 
@@ -1251,11 +1216,7 @@ def _append_failure_outcomes(
     digest = trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     last = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials)
     for sequence in range(last + 1, last + count + 1):
-        outcome: dict[str, object] = {
-            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-            "sequence": sequence,
-            "outcome": "failure",
-        }
+        outcome = trial_outcome(sequence, "failure")
         if abort_for is not None and sequence == last + count:
             outcome[TRIAL_OUTCOME_ABORT_KEY] = _failure_policy_abort_record(
                 abort_for,
@@ -1346,55 +1307,6 @@ def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
 
 
-def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Skip a phase whose search space changed after its winner was published."""
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    edited = experiment.phases[0].model_copy(
-        update={"search_space": {"a": IntParam(type="int", low=0, high=20)}}
-    )
-    return _load_winner(
-        experiment.model_copy(update={"phases": [edited]}),
-        edited,
-        {},
-        publication=_published_for_resume(experiment),
-    )
-
-
-def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Claim the fixture's ledger through a config whose workdir moved away from it."""
-    moved = _moved_workdir(materialize("current-journal", tmp_path, mode="tree"), tmp_path)
-    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
-
-
-def _validate_tree_bound_to_another_ledger(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Validate a config over a tree that a different storage ledger bound."""
-    owner = make_experiment(
-        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'a.journal'}"
-    )
-    _artifact_root_binding_path(owner).parent.mkdir(parents=True)
-    _write_artifact_root_binding(owner)
-    other = make_experiment(
-        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'b.journal'}"
-    )
-    return engine_ledger.validate_ledger(other)
-
-
-def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Validate a study whose recorded trial ran under another trainer environment."""
-    study = optuna.create_study(study_name="t::p")
-    study.add_trial(
-        optuna.trial.create_trial(
-            value=1.0,
-            params={},
-            distributions={},
-            user_attrs={TRAINER_ENV_DIGEST_ATTR: "e" * 64},
-        )
-    )
-    return study_policy._validate_environment_cohort(study, _digest_only_identity("d" * 64))
-
-
 def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Clean a stale trial group whose identity was recorded in another PID namespace."""
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "boot")
@@ -1434,30 +1346,29 @@ ORIGIN_CASES = (
         trigger=_reconcile_prepared_over_damaged_publication,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the publication evidence or access to it before retrying recovery.",
+        message="last-success publication is invalid or unreadable.",
     ),
     RoutingCase(
         id="registry_terminal_identity_missing",
         trigger=_preflight_registered_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger with its durable attempt and generation",
+        message="attempt or generation identity is missing",
     ),
     RoutingCase(
         id="uncertain_trial_attempt_missing",
         trigger=_inspect_uncertain(TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown. Restore the original storage ledger",
+        message="Process identity is unknown.",
     ),
     RoutingCase(
-        # Either the ledger or the tree may be the side that changed, so the
-        # message names both and no one repair is the remedy.
+        # Either the ledger or the tree may be the side that changed.
         id="uncertain_trial_identity_files_mismatch",
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Restore the original storage ledger and this attempt's process-identity files",
+        message="durable process identity is missing, malformed, partial",
     ),
     RoutingCase(
         id="lock_dir_no_account_home",
@@ -1492,14 +1403,21 @@ ORIGIN_CASES = (
         trigger=_scan_registry(damage=_field_dropped),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Delete the entry file only if you are certain no process",
+        message="has an unsupported or partial schema.",
+    ),
+    RoutingCase(
+        id="registry_identity_without_locator",
+        trigger=_scan_registry(damage=_locator_cleared),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="has an unsupported or partial schema.",
     ),
     RoutingCase(
         id="registry_entry_trial_dir_missing",
         trigger=_scan_registry(damage=_trial_dir_removed),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Delete the entry file only if you are certain nothing is running.",
+        message="its process state cannot be verified.",
     ),
     # recover-run runs every cleanup check below in both of its modes, so none
     # of these may route back to it.
@@ -1508,21 +1426,21 @@ ORIGIN_CASES = (
         trigger=_scan_registry(patch=_fd_listing_fails),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore the original registry and access to it before retrying.",
+        message="cannot be enumerated safely.",
     ),
     RoutingCase(
         id="running_trial_dir_invalid",
         trigger=_reap_trial_with_invalid_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger before retrying recovery.",
+        message="invalid persisted 'phasesweep_trial_dir'",
     ),
     RoutingCase(
         id="running_trial_attempt_missing",
         trigger=_reap_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown. Restore the original storage ledger",
+        message="Process identity is unknown.",
     ),
     RoutingCase(
         # The same split as uncertain_trial_identity_files_mismatch.
@@ -1530,28 +1448,28 @@ ORIGIN_CASES = (
         trigger=_reap_trial_with_foreign_lifecycle,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.INSPECT_LOGS,
-        message="Restore the original storage ledger and this attempt's lifecycle record",
+        message="attempt lifecycle record is malformed or belongs to another attempt",
     ),
     RoutingCase(
         id="uncertain_trial_dir_missing",
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Restore the original storage ledger before retrying recovery.",
+        message="missing or invalid 'phasesweep_trial_dir'",
     ),
     RoutingCase(
         id="recover_during_launch",
         trigger=_recover_during_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="wait for it to finish and retry",
+        message="another MCP launch is in progress",
     ),
     RoutingCase(
         id="recover_unsettled_launch",
         trigger=_recover_unsettled_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="Wait briefly and retry",
+        message="The run remains reserved.",
     ),
     # recover-run raises every RunRecoveryError itself, so none may route back
     # to it by default; only a confirmed run's own remedy names it.
@@ -1567,14 +1485,14 @@ ORIGIN_CASES = (
         trigger=_recover_with_config_snapshot(Path.unlink),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore it before retrying recovery.",
+        message="run config snapshot is missing:",
     ),
     RoutingCase(
         id="recover_config_snapshot_unreadable",
         trigger=_recover_with_config_snapshot(lambda path: path.chmod(0o000)),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Restore it or access to it before retrying recovery.",
+        message="cannot read run config snapshot:",
         marks=(requires_nonroot,),
     ),
     RoutingCase(
@@ -1635,47 +1553,11 @@ ORIGIN_CASES = (
         message="Refusing to replay it unless the current config sets",
     ),
     RoutingCase(
-        id="winner_phase_config_changed",
-        trigger=_resume_after_phase_edit,
-        raised=StudyFingerprintMismatchError,
-        action=OperatorAction.FIX_CONFIG,
-        message="or restore the matching config before resuming.",
-    ),
-    RoutingCase(
-        id="study_root_workdir_moved",
-        trigger=_claim_from_moved_workdir,
-        raised=ArtifactRootConflictError,
-        action=OperatorAction.FIX_CONFIG,
-        message="Restore the original workdir, or use a fresh artifact root",
-    ),
-    RoutingCase(
-        id="tree_bound_to_another_ledger",
-        trigger=_validate_tree_bound_to_another_ledger,
-        raised=ArtifactRootConflictError,
-        action=OperatorAction.FIX_CONFIG,
-        message="Use the config that owns this current-format tree",
-    ),
-    RoutingCase(
         id="ledger_directory_path_unusable",
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message="Correct the storage path, or the workdir for auto storage",
-    ),
-    RoutingCase(
-        id="ledger_directory_unwritable",
-        trigger=_claim_ledger_under(_unwritable_directory),
-        raised=PhaseSweepError,
-        action=OperatorAction.RESTORE_TREE,
-        message="Restore write access to the directory that holds it, then run again.",
-        marks=(requires_nonroot,),
-    ),
-    RoutingCase(
-        id="environment_cohort_changed",
-        trigger=_top_up_from_another_environment,
-        raised=StudyFingerprintMismatchError,
-        action=OperatorAction.FIX_CONFIG,
-        message="Restore the original semantic environment",
     ),
 )
 
@@ -1696,6 +1578,10 @@ def test_raise_sites_route_their_declared_action(
     if case.cause is not None:
         assert type(error.__cause__) is case.cause
     assert case.message in str(error)
+    if case.action is OperatorAction.RETRY:
+        rendered = _operational_error_text(error)
+        assert "retry the same operation once the reported blocker is resolved" in rendered
+        assert "start a new run" not in rendered
 
 
 def _defect_while_inspecting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1746,15 +1632,11 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
     assert not isinstance(excinfo.value, PhaseSweepError)
 
 
-# The MCP runner is where routing reaches an agent: a run's failure payload
-# says what to do next, and may say only what the raise routes. Each marker
-# belongs to one step's text alone, so a payload that names a step the raise
-# did not route fails as surely as one that omits a step.
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.FRESH_NAMESPACE: "new experiment name",
+        OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
-        OperatorAction.RESTORE_TREE: "repair the experiment tree",
+        OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
         OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
@@ -1818,13 +1700,12 @@ _UNCONFIRMED_CLEANUPS = (
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:
-    # The payload depends only on an error's type and action, and the tables
-    # above prove each trigger raises exactly its row's, so each row's
-    # declared routing stands in for driving its trigger again.
     errors = [cls("boom") for cls in _operator_error_classes()]
     errors += [case.raised("boom", action=case.action) for case in CASES]
     for error in errors:
-        failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+        failure = mcp_runner._terminal_failure_payload(
+            error, stage="preflight", cleanup_confirmed=True
+        )
         _assert_payload_follows(failure, [error.action])
     for primary, recorded, routed in _UNCONFIRMED_CLEANUPS:
         failure = mcp_runner._terminal_failure_payload(
@@ -1836,8 +1717,8 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         _assert_payload_follows(failure, routed)
     # The last, composed remediation, word for word.
     assert failure["remediation"] == (
-        "Ask the operator to restore or repair the storage ledger and access to it, and repair "
-        "the experiment tree's files and permissions, deleting a file only if certain nothing "
+        "Ask the operator to restore or repair the storage ledger and access to it, and restore "
+        "the files and permissions identified in the error, deleting a file only if certain nothing "
         "is running, then run phasesweep mcp recover-run before another launch. The error in "
         "the PhaseSweep run log gives the details."
     )

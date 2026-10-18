@@ -15,7 +15,10 @@ def _explain(*args: str) -> tuple[int, str, str]:
     :param str args: Arguments after the command name.
     :return tuple[int, str, str]: Exit code, stdout and stderr.
     """
-    result = CliRunner().invoke(cli_main, ["explain", *args], terminal_width=120)
+    runner = CliRunner()
+    if hasattr(runner, "mix_stderr"):
+        runner.mix_stderr = False
+    result = runner.invoke(cli_main, ["explain", *args], terminal_width=120)
     return result.exit_code, result.stdout, result.stderr
 
 

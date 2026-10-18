@@ -1,13 +1,8 @@
-"""Dry-run preview of an experiment against the trials its ledger already records.
+"""Read-only dry-run planning from captured ledger studies.
 
-A dry run reads the ledger through the write-nothing door and applies the
-rules a launch applies to what it read, so it refuses and replays as a launch
-would while it creates no study and changes nothing. The rules live where the
-launch calls them (:mod:`phasesweep.engine.ledger`,
-:mod:`phasesweep.engine.guards`, :mod:`phasesweep.engine.resume`,
-:mod:`phasesweep.engine.study_policy`, :mod:`phasesweep.engine.phase`); this
-module only reads the studies, feeds the rules read-only snapshots in the
-launch's order, and reports the verdict.
+Apply launch checks in launch order using snapshots and in-memory sample studies.
+Preview reports replay, refusal, rerun, and remaining-trial decisions without
+launching trainers or changing the configured ledger or artifact tree.
 """
 
 from __future__ import annotations
@@ -19,7 +14,7 @@ from dataclasses import dataclass
 import optuna
 
 import phasesweep.engine.resume as resume_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_applies,
@@ -44,8 +39,8 @@ from phasesweep.engine.phase import (
     _placeholder_winner,
     _replay_met_target,
 )
+from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
-    STUDY_SCHEMA_ATTR,
     Winner,
     _outcome_sequence_counts,
     _recovered_trial_state,
@@ -152,13 +147,10 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
 
 
 def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | None]:
-    """Read every phase's study from one capture of the ledger, creating and writing nothing.
+    """Read all phase studies from one write-free ledger capture.
 
-    The read goes through the write-nothing door ``status`` uses, so it
-    neither creates a study nor constructs file-backed storage. A missing
-    ledger or study counts zero attempts. A ledger that cannot be inspected
-    leaves every phase unread, so the preview falls back to a fresh study and
-    says so.
+    Missing studies count zero attempts. An unreadable ledger leaves phases unknown;
+    preview warns and uses fresh in-memory studies.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :raises ArtifactRootConflictError: The tree is bound to a different owner.
@@ -184,25 +176,12 @@ def _refuse_as_a_launch_would(
     *,
     from_phase: str | None,
 ) -> None:
-    """Apply a launch's claim and preflight refusals to the recorded studies, in its order.
+    """Apply claim, preflight, and top-up refusals to snapshots in launch order.
 
-    A launch checks what the ledger holds before it runs anything, so the
-    preview refuses before it previews anything. The order is the launch's
-    (:func:`phasesweep.engine.ledger.claim_ledger`, then
-    :func:`phasesweep.engine.guards._preflight_existing_studies`, then the
-    top-up checks of :mod:`phasesweep.engine.resume`), so the first refusal is
-    the one a launch gives, and several studies' refusals are combined as it
-    combines them. Every check is the launch's own function, run on the
-    read-only snapshots.
-
-    A launch recovers each RUNNING attempt before it checks that attempt's
-    study (as interrupted, or as failed when its objective recorded a failure),
-    and a snapshot cannot. Such a study gets the checks that do not depend on
-    that recovery (direction and schema) and a fixed configuration's attempt
-    limit from counts that treat each attempt as recovery would record it;
-    it is left out of the target and bound-descendant checks. A launch
-    also checks the trainer environment, the stored fingerprints, the trial
-    evidence and each study's artifact-root claim, which a preview does not.
+    Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
+    schema, and fixed-target checks using predicted recovery counts; defer target
+    and descendant checks requiring actual recovery. Preview does not verify trainer
+    environment, fingerprints, evidence, or per-study artifact-root claims.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -233,11 +212,7 @@ def _refuse_as_a_launch_would(
         record = recorded[phase.name]
         try:
             _validate_study_direction(study, experiment.metric.goal)
-            # The only write ``_validate_study_schema`` makes stamps an empty,
-            # unstamped study, which a snapshot cannot take and which cannot
-            # fail the check.
-            if study.get_trials(deepcopy=False) or STUDY_SCHEMA_ATTR in study.user_attrs:
-                _validate_study_schema(study)
+            _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
                     phase, finished=record.finished, completed=record.completed
@@ -278,71 +253,18 @@ def _preview_ledger(
     return recorded
 
 
-def _preview_resume_phase(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-    study: optuna.Study,
-) -> _PhaseResume | Winner:
-    """Judge a phase's recorded state as a launch would, without recovering or writing anything.
-
-    This is the live resume applied to a read-only snapshot: the same target,
-    partial-decision and abort rules, minus the steps that change the study
-    (recovering stale trials, stamping the schema, binding the fingerprint) and
-    minus the fingerprint comparison, whose inherited winners a preview may
-    only have stood in for. A replayed winner is selected from the recorded
-    trials but not evidence-verified: that proof reads the trial directories,
-    may query W&B or MLflow, and records the environment-drift warning once per
-    process, so a preview leaves it, and that warning, to the launch.
-
-    :param Experiment experiment: Parsed experiment config.
-    :param Phase phase: The phase being previewed.
-    :param dict[str, Winner] inherited_winners: Winners, or stand-ins for them,
-        for phases earlier in the chain.
-    :param optuna.Study study: The phase's read-only snapshot study.
-    :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
-        target, or a fixed configuration asks for more attempts than it may retry.
-    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
-        current limit with work remaining, at an accepted target its current
-        ``n_trials`` does not exceed.
-    :raises WinnerIntegrityError: An accepted partial-timeout decision would
-        replay while the current config disables ``allow_incomplete_on_timeout``.
-    :raises TimeoutError: An accepted partial-timeout decision replays with no
-        feasible trial.
-    :raises StudySchemaMismatchError: Durable phase state is malformed or
-        contradicts the study's trials.
-    :return _PhaseResume | Winner: The validated state, or the winner an
-        accepted partial-timeout decision replays.
-    """
-    return _judge_recorded_phase(
-        experiment,
-        phase,
-        inherited_winners,
-        study,
-        policy_state=_load_phase_policy_state(study),
-        phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
-        verify_evidence=False,
-    )
-
-
 def _preview_phase(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
     recorded: RecordedPhase | None,
 ) -> PhasePreview:
-    """Log what a launch would do with the phase's recorded trials, and return the verdict.
+    """Log and return the phase's predicted replay or trial work.
 
-    The recorded trials are judged by the rules a launch applies
-    (:func:`_preview_resume_phase`), so the preview refuses what a launch
-    refuses. A phase that would replay carries the winner a launch would
-    republish, which its children inherit, and launches no trials. A phase with
-    trials still to run carries a placeholder (:func:`_dry_run_phase`) and the
-    ``remaining`` count its line prints. A phase whose recorded
-    state could not be read is previewed as a fresh phase, and one whose
-    RUNNING attempts a launch recovers first is previewed from its counts,
-    with those attempts counted as recovery would record them and its recorded
-    state unjudged; both carry a placeholder.
+    A replay supplies its recorded winner to children. Remaining work supplies a
+    sampled placeholder. Unreadable studies and RUNNING studies needing recovery
+    also use placeholders; the latter retain predicted counts without judging
+    unrecovered state.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -361,7 +283,17 @@ def _preview_phase(
     resume: _PhaseResume | None = None
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
-        resumed = _preview_resume_phase(experiment, phase, inherited_winners, study)
+        # Snapshots never recover or stamp state; placeholder ancestry also
+        # prevents fingerprint comparison or evidence verification here.
+        resumed = _judge_recorded_phase(
+            experiment,
+            phase,
+            inherited_winners,
+            study,
+            policy_state=_load_phase_policy_state(study),
+            phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+            verify_evidence=False,
+        )
         if isinstance(resumed, Winner):
             # A run replays an accepted partial result before it logs a header.
             log.info(
@@ -373,14 +305,13 @@ def _preview_phase(
             )
             return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
         resume = resumed
-    log.info(
-        "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
-        phase.name,
+    _log_phase_header(
+        phase,
         _phase_study_name(experiment, phase),
-        finished,
-        remaining,
-        reruns,
-        phase.n_jobs,
+        finished=finished,
+        remaining=remaining,
+        reruns=reruns,
+        logger=log,
     )
     if recorded is None:
         log.warning(
@@ -463,35 +394,33 @@ def _dry_run_phase(
         "trial" if remaining == 1 else "trials",
         of_them,
     )
-    sampled: dict[str, object] | None = None
-    if remaining > 0:
-        sample_trial = study.ask()
-        sampled = {
-            name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
-        }
-        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
-        preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
-        cmd = render_command(
-            experiment.trial_command,
-            overrides,
-            experiment.override_format,
-            trial_dir=preview_dir,
-            trial_id=-1,
-            phase=phase.name,
-            run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
-            trainer_config=experiment.trainer_config,
+    sample_trial = study.ask()
+    sampled: dict[str, object] = {
+        name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
+    }
+    overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
+    preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
+    cmd = render_command(
+        experiment.trial_command,
+        overrides,
+        experiment.override_format,
+        trial_dir=preview_dir,
+        trial_id=-1,
+        phase=phase.name,
+        run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
+        trainer_config=experiment.trainer_config,
+    )
+    stand_ins = _inherited_placeholder_keys(
+        phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
+    )
+    note = ""
+    if stand_ins:
+        groups = "; ".join(
+            f"until {parent!r} publishes a winner: {', '.join(keys)}"
+            for parent, keys in stand_ins.items()
         )
-        stand_ins = _inherited_placeholder_keys(
-            phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
-        )
-        note = ""
-        if stand_ins:
-            groups = "; ".join(
-                f"until {parent!r} publishes a winner: {', '.join(keys)}"
-                for parent, keys in stand_ins.items()
-            )
-            note = f" (placeholders {groups})"
-        log.info("DRY RUN example command%s:\n  %s", note, cmd)
+        note = f" (placeholders {groups})"
+    log.info("DRY RUN example command%s:\n  %s", note, cmd)
 
     return _placeholder_winner(
         experiment,

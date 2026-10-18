@@ -1,22 +1,8 @@
 """Block a trial command until the orchestrator commits its process identity.
 
-STDLIB-ONLY, NO PHASESWEEP IMPORTS: this script runs in its own interpreter
-BEFORE PhaseSweep's durable process identity exists and BEFORE the parent has
-applied the trainer's environment. Anything importable from that environment
-— a poisoned or shadowed ``phasesweep`` package via a trainer-composed
-``PYTHONPATH``, a ``sitecustomize``/``usercustomize`` module, or heavy eager
-imports in ``phasesweep/__init__.py`` — must never get a chance to run here:
-it could fork and ``setsid``-escape undetected before any identity record is
-written. The parent therefore
-launches this file directly (never ``-m phasesweep.runtime.supervisor``)
-under ``python -I -S`` with a minimal sanitized environment. ``-S`` skips
-site initialization (no ``sitecustomize``/``usercustomize``); ``-I``
-(isolated mode) implies ``-P`` on Python >= 3.11, so this script's own
-directory — which contains the sibling modules ``phasesweep/runtime/json.py``
-and ``phasesweep/runtime/time.py`` — is never prepended to ``sys.path``,
-keeping ``import json`` and ``import time`` resolved to the stdlib modules
-every time. Keep imports here limited to the stdlib modules
-``contextlib``, ``os``, ``sys``, ``json``, ``signal``, and ``time``.
+Run directly under ``python -I -S`` with a minimal pre-ACK environment and stdlib
+imports only. The blocked child becomes the trainer group leader; the guardian
+stays outside that group and retains GPU leases until cleanup.
 """
 
 from __future__ import annotations
@@ -28,9 +14,7 @@ import signal
 import sys
 import time
 
-# Single source of truth for the wire frame's header width and the readiness
-# frame's leading tag: phasesweep.runtime.process reads both constants
-# directly (the parent already imports this module).
+# Wire frame constants shared with phasesweep.runtime.process.
 _HEADER_LEN = 10
 _READY_PID_WIDTH = 10
 _READY_TAG = b"R"
@@ -61,16 +45,11 @@ def _read_exact(fd: int, size: int) -> bytes | None:
 
 
 def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] | None:
-    """Read and parse the length-prefixed launch payload from the ack pipe.
+    """Read the length-prefixed launch payload from the acknowledgement pipe.
 
-    The wire format is ``_HEADER_LEN`` ASCII decimal bytes giving the byte
-    length of a UTF-8 JSON body, immediately followed by that many body
-    bytes. The body must decode to ``{"cmd": <str>, "env": {<str>: <str>}}``
-    with an optional ``"cwd": <str>`` naming the trainer's working directory.
-
-    Encoded on the other end by ``phasesweep.runtime.process._encode_launch_payload``
-    (prose reference only — this module is stdlib-only and must never import
-    phasesweep); keep both sides in sync if the wire format changes.
+    ``_HEADER_LEN`` ASCII decimal bytes specify the UTF-8 JSON body's byte length.
+    The body contains ``{"cmd": <str>, "env": {<str>: <str>}}`` and optional
+    ``"cwd": <str>``.
 
     :param int ack_fd: Read end of the acknowledgement pipe.
     :return tuple[str, dict[str, str], str | None] | None: ``(cmd, env, cwd)``
@@ -147,10 +126,7 @@ def _trainer_group_alive(pgid: int) -> bool:
             except FileNotFoundError:
                 continue
             except (IndexError, OSError, ValueError):
-                # hidepid/ProtectProc can hide unrelated users' stat files.
-                # getpgid still lets the kernel exclude those entries from
-                # this trainer group; only an unreadable possible member keeps
-                # the lease fail-closed.
+                # Only an unreadable possible group member must retain the lease.
                 try:
                     unreadable_pgid = os.getpgid(int(entry.name))
                 except ProcessLookupError:
@@ -216,7 +192,7 @@ def _reap_remaining_group(pgid: int) -> bool:
         pass
 
     # There is nobody left upstream to protect this lease after an
-    # orchestrator hard exit. If SIGKILL cannot be confirmed, deliberately
+    # orchestrator hard exit. If SIGKILL cannot be confirmed,
     # wait without a deadline rather than reopening the GPU to another run.
     _wait_for_group_exit(pgid, None)
     return True
@@ -312,14 +288,8 @@ def main(argv: list[str] | None = None) -> int:
     ready_fd = int(args[0])
     ack_fd = int(args[1])
 
-    # The parent spawns this process from inside its shutdown-signal deferral
-    # window, and the blocked signal mask survives fork AND exec — without
-    # this reset, the supervisor and every trainer exec'd from it would run
-    # with SIGTERM/SIGINT/SIGHUP permanently blocked, making the documented
-    # SIGTERM -> grace -> SIGKILL escalation a dead letter (trainers could
-    # never shut down gracefully and every kill burned the full grace before
-    # SIGKILL). This is the first code phasesweep controls after exec, so the
-    # mask is cleaned here.
+    # Restore the parent's inherited signal mask before forking the trainer so
+    # shutdown signals can reach both processes.
     if hasattr(signal, "pthread_sigmask"):
         signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
@@ -327,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     if child_pid == 0:
         os._exit(_run_trainer(ready_fd, ack_fd))
 
-    # The guardian is deliberately outside the trainer's new session and
+    # The guardian is outside the trainer's new session and
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)

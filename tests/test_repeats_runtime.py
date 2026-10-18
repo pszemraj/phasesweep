@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 import statistics
 from dataclasses import replace
 from pathlib import Path
@@ -13,28 +14,31 @@ import yaml
 
 import phasesweep.engine.artifacts as artifact_io
 from phasesweep import run_experiment
-from phasesweep.config import (
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import (
     CategoricalParam,
-    Experiment,
     IntParam,
-    Phase,
     Repeats,
     Sampler,
     sampler_search_space,
 )
-from phasesweep.engine import WinnerIntegrityError, read_status, read_trial_tables, read_winner
+from phasesweep.engine.confound import _validate_confound_block
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
-from phasesweep.engine.paths import _generation_summary_path, _generation_winner_path, _phase_dir
+from phasesweep.engine.paths import (
+    _generation_dir,
+    _generation_summary_path,
+    _generation_winner_path,
+    _phase_dir,
+)
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.publication_validation import ValidatedWinner
-from phasesweep.engine.read import _winner_view
-from phasesweep.engine.repeats import ReduceName, reduce_values, spread
+from phasesweep.engine.read import _winner_view, read_result, read_status, read_trial_tables
+from phasesweep.engine.repeats import ReduceName, _validate_repeats_block, reduce_values, spread
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_trainer
-from tests.ledger_fixtures import published_generation_id
-from tests.test_publication_transaction import _reseal_winner
+from tests.ledger_fixtures import published_generation_id, reseal_winner
 
 
 def _seed_trainer(tmp_path: Path) -> Path:
@@ -235,6 +239,26 @@ def _repeats_publication(tmp_path: Path, **phase_overrides: object) -> tuple[Exp
     return experiment, generation_id
 
 
+@pytest.fixture(scope="module")
+def readonly_repeats_publication(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Experiment, str]:
+    """Publish one CPU-only repeat group tree for consumers that never mutate its files."""
+    root = tmp_path_factory.mktemp("repeats-read")
+    locks = root / "locks"
+    locks.mkdir(mode=0o700)
+    locks.chmod(0o700)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("PHASESWEEP_HOME", raising=False)
+        patch.setenv("XDG_STATE_HOME", str(root / "state-home"))
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache-home"))
+        patch.setenv("PHASESWEEP_LOCK_DIR", str(locks))
+        patch.setenv("CUDA_VISIBLE_DEVICES", "")
+        patch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+        patch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
+        return _repeats_publication(root)
+
+
 def _winner_payload(experiment: Experiment, generation_id: str) -> JsonObject:
     """Return phase ``p``'s winner as one generation published it."""
     loaded = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
@@ -281,7 +305,7 @@ def test_group_winner_repeats_block_is_manifest_validated(
         repeats["spread"]["sd"] = 0.0
     else:
         del winner["repeats"]
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -353,7 +377,7 @@ def _publish_forgery(
     summary = yaml.safe_load(summary_path.read_text())
     next(item for item in summary["phases"] if item["name"] == "p")["metric"] = aggregate
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reseal_winner(experiment, generation_id, winner)
+    reseal_winner(experiment, generation_id, winner)
 
 
 _AXIS_MISMATCHES = [
@@ -395,7 +419,7 @@ def test_manifest_binds_the_repeats_block_to_the_snapshot_axis(
     assert "winner for phase 'p' has no valid repeats block" in pointer.error
     assert reason in pointer.error
     assert read_status(experiment)["publication_integrity"] == "failed"
-    assert read_winner(experiment, "p") is None
+    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 @pytest.mark.parametrize(("tamper", "reason"), _AXIS_MISMATCHES)
@@ -405,9 +429,21 @@ def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
     """The winner a skipped phase loads must carry the repeat axis the current config declares."""
     experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
     winner = _winner_payload(experiment, generation_id)
-    _forge_axis_mismatch(winner, tamper)
+    aggregate = _forge_axis_mismatch(winner, tamper)
     published = _published_for_resume(experiment)
-    forged = replace(published, winners={"p": ValidatedWinner(content=b"", payload=winner)})
+    confound = _validate_confound_block(
+        winner["confound"], winner_trial=published.winners["p"].source.trial_number
+    )
+    forged_winner = replace(
+        published.winners["p"],
+        payload=winner,
+        metric=aggregate,
+        confound=confound,
+        repeats=_validate_repeats_block(
+            winner, metric_value=aggregate, ranked_groups=confound["ranked_groups"]
+        ),
+    )
+    forged = replace(published, winners={"p": forged_winner})
 
     with pytest.raises(WinnerIntegrityError) as raised:
         artifact_io._load_winner(experiment, experiment.phases[0], {}, publication=forged)
@@ -416,14 +452,16 @@ def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
     assert reason in str(raised.value)
 
 
-def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
+def test_winner_view_projects_the_repeats_summary(
+    readonly_repeats_publication: tuple[Experiment, str],
+) -> None:
     """Reads expose the reducer and spread, and a malformed block hides the winner."""
-    experiment, generation_id = _repeats_publication(tmp_path)
+    experiment, generation_id = readonly_repeats_publication
     winner = _winner_payload(experiment, generation_id)
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
 
-    view = read_winner(experiment, "p")
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.repeats is not None
     assert view.repeats["reduce"] == "mean"
@@ -436,10 +474,12 @@ def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
     assert _winner_view(winner, "p") is None
 
 
-def test_trial_tables_label_repeat_groups_and_star_every_winning_member(tmp_path: Path) -> None:
+def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
+    readonly_repeats_publication: tuple[Experiment, str],
+) -> None:
     """A repeats phase's table groups trials as trials.csv does and stars the whole winning group."""
-    experiment, _ = _repeats_publication(tmp_path)
-    view = read_winner(experiment, "p")
+    experiment, _ = readonly_repeats_publication
+    _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None and view.repeats is not None
 
     (table,) = read_trial_tables(experiment).phases
@@ -466,25 +506,17 @@ def test_trial_tables_label_repeat_groups_and_star_every_winning_member(tmp_path
         ]
 
 
-def test_carried_group_winner_must_agree_on_repeats(tmp_path: Path) -> None:
-    """A carried group winner keeps its source generation's members verbatim."""
+def test_carried_repeat_winner_reads_without_older_publication(tmp_path: Path) -> None:
+    """A carried repeat group's current result embeds every member's identity."""
     experiment, source_generation = _repeats_publication(tmp_path)
-    run_experiment(experiment)
-    carrying_generation = published_generation_id(experiment)
-    assert carrying_generation not in (None, source_generation)
-    assert carrying_generation is not None
-    winner = _winner_payload(experiment, carrying_generation)
-    assert winner["generation_id"] == source_generation
-    assert winner["repeats"] == _winner_payload(experiment, source_generation)["repeats"]
-    # A non-representative member edit keeps the block self-consistent.
-    _members(winner)[0]["attempt_id"] = "a" * 32
-    _reseal_winner(experiment, carrying_generation, winner)
+    carried = run_experiment(experiment)["p"]
+    assert carried.generation_id == source_generation
+    assert carried.repeats is not None
+    expected = read_result(experiment)
+    shutil.rmtree(_generation_dir(experiment, source_generation))
 
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert "disagrees with the result recorded by its source generation" in pointer.error
-    assert "on repeats" in pointer.error
+    assert read_result(experiment) == expected
+    assert run_experiment(experiment)["p"].repeats == carried.repeats
 
 
 @pytest.mark.parametrize("reduce", ["mean", "median"])

@@ -24,19 +24,20 @@ import pytest
 import yaml
 
 from phasesweep import load_experiment
-from phasesweep.config import Experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_payload,
-    _artifact_root_identity,
 )
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
+    _artifact_root_identity,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from phasesweep.runtime.json import JsonObject
 from tests.fixtures.make_ledger_fixtures import (
     FIXTURE_ENVIRONMENT,
     LEDGER_FILENAME,
@@ -51,6 +52,14 @@ LEDGER_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "ledgers"
 #: points the same ledger at a workdir that has never existed, which is what a
 #: fresh checkout reading an inherited ledger actually looks like.
 LEDGER_MODES = ("tree", "ledger-only")
+
+
+def append_journal_tail(path: Path, tail: bytes) -> tuple[bytes, bytes]:
+    """Append caller-supplied bytes and return the complete and damaged journal contents."""
+    complete = path.read_bytes()
+    damaged = complete + tail
+    path.write_bytes(damaged)
+    return complete, damaged
 
 
 #: One snapshot entry: ``st_mode`` file-type and permission bits, then the
@@ -134,7 +143,7 @@ class Materialized:
     root: Path
     experiment: Experiment
     config_path: Path
-    ledger_dir: Path
+    ledger_path: Path
     before: dict[str, TreeEntry]
 
     def unchanged(self) -> bool:
@@ -215,8 +224,7 @@ def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
     A test that resumes a fixture study and allocates new trials passes the environment
     cohort check only from that environment, since each recorded trial holds its tracked
-    values. Without this the test follows the shell that runs it, and fails under the commit
-    hook, whose ``PATH`` differs from the developer's.
+    values.
 
     :param pytest.MonkeyPatch monkeypatch: The test's monkeypatch, which undoes the pin.
     """
@@ -227,9 +235,7 @@ def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setenv(name, value)
 
 
-def _write_config(
-    config_path: Path, *, backend: str, ledger_dir: Path, workdir: Path
-) -> Experiment:
+def _write_config(config_path: Path, *, ledger_dir: Path, workdir: Path) -> Experiment:
     """Write and load the fixture experiment config for a materialized copy.
 
     The config comes from the same builder the generator used, with only the
@@ -239,13 +245,12 @@ def _write_config(
     checkout path.
 
     :param Path config_path: Where to write the YAML.
-    :param str backend: Ledger backend recorded in the manifest.
     :param Path ledger_dir: Directory holding the copied ledger file.
     :param Path workdir: Artifact-root parent this read should use.
     :return Experiment: Parsed experiment config.
     """
     payload = experiment_payload(
-        storage_url=storage_url(backend, ledger_dir),
+        storage_url=storage_url(ledger_dir),
         workdir=workdir,
     )
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -320,7 +325,6 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
     if mode not in LEDGER_MODES:
         raise ValueError(f"unsupported ledger fixture mode: {mode!r}")
     fixture = fixture_by_name(name)
-    backend = str(fixture.manifest["backend"])
     root = tmp_path / "fixture"
     if mode == "tree":
         copy_fixture(name, root)
@@ -332,7 +336,6 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         workdir = root / "unvisited_workdir"
     experiment = _write_config(
         tmp_path / "experiment.yaml",
-        backend=backend,
         ledger_dir=root / "ledger",
         workdir=workdir,
     )
@@ -343,22 +346,9 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         root=root,
         experiment=experiment,
         config_path=tmp_path / "experiment.yaml",
-        ledger_dir=root / "ledger",
+        ledger_path=root / "ledger" / LEDGER_FILENAME,
         before=tree_snapshot(root),
     )
-
-
-def ledger_file(materialized: Materialized, backend: str) -> Path:
-    """Return the ledger file inside a materialized fixture.
-
-    :param Materialized materialized: Copied fixture.
-    :param str backend: Ledger backend recorded in the manifest; every
-        materialized fixture is ``"journal"``, kept as an explicit parameter
-        so a call site names what it expects to read.
-    :return Path: Absolute path to ``study.journal``.
-    """
-    assert backend == "journal", f"unsupported fixture ledger backend: {backend!r}"
-    return materialized.ledger_dir / LEDGER_FILENAME
 
 
 def published_generation_id(
@@ -378,6 +368,19 @@ def published_generation_id(
     return pointer.generation_id if pointer.state == "ok" else None
 
 
+def golden_publication(tmp_path: Path) -> tuple[Experiment, str]:
+    """Copy the golden one-generation publication for a test that needs a tree, not a sweep.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return tuple[Experiment, str]: The experiment reading the copy and its
+        published generation id.
+    """
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    return experiment, generation_id
+
+
 def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     """Point a publication pointer at ``summary_path``'s exact bytes."""
     pointer = yaml.safe_load(pointer_path.read_text())
@@ -385,6 +388,41 @@ def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     pointer["summary_size_bytes"] = len(content)
     pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
     pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+
+def reseal_winner(
+    experiment: Experiment,
+    generation_id: str,
+    winner: JsonObject,
+    *,
+    mirror_summary: bool = False,
+) -> None:
+    """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
+
+    The hashes then match, so only payload validation can refuse the winner.
+
+    :param Experiment experiment: Experiment whose golden publication is rewritten.
+    :param str generation_id: Published generation holding the winner.
+    :param JsonObject winner: Replacement winner payload for phase ``p``.
+    :param bool mirror_summary: Also write the winner's ``winner_source`` into the
+        summary's own per-phase copy, so the two copies agree and the summary
+        cross-check cannot be the reason the winner is refused.
+    """
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    artifact = next(
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    if mirror_summary:
+        winner_source = winner["winner_source"]
+        assert isinstance(winner_source, dict)
+        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+        phase_item["winner_source"] = dict(winner_source)
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
 
 def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
@@ -413,33 +451,15 @@ def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
 def forbid_file_backed_storage(
     monkeypatch: pytest.MonkeyPatch, *, allow_memory_studies: bool = False
 ) -> list[str]:
-    """Make any file-backed storage construction fail, and record every attempt.
+    """Reject and record file-backed storage construction during read-path tests.
 
-    Durability invariant 6 ("Read paths construct and write nothing"): a read
-    path never creates a study and never builds file-backed storage, and its
-    SQLite reads open the database ``mode=ro``.
-    Three constructors can break that -- ``RDBStorage`` (which runs
-    ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
-    (which creates the journal if absent), and ``optuna.create_study`` -- plus
-    any read-write ``sqlite3.connect``.
+    Patch RDBStorage, JournalFileBackend, create_study, and read-write sqlite connections.
+    Allow load_study and JournalStorage over an in-memory snapshot. The attempts list
+    retains evidence even when a read path catches the injected exception.
 
-    ``optuna.load_study`` is deliberately *not* patched: the journal read path
-    legitimately loads a study over an in-memory ``_JournalSnapshot``, which
-    touches no file. ``JournalStorage`` itself is likewise allowed, because
-    that is the wrapper the snapshot is handed to.
-
-    The attempts are both raised *and* recorded, because several read paths
-    swallow broad exceptions to stay tolerant of a live writer; the returned
-    list survives that, so an assertion on it cannot be silenced.
-
-    A dry run renders its example command on a throwaway in-memory study, which
-    is ``optuna.create_study`` without storage. ``allow_memory_studies`` lets
-    exactly that call through and still refuses one that names storage.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to install the patches.
-    :param bool allow_memory_studies: Whether ``optuna.create_study`` may build a
-        study that has no storage.
-    :return list[str]: Attempted constructions, appended to as they happen.
+    :param pytest.MonkeyPatch monkeypatch: Fixture installing the patches.
+    :param bool allow_memory_studies: Allow create_study only when no storage is supplied.
+    :return list[str]: Construction attempts, appended as they occur.
     """
     from optuna.storages._rdb.storage import RDBStorage
     from optuna.storages.journal._file import JournalFileBackend

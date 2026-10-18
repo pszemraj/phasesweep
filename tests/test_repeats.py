@@ -5,24 +5,26 @@ from __future__ import annotations
 import copy
 import math
 import statistics
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from phasesweep.config import Repeats
+from phasesweep.config.search import Repeats
 from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
     _repeats_summary,
     _validate_repeats_block,
     group_key,
-    group_labels,
+    group_labels_for,
     observed_means,
     ranked_group,
     reduce_values,
     spread,
     within_noise,
 )
+from phasesweep.engine.state import RERUN_OF_ATTR
 from phasesweep.runtime.json import JsonObject
 
 
@@ -118,7 +120,8 @@ def test_group_labels_name_each_grid_configuration_by_its_last_member() -> None:
         (4, 4, {"lr": 0.3}),
     ]
 
-    assert group_labels(trials, axis) == {0: 2, 1: 3, 2: 2, 3: 3}
+    recorded = [SimpleNamespace(number=n, params=params, user_attrs={}) for n, _, params in trials]
+    assert group_labels_for(recorded, axis) == {0: 2, 1: 3, 2: 2, 3: 3}
 
 
 def test_group_labels_put_a_seeded_random_rerun_in_its_source_slot() -> None:
@@ -132,7 +135,11 @@ def test_group_labels_put_a_seeded_random_rerun_in_its_source_slot() -> None:
         (4, 3, {"lr": 0.2, "seed": 1}),
     ]
 
-    assert group_labels(trials, axis) == {0: 3, 1: 3, 2: 4, 3: 3, 4: 4}
+    recorded = [
+        SimpleNamespace(number=n, params=params, user_attrs={RERUN_OF_ATTR: 1} if n == 3 else {})
+        for n, _, params in trials
+    ]
+    assert group_labels_for(recorded, axis) == {0: 3, 1: 3, 2: 4, 3: 3, 4: 4}
 
 
 def test_within_noise_compares_aggregates_against_two_standard_errors() -> None:

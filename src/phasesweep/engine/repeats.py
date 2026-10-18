@@ -4,9 +4,7 @@ A phase with ``repeats`` runs every configuration once per repeat value, and
 selection ranks only complete groups by a reducer over their members. This
 module holds the pure parts of that contract: the group key, the statistics,
 the winner's ``repeats`` record and its validator, and the evidence members a
-winner stands on. It imports nothing beyond the config models, the JSON
-helpers, the winner state module, and the standard library, because read-only
-publication validation imports it.
+winner stands on.
 """
 
 from __future__ import annotations
@@ -15,15 +13,18 @@ import json
 import math
 import statistics
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
 from phasesweep.engine.state import _validate_observed_block
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, json_object, nonempty_text
 
 if TYPE_CHECKING:
-    from phasesweep.config import Phase, Repeats
+    from optuna.trial import FrozenTrial
+
+    from phasesweep.config.models import Phase
+    from phasesweep.config.search import Repeats
 
 ReduceName = Literal["mean", "median"]
 """How a group's member metrics combine into the value that ranks it."""
@@ -197,7 +198,6 @@ class EvidenceSource(Protocol):
 def repeat_axis(phase: Phase) -> RepeatAxis | None:
     """Return a phase's repeat axis, or ``None`` for a phase without repeats.
 
-    :param Phase phase: The phase.
     :return RepeatAxis | None: The axis, slotted by repeat count under seeded random.
     """
     repeats = phase.repeats
@@ -230,25 +230,24 @@ def group_key(position: int, params: Mapping[str, object], axis: RepeatAxis) -> 
     return json.dumps([slot, rest], sort_keys=True, separators=(",", ":"))
 
 
-def group_labels(
-    trials: Iterable[tuple[int, int, Mapping[str, object]]], axis: RepeatAxis
-) -> dict[int, int]:
-    """Label each trial of a repeats phase with the highest trial number of its group so far.
+def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> dict[int, int]:
+    """Label repeat groups by their highest trial number, keeping reruns in their source slots.
 
-    The groups are the ones selection ranks, by :func:`group_key`. An incomplete
-    group's label moves as more members are allocated. A trial without the
-    repeat key, which was stopped before sampling it, belongs to no group and
-    gets no label.
+    Trials without a sampled repeat key have no group label.
 
-    :param Iterable[tuple[int, int, Mapping[str, object]]] trials: ``(trial_number,
-        draw_position, params)`` of every trial of the phase.
-    :param RepeatAxis axis: The phase's repeat axis.
-    :return dict[int, int]: Group label by trial number, for the trials that have one.
+    :param Sequence[FrozenTrial] trials: Trials from one phase study.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return dict[int, int]: Group label by trial number; empty without a repeat axis.
     """
+    from phasesweep.engine.optuna import _draw_positions
+
+    positions = _draw_positions(trials)
+    if axis is None:
+        return {}
     keyed = {
-        number: group_key(position, params, axis)
-        for number, position, params in trials
-        if axis.key in params
+        trial.number: group_key(positions[trial.number], trial.params, axis)
+        for trial in trials
+        if axis.key in trial.params
     }
     last: dict[str, int] = {}
     for number, key in keyed.items():
@@ -346,19 +345,6 @@ def _finite_number(value: object, *, label: str) -> float:
     return float(value)
 
 
-def _nonempty_text(value: object, *, label: str) -> str:
-    """Validate a nonempty string.
-
-    :param object value: Parsed value.
-    :param str label: Field name for the diagnostic.
-    :raises ValueError: The value is not a nonempty string.
-    :return str: The value.
-    """
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"repeats {label} is not a nonempty string")
-    return value
-
-
 def _repeat_value(value: object) -> RepeatValue:
     """Validate one recorded repeat value.
 
@@ -398,12 +384,12 @@ def _validate_member(data: object) -> RepeatMember:
         "trial_number": number,
         "repeat": _repeat_value(data["repeat"]),
         "metric": _finite_number(data["metric"], label="member metric"),
-        "generation_id": _nonempty_text(data["generation_id"], label="member generation_id"),
-        "attempt_id": _nonempty_text(data["attempt_id"], label="member attempt_id"),
+        "generation_id": nonempty_text(data["generation_id"], label="repeats member generation_id"),
+        "attempt_id": nonempty_text(data["attempt_id"], label="repeats member attempt_id"),
         "objective_provenance": provenance,
         "trainer_input": trainer_input,
         "constraints": {
-            _nonempty_text(name, label="member constraint name"): _finite_number(
+            nonempty_text(name, label="repeats member constraint name"): _finite_number(
                 value, label="member constraint value"
             )
             for name, value in constraints.items()
@@ -455,15 +441,11 @@ def _validate_repeats_block(
     metric_value: float,
     ranked_groups: Sequence[Sequence[int]] | None,
 ) -> RepeatsRecord | None:
-    """Validate a winner payload's ``repeats`` block against the winner beside it.
+    """Validate a repeat-group record against its winner and ranked confound population.
 
-    The one validator for the block, shared by publication validation, the
-    winner loader, and the winner read paths, which differ only in how they
-    wrap the ``ValueError``. The scalar winner fields describe the group's
-    highest-numbered member, so they must equal the last member; the metric,
-    the spread, and the observed values must be what the members recompute
-    to; and the members must be one of the groups the winner's validated
-    confound block ranked.
+    Scalar identity fields must match the highest-numbered member. Recompute the
+    aggregate metric, spread, and observations, and require membership in the
+    confound block's ranked groups.
 
     :param Mapping[str, object] payload: Decoded winner payload holding ``repeats``.
     :param float metric_value: The winner's published metric value.
@@ -486,7 +468,7 @@ def _validate_repeats_block(
         return None
     if not isinstance(data, Mapping) or set(data) != _REPEATS_KEYS:
         raise ValueError("repeats block must have exactly key, reduce, spread and members")
-    key = _nonempty_text(data["key"], label="key")
+    key = nonempty_text(data["key"], label="repeats key")
     reduce = data["reduce"]
     if reduce not in REDUCERS:
         raise ValueError(f"repeats reduce is not one of {', '.join(REDUCERS)}")
@@ -530,12 +512,9 @@ def _scalar_identity(value: RepeatValue) -> tuple[type, RepeatValue]:
 
 
 def _check_repeats_axis(record: RepeatsRecord | None, configured: Repeats | None) -> None:
-    """Require a validated ``repeats`` block to be the one a phase's repeat axis produces.
+    """Match a validated group to its configured repeat key, reducer, and values.
 
-    :func:`_validate_repeats_block` proves a block consistent with the winner
-    beside it, and its key and reducer come from the block itself. This
-    compares them with the configured axis: the same key and reducer, one
-    member per configured repeat value, and every configured value exactly once.
+    Require every configured repeat value exactly once.
 
     :param RepeatsRecord | None record: The block :func:`_validate_repeats_block` returned.
     :param Repeats | None configured: The phase's configured ``repeats``, or ``None``.
@@ -577,14 +556,9 @@ def _repeats_summary(record: RepeatsRecord) -> RepeatsSummary:
     :param RepeatsRecord record: A validated ``repeats`` block.
     :return RepeatsSummary: The string-free summary.
     """
-    stats = record["spread"]
     return {
         "reduce": record["reduce"],
-        "n": stats["n"],
-        "mean": stats["mean"],
-        "sd": stats["sd"],
-        "min": stats["min"],
-        "max": stats["max"],
+        **record["spread"],
         "member_trials": [member["trial_number"] for member in record["members"]],
     }
 

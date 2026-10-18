@@ -7,35 +7,14 @@ from typing import ClassVar, Self
 
 
 class OperatorAction(StrEnum):
-    """One remediation step an operator should take for a failure.
+    """Operator remediation category for routing expected failures.
 
-    The message stays authoritative about *what* went wrong; this says *what to
-    do next*, so callers can route a failure without parsing prose.
-
-    ``FRESH_NAMESPACE``
-        Start again under a new experiment name, artifact root, or local
-        storage instead of reusing the bound one.
-    ``RESTORE_LEDGER``
-        Restore or repair the persistent study ledger before running again.
-    ``RESTORE_TREE``
-        Restore or repair the on-disk experiment tree - artifacts, evidence, or
-        its permissions - before running again.
-    ``RUN_RECOVER_RUN``
-        Run operator recovery before anything else touches the run:
-        ``phasesweep mcp recover-run`` for an MCP run, or ``phasesweep run``
-        again with the same config for a CLI run, whose preflight retries the
-        cleanup before it launches anything.
-    ``FIX_CONFIG``
-        Correct the experiment configuration, the request, or the environment
-        it runs in (variables, installed extras), then run again.
-    ``RETRY``
-        Wait for the current holder to finish and repeat the same request.
-    ``INSPECT_LOGS``
-        Read the message and the surrounding logs; no single mechanical remedy
-        applies.
-
-    There is deliberately no ``REPORT_BUG`` member. A PhaseSweep defect must not
-    inherit a remediation, and defects do not subclass :class:`PhaseSweepError`.
+    FRESH_NAMESPACE starts a separate namespace for the affected state;
+    RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions.
+    RUN_RECOVER_RUN retries process cleanup through the appropriate CLI or MCP
+    recovery entry point. FIX_CONFIG corrects configuration or environment;
+    RETRY repeats the operation after its blocker resolves; INSPECT_LOGS requires diagnosis.
+    Defects do not inherit PhaseSweepError or an operator remediation.
     """
 
     FRESH_NAMESPACE = "fresh_namespace"
@@ -48,25 +27,14 @@ class OperatorAction(StrEnum):
 
 
 class PhaseSweepError(RuntimeError):
-    """Base for expected operational failures an operator is meant to act on.
+    """Expected operational failure carrying a diagnostic and remediation action.
 
-    Every subclass carries a complete diagnostic, so the CLI reports it as one
-    line without an internal-bug traceback. Exceptions that indicate a
-    PhaseSweep defect must not inherit from this class.
-
-    Each instance also carries its remediation as :attr:`action`, a routing
-    attribute only: it never changes the message text an operator reads. A
-    message that offers alternatives ("restore the setting, or start fresh")
-    routes the one that keeps the operator's existing work, and one that needs
-    several repairs, none sufficient alone, routes ``INSPECT_LOGS``. Retrying
-    what failed after a repair is implied, so ``RETRY`` is the action only
-    when waiting is the whole remedy.
+    The CLI reports these failures without an internal-defect traceback.
+    CLI and MCP boundaries render the action; ``str(error)`` and ``args`` retain
+    the diagnostic for Python callers and exception translation.
     """
 
-    # The base declares a fallback solely because the base class is itself
-    # raised directly at a few sites. It is not an inheritable default: every
-    # concrete subclass declares its own, and tests/test_error_routing.py fails
-    # when one silently inherits this one.
+    # Concrete subclasses must declare their own default action.
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
     def __init__(self, *args: object, action: OperatorAction | None = None) -> None:
@@ -86,15 +54,11 @@ class PhaseSweepError(RuntimeError):
         *args: object,
         action: OperatorAction | None = None,
     ) -> Self:
-        """Build this error from ``cause``, inheriting the remediation ``cause`` carried.
+        """Construct a translated error while retaining its cause's remediation.
 
-        Returns the new instance rather than raising it, so the caller still
-        writes ``raise X.rewrap(exc, msg) from exc`` and the explicit ``from``
-        clause that preserves ``__cause__`` stays visible at the raise site.
-
-        An explicit ``action`` wins. Otherwise a :class:`PhaseSweepError` cause
-        donates its action, so a remediation survives translation between
-        layers, and any other cause falls back to :attr:`default_action`.
+        An explicit action wins; otherwise a PhaseSweepError cause donates its
+        action, and other causes use default_action. The caller raises the returned
+        error with an explicit ``from cause``.
 
         :param BaseException cause: Failure being rewrapped.
         :param object args: Arguments for the new error; the first is the message.
@@ -106,12 +70,28 @@ class PhaseSweepError(RuntimeError):
         return cls(*args, action=action)
 
 
-#: The recovery a refusal at the ``RUN_RECOVER_RUN`` default names, on both
-#: surfaces, so a CLI operator is not sent to an MCP-only command.
+#: Recovery guidance for both CLI and MCP entry points.
 RERUN_CLEANUP_RECOVERY = (
     "run `phasesweep run` again with the same config for a CLI run, or "
     "`phasesweep mcp recover-run` for an MCP run"
 )
+
+
+# Path-free action phrases; boundary renderers supply framing and diagnostic details.
+OPERATOR_STEPS: dict[OperatorAction, str] = {
+    OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
+    OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
+    OperatorAction.RESTORE_TREE: (
+        "restore the files and permissions identified in the error, deleting a file only if "
+        "certain nothing is running"
+    ),
+    OperatorAction.RUN_RECOVER_RUN: RERUN_CLEANUP_RECOVERY,
+    OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",
+    OperatorAction.RETRY: (
+        "Wait briefly, then retry the same operation once the reported blocker is resolved"
+    ),
+    OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log and the logs its error points to",
+}
 
 
 class ProcessCleanupUncertainError(PhaseSweepError):
@@ -129,12 +109,10 @@ class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
 
 
 class ForeignPidNamespaceError(ProcessCleanupUncertainError):
-    """Raised when a process recorded in another PID namespace cannot be proven gone.
+    """A recorded process belongs to another PID namespace.
 
-    Its PID numbers name unrelated processes here, so the process can be neither
-    observed nor safely signalled. The remedy is to act from the host's initial
-    PID namespace, which proves the recorded processes gone without signalling
-    them, once any process it names has exited; never to clean up by hand.
+    Its PID numbers cannot safely identify or signal processes here. Recovery
+    from the initial host namespace can prove those recorded processes gone.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

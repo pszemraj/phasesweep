@@ -2,8 +2,7 @@
 
 from typing import ClassVar
 
-from phasesweep.errors import OperatorAction as OperatorAction
-from phasesweep.errors import PhaseSweepError as PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):
@@ -25,65 +24,40 @@ class StudyContextConflictError(PhaseSweepError):
 
 
 class ArtifactRootConflictError(PhaseSweepError):
-    """Raised when a persistent study is bound to a different artifact root.
-
-    Deliberately a sibling of :class:`StudyContextConflictError` rather than a
-    reuse of it: that error means one specific thing (an upstream top-up would
-    invalidate a bound descendant study) and its remedy is a new experiment
-    name, while this one means the offered ``workdir`` is not the publication
-    root this study already claimed and its remedy is the original ``workdir``
-    or a fresh artifact root and local storage.
-    """
+    """Raised when a study or artifact tree names a different publication owner."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
 class PublicationIntegrityError(PhaseSweepError):
-    """Raised when a recorded publication exists but no longer validates.
+    """Raised when a recorded publication exists but fails validation.
 
-    Read-only surfaces use this type to distinguish corruption from a tree that
-    never published, and resume/publication paths use it when a manifest they
-    must trust is malformed or no longer matches its artifacts. A corrupt
-    last-success pointer also blocks a forward run so it cannot mask the
-    damaged publication by advancing that pointer.
+    This is distinct from an absent publication.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
 
 class PublicationAccessError(PhaseSweepError):
-    """Raised when publication validation cannot run under the current user.
+    """Raised when the current user cannot validate a publication.
 
-    Distinct from :class:`PublicationIntegrityError`: a permission denial does
-    not show that the publication is corrupt, only that this user cannot prove
-    it sound. Read surfaces still fail closed and expose no result, but the
-    remedy is validation by the publishing user rather than restoration.
+    Permission denial does not establish corruption; no published result is exposed.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
 
 class PublicationCommitError(PhaseSweepError):
-    """Raised when a completed generation cannot pass its publication commit.
-
-    This is a write-side failure: the generation remains unpublished because
-    its newly written summary cannot be read back or does not identify the
-    generation being committed. It is distinct from read-side integrity and
-    access verdicts about a previously published result.
-    """
+    """Raised when a completed generation fails its pre-commit publication validation."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
 class WinnerIntegrityError(PhaseSweepError):
-    """Raised when a saved phase result cannot safely be reused.
+    """Raised when a saved result is unreadable, malformed, or cannot be reused.
 
-    A skipped phase's winner may be unreadable, structurally incomplete,
-    ambiguously scoped, or incompatible with the current phase's partial-result
-    policy, and a live phase's accepted partial-timeout decision replays only
-    under that policy too. These are operator-visible artifact/configuration
-    refusals; fingerprint drift keeps its more specific
-    :class:`StudyFingerprintMismatchError` type.
+    Includes ambiguous source identity and disallowed partial-result replay.
+    Fingerprint drift uses :class:`StudyFingerprintMismatchError`.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
@@ -96,19 +70,7 @@ class RunRequestError(PhaseSweepError):
 
 
 class TrialEvidenceMissingError(PhaseSweepError):
-    """Raised when a selection-eligible trial's on-disk evidence is gone.
-
-    A completed trial that the study still records as eligible to win no
-    longer has the evidence directory and audit artifacts its own record
-    names. Winner selection reads Optuna alone, so without this check the
-    orchestrator would republish that trial's number, metric, and provenance
-    from a tree that no longer contains a single byte behind them.
-
-    Fails the run closed rather than either silently selecting such a trial
-    or silently skipping it: skipping is not the safe fallback here, because
-    dropping the trials whose evidence happens to be missing changes which
-    trial wins and therefore biases the published result.
-    """
+    """Raised to refuse selection of a trial whose recorded evidence is missing."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
@@ -120,17 +82,11 @@ class StudyStorageUnavailableError(PhaseSweepError):
 
 
 class IncompleteJournalRecordError(StudyStorageUnavailableError):
-    """Raised before a write when a journal's partial final record could not be repaired.
+    """Raised when a partial final journal record cannot be repaired before writing.
 
-    A crashed writer's partial final record is normally cut under Optuna's
-    journal lock before any write. This names why that repair did not finish:
-    the lock, backup, or truncation failed, which restoring write access to
-    the ledger fixes; the lock stayed held past the repair's wait, which
-    removing a lock a killed writer left fixes; the journal has a second
-    hard-linked name, whose appends take another lock; or, while the lock
-    was held, the journal changed or another process took the lock over,
-    which a retry settles (``action`` is then ``RETRY``). The intact records
-    remain, so the ledger needs repair, not a copy from a backup.
+    Causes include lock timeout or replacement, multiple journal hard links, backup
+    or truncation failure, and journal changes during repair. Intact records remain;
+    lock replacement or concurrent changes carry ``OperatorAction.RETRY``.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER
@@ -143,18 +99,9 @@ class PublishedStudyMissingError(PhaseSweepError):
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):
-    """Raised when required attempt recovery state cannot persist before launch.
+    """Raised when required recovery state cannot persist before launch.
 
-    The allocated lifecycle marker proves a process was never created, and the
-    experiment-level ``attempts/`` registry discovers work after a phase rename,
-    removal, or storage change. Losing either record before launch creates an
-    attempt a later run cannot safely account for.
-
-    Both writes are consequently pre-launch durability requirements. This
-    failure is raised before any trainer starts or any GPU lease is consumed,
-    so nothing needs undoing. The condition is environmental (the experiment
-    workdir is not writable), so the remedy is restoring that tree, not a
-    config change.
+    Launch and GPU acquisition stop when recovery state cannot be persisted.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
@@ -167,13 +114,10 @@ class ExperimentLockBusyError(PhaseSweepError):
 
 
 class TrialTargetRefusedError(PhaseSweepError):
-    """Raised when a phase's trial target contradicts the trials its study already holds.
+    """Raised when a phase target contradicts its durable study state.
 
-    The target is refused in either direction. It is too low when it falls below
-    the target the study already accepted. It is too high when it is a fixed
-    configuration's target past what that configuration may retry: one attempt
-    more than its failures while none has completed, and none more once one
-    has. Both are fixed by correcting ``n_trials``.
+    ``n_trials`` cannot fall below the accepted target. A fixed configuration may
+    retry failures only until one attempt completes, feasible or not.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
