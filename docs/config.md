@@ -158,7 +158,7 @@ Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A fresh grid's
 
 For persistent storage, a phase with a `search_space` that uses `random`, `tpe`, or `cmaes` needs a seed. A phase with an empty `search_space` and no `repeats` draws nothing and is exempt. [Interrupted trials rerun](runtime.md#interrupted-trials-rerun) explains draw positions and reproducibility; [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) covers failed attempts, target increases, and partial results. When a grid winner touches the smallest or largest value of a numeric search axis, selection logs an advisory warning naming the key, value and boundary so you can consider expanding the range. This includes all-numeric categorical choices in numeric order; boolean, mixed, string, singleton and repeat axes are excluded. The warning never changes the winner or stops later phases.
 
-#Parallel TPE and CMA-ES suggestions depend on trial completion order, even with `sampler.seed`; `validate` and previews warn when `n_jobs` exceeds one. Set a seed and use one worker when reproducible adaptive draws matter.
+Parallel TPE and CMA-ES suggestions depend on trial completion order, even with `sampler.seed`; `validate` and previews warn when `n_jobs` exceeds one. Set a seed and use one worker when reproducible adaptive draws matter.
 
 ### Repeats
 
