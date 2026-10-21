@@ -55,3 +55,5 @@ def test_real_decoder_guide_has_a_complete_persistent_repeats_workflow() -> None
     assert f"phasesweep status {config} --trials" in section
     assert f"phasesweep show-winners {config}" in section
     assert section.count(f"phasesweep run {config}\n") >= 2
+    assert "`execution.cwd`" in section
+    assert "outside the checkout" in section

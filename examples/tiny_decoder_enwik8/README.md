@@ -48,7 +48,7 @@ The example sweeps only supported trainer controls. The upstream template does n
 
 ## Learning rates over seeds
 
-The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. After the setup above, run from the PhaseSweep repository root:
+The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. When copying this YAML outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After the setup above, run from the PhaseSweep repository root:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/repeats.yaml
