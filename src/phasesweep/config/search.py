@@ -340,6 +340,12 @@ def sampler_warnings(phase: Phase) -> list[str]:
             "and TPE never fits its model. Use sampler.type: random with a seed (same "
             "coverage), or set sampler.n_startup_trials below n_trials."
         )
+    if sampler.type in ("tpe", "cmaes") and phase_draws(phase) and phase.n_jobs > 1:
+        warnings.append(
+            f"Phase {phase.name!r}: parallel {sampler.type} suggestions depend on trial "
+            "completion order and are not reproducible even with sampler.seed. "
+            "Set sampler.seed and use n_jobs: 1 for reproducible draws given the same trial values."
+        )
     repeats = phase.repeats
     if repeats is not None and phase.max_consecutive_failures <= len(repeats.values):
         count = len(repeats.values)
