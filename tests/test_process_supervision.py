@@ -1960,6 +1960,7 @@ def test_uncertain_cleanup_cancels_queued_host_gpu_lease_wait(tmp_path: Path) ->
 
     result = subprocess.run(
         [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],  # The script imports the tests package.
         text=True,
         capture_output=True,
         timeout=10,
