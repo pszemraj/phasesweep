@@ -726,7 +726,16 @@ def main(argv: list[str] | None = None) -> int:
         # artifact upload carries no secrets; the exception text may.
         code = _error_code(exc)
         cause = _failure_cause(exc)
-        if code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
+        failure: BaseException | None = exc
+        while failure is not None and not isinstance(failure, ConnectionRefusedError):
+            failure = failure.__cause__ or failure.__context__
+        if isinstance(failure, ConnectionRefusedError):
+            cause = _failure_cause(failure)
+            advice = (
+                "the tracking server refused the connection; check tracking_uri "
+                "and that the server is running"
+            )
+        elif code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
             advice = "the experiment or run no longer exists"
         elif code in {"INVALID_PARAMETER_VALUE", 400}:
             advice = (
