@@ -232,6 +232,31 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
     assert "No module named 'm" in hints[0]
 
 
+def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_path: Path) -> None:
+    """The headline promises a cause for every failed or infeasible trial, and each row keeps its own."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_x_trainer(tmp_path),
+        metric=_bounded_metric(max=1.0),
+        n_trials=2,
+        max_consecutive_failures=5,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match="records why each failed or infeasible trial"):
+        run_experiment(experiment)
+
+    with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
+        rows = {row["state"]: row for row in csv.DictReader(handle)}
+    assert set(rows) == {"FAIL", "INFEASIBLE"}
+    assert "non-zero exit code 3" in rows["FAIL"][f"user_attr:{FAILURE_REASON_ATTR}"]
+    # An infeasible trial finished without an execution failure, so its cause is in its outcome.
+    assert rows["INFEASIBLE"][f"user_attr:{FAILURE_REASON_ATTR}"] == ""
+    assert "infeasible: metric" in rows["INFEASIBLE"][f"user_attr:{TRIAL_OUTCOME_ATTR}"]
+    assert "> max=1.0" in rows["INFEASIBLE"][f"user_attr:{TRIAL_OUTCOME_ATTR}"]
+
+
 @pytest.mark.parametrize("verbose", [False, True])
 @pytest.mark.integration
 def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bool) -> None:

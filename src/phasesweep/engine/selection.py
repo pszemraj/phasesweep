@@ -165,13 +165,14 @@ def select_winner(
             f"{len(repeats.values)} trials (one per repeats.values of {repeats.key!r}) are "
             f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
             "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-            "each failed trial's reason." + _metric_bounds_note(trials, experiment)
+            "why each failed or infeasible trial finished that way."
+            + _metric_bounds_note(trials, experiment)
         )
     if not survivors:
         raise NoFeasibleTrialError(
-            "No completed trials in phase. The phase's trials.csv records each "
-            "failed trial's reason; trainer output is in its trial_* directory."
-            + _metric_bounds_note(trials, experiment)
+            "No completed trials in phase. The phase's trials.csv records why each "
+            "failed or infeasible trial finished that way; trainer output is in its "
+            "trial_* directory." + _metric_bounds_note(trials, experiment)
         )
 
     winning: RankedGroup | None = None

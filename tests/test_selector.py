@@ -274,8 +274,9 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     with pytest.raises(NoFeasibleTrialError) as excinfo:
         select_winner(study, _with_bounds(_make_exp(), max=2.0))
     assert str(excinfo.value) == (
-        "No completed trials in phase. The phase's trials.csv records each "
-        "failed trial's reason; trainer output is in its trial_* directory. "
+        "No completed trials in phase. The phase's trials.csv records why each "
+        "failed or infeasible trial finished that way; trainer output is in its "
+        "trial_* directory. "
         "Metric bounds: metric.max=2.0. The best value among COMPLETE and INFEASIBLE trials "
         "with a finite value is 3.5 (trial 1)."
     )
@@ -398,7 +399,7 @@ def test_repeats_without_complete_group_names_incomplete_groups() -> None:
         "No complete repeat group: a configuration ranks only when all 3 trials (one per "
         "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 group(s) were "
         "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-        "each failed trial's reason. Metric bounds: metric.min=0.01."
+        "why each failed or infeasible trial finished that way. Metric bounds: metric.min=0.01."
     )
 
 

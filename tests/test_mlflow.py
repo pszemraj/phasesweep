@@ -1341,7 +1341,7 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failu
         )
         monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", unavailable)
         experiment = native_experiment(tmp_path)
-        with pytest.raises(NoFeasibleTrialError, match="trials.csv records each failed"):
+        with pytest.raises(NoFeasibleTrialError, match="trials.csv records why each failed"):
             run_experiment(experiment)
         from phasesweep.engine.paths import _experiment_dir
 
