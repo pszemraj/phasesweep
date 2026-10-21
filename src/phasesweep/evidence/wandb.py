@@ -499,6 +499,11 @@ def _poll_wandb_summary(
                         if time.monotonic() >= deadline:
                             break
                         return capture
+                    missing = sorted(key for key in required if key not in summary)
+                    last_error = RuntimeError(
+                        f"Missing required summary keys: {missing!r}; "
+                        f"available summary keys: {sorted(summary)!r}."
+                    )
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
 
@@ -590,6 +595,9 @@ def main(argv: list[str] | None = None) -> int:
         if task == "position":
             response = {"status": "position", "value": _locate_wandb_position(**request)}
         else:
+            # Leave time to report missing keys before the supervisor's deadline.
+            remaining = max(0.0, request["deadline"] - time.monotonic())
+            request["deadline"] -= min(0.1, remaining / 2)
             response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}

@@ -462,6 +462,7 @@ def _capture_wandb(
         )
         raise error(
             f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
+            + (f" Last observation: {exc.last_error}" if exc.last_error else "")
         ) from exc
     except WandbSetupError as exc:
         raise ExtractorError(

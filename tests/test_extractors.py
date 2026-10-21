@@ -691,6 +691,69 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
     assert "worker-diagnostic-marker" not in str(exc_info.value)
 
 
+def test_wandb_missing_summary_key_reports_available_names_after_polling(
+    wandb_worker_sdk, tmp_path
+):
+    calls = tmp_path / "lookup-count"
+    wandb_worker_sdk(f"""
+        from pathlib import Path
+        class Run:
+            state = "finished"
+            summary_metrics = {{"eval/loss": 0.25, "train/runtime": 123456.789}}
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                target = Path({str(calls)!r})
+                target.write_text(str(int(target.read_text()) + 1) if target.exists() else "1")
+                return Run()
+    """)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="eval_loss",
+        poll_seconds=0.02,
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(make_trial_context(tmp_path), extractor)
+
+    message = str(caught.value)
+    assert "eval_loss" in message
+    assert "available" in message.lower()
+    assert "eval/loss" in message
+    assert "train/runtime" in message
+    assert "123456.789" not in message
+    assert int(calls.read_text()) > 1
+
+
+def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_path):
+    wandb_worker_sdk("""
+        calls = 0
+        class Run:
+            state = "finished"
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                global calls
+                calls += 1
+                run = Run()
+                run.summary_metrics = {"loss": 0.25} if calls >= 3 else {"train/runtime": 1}
+                return run
+    """)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.01,
+        timeout_seconds=2,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
+
+
 @pytest.mark.parametrize("request_kind", ["summary", "position"])
 def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch, request_kind):
     """Uncertain worker cleanup is never downgraded, even for the advisory position read."""
