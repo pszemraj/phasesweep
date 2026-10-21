@@ -276,7 +276,7 @@ def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
 
 
 def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
-    """Whether failed trials were at least as numerous as ranked ones.
+    """Whether at least one trial failed and failures are at least as numerous as ranked ones.
 
     :param Mapping[str, int] counts: Survivorship counts.
     :return bool: Whether the failures could have decided what was ranked.

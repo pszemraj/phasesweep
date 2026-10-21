@@ -840,7 +840,7 @@ class RunStore:
     def clear_pre_spawn_orphan(self, run_id: str) -> Path | None:
         """Preserve any runner log and remove a revalidated preparation durably.
 
-        :param str run_id: Orphan identity previously reported by launch.
+        :param str run_id: Run id of the abandoned launch preparation.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
         :return Path | None: Preserved runner log path, including an archive from an
             interrupted recovery, or None when no log existed.

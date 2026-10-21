@@ -257,7 +257,8 @@ def _bind_lock_identities(
             ``nvidia-smi`` cannot validate an opaque token, or a configured
             numeric/UUID identity is absent from the readable inventory.
     :return list[GpuDevice]: The same devices, in order, with ``lock_token``
-        populated where a canonical identity could be resolved. No device is dropped.
+        set to its canonical GPU or MIG identity. A token that cannot be resolved
+        raises instead, so no device is dropped.
     """
     _validate_device_token_shapes(devices)
     numeric = [device for device in devices if device.visible_token.isdigit()]

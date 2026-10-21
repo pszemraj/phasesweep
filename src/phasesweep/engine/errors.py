@@ -105,10 +105,7 @@ class PublishedStudyMissingError(PhaseSweepError):
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):
-    """Raised when required recovery state cannot persist before launch.
-
-    Launch and GPU acquisition stop when recovery state cannot be persisted.
-    """
+    """Raised when required recovery state cannot persist before launch or GPU acquisition."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 

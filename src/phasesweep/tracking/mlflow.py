@@ -471,9 +471,8 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 
     binding, query = request["binding"], request["query"]
-    # The parent stops this worker when timeout_seconds runs out (``timeout_at``,
-    # a shared monotonic instant). Ending the wait just before lets the worker
-    # report what is missing; a nearer phase/run deadline still stops it first.
+    # Stop just before timeout_at, a shared monotonic instant, so the worker can report
+    # what is missing; a nearer phase or run deadline still stops it first.
     reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
     stop = request["timeout_at"] - reserve
     while True:

@@ -320,8 +320,8 @@ def sampler_capability_line(phase: Phase, storage: str | None) -> str:
 def sampler_warnings(phase: Phase) -> list[str]:
     """List advisory sampler and trial-budget warnings without blocking execution.
 
-    Fixed configurations have no sampler warnings; multiple requested trials
-    may represent retries, which only the existing study can establish.
+    A fixed configuration warns when ``n_trials`` exceeds 1, since the extra trials
+    can only retry failed attempts.
 
     :param Phase phase: Phase whose sampler, trial target and failure budget are checked.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
@@ -436,7 +436,7 @@ def grid_cardinality(phase: Phase) -> int:
 
 
 def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str | None:
-    """Limit a grid to one new attempt per cell without a completed result.
+    """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
     Finished failures remain spent. Raising the target may retry each failed
     cell once, or visit an unvisited cell; a completed cell is closed even if

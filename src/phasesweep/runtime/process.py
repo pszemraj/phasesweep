@@ -782,8 +782,8 @@ def run_supervised(
         pid = exc.pid
         return_code = -9
         if proc is not None:
-            # Raised at the pre-payload recheck: the supervisor is still
-            # blocked on its ack pipe; kill and reap it here.
+            # Raised at the pre-payload recheck or while the payload is written:
+            # the supervisor is still blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
             pid = pgid if pgid is not None else proc.pid
             if proc.returncode is not None:

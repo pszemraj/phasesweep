@@ -311,9 +311,9 @@ def signal_handler_scope() -> Iterator[None]:
     ownership. Restoration reports its first error only when the body did not fail.
 
     Raises:
-        SignalOwnershipUnavailableError: Called from a non-main thread while
-            no enclosing scope or explicit :func:`install_signal_handlers`
-            call already owns the shutdown signals.
+        SignalOwnershipUnavailableError: Called from a non-main thread when no
+            :func:`install_signal_handlers` call owns the shutdown signals for the
+            process lifetime; a scope open on the main thread does not count.
 
     Yields:
         ``None`` during the run whose children require shutdown cleanup.

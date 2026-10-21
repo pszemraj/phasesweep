@@ -425,8 +425,9 @@ def read_stale_process_identity(
         """Validate and return one required positive-int identity field.
 
         Args:
-            field: Name of the top-level identity field to validate, used
-                only to build the error message.
+            field: Name of the top-level identity field to read from the
+                payload and validate; it also names the field in the error
+                message.
 
         Returns:
             The field's value, guaranteed to be a non-bool ``int`` greater

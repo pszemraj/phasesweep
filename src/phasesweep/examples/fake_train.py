@@ -22,7 +22,7 @@ import yaml
 from phasesweep import report_objective
 
 #: Standard deviation of the loss noise a ``seed`` adds, comparable to the loss gap between
-#: neighboring learning rates, so close configurations scatter about the trend.
+#: neighboring learning rates.
 SEED_NOISE_SCALE = 0.02
 
 

@@ -218,7 +218,7 @@ def _config_entry_payload(entry: ReferenceEntry, description: str) -> JsonObject
 
 
 def _cursor_offset(cursor: str | None) -> int:
-    """Decode the opaque v1 cursor into a list offset.
+    """Decode a pagination cursor, the decimal offset ``next_cursor`` carries, into a list offset.
 
     :param str | None cursor: Cursor supplied by the agent.
     :return int: Zero-based catalog offset.
@@ -1224,7 +1224,8 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id to cancel.
         :return JsonObject: Cancellation result containing final state and optional cleanup confirmation.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
-        :raises PermissionDeniedError: If the run's entry did not allow cancel at launch time.
+        :raises PermissionDeniedError: If the run did not allow cancel at launch, or its
+            catalog entry no longer does.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
             process identity, so there is nothing safe to signal.
         :raises RunNamespaceMismatchError: If the runner was recorded in another

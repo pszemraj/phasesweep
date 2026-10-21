@@ -83,13 +83,9 @@ def _preflight_missing_reached_phase_environments(
 class TerminalReport:
     """One engine invocation's primary outcome and independent cleanup evidence.
 
-    ``winners`` is the engine's own authoritative winner mapping, populated on
-    the success path while the experiment lock is still held: a
-    terminal-result consumer (the MCP runner's snapshot capture) must be able
-    to freeze the published outcome from the exact in-memory state the engine
-    just returned, instead of re-deriving it from mutable storage or optional
-    diagnostic files whose absence would then contradict an engine-defined
-    success. ``None`` on every failure path.
+    ``winners`` holds the winners the engine captured under the experiment lock
+    on success, so a terminal-result consumer need not re-read storage. It is
+    ``None`` on every failure path.
     """
 
     generation_id: str
@@ -192,7 +188,7 @@ def run_experiment(
     :param publication_hook: Required sidecar around publication commit, if supplied.
     :param generation_id: Invocation identity, generated if omitted. Supplied names
         may contain only alphanumerics, underscores, and dashes.
-    :return Mapping[str, Winner]: Winners in declaration order. Dry runs return
+    :return dict[str, Winner]: Winners in declaration order. Dry runs return
         replayed winners where available and placeholders elsewhere.
     :raises NoFeasibleTrialError: A phase exhausted its failure limit or has no feasible trial.
     :raises UnsafeProcessCleanupError: A trial's process group may still be alive.

@@ -465,7 +465,7 @@ def prepare_trainer_input(
     :param str attempt_id: Attempt identity used in ``run_name`` placeholders.
     :param Path trial_dir: Per-trial artifact directory.
     :param dict[str, Any] overrides: Fully composed trial overrides.
-    :return PreparedTrainerInput: Materialized input bytes and historical identity.
+    :return PreparedTrainerInput: Materialized input bytes with their format, filename and digest.
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
@@ -558,9 +558,9 @@ def launch_trial(
     env = dict(environment_identity.values)
     phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
+    # Without a W&B query, the trainer keeps its own WANDB_RUN_ID.
     if wandb_query is not None:
         env["WANDB_RUN_ID"] = attempt_id
-    # Without an evidence consumer, preserve trainer-owned W&B identity.
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import read_binding, read_record

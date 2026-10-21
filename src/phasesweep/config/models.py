@@ -120,7 +120,7 @@ def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
 
 
 def _metric_scoring_line(metric: Metric) -> str:
-    """Describe the scalar source, within-trial selection, and between-trial goal.
+    """Describe the metric's name, goal, viability bounds, and extractor config.
 
     :param Metric metric: Configured optimization metric.
     :return str: One line naming the metric, its goal, its viability bounds when set, and
@@ -321,7 +321,8 @@ def _environment_contract_line(experiment: Experiment) -> str:
 
     :param Experiment experiment: Loaded experiment.
     :return str: One line naming the digested inherited names, the ``env`` keys and the
-        pass-through names, each name in exactly one group.
+        pass-through names. A name set under ``env`` that is also passed through appears
+        in both groups, flagged as digested.
     """
     execution = experiment.execution
     contract = execution.inherit_env

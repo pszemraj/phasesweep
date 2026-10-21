@@ -281,8 +281,8 @@ def closest(key: str, limit: int = 3) -> tuple[str, ...]:
     """Suggest documented keys for a key that matched nothing.
 
     Keys that end with the query's segments come first, so a bare ``inherit_env``
-    finds ``execution.inherit_env``. Misspelled whole paths and misspelled final
-    segments follow.
+    finds ``execution.inherit_env``. Only when none does, misspelled whole paths
+    and misspelled final segments are tried.
 
     :param str key: The unmatched key as the user typed it.
     :param int limit: Maximum number of suggestions.

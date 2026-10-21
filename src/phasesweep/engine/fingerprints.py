@@ -294,14 +294,14 @@ def _verify_fingerprint(
     phase: Phase,
     inherited_winners: dict[str, Winner],
 ) -> str:
-    """Stamp a fresh study with its fingerprint or fail on mismatch.
+    """Stamp a fresh study, or rebind an empty one, with its fingerprint; refuse a populated mismatch.
 
     :param optuna.Study study: Study being verified or stamped.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose fingerprint must match.
     :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
-    :raises StudyFingerprintMismatchError: The populated study has an incompatible
-        persisted fingerprint; the message names the keys that changed.
+    :raises StudyFingerprintMismatchError: The populated study has no persisted
+        fingerprint or an incompatible one; the message names the keys that changed.
     :return str: Verified current fingerprint.
     """
     payload = _phase_fingerprint_payload(experiment, phase, inherited_winners)

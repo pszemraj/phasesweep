@@ -141,6 +141,9 @@ def select_winner(
             satisfies every constraint and the metric's bounds, or with
             ``repeats`` if no group is complete. When the metric has bounds,
             the message names them and the best COMPLETE value seen.
+        TrialEvidenceMissingError: If the winning trial's persisted gate results,
+            objective provenance, or observed values are missing, corrupt, or
+            malformed.
 
     """
     minimize = experiment.metric.goal == "minimize"
@@ -517,8 +520,8 @@ def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: 
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the bounds and the goal.
-    :return str: A sentence naming each set bound and the best COMPLETE finite value with
-        its trial number, or an empty string when the metric has no bounds.
+    :return str: Text naming each set bound, then either the best COMPLETE finite value with
+        its trial number or that no COMPLETE trial has one; empty when the metric has no bounds.
     """
     metric = experiment.metric
     named = [

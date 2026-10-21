@@ -5,8 +5,7 @@ Mutations require the experiment lock. Reads and previews use captured snapshots
 ``validate_ledger`` checks tree ownership before scanning; a bound tree's unreadable
 scan may still serve its frozen publication. ``claim_ledger`` requires a complete
 scan, repairs a partial final record and validates existing studies before writing.
-It then creates the ledger directory, binds the tree and claims empty studies, in
-that order. Execution requires a ClaimedLedger.
+Execution requires a ClaimedLedger.
 
 MCP recovery may open live studies from a ValidatedLedger, checking their artifact
 ownership before reaping. Registry recovery validates its separately recorded ledger.

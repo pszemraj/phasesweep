@@ -298,9 +298,11 @@ def _cleanup_failure_payload(
         when classifying it as the nested cause.
     :param BaseException | None cleanup_error: The engine's recorded cleanup
         failure, whose repairs the payload keeps.
-    :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
-        ``primary`` nested under ``"cause"``. For an existing cleanup error,
-        retain its explicit storage failure when that prevents inspection.
+    :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload with
+        ``primary`` nested under ``"cause"``; a ``ProcessCleanupUncertainError``
+        primary nests only its ``StudyStorageUnavailableError`` cause, when it has one.
+        For an existing cleanup error, retain its explicit storage failure when that
+        prevents inspection.
     """
     payload = _cleanup_uncertain_payload(_cleanup_steps(primary, cleanup_error))
     # Preserve the primary cause's policy beneath the authoritative cleanup refusal.

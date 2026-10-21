@@ -1147,7 +1147,7 @@ execution: object = {}
   inherit_env: "all" | "none" | list[string] = "none"
 
   # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty, unpadded and free of = and NUL characters.
-  # TMPDIR is built in: it is always inherited when set and never digested, so a sandboxed and an ordinary shell agree on it, and it is not written here. A list adds names to it, and listing TMPDIR anyway changes nothing. PATH is not built in, because it decides which interpreter and tools run.
+  # TMPDIR is built in: it is always inherited when set and never digested, so a sandboxed and an ordinary shell agree on it, and it is not written here. A list adds names to it, and listing TMPDIR anyway changes nothing. PATH is not built in; see execution.inherit_env for why it is tracked.
   # With inherit_env all this list adds nothing to the environment, because every ambient variable is already inherited. With none or a list, it adds these variables to the base set.
   # The effective names, TMPDIR included, are part of the study fingerprint. Their values are neither recorded with each trial nor compared, so they can rotate without stopping reuse. A variable missing from the ambient environment is not invented.
   # These variables also reach PhaseSweep's own MLflow and W&B workers, so they must exist in the controller's environment, including for sync-tracking.
@@ -1159,7 +1159,7 @@ execution: object = {}
 
   # Write the composed base environment to environment.json in each attempt directory with owner-only mode 0600.
   # The file holds the digest, the inherit_env setting, the sorted effective passthrough_env names (TMPDIR included) and the full env mapping. It is written before the per-trial PHASESWEEP_* names, the GPU bindings and the per-attempt W&B and MLflow bindings are added, so they are absent from it.
-  # Whether or not this is true, each trial records the tracked environment (the base names, the names in an inherit_env list, the env entries and the W&B and MLflow variables PhaseSweep composes) and its digest in the study ledger. That record leaves out the pass-through values; this file holds them, and under inherit_env all the rest of the inherited shell too.
+  # Whether or not this is true, the study ledger keeps each trial's tracked environment (see execution.inherit_env) and its digest, without the pass-through values. This file holds those, and under inherit_env all the rest of the inherited shell too.
   # Excluded from the study fingerprint.
   # Warning: true stores ambient and passed-through secrets in the file. Use it only when keeping the full environment is intended.
   record_env: bool = false

@@ -206,8 +206,6 @@ def recover_run(
                 terminal_status["result_snapshot_state"] = "pending"
                 try:
                     write_status_file(store.status_path(run_id), terminal_status)
-                # The write is filesystem work an operator can fix; anything
-                # else is a defect and keeps its traceback.
                 except (PhaseSweepError, OSError) as exc:
                     raise RunRecoveryError.rewrap(
                         exc,

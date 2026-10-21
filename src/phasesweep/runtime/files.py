@@ -1209,8 +1209,8 @@ def file_url_path(storage: str) -> str:
 def journal_file_path(storage: str) -> Path:
     """Resolve a file-backed journal URL to its canonical path.
 
-    Freeze the working directory and resolve symlinks so storage and repair locks
-    address the same journal.
+    Anchor a relative path at the current working directory and resolve symlinks so
+    storage and repair locks address the same journal.
 
     :param str storage: Journal storage URL, including escaped ``file:`` forms.
     :raises ValueError: ``storage`` does not name a journal file.

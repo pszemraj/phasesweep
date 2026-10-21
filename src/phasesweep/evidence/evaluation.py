@@ -197,7 +197,7 @@ def _extract_json(
 ) -> float:
     """Read a trial-relative JSON file and extract its numeric value.
 
-    :param TrialContext ctx: Trial output directory.
+    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
     :param provenance: Optional source-evidence sink.
     :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
@@ -338,7 +338,7 @@ def _extract_log_regex(
     First selection stops matching after its first hit but continues reading for
     the digest. Provenance includes the selected 1-based line and numeric match count.
 
-    :param TrialContext ctx: Trial output directory.
+    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, unreadable, has no numeric match,
@@ -544,7 +544,8 @@ def locate_objective_position(
     """Add an advisory W&B evaluation position after the objective is accepted.
 
     Failed or expired history reads leave the position unset and retain the
-    accepted objective. Other extractor kinds already record their position.
+    accepted objective. Only W&B needs this lookup: envelope and MLflow objectives
+    record their position at extraction, and json and log_regex record none.
 
     :param TrialContext ctx: Accepted attempt.
     :param ObjectiveExtractor cfg: Objective extractor.

@@ -35,7 +35,7 @@ def _compact_value(value: Any) -> Any:
 
 
 def _compact_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
-    """Return a shallow copy without ``None`` values.
+    """Return a copy without ``None`` values and with overlong strings truncated.
 
     :param dict[str, Any] | None values: Optional mapping to compact.
     :return dict[str, Any]: Empty dict for ``None`` or a shallow copy with null-valued entries removed.

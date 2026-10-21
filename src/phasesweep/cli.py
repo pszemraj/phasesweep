@@ -1204,9 +1204,6 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
-    :raises FileExistsError: If ten randomized staging names all collide beside
-        ``output``; handled by this function's own ``OSError`` branch, which reports
-        the failure and returns ``False`` rather than propagating.
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():
