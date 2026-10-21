@@ -40,7 +40,7 @@ def _preflight_skipped_winners(
     :return dict[str, Winner]: Compatible required or published winners in declaration order.
     :raises TimeoutError: The whole-run wallclock deadline expired before a
         skipped phase could be validated.
-    :raises FileNotFoundError: A required skipped phase has no persisted ``winner.yaml``.
+    :raises ResumeWinnerMissingError: A required skipped phase has no persisted ``winner.yaml``.
     :raises WinnerIntegrityError: A skipped phase's persisted winner is invalid
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
@@ -128,7 +128,7 @@ def _accept_skipped_winner(
         phases, which supply ``phase``'s inherited context.
     :param ValidatedPublication | None publication: The publication resolved
         once for the whole resume.
-    :raises FileNotFoundError: The publication holds no winner for the phase.
+    :raises ResumeWinnerMissingError: The publication holds no winner for the phase.
     :raises WinnerIntegrityError: The winner is incompatible with the current
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a

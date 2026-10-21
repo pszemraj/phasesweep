@@ -7,7 +7,7 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Metric, Phase
 from phasesweep.config.search import CategoricalParam, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import ResumeWinnerMissingError, StudyFingerprintMismatchError
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import tree_snapshot
@@ -68,7 +68,7 @@ def test_dry_run_refuses_missing_inherited_winner(tmp_path: Path) -> None:
         ],
     )
 
-    with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'parent'"):
+    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'parent'"):
         run_experiment(experiment, from_phase="child", dry_run=True)
 
     assert not (tmp_path / "runs").exists()

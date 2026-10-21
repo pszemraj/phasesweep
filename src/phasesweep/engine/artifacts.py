@@ -16,7 +16,11 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
+from phasesweep.engine.errors import (
+    ResumeWinnerMissingError,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
@@ -263,7 +267,7 @@ def _load_winner(
     :param ValidatedPublication | None publication: The last-success publication the caller
         resolved with ``raise_on_manifest_error=True``; ``None`` when nothing is published. A
         caller loading several phases resolves it once.
-    :raises FileNotFoundError: The publication holds no winner for the phase.
+    :raises ResumeWinnerMissingError: The publication holds no winner for the phase.
     :raises WinnerIntegrityError: The winner is incomplete, incompatible with the current
         partial-result policy, or carries a ``repeats`` block that is not the phase's
         configured repeat axis.
@@ -272,13 +276,18 @@ def _load_winner(
     :return Winner: The reconstructed winner for ``phase``.
     """
     if publication is None:
-        raise FileNotFoundError(
-            f"Winner file missing for phase {phase.name!r}: no generation has completed."
+        raise ResumeWinnerMissingError(
+            f"Winner file missing for phase {phase.name!r}: no generation has completed, so "
+            "the workdir has no earlier results to resume from. Run without --from-phase so "
+            "the earlier phases run first, or use the workdir that holds their results."
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners.get(phase.name)
     if validated is None:
-        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
+        raise ResumeWinnerMissingError(
+            f"Winner file missing for phase {phase.name!r}: {path}. The last published "
+            "generation holds no winner for it. Run without --from-phase so it runs first."
+        )
     data = validated.payload
 
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)

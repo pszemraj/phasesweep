@@ -69,6 +69,12 @@ class WinnerIntegrityError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
 
+class ResumeWinnerMissingError(PhaseSweepError):
+    """Raised when a resume skips a phase whose winner the publication does not hold."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 class RunRequestError(PhaseSweepError):
     """Raised when a caller requests an unsupported or conflicting run identity."""
 

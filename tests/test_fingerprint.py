@@ -25,6 +25,7 @@ from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublishedStudyMissingError,
+    ResumeWinnerMissingError,
     RunRequestError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -369,7 +370,7 @@ def test_from_phase_dry_run_refuses_missing_inherited_winner(tmp_path):
             ),
         ],
     )
-    with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'arch'"):
+    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'arch'"):
         run_experiment(exp, from_phase="lr", dry_run=True)
     assert not (tmp_path / "runs").exists()
 

@@ -21,6 +21,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
+    ResumeWinnerMissingError,
     StudyContextConflictError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
@@ -472,7 +473,7 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
     assert totals() == ["DRY RUN total: would launch 6 trials (1 rerun) across 3 phases"]
 
     caplog.clear()
-    with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'a'"):
+    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'a'"):
         run_experiment(experiment, from_phase="b", dry_run=True)
     assert totals() == []
 

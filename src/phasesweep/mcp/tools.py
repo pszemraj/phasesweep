@@ -36,6 +36,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublicationAccessError,
     PublicationIntegrityError,
+    ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -1381,7 +1382,7 @@ class PhaseSweepMCP:
                     "failed" if isinstance(exc, PublicationIntegrityError) else "permission_denied"
                 )
                 return ResumePublicationUnusableError(reg.id, from_phase, state)
-            if isinstance(exc, FileNotFoundError):
+            if isinstance(exc, ResumeWinnerMissingError):
                 return ResumeNotReadyError(reg.id, from_phase, phase_name)
             if isinstance(
                 exc, (RuntimeError, KeyError, TypeError, ValueError, AttributeError, OSError)

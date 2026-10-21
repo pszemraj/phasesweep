@@ -197,7 +197,8 @@ def run_experiment(
     :raises PhaseSweepError: Preflight, storage, publication, or recovery refused the run.
     :raises RuntimeError: An engine invariant failed.
     :raises ValueError: An unsafe generation id or unknown resume phase was supplied.
-    :raises FileNotFoundError: A skipped phase has no published winner.
+    :raises ResumeWinnerMissingError: A skipped phase has no published winner; a fresh
+        artifact tree is refused before anything is written.
     """
     # Revalidate copied models while preserving mutable defaults and field-set state.
     experiment = Experiment.model_validate(experiment)
@@ -213,6 +214,9 @@ def run_experiment(
     # Fresh-tree launch checks precede writes; existing trees defer them until work remains.
     environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
     if environments_preflighted:
+        # A fresh tree holds no publication, so a resume that needs earlier winners cannot
+        # succeed; refuse it before the run creates the tree.
+        resume_ops._preflight_skipped_winners(experiment, from_phase=from_phase, run_deadline=None)
         _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
     winners = _run_experiment_outcome(
         experiment,
