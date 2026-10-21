@@ -493,6 +493,7 @@ phases: list[object] (required)
       type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 
       # Sampler random seed, an integer from 0 to 4294967295. It is independent of any trainer seed in trainer_config or phases[].fixed_overrides.
+      # Seeded random, tpe and cmaes also use the study name experiment::phase, formed from experiment and phases[].name. Renaming either changes the draws even with the same seed and search space.
       # For grid the seed fixes the order in which Optuna visits the grid points, which also decides which points a partial grid runs.
       # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that unless the phase draws nothing (an empty phases[].search_space without phases[].repeats).
       # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt, and so is a phase with an empty phases[].search_space and no phases[].repeats, which draws nothing.
