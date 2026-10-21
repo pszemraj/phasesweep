@@ -462,6 +462,14 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
     environment = _environment_identity(experiment, experiment.phases[0].name).values
     for path in _save_generation_intents(experiment, generation_id):
         _deliver(experiment, path, environment)
+    pending = delivery_status(experiment, generation_id)["pending"]
+    if pending:
+        log.warning(
+            "MLflow uploads PENDING generation=%s pending=%d; published result saved locally. "
+            "Run phasesweep sync-tracking with the same config to finish delivery.",
+            generation_id,
+            pending,
+        )
 
 
 def _published(experiment: Experiment, generation_id: str) -> bool:
