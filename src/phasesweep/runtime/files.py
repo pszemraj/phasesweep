@@ -98,7 +98,7 @@ class _LockPolicy:
     file_mode: int
 
 
-def require_posix_runtime() -> None:
+def require_linux_runtime() -> None:
     """Raise a clear error when execution is attempted on a non-Linux host.
 
     This is the only platform check. Everything below it may use Linux-only
@@ -179,7 +179,7 @@ def lock_dir() -> Path:
             ) from exc
         return path
 
-    require_posix_runtime()
+    require_linux_runtime()
     import pwd
 
     # Shells and services for one account must contend even when HOME or XDG
@@ -315,7 +315,7 @@ def _open_lock_file(path: Path) -> IO[str]:
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks.
     """
-    require_posix_runtime()
+    require_linux_runtime()
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
@@ -392,7 +392,7 @@ def try_flock(handle: IO[str]) -> bool:
     :param IO[str] handle: File descriptor whose inode all contenders open.
     :return bool: Whether the lock was acquired; the caller owns the handle.
     """
-    require_posix_runtime()
+    require_linux_runtime()
     import fcntl
 
     try:

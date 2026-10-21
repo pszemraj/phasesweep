@@ -800,7 +800,7 @@ def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
     """Real execution needs Linux; dry-run launches nothing and takes no locks."""
     from phasesweep.runtime import files as runtime_files
 
-    runtime_files.require_posix_runtime()
+    runtime_files.require_linux_runtime()
 
     exp = make_experiment(
         experiment="platform_check",

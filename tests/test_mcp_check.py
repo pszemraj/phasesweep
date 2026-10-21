@@ -195,7 +195,7 @@ def _platform_gate_refuses() -> None:
     ("patch_target", "value", "match"),
     [
         pytest.param(
-            "phasesweep.mcp.registry.require_posix_runtime",
+            "phasesweep.mcp.registry.require_linux_runtime",
             _platform_gate_refuses,
             "runs only on Linux",
             id="platform_gate_refuses",

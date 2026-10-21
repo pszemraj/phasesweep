@@ -31,7 +31,7 @@ from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
     canonical_storage_identity,
-    require_posix_runtime,
+    require_linux_runtime,
 )
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
@@ -47,7 +47,7 @@ def require_linux_mcp_host() -> None:
         recovery.
     """
     try:
-        require_posix_runtime()
+        require_linux_runtime()
     except PlatformCapabilityError as exc:
         raise CatalogError(str(exc), suggestion="run the MCP server on a Linux host") from exc
     if read_proc_starttime(os.getpid()) is None:
