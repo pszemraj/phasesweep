@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
+from phasesweep.runtime.json import JsonObject, json_object
 
 
 class PlannedPhase(NamedTuple):
@@ -42,12 +43,14 @@ class PlannedPhase(NamedTuple):
 
 
 class SnapshotPhases(NamedTuple):
-    """What a generation's validated config snapshot says about each of its phases."""
+    """Phase layout and argparse base from a generation's validated config snapshot."""
 
     inherits: Mapping[str, tuple[str, ...]]
     """Each phase's parents, in plan order."""
     repeats: Mapping[str, Repeats | None]
     """Each phase's configured ``repeats``, or ``None`` for a phase without them."""
+    argparse_trainer_config: JsonObject | None
+    """Producing argparse base, or ``None`` when the snapshot uses another format."""
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,8 @@ class ValidatedPublication:
     """The summary's metric semantics, checked against the config snapshot."""
     winners: Mapping[str, ValidatedWinner]
     """Every manifest-listed winner, keyed by the phase that exposes it."""
+    argparse_trainer_config: JsonObject | None
+    """Producing argparse base captured from the validated snapshot bytes."""
 
 
 def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
@@ -417,6 +422,7 @@ def _validate_generation_manifest(
         inherits=snapshot_phases.inherits,
         metric=metric,
         winners=winners,
+        argparse_trainer_config=snapshot_phases.argparse_trainer_config,
     )
 
 
@@ -446,8 +452,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return SnapshotPhases: Each snapshot phase's parents, in plan order, and its
-        configured ``repeats``.
+    :return SnapshotPhases: Each snapshot phase's parents, in plan order, its
+        configured ``repeats``, and the producing argparse base when applicable.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -543,7 +549,17 @@ def _validate_generation_provenance_files(
             raise fail(
                 f"config_snapshot artifact has a malformed repeats block for {phase['name']!r}"
             ) from exc
-    return SnapshotPhases(inherits=inherits, repeats=repeats)
+    argparse_trainer_config: JsonObject | None = None
+    if snapshot.get("override_format") == "argparse":
+        try:
+            argparse_trainer_config = json_object(snapshot.get("trainer_config"))
+        except ValueError as exc:
+            raise fail("config_snapshot artifact has a malformed trainer_config") from exc
+    return SnapshotPhases(
+        inherits=inherits,
+        repeats=repeats,
+        argparse_trainer_config=argparse_trainer_config,
+    )
 
 
 @dataclass(frozen=True)

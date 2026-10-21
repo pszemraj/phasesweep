@@ -682,6 +682,8 @@ def _run_experiment_inner(
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
         "artifacts": validation_ops._generation_artifact_manifest(experiment, generation_id),
     }
+    if experiment.override_format == "argparse":
+        summary["trainer_config"] = experiment.trainer_config
     artifact_io._write_yaml_atomic(summary_path, summary)
     generation_ops._publish_generation(
         experiment,
