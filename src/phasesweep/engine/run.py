@@ -598,6 +598,13 @@ def _run_experiment_inner(
             raise TimeoutError(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start."
             )
+        if (
+            using_preloaded_winner
+            and preloaded_winners is not None
+            and phase.name not in preloaded_winners
+        ):
+            log.info("phase=%s SKIPPED (not inherited by a reached phase)", phase.name)
+            continue
         # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}
 
