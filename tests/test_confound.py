@@ -861,6 +861,51 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert "2 failed trials against 2 ranked" in warnings[0]
 
 
+@pytest.mark.parametrize(
+    "record",
+    [_json(), log_regex_provenance(), _wandb(None), _envelope()],
+    ids=["json", "log_regex", "wandb-unlocated", "envelope"],
+)
+@pytest.mark.parametrize("count", [1, 2])
+def test_selection_warns_when_multiple_ranked_trials_have_no_evaluation_comparison(
+    caplog: pytest.LogCaptureFixture, record: JsonObject, count: int
+) -> None:
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=count)])
+    study = optuna.create_study(direction="minimize")
+    for number in range(count):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=0.2 + number * 0.1,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 10)},
+                user_attrs=_candidate_attrs(number, record),
+            )
+        )
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        selected = select_winner(study, experiment, phase_name="p")
+
+    assert selected.trial_number == 0
+    check = selected.confound["checks"]["evaluation_point"]
+    warnings = [
+        item.getMessage()
+        for item in caplog.records
+        if item.name == "phasesweep.engine.selection"
+        and item.levelno == logging.WARNING
+        and "evaluation_point" in item.getMessage()
+    ]
+    extractor = record["extractor"]
+    assert isinstance(extractor, dict)
+    if count == 2 and extractor["kind"] != "json_envelope":
+        assert check["verdict"] == "n/a"
+        assert len(warnings) == 1
+        assert "not checked" in warnings[0]
+        assert check["reason"] in warnings[0]
+    else:
+        assert warnings == []
+
+
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
     """Confound verdicts are advisory: a losing trial's bad record cannot fail selection."""
     experiment = make_experiment(phases=[_seeded_phase(n_trials=2)])

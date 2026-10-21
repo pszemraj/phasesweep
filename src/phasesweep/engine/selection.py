@@ -246,6 +246,13 @@ def select_winner(
             len(survivors),
             "; ".join(flagged),
         )
+    evaluation = confound["checks"]["evaluation_point"]
+    if len(survivors) >= 2 and evaluation["verdict"] == "n/a":
+        log.warning(
+            "[%s] evaluation_point not checked (advisory): %s.",
+            phase_name or study.study_name,
+            evaluation["reason"],
+        )
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     if phase is not None:
         _warn_grid_edges(phase, best.params)
