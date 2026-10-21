@@ -485,14 +485,14 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
-    """Persist the highest accepted target before the phase launches work.
+    """Persist the target the phase was validated against before it launches work.
+
+    The caller has already run :func:`_validate_trial_target` on this study under the
+    experiment lock, before claiming the generation.
 
     :param optuna.Study study: Study whose accepted trial target is stored.
     :param Phase phase: Phase config supplying the new ``n_trials`` target.
-    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
-        study's already-accepted target.
     """
-    _validate_trial_target(study, phase)
     if phase.n_trials != study.user_attrs.get(TRIAL_TARGET_ATTR):
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
