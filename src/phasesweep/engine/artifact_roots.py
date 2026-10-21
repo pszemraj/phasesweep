@@ -13,6 +13,7 @@ import optuna
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    ArtifactRootSchemaMismatchError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
@@ -179,7 +180,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
-        raise ArtifactRootConflictError(
+        raise ArtifactRootSchemaMismatchError(
             f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
             f"format {raw.get('schema_version')!r}. Nothing was written.",
         )

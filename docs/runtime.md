@@ -100,6 +100,8 @@ The two files are owner-only while their directories keep ordinary permissions. 
 
 `storage: null`, or omitting `storage`, is in-memory and ends with the process; it cannot be resumed or topped up by a later invocation, and a trial it interrupts never reruns. Persistent local storage is an explicit `journal:///...` URL, or `auto`, which always resolves to `<workdir>/<experiment>/study.journal`, regardless of `n_jobs`. The journal backend supports parallel trials (`n_jobs > 1`) on one host. Any other storage value, including `sqlite:///...`, `:memory:`, and external database URLs, is refused at config load; the error names the supported forms.
 
+PhaseSweep reads only the current artifact and study formats. When `status`, `show-winners`, or `run --dry-run` refuses an unsupported format, inspect the raw artifacts (`summary.yaml`, `winner.yaml`, trial logs, and the journal), or use the exact checkout that produced them for inspection if available. Development records may require an unreleased checkout. To launch a new run with the current checkout, use a fresh artifact root and ledger namespace.
+
 The selected artifact root and ledger are bound to each other in both directions:
 
 ```mermaid

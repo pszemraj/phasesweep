@@ -29,6 +29,12 @@ class ArtifactRootConflictError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
+class ArtifactRootSchemaMismatchError(ArtifactRootConflictError):
+    """Raised when an artifact root records an unsupported PhaseSweep schema."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
+
+
 class PublicationIntegrityError(PhaseSweepError):
     """Raised when a recorded publication exists but fails validation.
 

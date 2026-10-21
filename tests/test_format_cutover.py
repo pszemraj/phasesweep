@@ -60,6 +60,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     mark_current_format,
     requires_nonroot,
@@ -137,6 +138,63 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert tree_snapshot(materialized.root) == before
+
+
+@pytest.mark.parametrize("format_record", ["artifact-root", "study"])
+@pytest.mark.parametrize(
+    "command, options, read_only",
+    [
+        ("status", [], True),
+        ("status", ["--trials"], True),
+        ("show-winners", [], True),
+        ("run", ["--dry-run"], True),
+        ("run", [], False),
+    ],
+)
+def test_format_refusal_guidance_matches_cli_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    format_record: str,
+    command: str,
+    options: list[str],
+    read_only: bool,
+) -> None:
+    """Unsupported formats give inspection advice on reads and fresh-state advice on runs."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    if format_record == "artifact-root":
+        binding_path = _artifact_root_binding_path(materialized.experiment)
+        binding = json.loads(binding_path.read_text())
+        binding["schema_version"] -= 1
+        binding_path.write_text(json.dumps(binding) + "\n")
+    else:
+        records = [json.loads(line) for line in materialized.ledger_path.read_text().splitlines()]
+        changed = False
+        for record in records:
+            attrs = record.get("user_attr", {})
+            if STUDY_SCHEMA_ATTR in attrs:
+                attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
+                changed = True
+        assert changed
+        materialized.ledger_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
+    before = tree_snapshot(materialized.root)
+
+    code = invoke_cli_boundary([command, str(materialized.config_path), *options], monkeypatch)
+
+    output = capsys.readouterr()
+    assert code == 1
+    assert "unsupported" in output.err
+    assert "Traceback" not in output.err
+    assert tree_snapshot(materialized.root) == before
+    if read_only:
+        assert "inspect the raw artifacts" in output.err
+        assert "exact checkout that produced" in output.err
+        assert "if available" in output.err
+        assert "fresh namespace" not in output.err
+    else:
+        assert "fresh namespace" in output.err
 
 
 @pytest.mark.parametrize(
