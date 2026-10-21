@@ -658,6 +658,8 @@ class RepeatGroupView:
     max: float | None
     eligible: bool
     winner: bool
+    observed: dict[str, float]
+    observed_n: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -838,6 +840,14 @@ def _repeat_group_views(
             and trial.value is not None
             and math.isfinite(trial.value)
         ]
+        observations: dict[str, list[float]] = {}
+        for trial in found:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            for name, raw in trial.user_attrs.items():
+                value = _recorded_number(raw)
+                if name.startswith(OBSERVED_PREFIX) and value is not None and math.isfinite(value):
+                    observations.setdefault(name[len(OBSERVED_PREFIX) :], []).append(value)
         group = eligible.get(label)
         views.append(
             RepeatGroupView(
@@ -853,6 +863,8 @@ def _repeat_group_views(
                 max=max(values) if values else None,
                 eligible=group is not None,
                 winner=bool(found) and all(trial.number in marked for trial in found),
+                observed={name: statistics.fmean(values) for name, values in observations.items()},
+                observed_n={name: len(values) for name, values in observations.items()},
             )
         )
     return tuple(views)

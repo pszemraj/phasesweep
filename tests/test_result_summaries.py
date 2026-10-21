@@ -160,3 +160,23 @@ def test_repeat_summary_keeps_an_interrupted_group_without_measurements(tmp_path
     assert group.n == 0 and group.expected == 2
     assert group.mean is group.sd is group.min is group.max is group.aggregate is None
     assert not group.eligible and not group.winner
+
+
+def test_repeat_observed_means_report_their_own_contributor_counts(tmp_path: Path) -> None:
+    """Each observed mean names how many completed members actually recorded it."""
+    experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1, 2]), n_trials=3)
+    study = _new_phase_study(experiment, "p")
+    _add_trial(study, x=1, seed=0, value=0.4, attrs={"observed:heldout": 0.6})
+    _add_trial(study, x=1, seed=1, value=0.5, attrs={"observed:heldout": 0.8, "observed:cost": 2.0})
+    _add_trial(study, x=1, seed=2, value=0.6)
+
+    tables = read_trial_tables(experiment)
+    (table,) = tables.phases
+    (group,) = table.groups
+
+    assert group.n == 3
+    assert group.observed == {"cost": 2.0, "heldout": 0.7}
+    assert group.observed_n == {"cost": 1, "heldout": 2}
+    rendered = _render_trial_tables(tables, persisted=True)
+    assert "observed:heldout" in rendered and "observed_n:heldout" in rendered
+    assert "observed:cost" in rendered and "observed_n:cost" in rendered

@@ -816,10 +816,15 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
                     "min": group.min,
                     "max": group.max,
                     "eligible": "yes" if group.eligible else "no",
-                    "winner": "*" if group.winner else "",
                 }
                 for group in table.groups
             ]
+            observed_names = sorted({name for group in table.groups for name in group.observed})
+            for group, row in zip(table.groups, groups, strict=True):
+                for name in observed_names:
+                    row[f"observed:{name}"] = group.observed.get(name)
+                    row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
+                row["winner"] = "*" if group.winner else ""
             lines.extend(["", "Repeat groups (statistics include infeasible measured members):"])
             lines.extend(_table_lines(tuple(groups[0]), groups))
     return "\n".join(lines)
