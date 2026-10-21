@@ -687,7 +687,8 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     )
 
     # No winner file exists anywhere on disk; the frozen winner is exactly
-    # the engine's own in-memory outcome.
+    # the engine's own in-memory outcome, and the status agrees it is present.
+    assert [phase["winner_present"] for phase in snapshot["status"]["phases"]] == [True]
     (frozen,) = snapshot["winners"]
     assert frozen["phase"] == "p"
     assert frozen["trial_number"] == 4

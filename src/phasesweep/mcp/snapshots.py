@@ -392,8 +392,9 @@ def capture_result_snapshot(
 
     A pinned generation retains its own partial winners even if unpublished. One tolerant
     status read supplies all counts and RUNNING identities; unreadable phases retain
-    ``trial_data_available: false``. Engine-supplied winners are authoritative; otherwise
-    read the generation's validated winner bytes and recorded phase plan.
+    ``trial_data_available: false``. Engine-supplied winners are authoritative, and each
+    phase's ``winner_present`` says whether they hold its winner; otherwise read the
+    generation's validated winner bytes and recorded phase plan.
 
     An absent post-commit lifecycle record is tolerated; mismatches are logged.
 
@@ -415,6 +416,9 @@ def capture_result_snapshot(
             )
     if engine_winners is not None:
         status = read_status(experiment, generation_id=generation_id)
+        # The engine's winners count even where the generation holds no winner file.
+        for phase in status["phases"]:
+            phase["winner_present"] = phase["phase"] in engine_winners
         winner_snapshots = [
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
