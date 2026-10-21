@@ -17,6 +17,7 @@ from phasesweep.config.models import (
     Metric,
     Observation,
     Phase,
+    experiment_warnings,
 )
 from phasesweep.config.search import Sampler, sampler_capability_line
 from phasesweep.evidence.models import (
@@ -139,6 +140,83 @@ def test_evaluation_axis_is_part_of_study_identity():
         return _phase_fingerprint(experiment, experiment.phases[0], {})
 
     assert fingerprint("_step") != fingerprint("eval/step")
+
+
+@pytest.mark.parametrize("backend", ["wandb", "mlflow"])
+@pytest.mark.parametrize("source", ["trainer_config", "fixed_overrides"])
+@pytest.mark.parametrize("key", ["load_best_model_at_end", "training.load_best_model_at_end"])
+def test_best_model_reload_warns_about_remote_evaluation_position(backend, source, key):
+    settings = {key: True}
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config=settings if source == "trainer_config" else {},
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                fixed_overrides=settings if source == "fixed_overrides" else {},
+            )
+        ],
+    ).model_dump(mode="json")
+    experiment["metric"]["extractor"] = (
+        {
+            "type": "wandb",
+            "entity": "e",
+            "project": "p",
+            "metric_key": "eval/loss",
+            "evaluation_axis": "train/global_step",
+        }
+        if backend == "wandb"
+        else {"type": "mlflow", "metric_key": "eval/loss", "select": "last"}
+    )
+    if backend == "mlflow":
+        experiment["mlflow"] = {"tracking_uri": "databricks", "experiment_id": "1"}
+
+    warnings = experiment_warnings(Experiment.model_validate(experiment))
+
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert "load_best_model_at_end=True" in warning
+    assert "scored best-checkpoint weights may differ from the terminal training step" in warning
+    assert "does not verify checkpoint identity" in warning
+    assert all(
+        field in warning
+        for field in (
+            "json_envelope",
+            "policy",
+            "checkpoint",
+            "step",
+            "evaluation.progress",
+            "evaluation_axis",
+        )
+    )
+
+
+@pytest.mark.parametrize("value", [None, False, "true", 1])
+def test_best_model_warning_requires_explicit_true(value):
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config={} if value is None else {"load_best_model_at_end": value},
+        metric=Metric(
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        ),
+    )
+
+    assert experiment_warnings(experiment) == []
+
+
+def test_best_model_envelope_does_not_warn_about_remote_history():
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config={"training": {"load_best_model_at_end": True}},
+        metric=Metric(
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="validation", policy="best"
+            )
+        ),
+    )
+
+    assert experiment_warnings(experiment) == []
 
 
 def test_wandb_query_normalizes_targets_and_collects_exact_keys():

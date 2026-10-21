@@ -41,6 +41,7 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
     LocalExtractor,
+    MlflowExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -169,6 +170,21 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "Each trial records the value of every listed name in plain text in the study "
             "ledger, and rotating one refuses a resume. Credentials belong in "
             "execution.passthrough_env, which is inherited without being recorded or compared."
+        )
+    if isinstance(experiment.metric.extractor, WandbExtractor | MlflowExtractor) and any(
+        key.rsplit(".", 1)[-1] == "load_best_model_at_end" and value is True
+        for settings in (
+            flatten_trainer_config(experiment.trainer_config),
+            *(phase.fixed_overrides for phase in experiment.phases),
+        )
+        for key, value in settings.items()
+    ):
+        warnings.append(
+            "load_best_model_at_end=True: scored best-checkpoint weights may differ from the "
+            "terminal training step reported in remote history. The evaluation_point check "
+            "compares logged progress and does not verify checkpoint identity. Use "
+            "json_envelope to report policy, checkpoint and the evaluated step; report total "
+            "training progress in evaluation.progress and select it with evaluation_axis."
         )
     return warnings
 
