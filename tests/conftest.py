@@ -276,6 +276,14 @@ def isolate_phasesweep_homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.fixture(autouse=True)
+def isolate_working_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run each test from its own empty directory, so a default relative ``./runs`` stays out of the repo."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+
+@pytest.fixture(autouse=True)
 def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-wide test locks inside each test's temp directory."""
     lock_dir = tmp_path / "phasesweep-locks"
