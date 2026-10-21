@@ -10,6 +10,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
@@ -20,11 +21,16 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.study_policy import _ALLOCATION_CONTEXT_ATTR, _load_phase_policy_state
+from phasesweep.engine.study_policy import (
+    _ALLOCATION_CONTEXT_ATTR,
+    _load_phase_policy_state,
+    _PhasePolicyState,
+)
 from tests.conftest import (
     make_experiment,
     trial_outcome,
     write_flag_gated_trainer,
+    write_flaky_trainer,
     write_trainer,
     write_trial_zero_trainer,
 )
@@ -213,6 +219,53 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
     assert abort is not None
     assert abort["consecutive_failures"] == 3
     assert _last_successful_generation_path(_exp(4)).read_text() == published_before
+
+
+@pytest.mark.integration
+def test_retry_that_fails_again_aborts_after_a_fresh_failure_count(tmp_path: Path) -> None:
+    """Recovering from an abort restarts the failure count at zero.
+
+    The two cells that tripped a limit of 2 would trip it again after one more failure if they
+    still counted, so the retry that fails again must run both cells before it aborts, and a
+    later retry that succeeds must publish.
+    """
+    trainer, calls = write_flaky_trainer(tmp_path, failures=4)
+
+    def grid(n_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            n_trials=n_trials,
+            max_consecutive_failures=2,
+            gpu_policy="none",
+            sampler=Sampler(type="grid", seed=0),
+            search_space={"x": IntParam(type="int", low=1, high=2)},
+        )
+
+    def policy_state() -> tuple[list[str], _PhasePolicyState]:
+        study = optuna.load_study(
+            study_name="t::p", storage=_resolve_storage(grid(2).resolved_storage)
+        )
+        return [trial.state.name for trial in study.trials], _load_phase_policy_state(study)
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(grid(2))
+    assert len(calls.read_text().splitlines()) == 2
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(grid(4))
+    assert len(calls.read_text().splitlines()) == 4
+    states, state = policy_state()
+    assert states == ["FAIL"] * 4
+    assert state.consecutive_failures == 2
+    assert state.abort is not None
+    assert state.abort["trial_target"] == 4
+    assert state.abort["consecutive_failures"] == 2
+
+    assert run_experiment(grid(6))["p"].metric == pytest.approx(1.0)
+    states, state = policy_state()
+    assert states == ["FAIL"] * 4 + ["COMPLETE"] * 2
+    assert state.abort is None
 
 
 @pytest.mark.integration

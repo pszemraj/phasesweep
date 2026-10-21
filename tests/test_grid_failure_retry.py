@@ -196,7 +196,8 @@ def _advice(from_target: int, to_target: int, action: str) -> str:
     """Return the recovery advice a grid's abort and its refusals carry."""
     return (
         f"Fix the cause, then raise phases[p].n_trials from {from_target} to {to_target} "
-        f"in the config and rerun to {action}; completed cells are not repeated."
+        f"in the config and rerun to {action}; completed cells are not repeated, and the "
+        "failure count starts again from zero."
     )
 
 

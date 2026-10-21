@@ -641,9 +641,11 @@ def _target_advice(
         f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
         f"to {ceiling} in the config and rerun to"
     )
+    restart = "the failure count starts again from zero"
     if fixed:
         return _TargetAdvice(
-            f"{raise_to} retry its failed attempt once more; a completed attempt is not repeated.",
+            f"{raise_to} retry its failed attempt once more; a completed attempt is not "
+            f"repeated, and {restart}.",
             True,
         )
     failed = len(_failed_grid_cells(trials))
@@ -654,7 +656,8 @@ def _target_advice(
     if remaining:
         actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
     return _TargetAdvice(
-        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated.", True
+        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated, and {restart}.",
+        True,
     )
 
 
