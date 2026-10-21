@@ -58,12 +58,15 @@ from phasesweep.engine.selection import _rank_groups
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
+    TRIAL_OUTCOME_ATTR,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
+    _parsed_trial_outcome,
     _trial_interrupted,
     _validate_observed_block,
 )
@@ -669,7 +672,8 @@ class TrialTable:
     ``columns`` lists the keys every row carries, in display order: ``trial``,
     ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
     repeats phase, one ``observed:<name>`` per report-only value any trial
-    recorded, and ``winner``. ``state`` is the Optuna state, except that a
+    recorded, an optional ``reason`` when any trial has a recorded cause, and
+    ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
     winner stands on and empty elsewhere.
@@ -705,6 +709,19 @@ def _recorded_number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     return float(value)
+
+
+def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Read the recorded execution failure or outcome cause for a trial.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose diagnostic is displayed.
+    :return str | None: Recorded cause, or None when no diagnostic was recorded.
+    """
+    failure = trial.user_attrs.get(FAILURE_REASON_ATTR)
+    if isinstance(failure, str) and failure:
+        return failure
+    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return None if outcome is None else outcome.cause
 
 
 #: Columns every trial table starts with, as ``(header, getter)`` pairs.
@@ -767,11 +784,14 @@ def _trial_table(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )
     reruns = any(RERUN_OF_ATTR in t.user_attrs for t in trials)
+    reasons = {trial.number: _trial_reason(trial) for trial in trials}
+    has_reason = any(reasons.values())
     columns = (
         *(header for header, _ in _CORE_TRIAL_COLUMNS),
         *([] if axis is None else [_REPEAT_GROUP_COLUMN]),
         *([_RERUN_OF_COLUMN] if reruns else []),
         *observed,
+        *(["reason"] if has_reason else []),
         _WINNER_COLUMN,
     )
     standing = _winning_trials(winner)
@@ -784,6 +804,8 @@ def _trial_table(
             row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
         for name in observed:
             row[name] = _recorded_number(trial.user_attrs.get(name))
+        if has_reason:
+            row["reason"] = reasons[trial.number]
         attempt = standing.get(trial.number)
         marked = trial.number in standing and (
             attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt

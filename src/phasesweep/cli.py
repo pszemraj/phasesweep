@@ -849,7 +849,8 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     is_flag=True,
     help=(
         "Print one aligned table of trials per phase (state, value, params, duration, "
-        "repeat group, observed values, winner) and repeat-group statistics instead of YAML."
+        "repeat group, observed values, failure reasons, winner) and repeat-group statistics "
+        "instead of YAML."
     ),
 )
 def status(config_path: Path, show_trials: bool) -> None:

@@ -1067,7 +1067,7 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
     assert tables.published_generation_id == published_generation_id(experiment)
     (table,) = tables.phases
     assert table.available
-    assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+    assert table.columns == ("trial", "state", "value", "params", "duration_s", "reason", "winner")
     rows = table.rows
     assert [row["trial"] for row in rows] == [0, 1, 2]
     # Trial 1 completed but breached the metric's max, so it never ranked; trial 2 failed.
@@ -1078,6 +1078,9 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
         assert isinstance(row["params"], dict) and set(row["params"]) == {"x"}
     duration = rows[0]["duration_s"]
     assert isinstance(duration, float) and duration > 0
+    assert rows[0]["reason"] is None
+    assert "max=1.5" in str(rows[1]["reason"])
+    assert "non-zero exit code 1" in str(rows[2]["reason"])
 
 
 def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
@@ -1108,6 +1111,7 @@ def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> 
         "params",
         "duration_s",
         "observed:mem",
+        "reason",
         "winner",
     )
     assert [row["observed:mem"] for row in table.rows] == [3.0, 4.0, None]
