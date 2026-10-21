@@ -893,9 +893,7 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
 
     assert set(_run_lock_paths(exp_real)) == set(_run_lock_paths(exp_alias))
 
-    real, alias = exp_real, exp_alias
-    distinct = real.model_copy(update={"experiment": "distinct"})
-    lock = _experiment_lock
+    distinct = exp_real.model_copy(update={"experiment": "distinct"})
     (runs / "distinct").mkdir()
 
     def contender(config):
@@ -922,13 +920,13 @@ except ExperimentLockBusyError:
             timeout=15,
         )
 
-    with lock(real):
+    with _experiment_lock(exp_real):
         lock_inodes = {path: path.stat().st_ino for path in runtime_files.lock_dir().glob("*.lock")}
-        blocked = contender(alias)
+        blocked = contender(exp_alias)
         assert (blocked.returncode, blocked.stdout.strip()) == (2, "busy"), blocked.stderr
         control = contender(distinct)
         assert (control.returncode, control.stdout.strip()) == (0, "acquired"), control.stderr
-    released = contender(alias)
+    released = contender(exp_alias)
     assert (released.returncode, released.stdout.strip()) == (0, "acquired"), released.stderr
     assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 

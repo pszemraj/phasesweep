@@ -1865,8 +1865,6 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
     fingerprint, or the *corrected* config would be rejected with
     StudyFingerprintMismatchError even though nothing ever ran.
     """
-    from tests.conftest import make_experiment, write_trainer
-
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     db = tmp_path / "fp.journal"
 
@@ -1938,8 +1936,6 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
 @pytest.mark.integration
 def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -> None:
     """The empty-study rebind must not weaken identity once results exist."""
-    from tests.conftest import make_experiment, write_trainer
-
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     db = tmp_path / "fp2.journal"
 

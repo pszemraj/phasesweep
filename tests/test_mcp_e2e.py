@@ -280,8 +280,6 @@ def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
 
 def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
-    import asyncio
-
     from phasesweep.mcp.server import build_server
 
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
@@ -436,8 +434,6 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
 def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:
     """Only the user authorizes a launch; result payloads do not suggest transitions."""
     pytest.importorskip("mcp")
-    import asyncio
-
     from phasesweep.mcp.server import build_server
 
     catalog = write_mcp_config_catalog(

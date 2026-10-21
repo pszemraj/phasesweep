@@ -554,7 +554,7 @@ with open(os.devnull, "w") as output:
             parent.kill()
             parent.wait(timeout=5)
         if supervisor_pid is not None and is_pid_alive(supervisor_pid):
-            with __import__("contextlib").suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(supervisor_pid, signal.SIGKILL)
 
 
@@ -609,7 +609,7 @@ with open(os.devnull, "w") as output:
             parent.kill()
             parent.wait(timeout=5)
         if identity is not None and is_pid_alive(identity.pid):
-            with __import__("contextlib").suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(identity.pgid, signal.SIGKILL)
 
 

@@ -97,8 +97,6 @@ _RECORDED_NAMESPACE = "pid:[4026539001]@100"
 
 def test_read_proc_starttime_self():
     """We should be able to read our own process starttime on Linux."""
-    import os
-
     st = read_proc_starttime(os.getpid())
     # On Linux this should be a positive integer. On non-Linux, None.
     if Path("/proc/self/stat").exists():
@@ -581,8 +579,6 @@ def test_kill_stale_group_escalates_to_sigkill():
     try:
         # Give it a moment to install the handler.
         time.sleep(0.3)
-        from phasesweep.runtime.reaper import read_proc_starttime
-
         st = read_proc_starttime(proc.pid)
         assert st is not None
 

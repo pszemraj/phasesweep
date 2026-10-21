@@ -119,8 +119,6 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 ):
     import sys
 
-    from phasesweep.engine.read import read_result
-
     calls_path = tmp_path / "remote-reads"
     wandb_worker_sdk(f"""
         from pathlib import Path
