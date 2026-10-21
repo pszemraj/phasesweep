@@ -63,6 +63,39 @@ The nine trials run sequentially on CUDA device `0`, with 80 optimizer updates, 
 
 The last command replays a completed study without training again. After an interruption, the same command keeps completed trials and reruns interrupted attempts before new cells. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [runtime recovery](../../docs/runtime.md#interrupted-trials-rerun) for failure aborts and retry budgets.
 
+## Continue one checkpoint
+
+PhaseSweep resumes the study by keeping completed trials and rerunning interrupted attempts from their starting configuration. To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly from `repeats.members`; the aggregate score summarizes several models. Match its `trial_number` to `number` in the phase's `trials.csv`: `user_attr:phasesweep_trial_dir` gives that attempt's exact directory, and this example saves its checkpoint at `trainer/final.pt` below it.
+
+Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests **five additional optimizer updates**. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
+
+```bash
+python - /absolute/path/to/selected-member/trainer/final.pt /tmp/phasesweep-decoder-continued <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+import torch
+import yaml
+
+checkpoint = Path(sys.argv[1]).resolve()
+output = Path(sys.argv[2]).resolve()
+output.mkdir(parents=True, exist_ok=True)
+config = torch.load(checkpoint, map_location="cpu", weights_only=True)["config"].copy()
+config.update(num_batches=5, run_dir=str(output / "trainer"))
+config_path = output / "trainer.yaml"
+config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+upstream = Path("examples/tiny_decoder_enwik8/upstream").resolve()
+subprocess.run(
+    [sys.executable, str(upstream / "train.py"), "--config", str(config_path), "--resume", str(checkpoint)],
+    cwd=upstream,
+    check=True,
+)
+PY
+```
+
+The subprocess runs from the upstream checkout so the saved relative `data_path` still resolves. The continued checkpoint is `/tmp/phasesweep-decoder-continued/trainer/final.pt`. This standalone continuation restores model and optimizer state; the pinned trainer does not restore RNG or data-loader state, so it does not reproduce an uninterrupted stochastic trajectory. It leaves the sweep's saved validation scores intact.
+
 ## Native MLflow GPU smoke
 
 The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install the MLflow client and matching local server:
