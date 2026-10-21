@@ -27,10 +27,10 @@ def _preflight_skipped_winners(
     run_deadline: float | None,
     error_mapper: Callable[[str, Exception], Exception] | None = None,
 ) -> dict[str, Winner]:
-    """Validate required ancestors and carried published winners before a generation.
+    """Validate required ancestors and carried published winners before any phase runs.
 
     :param Experiment experiment: Experiment whose resume prefix is checked.
-    :param str | None from_phase: Validated first phase that the new generation will execute.
+    :param str | None from_phase: Validated first phase that this invocation will execute.
     :param float | None run_deadline: Whole-run monotonic deadline, when configured.
     :param Callable[[str, Exception], Exception] | None error_mapper: Optional
         frontend adapter receiving the phase whose winner was being checked
@@ -240,7 +240,7 @@ def _preflight_reached_fingerprint(
     preloaded_winners: dict[str, Winner],
     existing_studies: dict[str, optuna.Study],
 ) -> None:
-    """Verify the first reached study before publishing the new generation.
+    """Verify the first reached study before any phase runs.
 
     :param Experiment experiment: Parsed experiment whose first reached phase
         (``from_phase``, or the first declared phase) is checked.

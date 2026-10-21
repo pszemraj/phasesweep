@@ -232,7 +232,7 @@ def test_in_memory_storage_does_not_require_provenance() -> None:
 def test_late_child_fingerprint_failure_preserves_last_successful_results(
     tmp_path: Path,
 ) -> None:
-    """A child mismatch after phase one cannot publish a mixed result view."""
+    """A child mismatch after phase one replays cannot publish a mixed result view."""
     trainer = write_constant_trainer(tmp_path)
     experiment = _two_phase_experiment(
         workdir=tmp_path / "runs",
@@ -242,10 +242,13 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     run_experiment(experiment)
     protected_paths = [
         _summary_path(experiment),
+        _generation_path(experiment),
         _last_successful_generation_path(experiment),
         *(_winner_path(experiment, phase.name) for phase in experiment.phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
+    generations = _experiment_dir(experiment) / "generations"
+    generations_before = set(generations.iterdir())
     changed_child = experiment.phases[1].model_copy(
         update={"search_space": {"lr": IntParam(type="int", low=1, high=5)}}
     )
@@ -255,11 +258,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
         run_experiment(changed)
 
     assert {path: path.read_bytes() for path in protected_paths} == before
-    current = yaml.safe_load(_generation_path(experiment).read_text())
-    assert current["state"] == "failed"
-    assert yaml.safe_load(
-        _last_successful_generation_path(experiment).read_text()
-    ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
+    assert set(generations.iterdir()) == generations_before
 
 
 @pytest.mark.integration
@@ -804,7 +803,7 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
 
 @pytest.mark.integration
 def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
-    """A TPE study that reached its accepted target republishes without new trials."""
+    """A TPE study that reached its accepted target replays its winner without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = make_experiment(
@@ -1301,18 +1300,16 @@ def test_published_study_requirement_starts_at_from_phase(
     if missing_phase == "lr":
         with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
             run_experiment(experiment, from_phase="lr")
-        assert _generation_path(experiment).read_bytes() == generation_before
-        assert published_generation_id(experiment) == published
     else:
-        winners = run_experiment(experiment, from_phase="lr")
-        assert winners["arch"].params == original["arch"].params
-        assert winners["arch"].trial_number == original["arch"].trial_number
-        assert published_generation_id(experiment) != published
+        # The resume replays the published winners, so it publishes nothing new.
+        assert run_experiment(experiment, from_phase="lr") == original
         if replacement == "absent":
             assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
         else:
             assert not optuna.load_study(study_name="t::arch", storage=resolved).trials
         assert len(optuna.load_study(study_name="t::lr", storage=resolved).trials) == 1
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert published_generation_id(experiment) == published
 
 
 @pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])

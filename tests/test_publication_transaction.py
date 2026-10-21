@@ -110,6 +110,20 @@ def _stored_experiment(tmp_path: Path, *, env: dict[str, str] | None = None):
     )
 
 
+def _topped_up(experiment: Experiment) -> Experiment:
+    """Return ``experiment`` with phase ``p`` asking for one more trial than its first run.
+
+    A run of it launches a trial when the study holds one, and otherwise replays winners
+    that differ from the one-trial publication, so either way it publishes.
+
+    :param Experiment experiment: The one-trial experiment from :func:`_stored_experiment`.
+    :return Experiment: The same experiment at ``n_trials=2``.
+    """
+    return experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
+    )
+
+
 def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:
     """Return one generation's ``(config.snapshot.yaml, reproducibility.json)`` paths."""
     generation_dir = _generation_dir(experiment, generation_id)
@@ -228,7 +242,7 @@ def test_publication_commit_failure_keeps_prior_publication(
         captured.append(report.generation_id)
 
     with pytest.raises(error_type, match=error_match):
-        run_experiment(experiment, terminal_callback=capture)
+        run_experiment(_topped_up(experiment), terminal_callback=capture)
 
     assert len(captured) == 1
     second_generation = captured[0]
@@ -339,7 +353,7 @@ def test_postcommit_write_failure_leaves_run_successful(
         monkeypatch.setattr(generation_ops, fault, fail_write)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
-        winners = run_experiment(experiment)
+        winners = run_experiment(_topped_up(experiment))
 
     assert set(winners) == {"p"}
     second_generation = published_generation_id(experiment)
@@ -359,14 +373,13 @@ def test_postcommit_write_failure_leaves_run_successful(
             in r.message
             for r in caplog.records
         )
-        # The new publication resolves immutable evidence from the first
-        # generation: replaying a met target creates no new trial.
+        # The seeded second trial measures better, so the new publication selected its own winner.
         published_winner_path = _generation_winner_path(experiment, second_generation, "p")
         assert published_winner_path.is_file()
         _, (published,) = read_result(experiment, phase_names=["p"])
         assert published is not None
         assert published.source is not None
-        assert published.source.generation_id == first_generation
+        assert published.source.generation_id == second_generation
 
 
 @pytest.mark.integration
@@ -593,7 +606,7 @@ def test_successful_publication_never_logs_a_record_refusal(
         first_generation = published_generation_id(experiment)
         assert first_generation is not None
         first_record = _generation_record_path(experiment, first_generation).read_bytes()
-        run_experiment(experiment)  # republish onto the same storage
+        run_experiment(_topped_up(experiment))
     assert published_generation_id(experiment) != first_generation
     assert _generation_record_path(experiment, first_generation).read_bytes() == first_record
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
@@ -644,7 +657,7 @@ def test_next_publication_records_the_generation_whose_record_was_lost(
     """Moving the pointer first writes the ``published`` record of the generation it leaves."""
     experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
 
-    run_experiment(experiment)
+    run_experiment(_topped_up(experiment))
 
     second_generation = published_generation_id(experiment)
     assert second_generation is not None
@@ -703,16 +716,17 @@ def test_failed_publication_is_never_recorded_as_published(
     experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
     captured: list[str] = []
 
+    topped_up = _topped_up(experiment)
     with monkeypatch.context() as failing:
         inject_failure(failing, experiment)
         with pytest.raises((RuntimeError, OSError)):
-            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+            run_experiment(topped_up, terminal_callback=lambda r: captured.append(r.generation_id))
 
     [failed_generation] = captured
     assert published_generation_id(experiment) == first_generation
     assert _record_state(experiment, failed_generation) == "publication_failed"
 
-    run_experiment(experiment)
+    run_experiment(topped_up)
 
     assert published_generation_id(experiment) not in {first_generation, failed_generation}
     assert _record_state(experiment, first_generation) == "published"
@@ -728,11 +742,12 @@ def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer
     experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
     first_record = _generation_record_path(experiment, first_generation)
     captured: list[str] = []
+    topped_up = _topped_up(experiment)
 
     with monkeypatch.context() as failing:
         _lose_record_writes(failing, only=first_record)
         with pytest.raises(OSError, match="simulated record write failure"):
-            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+            run_experiment(topped_up, terminal_callback=lambda r: captured.append(r.generation_id))
 
     [failed_generation] = captured
     assert published_generation_id(experiment) == first_generation
@@ -742,7 +757,7 @@ def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer
     failed = yaml.safe_load(_generation_record_path(experiment, failed_generation).read_text())
     assert failed["error_class"] == "OSError"
 
-    run_experiment(experiment)
+    run_experiment(topped_up)
 
     assert published_generation_id(experiment) not in {first_generation, failed_generation}
     assert _record_state(experiment, first_generation) == "published"
@@ -1466,7 +1481,7 @@ def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
         captured.append(report.generation_id)
 
     with pytest.raises(RuntimeError):
-        run_experiment(experiment, terminal_callback=capture)
+        run_experiment(_topped_up(experiment), terminal_callback=capture)
 
     failed_generation = captured[0]
     assert failed_generation != first_generation

@@ -389,9 +389,8 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
     Unlike the last-success pointer, the current pointer is not validated
-    against any artifact: it is progress bookkeeping, always the most recent
-    invocation's own claim, and may legitimately name a failed or
-    in-progress generation.
+    against any artifact: it is progress bookkeeping, naming the most recently
+    claimed generation, and may legitimately name a failed or in-progress one.
 
     :param Experiment experiment: Experiment whose current pointer is read.
     :return str | None: The recorded ``generation_id``, or ``None`` when the
@@ -417,7 +416,7 @@ def read_status(
     Resolve current and last-success pointers once. Published facts use that capture;
     pinned unpublished generations use their own files. Generation fields mean:
 
-    - ``current_generation_id``: most recent invocation's mutable pointer.
+    - ``current_generation_id``: mutable pointer to the most recently claimed generation.
     - ``published_generation_id``: validated last-success pointer.
     - ``represented_generation_id``: pinned id, or published id by default.
     - ``is_published``: non-null represented id equals the published id.

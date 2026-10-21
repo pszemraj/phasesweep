@@ -778,13 +778,10 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     tmp_path: Path,
     from_phase: str | None,
 ) -> None:
-    """A failed preflight advances the current pointer but never the published one.
+    """A refused resume writes no generation and leaves every pointer and projection alone.
 
-    The current-generation pointer legitimately moves to this new (failed)
-    invocation -- a new invocation always overwrites it starting from
-    "preflighting", and every outcome path must drive it to a terminal state
-    -- but the convenience root projections and, critically, the last-success
-    pointer stay exactly as the prior successful publication left them.
+    Its terminal snapshot represents the refused run's own id, which names no
+    generation, and reports the prior publication unchanged.
     """
     phases = [
         Phase(
@@ -799,10 +796,9 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     first_generation = published_generation_id(experiment)
     assert first_generation is not None
 
-    # The convenience root projections must stay untouched by a failed resume;
-    # the current-generation pointer is deliberately excluded here since it
-    # legitimately advances even on a preflight failure (see docstring).
     protected_paths = [
+        _generation_path(experiment),
+        _last_successful_generation_path(experiment),
         _summary_path(experiment),
         *(_winner_path(experiment, phase.name) for phase in phases),
     ]
@@ -836,28 +832,17 @@ def test_failed_fingerprint_preflight_preserves_published_results(
             terminal_callback=capture_failed_resume,
         )
 
-    assert len(callback_generations) == 1
-    assert len(captured) == 1
-    # The failed attempt claims current_generation_id, while published_generation_id
-    # stays the first run's and is not forced to equal the pinned generation.
-    assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
-    assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
-    assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]
-    assert captured[0]["status"]["is_published"] is False  # type: ignore[index]
-    assert captured[0]["status"]["summary_present"] is False  # type: ignore[index]
-    assert all(
-        phase["generation_trials"] == {}
-        for phase in captured[0]["status"]["phases"]  # type: ignore[index]
-    )
-    assert captured[0]["winners"] == []
-    # Convenience root projections are untouched, and the published pointer
-    # still resolves to the prior successful generation.
+    [refused_generation] = callback_generations
+    [snapshot] = captured
+    status = snapshot["status"]
+    assert isinstance(status, dict)
+    assert status["current_generation_id"] == first_generation
+    assert status["published_generation_id"] == first_generation
+    assert status["represented_generation_id"] == refused_generation
+    assert status["is_published"] is False
+    assert status["summary_present"] is False
+    assert all(phase["generation_trials"] == {} for phase in status["phases"])
+    assert snapshot["winners"] == []
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert published_generation_id(experiment) == first_generation
-    failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
-    assert len(failed_generations) == 1
-    assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
-    # The current pointer legitimately advanced to this failed attempt.
-    current_pointer = yaml.safe_load(_generation_path(experiment).read_text())
-    assert current_pointer["generation_id"] == callback_generations[0]
-    assert current_pointer["state"] == "failed"
+    assert set(_generations_dir(experiment).iterdir()) == generations_before

@@ -174,15 +174,20 @@ The ordinary control flow is:
 ```mermaid
 flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
-    run --> preflight["take experiment lock, check and bind artifact root and ledger, claim generation, preflight attempts"]
+    run --> preflight["take experiment lock, check and bind artifact root and ledger, preflight attempts"]
     preflight --> phase["phase._run_phase"]
-    phase --> optimize["Optuna optimize"]
+    phase --> work{"trials to launch?"}
+    work -->|yes| claim["claim the generation once"]
+    work -->|no| select
+    claim --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
     launch --> evidence["read configured scalar and gates"]
     evidence --> select["select feasible winner"]
     select --> next{"more phases?"}
     next -->|yes| phase
-    next -->|no| generation["write immutable generation"]
+    next -->|no| changed{"claimed, or winners differ from the publication?"}
+    changed -->|yes| generation["write immutable generation"]
+    changed -->|no| unchanged["leave both pointers as they were"]
     generation --> pointer["commit last-successful pointer"]
     pointer --> snapshot["freeze MCP terminal result when applicable"]
 ```
@@ -196,6 +201,7 @@ flowchart TD
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
+- `tests/test_generation_claim.py`: no generation for a refused run or a replay of the published winners, from the CLI, the engine and a detached MCP run.
 - `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
 - `tests/test_grid_failure_retry.py` and `tests/test_fixed_configuration_retry.py`: raised-target retries of failed grid cells and fixed configurations, raised-limit recovery of a streak abort, the abort advice, and the grid winner advisories.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.

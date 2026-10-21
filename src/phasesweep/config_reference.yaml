@@ -273,7 +273,7 @@ phases: list[object] (required)
     # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it ended COMPLETE, INFEASIBLE or FAIL.
     # Failed and infeasible attempts consume the target, not only successes. If no feasible result is eligible the phase fails.
     # An interrupted attempt (phase or run deadline, host shutdown, a phase abort before its trainer launched, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
-    # Running the same config again on persistent storage re-ranks the stored trials and republishes when the target is already reached.
+    # Running the same config again on persistent storage re-ranks the stored trials when the target is already reached, and publishes only when the winners differ from the published ones or nothing is published.
     # Raising the target on persistent storage runs the remaining attempts in the same study.
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
     # A persistent phase cannot lower its target below the one it already accepted; the refusal names the target to set.
@@ -1167,7 +1167,7 @@ execution: object = {}
   record_env: bool = false
 
 # Wallclock budget for one invocation of phasesweep run, in seconds, finite and >= 0. 0 expires immediately.
-# The clock starts after the generation is claimed, before execution preflight and phase work. Initial locking and ledger setup are outside it.
+# The clock starts once the ledger is claimed, before the continuation preflight and phase work. Initial locking and ledger setup are outside it.
 # The clock restarts at every invocation: a later run, a --from-phase resume or an MCP launch gets a fresh budget, and the time earlier invocations spent does not count against it.
 # The earliest of this deadline and each phase's own deadlines limits the work. W&B evidence reads and MLflow resolution, run creation and capture are capped by the remaining budget too; MLflow result uploads are not.
 # An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.

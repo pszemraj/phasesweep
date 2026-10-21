@@ -36,6 +36,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
@@ -243,7 +244,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
             exp,
             exp.phases[0],
             inherited_winners={},
-            generation_id="generation-test",
+            generation=InvocationGeneration(
+                exp, generation_id="generation-test", caller_owned_id=True, from_phase=None
+            ),
             ledger=claimed,
         )
     assert reap_called["flag"]

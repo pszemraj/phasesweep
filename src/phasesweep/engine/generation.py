@@ -15,6 +15,7 @@ import yaml
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.provenance as provenance_ops
+import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.publication_validation as validation_ops
 from phasesweep._metadata import __version__
 from phasesweep.config.models import Experiment
@@ -29,45 +30,131 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
-    """Exclusively claim a generation namespace under the experiment lock.
+def _new_generation_id(experiment: Experiment, requested_id: str | None) -> str:
+    """Choose an invocation's generation id without creating its namespace.
+
+    :param Experiment experiment: Experiment whose generations root is checked.
+    :param str | None requested_id: Caller-supplied id, or ``None`` to mint one.
+    :return str: ``requested_id``, or a fresh UUID4 hex string.
+    :raises RunRequestError: ``requested_id`` already names a generation.
+    """
+    if requested_id is None:
+        return uuid4().hex
+    if path_ops._generation_dir(experiment, requested_id).exists():
+        raise RunRequestError(
+            f"Generation id {requested_id!r} already exists; refusing to overwrite history."
+        )
+    return requested_id
+
+
+def _claim_generation(experiment: Experiment, generation_id: str, *, caller_owned_id: bool) -> None:
+    """Exclusively create a generation namespace under the experiment lock.
 
     Freeze the effective configuration and reproducibility record before returning;
     provenance failure aborts the claim. The record retains whether an external
     launcher supplied the generation id, even if its own state is later lost.
 
     :param Experiment experiment: Experiment whose generations root is created if missing.
-    :param str | None requested_id: Caller-supplied generation id to claim, or
-        ``None`` to mint a fresh random id.
-    :return str: The claimed generation id (``requested_id`` if supplied and
-        free, otherwise a freshly minted UUID4 hex string).
-    :raises RunRequestError: ``requested_id`` already exists.
-    :raises RuntimeError: No unused random id could be minted after 10 attempts,
-        which indicates broken UUID generation rather than an operator conflict.
-    :raises OSError: The generation namespace or its provenance files could not
-        be created.
+    :param str generation_id: Id from :func:`_new_generation_id`.
+    :param bool caller_owned_id: Whether the caller supplied ``generation_id``.
+    :raises OSError: The generation namespace already exists, or it or its
+        provenance files could not be created.
     """
-    root = path_ops._generations_dir(experiment)
-    root.mkdir(parents=True, exist_ok=True)
-    if requested_id is not None:
-        try:
-            path_ops._generation_dir(experiment, requested_id).mkdir()
-        except FileExistsError as exc:
-            raise RunRequestError(
-                f"Generation id {requested_id!r} already exists; refusing to overwrite history."
-            ) from exc
-        provenance_ops._write_generation_provenance(experiment, requested_id, caller_owned_id=True)
-        return requested_id
+    path_ops._generations_dir(experiment).mkdir(parents=True, exist_ok=True)
+    path_ops._generation_dir(experiment, generation_id).mkdir()
+    provenance_ops._write_generation_provenance(
+        experiment, generation_id, caller_owned_id=caller_owned_id
+    )
 
-    for _ in range(10):
-        candidate = uuid4().hex
-        try:
-            path_ops._generation_dir(experiment, candidate).mkdir()
-        except FileExistsError:
-            continue
-        provenance_ops._write_generation_provenance(experiment, candidate, caller_owned_id=False)
-        return candidate
-    raise RuntimeError("Could not mint an unused generation id after 10 attempts.")
+
+class InvocationGeneration:
+    """One invocation's generation: an id from the start, a namespace only once work needs it.
+
+    :meth:`claim` creates the namespace and points the current-generation pointer at it.
+    The engine calls it before the first trial allocation, or before publishing winners
+    that differ from the current publication. Winners saved before the claim stay in
+    memory and are written by it, so an invocation that launches nothing and publishes
+    nothing leaves no generation and leaves both pointers as they were.
+    """
+
+    def __init__(
+        self,
+        experiment: Experiment,
+        *,
+        generation_id: str,
+        caller_owned_id: bool,
+        from_phase: str | None,
+    ) -> None:
+        """Hold an unclaimed generation.
+
+        :param Experiment experiment: Experiment the generation belongs to.
+        :param str generation_id: Id from :func:`_new_generation_id`.
+        :param bool caller_owned_id: Whether the caller supplied ``generation_id``.
+        :param str | None from_phase: Resume point recorded on the lifecycle state.
+        """
+        self.experiment = experiment
+        self.generation_id = generation_id
+        self.claimed = False
+        self._caller_owned_id = caller_owned_id
+        self._from_phase = from_phase
+        self._pending_winners: dict[str, Winner] = {}
+
+    def claim(self) -> str:
+        """Create the namespace, mark it running and write held winners, on first call only.
+
+        :return str: The generation id.
+        :raises OSError: The namespace already exists, or it, its provenance, its
+            running state or a held winner could not be written.
+        """
+        if not self.claimed:
+            _claim_generation(
+                self.experiment, self.generation_id, caller_owned_id=self._caller_owned_id
+            )
+            self.claimed = True
+            _write_generation_state(
+                self.experiment,
+                generation_id=self.generation_id,
+                state="running",
+                from_phase=self._from_phase,
+                publish_current=True,
+            )
+            for phase_name, winner in self._pending_winners.items():
+                artifact_io._save_winner(
+                    self.experiment, phase_name, winner, generation_id=self.generation_id
+                )
+            self._pending_winners.clear()
+        return self.generation_id
+
+    def save_winner(self, phase_name: str, winner: Winner) -> None:
+        """Write a phase winner into the claimed namespace, or hold it until the claim.
+
+        :param str phase_name: Phase the winner belongs to.
+        :param Winner winner: The phase's winner.
+        """
+        if self.claimed:
+            artifact_io._save_winner(
+                self.experiment, phase_name, winner, generation_id=self.generation_id
+            )
+        else:
+            self._pending_winners[phase_name] = winner
+
+
+def _publication_holds(experiment: Experiment, winners: Mapping[str, Winner]) -> str | None:
+    """Return the published generation whose winners equal ``winners``, if there is one.
+
+    :param Experiment experiment: Experiment whose last-success pointer is resolved.
+    :param Mapping[str, Winner] winners: Winners an invocation would publish.
+    :return str | None: The published generation id when its publication validates and
+        its winner files hold exactly these phases with these payloads, else ``None``.
+    """
+    validated = publication_ops._resolve_publication_pointer(experiment).validated
+    if validated is None or set(validated.winners) != set(winners):
+        return None
+    for phase_name, winner in winners.items():
+        payload = artifact_io._winner_payload(experiment, phase_name, winner)
+        if yaml.safe_load(yaml.safe_dump(payload)) != validated.winners[phase_name].payload:
+            return None
+    return validated.generation_id
 
 
 _TERMINAL_GENERATION_STATES = frozenset({"published", "publication_failed", "failed"})
@@ -129,14 +216,14 @@ def _write_generation_state(
 ) -> None:
     """Write mutable current-generation progress and/or its immutable terminal record.
 
-    The current pointer accepts every state and may restart at ``preflighting`` for
-    a new invocation. Per-generation records accept terminal states only, once.
+    The current pointer accepts every state and restarts at ``running`` for a newly
+    claimed generation. Per-generation records accept terminal states only, once.
     Subsequent record writes, including same-state rewrites, are refused and logged.
 
     :param Experiment experiment: Experiment whose generation state is written.
     :param str generation_id: Immutable generation namespace being recorded.
-    :param str state: Lifecycle state label (``"preflighting"``, ``"running"``,
-        ``"published"``, ``"publication_failed"``, or ``"failed"``).
+    :param str state: Lifecycle state label (``"running"``, ``"published"``,
+        ``"publication_failed"``, or ``"failed"``).
     :param str | None from_phase: Resume point for this invocation, or ``None``.
     :param bool publish_current: If ``True``, also overwrite the experiment's
         current-generation pointer with this state.

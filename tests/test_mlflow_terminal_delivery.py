@@ -22,7 +22,12 @@ from phasesweep.engine.ledger import (
     read_phase_trials,
     validate_ledger,
 )
-from phasesweep.engine.paths import _experiment_dir, _generation_record_path, _trial_dir_for
+from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_dir,
+    _generation_record_path,
+    _trial_dir_for,
+)
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -401,7 +406,8 @@ def _fail_engine(tmp_path, monkeypatch, error):
     """Fail after generation preparation with a durable owned summary binding."""
     experiment = native_experiment(tmp_path)
 
-    def fail(*args, generation_id, **kwargs):
+    def fail(*args, generation, **kwargs):
+        generation_id = generation.generation_id
         binding = {**_binding(), "phase": "generation", "generation_id": generation_id}
         write_record(tracking_root(experiment) / generation_id / "generation-binding.json", binding)
         raise error
@@ -711,15 +717,13 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     assert store.observe(handle).cleanup_recovery_required is (failure == "worker")
 
 
-def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
-    tmp_path, monkeypatch
-):
+def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_path, monkeypatch):
     """A controller that dies right after the pointer commit loses neither its proof nor its mirror.
 
     The first invocation dies before it writes the lifecycle record and before
-    the in-process mirror. A later no-work replay moves the pointer, which must
-    first leave the record that keeps the generation published, so
-    ``sync-tracking`` still rebuilds its winner and summary uploads.
+    the in-process mirror. The pointer alone keeps the generation published, a
+    later no-work replay leaves it there, and ``sync-tracking`` rebuilds its
+    winner and summary uploads.
     """
     from phasesweep.engine import generation as generation_ops
     from phasesweep.engine.paths import _last_successful_generation_path
@@ -750,10 +754,9 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
-    second = reports[0].generation_id
-    assert second != first
-    assert yaml.safe_load(pointer_path.read_text())["generation_id"] == second
-    assert _recorded_generation_state(_generation_record_path(experiment, first)) == "published"
+    assert not _generation_dir(experiment, reports[0].generation_id).exists()
+    assert yaml.safe_load(pointer_path.read_text())["generation_id"] == first
+    assert not _generation_record_path(experiment, first).exists()
     assert publication._published(experiment, first)
 
     assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 7}

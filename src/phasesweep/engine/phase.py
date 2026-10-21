@@ -32,6 +32,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
     _finished_trial_count,
@@ -1440,7 +1441,7 @@ def _run_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
-    generation_id: str,
+    generation: InvocationGeneration,
     ledger: ClaimedLedger,
     run_deadline: float | None = None,
 ) -> Winner:
@@ -1449,12 +1450,13 @@ def _run_phase(
     Validates the phase's durable state (:func:`_resume_phase`), runs Optuna's
     optimize loop with every worker sharing one :class:`_PhaseExecution`, and
     turns how that loop ended into the phase's winner or refusal
-    (:func:`_finish_phase`).
+    (:func:`_finish_phase`). A phase with trials to launch claims ``generation``
+    once every launch check has passed, before its first durable trial-target write.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase to execute.
     :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain.
-    :param str generation_id: Identity of the current engine invocation.
+    :param InvocationGeneration generation: The current engine invocation's generation.
     :param ClaimedLedger ledger: The claimed ledger, for ``experiment``, that this phase opens
         its live study through.
     :param float | None run_deadline: Optional ``time.monotonic()`` deadline inherited from the
@@ -1532,10 +1534,11 @@ def _run_phase(
         log.info("phase=%s checking MLflow target %s", phase.name, experiment.mlflow.tracking_uri)
         require_tracking_target(
             experiment,
-            generation_id=generation_id,
+            generation_id=generation.generation_id,
             environment=environment_identity.values,
             deadline=budget.deadline,
         )
+    generation_id = generation.claim()
     run = _PhaseExecution(
         experiment=experiment,
         phase=phase,
@@ -1612,7 +1615,7 @@ def _replay_met_target(
 ) -> Winner:
     """Select the winner of a phase whose trial target is already met, launching nothing.
 
-    A no-op invocation republishes the existing result. It must neither
+    The winner is selected from the recorded trials again. Replay must neither
     require launch resources (GPU discovery on a CPU-only host) nor mutate the
     durable accepted target.
 

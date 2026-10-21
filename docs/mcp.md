@@ -135,6 +135,8 @@ Read provenance and labels together:
 | `result_context` | `represented_generation` uses that generation's recorded metric name, goal, and phase plan; `current_config` uses the loaded configuration when no recorded semantics are available. |
 | `published_config_matches_current` | Whether the producing configuration matches the current catalog configuration. `false` means the historical labels may differ from the next run's; null does not establish a match. |
 
+A run's represented generation is its run ID, but a run [writes a generation](runtime.md#timeouts-cleanup-and-continuation) only when it launches a trial or publishes. A run refused before its first trial, or one that replays the winners already published, represents a run ID that names no generation, with `is_published` and `summary_present` false. A replay still succeeds and lists the winners it matched, each `prior_generation`, and `published_generation_id` names the generation that publishes them.
+
 `get_run_results` measures `missing_phases` and `all_phases_have_winners` against the represented generation's plan. Report that context with the winners rather than relabeling historical results using an edited catalog. The config-match comparison is refreshed on terminal reads; the scientific facts stay frozen.
 
 `publication_integrity` reports the publication validation recorded in the response. Terminal responses preserve snapshot-time validation and do not revalidate the current publication tree:

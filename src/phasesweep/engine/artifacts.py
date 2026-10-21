@@ -172,7 +172,18 @@ def _save_winner(
     """
     path = path_ops._generation_winner_path(experiment, generation_id, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    _write_yaml_atomic(path, _winner_payload(experiment, phase_name, winner))
+
+
+def _winner_payload(experiment: Experiment, phase_name: str, winner: Winner) -> dict[str, object]:
+    """Build the mapping a phase's ``winner.yaml`` holds.
+
+    :param Experiment experiment: Parsed experiment config; supplies the metric name and goal.
+    :param str phase_name: Name of the phase the winner belongs to.
+    :param Winner winner: The winning trial.
+    :return dict[str, object]: The winner file's payload.
+    """
+    return {
         "phase": phase_name,
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
         **_winner_common_payload(winner),
@@ -180,7 +191,6 @@ def _save_winner(
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
     }
-    _write_yaml_atomic(path, payload)
 
 
 def _winner_common_payload(winner: Winner) -> dict[str, Any]:

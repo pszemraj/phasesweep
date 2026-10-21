@@ -508,9 +508,20 @@ def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
 
 def test_carried_repeat_winner_reads_without_older_publication(tmp_path: Path) -> None:
     """A carried repeat group's current result embeds every member's identity."""
-    experiment, source_generation = _repeats_publication(tmp_path)
+    published, source_generation = _repeats_publication(tmp_path)
+    # A new phase gives the next run trials to launch, so its generation carries p's winner.
+    added = Phase.model_validate(
+        {
+            "name": "q",
+            "n_trials": 1,
+            "sampler": Sampler(type="random", seed=0),
+            "fixed_overrides": {"y": 1},
+        }
+    )
+    experiment = published.model_copy(update={"phases": [*published.phases, added]})
     carried = run_experiment(experiment)["p"]
     assert carried.generation_id == source_generation
+    assert published_generation_id(experiment) != source_generation
     assert carried.repeats is not None
     expected = read_result(experiment)
     shutil.rmtree(_generation_dir(experiment, source_generation))

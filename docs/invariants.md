@@ -35,8 +35,9 @@ flowchart TD
         bind --> claimst["claim empty studies for this root"]
     end
     claimst --> claimed["ClaimedLedger"]
-    claimed --> pre["environment preflight, generation claim,<br/>continuation preflight"]
+    claimed --> pre["environment and continuation preflight"]
     pre --> open["open_phase_study: open or create the study that runs trials"]
+    open --> gen["generation claim, once a phase passes its launch checks"]
     check -.->|"tree names another ledger"| refused["refused, nothing written"]
     scan -.->|"wrong format, or unreadable on an unbound tree"| refused
     roots -.->|"a study names another root"| refused
@@ -122,14 +123,14 @@ Recovery signals nothing for an attempt only on a durable lifecycle state that p
 **Held by:** `engine.phase._execute_objective`, which writes `allocated` through `runtime.process.write_attempt_lifecycle` before `engine.attempts._register_active_attempt`, the trial attributes, and the GPU wait, and sets `engine.state.TRIAL_DIR_ATTR` before `engine.trial.launch_trial`; `runtime.process.run_supervised`, which writes `launching` before `runtime.process._spawn_blocked_supervisor` and calls `runtime.process._record_attempt_exited` only when cleanup is confirmed; read by `engine.attempts._attempt_process_resolution`, `engine.attempts._resolve_attempt`, and `engine.cleanup._reap_stale_trials`, which resolves no process for a trial without the trial-directory attribute\
 **Tests:** `tests/test_trial_launch.py::test_trial_directory_and_allocated_lifecycle_precede_launch`, `tests/test_process_supervision.py::test_identity_write_failure_marks_launch_before_popen`, `tests/test_process_supervision.py::test_unexpected_status_read_failure_preserves_cleanup_evidence[deadline-cleanup-uncertain]`, `tests/test_process_supervision.py::test_run_supervised_preserves_identity_and_records_terminal_lifecycle[clean-exit]`, `tests/test_stale_reaper.py::test_prelaunch_allocated_attempt_recovers_without_identity`, `tests/test_stale_reaper.py::test_exited_attempt_recovers_without_signalling`
 
-#### 11. Preflight finishes before the claims it guards
+#### 11. Only work claims a generation, after every check that could refuse it
 
-Environment preflight finishes before the generation claim, and the continuation preflight finishes before the generation is marked running or any attempt is registered.
+A generation exists only for an invocation that launches a trial or publishes winners that differ from the current publication. A run refused before its first trial, or one whose phases all replay to the winners already published, writes no generation and leaves `generation.yaml` and `last_successful_generation.yaml` as they were; a generation that names no work would make `status` report an invocation that did nothing. Every check that can refuse a launch therefore finishes before the claim: environment preflight and the continuation preflight run before any phase, and each phase's resume, cohort, SDK, GPU, budget and tracking-target checks run before that phase claims the generation, ahead of its first trial-target write and any attempt registration. A run that launched nothing compares its winners with the validated publication and claims only when they differ or nothing validates as published. The claim writes the namespace and its provenance before it moves the current pointer to `running`, so a crash never leaves that pointer naming a missing generation.
 
-**Held by:** `engine.run._run_experiment_outcome`, which calls `_preflight_missing_reached_phase_environments` before `engine.generation._claim_generation`, then `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` before the running state\
-**Tests:** `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`, `tests/test_trial_evidence.py::test_topup_refuses_a_candidate_whose_evidence_left_the_tree`
+**Held by:** `engine.run._run_experiment_outcome`, which picks the id with `engine.generation._new_generation_id`, runs `_preflight_missing_reached_phase_environments`, `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` with nothing claimed, and records a failure only for a claimed generation; `engine.phase._run_phase`, which calls `engine.generation.InvocationGeneration.claim` after `engine.phase._resume_phase` and the launch checks; `engine.run._run_experiment_inner`, which claims at publication only when `engine.generation._publication_holds` finds no matching publication; `engine.generation.InvocationGeneration.save_winner`, which holds winners until the claim\
+**Tests:** `tests/test_generation_claim.py::test_a_refused_run_leaves_no_generation_and_both_pointers_as_they_were`, `tests/test_generation_claim.py::test_an_aborted_run_keeps_its_generation_and_the_refused_reruns_add_none`, `tests/test_generation_claim.py::test_a_replay_of_the_published_winners_writes_no_generation`, `tests/test_generation_claim.py::test_a_replay_publishes_a_generation_when_nothing_is_published`, `tests/test_generation_claim.py::test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports`, `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`, `tests/test_trial_evidence.py::test_topup_refuses_a_candidate_whose_evidence_left_the_tree`
 
-`claim_ledger` runs before environment preflight, and the generation claim runs before the continuation chain, so the chain guards the running state and the attempts, not either claim.
+`claim_ledger` runs before environment preflight, so these checks guard the generation and the attempts, not the ledger claim.
 
 #### 12. A persistent study holds one environment cohort
 
