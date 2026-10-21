@@ -50,6 +50,41 @@ def test_gpu_preflight_refuses_nonexistent_explicit_index(
 
 
 @pytest.mark.parametrize("command", ["validate", "dry-run"])
+@pytest.mark.parametrize("device", ["index", "uuid", "mig"])
+def test_gpu_preflight_inventory_refusal_explains_host_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, device: str
+) -> None:
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+    monkeypatch.setattr("phasesweep.runtime.gpu._detect_mig_uuid_set", lambda: set())
+
+    def refuse_lease(*args: object, **kwargs: object) -> None:
+        pytest.fail("read-only GPU preflight attempted to acquire a host lease")
+
+    monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", refuse_lease)
+    workdir = tmp_path / "runs"
+    phase = (
+        phase_payload(gpu_ids=[0])
+        if device == "index"
+        else phase_payload(gpu_devices=["GPU-test" if device == "uuid" else "MIG-test"])
+    )
+    config = write_experiment(tmp_path / "experiment.yaml", workdir=str(workdir), phases=[phase])
+
+    if command == "validate":
+        result = CliRunner().invoke(cli, ["validate", str(config)])
+        assert isinstance(result.exception, GpuConfigurationError), result.output
+        error = result.exception
+    else:
+        with pytest.raises(GpuConfigurationError) as failure:
+            run_experiment(load_experiment(config), dry_run=True)
+        error = failure.value
+
+    assert "nvidia-smi" in str(error)
+    assert "sandbox" in str(error)
+    assert "host shell with GPU access" in str(error)
+    assert not workdir.exists()
+
+
+@pytest.mark.parametrize("command", ["validate", "dry-run"])
 def test_gpu_preflight_warns_when_workers_exceed_devices(
     tmp_path: Path,
     single_gpu_inventory: None,

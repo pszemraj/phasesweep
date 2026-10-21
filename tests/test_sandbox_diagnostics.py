@@ -30,8 +30,11 @@ def test_gpu_enumeration_refusal_explains_cpu_only_policy(
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="gpu_policy: none"):
+    with pytest.raises(GpuConfigurationError, match="gpu_policy: none") as failure:
         GpuPool.create(n_jobs=1)
+
+    assert "sandbox" in str(failure.value)
+    assert "host shell with GPU access" in str(failure.value)
 
     with GpuPool.create(n_jobs=1, policy="none").acquire() as assignment:
         assert assignment.visible_devices is None

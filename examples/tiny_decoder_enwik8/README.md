@@ -17,6 +17,8 @@ For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-
 
 Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision) and [requirements](upstream/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
+Run GPU validation, dry runs, and training from a shell with host GPU access. If an agent sandbox hides the devices from `nvidia-smi`, use host execution for these commands.
+
 ## CLI smoke sweep
 
 For a short GPU integration check, run the two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. The wrapper passes its `trainer_config` keys to the upstream trainer and requires `run_dir` for checkpoint output. The config leases CUDA device `0`, runs 10 training batches per trial, sets trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:

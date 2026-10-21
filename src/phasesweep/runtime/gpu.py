@@ -33,6 +33,10 @@ log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
 _MIG_UUID_INVENTORY = re.compile(r"\(UUID:\s*(MIG-[^)]+)\)", re.IGNORECASE)
+_GPU_HOST_ACCESS_HINT = (
+    "If this shell is sandboxed, rerun GPU validation, dry runs, and training in a "
+    "host shell with GPU access."
+)
 
 
 class GpuLeaseTimeoutError(TimeoutError):
@@ -271,7 +275,7 @@ def _bind_lock_identities(
             "Cannot validate configured MIG token(s) "
             f"{[device.visible_token for device in mig_tokens]} because nvidia-smi -L "
             "reported no usable MIG inventory. Fix nvidia-smi or the configured "
-            "gpu_devices/CUDA_VISIBLE_DEVICES value."
+            f"gpu_devices/CUDA_VISIBLE_DEVICES value. {_GPU_HOST_ACCESS_HINT}"
         )
     if not uuid_map:
         if gpu_tokens:
@@ -279,7 +283,7 @@ def _bind_lock_identities(
                 "Cannot validate configured GPU UUID token(s) "
                 f"{[device.visible_token for device in gpu_tokens]} because nvidia-smi "
                 "reported no usable GPU UUID inventory. Fix nvidia-smi or the configured "
-                "gpu_devices/CUDA_VISIBLE_DEVICES value."
+                f"gpu_devices/CUDA_VISIBLE_DEVICES value. {_GPU_HOST_ACCESS_HINT}"
             )
         if numeric:
             raise GpuConfigurationError(
@@ -287,7 +291,8 @@ def _bind_lock_identities(
                 f"{[device.visible_token for device in numeric]} because nvidia-smi "
                 "reported no usable index-to-UUID inventory. Accepting index-form locks "
                 "would not exclude a concurrent UUID-form lock for the same card. Fix "
-                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value."
+                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value. "
+                f"{_GPU_HOST_ACCESS_HINT}"
             )
 
     resolved: list[GpuDevice] = []
@@ -566,24 +571,24 @@ class GpuPool:
                     "nvidia-smi could not enumerate GPUs, but "
                     "/proc/driver/nvidia/gpus reports hardware. PhaseSweep cannot "
                     "derive canonical device locks, so launching with unrestricted "
-                    "CUDA visibility could double-book the host. Fix nvidia-smi or "
-                    "set gpu_ids/gpu_devices explicitly"
+                    "CUDA visibility could double-book the host. Fix nvidia-smi. "
+                    f"{_GPU_HOST_ACCESS_HINT}"
                 )
                 if not allow_no_gpu:
                     raise GpuConfigurationError(
-                        f"{message}; for intentional CPU-only work, set gpu_policy: none "
+                        f"{message} For intentional CPU-only work, set gpu_policy: none "
                         "and disable CUDA in the trainer environment. Set "
                         "allow_no_gpu_isolation: true only to accept running without GPU host locks."
                     )
                 if pinned == "":
                     log.warning(
-                        "%s; pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
+                        "%s PhaseSweep is pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
                         "allow_no_gpu_isolation: true is set.",
                         message,
                     )
                 else:
                     log.warning(
-                        "%s; running without CUDA isolation because "
+                        "%s PhaseSweep is running without CUDA isolation because "
                         "allow_no_gpu_isolation: true is set.",
                         message,
                     )

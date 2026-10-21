@@ -50,24 +50,27 @@ The existing skip is `test_absence_proof_tracks_a_real_child_pid_namespace`: its
 
 ### Decoder workflow follow-up gates
 
-The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, and successful cleanup messages each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
+The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, successful cleanup messages, and sandbox GPU inventory diagnostics each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
 
 | Gate | Result |
 | --- | --- |
 | CLI, repeat runtime, decoder wrapper, and workflow regressions | 132 passed in 63.43 seconds |
 | Cleanup messages and stale-trial recovery | 62 passed in 2.17 seconds; 12 integration cases deselected |
 | Example and recipe checks after copied-config clarification | 14 passed in 0.07 seconds |
+| GPU inventory, sandbox diagnostics, and decoder recipes | 86 passed in 1.47 seconds; one live test excluded |
 | New regression cases across the focused runs | Nine passed |
 | Contract tests | 109 passed through the mandatory commit hooks |
-| Whole-suite collection | 3,034 non-live tests across 99 modules |
+| Whole-suite collection | 3,040 non-live tests across 99 modules |
 | Ruff lint | Passed |
 | Ruff format check | Passed; 193 files formatted |
 | mypy | Passed; 80 source files |
-| Mandatory commit hooks | Passed for each of the six fixes |
+| Mandatory commit hooks | Passed for each fix |
 
 A fresh GPT-6.1-sol agent on medium found the repeats and continuation recipes from the repository docs without a supplied config or commands. Its local CUDA run completed nine 80-update models, retained a completed trial across an intentional SIGINT, retried the interrupted attempt, and replayed in 0.408 seconds with all nine checkpoint paths and timestamps preserved. It continued a chosen seed's model from step 80 to 85 using five additional updates, with Adam counters also at 85.
 
 A separate final CUDA check selected that seed's checkpoint directly from the member directory printed by `show-winners` and executed the README's continuation code block. It required no CSV lookup: the saved step and Adam counters advanced from 80 to 85, and 20 model-state tensors changed. The study's objective records were preserved. These follow-up experiments used local-only logging.
+
+The fresh workflow check preceded the member-directory, cleanup-message, copied-config, and sandbox-diagnostic follow-ups. Those changes received focused checks; the complete workflow has not been rerun cold against this final tree. Read-only validation of the real repeats example confirmed the missing-inventory sandbox refusal includes host-access advice, and the unchanged config passes with host GPU access.
 
 ### Real CUDA qualification
 
