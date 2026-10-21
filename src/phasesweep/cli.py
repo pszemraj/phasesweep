@@ -35,7 +35,7 @@ from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
 from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
@@ -717,6 +717,18 @@ def show_winners(config_path: Path) -> None:
                     f"# trial_number {winner.source.trial_number} names the group's last member."
                 )
                 click.echo("# Choose a checkpoint explicitly from repeats.members.")
+                for member in repeats["members"]:
+                    trial_dir = _trial_dir_for(
+                        experiment,
+                        name,
+                        member["trial_number"],
+                        generation_id=member["generation_id"],
+                        attempt_id=member["attempt_id"],
+                    )
+                    click.echo(
+                        f"# {repeats['key']}={member['repeat']!r} "
+                        f"trial_number={member['trial_number']} trial_dir={trial_dir}"
+                    )
             click.echo(winner.content.decode("utf-8"))
         else:
             click.echo(f"=== {name} === (no winner yet)")

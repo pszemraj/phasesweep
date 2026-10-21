@@ -1,5 +1,6 @@
 """Explain repeated winners beside the CLI's unchanged publication YAML."""
 
+import csv
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import Repeats, Sampler
-from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.repeats import ReduceName
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import published_generation_id
@@ -44,6 +45,24 @@ def _publish_winners(
     return experiment, config_path, contents
 
 
+def _assert_member_directories(experiment: Experiment, saved: bytes, guidance: str) -> None:
+    repeats = yaml.safe_load(saved)["repeats"]
+    with (_phase_dir(experiment, "repeated") / "trials.csv").open(encoding="utf-8") as handle:
+        rows = {int(row["number"]): row for row in csv.DictReader(handle)}
+    for member in repeats["members"]:
+        row = rows[member["trial_number"]]
+        directory = Path(row["user_attr:phasesweep_trial_dir"])
+        assert directory.is_dir()
+        assert (directory / "stdout.log").is_file()
+        assert row["param:seed"] == str(member["repeat"])
+        assert member["generation_id"] in directory.name
+        assert member["attempt_id"] in directory.name
+        assert (
+            f"# seed={member['repeat']!r} trial_number={member['trial_number']} "
+            f"trial_dir={directory}"
+        ) in guidance.splitlines()
+
+
 @pytest.mark.parametrize("reducer", ["mean", "median"])
 def test_show_winners_explains_repeat_metric_and_checkpoint_choice(
     tmp_path: Path, reducer: ReduceName
@@ -59,6 +78,7 @@ def test_show_winners_explains_repeat_metric_and_checkpoint_choice(
     assert f"# metric is the {reducer} over 3 values of repeat key 'seed'." in guidance
     assert "# trial_number 2 names the group's last member." in guidance
     assert "# Choose a checkpoint explicitly from repeats.members." in guidance
+    _assert_member_directories(experiment, contents["repeated"], guidance)
     assert all(line.startswith("# ") for line in guidance.splitlines())
     assert rendered == "\n"
     assert yaml.safe_load(repeated) == yaml.safe_load(saved)
@@ -96,5 +116,6 @@ def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path
     assert "# metric is the median over 3 values of repeat key 'seed'." in guidance
     assert "# trial_number 2 names the group's last member." in guidance
     assert "# Choose a checkpoint explicitly from repeats.members." in guidance
+    _assert_member_directories(experiment, contents["repeated"], guidance)
     assert "fold" not in guidance
     assert "mean" not in guidance
