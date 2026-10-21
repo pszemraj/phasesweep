@@ -24,6 +24,7 @@ from typing import Annotated, Any, Literal, NoReturn, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 if typing.TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
 
 from phasesweep import __version__
@@ -710,12 +711,12 @@ def _safe_tool(fn: F) -> F:
     if inspect.iscoroutinefunction(fn):
 
         @functools.wraps(fn)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def async_wrapper(*args: object, **kwargs: object) -> object:
             """Invoke an async tool and redact any exception.
 
-            :param Any args: Positional arguments passed through to the wrapped tool.
-            :param Any kwargs: Keyword arguments passed through to the wrapped tool.
-            :return Any: Awaited tool result.
+            :param object args: Positional arguments passed through to the wrapped tool.
+            :param object kwargs: Keyword arguments passed through to the wrapped tool.
+            :return object: Awaited tool result.
             """
             try:
                 return await fn(*args, **kwargs)
@@ -725,12 +726,12 @@ def _safe_tool(fn: F) -> F:
         return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(fn)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+    def sync_wrapper(*args: object, **kwargs: object) -> object:
         """Invoke a synchronous tool and redact any exception.
 
-        :param Any args: Positional arguments passed through to the wrapped tool.
-        :param Any kwargs: Keyword arguments passed through to the wrapped tool.
-        :return Any: Wrapped tool result.
+        :param object args: Positional arguments passed through to the wrapped tool.
+        :param object kwargs: Keyword arguments passed through to the wrapped tool.
+        :return object: Wrapped tool result.
         """
         try:
             return fn(*args, **kwargs)
@@ -800,14 +801,14 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
             raise RuntimeError(f"MCP tool {tool_name!r} must require run_id")
 
 
-def build_server(app: PhaseSweepMCP) -> Any:
+def build_server(app: PhaseSweepMCP) -> FastMCP:
     """Construct the FastMCP server.
 
     The SDK is imported lazily so non-server code paths do not
     require the ``mcp`` package.
 
     :param PhaseSweepMCP app: SDK-free tool implementation to expose.
-    :return Any: Configured FastMCP server.
+    :return FastMCP: Configured FastMCP server.
     """
     from mcp.server.fastmcp import FastMCP
 

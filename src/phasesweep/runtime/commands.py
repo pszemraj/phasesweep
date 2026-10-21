@@ -172,10 +172,10 @@ def _validate_file_config_value(payload: object, *, position: str) -> None:
         raise ValueError(message) from exc
 
 
-def dump_overrides_json(payload: Any) -> str:
+def dump_overrides_json(payload: JsonValue) -> str:
     """Encode only JSON-compatible values using the trainer's strict wire format.
 
-    :param Any payload: JSON-compatible scalar, list, or string-keyed mapping.
+    :param JsonValue payload: JSON-compatible scalar, list, or string-keyed mapping.
     :return str: Deterministic JSON text.
     :raises ValueError: A value is non-finite, recursive, or outside the strict JSON domain.
     """

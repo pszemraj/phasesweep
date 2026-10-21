@@ -15,6 +15,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from phasesweep.runtime.files import open_private_text
+from phasesweep.runtime.json import JsonValue
 from phasesweep.runtime.time import utc_now_iso
 
 log = logging.getLogger("phasesweep.mcp.audit")
@@ -23,11 +24,11 @@ MAX_AUDIT_STRING_LENGTH = 256
 AuditTransport = Literal["stdio", "cli"]
 
 
-def _compact_value(value: Any) -> Any:
+def _compact_value(value: JsonValue) -> JsonValue:
     """Return an audit-safe scalar with bounded string size.
 
-    :param Any value: Scalar value to compact.
-    :return Any: The original value, or a truncated copy when it is an overlong string.
+    :param JsonValue value: Scalar value to compact.
+    :return JsonValue: The original value, or a truncated copy when it is an overlong string.
     """
     if isinstance(value, str) and len(value) > MAX_AUDIT_STRING_LENGTH:
         return f"{value[: MAX_AUDIT_STRING_LENGTH - 3]}..."
