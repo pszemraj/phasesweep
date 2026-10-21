@@ -429,7 +429,7 @@ def search_space_warnings(phase: Phase) -> list[str]:
     return warnings
 
 
-def retry_target_ceiling(phase: Phase, *, finished: int, completed: int) -> int | None:
+def retry_target_ceiling(phase: Phase, *, finished: int, measured: int) -> int | None:
     """Return the largest ``n_trials`` a fixed configuration or grid may be raised to.
 
     A fixed configuration keeps at most one COMPLETE result, feasible or not, so
@@ -441,19 +441,17 @@ def retry_target_ceiling(phase: Phase, *, finished: int, completed: int) -> int 
     :param Phase phase: Phase whose ceiling is computed.
     :param int finished: Finished attempts its study holds, interrupted ones left
         out, zero when the study does not exist yet.
-    :param int completed: How many of those attempts are COMPLETE, feasible or not.
+    :param int measured: How many of those attempts are COMPLETE, feasible or not.
     :return int | None: The ceiling, or ``None`` when the phase is unrestricted.
     """
     if not phase_draws(phase):
-        return finished if completed >= 1 else finished + 1
+        return finished if measured >= 1 else finished + 1
     if phase.sampler.type != "grid":
         return None
-    return finished + grid_cardinality(phase) - completed
+    return finished + grid_cardinality(phase) - measured
 
 
-def fixed_configuration_target_refusal(
-    phase: Phase, *, finished: int, completed: int
-) -> str | None:
+def fixed_configuration_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
     """Refuse extra measurements of an already completed fixed configuration.
 
     A fixed configuration keeps at most one COMPLETE result, feasible or not.
@@ -464,7 +462,7 @@ def fixed_configuration_target_refusal(
     :param Phase phase: Phase whose ``n_trials`` is checked.
     :param int finished: Finished attempts its study already holds, interrupted
         ones left out, zero when the study does not exist yet.
-    :param int completed: How many of those attempts are COMPLETE, whether or
+    :param int measured: How many of those attempts are COMPLETE, whether or
         not they are feasible.
     :return str | None: The refusal, which names the fix, or ``None`` when the
         target is allowed.
@@ -472,10 +470,10 @@ def fixed_configuration_target_refusal(
     if phase_draws(phase):
         return None
     name, target = phase.name, phase.n_trials
-    ceiling = retry_target_ceiling(phase, finished=finished, completed=completed)
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=measured)
     if ceiling is None or target <= ceiling:
         return None
-    if completed >= 1:
+    if measured >= 1:
         return (
             f"Phase {name!r} is a fixed configuration that already has a COMPLETE or "
             f"INFEASIBLE trial; n_trials={target} would run the same configuration again. "
@@ -506,7 +504,7 @@ def grid_cardinality(phase: Phase) -> int:
     )
 
 
-def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str | None:
+def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
     """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
     Finished failures remain spent. Raising the target may retry each failed
@@ -515,16 +513,16 @@ def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str |
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
-    :param int completed: Grid cells whose trial completed, in bounds or not.
+    :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
     :return str | None: Refusal when the target exceeds the available cells.
     """
-    maximum = retry_target_ceiling(phase, finished=finished, completed=completed)
+    maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
-        f"attempts: {finished} finished attempts and {completed} COMPLETE or INFEASIBLE cells "
+        f"attempts: {finished} finished attempts and {measured} COMPLETE or INFEASIBLE cells "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
         "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated."
     )

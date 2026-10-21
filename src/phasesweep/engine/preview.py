@@ -25,8 +25,8 @@ from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerpri
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _phase_study_name,
     _suggest,
 )
@@ -67,8 +67,8 @@ class RecordedPhase:
     #: plus each RUNNING one whose objective recorded a failure, which a launch recovers
     #: as failed first. Any other RUNNING attempt recovers as interrupted and reruns.
     finished: int
-    #: How many of those are COMPLETE.
-    completed: int
+    #: How many of those are COMPLETE, feasible or not.
+    measured: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
     #: Reruns a launch would run before any new draw: interrupted trials without one,
@@ -132,7 +132,7 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
-        return RecordedPhase(finished=0, completed=0, running=0, reruns=0, study=None)
+        return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
     running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
     sequence_counts = _outcome_sequence_counts(trials)
@@ -141,7 +141,7 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     )
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
-        completed=_completed_trial_count(trials),
+        measured=_measured_trial_count(trials),
         running=len(running),
         reruns=_pending_rerun_count(trials, None if running else phase)
         + len(running)
@@ -219,7 +219,7 @@ def _refuse_as_a_launch_would(
             _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
-                    phase, finished=record.finished, completed=record.completed
+                    phase, finished=record.finished, measured=record.measured
                 )
             elif reached:
                 _validate_trial_target(study, phase)

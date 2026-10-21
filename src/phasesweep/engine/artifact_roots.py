@@ -18,8 +18,8 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
@@ -331,11 +331,11 @@ def _check_published_phase_studies(
                 )
                 if matched and expected is not None:
                     finished = _finished_trial_count(trials)
-                    completed = _completed_trial_count(trials)
-                    if _meets_published_trial_history_boundary(finished, completed, expected):
+                    measured = _measured_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, measured, expected):
                         continue
                     missing = (
-                        f"has only {finished} finished and {completed} COMPLETE or INFEASIBLE "
+                        f"has only {finished} finished and {measured} COMPLETE or INFEASIBLE "
                         "trials, below the published completion boundary"
                     )
                     if expected.finished_trials is not None:

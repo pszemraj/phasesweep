@@ -31,7 +31,7 @@ from phasesweep.engine.fingerprints import (
     _changed_payload_keys,
     _render_changed_values,
 )
-from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
+from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -456,30 +456,30 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     _validate_fixed_configuration_target(
         phase,
         finished=_finished_trial_count(trials),
-        completed=_completed_trial_count(trials),
+        measured=_measured_trial_count(trials),
     )
 
 
-def _validate_fixed_configuration_target(phase: Phase, *, finished: int, completed: int) -> None:
-    """Reject a fixed configuration or grid target that would repeat completed cells.
+def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
+    """Reject a fixed configuration or grid target that would repeat measured cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
-    Raising ``n_trials`` retries it only while no attempt has completed: after
+    Raising ``n_trials`` retries it only while no attempt is COMPLETE: after
     ``finished`` failed attempts the target may reach ``finished + 1``, and a
-    completed attempt, feasible or not, closes it. A grid applies the same rule
+    COMPLETE attempt, feasible or not, closes it. A grid applies the same rule
     per cell: its target may add one attempt per cell without a COMPLETE result.
     Other sampled phases are unrestricted. A missing study counts zero finished
-    and zero completed.
+    and zero measured.
 
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
-    :param int finished: Terminal attempts the phase's study holds.
-    :param int completed: How many of those are COMPLETE.
+    :param int finished: Finished attempts the phase's study holds.
+    :param int measured: How many of those are COMPLETE, feasible or not.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
-    refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    refusal = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
-        refusal = grid_target_refusal(phase, finished=finished, completed=completed)
+        refusal = grid_target_refusal(phase, finished=finished, measured=measured)
     if refusal is not None:
         raise TrialTargetRefusedError(refusal)
 
@@ -831,9 +831,7 @@ def _recovery_remedies(
         )
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
-    ceiling = retry_target_ceiling(
-        phase, finished=finished, completed=_completed_trial_count(trials)
-    )
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=_measured_trial_count(trials))
     streak = _tripped_streak(abort)
     remedies = []
     if ceiling is None:

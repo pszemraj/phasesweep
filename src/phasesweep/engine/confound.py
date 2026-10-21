@@ -150,8 +150,8 @@ def _survivorship(
     Failures include evidence-gate and extraction errors. Infeasible trials and
     feasible members of incomplete repeat groups are counted separately and do not
     flag; interrupted trials are excluded, and so is a failed attempt that a
-    completed retry replaced (:func:`_replaced_by_completed_retry`), since its cell
-    has a successful trial. Counts are recorded for every verdict.
+    COMPLETE or INFEASIBLE retry replaced (:func:`_replaced_by_measured_retry`), since
+    its cell has a measured trial. Counts are recorded for every verdict.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
@@ -159,7 +159,7 @@ def _survivorship(
     :return dict[str, Any]: The check record.
     """
     ranked_numbers = {trial.number for trial in ranked}
-    replaced = _replaced_by_completed_retry(trials)
+    replaced = _replaced_by_measured_retry(trials)
     counts = dict.fromkeys(_SURVIVORSHIP_COUNTS, 0)
     counts["ranked"] = len(ranked_numbers)
     for trial in trials:
@@ -174,7 +174,7 @@ def _survivorship(
     return _checked("survivorship", counts)
 
 
-def _replaced_by_completed_retry(trials: Sequence[optuna.trial.FrozenTrial]) -> set[int]:
+def _replaced_by_measured_retry(trials: Sequence[optuna.trial.FrozenTrial]) -> set[int]:
     """Return the numbers of attempts that a COMPLETE retry replaced, however many retries ago.
 
     A retry names the attempt it reran under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`

@@ -1464,7 +1464,7 @@ def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
     """
     if storage is not None:
         return
-    refusal = fixed_configuration_target_refusal(phase, finished=0, completed=0)
+    refusal = fixed_configuration_target_refusal(phase, finished=0, measured=0)
     if refusal is not None:
         raise ValueError(refusal)
 

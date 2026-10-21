@@ -34,8 +34,8 @@ from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _phase_study_name,
     _suggest,
     _trial_count_state,
@@ -162,11 +162,11 @@ def _partial_completion_for_replay(
     """
     trials = study.get_trials(deepcopy=False)
     finished_trials = _finished_trial_count(trials)
-    completed_trials = _completed_trial_count(trials)
+    measured_trials = _measured_trial_count(trials)
     if (
         outcome_sequence != decision.outcome_sequence
         or finished_trials != decision.finished_trials
-        or completed_trials != decision.completed_trials
+        or measured_trials != decision.completed_trials
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
@@ -1337,7 +1337,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     study = run.study
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = _completed_trial_count(trials_after)
+    measured_after = _measured_trial_count(trials_after)
     # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
@@ -1393,7 +1393,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 "trial_target": phase.n_trials,
                 "outcome_sequence": current_policy_state.max_sequence,
                 "finished_trials": finished_after,
-                "completed_trials": completed_after,
+                "completed_trials": measured_after,
                 "timeout_scope": run.timeout_source,
                 "recovered_abort_sequence": recovered_abort_sequence,
             },
@@ -1420,7 +1420,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=finished_after,
-                completed_trials=completed_after,
+                completed_trials=measured_after,
                 incomplete=accepted_partial_timeout,
                 reason="timeout" if accepted_partial_timeout else None,
                 timeout_scope=run.timeout_source if accepted_partial_timeout else None,
@@ -1645,7 +1645,7 @@ def _replay_met_target(
         completion=_winner_completion(
             requested_trials=phase.n_trials,
             finished_trials=_finished_trial_count(trials),
-            completed_trials=_completed_trial_count(trials),
+            completed_trials=_measured_trial_count(trials),
             incomplete=False,
             reason=None,
             timeout_scope=None,

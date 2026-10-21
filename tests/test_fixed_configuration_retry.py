@@ -350,7 +350,7 @@ def test_dry_run_logs_the_fixed_configuration_warning(
 
 
 @pytest.mark.parametrize(
-    ("finished", "completed", "n_trials", "refusal"),
+    ("finished", "measured", "n_trials", "refusal"),
     [
         (0, 0, 1, None),
         (0, 0, 2, "would run 2 identical trials"),
@@ -366,11 +366,11 @@ def test_dry_run_logs_the_fixed_configuration_warning(
     ],
 )
 def test_fixed_configuration_target_rule(
-    finished: int, completed: int, n_trials: int, refusal: str | None
+    finished: int, measured: int, n_trials: int, refusal: str | None
 ) -> None:
-    """The whole rule in one table: F failures allow F + 1, and a completed trial closes it."""
+    """The whole rule in one table: F failures allow F + 1, and a COMPLETE trial closes it."""
     phase = Phase(name="p", n_trials=n_trials, fixed_overrides={"x": 1})
-    message = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    message = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
         assert message is None
     else:
