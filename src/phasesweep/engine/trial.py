@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -666,8 +667,6 @@ def extract_trial_result(
         acceptance.
     :return TrialResult: Finite metric and feasibility, or no metric and a failure reason.
     """
-    import time
-
     executed = replace(
         executed, ctx=replace(executed.ctx, wandb_query=_wandb_query(experiment, gates or []))
     )
