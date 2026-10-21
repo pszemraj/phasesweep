@@ -17,13 +17,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
+from pydantic import ConfigDict, TypeAdapter, ValidationError
+from pydantic import JsonValue as PydanticJsonValue
 
 from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
-_FILE_CONFIG_VALUE: TypeAdapter[JsonValue] = TypeAdapter(
-    JsonValue,
+# Validation needs pydantic's own alias: its tagged-union error types and locations are
+# what _validate_file_config_value reads, and the repo's string alias cannot validate.
+_FILE_CONFIG_VALUE: TypeAdapter[PydanticJsonValue] = TypeAdapter(
+    PydanticJsonValue,
     config=ConfigDict(strict=True, allow_inf_nan=False, hide_input_in_errors=True),
 )
 
