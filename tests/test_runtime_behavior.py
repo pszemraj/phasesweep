@@ -777,7 +777,7 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
     from phasesweep.cli import _configure_logging
 
     cases = [
-        ("default_quiet", optuna.logging.INFO, False, optuna.logging.WARNING),
+        ("default_quiet", optuna.logging.INFO, False, optuna.logging.ERROR),
         ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
     ]
 

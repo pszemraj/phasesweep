@@ -87,7 +87,7 @@ def _configure_logging(verbose: bool) -> None:
 
     Args:
         verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
-            otherwise root is ``INFO`` and Optuna is quieted to ``WARNING``.
+            otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
 
     """
     level = logging.DEBUG if verbose else logging.INFO
@@ -96,10 +96,7 @@ def _configure_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname).1s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Optuna's per-trial INFO output is essentially 1:1 with phasesweep's own
-    # runner.info "[phase/trial_N] <cmd>" line and adds nothing. Quiet it down
-    # by default; -v restores INFO for trial-level diagnostics.
-    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
+    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.ERROR)
 
 
 @click.group(

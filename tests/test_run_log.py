@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import optuna
@@ -14,6 +16,7 @@ from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import _bounded_metric, make_experiment, write_trainer
@@ -223,3 +226,73 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
     assert len(hints) == 1
     assert f"[p/trial_{first_import_failure}] the trainer exited with code 1 under" in hints[0]
     assert "No module named 'm" in hints[0]
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.integration
+def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bool) -> None:
+    """Normal CLI failures keep the TRIAL cause; verbose restores Optuna diagnostics."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_x_trainer(tmp_path),
+        n_trials=1,
+        max_consecutive_failures=1,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[2])},
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(experiment.model_dump_json())
+
+    result = subprocess.run(
+        [sys.executable, "-m", "phasesweep", "run", str(config_path), *(["-v"] if verbose else [])],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "TRIAL trial=0 state=FAIL" in result.stderr
+    assert "reason=non-zero exit code 3; stderr: second line" in result.stderr
+    if verbose:
+        assert "A new study created" in result.stderr
+        assert "Trial 0 failed" in result.stderr
+        assert "Traceback (most recent call last):" in result.stderr
+    else:
+        assert "Trial 0 failed" not in result.stderr
+        assert "Traceback (most recent call last):" not in result.stderr
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs: int) -> None:
+    """The abort stays in its triggering outcome and prints after that trial's TRIAL line."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trial_command="false {overrides}",
+        n_trials=2,
+        n_jobs=n_jobs,
+        max_consecutive_failures=1,
+        search_space={"x": IntParam(type="int", low=0, high=2)},
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+    )
+    triggering = next(
+        trial for trial in study.trials if "abort" in trial.user_attrs[TRIAL_OUTCOME_ATTR]
+    )
+    abort = triggering.user_attrs[TRIAL_OUTCOME_ATTR]["abort"]
+    lines = (_experiment_dir(experiment) / "run.log").read_text().splitlines()
+    abort_lines = [index for index, line in enumerate(lines) if "phase=p ABORTED:" in line]
+    trial_index = next(
+        index
+        for index, line in enumerate(lines)
+        if f"phase=p TRIAL trial={triggering.number} " in line
+    )
+    assert len(abort_lines) == 1
+    assert trial_index < abort_lines[0]
+    assert abort["cause"] in lines[abort_lines[0]]

@@ -48,6 +48,8 @@ MLflow-backed experiments additionally retain native run bindings in each trial 
 
 ### Following a run
 
+The CLI shows PhaseSweep's trial outcomes and causes by default, while Optuna logs only errors. `run --verbose` also enables Optuna's per-trial diagnostics and tracebacks. A failure-policy `ABORTED` line follows the `TRIAL` line that triggered it.
+
 `run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Each phase that runs logs a header line, and every trial that ends adds one `TRIAL` line, in the order trials end:
 
 ```text

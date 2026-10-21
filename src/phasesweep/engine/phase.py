@@ -63,6 +63,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     Winner,
     WinnerSource,
+    _parsed_trial_outcome,
     _trial_outcome_payload,
     constraint_attr,
     observed_attr,
@@ -898,8 +899,6 @@ def _record_outcome(
         run.record_fatal(unrecorded)
         raise unrecorded from write_error
 
-    assert abort_record is not None
-    log.error("phase=%s ABORTED: %s", run.phase.name, abort_record["cause"])
     with contextlib.suppress(Exception):
         run.study.stop()
 
@@ -1265,6 +1264,9 @@ def _settle_finished_trial(
             study.stop()
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     _log_finished_trial(run.phase, trial, finished)
+    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    if outcome is not None and outcome.abort is not None:
+        log.error("phase=%s ABORTED: %s", run.phase.name, outcome.abort["cause"])
     # Keep unsafe-cleanup entries until recovery. Run reconciliation handles skipped callbacks.
     finished_attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if (
