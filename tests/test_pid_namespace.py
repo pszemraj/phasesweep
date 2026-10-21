@@ -110,9 +110,14 @@ def _hide_namespace(proc: Path, pid: int) -> None:
 def _fake_proc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reader: str | None = INITIAL_READER
 ) -> Path:
-    """Replace ``/proc`` with one holding only the host's init, and the reader's namespace with ``reader``."""
+    """Replace ``/proc`` with one holding only the host's init and its current boot id, and the reader's namespace with ``reader``."""
     proc = tmp_path / "proc"
     _write_process(proc, 1, nspid=[1], namespace=INITIAL_READER)
+    boot_id = reaper.read_boot_id()
+    if boot_id is not None:
+        boot_id_file = proc / "sys" / "kernel" / "random" / "boot_id"
+        boot_id_file.parent.mkdir(parents=True)
+        boot_id_file.write_text(f"{boot_id}\n")
     monkeypatch.setattr(reaper, "_PROC", proc)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reader)
     return proc
@@ -142,6 +147,21 @@ def test_read_pid_namespace_names_this_process_namespace() -> None:
 
     assert namespace == f"{os.readlink('/proc/self/ns/pid')}@{read_proc_starttime(1)}"
     assert reaper.is_pid_namespace(namespace)
+
+
+def test_read_boot_id_reads_the_module_procfs_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boot id comes from ``_PROC``, so a fake procfs answers for it and a missing file reads as unknown."""
+    proc = _fake_proc(tmp_path, monkeypatch)
+    boot_id_file = proc / "sys" / "kernel" / "random" / "boot_id"
+    boot_id_file.parent.mkdir(parents=True, exist_ok=True)
+    boot_id_file.write_text("fake-boot\n")
+
+    assert reaper.read_boot_id() == "fake-boot"
+
+    boot_id_file.unlink()
+    assert reaper.read_boot_id() is None
 
 
 def test_read_pid_namespace_refuses_procfs_of_another_namespace(

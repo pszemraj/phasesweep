@@ -53,7 +53,8 @@ class StaleProcessIdentity:
 def read_boot_id() -> str | None:
     """Return the current Linux boot identity, or ``None`` when unavailable."""
     try:
-        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        boot_id_file = _PROC / "sys" / "kernel" / "random" / "boot_id"
+        value = boot_id_file.read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
         return None
     return value or None
