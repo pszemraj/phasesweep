@@ -116,6 +116,42 @@ def test_explain_a_leaf_prints_only_that_entry() -> None:
     assert "\n\n" not in out
 
 
+def test_explain_resolves_a_dotted_search_parameter_name() -> None:
+    """A dotted trainer key resolves to its search-parameter reference."""
+    code, out, err = _explain("phases[].search_space.optimizer.lr")
+
+    assert code == 0
+    assert not err
+    assert "choices:" in out
+    assert "low:" in out
+
+
+def test_explain_phases_is_a_compact_index_to_its_children() -> None:
+    """The broad phases query stays usable and points to detailed child queries."""
+    code, out, err = _explain("phases")
+
+    assert code == 0
+    assert not err
+    assert "phases[].n_trials" in out
+    assert "phases[].search_space" in out
+    assert "phasesweep explain" in out
+    assert len(out) < 8000
+
+
+def test_cross_field_validation_points_to_the_reference_index() -> None:
+    """A model-level refusal still gives a discoverable configuration command."""
+    from pydantic import ValidationError
+
+    from phasesweep.config.io import describe_validation_error
+    from phasesweep.config.models import Phase
+    from tests.conftest import make_experiment
+
+    with pytest.raises(ValidationError) as caught:
+        make_experiment(phases=[Phase(name="p", n_trials=1, inherits=["missing"])])
+
+    assert "see: phasesweep explain" in describe_validation_error(caught.value)
+
+
 def test_explain_unknown_key_exits_two_with_closest_matches() -> None:
     """A miss goes to stderr, names the closest documented keys and prints nothing else."""
     code, out, err = _explain("inherit_env")

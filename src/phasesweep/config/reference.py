@@ -250,14 +250,31 @@ def lookup(key: str) -> tuple[ReferenceEntry, ...]:
 
     A key that several discriminator variants share, such as ``metric.extractor.path``,
     returns one entry per variant, each labelled by its ``[type=...]`` path. A
-    ``<key>`` segment in the reference matches any single segment of the query. An
+    ``<key>`` segment in the reference matches a dotted trainer key in the query. An
     empty key matches every entry.
 
     :param str key: A key as the reference or a user spells it.
     :return tuple[ReferenceEntry, ...]: Matching entries in file order, empty when none match.
     """
     query = _segments(key)
-    return tuple(entry for entry in reference_entries() if _matches(_segments(entry.path), query))
+    entries = reference_entries()
+    paths = [_segments(entry.path) for entry in entries]
+    owners = {path[: path.index(_MAP_KEY)] for path in paths if _MAP_KEY in path}
+    for owner in owners:
+        if query[: len(owner)] != owner or len(query) <= len(owner):
+            continue
+        suffixes = [path[len(owner) + 1 :] for path in paths if path[: len(owner)] == owner]
+        end = next(
+            (
+                index
+                for index in range(len(owner) + 1, len(query))
+                if any(suffix and _matches(suffix, query[index:]) for suffix in suffixes)
+            ),
+            len(query),
+        )
+        query = (*owner, _MAP_KEY, *query[end:])
+        break
+    return tuple(entry for entry, path in zip(entries, paths, strict=True) if _matches(path, query))
 
 
 def closest(key: str, limit: int = 3) -> tuple[str, ...]:

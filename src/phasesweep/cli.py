@@ -26,6 +26,7 @@ from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
     first_sentence,
     lookup_or_suggest,
+    plain_path,
     reference_notes,
     sub_key_count,
     top_level_entries,
@@ -583,6 +584,7 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
         "keys; with a KEY such as 'phases[].sampler', print that key and every key below it. "
         "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
+        "The broad phases key lists its immediate children; narrow it for full details. "
         "With --notes, print the general notes on file paths, YAML typing and environment "
         "variables instead."
     ),
@@ -621,6 +623,13 @@ def explain(key: str | None, notes: bool) -> None:
         )
         click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
         raise click.exceptions.Exit(_USAGE_EXIT)
+    if plain_path(key) == "phases":
+        for entry in entries:
+            if plain_path(entry.path).count(".") == 1:
+                click.echo(f"{entry.path}: {entry.signature}")
+                click.echo(f"  {first_sentence(entry, _SUMMARY_WIDTH)}")
+        click.echo("Narrow with a key: phasesweep explain 'phases[].search_space'")
+        return
     for index, entry in enumerate(entries):
         if index:
             click.echo()

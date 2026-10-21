@@ -524,14 +524,14 @@ def test_describe_validation_error_adds_distinct_quoted_hints() -> None:
     )
 
 
-def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
-    """An experiment-level validator reports an empty location, so there is no key to explain."""
+def test_describe_validation_error_points_to_index_without_a_location() -> None:
+    """An experiment-level error points to the index when it has no specific key."""
     data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
     data["phases"][0]["inherits"] = ["baseline"]
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
     assert [error["loc"] for error in caught.value.errors()] == [()]
-    assert describe_validation_error(caught.value) == str(caught.value)
+    assert describe_validation_error(caught.value) == f"{caught.value}\nsee: phasesweep explain"
 
 
 def test_loc_to_path_has_no_key_for_unknown_or_model_level_locations() -> None:
