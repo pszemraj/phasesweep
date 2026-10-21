@@ -1924,7 +1924,7 @@ def test_uncertain_cleanup_cancels_queued_host_gpu_lease_wait(tmp_path: Path) ->
         os.environ["PHASESWEEP_LOCK_DIR"] = str(lock_dir)
         held_fds = []
         phase_module.GpuPool = SimpleNamespace(
-            create=lambda **kwargs: GpuPool([GpuDevice("0", "GPU-test")])
+            for_phase=lambda phase, **kwargs: GpuPool([GpuDevice("0", "GPU-test")])
         )
 
         def fake_launch_trial(**kwargs):
