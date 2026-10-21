@@ -10,7 +10,9 @@ class OperatorAction(StrEnum):
     """Operator remediation category for routing expected failures.
 
     FRESH_NAMESPACE starts a separate namespace for the affected state;
-    RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions.
+    RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions;
+    PROVISION_LOCK_DIR points PHASESWEEP_LOCK_DIR at an existing writable
+    directory every launching context shares, or moves the work to the host.
     RUN_RECOVER_RUN retries process cleanup through the appropriate CLI or MCP
     recovery entry point. FIX_CONFIG corrects configuration or environment;
     RETRY repeats the operation after its blocker resolves; INSPECT_LOGS requires diagnosis.
@@ -20,6 +22,7 @@ class OperatorAction(StrEnum):
     FRESH_NAMESPACE = "fresh_namespace"
     RESTORE_LEDGER = "restore_ledger"
     RESTORE_TREE = "restore_tree"
+    PROVISION_LOCK_DIR = "provision_lock_dir"
     RUN_RECOVER_RUN = "run_recover_run"
     FIX_CONFIG = "fix_config"
     RETRY = "retry"
@@ -84,6 +87,10 @@ OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.RESTORE_TREE: (
         "restore the files and permissions identified in the error, deleting a file only if "
         "certain nothing is running"
+    ),
+    OperatorAction.PROVISION_LOCK_DIR: (
+        "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
+        "MCP server, and sandbox on the host, or run on the host"
     ),
     OperatorAction.RUN_RECOVER_RUN: RERUN_CLEANUP_RECOVERY,
     OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",

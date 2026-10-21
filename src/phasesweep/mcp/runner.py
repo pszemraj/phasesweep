@@ -249,17 +249,12 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    next_steps = _routed_next_steps(error.action)
     if isinstance(error, UnsafeLockPathError):
         failure_stage = "preflight"
-        next_steps["remediation"] = (
-            "All launching contexts must share the same writable PHASESWEEP_LOCK_DIR. "
-            f"{next_steps['remediation']}"
-        )
     return {
         "code": code,
         "stage": _FIXED_STAGES.get(code, failure_stage),
-        **next_steps,
+        **_routed_next_steps(error.action),
     }
 
 

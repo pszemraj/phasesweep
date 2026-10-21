@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import optuna
@@ -90,6 +90,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
+from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafeLockPathError,
@@ -1027,6 +1028,39 @@ def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     return lock_dir()
 
 
+def _lock_dir_override_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve an explicit lock directory the OS refuses to open."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(
+        runtime_files, "open_directory_fd", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return lock_dir()
+
+
+def _lock_dir_default_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the default lock directory when the OS refuses to create it."""
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+    monkeypatch.setattr(
+        runtime_files, "ensure_private_dir", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return lock_dir()
+
+
+def _lock_dir_override_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve an explicit lock directory that does not exist."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "typo"))
+    return lock_dir()
+
+
+def _lock_file_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Take a lock file the OS refuses to open."""
+    monkeypatch.setattr(
+        runtime_files, "_open_lock_file", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return runtime_files.try_lock_file(tmp_path / "blocked.lock")
+
+
 def _home_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resolve the private root through a relative override."""
     monkeypatch.setenv("PHASESWEEP_HOME", "relative-home")
@@ -1378,6 +1412,34 @@ ORIGIN_CASES = (
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
     ),
     RoutingCase(
+        id="lock_dir_override_access_refused",
+        trigger=_lock_dir_override_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot access lock directory",
+    ),
+    RoutingCase(
+        id="lock_dir_default_access_refused",
+        trigger=_lock_dir_default_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot create or access default lock directory",
+    ),
+    RoutingCase(
+        id="lock_dir_override_missing",
+        trigger=_lock_dir_override_missing,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="does not exist; provision it before setting PHASESWEEP_LOCK_DIR",
+    ),
+    RoutingCase(
+        id="lock_file_access_refused",
+        trigger=_lock_file_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot open lock file",
+    ),
+    RoutingCase(
         id="phasesweep_home_override_relative",
         trigger=_home_override_relative,
         raised=UnsafePrivatePathError,
@@ -1637,6 +1699,7 @@ _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
         OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
+        OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
         OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",

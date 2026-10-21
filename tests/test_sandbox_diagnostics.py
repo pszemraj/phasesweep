@@ -4,22 +4,28 @@ from __future__ import annotations
 
 import pytest
 
-from phasesweep.errors import GpuConfigurationError
+from phasesweep.errors import GpuConfigurationError, OperatorAction
 from phasesweep.mcp.runner import _terminal_failure_payload
 from phasesweep.runtime.files import UnsafeLockPathError
 from phasesweep.runtime.gpu import GpuPool
 
 
 def test_mcp_lock_access_failure_has_operator_remediation() -> None:
-    error = UnsafeLockPathError("Cannot access /private/host/locks: Permission denied")
+    error = UnsafeLockPathError(
+        "Cannot access /private/host/locks: Permission denied",
+        action=OperatorAction.PROVISION_LOCK_DIR,
+    )
     failure = _terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
 
     assert failure["code"] == "storage_unavailable"
     assert failure["stage"] == "preflight"
     assert failure["actor"] == "operator"
     assert failure["retryable"] is False
-    assert "same writable PHASESWEEP_LOCK_DIR" in failure["remediation"]
-    assert "restore the files and permissions" in failure["remediation"]
+    assert failure["remediation"] == (
+        "Ask the operator to point PHASESWEEP_LOCK_DIR at an existing writable directory shared "
+        "by every shell, MCP server, and sandbox on the host, or run on the host. The error in "
+        "the PhaseSweep run log gives the details."
+    )
     assert "/private/host/locks" not in str(failure)
 
 

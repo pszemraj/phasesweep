@@ -274,6 +274,7 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
     with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist"):
         runtime_files.lock_dir()
+    assert not override.exists()
 
     override.mkdir()
     override.chmod(0o750)

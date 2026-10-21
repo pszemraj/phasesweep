@@ -175,7 +175,8 @@ def lock_dir() -> Path:
             _lock_policy(path)
         except OSError as exc:
             raise UnsafeLockPathError(
-                f"Cannot access lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+                f"Cannot access lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                action=OperatorAction.PROVISION_LOCK_DIR,
             ) from exc
         return path
 
@@ -205,7 +206,8 @@ def lock_dir() -> Path:
         raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
     except OSError as exc:
         raise UnsafeLockPathError(
-            f"Cannot create or access default lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+            f"Cannot create or access default lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+            action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     return path
 
@@ -229,7 +231,8 @@ def _lock_policy(path: Path) -> _LockPolicy:
         fd = open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}."
+            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}.",
+            action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Lock directory {path} has an unsafe path component.") from exc
@@ -294,7 +297,8 @@ def open_lock_file(path: Path) -> IO[str]:
             return _open_lock_file(path)
         except OSError as exc:
             raise UnsafeLockPathError(
-                f"Cannot open lock file {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+                f"Cannot open lock file {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                action=OperatorAction.PROVISION_LOCK_DIR,
             ) from exc
 
 

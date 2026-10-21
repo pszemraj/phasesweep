@@ -1721,6 +1721,11 @@ def test_cli_boundary_reports_expected_run_failure(
         (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (
+            OperatorAction.PROVISION_LOCK_DIR,
+            "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
+            "MCP server, and sandbox on the host, or run on the host",
+        ),
         (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
         (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
         (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
