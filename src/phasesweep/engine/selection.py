@@ -24,9 +24,11 @@ from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
     RepeatsRecord,
+    combined_standard_error,
     group_key,
     observed_means,
     ranked_group,
+    within_noise,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -227,9 +229,18 @@ def select_winner(
         incomplete_group=() if ranking is None else ranking.incomplete_group,
     )
     flagged = _describe_flagged(confound)
+    if winning is not None and ranking is not None:
+        for group in ranking.groups:
+            if dict(group.params) != dict(winning.params) and within_noise(winning, group):
+                flagged.append(
+                    f"tie: group {group.representative} params={dict(group.params)} versus "
+                    f"winner params={dict(winning.params)}, "
+                    f"gap={abs(group.aggregate - winning.aggregate):.6g}, "
+                    f"combined_se={combined_standard_error(winning, group):.6g}"
+                )
     if flagged:
         log.warning(
-            "[%s] potential confounds in the %d ranked trials (advisory; recorded in the "
+            "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "
             "winner's confound block): %s.",
             phase_name or study.study_name,
             len(survivors),
