@@ -282,7 +282,7 @@ def select_winner(
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
         confound=confound,
         observed=(
-            _observed_values(best)
+            _observed_values(best, subject=f"Winning trial {best.number}")
             if record is None
             else observed_means([member["observed"] for member in record["members"]])
         ),
@@ -453,20 +453,23 @@ def _repeats_record(
                     c.name: float(t.user_attrs[constraint_attr(c.name)])
                     for c in experiment.constraints
                 },
-                "observed": _observed_values(t),
+                "observed": _observed_values(
+                    t, subject=f"Trial {t.number} of the winning repeat group"
+                ),
             }
             for t in members
         ],
     }
 
 
-def _observed_values(trial: optuna.trial.FrozenTrial) -> dict[str, float]:
+def _observed_values(trial: optuna.trial.FrozenTrial, *, subject: str) -> dict[str, float]:
     """Read the report-only values one trial recorded, from its own attributes.
 
     The values come from the trial, not the current config, so a later edit to
     ``observe`` cannot change what an already-run trial reports.
 
-    :param optuna.trial.FrozenTrial trial: The selected trial.
+    :param optuna.trial.FrozenTrial trial: The selected trial, or a member of the winning group.
+    :param str subject: How an error names ``trial``, such as ``"Winning trial 3"``.
     :raises TrialEvidenceMissingError: A recorded value is not a finite number.
     :return dict[str, float]: Observed value by observation name, sorted by name.
     """
@@ -479,7 +482,7 @@ def _observed_values(trial: optuna.trial.FrozenTrial) -> dict[str, float]:
         return _validate_observed_block(recorded)
     except ValueError as exc:
         raise TrialEvidenceMissingError(
-            f"Winning trial {trial.number} has a malformed {OBSERVED_PREFIX!r} value: {exc}."
+            f"{subject} has a malformed {OBSERVED_PREFIX!r} value: {exc}."
         ) from exc
 
 
