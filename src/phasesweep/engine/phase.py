@@ -85,6 +85,7 @@ from phasesweep.engine.study_policy import (
     _record_trial_target,
     _recovery_action,
     _recovery_advice,
+    _streak_trials_all_completed,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
@@ -1344,9 +1345,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Without storage there is no study to continue, so only the logs are left to read.
         persistent = experiment.storage is not None
         advice = _recovery_advice(phase, study, abort) if persistent else None
+        evidence = (
+            "The tripping trials completed outside the metric bounds or constraints."
+            if _streak_trials_all_completed(study, abort)
+            else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
+        )
         raise NoFeasibleTrialError(
-            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} "
-            f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
+            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}"
             + ("" if advice is None else f" {advice}"),
             action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
         )

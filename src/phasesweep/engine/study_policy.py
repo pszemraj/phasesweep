@@ -652,6 +652,35 @@ def _tripped_streak(abort: Mapping[str, object]) -> int | None:
     return streak if type(streak) is int else None
 
 
+def _streak_trials_all_completed(study: optuna.Study, abort: Mapping[str, object]) -> bool:
+    """Say whether a streak abort tripped on trials that all completed outside the bounds.
+
+    The tripping trials are the last ``consecutive_failures`` failed or fatal outcomes up
+    to the abort's completion sequence; an interrupted outcome neither counts nor resets
+    the streak. A trial whose trainer failed ends FAIL and has a stderr log. One that
+    completed outside the metric bounds or constraints has none.
+
+    :param optuna.Study study: The phase's study.
+    :param Mapping[str, object] abort: The recorded abort.
+    :return bool: Whether ``abort`` is a streak abort and none of its tripping trials failed.
+    """
+    streak = _tripped_streak(abort)
+    sequence = abort.get("completion_sequence")
+    if streak is None or type(sequence) is not int:
+        return False
+    counted = []
+    for trial in study.get_trials(deepcopy=False):
+        parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+        if (
+            parsed is not None
+            and parsed.sequence <= sequence
+            and parsed.outcome in {"failure", "fatal"}
+        ):
+            counted.append((parsed.sequence, trial))
+    counted.sort(key=lambda entry: entry[0])
+    return all(trial.state == optuna.trial.TrialState.COMPLETE for _, trial in counted[-streak:])
+
+
 def _config_retires_abort(
     phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], abort: JsonObject
 ) -> bool:
@@ -748,11 +777,35 @@ def _retry_remedy(
     return f"{raise_to} {' and '.join(actions)}; completed cells are not repeated{restart}."
 
 
+_FRESH_START = (
+    "If a defect you have since fixed produced those results, they stay recorded, "
+    "so set a new `experiment` name in the config to start fresh."
+)
+
+
 def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
     Every recovery message takes its advice from here, and :func:`_recovery_action` routes
-    it. An unconfirmed unsafe-cleanup abort needs cleanup recovery before any target retires
+    it. Each remedy keeps the recorded results, and PhaseSweep cannot know that the trainer
+    changed since, so the advice always ends by saying how to discard them: a new
+    ``experiment`` name.
+
+    :param Phase phase: Phase that aborted.
+    :param optuna.Study study: The phase's study.
+    :param Mapping[str, object] abort: The recorded abort.
+    :return str | None: The advice, or ``None`` when no remedy or explanation applies.
+    """
+    remedies = _recovery_remedies(phase, study, abort)
+    return None if remedies is None else f"{remedies} {_FRESH_START}"
+
+
+def _recovery_remedies(
+    phase: Phase, study: optuna.Study, abort: Mapping[str, object]
+) -> str | None:
+    """Name the steps that continue a phase whose study recorded ``abort``, or say none does.
+
+    An unconfirmed unsafe-cleanup abort needs cleanup recovery before any target retires
     it. Otherwise the remedies are a raised ``n_trials``, which a grid or fixed
     configuration may raise only as far as its retry ceiling allows, and for a streak abort
     a ``max_consecutive_failures`` above the recorded count while the target still leaves
@@ -763,7 +816,7 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
-    :return str | None: The advice, or ``None`` when no remedy or explanation applies.
+    :return str | None: The steps, or ``None`` when no remedy or explanation applies.
     """
     name, target = phase.name, phase.n_trials
     if _awaits_cleanup_recovery(study, abort):

@@ -469,6 +469,62 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     _assert_advises_limit(message, 2, 2, 4)
 
 
+_FRESH_START = (
+    "If a defect you have since fixed produced those results, they stay recorded, "
+    "so set a new `experiment` name in the config to start fresh."
+)
+
+
+def _out_of_bounds_metric() -> Metric:
+    """Return a ``x=<value>`` metric whose upper bound a logged 5.0 exceeds."""
+    return Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        max=1.0,
+    )
+
+
+def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experiment_is_renamed(
+    tmp_path: Path,
+) -> None:
+    """Fixing the trainer does not re-measure cells it mis-measured, so every refusal says so."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    original = _grid(tmp_path, trainer, 4, cells=4, metric=_out_of_bounds_metric())
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(original)
+    assert [trial.state.name for trial in _trials(original)] == ["COMPLETE", "COMPLETE"]
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        run_experiment(original)
+    phase = original.phases[0]
+    streak = phase_ops._failure_policy_abort_record(
+        phase, consecutive_failures=2, completion_sequence=2, trial_target=4
+    )
+    with pytest.raises(NoFeasibleTrialError) as at_limit:
+        phase_ops._raise_streak_at_limit(phase, streak, _study(original))
+
+    for message in (str(aborted.value), str(refused.value), str(at_limit.value)):
+        _assert_advises_limit(message, 2, 2, 4)
+        assert message.endswith(_FRESH_START)
+        _assert_no_fresh_namespace(message)
+    headline = str(aborted.value)
+    assert "stderr" not in headline
+    assert "The tripping trials completed outside the metric bounds or constraints." in headline
+
+
+def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is_in_it(
+    tmp_path: Path,
+) -> None:
+    """One trainer failure among the tripping trials leaves a stderr log worth reading."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=1, value=5.0)
+    original = _grid(tmp_path, trainer, 4, cells=4, metric=_out_of_bounds_metric())
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(original)
+    assert [trial.state.name for trial in _trials(original)] == ["FAIL", "COMPLETE"]
+    message = str(aborted.value)
+    assert " for stderr logs." in message
+    assert "completed outside the metric bounds" not in message
+    assert message.endswith(_FRESH_START)
+
+
 def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: Path) -> None:
     """Random draws have no per-cell retry rule, so any target above the aborted one recovers."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
