@@ -145,7 +145,7 @@ class CategoricalParam(_Frozen):
         Optuna persists the first equal choice, so ``1``, ``1.0``, and ``True``
         cannot coexist as choices. Duplicates also alter random sampling weights.
 
-        :param choices: Candidate choices in configured order.
+        :param list choices: Candidate choices in configured order.
         :raises ValueError: A choice is unsupported, non-finite, or equal to an earlier choice.
         :return list: The choices, unchanged.
         """

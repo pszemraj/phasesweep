@@ -878,11 +878,11 @@ def _record_outcome(
     Retries rebuild the payload under the lock; backoff releases the lock.
     Already-recorded trials are ignored. A later success cannot clear an abort.
 
-    :param run: Phase execution whose counters advance after the durable write.
-    :param trial: Trial receiving the outcome record.
-    :param outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
-    :param cause: Optional explanation stored in the outcome.
-    :param fatal_policy: Optional policy stored in the outcome and fatal abort.
+    :param _PhaseExecution run: Phase execution whose counters advance after the durable write.
+    :param optuna.Trial trial: Trial receiving the outcome record.
+    :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
+    :param str | None cause: Optional explanation stored in the outcome.
+    :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
     :raises _TrialOutcomeUnrecordedAbort: Retries exhausted; leave the trial RUNNING
         and stop launches for stale-attempt recovery.
     """
@@ -1173,8 +1173,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     """Record each objective outcome before returning or re-raising its exception.
 
-    :param run: Phase execution receiving the outcome and any fatal error.
-    :param trial: Active Optuna trial.
+    :param _PhaseExecution run: Phase execution receiving the outcome and any fatal error.
+    :param optuna.Trial trial: Active Optuna trial.
     :return float: Extracted metric.
     """
     with run.workers.track(trial.number):
@@ -1279,9 +1279,9 @@ def _settle_finished_trial(
     Repeat ``study.stop()`` after an abort; the objective owns the abort decision.
     Write the log before attempting MLflow publication.
 
-    :param run: Phase execution.
-    :param study: Running study to stop after an abort.
-    :param trial: Finished trial whose attempt may be retired.
+    :param _PhaseExecution run: Phase execution.
+    :param optuna.Study study: Running study to stop after an abort.
+    :param optuna.trial.FrozenTrial trial: Finished trial whose attempt may be retired.
     """
     if run.aborted:
         with contextlib.suppress(Exception):
@@ -1728,10 +1728,10 @@ def _placeholder_winner(
     Carry inherited overrides, omit the repeat key, and mark searched or inherited
     stand-in keys unless fixed overrides replace them.
 
-    :param experiment: Experiment defining the phase graph.
-    :param phase: Phase needing a placeholder.
-    :param inherited_winners: Winners from earlier phases.
-    :param sampled_params: Preview samples, or None for low bounds and first choices.
+    :param Experiment experiment: Experiment defining the phase graph.
+    :param Phase phase: Phase needing a placeholder.
+    :param dict[str, Winner] inherited_winners: Winners from earlier phases.
+    :param dict | None sampled_params: Preview samples, or None for low bounds and first choices.
     :return Winner: Placeholder with trial number -1 and a NaN metric.
     """
     placeholder_params = (

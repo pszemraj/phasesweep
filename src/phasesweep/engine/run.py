@@ -180,13 +180,15 @@ def run_experiment(
     environments and trial evidence. Fingerprints with placeholder ancestry
     remain unknown until the parent publishes a winner.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Resume phase; validate and load earlier published winners.
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Resume phase; validate and load earlier published winners.
         None starts at the first phase, reusing recorded trials where applicable.
-    :param dry_run: Preview remaining trial counts and one command per phase.
-    :param terminal_callback: Synchronous diagnostic callback under the experiment lock.
-    :param publication_hook: Required sidecar around publication commit, if supplied.
-    :param generation_id: Invocation identity, generated if omitted. Supplied names
+    :param bool dry_run: Preview remaining trial counts and one command per phase.
+    :param Callable[[TerminalReport], None] | None terminal_callback: Synchronous diagnostic
+        callback under the experiment lock.
+    :param PublicationHook | None publication_hook: Required sidecar around publication
+        commit, if supplied.
+    :param str | None generation_id: Invocation identity, generated if omitted. Supplied names
         may contain only alphanumerics, underscores, and dashes.
     :return dict[str, Winner]: Winners in declaration order. Dry runs return
         replayed winners where available and placeholders elsewhere.
@@ -246,12 +248,13 @@ def _run_experiment_outcome(
 ) -> Mapping[str, Winner]:
     """Run and publish one generation while holding the experiment lock.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Optional resume point; see :func:`run_experiment`.
-    :param terminal_callback: Optional diagnostic callback.
-    :param publication_hook: Optional required publication sidecar.
-    :param generation_id: Optional caller-owned invocation identity.
-    :param environments_preflighted: Launch environments were checked before any
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
+    :param Callable[[TerminalReport], None] | None terminal_callback: Optional diagnostic
+        callback.
+    :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :param str | None generation_id: Optional caller-owned invocation identity.
+    :param bool environments_preflighted: Launch environments were checked before any
         writes to a fresh artifact tree.
     :return Mapping[str, Winner]: This invocation's winners, captured under the lock.
     :raises TrialEvidenceMissingError: Candidate evidence failed preflight or winner validation.
@@ -550,14 +553,16 @@ def _run_experiment_inner(
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Resume point whose earlier winners are loaded from disk.
-    :param ledger: Claimed ledger, or None for read-only command and trial-count previews.
-    :param generation_id: Invocation identity, or None for a dry run.
-    :param preloaded_winners: Validated skipped-phase winners captured before generation commit.
-    :param run_deadline: Monotonic deadline including preflight and stale cleanup.
-    :param publication_hook: Optional required publication sidecar.
-    :return Mapping[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Resume point whose earlier winners are loaded from disk.
+    :param ledger_ops.ClaimedLedger | None ledger: Claimed ledger, or None for read-only
+        command and trial-count previews.
+    :param str | None generation_id: Invocation identity, or None for a dry run.
+    :param dict[str, Winner] | None preloaded_winners: Validated skipped-phase winners captured
+        before generation commit.
+    :param float | None run_deadline: Monotonic deadline including preflight and stale cleanup.
+    :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :return dict[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
     :raises TimeoutError: The run deadline expired before a phase started.
     :raises PublicationAccessError: A recorded dry-run publication is inaccessible.
     :raises PublicationIntegrityError: A recorded dry-run publication fails validation.

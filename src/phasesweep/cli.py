@@ -662,7 +662,7 @@ def _render_reference_index() -> None:
 def show_winners(config_path: Path) -> None:
     """Print winners using their generation's recorded phase plan and validated bytes.
 
-    :param config_path: Config used to locate the publication and label drift as historical.
+    :param Path config_path: Config used to locate the publication and label drift as historical.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     """
