@@ -27,7 +27,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. The full config below uses an Optuna journal file for persistent status and reuse.
+The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. For a bounded comparison with seed noise and persistent resume, use [Learning rates over seeds](#learning-rates-over-seeds). The full config below uses an Optuna journal file for persistent status and reuse.
 
 Use the full three-phase example only when you intentionally want the longer experiment:
 
@@ -45,6 +45,23 @@ The upstream trainer records periodic validation with labels 0, 100, ..., 900, a
 Checkpoint loading and final evaluation belong to this example's trainer wrapper. See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
+
+## Learning rates over seeds
+
+The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. After the setup above, run from the PhaseSweep repository root:
+
+```bash
+phasesweep validate examples/tiny_decoder_enwik8/repeats.yaml
+phasesweep run examples/tiny_decoder_enwik8/repeats.yaml --dry-run
+phasesweep run examples/tiny_decoder_enwik8/repeats.yaml
+phasesweep status examples/tiny_decoder_enwik8/repeats.yaml --trials
+phasesweep show-winners examples/tiny_decoder_enwik8/repeats.yaml
+phasesweep run examples/tiny_decoder_enwik8/repeats.yaml
+```
+
+The nine trials run sequentially on CUDA device `0`, with 80 optimizer updates, batch size 4, and sequence length 128 each. The objective is the saved step-80 `final.pt` loss over eight held-out validation batches. Each learning rate is ranked by its mean over the three seeds; `status --trials` includes every group's mean and sample SD. A within-noise advisory means the current seeds do not separate the candidate rates; this short example demonstrates the workflow rather than convergence.
+
+The last command replays a completed study without training again. After an interruption, the same command keeps completed trials and reruns interrupted attempts before new cells. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [runtime recovery](../../docs/runtime.md#interrupted-trials-rerun) for failure aborts and retry budgets.
 
 ## Native MLflow GPU smoke
 

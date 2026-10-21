@@ -1,0 +1,73 @@
+# Compare three learning rates over three seeds, then inspect or resume the saved study.
+# Run: phasesweep run examples/tiny_decoder_enwik8/repeats.yaml
+# Setup: README.md. Accepted PhaseSweep keys: ../../src/phasesweep/config_reference.yaml.
+
+experiment: tiny_decoder_enwik8_repeats
+storage: auto
+workdir: /tmp/phasesweep-tiny-decoder-enwik8-repeats
+provenance:
+  trainer: "run-trial-v2+decoder-template@9c90a551"
+  data: "enwik8-template-download"
+execution:
+  cwd: ../..
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --template-root examples/tiny_decoder_enwik8/upstream --config {config_path}"
+trainer_config:
+  run_dir: "{trial_dir}/trainer"
+  num_tokens: 256
+  dim: 128
+  depth: 2
+  heads: 4
+  dim_head: 32
+  tied_embedding: true
+  flash_attn: true
+  compile: false
+  use_autocast: true
+  num_batches: 80
+  batch_size: 4
+  grad_accum_every: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  data_path: data/enwik8.gz
+  seq_len: 128
+  validate_every: 80
+  val_batches: 8
+  generate_every: 1000000
+  save_every: 1000000
+  seed: 7
+timeout_seconds_per_run: 900
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  WANDB_MODE: disabled
+
+metric:
+  name: val_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: val_loss
+    split: validation
+    policy: final_checkpoint
+    checkpoint: final.pt
+    expected_step: 80
+
+phases:
+  - name: learning_rate
+    # n_trials counts the three learning rates times the three seed values.
+    n_trials: 9
+    n_jobs: 1
+    gpu_ids: [0]
+    timeout_seconds_per_trial: 90
+    sampler: {type: grid, seed: 11}
+    repeats:
+      key: seed
+      values: [7, 17, 27]
+      reduce: mean
+    gates:
+      - type: json_equals
+        path: result.json
+        key: runtime.device_type
+        value: cuda
+    search_space:
+      learning_rate: {type: categorical, choices: [0.0003, 0.001, 0.003]}
