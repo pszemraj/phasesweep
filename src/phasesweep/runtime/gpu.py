@@ -673,10 +673,14 @@ class GpuPool:
         """
         if not self._devices:
             return None
+        waiting_logged = False
         while True:
             with self._condition:
                 while not self._available:
                     wait_seconds = self._remaining_seconds(deadline)
+                    if not waiting_logged:
+                        log.info("Waiting for GPU lease: local GPU slots are in use.")
+                        waiting_logged = True
                     self._condition.wait(timeout=wait_seconds)
                 candidates = list(self._available)
                 self._available.clear()
@@ -702,6 +706,9 @@ class GpuPool:
                     self._condition.notify_all()
             if acquired is not None:
                 return acquired
+            if not waiting_logged:
+                log.info("Waiting for GPU lease: host GPU locks are held.")
+                waiting_logged = True
             self._wait_for_retry(deadline)
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
@@ -713,10 +720,14 @@ class GpuPool:
         """
         if not self._devices:
             return None
+        waiting_logged = False
         while True:
             with self._condition:
                 while self._whole_node_in_use:
                     wait_seconds = self._remaining_seconds(deadline)
+                    if not waiting_logged:
+                        log.info("Waiting for GPU lease: local GPU slots are in use.")
+                        waiting_logged = True
                     self._condition.wait(timeout=wait_seconds)
                 self._whole_node_in_use = True
 
@@ -741,6 +752,9 @@ class GpuPool:
                         self._whole_node_in_use = False
                         self._condition.notify_all()
             if not all_leased:
+                if not waiting_logged:
+                    log.info("Waiting for GPU lease: host GPU locks are held.")
+                    waiting_logged = True
                 self._wait_for_retry(deadline)
                 continue
 
