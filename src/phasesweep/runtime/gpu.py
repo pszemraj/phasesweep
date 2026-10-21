@@ -147,10 +147,9 @@ def _release_host_gpu_lease(lease: IO[str] | None) -> None:
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
     """Probe ``nvidia-smi`` once for visible indices and usable device UUIDs.
 
-    Returns:
-        Numeric indices plus the subset mapped to a ``GPU-...`` or ``MIG-...``
-        identity. Both are empty when the probe is unavailable.
-
+    :return tuple[list[int], dict[str, str]]: Numeric indices plus the subset mapped to a
+        ``GPU-...`` or ``MIG-...`` identity, keyed by index. Both are empty when the probe is
+        unavailable.
     """
     try:
         out = subprocess.run(
@@ -786,10 +785,8 @@ class GpuPool:
     def _release(self, acquired: _GpuAcquisition | None) -> None:
         """Return a previously-acquired CUDA device token to the pool.
 
-        Args:
-            acquired: Assignment returned by :meth:`_acquire`. ``None`` is a no-op
-                (inactive pool).
-
+        :param _GpuAcquisition | None acquired: Assignment returned by :meth:`_acquire`.
+            ``None`` is a no-op (inactive pool).
         """
         if acquired is None:
             return

@@ -388,20 +388,15 @@ def _dry_run_phase(
     The log line names, by parent, the inherited keys whose values are stand-ins
     until that parent publishes a winner.
 
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase being previewed.
-        inherited_winners: Winners loaded for phases earlier in the chain.
-        study: An in-memory Optuna study used to ``ask`` for one sample.
-        remaining: Number of trials that *would* run; logged for the user.
-        reruns: How many of them rerun an interrupted trial or retry a failed grid cell
-            before any new draw.
-
-    Returns:
-        A :class:`Winner` placeholder built from the previewed sample, or from
-        each parameter's low bound or first choice, so downstream dry-run
-        previews see consistent inherited context.
-
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase being previewed.
+    :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain.
+    :param optuna.Study study: An in-memory Optuna study used to ``ask`` for one sample.
+    :param int remaining: Number of trials that *would* run; logged for the user.
+    :param int reruns: How many of them rerun an interrupted trial or retry a failed grid cell
+        before any new draw.
+    :return Winner: A placeholder built from the previewed sample, with the repeat key
+        omitted, so downstream dry-run previews see consistent inherited context.
     """
     of_them = ""
     if reruns == 1:

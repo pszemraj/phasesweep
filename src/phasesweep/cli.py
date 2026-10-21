@@ -85,10 +85,8 @@ _SUMMARY_WIDTH = 72
 def _configure_logging(verbose: bool) -> None:
     """Initialize root logging and tune Optuna's verbosity.
 
-    Args:
-        verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
-            otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
-
+    :param bool verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
+        otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(

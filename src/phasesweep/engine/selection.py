@@ -120,31 +120,24 @@ def select_winner(
     Assess and log confounds over the ranked population. These verdicts are advisory
     and never alter ranking or selection success.
 
-    Args:
-        study: Optuna study for the phase whose winner we want.
-        experiment: Parsed experiment config. Provides the optimization goal
-            (minimize/maximize) and the constraint definitions used to filter
-            trials.
-        phase_name: Phase label used in log messages; defaults to the study
-            name when the caller has no phase context.
-        repeats: The phase's repeat axis
-            (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a
-            phase without repeats.
-
-    Returns:
-        The winning trial as :class:`SelectedTrial` (number, params, metric,
-        constraint readings, persisted evidence-gate results, and the
-        population's confound block).
-
-    Raises:
-        NoFeasibleTrialError: If no trial in the study is both COMPLETE and
-            satisfies every constraint and the metric's bounds, or with
-            ``repeats`` if no group is complete. When the metric has bounds,
-            the message names them and the best COMPLETE value seen.
-        TrialEvidenceMissingError: If the winning trial's persisted gate results,
-            objective provenance, or observed values are missing, corrupt, or
-            malformed.
-
+    :param optuna.Study study: Study of the phase whose winner is selected.
+    :param Experiment experiment: Parsed experiment. Supplies the optimization goal
+        (minimize/maximize), the metric bounds, and the constraint definitions used to
+        filter trials.
+    :param str | None phase_name: Phase label used in log messages and to find the phase for
+        the grid advisories. Log messages fall back to the study name when ``None``, and
+        the grid advisories are skipped.
+    :param RepeatAxis | None repeats: The phase's repeat axis
+        (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
+    :raises NoFeasibleTrialError: No trial in the study is both COMPLETE and within every
+        constraint and the metric's bounds, or with ``repeats`` no group is complete. When
+        the metric has bounds, the message names them and the best COMPLETE value seen.
+    :raises TrialEvidenceMissingError: The winning trial's (with ``repeats``, any winning
+        group member's) persisted gate results, objective provenance, or observed values are
+        missing, corrupt, or malformed.
+    :return SelectedTrial: The winning trial: number, params, metric, constraint readings,
+        persisted evidence-gate results, objective provenance, trainer identity, observed
+        values, the population's confound block, and the repeat group when ``repeats`` is set.
     """
     minimize = experiment.metric.goal == "minimize"
     constraints_by_name = {c.name: c for c in experiment.constraints}

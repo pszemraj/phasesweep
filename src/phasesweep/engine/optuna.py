@@ -581,27 +581,20 @@ def _build_sampler(
 ) -> optuna.samplers.BaseSampler:
     """Construct the Optuna sampler for a phase from its YAML ``sampler`` block.
 
-    Args:
-        cfg: Parsed sampler config (type, seed, startup-trials, etc.).
-        search_space: The phase's validated sampler search space
-            (:func:`phasesweep.config.search.sampler_search_space`), used to build the
-            ``GridSampler`` grid; it includes the repeat axis.
-        n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
-            when ``n_jobs > 1``.
-        repeats: The phase's repeats block, which seeded random draws by
-            configuration slot.
-
-    Returns:
-        A configured :class:`optuna.samplers.BaseSampler` subclass instance.
-        A seeded stochastic sampler draws by draw position, so a study resumes
-        and grows without repeating a draw; an unseeded one is Optuna's own,
-        which only in-memory storage allows. A fixed configuration, whose
-        search space is empty, gets a plain random sampler that is never
+    :param Sampler cfg: Parsed sampler config (type, seed, startup-trials, etc.).
+    :param dict[str, SearchParam] search_space: The phase's validated sampler search space
+        (:func:`phasesweep.config.search.sampler_search_space`), used to build the
+        ``GridSampler`` grid; it includes the repeat axis.
+    :param int n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic when
+        ``n_jobs > 1``.
+    :param Repeats | None repeats: The phase's repeats block; the seeded random sampler draws
+        one configuration per slot of ``len(values)`` consecutive positions.
+    :raises ValueError: The validated grid search space cannot be enumerated.
+    :return optuna.samplers.BaseSampler: A configured sampler instance. A seeded stochastic
+        sampler draws by draw position, so a study resumes and grows without repeating a
+        draw; an unseeded one is Optuna's own, which only in-memory storage allows. A fixed
+        configuration, whose search space is empty, gets a plain random sampler that is never
         consulted.
-
-    Raises:
-        ValueError: The validated grid search space cannot be enumerated.
-
     """
     if not search_space:
         return optuna.samplers.RandomSampler(seed=cfg.seed)
@@ -637,14 +630,11 @@ def _build_sampler(
 def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
     """Dispatch to the right Optuna ``trial.suggest_*`` based on param type.
 
-    Args:
-        trial: The active Optuna trial.
-        name: Parameter name (used as the Optuna key).
-        p: The concrete search parameter from the phase's ``search_space``.
-
-    Returns:
-        The sampled value. Type matches ``p`` (``float``/``int``/categorical scalar).
-
+    :param optuna.Trial trial: The active Optuna trial.
+    :param str name: Parameter name (used as the Optuna key).
+    :param SearchParam p: The concrete search parameter from the phase's ``search_space``.
+    :return float | int | str | bool | None: The sampled value. Type matches ``p``
+        (``float``/``int``/categorical scalar).
     """
     if isinstance(p, FloatParam):
         return trial.suggest_float(name, p.low, p.high, step=p.step, log=p.log)

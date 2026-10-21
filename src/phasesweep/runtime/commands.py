@@ -387,34 +387,27 @@ def render_command(
     Never write input files. A supplied ``materialized_input_path`` is reused exactly;
     otherwise compose input for preview or validation without filesystem writes.
 
-    Args:
-        template: The user's ``trial_command`` template with ``{...}``
-            placeholders. Supported keys: ``config_path``, ``overrides``, ``overrides_path``,
-            ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
-        overrides: The composed overrides for this trial.
-        fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
-        trial_dir: Per-trial directory used for ``{trial_dir}``.
-        trial_id: Numeric trial number, used for ``{trial_id}``.
-        phase: Phase name, used for ``{phase}``.
-        run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
-            identifier used for ``{run_name}``.
-        trainer_config: Base trainer configuration embedded in the PhaseSweep
-            YAML. Every format composes the overrides into it; strings in it
-            expand the runtime placeholders (``{trial_dir}``, ``{trial_id}``,
-            ``{phase}``, ``{run_name}``).
-        materialized_input_path: Exact generated input already written by the
-            launch path. When supplied for a file mode, command rendering uses
-            this path without serializing or rewriting the input.
-
-    Returns:
-        The fully rendered, shell-ready command string.
-
-    Raises:
-        ValueError: If ``fmt`` is not one of the four supported formats, or a
-            dotted override cannot be composed into ``trainer_config``.
-        TypeError: A configured value cannot be represented by the selected
-            command or generated-file format.
-
+    :param str template: The user's ``trial_command`` template with ``{...}`` placeholders.
+        Supported keys: ``config_path``, ``overrides``, ``overrides_path``, ``trial_dir``,
+        ``trial_id``, ``phase``, ``run_name``.
+    :param dict[str, object] overrides: The composed overrides for this trial.
+    :param str fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
+    :param Path trial_dir: Per-trial directory used for ``{trial_dir}``.
+    :param int trial_id: Numeric trial number, used for ``{trial_id}``.
+    :param str phase: Phase name, used for ``{phase}``.
+    :param str run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>`` identifier
+        used for ``{run_name}``.
+    :param dict[str, object] | None trainer_config: Base trainer configuration embedded in the
+        PhaseSweep YAML. Every format composes the overrides into it; strings in it expand the
+        runtime placeholders (``{trial_dir}``, ``{trial_id}``, ``{phase}``, ``{run_name}``).
+    :param Path | None materialized_input_path: Exact generated input already written by the
+        launch path. When supplied for a file mode, command rendering uses this path without
+        serializing or rewriting the input.
+    :raises ValueError: ``fmt`` is not one of the four supported formats, or a dotted override
+        cannot be composed into ``trainer_config``.
+    :raises TypeError: A configured value cannot be represented by the selected command or
+        generated-file format.
+    :return str: The fully rendered, shell-ready command string.
     """
     config_path = ""
     overrides_path = ""

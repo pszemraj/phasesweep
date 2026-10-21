@@ -307,17 +307,13 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
 def read_proc_starttime(pid: int) -> int | None:
     """Read the start time of a process from /proc/<pid>/stat.
 
-    On Linux, (pid, starttime) uniquely identifies a process across its
-    lifetime. This is the only reliable way to avoid PID-reuse hazards
-    when killing stale processes from a prior orchestrator run.
+    Within one boot and PID namespace, (pid, starttime) identifies a process for its
+    whole lifetime. That pair guards against PID reuse when killing stale processes
+    from a prior orchestrator run.
 
-    Args:
-        pid: The process ID to inspect.
-
-    Returns:
-        The starttime in clock ticks (``/proc/<pid>/stat`` field 22), or
+    :param int pid: The process ID to inspect.
+    :return int | None: The starttime in clock ticks (``/proc/<pid>/stat`` field 22), or
         ``None`` on non-Linux systems and when the proc entry is unreadable.
-
     """
     stat = _read_proc_stat(Path("/proc") / str(pid))
     return None if stat is None else stat.starttime
@@ -326,13 +322,9 @@ def read_proc_starttime(pid: int) -> int | None:
 def is_pid_alive(pid: int) -> bool:
     """Check if a PID exists (best-effort; race-free check is impossible).
 
-    Args:
-        pid: The process ID to probe via ``kill(pid, 0)``.
-
-    Returns:
-        ``True`` if the PID exists (or exists but is owned by another user);
+    :param int pid: The process ID to probe via ``kill(pid, 0)``.
+    :return bool: ``True`` if the PID exists (or exists but is owned by another user);
         ``False`` if the kernel reports ``ProcessLookupError``.
-
     """
     try:
         os.kill(pid, 0)
@@ -364,12 +356,8 @@ def reap_child(pid: int) -> bool:
     Running processes, non-children and already-reaped children are unchanged.
     A child exiting after this call waits for a later reap.
 
-    Args:
-        pid: PID of a runner this process spawned.
-
-    Returns:
-        ``True`` when this call reaped ``pid``; ``False`` otherwise.
-
+    :param int pid: PID of a runner this process spawned.
+    :return bool: ``True`` when this call reaped ``pid``; ``False`` otherwise.
     """
     try:
         waited, _status = os.waitpid(pid, os.WNOHANG)
@@ -385,17 +373,12 @@ def read_stale_process_identity(
 ) -> StaleProcessIdentity:
     """Load and validate the atomic identity for a possibly-stale trial.
 
-    Args:
-        trial_dir: Trial directory containing ``process_identity.json``.
-        expected_attempt_id: Attempt identity stored on the Optuna trial.
-
-    Returns:
-        A complete, attempt-bound :class:`StaleProcessIdentity`.
-
-    Raises:
-        OSError: The identity record is missing or unreadable.
-        ValueError: The identity record is malformed or belongs to another attempt.
-
+    :param Path trial_dir: Trial directory containing ``process_identity.json``.
+    :param str expected_attempt_id: Attempt identity stored on the Optuna trial.
+    :raises OSError: The identity record is missing or unreadable.
+    :raises ValueError: The identity record is malformed, partial, of an unsupported schema, or
+        belongs to another attempt.
+    :return StaleProcessIdentity: A complete, attempt-bound identity.
     """
     path = trial_dir / PROCESS_IDENTITY_FILE
     try:
@@ -425,19 +408,11 @@ def read_stale_process_identity(
     def positive_int(field: str) -> int:
         """Validate and return one required positive-int identity field.
 
-        Args:
-            field: Name of the top-level identity field to read from the
-                payload and validate; it also names the field in the error
-                message.
-
-        Returns:
-            The field's value, guaranteed to be a non-bool ``int`` greater
-            than zero.
-
-        Raises:
-            ValueError: If the field is missing, not an ``int`` (or is a
-                ``bool``), or not strictly positive.
-
+        :param str field: Name of the top-level identity field to read from the payload and
+            validate; it also names the field in the error message.
+        :raises ValueError: The field is missing, not an ``int`` (or is a ``bool``), or not
+            strictly positive.
+        :return int: The field's value, a non-bool ``int`` greater than zero.
         """
         value = payload.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -532,16 +507,11 @@ def cleanup_stale_trial_process(
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     """Send SIGTERM, wait, then SIGKILL, confirming the group is gone.
 
-    Args:
-        pgid: Target process-group ID.
-        grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL.
-
-    Returns:
-        ``True`` if the group is confirmed dead (already gone, or died within
-        the SIGTERM grace, or died within 2s after SIGKILL). ``False`` if
-        signal delivery failed for non-``ProcessLookupError`` reasons, or the
-        group is still alive 2s after SIGKILL.
-
+    :param int pgid: Target process-group ID.
+    :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL.
+    :return bool: ``True`` if the group is confirmed dead (already gone, or died within the
+        SIGTERM grace, or died within 2s after SIGKILL). ``False`` if signal delivery failed
+        for non-``ProcessLookupError`` reasons, or the group is still alive 2s after SIGKILL.
     """
     return _terminate_process_groups((pgid,), grace_seconds=grace_seconds)[pgid]
 
@@ -552,15 +522,11 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
     Per-group verdicts match :func:`_terminate_process_group`; all groups share one
     SIGTERM grace and one post-SIGKILL confirmation window.
 
-    Args:
-        pgids: Target process-group IDs.
-        grace_seconds: Seconds to wait after SIGTERM before escalating to
-            SIGKILL, shared across all groups.
-
-    Returns:
-        Confirmation verdict per requested pgid — ``True`` only when that
+    :param tuple[int, ...] pgids: Target process-group IDs.
+    :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL,
+        shared across all groups.
+    :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
         group is confirmed dead.
-
     """
     confirmed: dict[int, bool] = {}
     members: dict[int, set[int]] = {}
@@ -628,15 +594,13 @@ def _process_group_alive(pgid: int) -> bool:
     """Check whether any non-zombie member of ``pgid`` is alive.
 
     On non-Linux systems without procfs, fall back to ``killpg(0)`` existence checks.
+    When the ``/proc`` scan is incomplete or the kernel-visible group has no inspectable
+    members, liveness cannot be ruled out and the group counts as alive.
 
-    Args:
-        pgid: Process-group ID to probe.
-
-    Returns:
-        ``True`` if at least one non-zombie member of the group exists.
-        ``False`` if the group is gone, or every remaining member is a zombie
-        (state ``Z``/``X``).
-
+    :param int pgid: Process-group ID to probe.
+    :return bool: ``True`` if at least one non-zombie member of the group exists or liveness
+        cannot be ruled out. ``False`` if the group is gone, or every remaining member is a
+        zombie (state ``Z``/``X``).
     """
     return _process_group_alive_with_members(pgid, None)
 
@@ -789,19 +753,15 @@ def kill_stale_group(
     if its leader has not been reused. Missing PID and PGID
     means no cleanup is needed; uncertain cleanup must block state advancement.
 
-    Args:
-        pid: Root PID from a durable process identity, or ``None`` if absent.
-        saved_starttime: Saved Linux process start time, or ``None`` when identity
-            cannot be verified. A live PID/PGID is never signalled in that case.
-        pgid: Process-group ID from the same durable identity.
-        grace_seconds: Seconds to wait after SIGTERM before escalating to
-            SIGKILL; passed through to :func:`_terminate_process_group`.
-
-    Returns:
-        ``True`` when it is safe to mark the trial ``FAIL`` (cleanup
-        confirmed or nothing to clean). ``False`` when cleanup is uncertain
-        and callers must NOT advance state.
-
+    :param int | None pid: Root PID from a durable process identity, or ``None`` if absent.
+    :param int | None saved_starttime: Saved Linux process start time, or ``None`` when
+        identity cannot be verified. A live PID/PGID is never signalled in that case.
+    :param int | None pgid: Process-group ID from the same durable identity.
+    :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL;
+        passed through to :func:`_terminate_process_group`.
+    :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (cleanup confirmed or
+        nothing to clean). ``False`` when cleanup is uncertain and callers must NOT advance
+        state.
     """
     target_pgid: int | None = None
 

@@ -160,13 +160,11 @@ def _save_winner(
     are never saved. Environment identity excludes ambient values. Evidence
     provenance remains a winner-only field.
 
-    Args:
-        experiment: Parsed experiment config; supplies the metric name used
-            in the persisted payload.
-        phase_name: Name of the phase whose winner is being saved.
-        winner: The winning trial.
-        generation_id: Immutable generation namespace to write into.
-
+    :param Experiment experiment: Parsed experiment config; supplies the metric name used in
+        the persisted payload.
+    :param str phase_name: Name of the phase whose winner is being saved.
+    :param Winner winner: The winning trial.
+    :param str generation_id: Immutable generation namespace to write into.
     """
     path = path_ops._generation_winner_path(experiment, generation_id, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,26 +256,20 @@ def _load_winner(
     Publication validation already checked persisted identities and structure, so
     this function checks only current-config-dependent requirements.
 
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase whose winner is being loaded.
-        inherited_winners: Winners loaded for phases earlier in the chain;
-            contribute to the recomputed fingerprint.
-        publication: The last-success publication the caller resolved with
-            ``raise_on_manifest_error=True``; ``None`` when nothing is
-            published. A caller loading several phases resolves it once.
-
-    Returns:
-        The reconstructed :class:`Winner` for ``phase``.
-
-    Raises:
-        FileNotFoundError: The publication holds no winner for the phase.
-        WinnerIntegrityError: The winner is incomplete, incompatible with
-            the current partial-result policy, or carries a ``repeats`` block
-            that is not the phase's configured repeat axis.
-        StudyFingerprintMismatchError: The stored fingerprint disagrees with
-            the freshly computed one.
-
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase whose winner is being loaded.
+    :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain;
+        contribute to the recomputed fingerprint.
+    :param ValidatedPublication | None publication: The last-success publication the caller
+        resolved with ``raise_on_manifest_error=True``; ``None`` when nothing is published. A
+        caller loading several phases resolves it once.
+    :raises FileNotFoundError: The publication holds no winner for the phase.
+    :raises WinnerIntegrityError: The winner is incomplete, incompatible with the current
+        partial-result policy, or carries a ``repeats`` block that is not the phase's
+        configured repeat axis.
+    :raises StudyFingerprintMismatchError: The stored fingerprint disagrees with the freshly
+        computed one.
+    :return Winner: The reconstructed winner for ``phase``.
     """
     if publication is None:
         raise FileNotFoundError(

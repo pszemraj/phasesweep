@@ -1167,14 +1167,10 @@ def file_url_path(storage: str) -> str:
         journal:////tmp/absolute.journal    -> /tmp/absolute.journal
         journal:///file:/tmp/a%3Fb?uri=true -> /tmp/a?b
 
-    Args:
-        storage: A file-style storage URL whose scheme is already known to be
-            file-based (``journal``).
-
-    Returns:
-        The bare filesystem path, without the scheme or leading slashes that
-        belong to URL grammar.
-
+    :param str storage: A file-style storage URL whose scheme is already known to be file-based
+        (``journal``).
+    :return str: The bare filesystem path, without the scheme or leading slashes that belong
+        to URL grammar.
     """
     scheme, rest = storage.split(":", 1)
 

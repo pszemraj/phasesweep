@@ -404,18 +404,17 @@ def _failed_trial(
     ``constraints`` is empty for failures that occur before constraint extraction
     starts; it carries the partial dict for failures that surface mid-loop.
 
-    Args:
-        rc: Subprocess return code.
-        duration: Wall-clock seconds the subprocess ran for.
-        failure_reason: Human-readable cause; surfaced in logs and Optuna user attrs.
-        constraints: Constraint readings collected before the failure, if any.
-        gate_results: Evidence gate results collected before the failure, if any.
-        deadline_exhausted: Whether the phase/run deadline caused the failure.
-        objective_provenance: Frozen evidence already captured before a later gate failed.
-
-    Returns:
-        A :class:`TrialResult` with ``metric=None`` and ``feasible=False``.
-
+    :param int rc: Subprocess return code.
+    :param float duration: Wall-clock seconds the subprocess ran for.
+    :param str failure_reason: Human-readable cause; surfaced in logs and Optuna user attrs.
+    :param dict[str, float] | None constraints: Constraint readings collected before the
+        failure, if any.
+    :param list[GateResult] | None gate_results: Evidence gate results collected before the
+        failure, if any.
+    :param bool deadline_exhausted: Whether the phase/run deadline caused the failure.
+    :param dict[str, object] | None objective_provenance: Frozen evidence already captured
+        before a later gate failed.
+    :return TrialResult: A result with ``metric=None`` and ``feasible=False``.
     """
     return TrialResult(
         metric=None,
@@ -675,14 +674,10 @@ def extract_trial_result(
     def _deadline_failure(stage: str) -> TrialResult | None:
         """Fail the trial when the wallclock deadline expired before ``stage``.
 
-        Args:
-            stage: Human-readable name of the stage about to run, used in the
-                failure reason.
-
-        Returns:
-            A deadline-failure :class:`TrialResult`, or ``None`` when no
-            deadline is set or budget remains.
-
+        :param str stage: Human-readable name of the stage about to run, used in the failure
+            reason.
+        :return TrialResult | None: A deadline-failure result, or ``None`` when no deadline is
+            set or budget remains.
         """
         if deadline is None or time.monotonic() < deadline:
             return None

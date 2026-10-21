@@ -61,12 +61,10 @@ class PhaseSweepShutdown(SystemExit):
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
         """Create a POSIX-style signaled exit with structured cleanup evidence.
 
-        Args:
-            signum: Shutdown signal that triggered the exit; the exit code is
-                ``128 + signum`` per the POSIX signaled-exit convention.
-            report: Cleanup evidence captured by the shutdown handler for the
-                child process groups it terminated.
-
+        :param int signum: Shutdown signal that triggered the exit; the exit code is
+            ``128 + signum`` per the POSIX signaled-exit convention.
+        :param ShutdownCleanupReport report: Cleanup evidence captured by the shutdown handler
+            for the child process groups it terminated.
         """
         super().__init__(128 + signum)
         self.signum = signum
@@ -129,14 +127,10 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     A main-thread critical section records the signal for its exit checkpoint;
     a concurrent handler invocation returns without interrupting cleanup.
 
-    Args:
-        signum: Shutdown signal number.
-        _frame: Unused frame required by the signal handler protocol.
-
-    Raises:
-        PhaseSweepShutdown: Exit code ``128 + signum``, unless deferred or cleanup
-            is already running.
-
+    :param int signum: Shutdown signal number.
+    :param FrameType | None _frame: Unused frame required by the signal handler protocol.
+    :raises PhaseSweepShutdown: Exit code ``128 + signum``, unless deferred or cleanup is
+        already running.
     """
     global _deferred_shutdown_signum, _servicing_signum
 
@@ -219,9 +213,7 @@ def install_signal_handlers() -> None:
     each call. An open temporary scope hands its installation over and skips
     restoration; later scopes leave process-lifetime ownership intact.
 
-    Raises:
-        SignalOwnershipUnavailableError: Called outside the main thread.
-
+    :raises SignalOwnershipUnavailableError: Called outside the main thread.
     """
     global _process_lifetime_owner
     if threading.current_thread() is not threading.main_thread():
@@ -310,14 +302,10 @@ def signal_handler_scope() -> Iterator[None]:
     restoration, including when claimed inside the scope. Worker calls require that
     ownership. Restoration reports its first error only when the body did not fail.
 
-    Raises:
-        SignalOwnershipUnavailableError: Called from a non-main thread when no
-            :func:`install_signal_handlers` call owns the shutdown signals for the
-            process lifetime; a scope open on the main thread does not count.
-
-    Yields:
-        ``None`` during the run whose children require shutdown cleanup.
-
+    :raises SignalOwnershipUnavailableError: Called from a non-main thread when no
+        :func:`install_signal_handlers` call owns the shutdown signals for the process
+        lifetime; a scope open on the main thread does not count.
+    :return Iterator[None]: Context for the run whose children require shutdown cleanup.
     """
     global _scope_depth, _servicing_signum
 
@@ -381,9 +369,7 @@ def defer_shutdown_signals() -> Iterator[None]:
     the handler wait on the launch lock. Python deferral remains active on platforms
     without ``pthread_sigmask``.
 
-    Yields:
-        ``None`` during the critical section.
-
+    :return Iterator[None]: Context for the critical section.
     """
     global _main_thread_defer_depth
     is_main = threading.current_thread() is threading.main_thread()
@@ -409,10 +395,9 @@ def service_pending_shutdown() -> None:
 
     Does nothing when no signal is pending.
 
-    Raises:
-        PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup
-            evidence for the recorded signal.
-
+    :raises PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup evidence for
+        the recorded signal, unless a main-thread critical section is still open (the signal
+        is recorded again) or another handler is already running (the call returns).
     """
     global _deferred_shutdown_signum
     signum = _deferred_shutdown_signum
@@ -438,10 +423,9 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
     without it, delivery can occur at window exit, with the terminal record remaining
     authoritative.
 
-    Yields:
-        AbsorbedShutdown: ``signum`` is the absorbed shutdown signal, or
-        ``None`` when no shutdown arrived during the window.
-
+    :return Iterator[AbsorbedShutdown]: Window outcome whose ``signum`` is the absorbed
+        shutdown signal, or ``None`` when no shutdown arrived during the window; it is set on
+        window exit.
     """
     global _main_thread_defer_depth
     global _deferred_shutdown_signum
@@ -479,14 +463,10 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
 def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
-    Args:
-        proc: Newly launched subprocess.
-        pgid: Explicit child process group guarded by ``proc``. When omitted,
-            register ``proc``'s own process group.
-
-    Returns:
-        Registered process-group ID for removal and signal targeting.
-
+    :param subprocess.Popen[bytes] proc: Newly launched subprocess.
+    :param int | None pgid: Explicit child process group guarded by ``proc``. When omitted,
+        register ``proc``'s own process group.
+    :return int: Registered process-group ID for removal and signal targeting.
     """
     resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
@@ -499,10 +479,8 @@ def _unregister(pgid: int) -> None:
 
     Defer shutdown while holding ``_lock`` to prevent handler re-entry deadlock.
 
-    Args:
-        pgid: The process-group ID returned by :func:`_register`. A pgid not
-            currently registered is silently ignored.
-
+    :param int pgid: The process-group ID returned by :func:`_register`. A pgid not currently
+        registered is silently ignored.
     """
     with defer_shutdown_signals(), _lock:
         _active_children.pop(pgid, None)

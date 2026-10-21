@@ -928,29 +928,19 @@ def _record_outcome(
 def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     """Optuna objective: sample, launch trial subprocess, extract, return metric.
 
-    Args:
-        run: The phase execution the trial belongs to.
-        trial: The active Optuna trial being evaluated.
-
-    Returns:
-        The extracted metric value (Optuna minimizes/maximizes per ``direction``).
-
-    Raises:
-        _UnlaunchedAbortError: A peer trial tripped a soft abort
-            (max_consecutive_failures) or a fatal error before this trial's
-            trainer launched, so it must not start.
-        UnsafeProcessCleanupError: The subprocess's cleanup could not be
-            confirmed; we hard-abort the phase before another trial can
-            acquire the just-released GPU lease.
-        TrialExecutionError: The subprocess returned non-zero / produced
-            no metric. Caught by ``study.optimize(catch=...)``.
-        ActiveAttemptPersistenceError: Required attempt recovery metadata
-            could not be persisted; nothing was launched and no GPU lease
-            was consumed.
-        _TrialOutcomeUnrecordedAbort: A successful trial's terminal
-            outcome could not be persisted, so the trial is
-            left ``RUNNING`` for stale-attempt recovery.
-
+    :param _PhaseExecution run: The phase execution the trial belongs to.
+    :param optuna.Trial trial: The active Optuna trial being evaluated.
+    :raises _UnlaunchedAbortError: A peer trial tripped a soft abort (max_consecutive_failures)
+        or a fatal error before this trial's trainer launched, so it must not start.
+    :raises UnsafeProcessCleanupError: The subprocess's cleanup could not be confirmed; the
+        phase hard-aborts before another trial can acquire the just-released GPU lease.
+    :raises TrialExecutionError: The subprocess returned non-zero or produced no metric.
+        Caught by ``study.optimize(catch=...)``.
+    :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
+        persisted; nothing was launched and no GPU lease was consumed.
+    :raises _TrialOutcomeUnrecordedAbort: A successful trial's terminal outcome could not be
+        persisted, so the trial is left ``RUNNING`` for stale-attempt recovery.
+    :return float: The extracted metric value (Optuna minimizes/maximizes per ``direction``).
     """
     experiment = run.experiment
     phase = run.phase
@@ -1441,44 +1431,37 @@ def _run_phase(
     turns how that loop ended into the phase's winner or refusal
     (:func:`_finish_phase`).
 
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase to execute.
-        inherited_winners: Winners loaded for phases earlier in the chain.
-        generation_id: Identity of the current engine invocation.
-        ledger: The claimed ledger, for ``experiment``, that this phase opens
-            its live study through.
-        run_deadline: Optional ``time.monotonic()`` deadline inherited from
-            the experiment-level wallclock guard.
-
-    Returns:
-        The selected phase :class:`Winner`.
-
-    Raises:
-        NoFeasibleTrialError: ``max_consecutive_failures`` tripped or every
-            trial was infeasible.
-        UnsafeProcessCleanupError: A trial's process group could not be
-            confirmed dead; phase hard-aborted.
-        ArtifactRootConflictError: This phase's persistent study is bound to a
-            different artifact root than the config's workdir offers.
-        TrialEvidenceMissingError: The selected winner's evidence directory,
-            audit artifacts, or objective source are missing or no longer match
-            the provenance frozen at extraction.
-        ActiveAttemptPersistenceError: A trial's required recovery metadata
-            could not be persisted, so it was never launched.
-        StudyStorageUnavailableError: A trial's terminal outcome could not be
-            persisted. That trial is left ``RUNNING`` with its attempt record
-            intact and recovers on the next run once storage is writable.
-        StudySchemaMismatchError: Persisted phase recovery state contradicts
-            the study's terminal trial count.
-        TimeoutError: The phase or run deadline expires before the requested
-            trial budget completes and partial publication is disabled, or
-            before any feasible trial completes.
-        PhaseSweepShutdown: The orchestrator receives a handled shutdown
-            signal; propagated after recording a non-failure trial outcome.
-        RuntimeError: Optuna returned before the requested trial budget without
-            a timeout, abort, or exception, which violates the runner invariant.
-
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase to execute.
+    :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain.
+    :param str generation_id: Identity of the current engine invocation.
+    :param ClaimedLedger ledger: The claimed ledger, for ``experiment``, that this phase opens
+        its live study through.
+    :param float | None run_deadline: Optional ``time.monotonic()`` deadline inherited from the
+        experiment-level wallclock guard.
+    :raises NoFeasibleTrialError: ``max_consecutive_failures`` tripped or every trial was
+        infeasible.
+    :raises UnsafeProcessCleanupError: A trial's process group could not be confirmed dead;
+        phase hard-aborted.
+    :raises ArtifactRootConflictError: This phase's persistent study is bound to a different
+        artifact root than the config's workdir offers.
+    :raises TrialEvidenceMissingError: The selected winner's evidence directory, audit
+        artifacts, or objective source are missing or no longer match the provenance frozen at
+        extraction.
+    :raises ActiveAttemptPersistenceError: A trial's required recovery metadata could not be
+        persisted, so it was never launched.
+    :raises StudyStorageUnavailableError: A trial's terminal outcome could not be persisted.
+        That trial is left ``RUNNING`` with its attempt record intact and recovers on the next
+        run once storage is writable.
+    :raises StudySchemaMismatchError: Persisted phase recovery state contradicts the study's
+        terminal trial count.
+    :raises TimeoutError: The phase or run deadline expires before the requested trial budget
+        completes and partial publication is disabled, or before any feasible trial completes.
+    :raises PhaseSweepShutdown: The orchestrator receives a handled shutdown signal;
+        propagated after recording a non-failure trial outcome.
+    :raises RuntimeError: Optuna returned before the requested trial budget without a timeout,
+        abort, or exception, which violates the runner invariant.
+    :return Winner: The selected phase winner.
     """
     study_name = _phase_study_name(experiment, phase)
     # The live opener also claims a newly created study's publication root,
