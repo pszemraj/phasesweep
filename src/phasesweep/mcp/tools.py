@@ -1115,16 +1115,16 @@ class PhaseSweepMCP:
                 live: list[RunHandle] = []
                 recovery_required_run_ids: list[str] = []
                 unobservable_run_ids: list[str] = []
-                for handle in handles:
-                    view = self._runs.runner_view(handle)
-                    observation = self._runs.observe(handle, view=view)
+                for inventory_handle in handles:
+                    view = self._runs.runner_view(inventory_handle)
+                    observation = self._runs.observe(inventory_handle, view=view)
                     if observation.state != "running":
                         continue
-                    live.append(handle)
+                    live.append(inventory_handle)
                     if observation.recovery_required:
-                        recovery_required_run_ids.append(handle.run_id)
+                        recovery_required_run_ids.append(inventory_handle.run_id)
                     if view.visibility == "unobservable":
-                        unobservable_run_ids.append(handle.run_id)
+                        unobservable_run_ids.append(inventory_handle.run_id)
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)
                 if busy is not None:
