@@ -156,39 +156,93 @@ class RunPersistentStateUnavailableError(McpToolError):
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 
-    def __init__(self, experiment_id: str, run_id: str) -> None:
+    def __init__(
+        self,
+        experiment_id: str,
+        run_id: str,
+        *,
+        recovery_required: bool = False,
+        runner_observable: bool = True,
+    ) -> None:
         """Create an experiment-busy tool error.
 
         :param str experiment_id: Catalog id that already has a live run.
         :param str run_id: Existing live run id blocking a new launch.
+        :param bool recovery_required: Whether the blocker requires operator recovery.
+        :param bool runner_observable: Whether this server can verify runner liveness.
         """
+        if recovery_required:
+            advice = (
+                "Ask the operator to inspect this run with `phasesweep mcp recover-run` "
+                "and complete its reported recovery before retrying the launch."
+            )
+        else:
+            advice = (
+                "If you just launched and lost the response, this is likely that run; "
+                f"monitor it with await_run using run_id {run_id!r}. "
+                "Cancel it only if the user wants to stop it."
+            )
+        if not runner_observable:
+            advice += (
+                " This server cannot verify runner liveness across PID namespaces. "
+                "Monitor durable progress; if it stops, ask the operator to inspect "
+                "and recover from a host shell outside the sandbox."
+            )
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
-            f"(run_id {run_id!r}). If you just launched and lost the response, this is "
-            "likely that run; monitor it with await_run using "
-            f"run_id {run_id!r}. Cancel it only if the user wants to stop it."
+            f"(run_id {run_id!r}). {advice}"
         )
 
 
 class ConcurrencyLimitError(McpToolError):
     """Raised when launching would exceed the server's max concurrent runs."""
 
-    def __init__(self, running: int, limit: int, blocking_run_ids: Sequence[str]) -> None:
+    def __init__(
+        self,
+        running: int,
+        limit: int,
+        blocking_run_ids: Sequence[str],
+        *,
+        recovery_required_run_ids: Sequence[str] = (),
+        unobservable_run_ids: Sequence[str] = (),
+    ) -> None:
         """Create a concurrency-limit tool error.
 
         :param int running: Number of currently live runs.
         :param int limit: Configured maximum number of concurrent runs.
         :param Sequence[str] blocking_run_ids: Live run ids the agent can await.
+        :param Sequence[str] recovery_required_run_ids: Blockers requiring operator recovery.
+        :param Sequence[str] unobservable_run_ids: Blockers with unverifiable runner liveness.
         """
-        shown = list(dict.fromkeys(blocking_run_ids))[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
+        recovery_ids = set(recovery_required_run_ids)
+        ordered = sorted(
+            dict.fromkeys(blocking_run_ids), key=lambda run_id: run_id not in recovery_ids
+        )
+        shown = ordered[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
         blockers = ", ".join(repr(run_id) for run_id in shown)
         omitted = max(0, running - len(shown))
         omitted_note = f" ({omitted} more active)" if omitted else ""
+        if recovery_ids:
+            needs_recovery = ", ".join(repr(run_id) for run_id in shown if run_id in recovery_ids)
+            advice = (
+                f"Run_ids requiring operator recovery: {needs_recovery}. Ask the operator to "
+                "inspect these runs with `phasesweep mcp recover-run` and complete the "
+                "reported recovery before retrying the launch."
+            )
+        else:
+            advice = (
+                "Call await_run with one of these run_ids, then retry this launch only "
+                "after that run is terminal. Ask the user before cancelling a blocking run."
+            )
+        if unobservable_run_ids:
+            advice += (
+                " This server cannot verify runner liveness for blockers in another PID "
+                "namespace. Monitor durable progress; if it stops, ask the operator to "
+                "inspect and recover from a host shell outside the sandbox."
+            )
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
-            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. Call "
-            "await_run with one of these run_ids, then retry this launch only "
-            "after that run is terminal. Ask the user before cancelling a blocking run."
+            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. {advice}"
         )
 
 

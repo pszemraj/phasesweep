@@ -41,7 +41,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     _safe_tool,
 )
@@ -73,6 +73,8 @@ from tests.mcp_helpers import (
     patch_popen_capture,
     record_runner_cleanup,
     side_effect_app,
+    stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
 )
@@ -183,6 +185,83 @@ def test_concurrency_limit_error_bounds_actionable_run_ids() -> None:
     assert "2 more active" in message
     assert "await_run" in message
     assert "only after that run is terminal" in message
+
+
+@pytest.mark.parametrize("recovery_required", [False, True], ids=["healthy", "needs-recovery"])
+@pytest.mark.parametrize("launch_target", ["next", "blocking"], ids=["capacity", "same-experiment"])
+def test_capacity_refusal_guidance_matches_the_blocking_run(
+    tmp_path: Path, recovery_required: bool, launch_target: str
+) -> None:
+    """Capacity blocked by cleanup uncertainty needs operator recovery instead of waiting."""
+    blocked_config = _config(tmp_path, name="blocking")
+    next_config = _config(tmp_path, name="next")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"blocking": blocked_config, "next": next_config},
+            allow=ALLOW_SIDE_EFFECTS,
+            max_concurrent_runs=1,
+        )
+    )
+    blocker_id = "blocking-run"
+    if recovery_required:
+        stage_dead_run(store, blocker_id, blocked_config, "blocking", cleanup_uncertain=False)
+    else:
+        stage_live_run(store, blocker_id, blocked_config, "blocking")
+
+    expected_error = ConcurrencyLimitError if launch_target == "next" else ExperimentBusyError
+    with pytest.raises(expected_error) as refused:
+        app.launch(launch_target)
+
+    message = str(refused.value)
+    assert blocker_id in message
+    if recovery_required:
+        assert "operator" in message
+        assert "recover-run" in message
+        assert "await_run" not in message
+    else:
+        assert "await_run" in message
+        if launch_target == "next":
+            assert "only after that run is terminal" in message
+
+
+@pytest.mark.parametrize("launch_target", ["next", "blocking"], ids=["capacity", "same-experiment"])
+def test_capacity_refusal_qualifies_unobservable_runner_liveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_target: str
+) -> None:
+    """A hidden runner keeps its reservation without a false claim that it is alive or dead."""
+    blocked_config = _config(tmp_path, name="blocking")
+    next_config = _config(tmp_path, name="next")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"blocking": blocked_config, "next": next_config},
+            allow=ALLOW_SIDE_EFFECTS,
+            max_concurrent_runs=1,
+        )
+    )
+    handle = stage_live_run(store, "hidden-run", blocked_config, "blocking")
+    monkeypatch.setattr(
+        RunStore,
+        "runner_view",
+        lambda _self, _handle: RunnerView("unobservable", "another PID namespace"),
+    )
+    before = store.observe(handle)
+    assert before.state == "running"
+    assert before.recovery_required is False
+
+    expected_error = ConcurrencyLimitError if launch_target == "next" else ExperimentBusyError
+    with pytest.raises(expected_error) as refused:
+        app.launch(launch_target)
+
+    message = str(refused.value)
+    assert handle.run_id in message
+    assert "cannot verify" in message
+    assert "host" in message
+    assert "progress" in message
+    after = store.observe(handle)
+    assert after.state == "running"
+    assert after.recovery_required is False
 
 
 def test_safe_tool_redacts_unexpected_exception() -> None:

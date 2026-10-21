@@ -98,8 +98,10 @@ DESCRIPTION_GET_LATEST_RUN = (
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
     "inspection and explicit user authorization; monitor with the returned run_id. "
-    "Never retry permission or config-identity refusals; await named blockers before retrying a "
-    "capacity refusal."
+    "Never retry permission or config-identity refusals. For capacity refusals, await healthy "
+    "named blockers; report blockers requiring recovery to the operator before retrying. "
+    "When runner liveness is unobservable, monitor durable progress and notify the operator "
+    "if it stops."
 )
 DESCRIPTION_GET_RUN_STATUS = (
     "Read process state and per-phase progress for exactly one run_id. Use as a single status "

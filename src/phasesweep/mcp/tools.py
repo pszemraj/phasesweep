@@ -1112,13 +1112,28 @@ class PhaseSweepMCP:
                         and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
                     )
                     raise RunCapacityUnknownError(len(unreadable), recoverable)
-                live = [
-                    handle for handle in handles if self._runs.observe(handle).state == "running"
-                ]
+                live: list[RunHandle] = []
+                recovery_required_run_ids: list[str] = []
+                unobservable_run_ids: list[str] = []
+                for handle in handles:
+                    view = self._runs.runner_view(handle)
+                    observation = self._runs.observe(handle, view=view)
+                    if observation.state != "running":
+                        continue
+                    live.append(handle)
+                    if observation.recovery_required:
+                        recovery_required_run_ids.append(handle.run_id)
+                    if view.visibility == "unobservable":
+                        unobservable_run_ids.append(handle.run_id)
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)
                 if busy is not None:
-                    raise ExperimentBusyError(experiment_id, busy.run_id)
+                    raise ExperimentBusyError(
+                        experiment_id,
+                        busy.run_id,
+                        recovery_required=busy.run_id in recovery_required_run_ids,
+                        runner_observable=busy.run_id not in unobservable_run_ids,
+                    )
                 if len(live) >= self._registry.max_concurrent_runs:
                     blocking_run_ids = [
                         handle.run_id
@@ -1128,6 +1143,8 @@ class PhaseSweepMCP:
                         len(live),
                         self._registry.max_concurrent_runs,
                         blocking_run_ids,
+                        recovery_required_run_ids=recovery_required_run_ids,
+                        unobservable_run_ids=unobservable_run_ids,
                     )
                 config_bytes = self._current_config_bytes(reg)
                 preparation: PreparedRun | None = None
