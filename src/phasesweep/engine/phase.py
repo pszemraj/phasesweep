@@ -1352,14 +1352,15 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
-        abort = _load_phase_policy_state(study).abort
+        aborted_state = _load_phase_policy_state(study)
+        abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so only the logs are left to read.
         persistent = experiment.storage is not None
         advice = _recovery_advice(phase, study, abort) if persistent else None
         evidence = (
             "The tripping trials completed outside the metric bounds or constraints."
-            if _streak_trials_all_completed(study, abort)
+            if _streak_trials_all_completed(study, aborted_state)
             else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
         raise NoFeasibleTrialError(

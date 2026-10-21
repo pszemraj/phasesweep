@@ -69,6 +69,9 @@ class _PhasePolicyState:
     abort: dict[str, Any] | None
     """The first abort recorded after the recovery boundary, if any. A later
     outcome resets the streak but never this recorded decision."""
+    abort_streak: tuple[int, ...] = ()
+    """The trial numbers of the failed or fatal outcomes in a row that ended at ``abort``'s
+    outcome, in completion order; empty while ``abort`` is ``None``."""
 
 
 def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
@@ -241,7 +244,8 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         per-trial outcome attrs are read and validated.
     :return _PhasePolicyState: Reconstructed state: the highest recorded
         outcome sequence, the consecutive-failure count since the last
-        recovery boundary, and the first abort recorded after it (if any).
+        recovery boundary, and the first abort recorded after it (if any)
+        with the trials of the failure streak that ended there.
     :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
         trial's outcome attr is malformed, two trials share a completion
         sequence, or the recovery boundary exceeds the largest recorded
@@ -250,7 +254,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     recovery = _load_recovery_record(study)
     recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
-    events: list[tuple[int, str, dict[str, Any] | None]] = []
+    events: list[tuple[int, str, dict[str, Any] | None, int]] = []
     seen_sequences: dict[int, int] = {}
     for trial in study.get_trials(deepcopy=False):
         raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
@@ -271,7 +275,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
             )
         seen_sequences[sequence] = trial.number
-        events.append((sequence, parsed.outcome, parsed.abort))
+        events.append((sequence, parsed.outcome, parsed.abort, trial.number))
 
     events.sort(key=lambda event: event[0])
     max_sequence = events[-1][0] if events else 0
@@ -283,18 +287,27 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         )
 
     consecutive_failures = 0
+    streak: list[int] = []
     abort: dict[str, Any] | None = None
-    for sequence, outcome, recorded_abort in events:
+    abort_streak: tuple[int, ...] = ()
+    for sequence, outcome, recorded_abort, trial_number in events:
         if sequence <= recovery_boundary:
             continue
-        consecutive_failures = _next_consecutive_failures(consecutive_failures, outcome)
-        if abort is None:
+        previous = consecutive_failures
+        consecutive_failures = _next_consecutive_failures(previous, outcome)
+        if consecutive_failures > previous:
+            streak.append(trial_number)
+        elif consecutive_failures == 0:
+            streak.clear()
+        if abort is None and recorded_abort is not None:
             abort = recorded_abort
+            abort_streak = tuple(streak)
 
     return _PhasePolicyState(
         max_sequence=max_sequence,
         consecutive_failures=consecutive_failures,
         abort=abort,
+        abort_streak=abort_streak,
     )
 
 
@@ -652,33 +665,24 @@ def _tripped_streak(abort: Mapping[str, object]) -> int | None:
     return streak if type(streak) is int else None
 
 
-def _streak_trials_all_completed(study: optuna.Study, abort: Mapping[str, object]) -> bool:
+def _streak_trials_all_completed(study: optuna.Study, policy_state: _PhasePolicyState) -> bool:
     """Say whether a streak abort tripped on trials that all completed outside the bounds.
 
-    The tripping trials are the last ``consecutive_failures`` failed or fatal outcomes up
-    to the abort's completion sequence; an interrupted outcome neither counts nor resets
-    the streak. A trial whose trainer failed ends FAIL and has a stderr log. One that
-    completed outside the metric bounds or constraints has none.
+    The tripping trials are the state's ``abort_streak``. A trial whose trainer failed ends
+    FAIL and has a stderr log. One that completed outside the metric bounds or constraints
+    has none.
 
     :param optuna.Study study: The phase's study.
-    :param Mapping[str, object] abort: The recorded abort.
-    :return bool: Whether ``abort`` is a streak abort and none of its tripping trials failed.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :return bool: Whether its abort is a streak abort and none of the tripping trials failed.
     """
-    streak = _tripped_streak(abort)
-    sequence = abort.get("completion_sequence")
-    if streak is None or type(sequence) is not int:
+    if policy_state.abort is None or _tripped_streak(policy_state.abort) is None:
         return False
-    counted = []
-    for trial in study.get_trials(deepcopy=False):
-        parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-        if (
-            parsed is not None
-            and parsed.sequence <= sequence
-            and parsed.outcome in {"failure", "fatal"}
-        ):
-            counted.append((parsed.sequence, trial))
-    counted.sort(key=lambda entry: entry[0])
-    return all(trial.state == optuna.trial.TrialState.COMPLETE for _, trial in counted[-streak:])
+    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+    return all(
+        trials[number].state == optuna.trial.TrialState.COMPLETE
+        for number in policy_state.abort_streak
+    )
 
 
 def _config_retires_abort(

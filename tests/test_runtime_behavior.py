@@ -1401,8 +1401,14 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         timeout_source=None,
     )
     first_abort: dict[str, Any] | None = None
+    streak: list[int] = []
+    abort_streak: tuple[int, ...] = ()
     for outcome in outcomes:
         trial = study.ask()
+        if outcome in {"failure", "fatal"}:
+            streak.append(trial.number)
+        elif outcome == "success":
+            streak.clear()
         abort = run.abort_decision(trial.number, outcome, cause=None, fatal_policy=None)
         payload = trial_outcome(run.completion_sequence + 1, outcome)
         if abort is not None:
@@ -1412,9 +1418,11 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         if abort is not None:
             run.abort_recorded = True
             first_abort = abort
+            abort_streak = tuple(streak)
         replayed = _load_phase_policy_state(study)
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
+        assert replayed.abort_streak == abort_streak
         assert tripped == (
             outcome == "fatal"
             or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
@@ -1428,6 +1436,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     assert run.completion_sequence == len(outcomes)
     assert run.consecutive_failures == 0
     assert replayed.abort is None
+    assert replayed.abort_streak == ()
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
