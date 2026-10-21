@@ -1,7 +1,12 @@
-"""Raised persistent grid targets retry failed cells without repeating completed cells."""
+"""Raised persistent grid targets retry failed cells without repeating completed cells.
+
+Recovery messages name the target that retries every failed cell, and a winner chosen while
+some cell has no successful trial says so.
+"""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import optuna
@@ -13,7 +18,7 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, _warn_unsuccessful_grid_cells
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment, write_flaky_trainer
 
@@ -289,3 +294,134 @@ def test_sampling_phase_keeps_the_generic_recovery_advice(tmp_path: Path) -> Non
         "as a successful phase. Increase n_trials above 2 to explicitly schedule new "
         "recovery attempts."
     )
+
+
+def _coverage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the advisories saying some grid cell has no successful trial."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "phasesweep.engine.selection" and "grid cells succeeded" in record.message
+    ]
+
+
+def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raised target that retries one of two failed cells publishes, and the log says so."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_grid(tmp_path, trainer, 2))
+    raised = _grid(tmp_path, trainer, 3)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(raised)["p"].metric == 1.0
+    trials = _trials(raised)
+    assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
+    expected = (
+        "[p] only 1 of 2 grid cells succeeded (advisory); the winner was chosen without a "
+        f"successful trial for: {trials[1].params}."
+    )
+    assert _coverage_warnings(caplog) == [expected]
+
+    # A replay selects from the recorded trials again and repeats the advisory.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(raised)["p"].metric == 1.0
+    assert _coverage_warnings(caplog) == [expected]
+
+
+def test_grid_winner_warns_about_cells_the_abort_never_reached(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cell with no trial at all is as unsuccessful as one that failed."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_grid(tmp_path, trainer, 4, cells=4))
+    raised = _grid(tmp_path, trainer, 5, cells=4)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(raised)["p"].metric == 1.0
+    succeeded = {trial.params["x"] for trial in _trials(raised) if trial.state.name == "COMPLETE"}
+    (missing,) = {1, 2, 3, 4} - succeeded
+    assert _coverage_warnings(caplog) == [
+        "[p] only 3 of 4 grid cells succeeded (advisory); the winner was chosen without a "
+        f"successful trial for: {{'x': {missing}}}."
+    ]
+
+
+def test_repeat_grid_winner_warns_about_the_failed_member(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A repeat group that lost a member cannot rank, so the cell names its repeat value."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
+    phase = Phase(
+        name="p",
+        n_trials=4,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=2)},
+        repeats=Repeats(key="seed", values=[1, 2]),
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(experiment)["p"].metric == 1.0
+    (failed,) = (trial for trial in _trials(experiment) if trial.state.name == "FAIL")
+    (warning,) = _coverage_warnings(caplog)
+    assert warning.startswith("[p] only 3 of 4 grid cells succeeded (advisory); ")
+    assert f"'x': {failed.params['x']}" in warning and f"'seed': {failed.params['seed']}" in warning
+
+
+@pytest.mark.parametrize("target", [2, 4], ids=["fresh-success", "every-failure-retried"])
+def test_grid_winner_with_a_successful_trial_in_every_cell_stays_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int
+) -> None:
+    """Failed attempts do not warn once their cells have a successful retry."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0 if target == 2 else 2)
+    if target == 4:
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_grid(tmp_path, trainer, 2))
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(_grid(tmp_path, trainer, target))["p"].metric == 1.0
+    assert _coverage_warnings(caplog) == []
+
+
+def test_sampling_winner_after_a_failure_has_no_cell_advisory(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only a grid has cells to cover."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
+    phase = Phase(
+        name="p",
+        n_trials=3,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=9)},
+    )
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        run_experiment(make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase]))
+    assert _coverage_warnings(caplog) == []
+
+
+def test_cell_advisory_spells_out_ten_cells_and_counts_the_rest(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wide grid with one successful cell keeps the advisory to one readable line."""
+    phase = Phase(
+        name="p",
+        n_trials=15,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=14)},
+    )
+    trial = optuna.trial.create_trial(
+        value=0.0,
+        params={"x": 0},
+        distributions={"x": optuna.distributions.IntDistribution(0, 14)},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        _warn_unsuccessful_grid_cells(phase, [trial])
+
+    (warning,) = _coverage_warnings(caplog)
+    assert warning.startswith("[p] only 1 of 15 grid cells succeeded (advisory); ")
+    assert "{'x': 10}" in warning and "{'x': 11}" not in warning
+    assert warning.endswith("; and 4 more.")

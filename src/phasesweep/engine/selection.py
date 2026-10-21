@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import logging
 import math
@@ -14,7 +15,7 @@ import optuna
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import grid_search_space
+from phasesweep.config.search import grid_search_space, phase_draws, sampler_search_space
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import TrialEvidenceMissingError
@@ -46,6 +47,9 @@ from phasesweep.engine.state import (
 from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.engine.selection")
+
+# Grid cells without a successful trial that one advisory spells out before it counts the rest.
+_MAX_LISTED_CELLS = 10
 
 
 @dataclass
@@ -256,6 +260,7 @@ def select_winner(
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     if phase is not None:
         _warn_grid_edges(phase, best.params)
+        _warn_unsuccessful_grid_cells(phase, trials)
 
     record = (
         None
@@ -322,6 +327,42 @@ def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
                 lower,
                 upper,
             )
+
+
+def _warn_unsuccessful_grid_cells(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> None:
+    """Warn when a grid winner was chosen while some cell has no successful trial.
+
+    A cell is successful when one of its trials is COMPLETE, feasible or not, which is
+    when the retry rule closes it. A cell whose attempts all failed, were interrupted or
+    never ran has none. The repeat axis counts as a grid axis. The advisory never changes
+    selection.
+
+    :param Phase phase: Configured search space and sampler.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    """
+    if phase.sampler.type != "grid" or not phase_draws(phase):
+        return
+    axes = grid_search_space(sampler_search_space(phase), phase_name=phase.name)
+    succeeded = {
+        tuple(trial.params.get(name) for name in axes)
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    }
+    cells = [dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())]
+    missing = [cell for cell in cells if tuple(cell.values()) not in succeeded]
+    if not missing:
+        return
+    listed = "; ".join(str(cell) for cell in missing[:_MAX_LISTED_CELLS])
+    if len(missing) > _MAX_LISTED_CELLS:
+        listed += f"; and {len(missing) - _MAX_LISTED_CELLS} more"
+    log.warning(
+        "[%s] only %d of %d grid cells succeeded (advisory); the winner was chosen without a "
+        "successful trial for: %s.",
+        phase.name,
+        len(cells) - len(missing),
+        len(cells),
+        listed,
+    )
 
 
 def _rank_groups(
