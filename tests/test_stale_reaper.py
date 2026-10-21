@@ -1753,8 +1753,6 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     tmp_path, monkeypatch, wandb_worker_sdk
 ):
     """The existing registry owns the polling worker after the trainer exits."""
-    from phasesweep.runtime.reaper import read_stale_process_identity
-
     old = make_experiment(
         workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}", n_trials=1
     )
