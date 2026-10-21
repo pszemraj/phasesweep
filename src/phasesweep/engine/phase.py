@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -82,6 +82,7 @@ from phasesweep.engine.study_policy import (
     _record_recovery_boundary,
     _record_reruns,
     _record_trial_target,
+    _retry_advice,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
@@ -390,42 +391,62 @@ def _abort_record(
     }
 
 
-def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None:
+def _raise_prior_phase_abort(
+    phase: Phase, abort_record: JsonObject, trials: Sequence[optuna.trial.FrozenTrial]
+) -> None:
     """Explain how to make an explicit recovery attempt after a durable abort.
+
+    A grid or fixed configuration is told the exact ``n_trials`` that retries its
+    failed cells (:func:`~phasesweep.engine.study_policy._retry_advice`); a
+    sampling phase is told to raise the target above the aborted one.
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
-    :param dict[str, Any] abort_record: Recorded abort; supplies
+    :param JsonObject abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
     trial_target = abort_record["trial_target"]
+    advice = _retry_advice(phase, trials) or (
+        f"Increase n_trials above {trial_target} to explicitly schedule new recovery attempts."
+    )
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
         f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
-        f"successful phase. Increase n_trials above {trial_target} to explicitly schedule "
-        "new recovery attempts.",
+        f"successful phase. {advice}",
         action=OperatorAction.FIX_CONFIG,
     )
 
 
-def _raise_streak_at_limit(phase: Phase, consecutive_failures: int, trial_target: int) -> None:
+def _raise_streak_at_limit(
+    phase: Phase,
+    consecutive_failures: int,
+    trial_target: int,
+    trials: Sequence[optuna.trial.FrozenTrial],
+) -> None:
     """Refuse new work while the resumed failure streak meets the current limit.
 
     :param Phase phase: Phase whose current ``max_consecutive_failures`` the
         streak meets.
     :param int consecutive_failures: Replayed consecutive-failure count.
     :param int trial_target: Durable accepted ``n_trials`` target.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
+    advice = _retry_advice(phase, trials)
+    remedy = (
+        f"Increase n_trials above {trial_target} to explicitly schedule new recovery "
+        "attempts, or raise max_consecutive_failures."
+        if advice is None
+        else f"{advice} Or raise max_consecutive_failures."
+    )
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
         f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
-        f"it launches no more trials at its accepted n_trials={trial_target}. Increase "
-        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, or raise "
-        "max_consecutive_failures.",
+        f"it launches no more trials at its accepted n_trials={trial_target}. {remedy}",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -582,7 +603,7 @@ def _judge_recorded_phase(
     # A later success or changed failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
     if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
-        _raise_prior_phase_abort(phase, active_abort)
+        _raise_prior_phase_abort(phase, active_abort, study.get_trials(deepcopy=False))
     if (
         active_abort is None
         and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
@@ -591,7 +612,12 @@ def _judge_recorded_phase(
         # A replayed streak at the current limit requires a raised target for new work.
         accepted_target = _accepted_trial_target(study)
         if phase.n_trials <= accepted_target:
-            _raise_streak_at_limit(phase, policy_state.consecutive_failures, accepted_target)
+            _raise_streak_at_limit(
+                phase,
+                policy_state.consecutive_failures,
+                accepted_target,
+                study.get_trials(deepcopy=False),
+            )
         active_abort = _failure_policy_abort_record(
             phase,
             consecutive_failures=policy_state.consecutive_failures,
@@ -1327,10 +1353,12 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
+        advice = _retry_advice(phase, trials_after)
         raise NoFeasibleTrialError(
             f"Phase {phase.name!r} aborted after "
             f"{phase.max_consecutive_failures} consecutive failures. "
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
+            + ("" if advice is None else f" {advice}")
         )
     if (
         finished_after < phase.n_trials

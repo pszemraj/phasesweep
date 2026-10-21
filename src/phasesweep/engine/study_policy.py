@@ -14,6 +14,7 @@ from phasesweep.config.search import (
     grid_cardinality,
     grid_target_refusal,
     phase_draws,
+    retry_target_ceiling,
 )
 from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
@@ -575,6 +576,75 @@ def _pending_rerun_count(trials: Sequence[optuna.trial.FrozenTrial]) -> int:
     return len(_rerun_sources(trials)) + waiting
 
 
+def _failed_grid_cells(
+    trials: Sequence[optuna.trial.FrozenTrial],
+) -> list[optuna.trial.FrozenTrial]:
+    """Return each grid cell whose latest attempt FAILED, in trial-number order.
+
+    A cell with a pending or running retry, a completed attempt or an interrupted
+    one is not listed: the first two are already handled and the last reruns itself.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return list[optuna.trial.FrozenTrial]: The latest failed attempt of each failed cell.
+    """
+    latest: dict[int, optuna.trial.FrozenTrial] = {}
+    for trial in trials:
+        grid_id = trial.system_attrs.get("grid_id")
+        if grid_id is not None:
+            latest[grid_id] = trial
+    return sorted(
+        (
+            trial
+            for trial in latest.values()
+            if trial.state == optuna.trial.TrialState.FAIL and not _trial_interrupted(trial)
+        ),
+        key=lambda trial: trial.number,
+    )
+
+
+def _retry_advice(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> str | None:
+    """Name the exact ``n_trials`` that retries every failed cell of a grid or fixed configuration.
+
+    The target is the ceiling :func:`~phasesweep.config.search.retry_target_ceiling`
+    allows, which also runs a grid's cells that no attempt has completed or failed.
+
+    :param Phase phase: Phase whose configured ``n_trials`` the advice raises.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :return str | None: A sentence, or ``None`` for a sampling phase, which has no
+        per-cell retry rule.
+    """
+    finished = _finished_trial_count(trials)
+    ceiling = retry_target_ceiling(
+        phase, finished=finished, completed=_completed_trial_count(trials)
+    )
+    if ceiling is None:
+        return None
+    fixed = not phase_draws(phase)
+    if ceiling <= phase.n_trials:
+        reason = (
+            "Its attempt already completed"
+            if fixed
+            else "No grid cell has a failed attempt to retry"
+        )
+        return f"{reason}, so raising n_trials would schedule nothing."
+    raise_to = (
+        f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
+        f"to {ceiling} and rerun to"
+    )
+    if fixed:
+        return (
+            f"{raise_to} retry its failed attempt once more; a completed attempt is not repeated."
+        )
+    failed = len(_failed_grid_cells(trials))
+    remaining = ceiling - finished - failed
+    actions = []
+    if failed:
+        actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
+    if remaining:
+        actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
+    return f"{raise_to} {' and '.join(actions)}; completed cells are not repeated."
+
+
 def _record_reruns(study: optuna.Study, phase: Phase | None = None) -> list[tuple[int, int]]:
     """Schedule interrupted reruns and the grid retries a raised target permits.
 
@@ -598,22 +668,9 @@ def _record_reruns(study: optuna.Study, phase: Phase | None = None) -> list[tupl
         and phase_draws(phase)
         and phase.n_trials > grid_cardinality(phase)
     ):
-        latest: dict[int, optuna.trial.FrozenTrial] = {}
-        for trial in trials:
-            grid_id = trial.system_attrs.get("grid_id")
-            if grid_id is not None:
-                latest[grid_id] = trial
         waiting = sum(trial.state == optuna.trial.TrialState.WAITING for trial in trials)
         slots = max(0, phase.n_trials - _finished_trial_count(trials) - len(sources) - waiting)
-        failed_cells = sorted(
-            (
-                trial
-                for trial in latest.values()
-                if trial.state == optuna.trial.TrialState.FAIL and not _trial_interrupted(trial)
-            ),
-            key=lambda trial: trial.number,
-        )
-        sources.extend(failed_cells[:slots])
+        sources.extend(_failed_grid_cells(trials)[:slots])
     for source in sources:
         study.add_trial(
             optuna.trial.create_trial(

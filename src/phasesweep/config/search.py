@@ -358,14 +358,37 @@ def sampler_warnings(phase: Phase) -> list[str]:
     return warnings
 
 
+def retry_target_ceiling(phase: Phase, *, finished: int, completed: int) -> int | None:
+    """Return the largest ``n_trials`` a fixed configuration or grid may be raised to.
+
+    A fixed configuration keeps at most one COMPLETE result, feasible or not, so
+    its ceiling is one attempt beyond its failures until one completes and its
+    finished attempts afterwards. A grid applies that rule per cell: one new
+    attempt for each cell without a COMPLETE result. Other sampled phases have
+    no ceiling.
+
+    :param Phase phase: Phase whose ceiling is computed.
+    :param int finished: Finished attempts its study holds, interrupted ones left
+        out, zero when the study does not exist yet.
+    :param int completed: How many of those attempts are COMPLETE, feasible or not.
+    :return int | None: The ceiling, or ``None`` when the phase is unrestricted.
+    """
+    if not phase_draws(phase):
+        return finished if completed >= 1 else finished + 1
+    if phase.sampler.type != "grid":
+        return None
+    return finished + grid_cardinality(phase) - completed
+
+
 def fixed_configuration_target_refusal(
     phase: Phase, *, finished: int, completed: int
 ) -> str | None:
     """Refuse extra measurements of an already completed fixed configuration.
 
     A fixed configuration keeps at most one COMPLETE result, feasible or not.
-    Without one, the target may allow one attempt beyond its finished failures.
-    Interrupted reruns do not count. Sampled phases are unrestricted here.
+    Without one, the target may allow one attempt beyond its finished failures
+    (:func:`retry_target_ceiling`). Interrupted reruns do not count. Sampled
+    phases are unrestricted here.
 
     :param Phase phase: Phase whose ``n_trials`` is checked.
     :param int finished: Finished attempts its study already holds, interrupted
@@ -378,16 +401,15 @@ def fixed_configuration_target_refusal(
     if phase_draws(phase):
         return None
     name, target = phase.name, phase.n_trials
+    ceiling = retry_target_ceiling(phase, finished=finished, completed=completed)
+    if ceiling is None or target <= ceiling:
+        return None
     if completed >= 1:
-        if target <= finished:
-            return None
         return (
             f"Phase {name!r} is a fixed configuration that already has a completed trial; "
             f"n_trials={target} would run the same configuration again. Keep n_trials at "
             f"{finished}, or use repeats to measure seed noise."
         )
-    if target <= finished + 1:
-        return None
     if finished == 0:
         return (
             f"Phase {name!r}: n_trials={target} with an empty search_space would run {target} "
@@ -425,12 +447,10 @@ def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str |
     :param int completed: Completed grid cells, feasible or not.
     :return str | None: Refusal when the target exceeds the available cells.
     """
-    if phase.sampler.type != "grid" or not phase_draws(phase):
+    maximum = retry_target_ceiling(phase, finished=finished, completed=completed)
+    if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
-    maximum = finished + cardinality - completed
-    if phase.n_trials <= maximum:
-        return None
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
         f"attempts: {finished} finished attempts and {completed} completed cells in a "

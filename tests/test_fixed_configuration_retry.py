@@ -150,6 +150,37 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
     assert _call_count(calls) == 3
 
 
+def _fixed_advice(from_target: int) -> str:
+    """Return the advice a fixed configuration's abort and refusal carry."""
+    return (
+        f"Fix the cause, then raise phases[p].n_trials from {from_target} to {from_target + 1} "
+        "and rerun to retry its failed attempt once more; a completed attempt is not repeated."
+    )
+
+
+def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> None:
+    """Each abort and the rerun refusing it quote the one-more-attempt target."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=2)
+
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
+    assert str(aborted.value).endswith(f"for stderr logs. {_fixed_advice(1)}")
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
+    assert str(refused.value).endswith(f"as a successful phase. {_fixed_advice(1)}")
+
+    # The retry fails again, so the next abort names the next target.
+    with pytest.raises(NoFeasibleTrialError) as aborted_again:
+        run_experiment(_fixed(tmp_path, trainer, 2, max_consecutive_failures=1))
+    assert str(aborted_again.value).endswith(f"for stderr logs. {_fixed_advice(2)}")
+    assert _call_count(calls) == 2
+
+    assert (
+        run_experiment(_fixed(tmp_path, trainer, 3, max_consecutive_failures=1))["p"].metric == 1.0
+    )
+    assert _states(_fixed(tmp_path, trainer, 3)) == ["FAIL", "FAIL", "COMPLETE"]
+
+
 def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
     """A COMPLETE trial out of the metric bounds still measured the configuration."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
