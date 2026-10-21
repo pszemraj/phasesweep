@@ -316,7 +316,7 @@ def read_proc_starttime(pid: int) -> int | None:
         ``None`` when the proc entry is missing or unreadable (hidepid, a container
         without procfs access, or an exited process).
     """
-    stat = _read_proc_stat(Path("/proc") / str(pid))
+    stat = _read_proc_stat(_PROC / str(pid))
     return None if stat is None else stat.starttime
 
 
@@ -345,7 +345,7 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     """
     if pid is None or not is_pid_alive(pid):
         return False
-    stat = _read_proc_stat(Path("/proc") / str(pid))
+    stat = _read_proc_stat(_PROC / str(pid))
     if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
         return False
     return stat is None or stat.state != "Z"
@@ -637,7 +637,7 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
         leader exists or its identity is compatible, and ``None`` when a live
         leader's proc identity is unreadable.
     """
-    stat = _read_proc_stat(Path("/proc") / str(pgid))
+    stat = _read_proc_stat(_PROC / str(pgid))
     if stat is None:
         return None if is_pid_alive(pgid) else False
     return stat.pgrp == pgid and stat.starttime != saved_starttime
@@ -652,8 +652,7 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     """
     if not _process_group_exists(pgid):
         return False
-    proc_root = Path("/proc")
-    if not proc_root.exists():
+    if not _PROC.exists():
         return True
     if member_pids is not None and _member_pids_alive(pgid, member_pids):
         return True
@@ -679,14 +678,13 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
         entry was inspectable, and whether all observed members were zombies
         or exited.
     """
-    proc_root = Path("/proc")
-    if not proc_root.exists():
+    if not _PROC.exists():
         return _GroupMemberScan(pids=(), complete=False, all_members_terminal=False)
     member_pids: list[int] = []
     all_members_terminal = True
     complete = True
     try:
-        for entry in proc_root.iterdir():
+        for entry in _PROC.iterdir():
             if not entry.name.isdigit():
                 continue
             stat, conclusive = _read_proc_stat_result(entry)
@@ -729,7 +727,7 @@ def _member_pids_alive(pgid: int, member_pids: Collection[int]) -> bool:
     :return bool: ``True`` when any candidate is a live, non-zombie member.
     """
     for pid in member_pids:
-        stat = _read_proc_stat(Path("/proc") / str(pid))
+        stat = _read_proc_stat(_PROC / str(pid))
         if stat is None:
             continue
         if stat.pgrp != pgid:
