@@ -15,7 +15,13 @@ import click
 import optuna
 import yaml
 
-from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
+from phasesweep.config.common import CONFIG_DIR_CONTEXT
+from phasesweep.config.io import (
+    ConfigError,
+    _load_yaml_mapping_from_text,
+    describe_validation_error,
+    load_experiment,
+)
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
     first_sentence,
@@ -47,7 +53,13 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
-from phasesweep.runtime.json import JsonObject, JsonValue, json_object, strict_json_loads
+from phasesweep.runtime.json import (
+    JsonObject,
+    JsonValue,
+    json_object,
+    json_value,
+    strict_json_loads,
+)
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -399,13 +411,32 @@ def report_objective_cmd(
     ),
 )
 @click.option(
+    "--workdir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Override the output workdir for this invocation (relative to the current directory).",
+)
+@click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Override a config value; repeat as needed. Use dotted paths and zero-based list indices.",
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
     show_default=True,
     help="Show debug logs from phasesweep and INFO logs from Optuna.",
 )
-def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool) -> None:
+def run(
+    config_path: Path,
+    from_phase: str | None,
+    dry_run: bool,
+    workdir: Path | None,
+    settings: tuple[str, ...],
+    verbose: bool,
+) -> None:
     """Run all phases defined in ``config_path``.
 
     :param Path config_path: Path to the experiment YAML file.
@@ -414,6 +445,8 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :param bool dry_run: Preview the trials each phase would launch, refuse most of what a
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
+    :param Path | None workdir: Invocation-relative output directory override.
+    :param tuple[str, ...] settings: Typed YAML assignments to dotted config paths.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
@@ -425,7 +458,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     # codes remain structured throughout startup, including dry-run previews.
     # run_experiment() repeats this idempotently for direct library callers.
     install_signal_handlers()
-    config = _load_cli_config(config_path)
+    config = _run_config(config_path, workdir=workdir, settings=settings)
     if from_phase is not None:
         valid = [p.name for p in config.phases]
         if from_phase not in valid:
@@ -441,6 +474,59 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
                 err=True,
             )
         raise
+
+
+def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) -> Experiment:
+    """Apply invocation overrides and validate the derived configuration.
+
+    :param Path path: Original config file, which remains unchanged.
+    :param Path | None workdir: Output directory relative to this invocation.
+    :param tuple[str, ...] settings: Dotted assignments with YAML values.
+    :raises click.BadParameter: An assignment cannot address a config value.
+    :raises ConfigError: The derived config fails normal model validation.
+    :return Experiment: Fully validated config with original path anchoring.
+    """
+    from pydantic import ValidationError
+
+    if workdir is None and not settings:
+        return _load_cli_config(path)
+    try:
+        payload = json_object(_load_yaml_mapping_from_text(path.read_text(encoding="utf-8"), path))
+    except ConfigError:
+        raise
+    except (UnicodeError, ValueError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    for setting in settings:
+        key, separator, raw = setting.partition("=")
+        parts = key.split(".")
+        if not separator or not all(parts):
+            raise click.BadParameter("expected KEY=VALUE", param_hint="--set")
+        try:
+            value = json_value(yaml.safe_load(raw))
+            target: JsonValue = payload
+            for part in parts[:-1]:
+                if isinstance(target, dict):
+                    target = target.setdefault(part, {})
+                elif isinstance(target, list):
+                    target = target[int(part)]
+                else:
+                    raise ValueError("path passes through a scalar value")
+            if isinstance(target, dict):
+                target[parts[-1]] = value
+            elif isinstance(target, list):
+                target[int(parts[-1])] = value
+            else:
+                raise ValueError("path ends at a scalar value")
+        except (ValueError, IndexError, yaml.YAMLError) as exc:
+            raise click.BadParameter(f"cannot set {key!r}: {exc}", param_hint="--set") from exc
+    if workdir is not None:
+        payload["workdir"] = str(workdir.expanduser().resolve())
+    try:
+        return Experiment.model_validate(
+            payload, context={CONFIG_DIR_CONTEXT: path.resolve().parent}
+        )
+    except ValidationError as exc:
+        raise ConfigError(f"{path} (run overrides): {describe_validation_error(exc)}") from exc
 
 
 @cli.command(

@@ -7,9 +7,10 @@
 
 # Config file: phasesweep run, validate, status, show-winners and sync-tracking each take the file as their CONFIG argument, and phasesweep mcp init-catalog reads one through --from. No default file is searched.
 # The path must name an existing file, not a directory.
-# Sources: the file is the only source of keys. No environment variable maps to a key and no command-line flag overrides one. Keys left out take the defaults below.
-# phasesweep run flags (--from-phase, --dry-run, --verbose) choose what to execute or print. They never set a key.
-# --from-phase PHASE must name a configured phase. Every earlier phase then needs a published winner whose fingerprint matches the current config and whose evidence is intact, or the run fails.
+# Sources: YAML values override the defaults below. For run only, repeatable --set KEY=VALUE assignments override YAML values before validation; --workdir PATH takes precedence over a --set workdir=... assignment. No environment variable maps to a key.
+# --set uses dotted config paths and zero-based list indices (phases.0.n_trials), with YAML values. Later assignments win. The source file stays unchanged; the derived configuration is validated and recorded in the run snapshot. --workdir resolves against the shell directory; paths in --set resolve against the config directory. An explicit storage journal needs its own override for a derived run.
+# phasesweep run flags --from-phase, --dry-run and --verbose choose what to execute or print.
+# --from-phase PHASE must name a configured phase. Earlier ancestors of the remaining phases need published winners whose fingerprints match the current config and whose evidence is intact, or the run and dry run fail. Unrelated earlier phases need no winner.
 # The file is read once per invocation. Editing it later does not change work that has already started.
 # The MCP server hashes the file when it loads its catalog. At each launch it re-reads the file and refuses to start if the SHA-256 changed, until the server restarts. The detached runner loads a copy of the verified bytes.
 # The file must be UTF-8 text whose top level is one mapping. That mapping describes one experiment.
