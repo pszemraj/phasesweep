@@ -443,8 +443,10 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         lambda _study: (_ for _ in ()).throw(RuntimeError("schema read failed")),
     )
 
-    with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
+    with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies") as exc_info:
         _preflight_existing_studies(_claimed_over(experiment, studies))
+    # The unexpected error names no remedy, so the aggregate borrows none from the refusal.
+    assert exc_info.value.action is OperatorAction.INSPECT_LOGS
 
 
 def test_preflight_keeps_attempts_reaped_before_a_later_refusal(

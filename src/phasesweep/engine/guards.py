@@ -213,8 +213,12 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     )
     # No single error speaks for an aggregate, whatever its types: it
     # routes to a remediation only when every collected error names the
-    # same one, and otherwise to reading the refusals it lists.
-    remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
+    # same one, and otherwise to reading the refusals it lists. An error that
+    # names no action of its own counts as reading them.
+    remediations = {
+        error.action if isinstance(error, PhaseSweepError) else OperatorAction.INSPECT_LOGS
+        for error in errors
+    }
     shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
     for error_type in (
         StudySchemaMismatchError,
