@@ -1227,7 +1227,8 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"
-    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    audit = AuditLogger(audit_path)
+    app = PhaseSweepMCP(registry, store, audit=audit)
     captured = patch_popen_capture(monkeypatch)
 
     app.validate("srv")
@@ -1245,7 +1246,7 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
         TOOL_LAUNCH_RUN,
         TOOL_LAUNCH_RUN,
     ]
-    assert {record["session_id"] for record in records}
+    assert {record["session_id"] for record in records} == {audit.session_id}
     assert all(record["actor"] == "local-stdio" for record in records)
     assert all(record["transport"] == "stdio" for record in records)
 

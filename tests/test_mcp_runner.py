@@ -1690,7 +1690,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert handle.experiment_id == "srv"
     assert handle.config_sha256 == config_sha256
     assert handle.pid == os.getpid()
-    assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
+    assert handle.pgid == os.getpgrp()
     assert handle.pid_starttime == read_proc_starttime(os.getpid())
     assert handle.started_at == started_at
     assert store.observe(handle).state == "succeeded"
