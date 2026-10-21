@@ -707,6 +707,16 @@ def show_winners(config_path: Path) -> None:
         if winner is not None:
             click.echo(f"=== {name} ===")
             _render_phase_comment(comment, prefix="# ")
+            if winner.repeats is not None:
+                repeats = winner.repeats
+                click.echo(
+                    f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} "
+                    f"values of repeat key {repeats['key']!r}."
+                )
+                click.echo(
+                    f"# trial_number {winner.source.trial_number} names the group's last member."
+                )
+                click.echo("# Choose a checkpoint explicitly from repeats.members.")
             click.echo(winner.content.decode("utf-8"))
         else:
             click.echo(f"=== {name} === (no winner yet)")
