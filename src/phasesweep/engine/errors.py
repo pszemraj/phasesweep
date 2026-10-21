@@ -117,7 +117,8 @@ class TrialTargetRefusedError(PhaseSweepError):
     """Raised when a phase target contradicts its durable study state.
 
     ``n_trials`` cannot fall below the accepted target. A fixed configuration may
-    retry failures only until one attempt completes, feasible or not.
+    retry failures only until one attempt completes, feasible or not. A grid
+    applies that limit per cell when its target exceeds the matrix size.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

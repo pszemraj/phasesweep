@@ -114,7 +114,7 @@ def _first_cause_line(trial: optuna.trial.FrozenTrial) -> str | None:
 
 
 def _log_reruns(phase: Phase, study: optuna.Study, reruns: Sequence[tuple[int, int]]) -> None:
-    """Log one INFO line per rerun scheduled, naming the interrupted trial and why it stopped.
+    """Log each interrupted rerun or failed grid-cell retry and its source's cause.
 
     :param Phase phase: The phase whose study scheduled the reruns.
     :param optuna.Study study: That study.

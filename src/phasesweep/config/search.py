@@ -396,7 +396,44 @@ def fixed_configuration_target_refusal(
     )
 
 
-def _validate_sampler_search_space(phase: Phase) -> None:
+def grid_cardinality(phase: Phase) -> int:
+    """Return the validated grid size, including its repeat axis.
+
+    :param Phase phase: Phase whose grid can be enumerated.
+    :return int: Number of cells in the grid.
+    """
+    return math.prod(
+        _grid_value_counts(sampler_search_space(phase), phase_name=phase.name).values()
+    )
+
+
+def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str | None:
+    """Limit a grid to one new attempt per cell without a completed result.
+
+    Finished failures remain spent. Raising the target may retry each failed
+    cell once, or visit an unvisited cell; a completed cell is closed even if
+    its metric was infeasible.
+
+    :param Phase phase: Phase whose target is checked.
+    :param int finished: Finished attempts, excluding interruptions.
+    :param int completed: Completed grid cells, feasible or not.
+    :return str | None: Refusal when the target exceeds the available cells.
+    """
+    if phase.sampler.type != "grid" or not phase_draws(phase):
+        return None
+    cardinality = grid_cardinality(phase)
+    maximum = finished + cardinality - completed
+    if phase.n_trials <= maximum:
+        return None
+    return (
+        f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
+        f"attempts: {finished} finished attempts and {completed} completed cells in a "
+        f"{cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
+        "failed cells once each; completed cells are never repeated."
+    )
+
+
+def _validate_sampler_search_space(phase: Phase, *, persistent: bool = False) -> None:
     """Validate sampler compatibility and the concrete trial target at config load.
 
     Grid counts include the repeat axis, float rounding, step fidelity, bounds,
@@ -404,13 +441,16 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     instead use :func:`fixed_configuration_target_refusal`.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
+    :param bool persistent: Whether recorded failed cells can justify grid retries.
     :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
         or with ``repeats``, if ``repeats`` is set without grid or seeded random
         or with a trial count that does not cover every repeat, if the CMA-ES
         sampler is paired with categorical params or the ``cmaes`` package is
         not importable, if the grid sampler cannot enumerate a parameter
         (raised by :func:`_grid_value_counts`), or if ``n_trials`` exceeds the
-        grid cardinality or does not equal it without ``allow_partial_grid``.
+        grid cardinality on in-memory storage or is below it without
+        ``allow_partial_grid``. Persistent upper targets are checked against
+        the recorded attempts at launch.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
@@ -423,7 +463,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             "sampler.type: grid."
         )
     if phase.repeats is not None:
-        _validate_repeat_sampling(phase, phase.repeats)
+        _validate_repeat_sampling(phase, phase.repeats, persistent=persistent)
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]
@@ -443,21 +483,19 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             ) from exc
 
     if sampler_type == "grid" and phase_draws(phase):
-        cardinality = math.prod(
-            _grid_value_counts(sampler_search_space(phase), phase_name=phase.name).values()
-        )
+        cardinality = grid_cardinality(phase)
         repeat_note = (
             ""
             if phase.repeats is None
             else f" ({cardinality // len(phase.repeats.values)} configurations x "
             f"{len(phase.repeats.values)} repeats)"
         )
-        if phase.n_trials > cardinality:
+        if phase.n_trials > cardinality and not persistent:
             raise ValueError(
                 f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
                 f"cardinality {cardinality}{repeat_note}."
             )
-        if not phase.allow_partial_grid and phase.n_trials != cardinality:
+        if not phase.allow_partial_grid and phase.n_trials < cardinality:
             remedy = (
                 "increase n_trials or set allow_partial_grid: true."
                 if phase.repeats is None
@@ -471,17 +509,18 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
+def _validate_repeat_sampling(phase: Phase, repeats: Repeats, *, persistent: bool = False) -> None:
     """Require complete repeat groups under grid or seeded random sampling.
 
     Partial grids are refused because they can leave configuration groups incomplete.
 
     :param Phase phase: Phase whose sampler and trial target are checked.
     :param Repeats repeats: The phase's repeats block.
+    :param bool persistent: Whether a raised grid target may retry recorded failed cells.
     :raises ValueError: The sampler is neither grid nor seeded random,
         ``allow_partial_grid`` is set, an empty search space has ``n_trials``
-        other than the repeat count, or seeded random has ``n_trials`` that is
-        not a multiple of it.
+        below the repeat count (or differs from it without persistent grid
+        storage), or seeded random has ``n_trials`` that is not a multiple of it.
     """
     sampler = phase.sampler
     count = len(repeats.values)
@@ -506,7 +545,11 @@ def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
             "complete groups. To run a subset of configurations with all their repeats, use "
             "sampler.type random with a seed."
         )
-    if not phase.search_space and phase.n_trials != count:
+    if (
+        not phase.search_space
+        and phase.n_trials != count
+        and not (persistent and sampler.type == "grid" and phase.n_trials > count)
+    ):
         raise ValueError(
             f"Phase {phase.name!r}: repeats over an empty search_space runs one configuration "
             f"once per repeat value, so n_trials must be {count} (the number of "

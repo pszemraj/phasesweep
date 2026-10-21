@@ -1319,7 +1319,7 @@ class Experiment(_Frozen):
                     "A key and a sub-key cannot both be overridden across the inheritance chain."
                 )
 
-            _validate_sampler_search_space(phase)
+            _validate_sampler_search_space(phase, persistent=self.resolved_storage is not None)
             _validate_persistent_sampler_seed(self.resolved_storage, phase)
             _validate_in_memory_fixed_target(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)

@@ -1520,7 +1520,7 @@ def _run_phase(
                 trainer_environment=environment_identity.digest,
             )
             # WAITING reruns precede new draws and share the allocation context.
-            _log_reruns(phase, study, _record_reruns(study))
+            _log_reruns(phase, study, _record_reruns(study, phase))
             try:
                 study.optimize(
                     functools.partial(_objective, run),

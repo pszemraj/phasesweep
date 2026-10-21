@@ -9,7 +9,12 @@ from typing import Any, Literal, NamedTuple, TypedDict
 import optuna
 
 from phasesweep.config.models import Phase
-from phasesweep.config.search import fixed_configuration_target_refusal
+from phasesweep.config.search import (
+    fixed_configuration_target_refusal,
+    grid_cardinality,
+    grid_target_refusal,
+    phase_draws,
+)
 from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -410,13 +415,13 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     """Reject a target the study's durable state does not allow.
 
     A target lower than the accepted one is refused, and so is a fixed
-    configuration's target past what it may retry (see
+    configuration or grid target past what it may retry (see
     :func:`_validate_fixed_configuration_target`).
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
-        study's durable accepted target, or a fixed configuration asks for more
+        study's durable accepted target, or a fixed configuration or grid asks for more
         attempts than it may retry.
     """
     accepted_target = _accepted_trial_target(study)
@@ -434,14 +439,15 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
 
 def _validate_fixed_configuration_target(phase: Phase, *, finished: int, completed: int) -> None:
-    """Reject a fixed configuration's target that would repeat a measured configuration.
+    """Reject a fixed configuration or grid target that would repeat completed cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
     Raising ``n_trials`` retries it only while no attempt has completed: after
     ``finished`` failed attempts the target may reach ``finished + 1``, and a
-    completed attempt, feasible or not, closes it. A phase that draws is not
-    checked here. A study that does not exist yet counts zero finished and
-    zero completed.
+    completed attempt, feasible or not, closes it. A grid applies the same rule
+    per cell: its target may add one attempt per cell without a COMPLETE result.
+    Other sampled phases are unrestricted. A missing study counts zero finished
+    and zero completed.
 
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Terminal attempts the phase's study holds.
@@ -450,6 +456,8 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, complet
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    if refusal is None:
+        refusal = grid_target_refusal(phase, finished=finished, completed=completed)
     if refusal is not None:
         raise TrialTargetRefusedError(refusal)
 
@@ -556,16 +564,19 @@ def _pending_rerun_count(trials: Sequence[optuna.trial.FrozenTrial]) -> int:
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :return int: Reruns the next run that reaches the phase launches before any new draw.
     """
+    by_number = {trial.number: trial for trial in trials}
     waiting = sum(
         1
         for trial in trials
-        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+        if trial.state == optuna.trial.TrialState.WAITING
+        and RERUN_OF_ATTR in trial.user_attrs
+        and _trial_interrupted(by_number[trial.user_attrs[RERUN_OF_ATTR]])
     )
     return len(_rerun_sources(trials)) + waiting
 
 
-def _record_reruns(study: optuna.Study) -> list[tuple[int, int]]:
-    """Schedule one WAITING rerun for every interrupted trial that has none.
+def _record_reruns(study: optuna.Study, phase: Phase | None = None) -> list[tuple[int, int]]:
+    """Schedule interrupted reruns and the grid retries a raised target permits.
 
     Each rerun is created in one storage record carrying its source's params,
     distributions and system attrs (a grid point, a CMA-ES generation) and
@@ -575,10 +586,34 @@ def _record_reruns(study: optuna.Study) -> list[tuple[int, int]]:
     sources' configurations, and each takes its source's draw position.
 
     :param optuna.Study study: Study about to allocate work.
-    :return list[tuple[int, int]]: ``(source, rerun)`` trial numbers, one per
-        rerun created, in source order.
+    :param Phase | None phase: Phase whose target above grid cardinality may retry failed cells.
+    :return list[tuple[int, int]]: ``(source, rerun)`` trial numbers, interrupted
+        sources first, then failed cells, each in trial-number order.
     """
-    sources = _rerun_sources(study.get_trials(deepcopy=False))
+    trials = study.get_trials(deepcopy=False)
+    sources = _rerun_sources(trials)
+    if (
+        phase is not None
+        and phase.sampler.type == "grid"
+        and phase_draws(phase)
+        and phase.n_trials > grid_cardinality(phase)
+    ):
+        latest: dict[int, optuna.trial.FrozenTrial] = {}
+        for trial in trials:
+            grid_id = trial.system_attrs.get("grid_id")
+            if grid_id is not None:
+                latest[grid_id] = trial
+        waiting = sum(trial.state == optuna.trial.TrialState.WAITING for trial in trials)
+        slots = max(0, phase.n_trials - _finished_trial_count(trials) - len(sources) - waiting)
+        failed_cells = sorted(
+            (
+                trial
+                for trial in latest.values()
+                if trial.state == optuna.trial.TrialState.FAIL and not _trial_interrupted(trial)
+            ),
+            key=lambda trial: trial.number,
+        )
+        sources.extend(failed_cells[:slots])
     for source in sources:
         study.add_trial(
             optuna.trial.create_trial(

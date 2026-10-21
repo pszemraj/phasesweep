@@ -360,8 +360,8 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
-        :raises RuntimeError: The position lies past the grid, which the trial
-            target's cardinality check rules out.
+        :raises RuntimeError: The position lies past the grid, which target
+            validation and queued failed-cell retries rule out.
         """
         if "grid_id" in trial.system_attrs:
             return
