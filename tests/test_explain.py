@@ -138,20 +138,6 @@ def test_explain_phases_is_a_compact_index_to_its_children() -> None:
     assert len(out) < 8000
 
 
-def test_cross_field_validation_points_to_the_reference_index() -> None:
-    """A model-level refusal still gives a discoverable configuration command."""
-    from pydantic import ValidationError
-
-    from phasesweep.config.io import describe_validation_error
-    from phasesweep.config.models import Phase
-    from tests.conftest import make_experiment
-
-    with pytest.raises(ValidationError) as caught:
-        make_experiment(phases=[Phase(name="p", n_trials=1, inherits=["missing"])])
-
-    assert "see: phasesweep explain" in describe_validation_error(caught.value)
-
-
 def test_explain_unknown_key_exits_two_with_closest_matches() -> None:
     """A miss goes to stderr, names the closest documented keys and prints nothing else."""
     code, out, err = _explain("inherit_env")

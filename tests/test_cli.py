@@ -1680,7 +1680,7 @@ def test_config_error_hints_stay_few_and_distinct(
     assert invoke_cli_boundary(["validate", str(config_path)], monkeypatch) == 2
     err = capsys.readouterr().err
     assert "is not a prior phase" in err
-    assert "see: phasesweep explain" in err
+    assert "see:" not in err
 
 
 @pytest.mark.parametrize(

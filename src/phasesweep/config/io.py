@@ -132,7 +132,7 @@ def describe_validation_error(exc: ValidationError) -> str:
     """Append up to three configuration-reference hints to a validation error.
 
     Hints name the deepest documented key for each distinct error location,
-    in error order, and are shell-quoted. A model-level error points to the index.
+    in error order, and are shell-quoted. Undocumented locations add no hint.
 
     :param ValidationError exc: Validation failure of an :class:`Experiment`.
     :return str: ``str(exc)`` plus up to three hint lines.
@@ -143,7 +143,7 @@ def describe_validation_error(exc: ValidationError) -> str:
         if path is not None and path not in paths:
             paths.append(path)
     hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
-    return "\n".join([str(exc), *(hints or ["see: phasesweep explain"])])
+    return "\n".join([str(exc), *hints])
 
 
 def load_experiment_bytes(
