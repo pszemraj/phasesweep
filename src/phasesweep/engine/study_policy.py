@@ -30,6 +30,7 @@ from phasesweep.engine.fingerprints import (
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -49,6 +50,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import OperatorAction
+from phasesweep.runtime.json import JsonObject
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -633,115 +635,130 @@ def _failed_grid_cells(
     )
 
 
-class _TargetAdvice(NamedTuple):
-    """What raising ``n_trials`` can do for a grid or fixed configuration."""
-
-    text: str
-    schedules: bool
-    """Whether a raised target schedules any attempt."""
-
-
-def _target_advice(
-    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
-) -> _TargetAdvice | None:
-    """Name the exact ``n_trials`` that retries every failed cell of a grid or fixed configuration.
-
-    The target is the ceiling :func:`~phasesweep.config.search.retry_target_ceiling`
-    allows, which also runs a grid's cells that no attempt has completed or failed.
-
-    :param Phase phase: Phase whose configured ``n_trials`` the advice raises.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
-    :return _TargetAdvice | None: A sentence, or ``None`` for a sampling phase, which has no
-        per-cell retry rule.
-    """
-    finished = _finished_trial_count(trials)
-    ceiling = retry_target_ceiling(
-        phase, finished=finished, completed=_completed_trial_count(trials)
-    )
-    if ceiling is None:
-        return None
-    fixed = not phase_draws(phase)
-    if ceiling <= phase.n_trials:
-        reason = (
-            "Its attempt already completed"
-            if fixed
-            else "No grid cell has a failed attempt to retry"
-        )
-        return _TargetAdvice(f"{reason}, so raising n_trials would schedule nothing.", False)
-    raise_to = (
-        f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
-        f"to {ceiling} in the config and rerun to"
-    )
-    restart = "the failure count starts again from zero"
-    if fixed:
-        return _TargetAdvice(
-            f"{raise_to} retry its failed attempt once more; a completed attempt is not "
-            f"repeated, and {restart}.",
-            True,
-        )
-    failed = len(_failed_grid_cells(trials))
-    remaining = ceiling - finished - failed
-    actions = []
-    if failed:
-        actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
-    if remaining:
-        actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
-    return _TargetAdvice(
-        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated, and {restart}.",
-        True,
-    )
-
-
-def _tripped_streak(abort: Mapping[str, object] | None) -> int | None:
+def _tripped_streak(abort: Mapping[str, object]) -> int | None:
     """Return the consecutive-failure count a streak abort recorded.
 
-    :param Mapping[str, object] | None abort: A recorded abort, if any.
+    :param Mapping[str, object] abort: A recorded abort.
     :return int | None: The count when ``max_consecutive_failures`` tripped, else ``None``.
     """
-    if abort is None or abort.get("policy") != "max_consecutive_failures":
+    if abort.get("policy") != "max_consecutive_failures":
         return None
     streak = abort.get("consecutive_failures")
     return streak if type(streak) is int else None
 
 
-def _recovery_advice(
-    phase: Phase,
-    trials: Sequence[optuna.trial.FrozenTrial],
-    *,
-    storage: str | None,
-    abort: Mapping[str, object] | None,
-) -> str | None:
-    """Say how to continue a grid or fixed configuration whose study recorded an abort.
+def _config_retires_abort(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], abort: JsonObject
+) -> bool:
+    """Say whether the current config lets a run recover from a recorded abort.
 
-    A raised target retries failed cells (:func:`_target_advice`). When it can schedule
-    nothing, the recorded abort cannot be reopened, so the advice is a fresh namespace:
-    with a limit above the recorded streak when trials were still unrun, otherwise
-    after fixing the cause. Without storage there is no study to continue.
+    A raised ``n_trials`` retires any abort. A ``max_consecutive_failures`` above the
+    count a streak abort recorded retires that abort too, but only while the target still
+    leaves trials to run: a recovery with none would replay an aborted phase as a result.
+
+    :param Phase phase: Phase whose current ``n_trials`` and limit are judged.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param JsonObject abort: The abort recorded after the recovery boundary.
+    :return bool: Whether the run writes the recovery boundary before any new work.
+    """
+    trial_target = abort["trial_target"]
+    if isinstance(trial_target, int) and phase.n_trials > trial_target:
+        return True
+    streak = _tripped_streak(abort)
+    return (
+        streak is not None
+        and phase.max_consecutive_failures > streak
+        and _finished_trial_count(trials) < phase.n_trials
+    )
+
+
+_COUNT_RESTARTS = "the failure count starts again from zero"
+
+
+def _retry_remedy(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceiling: int) -> str:
+    """Name the ``n_trials`` that retries every failed cell of a grid or fixed configuration.
+
+    :param Phase phase: Phase whose configured ``n_trials`` the remedy raises.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param int ceiling: The target :func:`~phasesweep.config.search.retry_target_ceiling`
+        allows, above ``phase.n_trials``; it also runs the cells no attempt has reached.
+    :return str: The sentence.
+    """
+    raise_to = (
+        f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
+        f"to {ceiling} in the config and rerun to"
+    )
+    if not phase_draws(phase):
+        return (
+            f"{raise_to} retry its failed attempt once more; a completed attempt is not "
+            f"repeated, and {_COUNT_RESTARTS}."
+        )
+    failed = len(_failed_grid_cells(trials))
+    remaining = ceiling - _finished_trial_count(trials) - failed
+    actions = []
+    if failed:
+        actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
+    if remaining:
+        actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
+    return (
+        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated, and "
+        f"{_COUNT_RESTARTS}."
+    )
+
+
+def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
+    """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
+
+    Every recovery message takes its advice from here. The remedies are a raised
+    ``n_trials``, which a grid or fixed configuration may raise only as far as its retry
+    ceiling allows, and for a streak abort a ``max_consecutive_failures`` above the
+    recorded count while the target still leaves trials to run. A grid or fixed
+    configuration with every cell measured has neither, and says so.
 
     :param Phase phase: Phase that aborted.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
-    :param str | None storage: The experiment's ``storage`` setting.
-    :param Mapping[str, object] | None abort: The recorded abort.
-    :return str | None: A sentence, or ``None`` when the phase is sampled or unstored.
+    :param optuna.Study study: The phase's study.
+    :param Mapping[str, object] abort: The recorded abort.
+    :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
-    target = _target_advice(phase, trials)
-    if storage is None or target is None:
-        return None
-    if target.schedules:
-        return target.text
-    streak = _tripped_streak(abort)
-    if streak is not None and _finished_trial_count(trials) < phase.n_trials:
-        lead = f"Raise phases[{phase.name}].max_consecutive_failures above {streak}"
-    else:
-        lead = "Fix the cause"
-    # Only `run` accepts --workdir and --set, so the new namespace belongs in the config,
-    # where `status` and `show-winners` read it too; an explicit journal needs its own change.
-    namespace = "`workdir` to a new directory" + (
-        "" if storage == "auto" else " and `storage` to `auto`"
+    name, target = phase.name, phase.n_trials
+    trials = study.get_trials(deepcopy=False)
+    finished = _finished_trial_count(trials)
+    ceiling = retry_target_ceiling(
+        phase, finished=finished, completed=_completed_trial_count(trials)
     )
+    remedies = []
+    if ceiling is None:
+        remedies.append(
+            f"Fix the cause, then raise phases[{name}].n_trials above {target} in the config "
+            f"and rerun to schedule new attempts; {_COUNT_RESTARTS}."
+        )
+    elif ceiling > target:
+        remedies.append(_retry_remedy(phase, trials, ceiling))
+    streak = _tripped_streak(abort)
+    if streak is not None and finished < target:
+        left = target - finished
+        remedies.append(
+            f"{'Or raise' if remedies else 'Raise'} phases[{name}].max_consecutive_failures "
+            f"above {streak} in the config and rerun to run the {left} trial"
+            f"{'' if left == 1 else 's'} still left at n_trials={target}; {_COUNT_RESTARTS}."
+        )
+    if remedies:
+        return " ".join(remedies)
+    if ceiling is None or ceiling > finished:
+        return None
+    if any(
+        trial.state == optuna.trial.TrialState.COMPLETE and trial.user_attrs.get(FEASIBLE_ATTR)
+        for trial in trials
+    ):
+        return (
+            "Nothing is left to run or retry, so no larger n_trials or max_consecutive_failures "
+            "schedules more work."
+        )
+    if phase_draws(phase):
+        return "Every cell was measured and none is feasible, so change the search space or bounds."
     return (
-        f"{target.text} {lead} and set {namespace} in the config, then rerun into a fresh "
-        "namespace; this study's recorded abort cannot be reopened."
+        "Its configuration was measured and is not feasible, so change fixed_overrides or "
+        "the bounds."
     )
 
 

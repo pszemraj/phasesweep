@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -71,6 +71,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
+    _config_retires_abort,
     _consecutive_failure_threshold_tripped,
     _initialize_study_schema,
     _load_accepted_partial_decision,
@@ -83,7 +84,6 @@ from phasesweep.engine.study_policy import (
     _record_reruns,
     _record_trial_target,
     _recovery_advice,
-    _target_advice,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
@@ -392,71 +392,48 @@ def _abort_record(
     }
 
 
-def _raise_prior_phase_abort(
-    phase: Phase,
-    abort_record: JsonObject,
-    trials: Sequence[optuna.trial.FrozenTrial],
-    storage: str | None,
-) -> None:
-    """Explain how to make an explicit recovery attempt after a durable abort.
+def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
+    """Refuse a phase whose recorded abort the current config does not retire.
 
-    A grid or fixed configuration is told the exact ``n_trials`` that retries its
-    failed cells, or that a fresh namespace is the only way out when no cell can be
-    retried (:func:`~phasesweep.engine.study_policy._recovery_advice`); a sampling
-    phase is told to raise the target above the aborted one.
+    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice`.
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
     :param JsonObject abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
-    :param str | None storage: The experiment's ``storage`` setting.
+    :param optuna.Study study: The phase's study.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
-    trial_target = abort_record["trial_target"]
-    advice = _recovery_advice(phase, trials, storage=storage, abort=abort_record) or (
-        f"Increase n_trials above {trial_target} in the config to explicitly schedule new "
-        "recovery attempts."
-    )
+    advice = _recovery_advice(phase, study, abort_record)
     raise NoFeasibleTrialError(
-        f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
-        f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
-        f"successful phase. {advice}",
+        f"Phase {phase.name!r} previously aborted at its accepted "
+        f"n_trials={abort_record['trial_target']}: {abort_record['cause']} "
+        "Refusing to reinterpret those terminal attempts as a successful phase."
+        + ("" if advice is None else f" {advice}"),
         action=OperatorAction.FIX_CONFIG,
     )
 
 
-def _raise_streak_at_limit(
-    phase: Phase,
-    consecutive_failures: int,
-    trial_target: int,
-    trials: Sequence[optuna.trial.FrozenTrial],
-) -> None:
+def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
     """Refuse new work while the resumed failure streak meets the current limit.
 
     :param Phase phase: Phase whose current ``max_consecutive_failures`` the
         streak meets.
-    :param int consecutive_failures: Replayed consecutive-failure count.
-    :param int trial_target: Durable accepted ``n_trials`` target.
-    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param JsonObject abort_record: The abort the streak would record, from
+        :func:`_failure_policy_abort_record`; supplies the replayed count and the
+        accepted target.
+    :param optuna.Study study: The phase's study.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
-    advice = _target_advice(phase, trials)
-    if advice is None:
-        remedy = (
-            f"Increase n_trials above {trial_target} in the config to explicitly schedule new "
-            "recovery attempts, or raise max_consecutive_failures."
-        )
-    elif advice.schedules:
-        remedy = f"{advice.text} Or raise max_consecutive_failures."
-    else:
-        remedy = f"{advice.text} Raise max_consecutive_failures instead."
+    advice = _recovery_advice(phase, study, abort_record)
     raise NoFeasibleTrialError(
-        f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
-        f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
-        f"it launches no more trials at its accepted n_trials={trial_target}. {remedy}",
+        f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
+        f"failed/infeasible trials, which meets "
+        f"max_consecutive_failures={phase.max_consecutive_failures}, so it launches no more "
+        f"trials at its accepted n_trials={abort_record['trial_target']}."
+        + ("" if advice is None else f" {advice}"),
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -468,7 +445,8 @@ class _PhaseResume:
     policy_state: _PhasePolicyState
     phase_fingerprint: str
     partial_decision: _AcceptedPartialDecision | None
-    # A durable abort that the raised n_trials authorizes this run to recover from.
+    # A durable abort that the raised n_trials or max_consecutive_failures authorizes this run
+    # to recover from.
     recovery_abort: dict[str, Any] | None
 
 
@@ -565,9 +543,10 @@ def _judge_recorded_phase(
         see :func:`_select_phase_winner` for everything it covers.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
         target, or a fixed configuration asks for more attempts than it may retry.
-    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
-        current limit with work remaining, at an accepted target its current
-        ``n_trials`` does not exceed.
+    :raises NoFeasibleTrialError: The phase aborted and the current config does not
+        retire the abort (see :func:`~phasesweep.engine.study_policy._config_retires_abort`),
+        or its streak meets the current limit with work remaining, at an accepted
+        target its current ``n_trials`` does not exceed.
     :raises WinnerIntegrityError: An accepted partial-timeout decision would
         replay while the current config disables ``allow_incomplete_on_timeout``.
     :raises TimeoutError: An accepted partial-timeout decision replays with no
@@ -610,32 +589,26 @@ def _judge_recorded_phase(
             )
         except NoFeasibleTrialError as exc:
             raise _no_feasible_before_deadline(phase.name, partial_decision.timeout_scope) from exc
-    # A later success or changed failure limit does not clear a recorded abort.
+    # A later success or a lowered failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
-    if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
-        _raise_prior_phase_abort(
-            phase, active_abort, study.get_trials(deepcopy=False), experiment.storage
-        )
+    trials = study.get_trials(deepcopy=False)
+    if active_abort is not None and not _config_retires_abort(phase, trials, active_abort):
+        _raise_prior_phase_abort(phase, active_abort, study)
     if (
         active_abort is None
-        and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
+        and _finished_trial_count(trials) < phase.n_trials
         and _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
     ):
         # A replayed streak at the current limit requires a raised target for new work.
         accepted_target = _accepted_trial_target(study)
-        if phase.n_trials <= accepted_target:
-            _raise_streak_at_limit(
-                phase,
-                policy_state.consecutive_failures,
-                accepted_target,
-                study.get_trials(deepcopy=False),
-            )
         active_abort = _failure_policy_abort_record(
             phase,
             consecutive_failures=policy_state.consecutive_failures,
             completion_sequence=policy_state.max_sequence,
             trial_target=accepted_target,
         )
+        if phase.n_trials <= accepted_target:
+            _raise_streak_at_limit(phase, active_abort, study)
     return _PhaseResume(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,
@@ -1365,12 +1338,10 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
-        advice = _recovery_advice(
-            phase,
-            trials_after,
-            storage=experiment.storage,
-            abort=_load_phase_policy_state(study).abort,
-        )
+        abort = _load_phase_policy_state(study).abort
+        assert abort is not None  # an aborted run recorded its abort with the tripping outcome
+        # Without storage there is no study to continue.
+        advice = None if experiment.storage is None else _recovery_advice(phase, study, abort)
         raise NoFeasibleTrialError(
             f"Phase {phase.name!r} aborted after "
             f"{phase.max_consecutive_failures} consecutive failures. "

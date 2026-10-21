@@ -102,7 +102,7 @@ Inspect recorded trials without launching work:
 phasesweep status starter.yaml --trials
 ```
 
-With persistent storage, rerun the same config after an interruption; interrupted trials rerun automatically. Recover a failure-aborted phase by raising its `n_trials`, or start an independent later phase with `--from-phase NAME` when its required ancestors have valid winners. See [continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) for trial budgets and reproducibility, and [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for status and result views.
+With persistent storage, rerun the same config after an interruption; interrupted trials rerun automatically. Recover a failure-aborted phase by raising its `n_trials` in the config, or, while its target still leaves trials to run, by raising its `max_consecutive_failures` in the config above the streak the abort recorded; or start an independent later phase with `--from-phase NAME` when its required ancestors have valid winners. See [continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) for trial budgets and reproducibility, and [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for status and result views.
 
 ## Use your own trainer
 

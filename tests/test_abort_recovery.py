@@ -298,6 +298,150 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
 
 
+def _with_limit(experiment: Experiment, limit: int) -> Experiment:
+    """Return ``experiment`` with phase ``p``'s ``max_consecutive_failures`` set to ``limit``."""
+    phase = experiment.phases[0].model_copy(update={"max_consecutive_failures": limit})
+    return experiment.model_copy(update={"phases": [phase]})
+
+
+def _study(experiment: Experiment) -> optuna.Study:
+    """Open the experiment's only phase study."""
+    return optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+    )
+
+
+def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_path: Path) -> None:
+    """A limit above the recorded streak recovers the abort and runs the trials the target left."""
+    flag = tmp_path / "resume_enabled"
+    initial = make_experiment(
+        persistent=tmp_path,
+        trainer=write_flag_gated_trainer(tmp_path, flag),
+        n_trials=4,
+        max_consecutive_failures=2,
+        gpu_policy="none",
+        sampler={"type": "random", "seed": 7},
+    )
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(initial)
+    assert [trial.state.name for trial in _study(initial).trials] == ["FAIL", "FAIL"]
+    message = str(aborted.value)
+    assert "phases[p].max_consecutive_failures above 2 in the config" in message
+    assert "run the 2 trials still left at n_trials=4" in message
+    assert "phases[p].n_trials above 4 in the config" in message
+
+    # A limit that is not above the recorded streak leaves the abort in place, preview and run.
+    flag.touch()
+    for limit in (1, 2):
+        for dry_run in (True, False):
+            with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+                run_experiment(_with_limit(initial, limit), dry_run=dry_run)
+    assert len(_study(initial).trials) == 2
+
+    raised = _with_limit(initial, 3)
+    run_experiment(raised, dry_run=True)
+    assert len(_study(initial).trials) == 2
+    assert run_experiment(raised)["p"].metric == pytest.approx(0.5)
+    study = _study(initial)
+    assert [trial.state.name for trial in study.trials] == ["FAIL", "FAIL", "COMPLETE", "COMPLETE"]
+    state = _load_phase_policy_state(study)
+    assert (state.abort, state.consecutive_failures) == (None, 0)
+    # The recovery keeps the accepted target and spends it: nothing else was raised.
+    assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 4
+
+
+def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path) -> None:
+    """With the target spent, only a raised target recovers, and a limit alone is no recovery."""
+    initial = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)"),
+        n_trials=2,
+        max_consecutive_failures=2,
+        gpu_policy="none",
+        sampler={"type": "random", "seed": 7},
+    )
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(initial)
+
+    refusals = [str(aborted.value)]
+    for dry_run in (True, False):
+        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+            run_experiment(_with_limit(initial, 5), dry_run=dry_run)
+        refusals.append(str(refused.value))
+    for message in refusals:
+        assert "phases[p].n_trials above 2 in the config" in message
+        assert "max_consecutive_failures above" not in message
+    assert len(_study(initial).trials) == 2
+
+
+def _abort_fatally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Experiment, Path]:
+    """Run a three-trial random phase whose first trial hits an unexpected objective error.
+
+    :return tuple[Experiment, Path]: The aborted experiment, and the log that gains a line
+        for every trainer launch, which the abort stopped before the first.
+    """
+    import phasesweep.engine.phase as phase_module
+
+    calls = tmp_path / "calls.log"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        with Path({str(calls)!r}).open("a") as log:
+            log.write("run\\n")
+        print("x=0.5")
+        """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=3,
+        max_consecutive_failures=2,
+        gpu_policy="none",
+        sampler={"type": "random", "seed": 7},
+    )
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated objective defect")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(phase_module, "prepare_trainer_input", explode)
+        with pytest.raises(RuntimeError, match="simulated objective defect"):
+            run_experiment(experiment)
+    abort = _load_phase_policy_state(_study(experiment)).abort
+    assert abort is not None
+    assert abort["policy"] == "unexpected_objective_exception"
+    return experiment, calls
+
+
+def test_raised_failure_limit_does_not_retire_a_fatal_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fatal abort records no streak, so only a raised target recovers it."""
+    initial, calls = _abort_fatally(tmp_path, monkeypatch)
+
+    # The limit now exceeds the one failure counted, with two trials left to run, and still
+    # retires nothing: the preview and the run both refuse, and nothing launched.
+    roomy = _with_limit(initial, 5)
+    refusals = []
+    for dry_run in (True, False):
+        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+            run_experiment(roomy, dry_run=dry_run)
+        refusals.append(str(refused.value))
+    for message in refusals:
+        assert "simulated objective defect" in message
+        assert "phases[p].n_trials above 3 in the config" in message
+        assert "max_consecutive_failures above" not in message
+    assert not calls.exists()
+    assert len(_study(initial).trials) == 1
+
+    raised_target = roomy.phases[0].model_copy(update={"n_trials": 4})
+    recovered = roomy.model_copy(update={"phases": [raised_target]})
+    assert run_experiment(recovered)["p"].metric == pytest.approx(0.5)
+    assert len(calls.read_text().splitlines()) == 3
+
+
 @pytest.mark.parametrize(
     ("failing_attr", "old_target_refusal"),
     [

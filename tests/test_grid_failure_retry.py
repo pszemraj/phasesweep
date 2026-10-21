@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.phase as phase_ops
-from phasesweep import run_experiment
+from phasesweep import load_experiment, run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
@@ -23,6 +23,8 @@ from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import NoFeasibleTrialError, _warn_unsuccessful_grid_cells
+from phasesweep.engine.state import PHASE_RECOVERY_ATTR
+from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
     invoke_cli_boundary,
@@ -54,13 +56,17 @@ def _grid(
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase], metric=metric)
 
 
-def _trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
-    """Read the grid's recorded attempts."""
-    study = optuna.load_study(
+def _study(experiment: Experiment) -> optuna.Study:
+    """Open the grid's recorded study."""
+    return optuna.load_study(
         study_name=f"{experiment.experiment}::p",
         storage=_resolve_storage(experiment.resolved_storage),
     )
-    return study.get_trials(deepcopy=False)
+
+
+def _trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
+    """Read the grid's recorded attempts."""
+    return _study(experiment).get_trials(deepcopy=False)
 
 
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
@@ -192,13 +198,30 @@ def test_grid_seed_audit_retries_only_its_failed_repeat(tmp_path: Path) -> None:
     assert len(calls.read_text().splitlines()) == 3
 
 
-def _advice(from_target: int, to_target: int, action: str) -> str:
-    """Return the recovery advice a grid's abort and its refusals carry."""
-    return (
-        f"Fix the cause, then raise phases[p].n_trials from {from_target} to {to_target} "
-        f"in the config and rerun to {action}; completed cells are not repeated, and the "
-        "failure count starts again from zero."
-    )
+def _assert_advises_target(message: str, from_target: int, to_target: int, action: str) -> None:
+    """Assert the message tells the operator to raise phase ``p``'s target in the config."""
+    assert f"phases[p].n_trials from {from_target} to {to_target} in the config" in message
+    assert action in message
+    assert "the failure count starts again from zero" in message
+
+
+def _assert_advises_limit(message: str, above: int, left: int, target: int) -> None:
+    """Assert the message tells the operator to raise phase ``p``'s failure limit in the config."""
+    assert f"phases[p].max_consecutive_failures above {above} in the config" in message
+    assert f"run the {left} trials still left at n_trials={target}" in message
+    assert "the failure count starts again from zero" in message
+
+
+def _assert_no_fresh_namespace(message: str) -> None:
+    """Assert the message does not send the operator to a new workdir."""
+    assert "namespace" not in message
+    assert "workdir" not in message
+
+
+def _assert_no_recovery(message: str) -> None:
+    """Assert the message offers no setting of phase ``p`` that continues the study."""
+    assert "phases[p]" not in message
+    _assert_no_fresh_namespace(message)
 
 
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
@@ -208,14 +231,17 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     """The abort, the identical rerun's refusal and the dry run name 4, which retries both cells."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=2)
     original = _grid(tmp_path, trainer, 2, repeats=repeats)
-    advice = _advice(2, 4, "retry its 2 failed cells")
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
-    assert str(aborted.value).endswith(f"for stderr logs. {advice}")
+    messages = [str(aborted.value)]
     for dry_run in (False, True):
         with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
             run_experiment(original, dry_run=dry_run)
-        assert str(refused.value).endswith(f"as a successful phase. {advice}")
+        messages.append(str(refused.value))
+    for message in messages:
+        _assert_advises_target(message, 2, 4, "retry its 2 failed cells")
+        # No cell is unrun, so a higher failure limit would schedule nothing.
+        assert "max_consecutive_failures above" not in message
 
     # The advertised target is exactly the one that retries both failed cells.
     recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
@@ -261,17 +287,19 @@ def test_phase_header_counts_the_failed_cells_a_raised_target_retries(
 
 
 def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
-    """An abort that left cells untried names the target that also runs them."""
+    """An abort that left cells untried names both the target that also runs them and the limit."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=2)
     original = _grid(tmp_path, trainer, 4, cells=4)
-    advice = _advice(4, 6, "retry its 2 failed cells and run its 2 remaining cells")
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
     assert [trial.state.name for trial in _trials(original)] == ["FAIL", "FAIL"]
-    assert str(aborted.value).endswith(f"for stderr logs. {advice}")
     with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
         run_experiment(original)
-    assert str(refused.value).endswith(f"as a successful phase. {advice}")
+    for message in (str(aborted.value), str(refused.value)):
+        _assert_advises_target(
+            message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells"
+        )
+        _assert_advises_limit(message, 2, 2, 4)
 
     recovered = _grid(tmp_path, trainer, 6, cells=4)
     assert run_experiment(recovered)["p"].metric == 1.0
@@ -279,35 +307,57 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     assert len(calls.read_text().splitlines()) == 6
 
 
-_NOTHING_TO_RETRY = (
-    "No grid cell has a failed attempt to retry, so raising n_trials would schedule nothing."
-)
-_REOPEN = "this study's recorded abort cannot be reopened."
-
-
-def test_fully_measured_infeasible_grid_points_to_a_fresh_namespace(tmp_path: Path) -> None:
-    """Completed cells are closed and no cell is left to run, so only a fresh study can recover."""
+def test_fully_measured_infeasible_grid_says_nothing_can_continue(tmp_path: Path) -> None:
+    """Every cell completed out of bounds, so no setting continues the study and none is offered."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
     bounded = Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         max=1.0,
     )
     original = _grid(tmp_path, trainer, 2, metric=bounded)
-    # The test config names an explicit journal, which a new workdir alone does not redirect.
-    advice = (
-        f"{_NOTHING_TO_RETRY} Fix the cause and set `workdir` to a new directory and `storage` "
-        f"to `auto` in the config, then rerun into a fresh namespace; {_REOPEN}"
+    with pytest.raises(NoFeasibleTrialError, match="Phase 'p' aborted") as aborted:
+        run_experiment(original)
+    messages = [str(aborted.value)]
+    for dry_run in (False, True):
+        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+            run_experiment(original, dry_run=dry_run)
+        messages.append(str(refused.value))
+    for message in messages:
+        assert "Every cell was measured and none is feasible" in message
+        assert "change the search space or bounds" in message
+        _assert_no_recovery(message)
+    assert len(calls.read_text().splitlines()) == 2
+
+    # Neither a larger limit nor a larger target reaches a study with nothing left to run.
+    roomier = original.model_copy(
+        update={"phases": [original.phases[0].model_copy(update={"max_consecutive_failures": 3})]}
     )
-    with pytest.raises(NoFeasibleTrialError, match="aborted after 2") as aborted:
-        run_experiment(original)
-    assert str(aborted.value).endswith(f"for stderr logs. {advice}")
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
-        run_experiment(original)
-    assert str(refused.value).endswith(f"as a successful phase. {advice}")
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(roomier)
+    with pytest.raises(TrialTargetRefusedError):
+        run_experiment(_grid(tmp_path, trainer, 3, metric=bounded))
     assert len(calls.read_text().splitlines()) == 2
 
 
-def _untried_cells_config(tmp_path: Path, trainer: Path, *, limit: int, workdir: Path) -> Path:
+def _write_cell_trainer(tmp_path: Path) -> tuple[Path, Path]:
+    """Write a trainer that logs its cell and measures out of bounds for x of 3 or more."""
+    calls = tmp_path / "cells.log"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+
+        x = next(int(arg.removeprefix("--x=")) for arg in sys.argv if arg.startswith("--x="))
+        with Path({str(calls)!r}).open("a") as log:
+            log.write(f"{{x}}\\n")
+        print(f"loss={{5.0 if x >= 3 else 0.5}}")
+        """,
+    )
+    return trainer, calls
+
+
+def _untried_cells_config(tmp_path: Path, trainer: Path, *, limit: int) -> Path:
     """Write a four-cell grid whose first two cells measure infeasible, with auto storage."""
     return write_experiment(
         tmp_path / "exp.yaml",
@@ -319,7 +369,7 @@ def _untried_cells_config(tmp_path: Path, trainer: Path, *, limit: int, workdir:
             "max": 1.0,
         },
         storage="auto",
-        workdir=str(workdir),
+        workdir=str(tmp_path / "runs"),
         provenance={"revision": "test"},
         phases=[
             {
@@ -333,67 +383,94 @@ def _untried_cells_config(tmp_path: Path, trainer: Path, *, limit: int, workdir:
     )
 
 
-def test_infeasible_streak_with_untried_cells_points_to_a_fresh_namespace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unrun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A recorded streak abort cannot be reopened, so the way out is a higher limit in a new workdir."""
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        """
-        import sys
+    """A limit above the recorded streak retires the abort, and the dry run predicts the same."""
+    caplog.set_level(logging.INFO)
+    trainer, calls = _write_cell_trainer(tmp_path)
 
-        x = next(int(arg.removeprefix("--x=")) for arg in sys.argv if arg.startswith("--x="))
-        print(f"loss={5.0 if x >= 3 else 0.5}")
-        """,
-    )
-    original = _untried_cells_config(tmp_path, trainer, limit=2, workdir=tmp_path / "runs")
-    advice = (
-        f"{_NOTHING_TO_RETRY} Raise phases[p].max_consecutive_failures above 2 and set `workdir` "
-        f"to a new directory in the config, then rerun into a fresh namespace; {_REOPEN}"
-    )
+    def config(limit: int) -> Path:
+        return _untried_cells_config(tmp_path, trainer, limit=limit)
 
-    assert invoke_cli_boundary(["run", str(original)], monkeypatch) != 0
+    def ran() -> list[str]:
+        return sorted(calls.read_text().splitlines())
+
+    assert invoke_cli_boundary(["run", str(config(2))], monkeypatch) != 0
     aborted = capsys.readouterr().err
-    assert "aborted after 2 consecutive failures" in aborted
-    assert advice in aborted
-    for argv in (["run", str(original)], ["run", str(original), "--dry-run"]):
-        assert invoke_cli_boundary(argv, monkeypatch) != 0
-        refused = capsys.readouterr().err
-        assert "previously aborted" in refused
-        assert advice in refused
+    assert "Phase 'p' aborted" in aborted
+    _assert_advises_limit(aborted, 2, 2, 4)
+    # The target retries nothing: both measured cells are closed.
+    assert "n_trials from" not in aborted
+    _assert_no_fresh_namespace(aborted)
+    measured = ran()
+    assert sorted(measured) == ["3", "4"]
 
-    # The raised limit alone changes nothing: the recorded abort still stands in the old namespace.
-    raised = _untried_cells_config(tmp_path, trainer, limit=3, workdir=tmp_path / "runs")
-    assert invoke_cli_boundary(["run", str(raised)], monkeypatch) != 0
-    assert "previously aborted" in capsys.readouterr().err
+    # A limit that is no higher than the recorded streak leaves the abort in place.
+    for limit in (1, 2):
+        for argv in (["run"], ["run", "--dry-run"]):
+            assert invoke_cli_boundary([*argv, str(config(limit))], monkeypatch) != 0
+            refused = capsys.readouterr().err
+            assert "previously aborted" in refused
+            _assert_advises_limit(refused, 2, 2, 4)
+    assert ran() == measured
 
-    # A new workdir in the config is the fresh namespace, and the read commands follow it.
-    fresh = tmp_path / "fresh"
-    moved = _untried_cells_config(tmp_path, trainer, limit=3, workdir=fresh)
-    assert invoke_cli_boundary(["run", str(moved)], monkeypatch) == 0
-    assert list(fresh.rglob("winner.yaml"))
+    # The dry run predicts the recovery: it launches the two unrun cells, and writes nothing.
+    caplog.clear()
+    assert invoke_cli_boundary(["run", str(config(3)), "--dry-run"], monkeypatch) == 0
+    lines = [record.getMessage() for record in caplog.records]
+    assert "phase=p study=t::p finished=2 remaining=2 reruns=0 n_jobs=1" in lines
+    assert "DRY RUN phase=p would launch 2 trials" in lines
+    assert ran() == measured
+
+    recovered = config(3)
+    assert invoke_cli_boundary(["run", str(recovered)], monkeypatch) == 0
+    assert list((tmp_path / "runs").rglob("winner.yaml"))
+    # Each cell ran exactly once: the completed ones were not repeated.
+    assert ran() == ["1", "2", "3", "4"]
+    experiment = load_experiment(recovered)
+    trials = _trials(experiment)
+    assert [trial.state.name for trial in trials] == ["COMPLETE"] * 4
+    assert sorted(trial.params["x"] for trial in trials[2:]) == [1, 2]
+    study = _study(experiment)
+    assert _load_phase_policy_state(study).abort is None
+    assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
+
+    # The recovery spent no further work, and a later lower limit never reinterprets its outcomes.
+    for limit in (3, 2):
+        assert invoke_cli_boundary(["run", str(config(limit))], monkeypatch) == 0
+    assert ran() == ["1", "2", "3", "4"]
     capsys.readouterr()
-    assert invoke_cli_boundary(["show-winners", str(moved)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(recovered)], monkeypatch) == 0
     assert "=== p ===" in capsys.readouterr().out
 
 
 def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> None:
     """A resumed streak at the limit quotes the same target, beside the limit alternative."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
-    original = _grid(tmp_path, trainer, 2)
+    original = _grid(tmp_path, trainer, 4, cells=4)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(original)
-
-    with pytest.raises(NoFeasibleTrialError) as refused:
-        phase_ops._raise_streak_at_limit(original.phases[0], 2, 2, _trials(original))
-    assert str(refused.value).endswith(
-        f"at its accepted n_trials=2. {_advice(2, 4, 'retry its 2 failed cells')} "
-        "Or raise max_consecutive_failures."
+    phase = original.phases[0]
+    streak = phase_ops._failure_policy_abort_record(
+        phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
 
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        phase_ops._raise_streak_at_limit(phase, streak, _study(original))
+    message = str(refused.value)
+    assert "has 2 consecutive failed/infeasible trials" in message
+    assert "meets max_consecutive_failures=2" in message
+    assert "at its accepted n_trials=4" in message
+    _assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
+    _assert_advises_limit(message, 2, 2, 4)
 
-def test_sampling_phase_keeps_the_generic_recovery_advice(tmp_path: Path) -> None:
-    """Random draws have no per-cell retry rule, so the refusal still asks for a higher target."""
+
+def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: Path) -> None:
+    """Random draws have no per-cell retry rule, so any target above the aborted one recovers."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
     phase = Phase(
         name="p",
@@ -405,13 +482,13 @@ def test_sampling_phase_keeps_the_generic_recovery_advice(tmp_path: Path) -> Non
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
-    assert str(aborted.value).endswith("for stderr logs.")
     with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
         run_experiment(experiment)
-    assert str(refused.value).endswith(
-        "as a successful phase. Increase n_trials above 2 in the config to explicitly "
-        "schedule new recovery attempts."
-    )
+    for message in (str(aborted.value), str(refused.value)):
+        assert "phases[p].n_trials above 2 in the config" in message
+        assert "the failure count starts again from zero" in message
+        # Both trials are spent, so a higher limit would schedule nothing.
+        assert "max_consecutive_failures above" not in message
 
 
 def _coverage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

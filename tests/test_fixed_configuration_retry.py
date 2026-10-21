@@ -150,13 +150,13 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
     assert _call_count(calls) == 3
 
 
-def _fixed_advice(from_target: int) -> str:
-    """Return the advice a fixed configuration's abort and refusal carry."""
-    return (
-        f"Fix the cause, then raise phases[p].n_trials from {from_target} to {from_target + 1} "
-        "in the config and rerun to retry its failed attempt once more; a completed attempt is "
-        "not repeated, and the failure count starts again from zero."
-    )
+def _assert_advises_next_target(message: str, from_target: int) -> None:
+    """Assert the message tells the operator to raise phase ``p``'s target by one in the config."""
+    assert f"phases[p].n_trials from {from_target} to {from_target + 1} in the config" in message
+    assert "retry its failed attempt once more" in message
+    assert "the failure count starts again from zero" in message
+    # The one attempt the target allowed is spent, so a higher limit would schedule nothing.
+    assert "max_consecutive_failures above" not in message
 
 
 def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> None:
@@ -165,15 +165,15 @@ def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> No
 
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
-    assert str(aborted.value).endswith(f"for stderr logs. {_fixed_advice(1)}")
+    _assert_advises_next_target(str(aborted.value), 1)
     with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
-    assert str(refused.value).endswith(f"as a successful phase. {_fixed_advice(1)}")
+    _assert_advises_next_target(str(refused.value), 1)
 
     # The retry fails again, so the next abort names the next target.
     with pytest.raises(NoFeasibleTrialError) as aborted_again:
         run_experiment(_fixed(tmp_path, trainer, 2, max_consecutive_failures=1))
-    assert str(aborted_again.value).endswith(f"for stderr logs. {_fixed_advice(2)}")
+    _assert_advises_next_target(str(aborted_again.value), 2)
     assert _call_count(calls) == 2
 
     assert (
@@ -196,6 +196,26 @@ def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Pat
 
     with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
         run_experiment(_fixed(tmp_path, trainer, 2, metric=bounded))
+    assert _call_count(calls) == 1
+
+
+def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_path: Path) -> None:
+    """An abort over a completed infeasible attempt offers no setting that retries it."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    bounded = Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        max=1.0,
+    )
+    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=bounded)
+
+    with pytest.raises(NoFeasibleTrialError, match="Phase 'p' aborted") as aborted:
+        run_experiment(experiment)
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        run_experiment(experiment)
+    for message in (str(aborted.value), str(refused.value)):
+        assert "Its configuration was measured and is not feasible" in message
+        assert "phases[p]" not in message
+        assert "workdir" not in message
     assert _call_count(calls) == 1
 
 
