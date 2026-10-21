@@ -188,6 +188,56 @@ def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.M
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("override", [False, True], ids=["default", "override"])
+def test_lock_directory_os_failure_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    lock_root = tmp_path / "locks" if override else tmp_path / ".cache/phasesweep/locks"
+    denied = PermissionError(13, "Permission denied", str(lock_root))
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise denied
+
+    if override:
+        monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_root))
+        monkeypatch.setattr(runtime_files, "open_directory_fd", refuse)
+    else:
+        monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+        monkeypatch.setattr(runtime_files, "ensure_private_dir", refuse)
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.lock_dir()
+
+    assert caught.value.__cause__ is denied
+    assert str(lock_root) in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
+    assert "same writable" in str(caught.value)
+    assert not lock_root.exists()
+
+
+def test_lock_file_os_failure_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "blocked.lock"
+    denied = PermissionError(13, "Permission denied", str(lock_path))
+
+    def refuse(path: Path) -> None:
+        raise denied
+
+    monkeypatch.setattr(runtime_files, "_open_lock_file", refuse)
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.try_lock_file(lock_path)
+
+    assert caught.value.__cause__ is denied
+    assert str(lock_path) in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
+    assert "same writable" in str(caught.value)
+    assert not lock_path.exists()
+
+
 def test_lock_dir_accepts_admin_shared_directory_and_creates_group_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

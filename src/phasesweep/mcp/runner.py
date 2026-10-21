@@ -51,6 +51,7 @@ from phasesweep.mcp.snapshots import (
     finalize_result_snapshot,
     mark_result_snapshot_published,
 )
+from phasesweep.runtime.files import UnsafeLockPathError
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -167,6 +168,7 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (StudySchemaMismatchError, "study_schema_mismatch"),
     (PublishedStudyMissingError, "published_study_missing"),
     (StudyStorageUnavailableError, "storage_unavailable"),
+    (UnsafeLockPathError, "storage_unavailable"),
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (TrialTargetRefusedError, "trial_target_refused"),
@@ -226,9 +228,10 @@ def _base_failure_payload(
     :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report for most error types;
         clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
-        falling back to ``"execution"`` for any other value. Three error types
+        falling back to ``"execution"`` for any other value. These error types
         override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError` and :class:`PublishedStudyMissingError`
+        :class:`ExperimentLockBusyError`, :class:`UnsafeLockPathError`, and
+        :class:`PublishedStudyMissingError`
         always report ``"preflight"`` and
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
@@ -246,10 +249,17 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
+    next_steps = _routed_next_steps(error.action)
+    if isinstance(error, UnsafeLockPathError):
+        failure_stage = "preflight"
+        next_steps["remediation"] = (
+            "All launching contexts must share the same writable PHASESWEEP_LOCK_DIR. "
+            f"{next_steps['remediation']}"
+        )
     return {
         "code": code,
         "stage": _FIXED_STAGES.get(code, failure_stage),
-        **_routed_next_steps(error.action),
+        **next_steps,
     }
 
 

@@ -25,6 +25,10 @@ POSIX_RUNTIME_ERROR = (
     "Windows support needs a separate locking and process-tree implementation."
 )
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
+_LOCK_ACCESS_GUIDANCE = (
+    "Use the same writable PHASESWEEP_LOCK_DIR for every shell, MCP server, and sandbox "
+    "launching work on this host; provision that directory before setting it."
+)
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SHARED_DIR_MODE = 0o3770
@@ -67,7 +71,7 @@ def file_sha256(path: Path) -> str:
 
 
 class UnsafeLockPathError(PhaseSweepError):
-    """Raised when a lock directory or file is not safe to trust."""
+    """Raised when a lock directory or file is inaccessible or unsafe to trust."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
@@ -156,7 +160,7 @@ def lock_dir() -> Path:
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
         ownership-and-mode check; the OS account has no absolute home; or
-        the default lock directory fails the owner-only checks.
+        the default lock directory fails the owner-only checks; or the OS refuses access.
     :raises PlatformCapabilityError: The host lacks the required POSIX runtime.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
@@ -167,7 +171,12 @@ def lock_dir() -> Path:
                 f"{_LOCK_DIR_ENV} must be an absolute path: {path}",
                 action=OperatorAction.FIX_CONFIG,
             )
-        _lock_policy(path)
+        try:
+            _lock_policy(path)
+        except OSError as exc:
+            raise UnsafeLockPathError(
+                f"Cannot access lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+            ) from exc
         return path
 
     require_posix_runtime()
@@ -194,6 +203,10 @@ def lock_dir() -> Path:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
+    except OSError as exc:
+        raise UnsafeLockPathError(
+            f"Cannot create or access default lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+        ) from exc
     return path
 
 
@@ -272,12 +285,17 @@ def open_lock_file(path: Path) -> IO[str]:
     :raises PlatformCapabilityError: If the platform lacks ``O_NOFOLLOW``.
     :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
         the leaf name is unsafe, or the file fails the regular-file/ownership/
-        mode checks.
+        mode checks, or the OS refuses access.
     """
     from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     with defer_shutdown_signals():
-        return _open_lock_file(path)
+        try:
+            return _open_lock_file(path)
+        except OSError as exc:
+            raise UnsafeLockPathError(
+                f"Cannot open lock file {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}"
+            ) from exc
 
 
 def _open_lock_file(path: Path) -> IO[str]:

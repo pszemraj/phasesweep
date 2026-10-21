@@ -553,8 +553,9 @@ class GpuPool:
                 )
                 if not allow_no_gpu:
                     raise GpuConfigurationError(
-                        f"{message}; set allow_no_gpu_isolation: true only to accept "
-                        "running without GPU host locks."
+                        f"{message}; for intentional CPU-only work, set gpu_policy: none "
+                        "and disable CUDA in the trainer environment. Set "
+                        "allow_no_gpu_isolation: true only to accept running without GPU host locks."
                     )
                 if pinned == "":
                     log.warning(
