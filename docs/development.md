@@ -31,6 +31,23 @@ mypy src
 > [!IMPORTANT]
 > Run `pytest` by itself, with no concurrent lint or type check: process-supervision and timeout tests are timing-sensitive.
 
+### Latest local gate results
+
+Qualification on 2026-10-20 ran the two non-live lanes sequentially, with pytest isolated from other checks.
+
+| Gate | Result |
+| --- | --- |
+| Parallel fast lane, two workers | 2,564 passed in 155.15 seconds |
+| Serial integration and signal lane | 460 passed, 1 skipped in 802.38 seconds |
+| Contract tests, the three modules above | 109 passed in 2.17 seconds |
+| Whole-suite collection | 3,025 selected of 3,027 collected; two live tests excluded |
+| Ruff lint | Passed |
+| Ruff format check | Passed; 189 files formatted |
+| mypy | Passed; 80 source files |
+| Mandatory commit hooks | Passed for all committed changes |
+
+The existing skip is `test_absence_proof_tracks_a_real_child_pid_namespace`: its absence proof requires the host's initial PID namespace. Live-marked GPU and external-service tests were excluded. The Hugging Face recipe contract test reads synthetic trainer outputs without training or downloading a model.
+
 ### Git hooks
 
 The [hook configuration](../.pre-commit-config.yaml) calls the tools installed in the active environment and builds none of its own, so commit from a shell with that environment active. The development extra provides `pre-commit` and `pathlint`; after installing it, enable the hooks once per clone:
