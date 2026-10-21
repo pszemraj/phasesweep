@@ -678,8 +678,6 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
         entry was inspectable, and whether all observed members were zombies
         or exited.
     """
-    if not _PROC.exists():
-        return _GroupMemberScan(pids=(), complete=False, all_members_terminal=False)
     member_pids: list[int] = []
     all_members_terminal = True
     complete = True
