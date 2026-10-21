@@ -18,7 +18,7 @@ def test_decoder_checkpoint_recipe_uses_additional_steps_and_upstream_cwd(
     """Execute the recipe while replacing checkpoint loading and the training subprocess."""
     guide = REPO / "examples/tiny_decoder_enwik8/README.md"
     section = re.search(
-        r"## Continue one checkpoint\n.*?```bash\npython - [^\n]+ <<'PY'\n(.*?)\nPY\n```",
+        r"```bash\npython - [^\n]+ <<'PY'\n(.*?)\nPY\n```",
         guide.read_text(encoding="utf-8"),
         re.DOTALL,
     )

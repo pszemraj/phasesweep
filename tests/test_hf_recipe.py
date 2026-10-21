@@ -16,12 +16,11 @@ from tests.conftest import REPO, make_trial_context
 
 def test_hf_argparse_recipe_reads_results_below_the_rendered_output_dir(tmp_path: Path) -> None:
     guide = (REPO / "docs/config.md").read_text()
-    section = re.search(
-        r"### Hugging Face argparse recipe\n.*?```yaml\n(.*?)\n```", guide, re.DOTALL
-    )
-    assert section is not None, "The guide needs a complete Hugging Face argparse recipe"
+    blocks = re.findall(r"```yaml\n(.*?)\n```", guide, re.DOTALL)
+    recipe = next((block for block in blocks if "run_glue.py" in block), None)
+    assert recipe is not None, "The guide needs a complete Hugging Face argparse recipe"
     experiment = load_experiment_bytes(
-        section.group(1).encode(), source="documented HF recipe", config_dir=tmp_path
+        recipe.encode(), source="documented HF recipe", config_dir=tmp_path
     )
     phase = experiment.phases[0]
     assert phase.repeats is not None
