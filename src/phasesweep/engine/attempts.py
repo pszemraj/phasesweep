@@ -715,8 +715,8 @@ def _registry_attempt_fail_stale_trial(
         ),
     )
     report.reaped_running_trials += 1
-    log.warning(
-        "Reaped stale RUNNING trial %d in study %s via the attempt registry",
+    log.info(
+        "Confirmed process cleanup for RUNNING trial %d in study %s via the attempt registry",
         trial.number,
         entry["study_name"],
     )
