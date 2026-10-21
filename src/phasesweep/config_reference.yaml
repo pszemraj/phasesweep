@@ -769,6 +769,7 @@ workdir: string = "./runs"
 # Requires: storage auto or a journal needs at least one entry; blank keys or values fail config load.
 # Warning: values are copied into the shareable reproducibility.json of each generation, so they must not hold secrets.
 # Recommended: change these whenever an input outside this YAML changes. PhaseSweep does not infer downloaded model or data revisions.
+# Warning: changing a value or key changes the fingerprint of every phase, so an existing study refuses the run. Set a new experiment name to run the changed config as a new study (with storage auto a new workdir also works); the old study stays readable under the old name.
 provenance: map[string, string] = {}
 
 # ---------- Constraints ----------

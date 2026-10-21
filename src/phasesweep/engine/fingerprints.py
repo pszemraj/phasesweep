@@ -188,6 +188,11 @@ _CWD_FOLLOWS_INVOCATION = (
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
     "config (relative paths resolve against the config file)."
 )
+# An explicit storage keeps the same study under a new workdir; only auto storage follows it.
+_NEW_STUDY_STEP = (
+    "To run this config, set a new `experiment` name in the config (with `storage: auto` a new "
+    "`workdir` also works); the old study stays readable under the old name."
+)
 
 
 def _changed_payload_keys(
@@ -337,7 +342,7 @@ def _verify_fingerprint(
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}"
-            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else ''}",
+            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else _NEW_STUDY_STEP}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
         )

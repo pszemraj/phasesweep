@@ -71,7 +71,7 @@ phases:
       optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
 ```
 
-Choose `storage: auto` or a `journal:///...` URL for persistent local work, with a nonempty `provenance` mapping. `storage: null` is disposable. See [storage and locks](runtime.md#storage-and-locks) for path resolution, artifact-root binding, and continuation behavior.
+Choose `storage: auto` or a `journal:///...` URL for persistent local work, with a nonempty `provenance` mapping. Change a `provenance` value whenever an input outside the YAML changes, such as the trainer or dataset revision. It is part of every phase's study fingerprint, so an existing study refuses the changed config: set a new `experiment` name to run it as a new study (with `storage: auto` a new `workdir` also works), and the old study stays readable under the old name. `storage: null` is disposable. See [storage and locks](runtime.md#storage-and-locks) for path resolution, artifact-root binding, and continuation behavior.
 
 ## Phase composition
 
