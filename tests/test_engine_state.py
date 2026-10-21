@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import optuna
 
-from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
+from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 
 
 def test_trial_state_names_match_optuna_trial_state() -> None:
@@ -15,7 +15,7 @@ def test_trial_state_names_match_optuna_trial_state() -> None:
 
 
 def test_terminal_trial_states_match_is_finished() -> None:
-    """``TERMINAL_TRIAL_STATES`` names the states Optuna reports as finished, except ``PRUNED``, plus ``INFEASIBLE``."""
+    """``FINISHED_TRIAL_STATES`` names the states Optuna reports as finished, except ``PRUNED``, plus ``INFEASIBLE``."""
     finished_names = {state.name for state in optuna.trial.TrialState if state.is_finished()}
-    assert set(TERMINAL_TRIAL_STATES) == (finished_names - {"PRUNED"}) | {"INFEASIBLE"}
-    assert set(TERMINAL_TRIAL_STATES) < set(TRIAL_STATE_NAMES)
+    assert set(FINISHED_TRIAL_STATES) == (finished_names - {"PRUNED"}) | {"INFEASIBLE"}
+    assert set(FINISHED_TRIAL_STATES) < set(TRIAL_STATE_NAMES)

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
-from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
+from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
 
@@ -187,8 +187,8 @@ def status_payload(
         generation_counts = {
             state: int(raw_generation_counts.get(state, 0)) for state in TRIAL_STATE_NAMES
         }
-        terminal_trials_total = sum(counts[state] for state in TERMINAL_TRIAL_STATES)
-        terminal_trials_this_run = sum(generation_counts[state] for state in TERMINAL_TRIAL_STATES)
+        terminal_trials_total = sum(counts[state] for state in FINISHED_TRIAL_STATES)
+        terminal_trials_this_run = sum(generation_counts[state] for state in FINISHED_TRIAL_STATES)
         terminal_trials_before_run = max(
             0,
             terminal_trials_total - terminal_trials_this_run,

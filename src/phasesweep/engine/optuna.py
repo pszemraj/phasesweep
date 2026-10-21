@@ -32,9 +32,9 @@ from phasesweep.config.search import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
+    FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
-    TERMINAL_TRIAL_STATES,
     TRIAL_STATE_NAMES,
     RecoveredTrialState,
     TrialStateName,
@@ -118,9 +118,9 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     never consumes the trial target.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials in a state of :data:`~phasesweep.engine.state.TERMINAL_TRIAL_STATES`.
+    :return int: Number of trials in a state of :data:`~phasesweep.engine.state.FINISHED_TRIAL_STATES`.
     """
-    return sum(1 for trial in trials if _trial_count_state(trial) in TERMINAL_TRIAL_STATES)
+    return sum(1 for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES)
 
 
 def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
@@ -209,7 +209,7 @@ def _published_trial_history_available(
     """
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
-    finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES)
+    finished = sum(stats.counts.get(state, 0) for state in FINISHED_TRIAL_STATES)
     # A publication records Optuna's COMPLETE count, which includes the INFEASIBLE trials.
     measured = stats.counts.get("COMPLETE", 0) + stats.counts.get("INFEASIBLE", 0)
     return _meets_published_trial_history_boundary(finished, measured, published_trial)

@@ -41,7 +41,7 @@ Optuna's ``PRUNED`` is absent because the study's ``NopPruner`` never prunes and
 trainer raises ``TrialPruned``.
 """
 
-TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "INFEASIBLE", "FAIL")
+FINISHED_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "INFEASIBLE", "FAIL")
 """The states that count toward ``n_trials``; an interrupted trial is in none of them."""
 
 RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]

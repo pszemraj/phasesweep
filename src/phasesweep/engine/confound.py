@@ -36,7 +36,7 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 CONFOUND_SCHEMA_VERSION = 2
 
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed")
-# Where a terminal trial that selection did not rank is counted. A COMPLETE
+# Where a finished trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set violated a constraint or the metric's bounds,
 # unless it was feasible and only its repeat group was incomplete; a trial
 # that failed an evidence gate or extraction is FAIL.
