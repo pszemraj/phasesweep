@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import re
 import subprocess
 import sys
@@ -14,12 +15,15 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
+from phasesweep.engine import phase as phase_ops
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import FAILURE_REASON_ATTR, FEASIBLE_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import _bounded_metric, make_experiment, write_trainer
+from phasesweep.runtime.gpu import GpuPool
+from tests.conftest import _bounded_metric, make_experiment, trial_outcome, write_trainer
 
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
@@ -262,6 +266,66 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     else:
         assert "Trial 0 failed" not in result.stderr
         assert "Traceback (most recent call last):" not in result.stderr
+
+
+def _execution(tmp_path: Path) -> phase_ops._PhaseExecution:
+    """Build a phase execution over an empty in-memory study."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=6, gpu_policy="none")
+    phase = experiment.phases[0]
+    return phase_ops._PhaseExecution(
+        experiment=experiment,
+        phase=phase,
+        study=optuna.create_study(),
+        inherited_winners={},
+        generation_id="generation",
+        environment_identity=_environment_identity(experiment, phase.name),
+        gpu_pool=GpuPool.for_phase(phase),
+        optimize_deadline=None,
+        timeout_source=None,
+    )
+
+
+def _finish(run: phase_ops._PhaseExecution, outcome: str) -> int:
+    """Record ``outcome`` for a new trial of ``run``'s study, as the objective does; return its number."""
+    trial = run.study.ask()
+    trial.set_user_attr(FEASIBLE_ATTR, outcome == "success")
+    trial.set_user_attr(
+        TRIAL_OUTCOME_ATTR, trial_outcome(run.completion_sequence + 1, outcome, cause="boom")
+    )
+    run.advance(trial.number, outcome)
+    return trial.number
+
+
+def test_trial_lines_carry_their_own_completion_ordinal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Parallel trials that finish together each log the ordinal their outcome took, not a shared count."""
+    run = _execution(tmp_path)
+    numbers = [_finish(run, "success"), _finish(run, "failure"), _finish(run, "success")]
+    # Under parallel jobs every trial is terminal before the first callback reads the study.
+    run.study.tell(numbers[0], 0.5)
+    run.study.tell(numbers[1], state=optuna.trial.TrialState.FAIL)
+    run.study.tell(numbers[2], 0.5)
+    caplog.set_level(logging.INFO)
+
+    for number in numbers:
+        phase_ops._settle_finished_trial(run, run.study, run.study.trials[number])
+
+    ordinals = [
+        _field(record.getMessage(), r"\((\d+/6) finished\)")
+        for record in caplog.records
+        if " TRIAL " in record.getMessage()
+    ]
+    assert ordinals == ["1/6", "2/6", "3/6"]
+
+
+def test_an_interrupted_trial_takes_no_ordinal(tmp_path: Path) -> None:
+    """An interrupted trial reruns, so it leaves the count where it was and the next trial follows."""
+    run = _execution(tmp_path)
+    numbers = [_finish(run, "success"), _finish(run, "interrupted"), _finish(run, "failure")]
+
+    assert [run.finished_ordinals[number] for number in numbers] == [1, 1, 2]
+    assert run.finished_trials == 2
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])

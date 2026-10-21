@@ -693,6 +693,11 @@ class _PhaseExecution:
     completion_sequence: int = 0
     consecutive_failures: int = 0
     recorded_outcomes: dict[int, str] = field(default_factory=dict)
+    # Trials that count toward n_trials: the study's at phase start, then one per recorded
+    # outcome other than ``interrupted``. ``finished_ordinals`` keeps the count each trial's
+    # outcome took, so a TRIAL line states its own position however callbacks interleave.
+    finished_trials: int = 0
+    finished_ordinals: dict[int, int] = field(default_factory=dict)
     # Shared by the consecutive-failure and fatal-error paths. Queued
     # objectives check it inside the GPU lease and stop, interrupted, before launching.
     aborted: bool = False
@@ -772,6 +777,9 @@ class _PhaseExecution:
         """
         self.completion_sequence += 1
         self.recorded_outcomes[trial_number] = outcome
+        if outcome != "interrupted":
+            self.finished_trials += 1
+        self.finished_ordinals[trial_number] = self.finished_trials
         self.consecutive_failures = _next_consecutive_failures(self.consecutive_failures, outcome)
         threshold_tripped = not self.aborted and _consecutive_failure_threshold_tripped(
             self.consecutive_failures, self.phase
@@ -1277,7 +1285,9 @@ def _settle_finished_trial(
         with contextlib.suppress(Exception):
             study.stop()
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    _log_finished_trial(run.phase, trial, finished)
+    # Peers finish while this callback waits, so the study's count here can repeat or skip a
+    # value; the ordinal this trial's outcome took is its own.
+    _log_finished_trial(run.phase, trial, run.finished_ordinals.get(trial.number, finished))
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     if outcome is not None and outcome.abort is not None:
         log.error("phase=%s ABORTED: %s", run.phase.name, outcome.abort["cause"])
@@ -1531,6 +1541,7 @@ def _run_phase(
         gpu_pool=gpu_pool,
         optimize_deadline=budget.deadline,
         timeout_source=budget.source,
+        finished_trials=finished,
     )
     run.resume_from(resume.policy_state)
     # Accept the target only after environment, tracking, GPU, and budget checks pass.

@@ -74,8 +74,8 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
 
     :param Phase phase: The phase the trial belongs to.
     :param optuna.trial.FrozenTrial trial: The just-finished trial.
-    :param int finished: Trials the phase's study holds that count toward its
-        target, this one included unless it was interrupted.
+    :param int finished: Trials of the phase's study that counted toward its target when
+        this trial's outcome was recorded, this one included unless it was interrupted.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     value = "none" if trial.value is None else f"{trial.value:g}"
