@@ -137,3 +137,9 @@ class TrackingTargetUnavailableError(PhaseSweepError):
     """Raised before a phase allocates trials when its MLflow target cannot be reached."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+class TrackingSyncRefusedError(PhaseSweepError):
+    """Raised when ``sync-tracking`` has no matching MLflow deliveries it may retry."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

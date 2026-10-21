@@ -597,14 +597,16 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
         retried, or ``None`` for every generation's retained deliveries.
-    :raises ValueError: No deliveries exist, or the target or generation does
-        not match the saved records.
+    :raises ValueError: The generation name is unsafe, or a delivery record is malformed.
+    :raises TrackingSyncRefusedError: The config has no ``mlflow`` block, no deliveries
+        exist, or the target or generation does not match the saved records.
     :raises PhaseSweepError: The MLflow SDK is not installed, or a published
         generation's artifacts no longer validate.
     :return dict[str, int]: Remaining pending and delivered counts in that scope.
     """
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
+    from phasesweep.engine.errors import TrackingSyncRefusedError
     from phasesweep.engine.locking import _experiment_lock
     from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import signal_handler_scope
@@ -613,7 +615,10 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
     if experiment.mlflow is None:
-        raise ValueError("sync-tracking requires MLflow settings.")
+        raise TrackingSyncRefusedError(
+            "sync-tracking needs an `mlflow` block, and this config has none. Use the config "
+            "the sweep ran with, or see `phasesweep explain mlflow`."
+        )
     require_mlflow_sdk()
     with signal_handler_scope(), _experiment_lock(experiment):
         _preflight_active_attempts(
@@ -627,7 +632,9 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             source.exists()
             and read_record(source)["source"] != experiment.mlflow.evidence_identity()
         ):
-            raise ValueError("Tracking delivery belongs to a different target or generation.")
+            raise TrackingSyncRefusedError(
+                "Tracking delivery belongs to a different target or generation."
+            )
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
@@ -641,14 +648,16 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             _save_generation_intents(experiment, parent.parent.name)
         paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
         if not paths:
-            raise ValueError("No tracking deliveries exist for this scope.")
+            raise TrackingSyncRefusedError("No tracking deliveries exist for this scope.")
         for path in paths:
             record = read_record(path)
             if (
                 record["source"] != experiment.mlflow.evidence_identity()
                 or record["generation_id"] != path.parent.parent.name
             ):
-                raise ValueError("Tracking delivery belongs to a different target or generation.")
+                raise TrackingSyncRefusedError(
+                    "Tracking delivery belongs to a different target or generation."
+                )
         for path in paths:
             _deliver(experiment, path, environment)
     return delivery_status(experiment, generation_id)

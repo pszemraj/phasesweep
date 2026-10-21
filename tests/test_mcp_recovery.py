@@ -33,6 +33,7 @@ from phasesweep.engine.attempts import (
     _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
@@ -1048,7 +1049,7 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     if scope == "own_generation":
         assert sync_tracking(experiment, run_id)["pending"] == 0
     else:
-        with pytest.raises(ValueError, match="No tracking deliveries exist"):
+        with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
             sync_tracking(experiment, "other-generation")
 
     study = _load_first_phase_study(config_path)
@@ -1090,7 +1091,7 @@ def test_sync_tracking_finishes_an_attempt_whose_cleanup_recover_run_confirmed(
     write_unsafe_cleanup_status(store, run_id)
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
     uploads.clear()
-    with pytest.raises(ValueError, match="No tracking deliveries exist"):
+    with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
         sync_tracking(experiment, run_id)
     assert uploads == []
 

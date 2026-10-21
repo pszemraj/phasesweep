@@ -43,7 +43,7 @@ from phasesweep.engine.publication import (
 )
 from phasesweep.engine.read import TrialTables, read_trial_tables
 from phasesweep.engine.run import experiment_status, run_experiment
-from phasesweep.errors import OPERATOR_STEPS, PhaseSweepError
+from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -928,7 +928,8 @@ def sync_tracking(config_path: Path, generation_id: str | None) -> None:
 
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
-    :raises ClickException: Target mismatch or incomplete delivery.
+    :raises ClickException: The generation name or a delivery record is malformed.
+    :raises PhaseSweepError: Nothing matching can be synchronized, or uploads remain pending.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
 
@@ -939,7 +940,7 @@ def sync_tracking(config_path: Path, generation_id: str | None) -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
     if counts["pending"]:
-        raise click.ClickException("MLflow uploads remain pending.")
+        raise PhaseSweepError("MLflow uploads remain pending.", action=OperatorAction.RETRY)
 
 
 @cli.group(

@@ -14,6 +14,7 @@ import yaml
 from optuna.trial import TrialState, create_trial
 
 from phasesweep.config.models import Experiment
+from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.generation import _recorded_generation_state
 from phasesweep.engine.ledger import (
     claim_ledger,
@@ -370,7 +371,7 @@ def test_sync_finishes_an_attempt_once_recovery_confirms_its_cleanup(tmp_path, m
 
     # While its cleanup is unresolved, the attempt reports nothing: there is nothing to deliver.
     uploads.clear()
-    with pytest.raises(ValueError, match="No tracking deliveries exist"):
+    with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
         publication.sync_tracking(experiment)
     assert not record.exists()
     assert uploads == []

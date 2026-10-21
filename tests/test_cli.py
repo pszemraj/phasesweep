@@ -1907,6 +1907,45 @@ def test_cli_boundary_leaves_help_exit_status_unchanged(
     assert "Phase-chained hyperparameter sweeps" in captured.out
 
 
+def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A config with nothing to sync is refused as `phasesweep:` plus a fix line, not Click's `Error:`."""
+    config = write_experiment(tmp_path / "exp.yaml")
+
+    status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
+
+    assert status == 1
+    error = capsys.readouterr().err
+    assert error == (
+        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none. Use the "
+        "config the sweep ran with, or see `phasesweep explain mlflow`.\n"
+        "fix: correct the experiment configuration or the environment it runs in.\n"
+    )
+
+
+def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Counts print first, then the failure is a `phasesweep:` line with a retry step."""
+    monkeypatch.setattr(
+        "phasesweep.tracking.publication.sync_tracking",
+        lambda *_args: {"pending": 2, "delivered": 1},
+    )
+
+    status = invoke_cli_boundary(
+        ["sync-tracking", str(write_experiment(tmp_path / "exp.yaml"))], monkeypatch
+    )
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert captured.out == "pending: 2\ndelivered: 1\n"
+    assert captured.err == (
+        "phasesweep: MLflow uploads remain pending.\n"
+        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+    )
+
+
 def test_expected_operational_failures_share_one_base() -> None:
     """Every operator-facing failure the boundary reports without a traceback.
 

@@ -1043,7 +1043,7 @@ observe: list[object] = []
 # A projection is written to the attempt's run as phasesweep.* metrics at step 0 (objective, feasible, duration_seconds, constraint.<name>, observed.<name>), phasesweep.override.<key> params, phasesweep.* tags and a phasesweep/<name>.json artifact.
 # A failed upload leaves a pending delivery without invalidating accepted scientific results.
 # phasesweep sync-tracking CONFIG retries every pending upload of every generation and rebuilds a published generation's unsaved winner records from its artifacts; --generation ID limits it to one generation. It trains nothing and rereads no metrics.
-# sync-tracking takes the experiment lock, so it cannot run while a sweep is active. It exits nonzero while uploads remain pending, and when no deliveries exist.
+# sync-tracking takes the experiment lock, so it cannot run while a sweep is active. It exits nonzero while uploads remain pending, when no deliveries exist, and when the config has no mlflow block.
 # No YAML key controls publishing or retrying.
 mlflow: object | null = null
   # MLflow tracking server: an http or https URL, databricks, or databricks://profile.
