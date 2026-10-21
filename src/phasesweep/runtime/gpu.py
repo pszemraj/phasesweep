@@ -806,8 +806,9 @@ class GpuPool:
         """Block until a GPU is available and yield its visibility plus lease FDs.
 
         :param float | None deadline: Optional monotonic deadline for the wait.
-        :return: Context manager yielding GpuAssignment visibility and guardian-inherited lock FDs.
-            Inactive pools carry a configured disable sentinel or None visibility.
+        :return Generator[GpuAssignment, None, None]: Context manager yielding GpuAssignment
+            visibility and guardian-inherited lock FDs. Inactive pools carry a configured disable
+            sentinel or None visibility.
         :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
         :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """

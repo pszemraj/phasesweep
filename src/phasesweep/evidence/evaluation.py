@@ -425,7 +425,7 @@ def _capture_wandb(
     :raises DeadlineExceededError: The execution deadline prevents capture.
     :raises ExtractorError: Polling, authentication, SDK setup, run state, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
-    :return: Finished run identity, numeric values, present keys, and retrieval time.
+    :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
     if ctx.wandb_capture:
         return ctx.wandb_capture

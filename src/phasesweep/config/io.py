@@ -34,7 +34,7 @@ def _construct_mapping_strict(
     :param yaml.MappingNode node: Mapping node to construct.
     :param bool deep: Whether to construct nested objects deeply.
     :raises yaml.constructor.ConstructorError: A key is unhashable or duplicated.
-    :return: Constructed mapping.
+    :return dict: Constructed mapping.
     """
     literal_keys: dict[Any, None] = {}
     merge_key_seen = False

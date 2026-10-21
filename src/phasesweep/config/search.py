@@ -147,7 +147,7 @@ class CategoricalParam(_Frozen):
 
         :param choices: Candidate choices in configured order.
         :raises ValueError: A choice is unsupported, non-finite, or equal to an earlier choice.
-        :return: The choices, unchanged.
+        :return list: The choices, unchanged.
         """
         _validate_optuna_choices(choices, label="categorical choices")
         return choices
@@ -766,7 +766,7 @@ def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str
     """Choose deterministic preflight values for every sampler axis.
 
     :param Mapping[str, SearchParam] search_space: Parameters keyed by override name.
-    :return: One valid value per parameter.
+    :return dict: One valid value per parameter.
     """
     return {
         name: param.low if isinstance(param, (FloatParam, IntParam)) else param.choices[0]

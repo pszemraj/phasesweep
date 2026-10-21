@@ -129,7 +129,7 @@ def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideForma
 
     :param Mapping[str, object] overrides: Scalar/list values keyed by dotted parameter names.
     :param _CliOverrideFormat fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
-    :return: Space-separated ``key=value`` tokens in insertion order.
+    :return str: Space-separated ``key=value`` tokens in insertion order.
     :raises TypeError: A value has no faithful representation in the selected grammar.
     """
     prefix = "--" if fmt == "argparse" else ""

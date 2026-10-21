@@ -146,7 +146,8 @@ def _phase_fingerprint_payload(
     :param Phase phase: Phase whose run-control keys are excluded.
     :param dict[str, Winner] inherited_winners: Parent winners whose effective
         overrides contribute to identity.
-    :return: Configured trial semantics normalized to the JSON representation being hashed.
+    :return JsonObject: Configured trial semantics normalized to the JSON representation being
+        hashed.
     """
     semantic_phase = _semantic_phase_dump(phase)
     payload = {

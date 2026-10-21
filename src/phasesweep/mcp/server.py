@@ -822,7 +822,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
         :param ListLimit limit: Maximum catalog entries to return.
         :param MaybeCursor cursor: Optional pagination cursor from a prior result.
-        :return: Structured catalog listing.
+        :return ListExperimentsResult: Structured catalog listing.
         """
         return ListExperimentsResult.model_validate(
             app.list_experiments(limit=limit, cursor=cursor)
@@ -831,14 +831,14 @@ def build_server(app: PhaseSweepMCP) -> Any:
     def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
         """Validate the configuration-reference result.
 
-        :return: Matching reference entries, or the closest documented keys.
+        :return ExplainConfigResult: Matching reference entries, or the closest documented keys.
         """
         return ExplainConfigResult.model_validate(app.explain_config(key))
 
     async def inspect_experiment(experiment_id: ExperimentId) -> InspectExperimentResult:
         """Validate the experiment inspection result.
 
-        :return: Structured inspection payload.
+        :return InspectExperimentResult: Structured inspection payload.
         """
         return InspectExperimentResult.model_validate(
             await asyncio.to_thread(app.validate, experiment_id)
@@ -847,7 +847,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
         """Validate the latest-run result.
 
-        :return: One computed run handle or ``found=false``.
+        :return GetLatestRunResult: One computed run handle or ``found=false``.
         """
         return GetLatestRunResult.model_validate(
             await asyncio.to_thread(app.latest_run, experiment_id)
@@ -856,7 +856,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_run_status(run_id: RunId) -> GetRunStatusResult:
         """Validate the run-status result.
 
-        :return: Structured status payload.
+        :return GetRunStatusResult: Structured status payload.
         """
         return GetRunStatusResult.model_validate(await asyncio.to_thread(app.status, run_id))
 
@@ -869,7 +869,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param RunId run_id: Detached run id to wait on.
         :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current
             status.
-        :return: Structured status payload plus changed and reason.
+        :return AwaitRunResult: Structured status payload plus changed and reason.
         """
         result = AwaitRunResult.model_validate(
             await app.await_run(run_id, timeout_seconds=timeout_seconds)
@@ -879,7 +879,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_run_results(run_id: RunId) -> GetRunResultsResult:
         """Validate the run-results payload.
 
-        :return: Structured results payload.
+        :return GetRunResultsResult: Structured results payload.
         """
         return GetRunResultsResult.model_validate(await asyncio.to_thread(app.winners, run_id))
 
@@ -891,7 +891,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
         :param ExperimentId experiment_id: Catalog experiment id to launch.
         :param MaybePhaseName from_phase: Optional phase to resume from.
-        :return: Structured launch result.
+        :return LaunchRunResult: Structured launch result.
         """
         return LaunchRunResult.model_validate(
             await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
@@ -900,7 +900,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def cancel_run(run_id: RunId) -> CancelRunResult:
         """Cancel a run and validate the result.
 
-        :return: Structured cancellation result.
+        :return CancelRunResult: Structured cancellation result.
         """
         # MCP 1.27 invokes synchronous tool functions on the event-loop
         # thread. Cancellation may spend its 30-second grace period waiting
@@ -979,7 +979,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     def catalog_resource() -> str:
         """Return the first catalog page for clients that attach MCP resources.
 
-        :return: Compact JSON catalog page.
+        :return str: Compact JSON catalog page.
         """
         result = ListExperimentsResult.model_validate(
             app.list_experiments(limit=DEFAULT_LIST_LIMIT, cursor=None)
@@ -994,7 +994,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     def run_and_monitor_prompt() -> str:
         """Return safe agent instructions for the normal MCP sweep workflow.
 
-        :return: Prompt text.
+        :return str: Prompt text.
         """
         return agent_prompt_text()
 

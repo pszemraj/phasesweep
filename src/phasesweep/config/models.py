@@ -930,7 +930,7 @@ class ExecutionContext(_Frozen):
     def resolved_cwd(self) -> Path | None:
         """Resolve the configured trainer directory through home and symlink expansion.
 
-        :return: Absolute directory, or ``None`` to inherit the invocation directory.
+        :return Path | None: Absolute directory, or ``None`` to inherit the invocation directory.
         """
         return None if self.cwd is None else Path(self.cwd).expanduser().resolve()
 
@@ -1049,7 +1049,7 @@ class Experiment(_Frozen):
     def phase(self, name: str) -> Phase:
         """Look up a configured phase by its unique name.
 
-        :return: The matching configured phase.
+        :return Phase: The matching configured phase.
         :raises StopIteration: No phase has that name.
         """
         return next(phase for phase in self.phases if phase.name == name)
