@@ -320,21 +320,19 @@ def restored_signal_ownership() -> Iterator[None]:
 
     # Bound at entry so a replacement a test installs cannot do the restoring.
     restore_signal = signal.signal
-    restore_mask = getattr(signal, "pthread_sigmask", None)
+    restore_mask = signal.pthread_sigmask
     prior_owner = shutdown._process_lifetime_owner
     prior_depth = shutdown._scope_depth
     prior_servicing = shutdown._servicing_signum
     prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
-    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
+    prior_mask = restore_mask(signal.SIG_BLOCK, set())
     try:
         yield
     finally:
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_BLOCK, set(shutdown._SHUTDOWN_SIGNALS))
+        restore_mask(signal.SIG_BLOCK, set(shutdown._SHUTDOWN_SIGNALS))
         for sig, handler in prior_handlers.items():
             restore_signal(sig, handler)
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_SETMASK, prior_mask)
+        restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
         shutdown._servicing_signum = prior_servicing

@@ -10,7 +10,6 @@ import hashlib
 import os
 import shlex
 import stat
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +28,10 @@ from phasesweep.engine.paths import _artifact_root_identity
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
+    PlatformCapabilityError,
     UnsafePrivatePathError,
     canonical_storage_identity,
+    require_posix_runtime,
 )
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
@@ -40,16 +41,15 @@ VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 def require_linux_mcp_host() -> None:
     """Require Linux process identity semantics for autonomous MCP control.
 
-    :raises CatalogError: If the host cannot provide Linux ``/proc`` process
-        start times and this process's own PID namespace, both used to prevent
-        PID-reuse mistakes during cancellation and crash recovery.
+    :raises CatalogError: If the host is not Linux, or cannot provide the
+        ``/proc`` process start times and this process's own PID namespace
+        used to prevent PID-reuse mistakes during cancellation and crash
+        recovery.
     """
-    if not sys.platform.startswith("linux"):
-        raise CatalogError(
-            "the phasesweep MCP server is supported only on Linux because safe "
-            "cancellation and crash recovery require /proc process identities",
-            suggestion="run the MCP server on Linux; the core phasesweep CLI remains POSIX-oriented",
-        )
+    try:
+        require_posix_runtime()
+    except PlatformCapabilityError as exc:
+        raise CatalogError(str(exc), suggestion="run the MCP server on a Linux host") from exc
     if read_proc_starttime(os.getpid()) is None:
         raise CatalogError(
             "the phasesweep MCP server cannot read this process's Linux /proc start time, "

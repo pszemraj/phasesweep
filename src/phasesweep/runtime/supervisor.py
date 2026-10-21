@@ -289,8 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Restore the parent's inherited signal mask before forking the trainer so
     # shutdown signals can reach both processes.
-    if hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_SETMASK, set())
+    signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
     child_pid = os.fork()
     if child_pid == 0:

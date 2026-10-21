@@ -1,6 +1,6 @@
 """Shutdown-signal handling and the live-child registry it drains.
 
-SIGTERM, SIGINT and available SIGHUP terminate registered process groups and raise
+SIGTERM, SIGINT and SIGHUP terminate registered process groups and raise
 ``PhaseSweepShutdown`` with cleanup evidence. Scopes control handler ownership and
 defer or absorb signals during critical sections.
 """
@@ -31,15 +31,7 @@ _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 # The handler waits until each in-flight launch registers its PGID or fails.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
-_SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
-    sig
-    for sig in (
-        signal.SIGTERM,
-        signal.SIGINT,
-        getattr(signal, "SIGHUP", None),
-    )
-    if sig is not None
-)
+_SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 @dataclass(frozen=True)
@@ -194,8 +186,6 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
 def _unblock_shutdown_signals() -> None:
     """Ensure shutdown signals can reach the main-thread handler."""
-    if not hasattr(signal, "pthread_sigmask"):
-        return
     if threading.current_thread() is not threading.main_thread():
         return
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
@@ -207,7 +197,7 @@ _scope_depth = 0
 
 
 def install_signal_handlers() -> None:
-    """Take process-lifetime ownership of SIGTERM, SIGINT and available SIGHUP.
+    """Take process-lifetime ownership of SIGTERM, SIGINT and SIGHUP.
 
     Main-thread only. Reinstall missing handlers and unblock shutdown signals on
     each call. An open temporary scope hands its installation over and skips
@@ -226,10 +216,8 @@ def install_signal_handlers() -> None:
     if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
         _process_lifetime_owner = True
         return
-    signal.signal(signal.SIGTERM, _shutdown_handler)
-    signal.signal(signal.SIGINT, _shutdown_handler)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _shutdown_handler)
+    for sig in _SHUTDOWN_SIGNALS:
+        signal.signal(sig, _shutdown_handler)
     _process_lifetime_owner = True
 
 
@@ -255,7 +243,7 @@ def _reassert_process_lifetime_handlers() -> None:
 
 def _restore_host_signal_state(
     prior_handlers: dict[int, Any],
-    prior_mask: Collection[int] | None,
+    prior_mask: Collection[int],
 ) -> Exception | None:
     """Restore the embedding process's shutdown handlers and signal mask.
 
@@ -265,14 +253,12 @@ def _restore_host_signal_state(
     :param dict[int, Any] prior_handlers: Handlers captured before the scope
         installed its own, keyed by signal number. A ``None`` value means the
         signal had a C-level default that Python cannot reinstall.
-    :param Collection[int] | None prior_mask: Thread signal mask captured
-        before the scope unblocked shutdown signals, or ``None`` on platforms
-        without ``signal.pthread_sigmask``.
+    :param Collection[int] prior_mask: Thread signal mask captured before the
+        scope unblocked shutdown signals.
     :return Exception | None: The first restoration failure, or ``None`` when
         every handler was restored.
     """
-    if hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     restoration_error: Exception | None = None
     for sig, handler in prior_handlers.items():
         if handler is None:
@@ -289,8 +275,7 @@ def _restore_host_signal_state(
             log.exception("Failed to restore the prior handler for signal %d after scope exit", sig)
             if restoration_error is None:
                 restoration_error = exc
-    if prior_mask is not None:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
     return restoration_error
 
 
@@ -335,10 +320,8 @@ def signal_handler_scope() -> Iterator[None]:
         return
 
     prior_handlers: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
-    prior_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        # Read the mask without changing it.
-        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    # Read the mask without changing it.
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     _scope_depth = 1
     try:
         for sig in _SHUTDOWN_SIGNALS:
@@ -366,16 +349,13 @@ def defer_shutdown_signals() -> Iterator[None]:
 
     Kernel masking blocks this thread's signals; Python-level main-thread deferral
     also covers signals delivered to other threads. Worker launchers instead make
-    the handler wait on the launch lock. Python deferral remains active on platforms
-    without ``pthread_sigmask``.
+    the handler wait on the launch lock.
 
     :return Iterator[None]: Context for the critical section.
     """
     global _main_thread_defer_depth
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     if is_main:
         _main_thread_defer_depth += 1
     try:
@@ -383,9 +363,8 @@ def defer_shutdown_signals() -> Iterator[None]:
     finally:
         if is_main:
             _main_thread_defer_depth -= 1
-        if old_mask is not None:
-            # Mask restoration delivers queued signals after deferral ends.
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        # Mask restoration delivers queued signals after deferral ends.
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
             service_pending_shutdown()
 
@@ -419,9 +398,7 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
 
     Signals arriving inside the window are reported on the yielded object and
     retained for a later shutdown checkpoint. Signals arriving before entry raise
-    normally. Kernel-queued signals are drained while blocked using ``sigtimedwait``;
-    without it, delivery can occur at window exit, with the terminal record remaining
-    authoritative.
+    normally. Kernel-queued signals are drained while blocked using ``sigtimedwait``.
 
     :return Iterator[AbsorbedShutdown]: Window outcome whose ``signum`` is the absorbed
         shutdown signal, or ``None`` when no shutdown arrived during the window; it is set on
@@ -431,24 +408,20 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
     global _deferred_shutdown_signum
     absorbed = AbsorbedShutdown()
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     if is_main:
         _main_thread_defer_depth += 1
     try:
         yield absorbed
     finally:
         drained: int | None = None
-        if old_mask is not None and hasattr(signal, "sigtimedwait"):
-            # Drain while blocked to prevent an exception after commit.
-            while True:
-                info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
-                if info is None:
-                    break
-                drained = info.si_signo
-        if old_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        # Drain while blocked to prevent an exception after commit.
+        while True:
+            info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
+            if info is None:
+                break
+            drained = info.si_signo
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main:
             _main_thread_defer_depth -= 1
             recorded = _deferred_shutdown_signum

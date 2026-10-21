@@ -37,7 +37,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
-    PlatformCapabilityError,
     UnsafePrivatePathError,
     canonical_storage_identity,
     open_directory_fd,
@@ -253,7 +252,6 @@ def _write_tracking_cleanup_receipt(
     :param str operation_id: Tracking operation whose cleanup was confirmed.
     :param str generation_id: Generation that produced the operation.
     :raises OSError: The receipt could not be written.
-    :raises PlatformCapabilityError: The platform lacks the required file primitives.
     :raises UnsafePrivatePathError: The receipt destination is unsafe.
     """
     from phasesweep.tracking.session import tracking_root
@@ -347,7 +345,7 @@ def _register_active_attempt(
             "generation_id": generation_id,
         }
         private_atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
-    except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+    except (OSError, UnsafePrivatePathError) as exc:
         raise ActiveAttemptPersistenceError(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
@@ -369,7 +367,7 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     :param str attempt_id: Attempt whose trial reached a terminal state.
     """
     with (
-        contextlib.suppress(OSError, PlatformCapabilityError, ProcessCleanupUncertainError),
+        contextlib.suppress(OSError, ProcessCleanupUncertainError),
         _open_attempt_registry(experiment) as (directory_fd, _entry_paths),
     ):
         if directory_fd is not None:
@@ -778,7 +776,7 @@ def _preflight_active_attempts(
                     _write_tracking_cleanup_receipt(
                         experiment, operation_id=attempt_id, generation_id=entry["generation_id"]
                     )
-                except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+                except (OSError, UnsafePrivatePathError) as exc:
                     report.unreceipted_attempt_ids.add(attempt_id)
                     log.warning(
                         "Could not record the cleanup receipt for tracking operation %s: %s. "

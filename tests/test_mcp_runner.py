@@ -104,11 +104,6 @@ from tests.mcp_helpers import (
 )
 from tests.recovery_helpers import recover_run_cli
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="cancel path relies on POSIX process groups + /proc liveness",
-)
-
 
 @pytest.mark.integration
 def test_in_process_runner_helper_restores_host_signal_state(

@@ -7,7 +7,6 @@ import json
 import logging
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -795,32 +794,13 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
         root.setLevel(saved_level)
 
 
-def test_runtime_platform_guard_feature_checks_and_dry_run(
+def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real execution needs POSIX process groups and flock; dry-run does not."""
-    import sys
-
+    """Real execution needs Linux; dry-run launches nothing and takes no locks."""
     from phasesweep.runtime import files as runtime_files
 
-    for os_name, has_killpg, has_fcntl in [
-        ("posix", True, True),
-        ("nt", True, True),
-        ("posix", False, True),
-        ("posix", True, False),
-    ]:
-        with monkeypatch.context() as patch:
-            host = SimpleNamespace(name=os_name)
-            if has_killpg:
-                host.killpg = lambda *_args: None
-            patch.setattr(runtime_files, "os", host)
-            if not has_fcntl:
-                patch.setitem(sys.modules, "fcntl", None)
-            if os_name == "posix" and has_killpg and has_fcntl:
-                runtime_files.require_posix_runtime()
-            else:
-                with pytest.raises(RuntimeError, match="requires a POSIX platform"):
-                    runtime_files.require_posix_runtime()
+    runtime_files.require_posix_runtime()
 
     exp = make_experiment(
         experiment="platform_check",
@@ -829,12 +809,11 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
         search_space={"x": IntParam(type="int", low=0, high=1)},
     )
 
-    monkeypatch.delattr(runtime_files.os, "killpg")
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_files.sys, "platform", "darwin")
+        with pytest.raises(runtime_files.PlatformCapabilityError, match="only on Linux.*'darwin'"):
+            run_experiment(exp)
 
-    with pytest.raises(RuntimeError, match="requires a POSIX platform"):
-        run_experiment(exp)
-
-    # Dry-run remains available because it launches no subprocesses and takes no locks.
     winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
 

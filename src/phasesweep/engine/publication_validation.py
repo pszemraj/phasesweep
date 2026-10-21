@@ -31,7 +31,7 @@ from phasesweep.engine.state import (
     _parse_winner_source,
     _validate_observed_block,
 )
-from phasesweep.runtime.files import file_sha256, nofollow_flag
+from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import JsonObject, json_object
 
 
@@ -131,7 +131,7 @@ def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
         raise OSError(f"artifact {path} is outside {root}") from exc
     if not relative.parts or any(part in {".", ".."} for part in relative.parts):
         raise OSError(f"artifact {path} is not a file below {root}")
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow_flag()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory_fd = os.open(root, directory_flags)
     file_fd = -1
     try:
@@ -141,7 +141,7 @@ def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
             directory_fd = next_fd
         file_fd = os.open(
             relative.parts[-1],
-            os.O_RDONLY | os.O_CLOEXEC | nofollow_flag(),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=directory_fd,
         )
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):

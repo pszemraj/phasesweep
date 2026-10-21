@@ -92,9 +92,6 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
     handlers unrestored. The required order is: block, then restore handlers,
     then restore the mask.
     """
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
     received: list[int] = []
 
     def host_handler(signum: int, _frame: object) -> None:
@@ -378,9 +375,6 @@ def test_dry_run_does_not_enter_signal_handler_scope(
 def test_defer_shutdown_signals_blocks_and_restores() -> None:
     """The context manager must add SIGTERM/SIGINT to the thread mask on entry
     and restore the original mask on exit."""
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
     before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     try:
         with defer_shutdown_signals():
@@ -405,9 +399,6 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
             "    os.kill(os.getpid(), signal.SIGTERM)\n",
             "queued",
             id="inherited-shutdown-mask",
-            marks=pytest.mark.skipif(
-                not hasattr(signal, "pthread_sigmask"), reason="pthread_sigmask not available"
-            ),
         ),
         pytest.param(
             "install_signal_handlers()\n"

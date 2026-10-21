@@ -615,9 +615,6 @@ def _recover_over_malformed_registry_entry(
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
-_NO_NOFOLLOW = "O_NOFOLLOW is unavailable."
-
-
 def _scan_registry(
     damage: Callable[[Path], None] = lambda _entry: None,
     patch: Callable[[pytest.MonkeyPatch], None] = lambda _monkeypatch: None,
@@ -637,13 +634,6 @@ def _scan_registry(
         return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     return trigger
-
-
-def _lacks_capability(helper: str) -> Callable[[pytest.MonkeyPatch], None]:
-    """Return a patch under which the registry's ``helper`` lacks a platform capability."""
-    return lambda monkeypatch: monkeypatch.setattr(
-        f"phasesweep.engine.attempts.{helper}", _raiser(PlatformCapabilityError(_NO_NOFOLLOW))
-    )
 
 
 def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
@@ -854,7 +844,7 @@ WRAP_CASES = (
     RoutingCase(
         id="finalize_snapshot_platform",
         trigger=_finalize_complete_snapshot_while(
-            "write_status_file", PlatformCapabilityError("O_NOFOLLOW is unavailable.")
+            "write_status_file", PlatformCapabilityError("The host is not Linux.")
         ),
         raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
@@ -903,21 +893,6 @@ WRAP_CASES = (
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Could not inspect study 't::p' for stale RUNNING trials.",
-    ),
-    RoutingCase(
-        # Not a damaged registry: the missing capability keeps its own routing.
-        id="registry_open_platform_capability",
-        trigger=_scan_registry(patch=_lacks_capability("open_directory_fd")),
-        raised=PlatformCapabilityError,
-        action=OperatorAction.FIX_CONFIG,
-        message=_NO_NOFOLLOW,
-    ),
-    RoutingCase(
-        id="registry_entry_platform_capability",
-        trigger=_scan_registry(patch=_lacks_capability("read_private_text_at")),
-        raised=PlatformCapabilityError,
-        action=OperatorAction.FIX_CONFIG,
-        message=_NO_NOFOLLOW,
     ),
     RoutingCase(
         id="preflight_same_type_aggregate",

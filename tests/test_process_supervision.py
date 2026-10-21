@@ -129,9 +129,6 @@ def test_run_supervised_preserves_identity_and_records_terminal_lifecycle(
     Retained identity proves cleanup after an orchestrator death between process
     exit and Optuna's terminal commit, including clean trainer exits.
     """
-    if not Path("/proc/self/stat").exists():
-        pytest.skip("Linux-only test")
-
     trial_dir = tmp_path / "trial"
     result = _run_supervised(
         trial_dir,
@@ -1008,9 +1005,6 @@ def test_unexpected_status_read_failure_preserves_cleanup_evidence(
 
 def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
     """The exec'd trainer receives unblocked shutdown signals despite launch-time deferral."""
-    if not Path("/proc/self/status").exists():
-        pytest.skip("Linux-only test")
-
     trial_dir = tmp_path / "trial"
     status_out = tmp_path / "status.txt"
     cmd = f"cp /proc/self/status {status_out}"

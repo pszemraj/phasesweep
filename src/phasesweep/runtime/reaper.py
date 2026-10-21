@@ -313,7 +313,8 @@ def read_proc_starttime(pid: int) -> int | None:
 
     :param int pid: The process ID to inspect.
     :return int | None: The starttime in clock ticks (``/proc/<pid>/stat`` field 22), or
-        ``None`` on non-Linux systems and when the proc entry is unreadable.
+        ``None`` when the proc entry is missing or unreadable (hidepid, a container
+        without procfs access, or an exited process).
     """
     stat = _read_proc_stat(Path("/proc") / str(pid))
     return None if stat is None else stat.starttime
@@ -492,7 +493,7 @@ def cleanup_stale_trial_process(
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
         log.warning(
             "Refusing automatic cleanup for attempt %s because robust process-birth identity "
-            "is unavailable on this platform.",
+            "(boot id or /proc start time) is unavailable.",
             identity.attempt_id,
         )
         return False
@@ -593,9 +594,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
 def _process_group_alive(pgid: int) -> bool:
     """Check whether any non-zombie member of ``pgid`` is alive.
 
-    On non-Linux systems without procfs, fall back to ``killpg(0)`` existence checks.
-    When the ``/proc`` scan is incomplete or the kernel-visible group has no inspectable
-    members, liveness cannot be ruled out and the group counts as alive.
+    Without a mounted ``/proc`` (a chroot or container), fall back to ``killpg(0)``
+    existence checks. When the ``/proc`` scan is incomplete or the kernel-visible group has
+    no inspectable members, liveness cannot be ruled out and the group counts as alive.
 
     :param int pgid: Process-group ID to probe.
     :return bool: ``True`` if at least one non-zombie member of the group exists or liveness

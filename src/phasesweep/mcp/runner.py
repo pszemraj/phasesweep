@@ -620,7 +620,7 @@ def _persist_spawned_handle(
     """
     store = RunStore(state_dir)
     pid = os.getpid()
-    pgid = os.getpgrp() if hasattr(os, "getpgrp") else pid
+    pgid = os.getpgrp()
     pid_starttime = read_proc_starttime(pid)
     if pid_starttime is None:
         raise RuntimeError(

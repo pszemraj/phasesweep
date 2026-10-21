@@ -1110,7 +1110,6 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     assert env["PHASESWEEP_KEEP_ME"] == "kept"
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
 @pytest.mark.integration
 def test_spawned_runner_cannot_execute_project_local_code(
     tmp_path: Path,
@@ -1188,7 +1187,6 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     assert terminal["returncode"] == 1
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
 @pytest.mark.integration
 def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,

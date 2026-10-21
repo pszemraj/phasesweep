@@ -96,13 +96,9 @@ _RECORDED_NAMESPACE = "pid:[4026539001]@100"
 
 
 def test_read_proc_starttime_self():
-    """We should be able to read our own process starttime on Linux."""
+    """A process can read its own start time."""
     st = read_proc_starttime(os.getpid())
-    # On Linux this should be a positive integer. On non-Linux, None.
-    if Path("/proc/self/stat").exists():
-        assert st is not None and st > 0
-    else:
-        assert st is None
+    assert st is not None and st > 0
 
 
 def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
@@ -564,9 +560,6 @@ def test_mixed_preflight_error_boundary(
 @pytest.mark.integration
 def test_kill_stale_group_escalates_to_sigkill():
     """A child that ignores SIGTERM must still be killed within the grace window."""
-    if not Path("/proc/self/stat").exists():
-        pytest.skip("Linux-only test (uses /proc starttime)")
-
     # Spawn a child that ignores SIGTERM and only dies on SIGKILL.
     proc = subprocess.Popen(
         [

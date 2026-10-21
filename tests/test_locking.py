@@ -31,18 +31,6 @@ from tests.conftest import (
 )
 
 
-def test_missing_nofollow_is_a_platform_capability_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delattr(runtime_files.os, "O_NOFOLLOW")
-
-    with pytest.raises(
-        runtime_files.PlatformCapabilityError,
-        match="without following symlinks",
-    ):
-        runtime_files.nofollow_flag()
-
-
 @pytest.mark.parametrize(
     "variable",
     ["HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "PHASESWEEP_HOME"],

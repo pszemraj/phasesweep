@@ -56,11 +56,6 @@ from tests.conftest import (
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import SEEDED_RANDOM, write_slow_mcp_config
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="the detached runner relies on POSIX process groups + /proc liveness",
-)
-
 
 def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
     """Render a validated frozen snapshot through the result boundary."""

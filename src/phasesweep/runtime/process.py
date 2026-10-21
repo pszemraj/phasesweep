@@ -231,7 +231,7 @@ def _trial_process_identity(
     :param str pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in, from
         :func:`read_pid_namespace` before the launch.
     :return StaleProcessIdentity: The given fields combined with the current schema version,
-        ``pid``'s ``/proc`` start time (``None`` off-Linux or if unreadable), and the current
+        ``pid``'s ``/proc`` start time (``None`` if unreadable), and the current
         boot id (``None`` when unavailable).
     """
     return StaleProcessIdentity(
