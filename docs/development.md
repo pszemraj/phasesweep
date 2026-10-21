@@ -31,68 +31,6 @@ mypy src
 > [!IMPORTANT]
 > Run `pytest` by itself, with no concurrent lint or type check: process-supervision and timeout tests are timing-sensitive.
 
-### Latest local gate results
-
-Qualification on 2026-10-20 ran the two non-live lanes sequentially, with pytest isolated from other checks.
-
-| Gate | Result |
-| --- | --- |
-| Parallel fast lane, two workers | 2,564 passed in 155.15 seconds |
-| Serial integration and signal lane | 460 passed, 1 skipped in 802.38 seconds |
-| Contract tests, the three modules above | 109 passed in 2.17 seconds |
-| Whole-suite collection | 3,025 selected of 3,027 collected; two live tests excluded |
-| Ruff lint | Passed |
-| Ruff format check | Passed; 189 files formatted |
-| mypy | Passed; 80 source files |
-| Mandatory commit hooks | Passed for all committed changes |
-
-The existing skip is `test_absence_proof_tracks_a_real_child_pid_namespace`: its absence proof requires the host's initial PID namespace. Live-marked GPU and external-service tests were excluded. The Hugging Face recipe contract test reads synthetic trainer outputs without training or downloading a model.
-
-### Decoder workflow follow-up gates
-
-The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, successful cleanup messages, sandbox GPU inventory diagnostics, and changing repeat-group number guidance each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
-
-| Gate | Result |
-| --- | --- |
-| CLI, repeat runtime, decoder wrapper, and workflow regressions | 132 passed in 63.43 seconds |
-| Cleanup messages and stale-trial recovery | 62 passed in 2.17 seconds; 12 integration cases deselected |
-| Example and recipe checks after copied-config clarification | 14 passed in 0.07 seconds |
-| GPU inventory, sandbox diagnostics, and decoder recipes | 86 passed in 1.47 seconds; one live test excluded |
-| Repeat summaries, repeated-winner guidance, and CLI | 105 passed in 11.73 seconds |
-| New regression cases across the focused runs | 16 passed |
-| Contract tests | 109 passed through the mandatory commit hooks |
-| Whole-suite collection | 3,041 non-live tests across 99 modules |
-| Ruff lint | Passed |
-| Ruff format check | Passed; 193 files formatted |
-| mypy | Passed; 80 source files |
-| Mandatory commit hooks | Passed for each fix |
-
-A fresh GPT-6.1-sol agent on medium found the repeats and continuation recipes from the repository docs without a supplied config or commands. Its local CUDA run completed nine 80-update models, retained a completed trial across an intentional SIGINT, retried the interrupted attempt, and replayed in 0.408 seconds with all nine checkpoint paths and timestamps preserved. It continued a chosen seed's model from step 80 to 85 using five additional updates, with Adam counters also at 85.
-
-A separate final CUDA check selected that seed's checkpoint directly from the member directory printed by `show-winners` and executed the README's continuation code block. It required no CSV lookup: the saved step and Adam counters advanced from 80 to 85, and 20 model-state tensors changed. The study's objective records were preserved. These follow-up experiments used local-only logging.
-
-The fresh workflow check preceded the member-directory, cleanup-message, copied-config, sandbox-diagnostic, and group-number guidance follow-ups. Those changes received focused checks; the complete workflow has not been rerun cold against this final tree. Read-only validation of the real repeats example confirmed the missing-inventory sandbox refusal includes host-access advice, and the unchanged config passes with host GPU access. The saved real experiment's status also renders the explanation of changing group numbers.
-
-### Real CUDA qualification
-
-The 2026-10-20 [Enwik8 example](../examples/tiny_decoder_enwik8/README.md) check asked whether three learning rates could be ranked by mean final-checkpoint loss over two seeds, then replayed without retraining. It used the pinned trainer at `9c90a551`, one RTX 5090 (32 GB), PyTorch `2.13.0+cu130`, driver `595.91.07`, and W&B `0.28.0`. The fixed 27,403,008-parameter decoder used dimension 512, eight layers, eight heads, sequence length 512, batch size 16, bfloat16 autocast, Adam, zero weight decay, and gradient clipping at 1.0. Each of six trials trained for 300 optimizer steps: 1,800 steps and 14,745,600 training tokens in total.
-
-Final-checkpoint validation used ten batches (81,920 tokens) from the example's held-out Enwik8 split. Seeds 7 and 19 supplied the repeats; matching seeds used matching validation samples across learning rates. The baseline was learning rate `0.001`.
-
-| Learning rate | Mean final validation loss | Sample SD over two seeds |
-| --- | --- | --- |
-| **0.0003** | **1.835799** | 0.012816 |
-| 0.001 | 2.041565 | 0.033261 |
-| 0.003 | 2.735622 | 0.023171 |
-
-The selected rate won under both seeds. The numeric-grid boundary advisory correctly identified that it was the smallest tested rate; this bounded check does not establish convergence or the optimum outside that interval. CUDA-event timing covered input fetch/transfer, forward, backward, clipping, and Adam, excluding periodic validation. After discarding 20 warmup steps, each trial retained 280 raw timing samples; per-trial medians ranged from 20.27 to 20.43 ms. Peak allocated memory was 2.632 GB, with 2.804 GB reserved, measured across upstream training setup, optimizer steps, and periodic validation, before final-checkpoint reload/evaluation. GPU clocks were unlocked.
-
-All six saved checkpoints and Adam states independently confirmed step 300. Persisted group means and SDs matched the individual objectives; a completed dry run predicted zero launches, and actual replay preserved all six trial directories and measurement timestamps without launching a trainer. A guided GPT-6.1-sol agent on medium prepared the PhaseSweep configuration and checked persisted status and replay; the training setup and measurement wrapper were supplied. The live host inventory regression, `test_real_nvidia_smi_resolves_index_zero_to_a_uuid`, passed separately (one test, 0.07 seconds).
-
-The temporary [W&B test project](https://wandb.ai/pszemraj/tmp-phasesweep-test-20261020), group `20261020-enwik8-lr-300step`, contains all six finished runs, source, loss histories, raw timings, and evaluation artifacts. API readback verified each run's CUDA identity, configuration, final metric, timing sample count, history, and artifact destination against the local records. No dataset contents or model checkpoints were uploaded. PhaseSweep selected these objectives through `json_envelope`; this experiment does not qualify its W&B extractor. Generated configs, logs, checkpoints, and measurement files stayed outside the worktree.
-
-A separate workflow check gave a fresh GPT-6.1-sol agent on medium the user task of comparing learning rates with seed noise, inspecting saved results, and demonstrating resume, plus the standing environment and resource constraints. No experiment configuration, measurement wrapper, or CLI commands were supplied. It independently chose the bundled example's smaller 557,728-parameter decoder, three learning rates, three seeds, and 80 updates per trial, with local-only logging. It diagnosed the need for persistent storage and provenance, recovered an intentionally interrupted trial, completed nine successful trials, recomputed all nine final-checkpoint validation losses with an independent evaluation loop to within `1e-7`, and verified a completed replay launched no trainer. Its selected `0.001` learning rate was correctly flagged as within seed noise of `0.003`. This was a smaller workflow check than the 300-step CUDA qualification above.
-
 ### Git hooks
 
 The [hook configuration](../.pre-commit-config.yaml) calls the tools installed in the active environment and builds none of its own, so commit from a shell with that environment active. The development extra provides `pre-commit` and `pathlint`; after installing it, enable the hooks once per clone:
