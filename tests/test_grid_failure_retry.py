@@ -315,7 +315,7 @@ def test_fully_measured_infeasible_grid_says_nothing_can_continue(tmp_path: Path
         max=1.0,
     )
     original = _grid(tmp_path, trainer, 2, metric=bounded)
-    with pytest.raises(NoFeasibleTrialError, match="Phase 'p' aborted") as aborted:
+    with pytest.raises(NoFeasibleTrialError, match="2 consecutive failed/infeasible") as aborted:
         run_experiment(original)
     messages = [str(aborted.value)]
     for dry_run in (False, True):
@@ -401,7 +401,7 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
 
     assert invoke_cli_boundary(["run", str(config(2))], monkeypatch) != 0
     aborted = capsys.readouterr().err
-    assert "Phase 'p' aborted" in aborted
+    assert "2 consecutive failed/infeasible trials reached max_consecutive_failures=2" in aborted
     _assert_advises_limit(aborted, 2, 2, 4)
     # The target retries nothing: both measured cells are closed.
     assert "n_trials from" not in aborted

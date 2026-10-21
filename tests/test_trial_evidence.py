@@ -896,7 +896,7 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
         max_consecutive_failures=1,
         fixed_overrides={"recovered": str(recovery_marker)},
     )
-    with pytest.raises(NoFeasibleTrialError, match="consecutive failures"):
+    with pytest.raises(NoFeasibleTrialError, match="consecutive failed/infeasible trials"):
         run_experiment(crashing)
 
     crashed_generation = yaml.safe_load(_generation_path(crashing).read_text())["generation_id"]

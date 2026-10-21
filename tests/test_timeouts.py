@@ -368,7 +368,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     monkeypatch.setattr(phase_mod, "launch_trial", launch_and_burn_the_budget)
 
     if not clock_elapses:
-        with pytest.raises(NoFeasibleTrialError, match="aborted after 1 consecutive failures"):
+        with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible trials"):
             run_experiment(exp)
         return
 

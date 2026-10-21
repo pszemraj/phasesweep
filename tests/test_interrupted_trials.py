@@ -361,7 +361,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
     expected = (
         (RuntimeError, "stopped after 0/1")
         if serviced
-        else (NoFeasibleTrialError, "aborted after 1 consecutive failures")
+        else (NoFeasibleTrialError, "1 consecutive failed/infeasible trials")
     )
     with pytest.raises(expected[0], match=expected[1]):
         run_experiment(exp)

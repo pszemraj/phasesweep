@@ -71,6 +71,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
+    _awaits_cleanup_recovery,
     _config_retires_abort,
     _consecutive_failure_threshold_tripped,
     _initialize_study_schema,
@@ -392,10 +393,22 @@ def _abort_record(
     }
 
 
+def _as_sentence(cause: object) -> str:
+    """End a recorded abort cause as a sentence, so the text after it starts a new one.
+
+    :param object cause: A recorded abort cause, which an exception's text may leave unpunctuated.
+    :return str: ``cause`` with a period added unless it already ends in sentence punctuation.
+    """
+    text = str(cause)
+    return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
+
+
 def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
     """Refuse a phase whose recorded abort the current config does not retire.
 
-    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice`.
+    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice`. An
+    unsafe-cleanup abort whose cleanup is still unconfirmed routes to cleanup recovery
+    instead of the config.
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
@@ -408,10 +421,14 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     advice = _recovery_advice(phase, study, abort_record)
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} previously aborted at its accepted "
-        f"n_trials={abort_record['trial_target']}: {abort_record['cause']} "
+        f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
         "Refusing to reinterpret those terminal attempts as a successful phase."
         + ("" if advice is None else f" {advice}"),
-        action=OperatorAction.FIX_CONFIG,
+        action=(
+            OperatorAction.RUN_RECOVER_RUN
+            if _awaits_cleanup_recovery(study, abort_record)
+            else OperatorAction.FIX_CONFIG
+        ),
     )
 
 
@@ -1343,8 +1360,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Without storage there is no study to continue.
         advice = None if experiment.storage is None else _recovery_advice(phase, study, abort)
         raise NoFeasibleTrialError(
-            f"Phase {phase.name!r} aborted after "
-            f"{phase.max_consecutive_failures} consecutive failures. "
+            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} "
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
             + ("" if advice is None else f" {advice}")
         )

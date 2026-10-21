@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -413,6 +414,34 @@ def _abort_fatally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Exp
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
     return experiment, calls
+
+
+def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline quotes the ledger's cause, not a failure count, and advises the target alone."""
+    import phasesweep.engine.phase as phase_module
+
+    experiment, _calls = _abort_fatally(tmp_path, monkeypatch)
+    # A live run raises a fatal error itself before the phase is finished, so this is the one
+    # way to reach the headline with a fatal abort on record.
+    run = SimpleNamespace(
+        experiment=experiment,
+        phase=experiment.phases[0],
+        study=_study(experiment),
+        optimize_deadline=None,
+        deadline_exhausted=False,
+        aborted=True,
+    )
+
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        phase_module._finish_phase(run, phase_fingerprint="unused")
+
+    message = str(aborted.value)
+    assert "Phase 'p' aborted: RuntimeError: simulated objective defect" in message
+    assert "consecutive" not in message
+    assert "phases[p].n_trials above 3 in the config" in message
+    assert "max_consecutive_failures above" not in message
 
 
 def test_raised_failure_limit_does_not_retire_a_fatal_abort(

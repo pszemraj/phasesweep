@@ -1252,6 +1252,15 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         assert CLEANUP_CONFIRMED_ATTR not in unsafe_trial.user_attrs
     assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
+    # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as previewed:
+        run_experiment(_exp(2), dry_run=True)
+    message = str(previewed.value)
+    assert "cleanup could not be confirmed" in message
+    assert "A larger n_trials does not retire this abort" in message
+    assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
+    assert "Then raise phases[p].n_trials above 2 in the config" in message
+
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)
     with pytest.raises(ProcessCleanupUncertainError):
@@ -1273,6 +1282,11 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
             cleanup_confirmed=True,
         )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
+    # Once the preflight has confirmed cleanup, only the target is left to raise.
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as confirmed:
+        run_experiment(_exp(2))
+    assert "phases[p].n_trials above 2 in the config" in str(confirmed.value)
+    assert "mcp recover-run" not in str(confirmed.value)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 

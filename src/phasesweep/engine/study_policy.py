@@ -16,6 +16,10 @@ from phasesweep.config.search import (
     phase_draws,
     retry_target_ceiling,
 )
+from phasesweep.engine.attempts import (
+    _cleanup_recovered_trial_numbers,
+    _trial_requires_cleanup_recovery,
+)
 from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -49,7 +53,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction
 from phasesweep.runtime.json import JsonObject
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
@@ -672,6 +676,28 @@ def _config_retires_abort(
     )
 
 
+def _awaits_cleanup_recovery(study: optuna.Study, abort: Mapping[str, object]) -> bool:
+    """Say whether an unsafe-cleanup abort still waits for the recovery that retires it.
+
+    Only a run's preflight or a confirmed ``recover-run`` proving the process group gone
+    does; a raised ``n_trials`` does not.
+
+    :param optuna.Study study: Study whose cleanup recovery ledger and trials are read.
+    :param Mapping[str, object] abort: The recorded abort.
+    :return bool: Whether the abort's policy is ``unsafe_process_cleanup`` and a terminal
+        trial still lacks confirmed cleanup.
+    """
+    if abort.get("policy") != "unsafe_process_cleanup":
+        return False
+    recovered = _cleanup_recovered_trial_numbers(study)
+    return any(
+        trial.state.is_finished()
+        and trial.number not in recovered
+        and _trial_requires_cleanup_recovery(trial)
+        for trial in study.get_trials(deepcopy=False)
+    )
+
+
 _COUNT_RESTARTS = "the failure count starts again from zero"
 
 
@@ -709,9 +735,10 @@ def _retry_remedy(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceil
 def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
-    Every recovery message takes its advice from here. The remedies are a raised
-    ``n_trials``, which a grid or fixed configuration may raise only as far as its retry
-    ceiling allows, and for a streak abort a ``max_consecutive_failures`` above the
+    Every recovery message takes its advice from here. An unconfirmed unsafe-cleanup abort
+    needs cleanup recovery before any target retires it. Otherwise the remedies are a
+    raised ``n_trials``, which a grid or fixed configuration may raise only as far as its
+    retry ceiling allows, and for a streak abort a ``max_consecutive_failures`` above the
     recorded count while the target still leaves trials to run. A grid or fixed
     configuration with every cell measured has neither, and says so.
 
@@ -721,6 +748,12 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
     name, target = phase.name, phase.n_trials
+    if _awaits_cleanup_recovery(study, abort):
+        return (
+            "A larger n_trials does not retire this abort while a trial's process cleanup is "
+            f"unconfirmed. First confirm the cleanup: {RERUN_CLEANUP_RECOVERY}. Then raise "
+            f"phases[{name}].n_trials above {target} in the config."
+        )
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     ceiling = retry_target_ceiling(

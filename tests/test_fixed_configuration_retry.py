@@ -208,7 +208,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
     )
     experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=bounded)
 
-    with pytest.raises(NoFeasibleTrialError, match="Phase 'p' aborted") as aborted:
+    with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible") as aborted:
         run_experiment(experiment)
     with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
         run_experiment(experiment)

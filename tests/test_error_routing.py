@@ -52,7 +52,7 @@ from phasesweep.engine.paths import (
     _attempts_dir,
     _generation_summary_path,
 )
-from phasesweep.engine.phase import _failure_policy_abort_record
+from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -1283,6 +1283,34 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
+def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 4})
+    trials = study.get_trials(deepcopy=False)
+    sequence = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials) + 1
+    outcome = trial_outcome(sequence, "fatal", policy="unsafe_process_cleanup")
+    outcome[TRIAL_OUTCOME_ABORT_KEY] = _abort_record(
+        policy="unsafe_process_cleanup",
+        completion_sequence=sequence,
+        trial_target=phase.n_trials,
+        cause="trial cleanup could not be confirmed",
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                TRAINER_ENV_DIGEST_ATTR: trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR],
+                TRIAL_OUTCOME_ATTR: outcome,
+                CLEANUP_CONFIRMED_ATTR: False,
+            },
+        )
+    )
+    study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}), dry_run=True)
+
+
 def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
 
@@ -1592,6 +1620,14 @@ ORIGIN_CASES = (
         raised=NoFeasibleTrialError,
         action=OperatorAction.FIX_CONFIG,
         message="phases[p].n_trials above 4 in the config",
+    ),
+    RoutingCase(
+        # Raising the target does not retire an unsafe-cleanup abort; cleanup recovery does.
+        id="prior_phase_abort_awaiting_cleanup_recovery",
+        trigger=_preview_unconfirmed_cleanup_abort,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        message="First confirm the cleanup",
     ),
     RoutingCase(
         id="failure_streak_at_limit",
