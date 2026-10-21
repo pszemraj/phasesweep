@@ -474,8 +474,9 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
     ]
 
     caplog.clear()
-    run_experiment(experiment, from_phase="b", dry_run=True)
-    assert totals() == ["DRY RUN total: would launch 5 trials across 2 phases"]
+    with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'a'"):
+        run_experiment(experiment, from_phase="b", dry_run=True)
+    assert totals() == []
 
     caplog.clear()
     lowered = _persistent(tmp_path, _phase("d", 2))

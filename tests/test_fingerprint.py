@@ -351,11 +351,8 @@ def test_fingerprint_changes_when_parent_winner_changes():
     )
 
 
-def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
-    """--from-phase dry-run with missing winner.yaml falls back to placeholder.
-
-    The placeholder must still compose inherited overrides for its descendants.
-    """
+def test_from_phase_dry_run_refuses_missing_inherited_winner(tmp_path):
+    """A preview cannot replace a required missing winner with inherited placeholders."""
     exp = make_experiment(
         workdir=tmp_path / "runs",
         phases=[
@@ -373,15 +370,9 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
             ),
         ],
     )
-    # No winner files on disk; dry-run from phase 'lr' must synthesize a placeholder
-    # for arch that still carries its fixed_overrides.
-    winners = run_experiment(exp, from_phase="lr", dry_run=True)
-    assert winners["arch"].effective_overrides.get("model_family") == "llama"
-    assert "n_layers" in winners["arch"].effective_overrides
-    lr_eff = winners["lr"].effective_overrides
-    assert lr_eff["model_family"] == "llama"
-    assert "n_layers" in lr_eff
-    assert "lr" in lr_eff
+    with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'arch'"):
+        run_experiment(exp, from_phase="lr", dry_run=True)
+    assert not (tmp_path / "runs").exists()
 
 
 @pytest.mark.parametrize(

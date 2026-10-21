@@ -21,7 +21,7 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
 from phasesweep.engine.optuna import (
@@ -181,7 +181,7 @@ def _refuse_as_a_launch_would(
     Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
     schema, and fixed-target checks using predicted recovery counts; defer target
     and descendant checks requiring actual recovery. Preview does not verify trainer
-    environment, fingerprints, evidence, or per-study artifact-root claims.
+    environment, evidence, or per-study artifact-root claims.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -281,17 +281,32 @@ def _preview_phase(
     remaining = max(0, phase.n_trials - finished)
     study: optuna.Study | None = None
     resume: _PhaseResume | None = None
+    phase_fingerprint = _phase_fingerprint(experiment, phase, inherited_winners)
+    if (
+        recorded is not None
+        and recorded.study is not None
+        and recorded.study.get_trials(deepcopy=False)
+    ):
+        if not any(winner.placeholder_keys for winner in inherited_winners.values()):
+            phase_fingerprint = _verify_fingerprint(
+                recorded.study, experiment, phase, inherited_winners
+            )
+        else:
+            log.warning(
+                "DRY RUN warning: phase=%s fingerprint comparison awaits the inherited "
+                "winner whose values are placeholders",
+                phase.name,
+            )
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
-        # Snapshots never recover or stamp state; placeholder ancestry also
-        # prevents fingerprint comparison or evidence verification here.
+        # Empty snapshots need no fingerprint stamp or comparison.
         resumed = _judge_recorded_phase(
             experiment,
             phase,
             inherited_winners,
             study,
             policy_state=_load_phase_policy_state(study),
-            phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+            phase_fingerprint=phase_fingerprint,
             verify_evidence=False,
         )
         if isinstance(resumed, Winner):

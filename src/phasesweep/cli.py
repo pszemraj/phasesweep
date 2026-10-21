@@ -361,8 +361,8 @@ def report_objective_cmd(
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run every phase in a phasesweep experiment config. Use --from-phase to skip earlier "
-        "phases after their winner.yaml files already exist."
+        "Run configured phases. Use --from-phase to skip earlier phases; only the winners "
+        "inherited by the remaining phases are required."
     ),
     short_help="Run configured phases.",
 )
@@ -372,7 +372,7 @@ def report_objective_cmd(
     metavar="PHASE",
     default=None,
     show_default="first phase",
-    help="Skip earlier phases and load their winners from disk.",
+    help="Skip earlier phases and load winners required by the remaining phases.",
 )
 @click.option(
     "--dry-run",
@@ -395,7 +395,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 
     :param Path config_path: Path to the experiment YAML file.
     :param str | None from_phase: Optional phase name to start from after loading
-        earlier winners from disk.
+        required earlier winners from disk.
     :param bool dry_run: Preview the trials each phase would launch, refuse most of what a
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.

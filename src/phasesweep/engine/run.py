@@ -30,7 +30,7 @@ from phasesweep.config.models import (
 )
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
-from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
     RecordedPhase,
@@ -180,7 +180,8 @@ def run_experiment(
     Live runs hold the experiment lock across all phases and install shutdown
     handlers. Dry runs inspect recorded state and render commands without writes
     or subprocesses. Dry-run checks omit recovery-dependent checks, trainer
-    environments, stored fingerprints, and trial evidence.
+    environments and trial evidence. Fingerprints with placeholder ancestry
+    remain unknown until the parent publishes a winner.
 
     :param experiment: Parsed experiment config.
     :param from_phase: Resume phase; validate and load earlier published winners.
@@ -578,14 +579,9 @@ def _run_experiment_inner(
                 else:
                     log.info("DRY RUN %s", line)
         recorded = _preview_ledger(experiment, from_phase=from_phase)
-
-    # Only a dry run resumes without preloaded winners; it resolves the
-    # publication once for every phase it skips.
-    dry_run_publication = (
-        resume_ops._published_for_resume(experiment)
-        if skip_until and preloaded_winners is None and experiment.phases[0].name != from_phase
-        else None
-    )
+        preloaded_winners = resume_ops._preflight_skipped_winners(
+            experiment, from_phase=from_phase, run_deadline=None
+        )
     for phase in experiment.phases:
         using_preloaded_winner = (
             skip_until and phase.name != from_phase and preloaded_winners is not None
@@ -609,30 +605,17 @@ def _run_experiment_inner(
         inherited = {p: winners[p] for p in phase.inherits}
 
         if skip_until and phase.name != from_phase:
-            if preloaded_winners is not None:
-                winners[phase.name] = preloaded_winners[phase.name]
-                if not dry_run:
-                    assert generation_id is not None
-                    artifact_io._save_winner(
-                        experiment,
-                        phase.name,
-                        winners[phase.name],
-                        generation_id=generation_id,
-                    )
-                log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
-            else:
-                # Only a dry run gets here: a real run preloads every skipped winner.
-                try:
-                    winners[phase.name] = artifact_io._load_winner(
-                        experiment,
-                        phase,
-                        inherited,
-                        publication=dry_run_publication,
-                    )
-                    log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
-                except FileNotFoundError:
-                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
-                    log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
+            assert preloaded_winners is not None
+            winners[phase.name] = preloaded_winners[phase.name]
+            if not dry_run:
+                assert generation_id is not None
+                artifact_io._save_winner(
+                    experiment,
+                    phase.name,
+                    winners[phase.name],
+                    generation_id=generation_id,
+                )
+            log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             continue
         skip_until = False
 
