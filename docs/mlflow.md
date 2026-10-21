@@ -136,7 +136,7 @@ gates:
     tags: [dataset_revision]
 ```
 
-At least one namespace must be nonempty. Missing evidence fails the trial; values from another run or a PhaseSweep result metric cannot substitute for it. Accepted evidence freezes the selected value, step, timestamp, verified native run identity, and required metadata. Local reads and no-work replay require neither an MLflow import nor server access. See [confound verdicts](runtime.md#confound-verdicts) for evaluation-position checks.
+At least one namespace must be nonempty. Missing evidence fails the trial; values from another run or a PhaseSweep result metric cannot substitute for it. Accepted evidence freezes the selected value, step, timestamp, verified native run identity, and required metadata. Local reads and no-work replay require neither an MLflow import nor server access. A no-work replay publishes a new local scientific generation without creating tracking generation directories or uploading to MLflow. See [confound verdicts](runtime.md#confound-verdicts) for evaluation-position checks.
 
 ## Result delivery and recovery
 
