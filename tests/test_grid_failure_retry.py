@@ -264,8 +264,8 @@ def test_fully_measured_infeasible_grid_points_to_a_fresh_namespace(tmp_path: Pa
     original = _grid(tmp_path, trainer, 2, metric=bounded)
     # The test config names an explicit journal, which a new workdir alone does not redirect.
     advice = (
-        f"{_NOTHING_TO_RETRY} Fix the cause and rerun into a fresh namespace, for example "
-        f"`phasesweep run CONFIG --workdir NEW_DIR --set storage=auto`; {_REOPEN}"
+        f"{_NOTHING_TO_RETRY} Fix the cause and set `workdir` to a new directory and `storage` "
+        f"to `auto` in the config, then rerun into a fresh namespace; {_REOPEN}"
     )
     with pytest.raises(NoFeasibleTrialError, match="aborted after 2") as aborted:
         run_experiment(original)
@@ -317,8 +317,8 @@ def test_infeasible_streak_with_untried_cells_points_to_a_fresh_namespace(
     )
     original = _untried_cells_config(tmp_path, trainer, limit=2, workdir=tmp_path / "runs")
     advice = (
-        f"{_NOTHING_TO_RETRY} Raise phases[p].max_consecutive_failures above 2 and rerun into a "
-        f"fresh namespace, for example `phasesweep run CONFIG --workdir NEW_DIR`; {_REOPEN}"
+        f"{_NOTHING_TO_RETRY} Raise phases[p].max_consecutive_failures above 2 and set `workdir` "
+        f"to a new directory in the config, then rerun into a fresh namespace; {_REOPEN}"
     )
 
     assert invoke_cli_boundary(["run", str(original)], monkeypatch) != 0
@@ -336,9 +336,14 @@ def test_infeasible_streak_with_untried_cells_points_to_a_fresh_namespace(
     assert invoke_cli_boundary(["run", str(raised)], monkeypatch) != 0
     assert "previously aborted" in capsys.readouterr().err
 
+    # A new workdir in the config is the fresh namespace, and the read commands follow it.
     fresh = tmp_path / "fresh"
-    assert invoke_cli_boundary(["run", str(raised), "--workdir", str(fresh)], monkeypatch) == 0
+    moved = _untried_cells_config(tmp_path, trainer, limit=3, workdir=fresh)
+    assert invoke_cli_boundary(["run", str(moved)], monkeypatch) == 0
     assert list(fresh.rglob("winner.yaml"))
+    capsys.readouterr()
+    assert invoke_cli_boundary(["show-winners", str(moved)], monkeypatch) == 0
+    assert "=== p ===" in capsys.readouterr().out
 
 
 def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> None:

@@ -700,15 +700,17 @@ def _recovery_advice(
         return target.text
     streak = _tripped_streak(abort)
     if streak is not None and _finished_trial_count(trials) < phase.n_trials:
-        lead = f"Raise phases[{phase.name}].max_consecutive_failures above {streak} and rerun"
+        lead = f"Raise phases[{phase.name}].max_consecutive_failures above {streak}"
     else:
-        lead = "Fix the cause and rerun"
-    command = "phasesweep run CONFIG --workdir NEW_DIR" + (
-        "" if storage == "auto" else " --set storage=auto"
+        lead = "Fix the cause"
+    # Only `run` accepts --workdir and --set, so the new namespace belongs in the config,
+    # where `status` and `show-winners` read it too; an explicit journal needs its own change.
+    namespace = "`workdir` to a new directory" + (
+        "" if storage == "auto" else " and `storage` to `auto`"
     )
     return (
-        f"{target.text} {lead} into a fresh namespace, for example `{command}`; "
-        "this study's recorded abort cannot be reopened."
+        f"{target.text} {lead} and set {namespace} in the config, then rerun into a fresh "
+        "namespace; this study's recorded abort cannot be reopened."
     )
 
 
