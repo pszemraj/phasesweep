@@ -112,7 +112,17 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     try:
         data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{source}: {exc}") from exc
+        if isinstance(exc, yaml.MarkedYAMLError):
+            for mark in (exc.context_mark, exc.problem_mark):
+                if mark is not None:
+                    mark.name = str(source)
+        hint = (
+            " Quote text values containing ': ' with single or double quotes."
+            if isinstance(exc, yaml.MarkedYAMLError)
+            and exc.problem == "mapping values are not allowed here"
+            else ""
+        )
+        raise ConfigError(f"{source}: {exc}{hint}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: top level must be a mapping.")
     return data
@@ -128,12 +138,22 @@ def describe_validation_error(exc: ValidationError) -> str:
     :return str: ``str(exc)`` plus up to three hint lines.
     """
     paths: list[str] = []
+    advice: list[str] = []
     for error in exc.errors(include_input=False):
+        if (
+            error["type"] == "extra_forbidden"
+            and error["loc"][-1:] == ("allow_seed_search",)
+            and not advice
+        ):
+            advice.append(
+                "allow_seed_search was removed. For a seed audit use search_space: {} and "
+                "repeats: {key: seed, values: [1, 2, 3]}."
+            )
         path = loc_to_path(error["loc"])
         if path is not None and path not in paths:
             paths.append(path)
     hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
-    return "\n".join([str(exc), *hints])
+    return "\n".join([str(exc), *advice, *hints])
 
 
 def load_experiment_bytes(
