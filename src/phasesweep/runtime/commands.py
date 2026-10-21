@@ -211,11 +211,11 @@ def compose_trainer_config(
     :raises ValueError: An override path must descend through a non-mapping value.
     :return dict[str, JsonValue]: Deep-copied complete configuration for one trial.
     """
-    base: dict[str, JsonValue] = (
-        _substitute_trainer_config_placeholders(trainer_config, substitutions)
-        if substitutions
-        else trainer_config
-    )
+    base = trainer_config
+    if substitutions:
+        expanded = _substitute_trainer_config_placeholders(trainer_config, substitutions)
+        assert isinstance(expanded, dict)  # a mapping expands to a mapping
+        base = expanded
     composed = deepcopy(base)
     for key, value in overrides.items():
         current = composed
@@ -238,16 +238,18 @@ def compose_trainer_config(
     return composed
 
 
-def _substitute_trainer_config_placeholders(value: Any, substitutions: dict[str, str]) -> Any:
+def _substitute_trainer_config_placeholders(
+    value: JsonValue, substitutions: dict[str, str]
+) -> JsonValue:
     """Expand PhaseSweep runtime placeholders inside trainer-config strings.
 
     Each source string is scanned once so placeholder-like text inside a real
     replacement value (for example, a workdir containing ``{phase}``) remains
     literal instead of being substituted again.
 
-    :param Any value: Configuration subtree to copy and expand.
+    :param JsonValue value: Configuration subtree to copy and expand.
     :param dict[str, str] substitutions: Literal placeholder-to-value mapping.
-    :return Any: Expanded copy of ``value``.
+    :return JsonValue: Expanded copy of ``value``, a mapping again when ``value`` is one.
     """
     if isinstance(value, str):
         pattern = "|".join(re.escape(placeholder) for placeholder in substitutions)
