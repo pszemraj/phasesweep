@@ -276,7 +276,7 @@ def _validate_generation_manifest(
             raise _fail("summary artifact entry is malformed")
         name = str(entry["phase"])
         if name in listed:
-            raise _fail(f"duplicate artifact entry for {('winner', name)}")
+            raise _fail(f"duplicate artifact entry for winner {name!r}")
         listed[name] = entry
     snapshot_phases = _validate_generation_provenance_files(
         generation_dir,

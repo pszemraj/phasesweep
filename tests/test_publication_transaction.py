@@ -924,6 +924,22 @@ def test_manifest_rejects_a_malformed_phase_plan(tmp_path: Path, phase_plan: obj
     assert read_status(experiment)["publication_integrity"] == "failed"
 
 
+def test_manifest_rejects_a_duplicate_winner_entry_naming_its_phase(tmp_path: Path) -> None:
+    """A phase listed twice in the artifact manifest fails the publication and names the phase."""
+    experiment, generation_id = golden_publication(tmp_path)
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    winner_entry = next(item for item in summary["artifacts"] if item.get("kind") == "winner")
+    summary["artifacts"].append(dict(winner_entry))
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert f"duplicate artifact entry for winner {winner_entry['phase']!r}" in pointer.error
+
+
 def test_published_reads_consume_the_bytes_validation_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
