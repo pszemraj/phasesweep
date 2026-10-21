@@ -203,7 +203,7 @@ The first successful upload converts the pending publisher into the project's tr
 
 ## Package map
 
-- `phasesweep.config`: Pydantic Experiment models and strict YAML loading.
+- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and the `run --set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.

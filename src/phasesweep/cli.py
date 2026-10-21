@@ -31,6 +31,7 @@ from phasesweep.config.reference import (
     sub_key_count,
     top_level_entries,
 )
+from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
@@ -59,7 +60,6 @@ from phasesweep.runtime.json import (
     JsonObject,
     JsonValue,
     json_object,
-    json_value,
     strict_json_loads,
 )
 from phasesweep.runtime.shutdown import (
@@ -419,7 +419,14 @@ def report_objective_cmd(
     "settings",
     multiple=True,
     metavar="KEY=VALUE",
-    help="Override a config value; repeat as needed. Use dotted paths and zero-based list indices.",
+    help=(
+        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
+        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
+        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
+        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
+        "Inside [...], write \\] and \\\\ for a literal ] and \\. Missing mapping keys are "
+        "created; a validation error at one names the --set that created it."
+    ),
 )
 @click.option(
     "-v",
@@ -445,7 +452,7 @@ def run(
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
     :param Path | None workdir: Invocation-relative output directory override.
-    :param tuple[str, ...] settings: Typed YAML assignments to dotted config paths.
+    :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
@@ -480,7 +487,8 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
 
     :param Path path: Original config file, which remains unchanged.
     :param Path | None workdir: Output directory relative to this invocation.
-    :param tuple[str, ...] settings: Dotted assignments with YAML values.
+    :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values; the key
+        syntax is :data:`phasesweep.config.run_overrides.SET_SYNTAX`.
     :raises click.BadParameter: An assignment cannot address a config value.
     :raises ConfigError: The derived config fails normal model validation.
     :return Experiment: Fully validated config with original path anchoring.
@@ -495,29 +503,14 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
         raise
     except (UnicodeError, ValueError) as exc:
         raise ConfigError(f"{path}: {exc}") from exc
+    created: list[CreatedKey] = []
     for setting in settings:
-        key, separator, raw = setting.partition("=")
-        parts = key.split(".")
-        if not separator or not all(parts):
-            raise click.BadParameter("expected KEY=VALUE", param_hint="--set")
         try:
-            value = json_value(yaml.safe_load(raw))
-            target: JsonValue = payload
-            for part in parts[:-1]:
-                if isinstance(target, dict):
-                    target = target.setdefault(part, {})
-                elif isinstance(target, list):
-                    target = target[int(part)]
-                else:
-                    raise ValueError("path passes through a scalar value")
-            if isinstance(target, dict):
-                target[parts[-1]] = value
-            elif isinstance(target, list):
-                target[int(parts[-1])] = value
-            else:
-                raise ValueError("path ends at a scalar value")
-        except (ValueError, IndexError, yaml.YAMLError) as exc:
-            raise click.BadParameter(f"cannot set {key!r}: {exc}", param_hint="--set") from exc
+            new_key = apply_set(payload, setting)
+        except SetPathError as exc:
+            raise click.BadParameter(str(exc), param_hint="--set") from exc
+        if new_key is not None:
+            created.append(new_key)
     if workdir is not None:
         payload["workdir"] = str(workdir.expanduser().resolve())
     try:
@@ -525,7 +518,8 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
             payload, context={CONFIG_DIR_CONTEXT: path.resolve().parent}
         )
     except ValidationError as exc:
-        raise ConfigError(f"{path} (run overrides): {describe_validation_error(exc)}") from exc
+        detail = "\n".join([describe_validation_error(exc), *created_key_notes(exc, created)])
+        raise ConfigError(f"{path} (run overrides): {detail}") from exc
 
 
 @cli.command(

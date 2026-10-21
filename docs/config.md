@@ -143,7 +143,20 @@ phasesweep run smoke-source.yaml --dry-run --workdir /tmp/phasesweep-smoke \
   --set experiment=smoke --set phases.0.n_trials=1
 ```
 
-`run --set KEY=VALUE` is repeatable. Keys use dotted paths with zero-based list indices (`phases.0.n_trials`); values use YAML types, including booleans, lists, mappings and `null`. Later assignments to the same key win. To set a mapping whose own keys contain dots, replace that whole mapping, for example `--set 'phases.0.fixed_overrides={optimizer.lr: 0.001}'`. A whole `phases` list can also be replaced; normal inheritance and sampler rules still apply. The final derived config is validated before execution and recorded in the run's config snapshot. The source YAML stays unchanged.
+`run --set KEY=VALUE` is repeatable. Values use YAML types, including booleans, lists, mappings and `null`. Later assignments to the same key win. A whole `phases` list can also be replaced; normal inheritance and sampler rules still apply. The final derived config is validated before execution and recorded in the run's config snapshot. The source YAML stays unchanged.
+
+A `KEY` is a path of steps:
+
+| Step | Meaning | Example |
+| --- | --- | --- |
+| `name`, joined by `.` | A mapping key without dots, brackets or `=` | `env.NOTE`, `execution.cwd` |
+| `.N` or `[N]` | The list element at zero-based position `N` | `phases.0.n_trials`, `phases[0].n_trials` |
+| `[NAME]` | The list element whose `name` is `NAME`, such as a phase | `phases[learning_rate].n_trials` |
+| `[KEY]` | The mapping key `KEY` taken verbatim, so it may contain dots, brackets or `=` | `phases[learning_rate].search_space[model.n_layers].choices` |
+
+Inside `[...]`, write `\]` for a literal `]` and `\\` for a literal `\`. On a list, digits inside brackets are a position, so a phase whose name is all digits is addressed by position. A malformed bracket, an unknown name, an index past the end, a non-numeric dotted step on a list (`phases.lr`) and a step into a scalar are refused when `--set` is read. The error quotes the argument, names the failing step and repeats this syntax. Quote the argument in the shell, because `[` and `]` are glob characters.
+
+A mapping key that the config does not have is created, so an absent optional block can be filled in and `trainer_config` takes any new key. If validation then fails at or below a key an assignment created, which is what a misspelled schema key produces, the error adds a note naming that `--set` argument and the key it created.
 
 `--workdir PATH` resolves against the invoking shell's directory. Paths inside `--set` retain the YAML file's directory as their base. Changing `workdir` alone does not redirect an explicit journal in `storage`; use `--set storage=auto` or a fresh journal path for a derived run. Semantic edits cannot reuse a populated study; choose a fresh experiment/output namespace. Apply `--dry-run` to the same overrides before launching.
 
