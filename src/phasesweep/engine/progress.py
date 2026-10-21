@@ -11,7 +11,7 @@ from collections.abc import Hashable, Sequence
 import optuna
 
 from phasesweep.config.models import Phase
-from phasesweep.engine.optuna import _trial_state_label
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
 
@@ -91,7 +91,7 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
         "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s%s (%d/%d finished)%s",
         phase.name,
         trial.number,
-        _trial_state_label(trial),
+        _trial_count_state(trial),
         "unknown" if parsed is None else parsed.outcome,
         value,
         duration,

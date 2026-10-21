@@ -751,8 +751,8 @@ def _cli_phase_payloads(
         )
         cli_phases.append(
             {
-                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
                 "name": phase["phase"],
+                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
                 "winner": None if winner_path is None else str(winner_path),
             }
         )

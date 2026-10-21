@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep import experiment_status
-from phasesweep.config.models import Experiment
+from phasesweep import experiment_status, run_experiment
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.read import read_status
-from tests.conftest import make_experiment
+from phasesweep.engine.read import read_status, read_trial_tables
+from phasesweep.evidence.models import LogRegexExtractor
+from tests.conftest import make_experiment, write_trainer
 from tests.ledger_fixtures import materialize, published_generation_id
 
 EXPERIMENT_STATUS_KEYS = [
@@ -137,6 +139,52 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
     assert read_phase["trial_data_available"] is True
     assert read_phase["running_attempts"] == []
     assert set(cli_phase) == PHASE_STATUS_KEYS
+
+
+def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> None:
+    """A trial that completed out of bounds reads INFEASIBLE in the counts, as in ``status --trials``.
+
+    ``completed`` is the COMPLETE count: trials that finished within every bound and
+    constraint. Infeasible and failed trials are terminal and count toward ``n_trials``.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+
+        x = next(int(arg.removeprefix("--x=")) for arg in sys.argv if arg.startswith("--x="))
+        if x == 2:
+            sys.exit(1)
+        print(f"x={5.0 if x == 3 else 0.5}")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=3,
+        max_consecutive_failures=3,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=3)},
+    )
+    metric = Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        max=1.0,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[phase], metric=metric
+    )
+    run_experiment(experiment)
+
+    (phase_status,) = experiment_status(experiment)["phases"]
+    (read_phase,) = read_status(experiment)["phases"]
+
+    expected = {"COMPLETE": 1, "INFEASIBLE": 1, "FAIL": 1}
+    assert phase_status["trials"] == expected
+    assert phase_status["generation_trials"] == expected
+    assert phase_status["completed"] == 1
+    assert read_phase["trials"] == expected
+    assert next(iter(phase_status)) == "name"
+    (table,) = read_trial_tables(experiment).phases
+    assert sorted(str(row["state"]) for row in table.rows) == sorted(expected)
 
 
 def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(

@@ -40,6 +40,7 @@ from phasesweep.evidence.models import (
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    tell_feasible,
     trial_outcome,
     write_constant_trainer,
     write_trainer,
@@ -103,7 +104,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
-    study.optimize(lambda trial: 1.0, n_trials=1)
+    tell_feasible(study, study.ask(), 1.0)
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
@@ -315,7 +316,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
-    study.tell(trial, 0.5)
+    tell_feasible(study, trial)
     complete = ledger.read_bytes()
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
     # The handle's format scan also captures the journal. Take it on the whole
@@ -392,7 +393,7 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     ]
     mark_current_format(experiment, *studies)
     for study in studies:
-        study.tell(study.ask(), 0.5)
+        tell_feasible(study, study.ask())
     real_capture = engine_ledger._capture_journal
     captures: list[Path] = []
 
@@ -431,7 +432,7 @@ def test_read_status_captures_trial_data_after_resolving_the_publication_pointer
 
     def finish_then_resolve(target: Experiment):
         # A publication tells its winning trial before it moves the pointer.
-        study.tell(trial, 0.5)
+        tell_feasible(study, trial)
         return real_resolve(target)
 
     monkeypatch.setattr(engine_read, "_resolve_publication_pointer", finish_then_resolve)
@@ -606,7 +607,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
-        study.tell(trial, 0.5)
+        tell_feasible(study, trial)
     mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,

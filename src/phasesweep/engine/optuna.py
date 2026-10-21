@@ -86,18 +86,24 @@ class _PhaseTrialStats:
 
 
 def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
-    """Return the state a trial is counted under: ``INTERRUPTED``, or its Optuna state.
+    """Return the state a trial is counted and reported under.
 
-    The one classifier behind every state-keyed count, so an interrupted trial
-    (:func:`~phasesweep.engine.state._trial_interrupted`) is never counted as
-    finished anywhere.
+    The one classifier behind every state-keyed count, run log line and trial table, so
+    an interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) is never
+    counted as finished anywhere, and a trial that completed out of bounds reads
+    ``INFEASIBLE`` wherever it is shown. A run records the feasibility attr before a
+    trial completes, so a COMPLETE trial without a truthy one never ranks either.
 
     :param optuna.trial.FrozenTrial trial: Trial to classify.
-    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, otherwise
-        the Optuna state name.
+    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, ``INFEASIBLE`` for a
+        COMPLETE trial without a truthy feasibility attr, otherwise the Optuna state name.
     """
     if _trial_interrupted(trial):
         return "INTERRUPTED"
+    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
+        FEASIBLE_ATTR, False
+    ):
+        return "INFEASIBLE"
     name = trial.state.name
     for state in TRIAL_STATE_NAMES:
         if state == name:
@@ -124,25 +130,6 @@ def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
-
-
-def _trial_state_label(trial: optuna.trial.FrozenTrial) -> str:
-    """Return the state a trial is reported under: its counted state, or ``INFEASIBLE``.
-
-    A COMPLETE trial that violated a constraint or the metric's bounds is never
-    eligible for selection, so run logs and trial tables name it apart from the
-    trials that ranked, and an interrupted trial reads ``INTERRUPTED``, as it
-    is counted.
-
-    :param optuna.trial.FrozenTrial trial: Trial whose state is labeled.
-    :return str: :func:`_trial_count_state`, except ``INFEASIBLE`` for a COMPLETE
-        trial without a truthy feasibility attr.
-    """
-    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
-        FEASIBLE_ATTR, False
-    ):
-        return "INFEASIBLE"
-    return _trial_count_state(trial)
 
 
 def _published_phase_trial_refs(
@@ -219,7 +206,8 @@ def _published_trial_history_available(
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
     finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES)
-    completed = stats.counts.get("COMPLETE", 0)
+    # A publication records Optuna's COMPLETE count, which includes the INFEASIBLE trials.
+    completed = stats.counts.get("COMPLETE", 0) + stats.counts.get("INFEASIBLE", 0)
     return _meets_published_trial_history_boundary(finished, completed, published_trial)
 
 

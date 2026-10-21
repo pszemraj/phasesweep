@@ -23,7 +23,6 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
-    _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.read import read_trial_tables
@@ -242,7 +241,6 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
     trials = study.get_trials(deepcopy=False)
 
     assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
-    assert [_trial_state_label(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
     assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
@@ -370,12 +368,12 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
     assert launched.exists()
     if serviced:
-        assert _trial_state_label(trial) == "INTERRUPTED"
+        assert _trial_count_state(trial) == "INTERRUPTED"
         assert _cause(trial) == _SIGINT_CAUSE
         assert _load_phase_policy_state(study).consecutive_failures == 0
         assert _record_reruns(study) == [(0, 1)]
     else:
-        assert _trial_state_label(trial) == "FAIL"
+        assert _trial_count_state(trial) == "FAIL"
         assert _load_phase_policy_state(study).consecutive_failures == 1
         assert _record_reruns(study) == []
 
@@ -408,7 +406,7 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
 
     (trial,) = _phase_trials(exp)
     assert not launched.exists()
-    assert _trial_state_label(trial) == "INTERRUPTED"
+    assert _trial_count_state(trial) == "INTERRUPTED"
     assert _cause(trial) == _SIGINT_CAUSE
 
 
@@ -469,7 +467,7 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     sender.join(timeout=5.0)
 
     trials = _phase_trials(exp)
-    assert [_trial_state_label(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
+    assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
     assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)
 

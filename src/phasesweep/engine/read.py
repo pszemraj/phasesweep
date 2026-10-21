@@ -36,7 +36,7 @@ from phasesweep.engine.optuna import (
     _PhaseTrialStats,
     _published_phase_trial_refs,
     _published_trial_history_available,
-    _trial_state_label,
+    _trial_count_state,
     _TrialRef,
 )
 from phasesweep.engine.paths import (
@@ -164,6 +164,7 @@ def _phase_status_payloads(
             "trials": counts,
             "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
+            # The COMPLETE count: infeasible trials are counted apart, under INFEASIBLE.
             "completed": counts.get("COMPLETE", 0),
             "generation_trials": (
                 stats.generation_counts.get(trial_scope_generation_id, {})
@@ -725,7 +726,7 @@ def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
 #: Columns every trial table starts with, as ``(header, getter)`` pairs.
 _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
     ("trial", lambda trial: trial.number),
-    ("state", _trial_state_label),
+    ("state", _trial_count_state),
     ("value", lambda trial: trial.value),
     ("params", lambda trial: dict(trial.params)),
     ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),

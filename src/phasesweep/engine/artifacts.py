@@ -17,7 +17,7 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
-from phasesweep.engine.optuna import _trial_state_label
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
@@ -132,7 +132,7 @@ def _write_trials_csv(
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": _trial_state_label(t),
+                "state": _trial_count_state(t),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,

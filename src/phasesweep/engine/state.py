@@ -21,25 +21,27 @@ WinnerSourceKind = Literal["phase_trial"]
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
 
-TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "FAIL", "INTERRUPTED"]
-"""Name of a trial state as status payloads report it, including ``INTERRUPTED``."""
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "INFEASIBLE", "FAIL", "INTERRUPTED"]
+"""Name of a trial state as status, trial tables and logs report it."""
 
 TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
     "WAITING",
     "RUNNING",
     "COMPLETE",
+    "INFEASIBLE",
     "FAIL",
     "INTERRUPTED",
 )
 """Every counted trial state, in the key order status payloads use.
 
-``INTERRUPTED`` is an Optuna ``FAIL`` trial whose recorded outcome is
-``interrupted``; it is counted apart from ``FAIL`` and reruns. Optuna's
-``PRUNED`` is absent because the study's ``NopPruner`` never prunes and no
+``INFEASIBLE`` is an Optuna ``COMPLETE`` trial that violated a constraint or the
+metric's bounds, so it can never win. ``INTERRUPTED`` is an Optuna ``FAIL`` trial whose
+recorded outcome is ``interrupted``; it is counted apart from ``FAIL`` and reruns.
+Optuna's ``PRUNED`` is absent because the study's ``NopPruner`` never prunes and no
 trainer raises ``TrialPruned``.
 """
 
-TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "FAIL")
+TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "INFEASIBLE", "FAIL")
 """The states that count toward ``n_trials``; an interrupted trial is in none of them."""
 
 RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]

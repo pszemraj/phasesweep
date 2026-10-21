@@ -52,7 +52,12 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.read import read_status
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    FEASIBLE_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+)
 from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import (
@@ -488,7 +493,11 @@ def _bound_tree_with_foreign_study(tmp_path: Path, *, foreign: bool = True) -> E
     storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     study = optuna.create_study(study_name="t::p", storage=_resolve_storage(storage))
-    study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=0.5, state=optuna.trial.TrialState.COMPLETE, user_attrs={FEASIBLE_ATTR: True}
+        )
+    )
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
     mark_current_format(experiment, study)
     if foreign:

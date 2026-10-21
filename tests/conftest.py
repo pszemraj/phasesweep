@@ -37,6 +37,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    FEASIBLE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -229,6 +230,20 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     if _check_artifact_root_binding(experiment) == "unbound":
         _write_artifact_root_binding(experiment)
+
+
+def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) -> None:
+    """Complete a hand-built trial as a run completes one inside every bound.
+
+    A run records the feasibility attr before a trial completes, and a COMPLETE trial
+    without it reads ``INFEASIBLE`` in counts and tables.
+
+    :param optuna.Study study: Study that owns ``trial``.
+    :param optuna.Trial trial: Asked trial to complete.
+    :param float value: Objective value to tell.
+    """
+    trial.set_user_attr(FEASIBLE_ATTR, True)
+    study.tell(trial, value)
 
 
 def _bounded_metric(**bounds: float) -> Metric:

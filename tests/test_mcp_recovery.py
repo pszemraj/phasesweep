@@ -1448,6 +1448,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "WAITING": 0,
             "RUNNING": 0,
             "COMPLETE": 0,
+            "INFEASIBLE": 0,
             "FAIL": 0,
             "INTERRUPTED": 1,
         }

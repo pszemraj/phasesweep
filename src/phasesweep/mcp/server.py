@@ -321,7 +321,7 @@ class PhaseValidationPayload(_ToolPayload):
     n_trials: int = Field(
         ge=1,
         description=(
-            "Target number of terminal attempts; COMPLETE and FAIL trials both count. "
+            "Target number of terminal attempts; COMPLETE, INFEASIBLE and FAIL trials all count. "
             "INTERRUPTED trials never count: each reruns with its parameters before any new draw."
         ),
     )
@@ -391,7 +391,8 @@ class PhaseStatusPayload(_ToolPayload):
     trials: dict[TrialStateName, int] | None = Field(
         description=(
             "Dense cumulative study counts, or null when unavailable. Every state key is "
-            "present when counts are known. INTERRUPTED "
+            "present when counts are known. INFEASIBLE counts trials that completed outside "
+            "the metric bounds or constraints; they are terminal and can never win. INTERRUPTED "
             "counts trials a deadline, shutdown or orchestrator death cut short; they are "
             "not terminal, and WAITING counts their scheduled reruns."
         )
@@ -401,10 +402,15 @@ class PhaseStatusPayload(_ToolPayload):
     )
     target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
     completed_trials_total: int | None = Field(
-        ge=0, description="Cumulative COMPLETE study rows; null when unavailable."
+        ge=0,
+        description=(
+            "Cumulative COMPLETE study rows, those within every bound and constraint; "
+            "null when unavailable."
+        ),
     )
     terminal_trials_total: int | None = Field(
-        ge=0, description="Cumulative COMPLETE + FAIL study rows; null when unavailable."
+        ge=0,
+        description=("Cumulative COMPLETE + INFEASIBLE + FAIL study rows; null when unavailable."),
     )
     terminal_trials_before_run: int | None = Field(
         ge=0,
