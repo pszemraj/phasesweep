@@ -148,8 +148,9 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
     """Probe ``nvidia-smi`` once for visible indices and usable device UUIDs.
 
     :return tuple[list[int], dict[str, str]]: Numeric indices plus the subset mapped to a
-        ``GPU-...`` or ``MIG-...`` identity, keyed by index. Both are empty when the probe is
-        unavailable.
+        ``GPU-...`` or ``MIG-...`` identity, keyed by index. Both are empty when there is no
+        usable ``nvidia-smi``: the binary is missing or not runnable, it exits nonzero, or it
+        times out. Callers turn an empty inventory into their own refusal.
     """
     try:
         out = subprocess.run(
@@ -159,11 +160,9 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
             timeout=5,
             check=False,
         )
-        if out.returncode != 0:
-            return [], {}
-    except FileNotFoundError:
+    except (OSError, subprocess.SubprocessError):
         return [], {}
-    except Exception:
+    if out.returncode != 0:
         return [], {}
     ids: list[int] = []
     uuid_map: dict[str, str] = {}
