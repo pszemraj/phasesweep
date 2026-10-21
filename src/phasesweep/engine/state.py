@@ -144,12 +144,12 @@ class Winner:
     confound: dict[str, Any] | None = None
     # Report-only values the selected trial recorded, by observation name; for
     # a repeats phase, the mean over the members that recorded each name.
-    # Winner-only: they never enter summary.yaml, a fingerprint, or selection.
+    # They never enter a fingerprint or selection.
     observed: dict[str, float] = field(default_factory=dict)
     # The winning repeat group (:mod:`phasesweep.engine.repeats`): reducer,
     # spread and every member. The scalar fields above then describe the
     # group's highest-numbered member and ``metric`` is the reduced value.
-    # ``None`` for a phase without repeats. Winner-only, like ``observed``.
+    # ``None`` for a phase without repeats.
     repeats: RepeatsRecord | None = None
     # The keys of ``effective_overrides`` whose values are dry-run stand-ins:
     # a placeholder's own searched keys plus those it carries from placeholder

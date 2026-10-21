@@ -38,7 +38,7 @@ demo/
       result.json               # when produced by the trainer
 ```
 
-The root `summary.yaml` and per-phase `winner.yaml` files are convenience projections. `last_successful_generation.yaml` points to the immutable generation that authoritatively represents the latest successful result. A failed invocation does not replace that pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
+The root `summary.yaml` and per-phase `winner.yaml` files are convenience projections. Each summary phase entry retains its winner's `observed`, `repeats` and `confound` blocks, so the reduced metric can be read beside its spread, observations and comparison verdicts. `last_successful_generation.yaml` points to the immutable generation that authoritatively represents the latest successful result. A failed invocation does not replace that pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
 
 `trials.csv` lists every trial with its sampled parameters and user attributes, including the `observed:<name>` values that [`observe`](config.md#objective-evidence-constraints-and-gates) recorded. Its `state` column reads as in `status --trials`, `INTERRUPTED` and `INFEASIBLE` included, and a rerun's `user_attr:phasesweep_rerun_of` names the [interrupted trial](#interrupted-trials-rerun) it reran. A phase with [`repeats`](config.md#repeats) adds a `repeat_group` column. Each `winner.yaml` carries the selected trial's `observed` map, which is empty when the experiment declares none or the trial recorded none, and a `repeats` block that is `null` outside a repeats phase.
 

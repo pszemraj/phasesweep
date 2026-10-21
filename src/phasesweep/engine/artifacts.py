@@ -157,8 +157,8 @@ def _save_winner(
     """Persist a phase winner into its immutable generation namespace.
 
     Real winners carry a phase fingerprint for resume validation; dry-run placeholders
-    are never saved. Environment identity excludes ambient values. Confound verdicts,
-    observations, repeats, and evidence provenance remain winner-only fields.
+    are never saved. Environment identity excludes ambient values. Evidence
+    provenance remains a winner-only field.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -177,9 +177,6 @@ def _save_winner(
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
-        "confound": winner.confound,
-        "observed": winner.observed,
-        "repeats": winner.repeats,
     }
     _write_yaml_atomic(path, payload)
 
@@ -203,6 +200,9 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "attempt_id": winner.attempt_id,
         "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
+        "confound": winner.confound,
+        "observed": winner.observed,
+        "repeats": winner.repeats,
     }
     return payload
 
