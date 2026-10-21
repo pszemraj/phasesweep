@@ -416,7 +416,8 @@ def _raise_prior_phase_abort(
     """
     trial_target = abort_record["trial_target"]
     advice = _recovery_advice(phase, trials, storage=storage, abort=abort_record) or (
-        f"Increase n_trials above {trial_target} to explicitly schedule new recovery attempts."
+        f"Increase n_trials above {trial_target} in the config to explicitly schedule new "
+        "recovery attempts."
     )
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
@@ -445,8 +446,8 @@ def _raise_streak_at_limit(
     advice = _target_advice(phase, trials)
     if advice is None:
         remedy = (
-            f"Increase n_trials above {trial_target} to explicitly schedule new recovery "
-            "attempts, or raise max_consecutive_failures."
+            f"Increase n_trials above {trial_target} in the config to explicitly schedule new "
+            "recovery attempts, or raise max_consecutive_failures."
         )
     elif advice.schedules:
         remedy = f"{advice.text} Or raise max_consecutive_failures."
@@ -589,7 +590,7 @@ def _judge_recorded_phase(
                 f"{partial_decision.finished_trials}/{partial_decision.trial_target} "
                 "terminal trials. Refusing to replay it unless the current config sets "
                 "allow_incomplete_on_timeout: true; increase n_trials above "
-                f"{partial_decision.trial_target} to continue the phase instead.",
+                f"{partial_decision.trial_target} in the config to continue the phase instead.",
                 action=OperatorAction.FIX_CONFIG,
             )
         completion = _partial_completion_for_replay(
@@ -998,7 +999,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             f"Could not persist the allocated lifecycle marker for trial "
             f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
             "No trainer was started and no GPU lease was consumed. With persistent "
-            "storage, retry requires n_trials above its accepted target."
+            "storage, retry requires n_trials above its accepted target in the config."
         ) from exc
     # Register before leasing or launch; retain unsafe-cleanup entries until recovery.
     _register_active_attempt(

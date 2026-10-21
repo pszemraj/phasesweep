@@ -154,7 +154,7 @@ def _fixed_advice(from_target: int) -> str:
     """Return the advice a fixed configuration's abort and refusal carry."""
     return (
         f"Fix the cause, then raise phases[p].n_trials from {from_target} to {from_target + 1} "
-        "and rerun to retry its failed attempt once more; a completed attempt is not repeated."
+        "in the config and rerun to retry its failed attempt once more; a completed attempt is not repeated."
     )
 
 

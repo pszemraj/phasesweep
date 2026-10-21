@@ -352,7 +352,7 @@ def _register_active_attempt(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
             "consumed. Persistent storage records a phase abort; retry requires "
-            "n_trials above its accepted target."
+            "n_trials above its accepted target in the config."
         ) from exc
 
 

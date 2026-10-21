@@ -143,7 +143,7 @@ phasesweep run smoke-source.yaml --dry-run --workdir /tmp/phasesweep-smoke \
   --set experiment=smoke --set phases.0.n_trials=1
 ```
 
-`run --set KEY=VALUE` is repeatable. Values use YAML types, including booleans, lists, mappings and `null`. Later assignments to the same key win. A whole `phases` list can also be replaced; normal inheritance and sampler rules still apply. The final derived config is validated before execution and recorded in the run's config snapshot. The source YAML stays unchanged.
+`run --set KEY=VALUE` is repeatable. Values use YAML types, including booleans, lists, mappings and `null`. Later assignments to the same key win. A whole `phases` list can also be replaced; normal inheritance and sampler rules still apply. The final derived config is validated before execution and recorded in the run's config snapshot. The source YAML stays unchanged. A raised `n_trials` becomes the phase's accepted target on persistent storage, so a later run without that `--set` is refused as a lower target, and recovery changes belong in the YAML.
 
 A `KEY` is a path of steps:
 

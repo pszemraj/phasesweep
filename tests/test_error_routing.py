@@ -1591,7 +1591,7 @@ ORIGIN_CASES = (
         trigger=_rerun_aborted_phase,
         raised=NoFeasibleTrialError,
         action=OperatorAction.FIX_CONFIG,
-        message="Increase n_trials above 4 to explicitly schedule new recovery attempts",
+        message="Increase n_trials above 4 in the config to explicitly schedule new recovery attempts",
     ),
     RoutingCase(
         id="failure_streak_at_limit",

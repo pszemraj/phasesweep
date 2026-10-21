@@ -639,7 +639,7 @@ def _target_advice(
         return _TargetAdvice(f"{reason}, so raising n_trials would schedule nothing.", False)
     raise_to = (
         f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
-        f"to {ceiling} and rerun to"
+        f"to {ceiling} in the config and rerun to"
     )
     if fixed:
         return _TargetAdvice(

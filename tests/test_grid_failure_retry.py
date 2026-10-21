@@ -196,7 +196,7 @@ def _advice(from_target: int, to_target: int, action: str) -> str:
     """Return the recovery advice a grid's abort and its refusals carry."""
     return (
         f"Fix the cause, then raise phases[p].n_trials from {from_target} to {to_target} "
-        f"and rerun to {action}; completed cells are not repeated."
+        f"in the config and rerun to {action}; completed cells are not repeated."
     )
 
 
@@ -372,8 +372,8 @@ def test_sampling_phase_keeps_the_generic_recovery_advice(tmp_path: Path) -> Non
     with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
         run_experiment(experiment)
     assert str(refused.value).endswith(
-        "as a successful phase. Increase n_trials above 2 to explicitly schedule new "
-        "recovery attempts."
+        "as a successful phase. Increase n_trials above 2 in the config to explicitly "
+        "schedule new recovery attempts."
     )
 
 
