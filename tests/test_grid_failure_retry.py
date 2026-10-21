@@ -1,7 +1,8 @@
 """Raised persistent grid targets retry failed cells without repeating completed cells.
 
-Recovery messages name the target that retries every failed cell, and a winner chosen while
-some cell has no successful trial says so.
+Recovery messages name the target that retries every failed cell, a winner chosen while
+some cell has no successful trial says so, and the winner's survivorship check counts only the
+failures that no successful retry replaced.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import optuna
 import pytest
+import yaml
 
 import phasesweep.engine.phase as phase_ops
 from phasesweep import run_experiment
@@ -18,6 +20,8 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import NoFeasibleTrialError, _warn_unsuccessful_grid_cells
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
@@ -461,6 +465,60 @@ def test_grid_winner_with_a_successful_trial_in_every_cell_stays_quiet(
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(_grid(tmp_path, trainer, target))["p"].metric == 1.0
     assert _coverage_warnings(caplog) == []
+
+
+def _published_survivorship(experiment: Experiment) -> dict[str, object]:
+    """Read the survivorship check that phase ``p``'s published winner.yaml records."""
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.generation_id is not None
+    path = _generation_winner_path(experiment, pointer.generation_id, "p")
+    return yaml.safe_load(path.read_text())["confound"]["checks"]["survivorship"]
+
+
+@pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
+def test_survivorship_ignores_failures_that_a_successful_retry_replaced(
+    tmp_path: Path, repeats: bool
+) -> None:
+    """Every cell has a successful trial after the retries, so nothing was lost to survivorship."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_grid(tmp_path, trainer, 2, repeats=repeats))
+    recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
+    assert run_experiment(recovered)["p"].metric == 1.0
+    assert [trial.state.name for trial in _trials(recovered)] == ["FAIL"] * 2 + ["COMPLETE"] * 2
+
+    assert _published_survivorship(recovered) == {
+        "verdict": "ok",
+        "detail": {"ranked": 2, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    ("failures", "target", "failed"),
+    [
+        pytest.param(2, 3, 1, id="cell-never-retried"),
+        pytest.param(3, 4, 2, id="cell-retried-and-failed-again"),
+    ],
+)
+def test_survivorship_still_counts_the_failures_of_a_cell_that_never_succeeded(
+    tmp_path: Path, failures: int, target: int, failed: int
+) -> None:
+    """Replacing a failure discounts it only when a later attempt of its cell succeeded."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=failures)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_grid(tmp_path, trainer, 2))
+    if failures == 3:
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(_grid(tmp_path, trainer, 3))
+    raised = _grid(tmp_path, trainer, target)
+    assert run_experiment(raised)["p"].metric == 1.0
+    succeeded = {trial.params["x"] for trial in _trials(raised) if trial.state.name == "COMPLETE"}
+    assert len(succeeded) == 1
+
+    assert _published_survivorship(raised) == {
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": failed},
+    }
 
 
 def test_sampling_winner_after_a_failure_has_no_cell_advisory(

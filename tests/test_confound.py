@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
@@ -507,6 +508,38 @@ def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
         "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1},
     }
     assert _validate_confound_block(block, winner_trial=1) == block
+
+
+def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() -> None:
+    """A failed attempt is replaced when a retry of it, or of a retry of it, completed."""
+    study = optuna.create_study()
+    # (state, x, rerun_of): cell 1 fails, its retry fails, and the next retry completes; cell 2
+    # fails and its retry fails; cell 3 fails and nothing retries it.
+    for state, x, rerun_of in [
+        (_FAIL, 1, None),
+        (_FAIL, 2, None),
+        (_FAIL, 3, None),
+        (_FAIL, 1, 0),
+        (_FAIL, 2, 1),
+        (_COMPLETE, 1, 3),
+    ]:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=state,
+                value=None if state == _FAIL else 0.5,
+                params={"x": x},
+                distributions={"x": optuna.distributions.IntDistribution(0, 100)},
+                user_attrs={} if rerun_of is None else {RERUN_OF_ATTR: rerun_of},
+            )
+        )
+    trials = study.get_trials(deepcopy=False)
+    block = _assess(trials, trials[5:])
+
+    assert block["checks"]["survivorship"] == {
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 3},
+    }
+    assert _validate_confound_block(block, winner_trial=5) == block
 
 
 @pytest.mark.parametrize(
