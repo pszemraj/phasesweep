@@ -15,6 +15,7 @@ import os
 import select
 import subprocess
 import sys
+import time
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -458,8 +459,6 @@ def fd_ready(fd: int, *, timeout: float, write: bool = False) -> bool:
     :return bool: Whether ``fd`` became ready within ``timeout``.
     :raises OSError: If ``fd`` is not an open descriptor.
     """
-    import time
-
     deadline = time.monotonic() + timeout
     poller = select.poll()
     poller.register(fd, select.POLLOUT if write else select.POLLIN)
@@ -491,8 +490,6 @@ def _write_all(
         ``deadline``.
     :raises OSError: If the underlying ``os.write`` call fails.
     """
-    import time
-
     view = memoryview(data)
     if deadline is not None:
         os.set_blocking(fd, False)
@@ -524,8 +521,6 @@ def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
     :param float deadline: Absolute ``time.monotonic`` deadline.
     :return bytes | None: Complete frame, or ``None`` on timeout or early EOF.
     """
-    import time
-
     chunks: list[bytes] = []
     remaining = size
     while remaining:
@@ -573,8 +568,6 @@ def _spawn_blocked_supervisor(
         UnsafeProcessCleanupError: Failed or interrupted launch left cleanup unconfirmed.
 
     """
-    import time
-
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
     proc: subprocess.Popen[bytes] | None = None
@@ -697,8 +690,6 @@ def run_supervised(
         UnsafeProcessCleanupError: Unexpected post-launch failure with uncertain cleanup.
 
     """
-    import time
-
     started = time.monotonic()
     deadline, timeout_capped_by_wallclock = _choose_process_deadline(
         started=started,

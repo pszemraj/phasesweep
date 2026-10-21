@@ -245,7 +245,6 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
         os.execve("/bin/sh", ["/bin/sh", "-c", cmd], env)
     except OSError:
         return 77
-    return 77
 
 
 def _return_child_status(status: int) -> int:

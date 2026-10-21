@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import signal
+import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -561,8 +562,6 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
         group is confirmed dead.
 
     """
-    import time
-
     confirmed: dict[int, bool] = {}
     members: dict[int, set[int]] = {}
     pending: list[int] = []
