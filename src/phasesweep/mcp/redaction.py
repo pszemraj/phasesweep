@@ -180,6 +180,7 @@ def status_payload(
     """
     phases = []
     for phase in status["phases"]:
+        available = phase["trial_data_available"]
         raw_counts = phase["trials"]
         counts = {state: int(raw_counts.get(state, 0)) for state in TRIAL_STATE_NAMES}
         raw_generation_counts = phase.get("generation_trials") or {}
@@ -196,18 +197,24 @@ def status_payload(
         phases.append(
             {
                 "phase": phase["phase"],
-                "trials": counts,
-                "running_trials_total": counts["RUNNING"],
+                "trials": counts if available else None,
+                "running_trials_total": counts["RUNNING"] if available else None,
                 "target_terminal_trials": target_terminal_trials,
-                "completed_trials_total": counts["COMPLETE"],
-                "terminal_trials_total": terminal_trials_total,
-                "terminal_trials_before_run": terminal_trials_before_run,
-                "attempts_launched_this_run": sum(generation_counts.values()),
-                "terminal_trials_this_run": terminal_trials_this_run,
-                "remaining_trials": max(0, target_terminal_trials - terminal_trials_total),
-                "target_already_satisfied": (terminal_trials_before_run >= target_terminal_trials),
+                "completed_trials_total": counts["COMPLETE"] if available else None,
+                "terminal_trials_total": terminal_trials_total if available else None,
+                "terminal_trials_before_run": terminal_trials_before_run if available else None,
+                "attempts_launched_this_run": sum(generation_counts.values())
+                if available
+                else None,
+                "terminal_trials_this_run": terminal_trials_this_run if available else None,
+                "remaining_trials": (
+                    max(0, target_terminal_trials - terminal_trials_total) if available else None
+                ),
+                "target_already_satisfied": (
+                    terminal_trials_before_run >= target_terminal_trials if available else None
+                ),
                 "winner_present": phase["winner_present"],
-                "trial_data_available": phase["trial_data_available"],
+                "trial_data_available": available,
                 "published_study_unavailable": phase.get("published_study_unavailable"),
             }
         )

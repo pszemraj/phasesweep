@@ -121,6 +121,57 @@ def _read_run_tool(app: PhaseSweepMCP, read_tool: str, run_id: str) -> dict[str,
     return getattr(app, read_tool)(run_id=run_id)
 
 
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+@pytest.mark.parametrize("snapshot_unavailable", [False, True], ids=["known-empty", "unavailable"])
+def test_run_status_distinguishes_unknown_trial_counts_from_known_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_tool: str,
+    snapshot_unavailable: bool,
+) -> None:
+    """Unavailable terminal results expose unknown counts; an empty live study exposes zero."""
+    config, app, registry, store = side_effect_app(tmp_path)
+    run_id = "srv-count-availability"
+    if snapshot_unavailable:
+        stage_dead_run(store, run_id, config, "srv", cleanup_uncertain=False)
+        write_run_status(
+            store,
+            run_id,
+            returncode=1,
+            error_class="RuntimeError",
+            result_snapshot_state="failed",
+        )
+    else:
+        stage_live_run(store, run_id, config, "srv")
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = _read_run_tool(app, read_tool, run_id)
+
+    result_type = AwaitRunResult if read_tool == "await_run" else GetRunStatusResult
+    result = result_type.model_validate(payload)
+    phase = result.phases[0]
+    assert phase.target_terminal_trials == registry.get("srv").experiment.phases[0].n_trials
+    assert phase.trial_data_available is not snapshot_unavailable
+    counts = (
+        phase.running_trials_total,
+        phase.completed_trials_total,
+        phase.terminal_trials_total,
+        phase.terminal_trials_before_run,
+        phase.attempts_launched_this_run,
+        phase.terminal_trials_this_run,
+    )
+    if snapshot_unavailable:
+        assert phase.trials is None
+        assert counts == (None,) * len(counts)
+        assert phase.remaining_trials is None
+        assert phase.target_already_satisfied is None
+    else:
+        assert phase.trials and set(phase.trials.values()) == {0}
+        assert counts == (0,) * len(counts)
+        assert phase.remaining_trials == phase.target_terminal_trials
+        assert phase.target_already_satisfied is False
+
+
 @pytest.mark.integration
 def test_run_results_carry_path_free_confound_verdicts(tmp_path: Path) -> None:
     """Agents get every verdict and its counts; operator evidence stays in winner.yaml."""

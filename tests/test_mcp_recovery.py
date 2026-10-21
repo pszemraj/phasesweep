@@ -561,7 +561,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         assert payload["run"]["state"] == "failed"
         assert payload["run"]["recovery_required"] is False
         assert payload["run"]["failure"] == failure
-        assert payload["phases"][0]["running_trials_total"] == 0
+        assert payload["phases"][0]["running_trials_total"] is None
         assert payload["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
     assert winners["represented_generation_id"] is None
