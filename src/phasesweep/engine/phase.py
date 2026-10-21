@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import optuna
 
-from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.models import Constraint, Experiment, Metric, Phase
 from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
@@ -1121,13 +1121,14 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     assert result.metric is not None  # guaranteed when failure_reason is None
     violations: list[str] = []
     if not result.feasible:
-        for label, value, bounds in [
+        bound_checks: list[tuple[str, float, Metric | Constraint]] = [
             (f"metric {experiment.metric.name!r}", result.metric, experiment.metric),
             *(
                 (f"constraint {constraint.name!r}", result.constraints[constraint.name], constraint)
                 for constraint in experiment.constraints
             ),
-        ]:
+        ]
+        for label, value, bounds in bound_checks:
             if bounds.min is not None and value < bounds.min:
                 violations.append(f"{label}={value} < min={bounds.min}")
             if bounds.max is not None and value > bounds.max:
