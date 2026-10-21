@@ -426,7 +426,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
-            f"for {finished} terminal trial(s)."
+            f"for {finished} finished trial(s)."
         )
     recovery = _load_recovery_record(study)
     return stored if recovery is None else max(stored, recovery.trial_target)
@@ -448,7 +448,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
         raise TrialTargetRefusedError(
-            f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
+            f"Phase {phase.name!r} has already accepted a target of {accepted_target} finished "
             f"trial(s), but the current config requests {phase.n_trials}. Set "
             f"phases[{phase.name}].n_trials to at least {accepted_target} in the config."
         )
@@ -665,12 +665,12 @@ def _tripped_streak(abort: Mapping[str, object]) -> int | None:
     return streak if type(streak) is int else None
 
 
-def _streak_trials_all_completed(study: optuna.Study, policy_state: _PhasePolicyState) -> bool:
-    """Say whether a streak abort tripped on trials that all completed outside the bounds.
+def _streak_trials_all_infeasible(study: optuna.Study, policy_state: _PhasePolicyState) -> bool:
+    """Say whether a streak abort tripped on trials that all ended outside the bounds.
 
     The tripping trials are the state's ``abort_streak``. A trial whose trainer failed ends
-    FAIL and has a stderr log. One that completed outside the metric bounds or constraints
-    has none.
+    FAIL and has a stderr log. One that is INFEASIBLE, a COMPLETE trial outside the metric
+    bounds or constraints, has none.
 
     :param optuna.Study study: The phase's study.
     :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
@@ -768,8 +768,8 @@ def _retry_remedy(
     restart = f", and {_COUNT_RESTARTS}" if restarts else ""
     if not phase_draws(phase):
         return (
-            f"{raise_to} retry its failed attempt once more; a completed attempt is not "
-            f"repeated{restart}."
+            f"{raise_to} retry its failed attempt once more; a COMPLETE or INFEASIBLE attempt "
+            f"is not repeated{restart}."
         )
     failed = len(_failed_grid_cells(trials))
     remaining = ceiling - _finished_trial_count(trials) - failed
@@ -778,7 +778,10 @@ def _retry_remedy(
         actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
     if remaining:
         actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
-    return f"{raise_to} {' and '.join(actions)}; completed cells are not repeated{restart}."
+    return (
+        f"{raise_to} {' and '.join(actions)}; COMPLETE and INFEASIBLE cells are not "
+        f"repeated{restart}."
+    )
 
 
 _FRESH_START = (

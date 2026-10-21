@@ -321,7 +321,7 @@ class PhaseValidationPayload(_ToolPayload):
     n_trials: int = Field(
         ge=1,
         description=(
-            "Target number of terminal attempts; COMPLETE, INFEASIBLE and FAIL trials all count. "
+            "Target number of finished attempts; COMPLETE, INFEASIBLE and FAIL trials all count. "
             "INTERRUPTED trials never count: each reruns with its parameters before any new draw."
         ),
     )
@@ -391,16 +391,16 @@ class PhaseStatusPayload(_ToolPayload):
     trials: dict[TrialStateName, int] | None = Field(
         description=(
             "Dense cumulative study counts, or null when unavailable. Every state key is "
-            "present when counts are known. INFEASIBLE counts trials that completed outside "
-            "the metric bounds or constraints; they are terminal and can never win. INTERRUPTED "
+            "present when counts are known. INFEASIBLE counts trials that finished outside "
+            "the metric bounds or constraints; they can never win. INTERRUPTED "
             "counts trials a deadline, shutdown or orchestrator death cut short; they are "
-            "not terminal, and WAITING counts their scheduled reruns."
+            "not finished, and WAITING counts their scheduled reruns."
         )
     )
     running_trials_total: int | None = Field(
         ge=0, description="Cumulative RUNNING study rows; null when unavailable."
     )
-    target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
+    target_terminal_trials: int = Field(ge=0, description="Configured finished-trial target.")
     completed_trials_total: int | None = Field(
         ge=0,
         description=(
@@ -414,25 +414,25 @@ class PhaseStatusPayload(_ToolPayload):
     )
     terminal_trials_before_run: int | None = Field(
         ge=0,
-        description="Terminal rows that predate the represented generation; null when unavailable.",
+        description="Finished rows that predate the represented generation; null when unavailable.",
     )
     attempts_launched_this_run: int | None = Field(
         ge=0, description="All attempts owned by the represented generation; null when unavailable."
     )
     terminal_trials_this_run: int | None = Field(
         ge=0,
-        description="Terminal attempts owned by the represented generation; null when unavailable.",
+        description="Finished attempts owned by the represented generation; null when unavailable.",
     )
     remaining_trials: int | None = Field(
         ge=0,
         description=(
-            "Additional terminal trials needed to reach the configured target, reruns of "
+            "Additional finished trials needed to reach the configured target, reruns of "
             "interrupted trials included; null when counts are unavailable."
         ),
     )
     target_already_satisfied: bool | None = Field(
         description=(
-            "Whether pre-run terminal history already met the configured target; "
+            "Whether the trials finished before this run already met the configured target; "
             "null when counts are unavailable."
         )
     )

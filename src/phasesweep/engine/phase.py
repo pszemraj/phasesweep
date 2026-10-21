@@ -86,7 +86,7 @@ from phasesweep.engine.study_policy import (
     _record_trial_target,
     _recovery_action,
     _recovery_advice,
-    _streak_trials_all_completed,
+    _streak_trials_all_infeasible,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
@@ -424,7 +424,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
-        "Refusing to reinterpret those terminal attempts as a successful phase."
+        "Refusing to reinterpret those finished attempts as a successful phase."
         + ("" if advice is None else f" {advice}"),
         action=_recovery_action(study, abort_record),
     )
@@ -522,7 +522,7 @@ def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> Timeout
     """
     return TimeoutError(
         f"Phase {phase_name!r} hit its {timeout_scope} deadline "
-        "before any feasible trial could complete; no winner can be selected."
+        "before any trial could complete; no winner can be selected."
     )
 
 
@@ -576,7 +576,7 @@ def _judge_recorded_phase(
                 f"Phase {phase.name!r} accepted an incomplete result when its "
                 f"{partial_decision.timeout_scope} deadline expired at "
                 f"{partial_decision.finished_trials}/{partial_decision.trial_target} "
-                "terminal trials. Refusing to replay it unless the current config sets "
+                "finished trials. Refusing to replay it unless the current config sets "
                 "allow_incomplete_on_timeout: true; increase n_trials above "
                 f"{partial_decision.trial_target} in the config to continue the phase instead.",
                 action=OperatorAction.FIX_CONFIG,
@@ -924,7 +924,7 @@ def _record_outcome(
             f"in study {run.study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
             f"attempts ({type(write_error).__name__}: {write_error}). Trial "
             f"{trial.number} was deliberately left RUNNING, with its durable "
-            "attempt record intact, so no terminal trial exists without its "
+            "attempt record intact, so no finished trial exists without its "
             "outcome record. Once storage accepts writes again, the next run "
             "recovers it through the standard stale-attempt protocol, which "
             "records its outcome before marking the trial FAIL."
@@ -1327,7 +1327,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     :raises NoFeasibleTrialError: An abort tripped and no timeout left work
         undone, or every trial was infeasible.
     :raises TimeoutError: The deadline left the phase incomplete and partial
-        publication is disabled, or no feasible trial completed before it.
+        publication is disabled, or no trial completed before it.
     :raises RuntimeError: Optuna returned short of the trial target without a
         timeout or abort.
     :return Winner: The selected phase winner.
@@ -1359,8 +1359,8 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         persistent = experiment.storage is not None
         advice = _recovery_advice(phase, study, abort) if persistent else None
         evidence = (
-            "The tripping trials completed outside the metric bounds or constraints."
-            if _streak_trials_all_completed(study, aborted_state)
+            "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."
+            if _streak_trials_all_infeasible(study, aborted_state)
             else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
         raise NoFeasibleTrialError(
@@ -1375,7 +1375,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     ):
         raise RuntimeError(
             f"Phase {phase.name!r} stopped after {finished_after}/{phase.n_trials} "
-            "terminal trials without an accepted timeout; refusing to publish "
+            "finished trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
     current_policy_state = _load_phase_policy_state(study)
@@ -1473,9 +1473,9 @@ def _run_phase(
         That trial is left ``RUNNING`` with its attempt record intact and recovers on the next
         run once storage is writable.
     :raises StudySchemaMismatchError: Persisted phase recovery state contradicts the study's
-        terminal trial count.
+        finished trial count.
     :raises TimeoutError: The phase or run deadline expires before the requested trial budget
-        completes and partial publication is disabled, or before any feasible trial completes.
+        completes and partial publication is disabled, or before any trial completes.
     :raises PhaseSweepShutdown: The orchestrator receives a handled shutdown signal;
         propagated after recording a non-failure trial outcome.
     :raises RuntimeError: Optuna returned before the requested trial budget without a timeout,

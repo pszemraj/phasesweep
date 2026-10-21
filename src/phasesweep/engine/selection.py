@@ -160,7 +160,7 @@ def select_winner(
         )
     if not survivors:
         raise NoFeasibleTrialError(
-            "No feasible completed trials in phase. The phase's trials.csv records each "
+            "No completed trials in phase. The phase's trials.csv records each "
             "failed trial's reason; trainer output is in its trial_* directory."
             + _metric_bounds_note(trials, experiment)
         )

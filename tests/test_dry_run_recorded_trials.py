@@ -516,7 +516,7 @@ def test_met_target_without_a_feasible_trial_is_refused_as_a_run_refuses(
     experiment = _persistent(tmp_path, _phase("a", 2))
     _record(experiment, "a", _STATE.FAIL, _STATE.FAIL, target=2)
 
-    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No feasible completed trials")
+    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No completed trials")
 
 
 @pytest.mark.parametrize(

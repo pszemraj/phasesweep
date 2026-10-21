@@ -274,7 +274,7 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     with pytest.raises(NoFeasibleTrialError) as excinfo:
         select_winner(study, _with_bounds(_make_exp(), max=2.0))
     assert str(excinfo.value) == (
-        "No feasible completed trials in phase. The phase's trials.csv records each "
+        "No completed trials in phase. The phase's trials.csv records each "
         "failed trial's reason; trainer output is in its trial_* directory. "
         "Metric bounds: metric.max=2.0. The best value among COMPLETE and INFEASIBLE trials "
         "with a finite value is 3.5 (trial 1)."

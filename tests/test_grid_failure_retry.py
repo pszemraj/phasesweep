@@ -509,7 +509,9 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
         _assert_no_fresh_namespace(message)
     headline = str(aborted.value)
     assert "stderr" not in headline
-    assert "The tripping trials completed outside the metric bounds or constraints." in headline
+    assert (
+        "The tripping trials were INFEASIBLE: outside the metric bounds or constraints." in headline
+    )
 
 
 def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is_in_it(

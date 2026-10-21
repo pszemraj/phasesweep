@@ -103,7 +103,7 @@ def test_runtime_rejects_unexplained_trial_budget_shortfall(
     exp = _sleeping_score_experiment(tmp_path, experiment="budget_shortfall", n_trials=1)
     monkeypatch.setattr(optuna.Study, "optimize", lambda self, objective, **kwargs: None)
 
-    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials") as exc_info:
+    with pytest.raises(RuntimeError, match="stopped after 0/1 finished trials") as exc_info:
         run_experiment(exp)
     assert not isinstance(exc_info.value, PhaseSweepError)
 
