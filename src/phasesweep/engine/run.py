@@ -600,7 +600,7 @@ def _run_experiment_inner(
             and preloaded_winners is not None
             and phase.name not in preloaded_winners
         ):
-            log.info("phase=%s SKIPPED (not inherited by a reached phase)", phase.name)
+            log.info("phase=%s SKIPPED (no published or required winner)", phase.name)
             continue
         # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}

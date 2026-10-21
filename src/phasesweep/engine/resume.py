@@ -27,7 +27,7 @@ def _preflight_skipped_winners(
     run_deadline: float | None,
     error_mapper: Callable[[str, Exception], Exception] | None = None,
 ) -> dict[str, Winner]:
-    """Validate the skipped ancestors of reached phases before a new generation.
+    """Validate required ancestors and carried published winners before a generation.
 
     :param Experiment experiment: Experiment whose resume prefix is checked.
     :param str | None from_phase: Validated first phase that the new generation will execute.
@@ -37,10 +37,10 @@ def _preflight_skipped_winners(
         and its refusal. Publication-resolution failures name the first skipped
         phase. Adapted refusals suppress the internal cause; without an adapter
         every exception is re-raised unchanged.
-    :return dict[str, Winner]: Compatible required ancestors in declaration order.
+    :return dict[str, Winner]: Compatible required or published winners in declaration order.
     :raises TimeoutError: The whole-run wallclock deadline expired before a
         skipped phase could be validated.
-    :raises FileNotFoundError: A skipped phase has no persisted ``winner.yaml``.
+    :raises FileNotFoundError: A required skipped phase has no persisted ``winner.yaml``.
     :raises WinnerIntegrityError: A skipped phase's persisted winner is invalid
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
@@ -56,16 +56,17 @@ def _preflight_skipped_winners(
         return {}
 
     required = {phase.name for _index, phase in experiment.phases_from(from_phase)}
-    for candidate in reversed(experiment.phases):
-        if candidate.name in required:
-            required.update(candidate.inherits)
-
     # One validated immutable generation supplies every skipped winner. The
     # engine holds _experiment_lock; the MCP gate retains the same publication
-    # snapshot while checking the required ancestors before spawning its runner.
+    # snapshot while checking skipped winners before spawning its runner.
     phase = experiment.phases[0]
     try:
         publication = _published_for_resume(experiment)
+        if publication is not None:
+            required.update(publication.winners)
+        for candidate in reversed(experiment.phases):
+            if candidate.name in required:
+                required.update(candidate.inherits)
         winners: dict[str, Winner] = {}
         for phase in experiment.phases:
             if run_deadline is not None and time.monotonic() >= run_deadline:
