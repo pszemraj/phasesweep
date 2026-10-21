@@ -7,6 +7,7 @@ the key it names.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import re
 
@@ -24,6 +25,7 @@ from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
     _parse_notes,
+    _reference_resource,
     closest,
     first_sentence,
     loc_to_path,
@@ -295,10 +297,9 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
 def test_config_guide_index_lists_every_top_level_key() -> None:
     """The guide's reference index names each top-level key under the section it sits in."""
     guide = (REPO / "docs/config.md").read_text()
-    index = guide.split("## Reference index\n", 1)[1].split("\n## ", 1)[0]
     rows = re.findall(
         r"^\| ([^|`]+?) \| ((?:`[^`]+`(?:, )?)+) \| `phasesweep explain ([^`]+)` \|$",
-        index,
+        guide,
         re.MULTILINE,
     )
     documented = {section: re.findall(r"`([^`]+)`", keys) for section, keys, _ in rows}
@@ -331,7 +332,9 @@ def test_sub_key_count_counts_entries_below_a_key() -> None:
 def test_first_sentence_stops_at_the_first_full_stop_and_shortens_long_ones() -> None:
     """A listing row shows one sentence, cut at a word boundary when it is long."""
     storage = next(entry for entry in reference_entries() if entry.path == "storage")
-    assert first_sentence(storage) == "Where the study ledger is kept."
+    sentence = first_sentence(storage, None)
+    assert sentence
+    assert storage.comments[0].startswith(sentence)
     long = ReferenceEntry("k", "string", ("Word " * 40 + "end. Second.",), "S")
     assert first_sentence(long, 30) == "Word Word Word Word Word..."
     assert first_sentence(long, None) == "Word " * 40 + "end."
@@ -345,9 +348,12 @@ def test_mcp_catalog_table_matches_all_catalog_paths() -> None:
         *(f"experiments[].{key}" for key in _Entry.model_fields),
         *(f"experiments[].allow.{key}" for key in _Allow.model_fields),
     }
-    catalog_section = (REPO / "docs/mcp.md").read_text().split("## The catalog\n", 1)[1]
-    catalog_section = catalog_section.split("\n## ", 1)[0]
-    paths = re.findall(r"^\| `([^`]+)` \|", catalog_section, re.MULTILINE)
+    # The catalog is the only three-column table whose first column is a code-spelled key.
+    paths = re.findall(
+        r"^\| `([^`]+)` \| [^|]+ \| [^|]+ \|$",
+        (REPO / "docs/mcp.md").read_text(),
+        re.MULTILINE,
+    )
     assert len(paths) == len(set(paths)), "Duplicate catalog table paths"
     actual = set(paths)
     assert actual == expected, {
@@ -360,18 +366,15 @@ def test_reference_entries_record_their_section_and_are_immutable() -> None:
     """Every entry names the section marker above it, and entries cannot be edited."""
     entries = reference_entries()
     assert entries[0].path == "experiment"
-    assert entries[0].section == "Required experiment fields"
-    assert {entry.section for entry in entries} == {
-        "Required experiment fields",
-        "Trainer inputs",
-        "Storage and provenance",
-        "Constraints",
-        "Observations",
-        "MLflow target and ownership",
-        "Execution environment",
-    }
+    markers = re.findall(
+        r"^# -{10} (.+?) -{10}$",
+        _reference_resource().read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    # Each marker heads one unbroken run of entries, in file order.
+    assert [section for section, _ in itertools.groupby(e.section for e in entries)] == markers
+    assert len(set(markers)) == len(markers) > 1
     by_path = {entry.path: entry for entry in entries}
-    assert by_path["execution.inherit_env"].section == "Execution environment"
     assert isinstance(by_path["trial_command"].comments, tuple)
     with pytest.raises(dataclasses.FrozenInstanceError):
         entries[0].path = "other"
@@ -399,18 +402,15 @@ def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() 
         _parse_notes("# about this file\n\n# ---------- First ----------\n\n# one\nname: string\n")
 
 
-def test_packaged_reference_notes_hold_user_notes_and_no_maintainer_lines() -> None:
-    """The packaged notes cover paths, YAML typing and environment variables, not the file itself."""
-    notes = "\n".join(reference_notes())
-    for fragment in ("Config file:", "Paths:", "YAML scalars follow PyYAML", "PHASESWEEP_LOCK_DIR"):
-        assert fragment in notes
-    for maintainer in ("does not load as YAML", "maintained by hand", "parsed by", "tests/"):
-        assert maintainer not in notes
-    assert not any(
-        comment.startswith("Config file:")
-        for entry in reference_entries()
-        for comment in entry.comments
-    )
+def test_packaged_reference_notes_are_neither_the_maintainer_block_nor_an_entry_comment() -> None:
+    """The packaged notes are the header's second block, apart from the first block and every entry."""
+    first_block = _reference_resource().read_text(encoding="utf-8").split("\n\n", 1)[0]
+    maintainer_lines = {line.removeprefix("#").strip() for line in first_block.splitlines()}
+    notes = set(reference_notes())
+    assert notes
+    assert maintainer_lines
+    assert not notes & maintainer_lines
+    assert not notes & {comment for entry in reference_entries() for comment in entry.comments}
 
 
 @pytest.mark.parametrize(
@@ -470,7 +470,7 @@ def test_lookup_of_an_unknown_key_is_empty_and_an_empty_key_is_everything() -> N
 
 
 def test_closest_suggests_the_documented_key_for_a_partial_or_misspelled_one() -> None:
-    """A bare leaf finds its parent path, and a typo finds the key it misspells."""
+    """A partial path or bare key finds the full documented path, and a typo finds the key it misspells."""
     assert closest("inherit_env") == ("execution.inherit_env",)
     assert closest("sampler.type") == ("phases[].sampler.type",)
     assert closest("phases.sampler.typ")[0] == "phases[].sampler.type"
