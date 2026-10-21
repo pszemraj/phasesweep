@@ -475,24 +475,18 @@ def _resume_phase(
     partial-timeout decision at the current target replays as the phase's
     winner while the current config still accepts incomplete results. An abort
     recorded in the outcome ledger, or a replayed streak that meets the current
-    limit while work remains, is refused unless the raised ``n_trials``
-    authorizes recovering from it.
+    limit while work remains, is refused unless the raised ``n_trials`` or, for
+    a streak abort with trials left to run, a ``max_consecutive_failures``
+    above the recorded count authorizes recovering from it.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being resumed.
     :param dict[str, Winner] inherited_winners: Winners loaded for phases
         earlier in the chain.
     :param optuna.Study study: The phase's live study.
-    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
-        current limit with work remaining, at an accepted target its current
-        ``n_trials`` does not exceed.
-    :raises WinnerIntegrityError: An accepted partial-timeout decision would
-        replay while the current config disables
-        ``allow_incomplete_on_timeout``.
-    :raises TimeoutError: An accepted partial-timeout decision replays with
-        no feasible trial.
-    :raises StudySchemaMismatchError: Durable phase state is malformed or
-        contradicts the study's trials.
+    :raises StudySchemaMismatchError: The study's schema or stored direction is
+        unsupported; what the recorded state contradicts is listed with
+        :func:`_judge_recorded_phase`, whose other refusals also propagate.
     :raises StudyFingerprintMismatchError: The study was produced by a
         different phase config.
     :raises ProcessCleanupUncertainError: A stale trial's process could not be
@@ -643,7 +637,8 @@ def _phase_budget(phase: Phase, run_deadline: float | None) -> _PhaseBudget:
     :param Phase phase: Phase supplying ``timeout_seconds_per_phase``.
     :param float | None run_deadline: Whole-run ``time.monotonic()`` deadline,
         when configured.
-    :raises TimeoutError: The run deadline has already passed.
+    :raises TimeoutError: The run deadline has already passed, or the phase's own
+        ``timeout_seconds_per_phase`` is 0.
     :return _PhaseBudget: The optimize timeout in seconds, its monotonic
         deadline, and which guard (``"phase"`` or ``"run"``) sets it.
     """
@@ -661,8 +656,12 @@ def _phase_budget(phase: Phase, run_deadline: float | None) -> _PhaseBudget:
             else min(optimize_timeout, remaining_run_seconds)
         )
     if optimize_timeout is not None and optimize_timeout <= 0.0:
+        if timeout_source == "run":
+            raise TimeoutError(
+                f"Run wallclock deadline reached before phase {phase.name!r} could launch."
+            )
         raise TimeoutError(
-            f"Run wallclock deadline reached before phase {phase.name!r} could launch."
+            f"Phase {phase.name!r} sets timeout_seconds_per_phase to 0, so it could not launch."
         )
     optimize_deadline = None if optimize_timeout is None else time.monotonic() + optimize_timeout
     return _PhaseBudget(optimize_timeout, optimize_deadline, timeout_source)

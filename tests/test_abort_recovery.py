@@ -88,7 +88,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
 def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
     tmp_path: Path,
 ) -> None:
-    """Contradictory durable abort/trial counts are operator-visible study state."""
+    """A raised target the recorded trials already fill leaves no slot to recover into, so it is refused."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'abort.journal'}"
 

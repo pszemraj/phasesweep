@@ -1429,8 +1429,8 @@ def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
 
     The fixture's trials record the pinned environment they were generated under, so the
-    cohort check that allocation needs (routed by ``environment_cohort_changed``) passes
-    only from that environment, whatever shell runs the test.
+    cohort check that allocation runs (``_validate_environment_cohort``) passes only from
+    that environment, whatever shell runs the test.
     """
     pin_fixture_environment(monkeypatch)
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
@@ -1972,8 +1972,11 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         # The durable payload schema is unchanged: the action routes, it is not stored.
         assert "action" not in failure
         _assert_payload_follows(failure, routed)
-    # The last, composed remediation, word for word.
-    assert failure["remediation"] == (
+    # A ledger failure with a shared-registry cleanup error composes both repairs, word for word.
+    composed = mcp_runner._terminal_failure_payload(
+        _LEDGER_LOST, stage="execution", cleanup_confirmed=False, cleanup_error=_SHARED_REGISTRY
+    )
+    assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
         "the files and permissions identified in the error, deleting a file only if certain nothing "
         "is running, then run phasesweep mcp recover-run before another launch. The error in "

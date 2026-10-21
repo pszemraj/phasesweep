@@ -82,6 +82,18 @@ def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
     )
 
 
+def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_path: Path) -> None:
+    """A phase timeout of 0 leaves no time to launch, and the refusal does not blame the run."""
+    exp = _sleeping_score_experiment(
+        tmp_path, experiment="phase_zero_timeout", timeout_seconds_per_phase=0.0
+    )
+
+    with pytest.raises(TimeoutError, match="sets timeout_seconds_per_phase to 0") as refused:
+        run_experiment(exp)
+
+    assert "Run wallclock deadline" not in str(refused.value)
+
+
 @pytest.mark.integration
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

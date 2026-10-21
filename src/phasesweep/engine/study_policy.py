@@ -90,7 +90,8 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
     """Check the live or resumed failure count against the configured threshold.
 
-    Replay uses the abort recorded with each outcome, not today's threshold.
+    A resumed phase applies today's threshold only when no abort is recorded. A recorded
+    abort is judged by :func:`_config_retires_abort`, never by recounting against it.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.

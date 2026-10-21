@@ -293,9 +293,7 @@ def _represented_winners(
 ) -> list[PhaseWinnerView]:
     """Return the represented generation's winners, in ``phase_names`` order.
 
-    When the represented generation is the validated publication, every winner
-    comes from the bytes that validation read and nothing is reread. Any other
-    generation is read permissively from its files.
+    Where each winner is read from follows the module docstring.
 
     :param Experiment experiment: Experiment whose artifact tree is read.
     :param PublicationPointer publication: This read's single pointer resolution.
@@ -671,9 +669,9 @@ class TrialTable:
 
     ``columns`` lists the keys every row carries, in display order: ``trial``,
     ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
-    repeats phase, one ``observed:<name>`` per report-only value any trial
-    recorded, an optional ``reason`` when any trial has a recorded cause, and
-    ``winner``. ``state`` is the Optuna state, except that a
+    repeats phase, ``rerun_of`` once any trial is a rerun, one ``observed:<name>``
+    per report-only value any trial recorded, an optional ``reason`` when any
+    trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
     winner stands on and empty elsewhere.
@@ -768,8 +766,8 @@ def _trial_table(
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
-    A ``rerun_of`` column, naming the interrupted trial each rerun reran, appears
-    once the phase holds a rerun.
+    A ``rerun_of`` column, naming the interrupted trial or failed grid cell each rerun
+    reran, appears once the phase holds a rerun.
 
     :param Experiment experiment: Current metric and constraint eligibility bounds.
     :param Phase phase: The configured phase the trials belong to.

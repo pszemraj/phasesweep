@@ -51,7 +51,8 @@ def _log_phase_header(
     :param str study_name: Its Optuna study name.
     :param int finished: Trials that count toward its target.
     :param int remaining: Trials still needed to reach ``phase.n_trials``.
-    :param int reruns: Reruns it owes for interrupted trials.
+    :param int reruns: Reruns it schedules, for interrupted trials and for the failed grid
+        cells a raised ``n_trials`` retries.
     :param logging.Logger logger: Progress channel for a live phase or its preview.
     """
     logger.info(
