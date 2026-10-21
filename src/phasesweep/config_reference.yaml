@@ -276,7 +276,7 @@ phases: list[object] (required)
     # Running the same config again on persistent storage re-ranks the stored trials and republishes when the target is already reached.
     # Raising the target on persistent storage runs the remaining attempts in the same study.
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
-    # A persistent phase cannot lower its target below the one it already accepted.
+    # A persistent phase cannot lower its target below the one it already accepted; the refusal names the target to set.
     # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
     # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
     # A fixed configuration keeps at most one completed result. On persistent storage a failed trial, including one stopped by timeout_seconds_per_trial, still counts toward n_trials, so running the same config again replays the failure, while an interrupted one reruns by itself. Raising n_trials by one per failed attempt retries it, under any sampler, and never once an attempt completed, feasible or not.

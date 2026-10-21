@@ -429,7 +429,8 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
     if phase.n_trials < accepted_target:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
-            f"trial(s), but the current config requests {phase.n_trials}."
+            f"trial(s), but the current config requests {phase.n_trials}. Set "
+            f"phases[{phase.name}].n_trials to at least {accepted_target} in the config."
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(

@@ -532,7 +532,13 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -
     states = () if case == "target-only-empty-study" else (_STATE.COMPLETE, _STATE.FAIL)
     _record(experiment, "a", *states, target=4)
 
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
+    _refusals_match(
+        experiment,
+        tmp_path,
+        TrialTargetRefusedError,
+        r"already accepted a target of 4 .* requests 2\. Set phases\[a\]\.n_trials to at least 4 "
+        "in the config",
+    )
 
 
 @pytest.mark.parametrize("target", [4, 2], ids=["failed-mid-target", "target-raised"])
