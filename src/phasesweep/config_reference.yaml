@@ -325,7 +325,7 @@ phases: list[object] (required)
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
     # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. phases[].n_trials above 1 only retries failed attempts, as phases[].n_trials describes. validate and the dry run say "fixed configuration, no sampler draws (resumable)", or "(not resumable: in-memory storage)" on storage: null.
     # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value, an optional one-off for measuring how far a configuration moves with the seed.
-    # A key that is exactly seed or ends in .seed fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix the seed in phases[].fixed_overrides or trainer_config. To compare finalists across seeds, use phases[].repeats. The match is case sensitive.
+    # A key whose last dotted component is seed, data_seed or random_state fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix it in phases[].fixed_overrides or trainer_config. To compare finalists across seeds, use phases[].repeats. The match is case sensitive.
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
     # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
     # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).

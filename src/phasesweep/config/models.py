@@ -764,7 +764,11 @@ class Phase(_Frozen):
                 f"Phase {self.name!r}: timeout_seconds_per_phase",
                 self.timeout_seconds_per_phase,
             )
-        seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
+        seed_keys = [
+            key
+            for key in self.search_space
+            if key.rsplit(".", 1)[-1] in {"seed", "data_seed", "random_state"}
+        ]
         if seed_keys:
             example = seed_keys[0]
             raise ValueError(

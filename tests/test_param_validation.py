@@ -27,6 +27,19 @@ from phasesweep.evidence.models import JsonExtractor
 from tests.conftest import make_experiment
 
 
+@pytest.mark.parametrize(
+    "key", ["data_seed", "random_state", "trainer.data_seed", "model.random_state"]
+)
+def test_seed_aliases_cannot_be_optimized_as_configuration(key: str) -> None:
+    """Common trainer seed names belong in fixed inputs or the repeat axis."""
+    with pytest.raises(ValidationError, match="seed keys cannot be searched"):
+        Phase(
+            name="p",
+            n_trials=2,
+            search_space={key: IntParam(type="int", low=0, high=1)},
+        )
+
+
 @pytest.mark.parametrize(("n_jobs", "constant_liar"), [(4, True), (1, False)])
 def test_tpe_sampler_constant_liar_policy(n_jobs: int, constant_liar: bool) -> None:
     """TPE enables constant_liar only for parallel optimization."""
