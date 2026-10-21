@@ -522,7 +522,8 @@ def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> Timeout
     """
     return TimeoutError(
         f"Phase {phase_name!r} hit its {timeout_scope} deadline "
-        "before any trial could complete; no winner can be selected."
+        "before any trial completed inside the metric bounds and constraints; no winner can "
+        "be selected."
     )
 
 
