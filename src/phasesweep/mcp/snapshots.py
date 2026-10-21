@@ -83,7 +83,7 @@ class RunningAttemptSnapshot(_SnapshotModel):
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
-    """One phase's terminal trial counts and winner presence."""
+    """One phase's trial counts by state at capture, and winner presence."""
 
     phase: str
     trials: dict[str, NonNegativeInt]
@@ -174,7 +174,7 @@ class EvaluationPointSummary(_SnapshotModel):
 
 
 class SurvivorshipSummary(_SnapshotModel):
-    """How many terminal trials were ranked versus excluded from ranking."""
+    """How many finished trials were ranked versus excluded from ranking."""
 
     verdict: ConfoundVerdict = Field(
         description=(

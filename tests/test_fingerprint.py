@@ -172,7 +172,7 @@ def _two_phase_experiment(
 def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
     """Build a stand-in study exposing only what the top-up guard reads.
 
-    :param int completed: Number of terminal trials the study reports.
+    :param int completed: Number of Optuna COMPLETE trials the study reports.
     :param str | None fingerprint: Bound phase fingerprint, or ``None`` for a
         study that has not been bound to a published winner yet.
     :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``

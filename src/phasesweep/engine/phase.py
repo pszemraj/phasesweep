@@ -127,7 +127,7 @@ def _winner_completion(
     """Build the completion metadata a phase's :class:`Winner` persists.
 
     :param int requested_trials: Trial target the phase was configured to reach.
-    :param int finished_trials: Terminal trial count backing this completion.
+    :param int finished_trials: Finished trial count backing this completion.
     :param int completed_trials: Optuna COMPLETE trial count backing this completion,
         infeasible trials included, so it can exceed the ``completed`` of ``status``.
     :param bool incomplete: Whether the phase stopped short of its trial target.
@@ -154,7 +154,7 @@ def _partial_completion_for_replay(
 ) -> dict[str, Any]:
     """Re-prove and return the frozen completion metadata for a decision replay.
 
-    :param optuna.Study study: Study whose current terminal counts are verified.
+    :param optuna.Study study: Study whose current finished and measured counts are verified.
     :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
     :param int outcome_sequence: Current durable outcome sequence for the study.
     :raises StudySchemaMismatchError: Trial counts or the outcome sequence changed
@@ -1673,7 +1673,7 @@ def _select_phase_winner(
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: Phase whose winner is selected.
     :param dict[str, Winner] inherited_winners: Winners from earlier phases in the chain.
-    :param optuna.Study study: Study whose terminal trials supply the winner.
+    :param optuna.Study study: Study whose completed trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
     :param bool verify_evidence: Whether to verify the selected trial against its

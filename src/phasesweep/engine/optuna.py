@@ -53,7 +53,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their terminal and complete count boundary, and a RUNNING row the
+    carry their finished and measured count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -114,8 +114,8 @@ def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the number of trials that count toward ``n_trials``.
 
-    A trial counts once it is terminal and was not interrupted: an interrupted
-    trial reruns instead, so it never consumes the trial target.
+    A trial counts once it is finished: an interrupted trial reruns instead, so it
+    never consumes the trial target.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in a state of :data:`~phasesweep.engine.state.TERMINAL_TRIAL_STATES`.
@@ -142,7 +142,7 @@ def _published_phase_trial_refs(
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
-        their known terminal-count boundary; None when a published phase does
+        their known finished-count boundary; None when a published phase does
         not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}

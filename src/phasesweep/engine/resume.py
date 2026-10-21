@@ -169,8 +169,8 @@ def _reject_bound_descendant_topups(
         study = existing_studies.get(phase.name)
         if study is None:
             continue
-        terminal = _finished_trial_count(study.get_trials(deepcopy=False))
-        if terminal >= phase.n_trials:
+        finished = _finished_trial_count(study.get_trials(deepcopy=False))
+        if finished >= phase.n_trials:
             continue
         partial_decision = study_policy_ops._load_accepted_partial_decision(study)
         if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
@@ -196,7 +196,7 @@ def _reject_bound_descendant_topups(
         ]
         if bound:
             raise StudyContextConflictError(
-                f"Phase {phase.name!r} has {phase.n_trials - terminal} top-up trial(s) "
+                f"Phase {phase.name!r} has {phase.n_trials - finished} top-up trial(s) "
                 f"remaining, but dependent phase study/studies {bound} are already bound "
                 "to its published winner via inheritance. "
                 "Use a new experiment name to run the larger upstream budget without "
