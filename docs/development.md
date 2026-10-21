@@ -48,6 +48,27 @@ Qualification on 2026-10-20 ran the two non-live lanes sequentially, with pytest
 
 The existing skip is `test_absence_proof_tracks_a_real_child_pid_namespace`: its absence proof requires the host's initial PID namespace. Live-marked GPU and external-service tests were excluded. The Hugging Face recipe contract test reads synthetic trainer outputs without training or downloading a model.
 
+### Decoder workflow follow-up gates
+
+The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, and successful cleanup messages each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
+
+| Gate | Result |
+| --- | --- |
+| CLI, repeat runtime, decoder wrapper, and workflow regressions | 132 passed in 63.43 seconds |
+| Cleanup messages and stale-trial recovery | 62 passed in 2.17 seconds; 12 integration cases deselected |
+| Example and recipe checks after copied-config clarification | 14 passed in 0.07 seconds |
+| New regression cases across the focused runs | Nine passed |
+| Contract tests | 109 passed through the mandatory commit hooks |
+| Whole-suite collection | 3,034 non-live tests across 99 modules |
+| Ruff lint | Passed |
+| Ruff format check | Passed; 193 files formatted |
+| mypy | Passed; 80 source files |
+| Mandatory commit hooks | Passed for each of the six fixes |
+
+A fresh GPT-6.1-sol agent on medium found the repeats and continuation recipes from the repository docs without a supplied config or commands. Its local CUDA run completed nine 80-update models, retained a completed trial across an intentional SIGINT, retried the interrupted attempt, and replayed in 0.408 seconds with all nine checkpoint paths and timestamps preserved. It continued a chosen seed's model from step 80 to 85 using five additional updates, with Adam counters also at 85.
+
+A separate final CUDA check selected that seed's checkpoint directly from the member directory printed by `show-winners` and executed the README's continuation code block. It required no CSV lookup: the saved step and Adam counters advanced from 80 to 85, and 20 model-state tensors changed. The study's objective records were preserved. These follow-up experiments used local-only logging.
+
 ### Real CUDA qualification
 
 The 2026-10-20 [Enwik8 example](../examples/tiny_decoder_enwik8/README.md) check asked whether three learning rates could be ranked by mean final-checkpoint loss over two seeds, then replayed without retraining. It used the pinned trainer at `9c90a551`, one RTX 5090 (32 GB), PyTorch `2.13.0+cu130`, driver `595.91.07`, and W&B `0.28.0`. The fixed 27,403,008-parameter decoder used dimension 512, eight layers, eight heads, sequence length 512, batch size 16, bfloat16 autocast, Adam, zero weight decay, and gradient clipping at 1.0. Each of six trials trained for 300 optimizer steps: 1,800 steps and 14,745,600 training tokens in total.
