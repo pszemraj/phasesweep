@@ -50,7 +50,7 @@ The existing skip is `test_absence_proof_tracks_a_real_child_pid_namespace`: its
 
 ### Decoder workflow follow-up gates
 
-The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, successful cleanup messages, and sandbox GPU inventory diagnostics each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
+The persistent repeats recipe, repeat-winner guidance and member directories, checkpoint-continuation recipe, copied-config guidance, successful cleanup messages, sandbox GPU inventory diagnostics, and changing repeat-group number guidance each gained a failing regression before the fix. Their follow-up validation used the focused gates below; the two-lane table above records the earlier full-suite qualification.
 
 | Gate | Result |
 | --- | --- |
@@ -58,9 +58,10 @@ The persistent repeats recipe, repeat-winner guidance and member directories, ch
 | Cleanup messages and stale-trial recovery | 62 passed in 2.17 seconds; 12 integration cases deselected |
 | Example and recipe checks after copied-config clarification | 14 passed in 0.07 seconds |
 | GPU inventory, sandbox diagnostics, and decoder recipes | 86 passed in 1.47 seconds; one live test excluded |
-| New regression cases across the focused runs | Nine passed |
+| Repeat summaries, repeated-winner guidance, and CLI | 105 passed in 11.73 seconds |
+| New regression cases across the focused runs | 16 passed |
 | Contract tests | 109 passed through the mandatory commit hooks |
-| Whole-suite collection | 3,040 non-live tests across 99 modules |
+| Whole-suite collection | 3,041 non-live tests across 99 modules |
 | Ruff lint | Passed |
 | Ruff format check | Passed; 193 files formatted |
 | mypy | Passed; 80 source files |
@@ -70,7 +71,7 @@ A fresh GPT-6.1-sol agent on medium found the repeats and continuation recipes f
 
 A separate final CUDA check selected that seed's checkpoint directly from the member directory printed by `show-winners` and executed the README's continuation code block. It required no CSV lookup: the saved step and Adam counters advanced from 80 to 85, and 20 model-state tensors changed. The study's objective records were preserved. These follow-up experiments used local-only logging.
 
-The fresh workflow check preceded the member-directory, cleanup-message, copied-config, and sandbox-diagnostic follow-ups. Those changes received focused checks; the complete workflow has not been rerun cold against this final tree. Read-only validation of the real repeats example confirmed the missing-inventory sandbox refusal includes host-access advice, and the unchanged config passes with host GPU access.
+The fresh workflow check preceded the member-directory, cleanup-message, copied-config, sandbox-diagnostic, and group-number guidance follow-ups. Those changes received focused checks; the complete workflow has not been rerun cold against this final tree. Read-only validation of the real repeats example confirmed the missing-inventory sandbox refusal includes host-access advice, and the unchanged config passes with host GPU access. The saved real experiment's status also renders the explanation of changing group numbers.
 
 ### Real CUDA qualification
 

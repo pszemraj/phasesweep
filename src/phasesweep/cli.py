@@ -851,7 +851,14 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
                     row[f"observed:{name}"] = group.observed.get(name)
                     row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
                 row["winner"] = "*" if group.winner else ""
-            lines.extend(["", "Repeat groups (statistics include infeasible measured members):"])
+            lines.extend(
+                [
+                    "",
+                    "Repeat groups (statistics include infeasible measured members):",
+                    "Group numbers track the highest member trial number so far "
+                    "and can change as members arrive.",
+                ]
+            )
             lines.extend(_table_lines(tuple(groups[0]), groups))
     return "\n".join(lines)
 

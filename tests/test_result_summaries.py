@@ -115,6 +115,24 @@ def test_repeat_summary_includes_losing_infeasible_and_partial_groups(
     assert "3/3" in rendered and "1/3" in rendered
 
 
+def test_repeat_table_explains_group_numbers_while_members_arrive(tmp_path: Path) -> None:
+    """An incomplete group's displayed number tracks its highest recorded member."""
+    experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1]), n_trials=2)
+    study = _new_phase_study(experiment, "p")
+
+    for seed in [0, 1]:
+        _add_trial(study, x=1, seed=seed, value=1.0 + seed)
+        tables = read_trial_tables(experiment)
+        (table,) = tables.phases
+        (group,) = table.groups
+        assert group.params == {"x": 1} and group.group == seed
+        assert all(row["repeat_group"] == seed for row in table.rows)
+        rendered = _render_trial_tables(tables, persisted=True)
+        assert f"{seed + 1}/2" in rendered
+        assert "highest member trial number so far" in rendered
+        assert "can change as members arrive" in rendered
+
+
 @pytest.mark.parametrize("outcome", ["failure", "interrupted"])
 def test_repeat_summary_counts_a_rerun_once_and_keeps_random_slots_distinct(
     tmp_path: Path, outcome: str
