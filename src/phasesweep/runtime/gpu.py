@@ -164,7 +164,7 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
             return [], {}
     except FileNotFoundError:
         return [], {}
-    except Exception:  # noqa: BLE001
+    except Exception:
         return [], {}
     ids: list[int] = []
     uuid_map: dict[str, str] = {}

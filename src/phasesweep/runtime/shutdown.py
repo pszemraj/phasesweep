@@ -138,7 +138,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             is already running.
 
     """
-    global _deferred_shutdown_signum, _servicing_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum, _servicing_signum
 
     # A second signal must not re-enter registry locks or replace the first
     # handler's cleanup evidence.
@@ -223,7 +223,7 @@ def install_signal_handlers() -> None:
         SignalOwnershipUnavailableError: Called outside the main thread.
 
     """
-    global _process_lifetime_owner  # noqa: PLW0603
+    global _process_lifetime_owner
     if threading.current_thread() is not threading.main_thread():
         raise SignalOwnershipUnavailableError(
             "install_signal_handlers() must be called from the main thread: "
@@ -293,7 +293,7 @@ def _restore_host_signal_state(
             continue
         try:
             signal.signal(sig, handler)
-        except Exception as exc:  # noqa: BLE001 - continue past one bad restore
+        except Exception as exc:  # continue past one bad restore
             log.exception("Failed to restore the prior handler for signal %d after scope exit", sig)
             if restoration_error is None:
                 restoration_error = exc
@@ -319,7 +319,7 @@ def signal_handler_scope() -> Iterator[None]:
         ``None`` during the run whose children require shutdown cleanup.
 
     """
-    global _scope_depth, _servicing_signum  # noqa: PLW0603
+    global _scope_depth, _servicing_signum
 
     if _scope_depth == 0:
         # A new outermost run starts with no shutdown under way.
@@ -385,7 +385,7 @@ def defer_shutdown_signals() -> Iterator[None]:
         ``None`` during the critical section.
 
     """
-    global _main_thread_defer_depth  # noqa: PLW0603
+    global _main_thread_defer_depth
     is_main = threading.current_thread() is threading.main_thread()
     old_mask = None
     if hasattr(signal, "pthread_sigmask"):
@@ -414,7 +414,7 @@ def service_pending_shutdown() -> None:
             evidence for the recorded signal.
 
     """
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum
     signum = _deferred_shutdown_signum
     _deferred_shutdown_signum = None
     if signum is not None:
@@ -443,8 +443,8 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
         ``None`` when no shutdown arrived during the window.
 
     """
-    global _main_thread_defer_depth  # noqa: PLW0603
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _main_thread_defer_depth
+    global _deferred_shutdown_signum
     absorbed = AbsorbedShutdown()
     is_main = threading.current_thread() is threading.main_thread()
     old_mask = None

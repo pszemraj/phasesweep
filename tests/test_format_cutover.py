@@ -824,7 +824,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
     def repair() -> None:
         try:
             repair_incomplete_journal_record(ledger)
-        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+        except BaseException as exc:  # handed to the assertions below
             raised.append(exc)
 
     worker = threading.Thread(target=repair, daemon=True)

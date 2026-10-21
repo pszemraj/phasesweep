@@ -187,7 +187,7 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
     assert w.params == {"x": 1}
 
 
-def _add_interrupted(study, params: dict[str, int]) -> None:  # noqa: ANN001
+def _add_interrupted(study, params: dict[str, int]) -> None:
     """Add a FAIL trial that recorded its params before an interruption stopped it."""
     study.add_trial(
         optuna.trial.create_trial(
@@ -305,13 +305,13 @@ def _axis(reduce: str = "mean", *, slot_size: int | None = None) -> RepeatAxis:
     return RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=slot_size)
 
 
-def _add_group(study, x: int, values: list[float], **kwargs) -> None:  # noqa: ANN001
+def _add_group(study, x: int, values: list[float], **kwargs) -> None:
     """Add one configuration's trials, one per seed in order."""
     for seed, value in enumerate(values):
         _add_trial(study, value, params={"x": x, "seed": seed}, **kwargs)
 
 
-def _add_failed(study, x: int, seed: int) -> None:  # noqa: ANN001
+def _add_failed(study, x: int, seed: int) -> None:
     """Add a FAIL trial that recorded its params before failing."""
     study.add_trial(
         optuna.trial.create_trial(

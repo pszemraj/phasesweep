@@ -890,7 +890,7 @@ def read_trial_stats(
         snapshot = _journal_snapshot_storage(
             ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
     stats: dict[str, _PhaseTrialStats] = {}
     for phase in phases:
@@ -905,7 +905,7 @@ def read_trial_stats(
             )
         except StudySchemaMismatchError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
     return stats
 

@@ -652,7 +652,7 @@ def _registry_attempt_fail_stale_trial(
         trials = study.get_trials(deepcopy=False)
     except StudySchemaMismatchError:
         raise
-    except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
+    except Exception:  # unreachable storage keeps the entry for retry
         log.warning(
             "Attempt registry entry %s references storage that cannot be "
             "read right now; the stale trial will be retried on a later run.",

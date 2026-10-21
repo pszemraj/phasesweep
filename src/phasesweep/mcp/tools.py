@@ -1623,7 +1623,7 @@ class PhaseSweepMCP:
         runner_acknowledged = False
         try:
             with open_private_text(log_path, "w") as log_file:
-                proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
+                proc = subprocess.Popen(  # argv list, no shell, server-controlled
                     cmd,
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,

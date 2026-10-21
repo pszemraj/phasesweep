@@ -1064,7 +1064,7 @@ def test_supervised_deadline_uses_remaining_budget(
 
     real_write_identity = _process._write_process_identity
 
-    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
+    def slow_write_identity(path, identity):
         real_write_identity(path, identity)
         time.sleep(identity_delay)
 
@@ -1476,7 +1476,7 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     """Host-global hidepid failures do not poison an unrelated trainer group."""
     real_iterdir = Path.iterdir
 
-    def fake_iterdir(path: Path):  # noqa: ANN202
+    def fake_iterdir(path: Path):
         if path == Path("/proc"):
             return iter((Path("/proc/11"), Path("/proc/22")))
         return real_iterdir(path)
@@ -1511,7 +1511,7 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
 
     real_open = builtins.open
 
-    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):  # noqa: ANN202
+    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):
         if path == "/proc/11/stat":
             return io.BytesIO(b"11 (trainer) Z 1 1234 0")
         if path == "/proc/22/stat":

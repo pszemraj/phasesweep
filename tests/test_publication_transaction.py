@@ -110,7 +110,7 @@ def _stored_experiment(tmp_path: Path, *, env: dict[str, str] | None = None):
     )
 
 
-def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:  # noqa: ANN001
+def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:
     """Return one generation's ``(config.snapshot.yaml, reproducibility.json)`` paths."""
     generation_dir = _generation_dir(experiment, generation_id)
     return (
@@ -779,7 +779,7 @@ def test_publication_refuses_invalid_winner_artifact(
 
     original = generation_ops._validate_generation_publishable
 
-    def delete_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
+    def delete_winner_then_validate(exp, generation_id: str) -> None:
         mutate_winner(_generation_winner_path(exp, generation_id, "p"))
         original(exp, generation_id)
 
@@ -1096,7 +1096,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
     parsed_summary_bytes = False
     original_safe_load = validation_ops.yaml.safe_load
 
-    def track_safe_load(stream):  # noqa: ANN001, ANN202
+    def track_safe_load(stream):
         nonlocal parsed_summary_bytes
         if isinstance(stream, bytes):
             parsed_summary_bytes = True
@@ -1797,7 +1797,7 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
 def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     tmp_path: Path,
     filename: str,
-    mutate,  # noqa: ANN001
+    mutate,
     error_match: str,
 ) -> None:
     """Re-hashing an edited provenance file into the manifest does not launder it.

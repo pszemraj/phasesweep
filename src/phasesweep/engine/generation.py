@@ -99,7 +99,7 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
     """
     try:
         action()
-    except BaseException:  # noqa: BLE001
+    except BaseException:
         log.exception(message)
 
 

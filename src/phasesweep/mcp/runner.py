@@ -549,14 +549,14 @@ def _write_status(
                 "outcome is unaffected but this run has no terminal MCP evidence"
             )
             return False
-        except Exception as exc:  # noqa: BLE001 - terminal evidence must not mask the run's exit
+        except Exception as exc:  # terminal evidence must not mask the run's exit
             log.exception("failed to write status.json with the captured result snapshot")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
             try:
                 _write_status_file_with_retry(status_path, terminal)
-            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+            except Exception:  # no further persistence fallback is available
                 log.exception("failed to write status.json without the result snapshot")
                 return False
             return True
@@ -567,7 +567,7 @@ def _write_status(
             terminal["result_snapshot"] = finalize_result_snapshot(
                 result_snapshot,
             )
-        except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
+        except Exception as exc:  # minimal terminal evidence is already durable
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
@@ -584,14 +584,14 @@ def _write_status(
                 "recoverable with `phasesweep mcp recover-run`"
             )
             return True
-        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
+        except Exception as exc:  # preserve a serializable failed state
             log.exception("failed to finalize result snapshot state in status.json")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = type(exc).__name__
             try:
                 _write_status_file_with_retry(status_path, terminal)
-            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+            except Exception:  # no further persistence fallback is available
                 log.exception("failed to persist result snapshot finalization failure")
         return True
 
@@ -819,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
                             generation_id=report.generation_id,
                             engine_winners=report.winners,
                         )
-                    except Exception as exc:  # noqa: BLE001 - preserve engine terminal cause
+                    except Exception as exc:  # preserve engine terminal cause
                         result_snapshot_error = type(exc).__name__
                         logging.getLogger("phasesweep.mcp.runner").exception(
                             "failed to capture terminal result snapshot under the experiment lock"
@@ -859,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_error=_recorded_cleanup_error(terminal_report),
             )
         raise
-    except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
+    except BaseException as exc:  # record every terminal cause, then re-raise
         status["returncode"] = 1
         primary, failure_stage = _terminal_error(terminal_report, exc)
         cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError)
@@ -888,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
                 result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
                     mode="json"
                 )
-            except Exception as exc:  # noqa: BLE001 - preserve the terminal engine failure
+            except Exception as exc:  # preserve the terminal engine failure
                 result_snapshot_error = type(exc).__name__
             else:
                 status["generation_unavailable_reason"] = "engine_generation_not_claimed"

@@ -486,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         produced_by = _produced_by(source_root)
         try:
             generate(out_dir, scratch=sandbox, produced_by=produced_by, notes=args.notes)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
     print(f"generated {FIXTURE_NAME} under {out_dir}")

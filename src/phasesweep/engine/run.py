@@ -420,7 +420,7 @@ def _run_experiment_outcome(
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
-                except BaseException as tracking_exc:  # noqa: BLE001 - primary error must survive
+                except BaseException as tracking_exc:  # primary error must survive
                     if (
                         isinstance(tracking_exc, PhaseSweepShutdown)
                         and not tracking_exc.report.cleanup_confirmed
@@ -484,7 +484,7 @@ def _run_experiment_outcome(
                             failure_stage=("execution" if generation_prepared else "preflight"),
                         )
                     terminal_callback(terminal_report)
-                except BaseException:  # noqa: BLE001
+                except BaseException:
                     # Callback failures cannot replace the committed result or the engine error.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 

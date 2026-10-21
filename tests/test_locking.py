@@ -796,9 +796,7 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
 
     with (
         _experiment_lock(exp_a),
-        pytest.raises(  # noqa: SIM117
-            ExperimentLockBusyError, match="Another phasesweep process"
-        ),
+        pytest.raises(ExperimentLockBusyError, match="Another phasesweep process"),
         _experiment_lock(exp_b),
     ):
         pass
@@ -818,7 +816,7 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
         workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'b.journal'}"
     )
 
-    with (  # noqa: SIM117 — testing that the inner enter raises
+    with (  # testing that the inner enter raises
         _experiment_lock(exp_a),
         pytest.raises(RuntimeError, match="output namespace|backend"),
         _experiment_lock(exp_b),

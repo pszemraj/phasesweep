@@ -110,7 +110,7 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     :return dict[str, Any]: Parsed top-level YAML mapping.
     """
     try:
-        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
+        data = yaml.load(text, Loader=_StrictMappingLoader)  # strict SafeLoader subclass
     except yaml.YAMLError as exc:
         if isinstance(exc, yaml.MarkedYAMLError):
             for mark in (exc.context_mark, exc.problem_mark):

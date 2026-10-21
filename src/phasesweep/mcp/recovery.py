@@ -961,7 +961,7 @@ def _finalize_stored_terminal_result_snapshot(
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
-    except Exception as exc:  # noqa: BLE001 - restore the prior view, then sort below
+    except Exception as exc:
         # Whatever failed, the prior frozen view is put back before it propagates.
         terminal_status["result_snapshot"] = raw_snapshot
         terminal_status["result_snapshot_state"] = prior_state

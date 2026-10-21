@@ -158,7 +158,7 @@ def main() -> None:
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
         sys.exit(_FAILURE_EXIT)
-    except Exception:  # noqa: BLE001 - the boundary's purpose is to report bugs
+    except Exception:  # the boundary's purpose is to report bugs
         click.echo("phasesweep: internal error — please report this traceback.", err=True)
         traceback.print_exc()
         sys.exit(_INTERNAL_EXIT)

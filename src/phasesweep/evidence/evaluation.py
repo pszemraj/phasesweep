@@ -754,7 +754,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     """
     try:
         _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
@@ -776,7 +776,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     try:
         _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
         value = json_float(raw_value, label=gate.key)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
@@ -841,7 +841,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         assert gate.key is not None
         try:
             _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")
