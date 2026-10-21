@@ -239,6 +239,55 @@ Set the top-level `override_format` to select the boundary your trainer accepts.
 
 `trainer_config` is the base for every format, and overrides apply to it at their dotted paths. Strings in it expand `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}` in every format. `argparse` and `hydra` flatten nested mappings into dotted keys, so each leaf must be a value that format can render: no mapping inside a list and no empty mapping. A nonempty `trainer_config` makes the format's placeholder required, because the base has to reach the trainer; a constant command may omit its placeholder only when `trainer_config` and every phase's composed overrides are empty. Incompatible placeholders are rejected too. For `yaml_file` and `json_file`, `overrides_resolved.json` is the flat audit record of the overrides alone; for `argparse` and `hydra` it is the trainer input and holds the merged flat mapping, which is the overrides alone when `trainer_config` is empty. YAML input contains the complete base configuration plus overrides. All phases' compositions are validated before launch, including dotted-key collisions and choices indistinguishable on the trainer wire.
 
+### Hugging Face argparse recipe
+
+This uses Hugging Face's [Transformers v4.57.3 `run_glue.py`](https://github.com/huggingface/transformers/blob/v4.57.3/examples/pytorch/text-classification/run_glue.py) without a wrapper trainer. Use that script with its matching Transformers library and [example dependencies](https://github.com/huggingface/transformers/blob/v4.57.3/examples/pytorch/text-classification/requirements.txt), replace `execution.cwd` with your checkout, and follow [source-checkout preflight](#source-checkout-preflight). The script's `--do_train` and `--do_eval` flags stay in the command; scalar settings become argparse options.
+
+Save this as `hf_sst2.yaml`. It schedules four fine-tunes: two learning rates, each measured at two trainer seeds, ranked by mean validation loss. `n_jobs: 1` runs them sequentially, using the default single-GPU policy when a GPU is available.
+
+```yaml
+experiment: hf_sst2
+storage: auto
+workdir: ./runs
+provenance:
+  trainer: transformers-v4.57.3-run_glue
+execution:
+  cwd: /absolute/path/to/transformers
+trial_command: >-
+  python examples/pytorch/text-classification/run_glue.py
+  --do_train --do_eval {overrides}
+override_format: argparse
+trainer_config:
+  model_name_or_path: distilbert/distilbert-base-uncased
+  task_name: sst2
+  output_dir: "{trial_dir}/hf"
+  report_to: none
+  max_seq_length: 128
+  per_device_train_batch_size: 16
+  num_train_epochs: 3
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {type: json, path: hf/eval_results.json, key: eval_loss}
+observe:
+  - name: accuracy
+    extractor: {type: json, path: hf/eval_results.json, key: eval_accuracy}
+  - name: train_runtime
+    extractor: {type: json, path: hf/train_results.json, key: train_runtime}
+phases:
+  - name: learning_rate
+    n_trials: 4
+    n_jobs: 1
+    sampler: {type: grid}
+    search_space:
+      learning_rate: {type: categorical, choices: [0.00002, 0.00005]}
+    repeats: {key: seed, values: [11, 22], reduce: mean}
+```
+
+The script saves `eval_results.json` and `train_results.json` under its `output_dir`, so these extractor paths read beneath `{trial_dir}/hf`. Accuracy and training runtime are report-only observations; the loss decides the winner. This JSON objective has `evaluation_point: n/a`; use the [`json_envelope` reporting contract](#reporting-an-objective) when the evaluated checkpoint and progress must be recorded.
+
+Review `phasesweep validate hf_sst2.yaml` and `phasesweep run hf_sst2.yaml --dry-run` before launching `phasesweep run hf_sst2.yaml`. Model and dataset downloads and the four training runs belong to that launch.
+
 ## Objective evidence, constraints, and gates
 
 The metric is a finite scalar extracted after the trainer exits successfully. Use the reader that matches the trainer's existing reporting:
@@ -344,6 +393,8 @@ The reader receives the trainer's composed authentication and transport environm
 W&B's source is keyed by attempt ID; it makes none of the envelope's evaluation-metadata or trainer-input-content assurances. It only records where in the run's history the objective's value was logged. Report through `json_envelope` instead when the checkpoint behind the value must be recorded.
 
 ## Trainer contract
+
+Every relative local evidence `path` uses `{trial_dir}` as its base. For `path: hf/eval_results.json`, set the trainer's output directory to `{trial_dir}/hf` so it writes the file PhaseSweep reads.
 
 The trainer runs in `execution.cwd` when configured (a relative value resolves against the YAML file's directory), otherwise in the directory PhaseSweep was started from, or the catalog entry's `cwd` under MCP. It receives the configured environment plus PhaseSweep-managed attempt identity, evidence-path, trainer-input, and GPU variables. Use `execution.inherit_env` to choose ambient variables and `execution.passthrough_env` for rotating credentials or transport settings. Top-level `env` values remain semantic configuration.
 
