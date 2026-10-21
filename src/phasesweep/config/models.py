@@ -34,6 +34,7 @@ from phasesweep.config.search import (
     sampler_capability_line,
     sampler_search_space,
     sampler_warnings,
+    search_space_warnings,
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
@@ -215,6 +216,7 @@ def experiment_disclosures(
             [
                 (False, sampler_capability_line(phase, experiment.resolved_storage)),
                 *((True, line) for line in sampler_warnings(phase)),
+                *((True, line) for line in search_space_warnings(phase)),
             ],
         )
 

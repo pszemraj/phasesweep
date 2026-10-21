@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -354,6 +356,75 @@ def sampler_warnings(phase: Phase) -> list[str]:
             f"<= {count} repeats.values, so one configuration that fails on every repeat value "
             "can abort the phase by itself; under seeded random its repeats run back to back. "
             f"Set max_consecutive_failures above {count}."
+        )
+    return warnings
+
+
+_MAX_REPORTED_CHOICES = 6
+_EXPONENT_LITERAL = re.compile(r"([+-]?\d+)(?:\.(\d*))?e([+-]?)(\d+)")
+_MAX_DECIMAL_SPELLING_CHARS = 24
+
+
+def _is_numeric_string(choice: object) -> bool:
+    """Say whether a categorical choice is a string that Python reads as a finite float.
+
+    :param object choice: One configured categorical choice.
+    :return bool: ``True`` for a string such as ``"1e-4"`` that YAML 1.1 left as text.
+    """
+    if not isinstance(choice, str):
+        return False
+    try:
+        return math.isfinite(float(choice))
+    except ValueError:
+        return False
+
+
+def _numeric_spellings(text: str) -> str:
+    """Spell a numeric string as the YAML 1.1 numbers that mean it.
+
+    :param str text: A string for which :func:`_is_numeric_string` holds.
+    :return str: The decimal-point-and-signed-exponent form and the plain decimal form
+        joined by ``or`` for an exponent, otherwise the number unquoted.
+    """
+    stripped = text.strip()
+    match = _EXPONENT_LITERAL.fullmatch(stripped.lower())
+    if match is None:
+        return f"{stripped} without quotes"
+    whole, fraction, sign, exponent = match.groups()
+    spellings = [f"{whole}.{fraction or '0'}e{sign or '+'}{exponent}"]
+    plain = format(Decimal(stripped), "f")
+    if len(plain) <= _MAX_DECIMAL_SPELLING_CHARS:
+        spellings.append(plain)
+    return " or ".join(spellings)
+
+
+def search_space_warnings(phase: Phase) -> list[str]:
+    """List advisory search-space warnings without blocking execution.
+
+    A categorical choice that is a string reading as a float, such as ``1e-4``, is what
+    PyYAML's YAML 1.1 typing makes of an exponent without a decimal point and sign. The
+    trainer then receives text where it expects a number.
+
+    :param Phase phase: Phase whose categorical choices are checked.
+    :return list[str]: One sentence per categorical key with such choices, empty when
+        nothing is amiss.
+    """
+    warnings: list[str] = []
+    for key, param in phase.search_space.items():
+        if not isinstance(param, CategoricalParam):
+            continue
+        numeric = [choice for choice in param.choices if _is_numeric_string(choice)]
+        if not numeric:
+            continue
+        shown = [repr(choice) for choice in numeric[:_MAX_REPORTED_CHOICES]]
+        if len(numeric) > _MAX_REPORTED_CHOICES:
+            shown.append(f"and {len(numeric) - _MAX_REPORTED_CHOICES} more")
+        warnings.append(
+            f"Phase {phase.name!r}: search_space {key!r} has categorical choices that load as "
+            f"strings, not numbers: {', '.join(shown)}. YAML 1.1 leaves an exponent without a "
+            "decimal point and sign as text (so does a quoted number), and the trainer "
+            f"receives a string. Write {numeric[0].strip()} as {_numeric_spellings(numeric[0])}, "
+            "and the rest likewise, or ignore this if the strings are intended."
         )
     return warnings
 

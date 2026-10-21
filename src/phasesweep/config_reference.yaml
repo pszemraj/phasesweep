@@ -344,6 +344,7 @@ phases: list[object] (required)
         # Under override_format argparse and hydra the choices must also render to distinct command-line values, so [1, "1"] fails under argparse. This applies to every sampler.
         # Requires: phases[].sampler.type is not cmaes; grid enumerates these choices.
         # Warning: YAML scalar types are kept, so a bare 1e-3 is the string "1e-3" here. Write 1.0e-3 or 0.001 for a float and quote strings that look like numbers.
+        # phasesweep validate and run --dry-run warn about each categorical key with a string choice that Python reads as a finite float, such as 1e-3, quoted or not, naming the phase, the key and the values. The warning is advisory and stays for a string that is meant as text.
         choices: list[null | bool | int | float | string] (required)
 
         # Variant float; selected by type: float.
