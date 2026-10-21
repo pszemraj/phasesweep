@@ -702,7 +702,7 @@ def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error()
 
 
 def test_trial_command_accepts_supported_templates() -> None:
-    """Accepted templates include normal overrides, format specs, and no-override phases."""
+    """Accepted templates include a format spec on {overrides} and plain ones naming {trial_dir} and {overrides}."""
     cases = [
         (
             "field_format_spec",
@@ -730,9 +730,7 @@ def test_trial_command_accepts_supported_templates() -> None:
 
 
 def test_override_keys_reject_malformed_and_shell_unsafe_values() -> None:
-    """argparse/Hydra can't render an override of an empty or
-    whitespace-bearing key correctly. We reject these at config-load.
-    """
+    """Override keys with empty or dot-edge segments, whitespace, shell-special characters, or path separators are rejected at config load."""
     malformed_keys = [
         "",  # empty string
         ".",  # single dot

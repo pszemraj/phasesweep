@@ -565,10 +565,10 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
-    # The operator's documented remedy is now viable: with a fresh/larger
-    # budget, the remaining attempt can run instead of the stale failure abort
-    # rejecting the invocation during phase startup.
+    # With a fresh, larger budget the remaining attempt runs; no failure abort
+    # is recorded to block it at phase startup.
     offset["seconds"] = 0.0
+    # Overwrites the failing trainer at the same path the experiment already names.
     write_constant_trainer(tmp_path)
     monkeypatch.setattr(phase_mod, "launch_trial", real_launch_trial)
     winners = run_experiment(exp)
@@ -895,8 +895,8 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     """A quick trainer with slow extraction times out and publishes nothing.
 
     The trainer finishes inside the 0.5s budget but extraction takes 3s. The
-    run must report a timeout rather than publish ``incomplete: false`` more
-    than 2x past both limits.
+    run must report a timeout rather than publish a complete winner, and must
+    return within 20s of starting.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(

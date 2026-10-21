@@ -181,7 +181,7 @@ def _leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
 
 
 def _remote_example(tmp_path, monkeypatch):
-    """Run the native example against in-process MLflow answers and a no-op trainer."""
+    """Patch the MLflow request operations with in-process answers; return the native example config and the list collecting uploads."""
     config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
     config.update(
         workdir=str(tmp_path / "runs"),

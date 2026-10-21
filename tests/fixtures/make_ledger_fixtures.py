@@ -295,9 +295,9 @@ def _computed_expectations(paths: FixturePaths) -> dict[str, str]:
     """Derive the verdict each mode owes this fixture, from the produced bytes.
 
     The artifact-root binding is validated before the ledger is scanned, so a
-    missing or mismatched binding decides the ``tree`` verdict on its own; the
-    ledger decides ``ledger-only`` and any ``tree`` read whose binding is
-    current.
+    mismatched binding decides the ``tree`` verdict on its own, and so does a
+    missing one beside a durable tree. Otherwise the ledger decides both
+    ``tree`` and ``ledger-only``.
 
     :param FixturePaths paths: Produced fixture.
     :return dict[str, str]: Verdict per mode.

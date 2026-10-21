@@ -111,11 +111,9 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
         signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
         assert received == [], "signal fired before scope exit"
 
-    # Scope exit order: block -> restore handlers -> restore mask. The pending
-    # SIGTERM is delivered on the final unblock, by which point the HOST handler
-    # (not phasesweep's) is installed. CPython only invokes the Python-level handler
-    # at the next eval-breaker check, not necessarily synchronously with the
-    # unblocking call, so poll briefly instead of asserting immediately.
+    # CPython only invokes the Python-level handler at the next eval-breaker check,
+    # not necessarily synchronously with the unblocking call, so poll briefly
+    # instead of asserting immediately.
     deadline = time.monotonic() + 2.0
     while not received and time.monotonic() < deadline:
         time.sleep(0.001)

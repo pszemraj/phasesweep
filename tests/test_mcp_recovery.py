@@ -1014,7 +1014,7 @@ def test_damaged_tracking_receipt_is_not_cleanup_evidence(
 def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str
 ) -> None:
-    """The real sync retires a tracking entry in any generation scope, with its proof kept."""
+    """The real sync retires a tracking entry only in its own generation, and recover-run clears the run either way."""
     pytest.importorskip("mlflow")
     from tests.tracking_helpers import _remote_example
 

@@ -142,7 +142,7 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
 def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     tmp_path: Path,
 ) -> None:
-    """A publication that no longer validates adds two keys and invents nothing.
+    """A publication that no longer validates adds one key, ``publication_error``, and invents nothing.
 
     The payload for a corrupt publication must differ from the one for a tree
     that never published; if the two were identical, the operator's natural

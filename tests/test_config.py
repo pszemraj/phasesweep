@@ -893,12 +893,7 @@ phases:
 
 
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
-    """A parser/scanner error must carry the file path, not PyYAML's stream label.
-
-    Bad indentation is one of the two most common YAML mistakes. PyYAML marks it
-    ``in "<unicode string>"``, so an unwrapped error leaves an operator with a
-    line number and no file - useless for a suite that loads several configs.
-    """
+    """A parser/scanner error must carry the file path, not PyYAML's ``<unicode string>`` label."""
     config_path = tmp_path / "broken.yaml"
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 

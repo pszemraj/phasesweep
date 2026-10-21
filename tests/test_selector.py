@@ -300,7 +300,7 @@ def test_metric_bounds_note_without_a_completed_value() -> None:
 
 
 def _axis(reduce: str = "mean", *, slot_size: int | None = None) -> RepeatAxis:
-    """Return a ``seed`` repeat axis over three values, slotted for seeded random."""
+    """Return a ``seed`` repeat axis over values 0-2 with the given ``reduce`` and ``slot_size`` (None leaves it unslotted)."""
     assert reduce in ("mean", "median")
     return RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=slot_size)
 

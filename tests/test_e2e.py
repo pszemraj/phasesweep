@@ -1,7 +1,6 @@
 """End-to-end: run all three phases against the fake training script.
 
 Verifies:
-  - Phase chaining: depth winner is fixed during lr phase, etc.
   - Constraint enforcement: 16-layer trial violates 16 MiB budget and is excluded.
   - Winner persistence: winner.yaml + summary.yaml written.
   - Replay: --from-phase loads prior winners.

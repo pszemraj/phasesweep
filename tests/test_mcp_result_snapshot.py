@@ -351,10 +351,11 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     monkeypatch: pytest.MonkeyPatch,
     storage_kind: str,
 ) -> None:
-    """Unavailable trial storage freezes explicit flags without a redundant study read.
+    """A storage-less experiment freezes explicit flags without a redundant study read.
 
     ``running_attempts`` is ``None`` rather than ``[]`` here: nothing was read,
-    so an empty list would claim there are no RUNNING rows.
+    so an empty list would claim there are no RUNNING rows. A corrupt journal
+    raises instead of freezing.
     """
     storage = None
     if storage_kind == "corrupt-journal":
@@ -601,9 +602,9 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         TRIAL_OUTCOME_ATTR,
         trial_outcome(1, "failure"),
     )
-    # A RUNNING row written before attempt identity existed: reported with
-    # null identity, never dropped, so the counts and the list agree. It
-    # recorded nothing, so recovery records it as interrupted.
+    # A RUNNING row with no attempt identity: reported with null identity, never
+    # dropped, so the counts and the list agree. It recorded nothing, so recovery
+    # records it as interrupted.
     study.ask()
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -841,13 +842,8 @@ def test_failed_fingerprint_preflight_preserves_published_results(
 
     assert len(callback_generations) == 1
     assert len(captured) == 1
-    # current_generation_id is always the actual mutable pointer, which this
-    # failed preflight attempt does legitimately claim (a new invocation
-    # overwrites it with "preflighting" before it knows whether preflight
-    # will succeed). published_generation_id is always the actual validated
-    # last-success pointer -- the *first* (successful) run here -- never
-    # forced to equal the pinned generation_id, even though this pinned
-    # capture's own represented_generation_id is that failed generation.
+    # The failed attempt claims current_generation_id, while published_generation_id
+    # stays the first run's and is not forced to equal the pinned generation.
     assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
     assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
     assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]

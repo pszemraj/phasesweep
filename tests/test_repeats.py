@@ -76,7 +76,10 @@ _GROUPS = [[0, 2, 4], [1, 3, 5]]
 
 
 def _metric(payload: JsonObject) -> float:
-    """Return the aggregate a payload's members reduce to."""
+    """Reduce the member metrics of a pristine ``_payload`` with ``payload``'s reducer.
+
+    The payload's own members are not read, so a test that edits them still passes the true aggregate.
+    """
     repeats = payload["repeats"]
     assert isinstance(repeats, dict)
     reduce = repeats["reduce"]

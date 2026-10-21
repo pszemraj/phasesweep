@@ -1534,11 +1534,8 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
     assert len(study.trials) == 1
 
 
-# A pairwise-unequal mixed-type choice set. `True` is not equal to 0, 1.5, or
-# "one", so config validation accepts it and Optuna's `choices.index(value)`
-# lookup resolves each sampled value to its own index. That is the property
-# `CategoricalParam` enforces: a choice set containing 1 alongside True would
-# collapse both onto one index the moment Optuna recorded `FrozenTrial.params`.
+# A pairwise-unequal mixed-type choice set: `True` equals none of the others, so
+# config validation accepts it and each sampled value keeps its own index.
 _FIDELITY_CHOICES: list[Any] = [0, 1.5, "one", True]
 
 # Trainer losses keyed by the rendered argparse token for each choice, chosen so

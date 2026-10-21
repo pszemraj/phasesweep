@@ -250,14 +250,10 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
 ) -> None:
     """Reads skip a bad final line exactly as Optuna does; a write repairs it and proceeds.
 
-    Optuna's reader skips a final line that lacks its newline or does not
-    decode, so status reports the complete records a live load would see. A
-    write does not refuse on sight: under the PhaseSweep inode lock it
-    backs the damaged bytes up beside the journal, cuts the journal back to
-    its last complete record, and continues. When nothing survives the cut
-    (``keep_prefix=False``) and a generation already published a winner from
-    this study, the truncation still leaves that publication's evidence gone
-    -- a real, later, unrelated refusal the repair cannot paper over.
+    When the repair leaves nothing of the journal (``keep_prefix=False``) and a
+    generation already published a winner from this study, the truncation still
+    leaves that publication's evidence gone -- a real, later, unrelated refusal
+    the repair cannot paper over.
     """
     from phasesweep.engine.errors import PublishedStudyMissingError
 

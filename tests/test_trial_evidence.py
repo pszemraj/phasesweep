@@ -299,7 +299,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 # The constant objective of ``write_constant_trainer``, but trial 1 exits
 # non-zero until a recovery marker file appears. Used to produce a *genuine*
 # generation that crashed between a trial completing and anything being
-# published (see the carve-out control).
+# published.
 _FLAKY_TRAINER = """
 import argparse, sys
 from pathlib import Path

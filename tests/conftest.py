@@ -537,7 +537,7 @@ def make_experiment(
 
 
 def write_yaml(tmp_path: Path, body: str) -> Path:
-    """Write a YAML body verbatim to ``tmp_path/exp.yaml``; return the path.
+    """Write a YAML body, dedented, to ``tmp_path/exp.yaml``; return the path.
 
     Body is passed through ``textwrap.dedent`` so callers can use indented
     triple-quoted strings naturally. No ``.format()`` magic — if a test

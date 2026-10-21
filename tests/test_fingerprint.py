@@ -298,8 +298,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     # The first (arch) convenience copy completed before the injected failure; the
-    # second one (lr, or the summary) did not. Either way, reads resolve via
-    # the generation-scoped artifact once any generation has published.
+    # second one (lr, or the summary) did not.
     assert {
         view.phase
         for view in read_result(
@@ -1240,11 +1239,7 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The published-phase existence read keeps strict storage-error semantics.
-
-    Opening a study reads its trials too, so the failure is confined to the
-    published check rather than raised from every ``get_trials`` call.
-    """
+    """The published-phase existence read keeps strict storage-error semantics."""
     import phasesweep.engine.ledger as ledger
 
     materialized = materialize("current-journal", tmp_path, mode="tree")

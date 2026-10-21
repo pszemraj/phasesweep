@@ -68,7 +68,7 @@ def test_positions_count_new_draws_and_give_each_rerun_its_source_position() -> 
 
 @pytest.mark.parametrize("source", [5, "1", None, 2], ids=["later", "text", "null", "self"])
 def test_a_rerun_must_name_an_earlier_trial(source: object) -> None:
-    """A marker that names no earlier trial is refused instead of shifting every later position."""
+    """A rerun marker that is later, non-integer, or the trial's own number is refused; a null marker is a new draw."""
     trial = _trial(2)
     trial.user_attrs[RERUN_OF_ATTR] = source
     if source is None:

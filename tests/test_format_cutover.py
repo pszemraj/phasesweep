@@ -110,7 +110,7 @@ def test_unmarked_output_root_is_refused_before_mutation(
 def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     tmp_path: Path,
 ) -> None:
-    """A publication with the preceding winner format is refused before any write."""
+    """An artifact root whose binding records an unsupported format version is refused before any write."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     generation = published_generation_id(experiment)

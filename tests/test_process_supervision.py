@@ -438,7 +438,7 @@ def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A missing identity after Popen cannot retain the pre-launch marker."""
+    """With no process identity and unconfirmed cleanup, the ``launching`` marker stays for recovery."""
     import phasesweep.runtime.process as process
 
     real_abort_launch = process._abort_launch
@@ -636,7 +636,7 @@ def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
 @pytest.mark.parametrize(
     ("poison_file", "marker_name", "attempt_id"),
     [
-        # Running the supervisor with ``-m phasesweep.runtime.supervisor`` under the FULL trainer environment, including any ``PYTHONPATH`` composed from ``experiment.env``, would execute a shadowed ``phasesweep`` package at import time, before ``process_identity.json`` exists. The supervisor is launched as a stdlib-only script directly under a sanitized ``{"PATH": ...}`` environment instead.
+        # The supervisor runs as a stdlib script under a PATH-only env: ``-m`` under the trainer env would import a shadowed ``phasesweep`` before ``process_identity.json`` exists.
         pytest.param(
             "phasesweep/__init__.py",
             "poison-marker",

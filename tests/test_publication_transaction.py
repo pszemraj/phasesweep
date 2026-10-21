@@ -1046,16 +1046,13 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
     record["state"] = "failed"
     record_path.write_text(yaml.safe_dump(record))
 
-    # The tampered state has no effect: the record is not consulted.
     assert published_generation_id(experiment) == generation_id
     assert read_result(experiment, phase_names=["p"])[1] != []
 
 
 # --------------------------------------------------------------------------
-# Publication integrity states. "Nothing published" and "the recorded
-# publication no longer validates" are different facts and must never collapse
-# into the same answer: reporting corruption as a fresh tree invites a re-run,
-# which advances the pointer and leaves the corruption flagged nowhere.
+# Publication integrity states: nothing published and a recorded publication
+# that no longer validates are distinct facts.
 # --------------------------------------------------------------------------
 
 
@@ -1700,15 +1697,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     tmp_path: Path,
     filename: str,
 ) -> None:
-    """A provenance file this user may not read fails closed with its own reason.
-
-    ``config.snapshot.yaml`` is owner-only, so a second operator reading a
-    perfectly healthy tree must not get the generic "missing or unreadable"
-    verdict and the "inspect or restore the generation namespace" remedy --
-    for a permission bit. The verdict is ``permission_denied`` (an
-    unvalidatable tree is still not exposed as a published one), and the
-    reason points at the publishing user.
-    """
+    """A provenance file this user may not read reports ``permission_denied`` and names the publishing user."""
     experiment, generation_id = golden_publication(tmp_path)
 
     target = _generation_dir(experiment, generation_id) / filename
