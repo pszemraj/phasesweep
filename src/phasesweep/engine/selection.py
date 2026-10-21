@@ -91,6 +91,15 @@ class NoFeasibleTrialError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
+class PhaseAbortRefusedError(NoFeasibleTrialError):
+    """Raised when a phase's recorded abort or failure streak stops a run before it launches a trial.
+
+    It subclasses :class:`NoFeasibleTrialError`, so callers that catch that error still catch it.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 @dataclass(frozen=True)
 class _GroupRanking:
     """The complete repeat groups of one phase study and what selection left out."""

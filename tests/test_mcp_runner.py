@@ -48,7 +48,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -83,6 +83,7 @@ from tests.conftest import (
     mark_current_format,
     requires_nonroot,
     write_constant_trainer,
+    write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
@@ -278,6 +279,35 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert remediation_fragment in str(failure["remediation"])
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "stage"),
+    [
+        pytest.param(
+            TrialTargetRefusedError("target moved backward"),
+            "trial_target_refused",
+            "preflight",
+            id="target",
+        ),
+        pytest.param(
+            PhaseAbortRefusedError("phase previously aborted"),
+            "trial_target_refused",
+            "preflight",
+            id="prior_abort",
+        ),
+        pytest.param(
+            NoFeasibleTrialError("trainer failed"), "trainer_failed", "execution", id="trainer"
+        ),
+    ],
+)
+def test_a_refusal_before_any_launch_reports_preflight_whatever_stage_the_engine_gave(
+    error: RuntimeError, code: str, stage: str
+) -> None:
+    """The engine reports ``execution`` once its preflight passes, but a refusal raised by the phase launched no trainer."""
+    failure = mcp_runner._terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
+
+    assert (failure["code"], failure["stage"]) == (code, stage)
 
 
 def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
@@ -548,6 +578,38 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     other_status = asyncio.run(app.await_run(other_relaunch["run_id"], timeout_seconds=30))
     assert other_status["reason"] == "terminal"
     assert other_status["run"]["state"] == "succeeded"
+
+
+@pytest.mark.integration
+def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rerun refused for a recorded abort launches no trainer, so it reports like the other refusals."""
+    monkeypatch.chdir(tmp_path)
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'abort.journal'}",
+        trainer=trainer,
+        n_trials=2,
+        max_consecutive_failures=1,
+        sampler={"type": "random", "seed": 7},
+    )
+    config_path = tmp_path / "experiment.yaml"
+    _write_experiment_config(config_path, experiment)
+    store = RunStore(tmp_path / "state")
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_claimed_runner(store, "aborting", config_path, experiment_id="t", cwd=tmp_path)
+    aborting = json.loads(store.status_path("aborting").read_text())["failure"]
+    assert (aborting["code"], aborting["stage"]) == ("trainer_failed", "execution")
+
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_claimed_runner(store, "refused", config_path, experiment_id="t", cwd=tmp_path)
+    refused = json.loads(store.status_path("refused").read_text())["failure"]
+    assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")
+    assert (refused["retryable"], refused["actor"]) == (False, "operator")
+    assert "correct the experiment configuration" in refused["remediation"]
 
 
 @pytest.mark.integration

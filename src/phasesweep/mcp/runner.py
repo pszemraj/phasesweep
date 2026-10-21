@@ -29,7 +29,7 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.run import PublicationHook, TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     OPERATOR_STEPS,
@@ -172,12 +172,15 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (TrialTargetRefusedError, "trial_target_refused"),
+    # Ahead of its parent: this refusal comes before any trainer runs.
+    (PhaseAbortRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )
 # Categories that only occur at one stage, whatever stage the caller reports.
 _FIXED_STAGES: dict[FailureCode, FailureStage] = {
     "experiment_busy": "preflight",
     "published_study_missing": "preflight",
+    "trial_target_refused": "preflight",
 }
 
 
@@ -230,8 +233,9 @@ def _base_failure_payload(
         clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
         falling back to ``"execution"`` for any other value. These error types
         override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError`, :class:`UnsafeLockPathError`, and
-        :class:`PublishedStudyMissingError`
+        :class:`ExperimentLockBusyError`, :class:`UnsafeLockPathError`,
+        :class:`PublishedStudyMissingError`, :class:`TrialTargetRefusedError`, and
+        :class:`PhaseAbortRefusedError`
         always report ``"preflight"`` and
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,

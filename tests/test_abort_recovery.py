@@ -15,7 +15,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -79,7 +79,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
 
     # Identical retry: no new work is schedulable (3/3 terminal trials), so the
     # durable abort must keep the phase failed instead of publishing.
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
 

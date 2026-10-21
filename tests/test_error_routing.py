@@ -55,7 +55,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -1705,7 +1705,7 @@ ORIGIN_CASES = (
     RoutingCase(
         id="prior_phase_abort",
         trigger=_rerun_aborted_phase,
-        raised=NoFeasibleTrialError,
+        raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
         message="phases[p].n_trials above 4 in the config",
     ),
@@ -1713,7 +1713,7 @@ ORIGIN_CASES = (
         # Raising the target does not retire an unsafe-cleanup abort; cleanup recovery does.
         id="prior_phase_abort_awaiting_cleanup_recovery",
         trigger=_preview_unconfirmed_cleanup_abort,
-        raised=NoFeasibleTrialError,
+        raised=PhaseAbortRefusedError,
         action=OperatorAction.RUN_RECOVER_RUN,
         message="First confirm the cleanup",
     ),
@@ -1764,7 +1764,7 @@ ORIGIN_CASES = (
     RoutingCase(
         id="failure_streak_at_limit",
         trigger=_resume_with_streak_at_limit,
-        raised=NoFeasibleTrialError,
+        raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
         message="meets max_consecutive_failures=2, so it launches no more trials",
     ),

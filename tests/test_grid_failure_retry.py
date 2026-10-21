@@ -22,7 +22,11 @@ from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.selection import NoFeasibleTrialError, _warn_unsuccessful_grid_cells
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    _warn_unsuccessful_grid_cells,
+)
 from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
@@ -461,7 +465,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
 
-    with pytest.raises(NoFeasibleTrialError) as refused:
+    with pytest.raises(PhaseAbortRefusedError) as refused:
         phase_ops._raise_streak_at_limit(phase, streak, _study(original))
     message = str(refused.value)
     assert "has 2 consecutive failed/infeasible trials" in message

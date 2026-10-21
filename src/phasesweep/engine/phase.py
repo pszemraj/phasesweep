@@ -44,7 +44,11 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
 from phasesweep.engine.repeats import repeat_axis
-from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    select_winner,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -418,11 +422,11 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     :param JsonObject abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
     :param optuna.Study study: The phase's study.
-    :raises NoFeasibleTrialError: Always; this function never returns
+    :raises PhaseAbortRefusedError: Always; this function never returns
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
-    raise NoFeasibleTrialError(
+    raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
         "Refusing to reinterpret those finished attempts as a successful phase."
@@ -440,11 +444,11 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         :func:`_failure_policy_abort_record`; supplies the replayed count and the
         accepted target.
     :param optuna.Study study: The phase's study.
-    :raises NoFeasibleTrialError: Always; this function never returns
+    :raises PhaseAbortRefusedError: Always; this function never returns
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
-    raise NoFeasibleTrialError(
+    raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
         f"max_consecutive_failures={phase.max_consecutive_failures}, so it launches no more "
@@ -554,7 +558,7 @@ def _judge_recorded_phase(
         see :func:`_select_phase_winner` for everything it covers.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
         target, or a fixed configuration asks for more attempts than it may retry.
-    :raises NoFeasibleTrialError: The phase aborted and the current config does not
+    :raises PhaseAbortRefusedError: The phase aborted and the current config does not
         retire the abort (see :func:`~phasesweep.engine.study_policy._config_retires_abort`),
         or its streak meets the current limit with work remaining, at an accepted
         target its current ``n_trials`` does not exceed.
@@ -1463,6 +1467,8 @@ def _run_phase(
         experiment-level wallclock guard.
     :raises NoFeasibleTrialError: ``max_consecutive_failures`` tripped or every trial was
         infeasible.
+    :raises PhaseAbortRefusedError: A recorded abort or a replayed failure streak stops the
+        phase before it launches a trial.
     :raises UnsafeProcessCleanupError: A trial's process group could not be confirmed dead;
         phase hard-aborted.
     :raises ArtifactRootConflictError: This phase's persistent study is bound to a different
