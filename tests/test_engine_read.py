@@ -581,8 +581,12 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     assert status["phases"][0]["published_study_unavailable"] is True
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
 
-    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+    with pytest.raises(PublishedStudyMissingError) as refused:
         run_experiment(experiment)
+    assert (
+        "has only 1 finished and 1 COMPLETE or INFEASIBLE trials, below the published "
+        "completion boundary (3 finished, 3 COMPLETE or INFEASIBLE)"
+    ) in str(refused.value)
 
     study = optuna.load_study(
         study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)

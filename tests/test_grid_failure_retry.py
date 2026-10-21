@@ -98,7 +98,9 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert trials[3].params == trials[1].params
     assert len(calls.read_text().splitlines()) == 4
     assert run_experiment(recovered)["p"].metric == 1.0
-    with pytest.raises(TrialTargetRefusedError, match="completed"):
+    with pytest.raises(
+        TrialTargetRefusedError, match="COMPLETE and INFEASIBLE cells are never repeated"
+    ):
         run_experiment(_grid(tmp_path, trainer, 5, repeats=repeats))
     assert len(calls.read_text().splitlines()) == 4
 

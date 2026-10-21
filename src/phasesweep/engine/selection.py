@@ -516,8 +516,9 @@ def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: 
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the bounds and the goal.
-    :return str: Text naming each set bound, then either the best COMPLETE finite value with
-        its trial number or that no COMPLETE trial has one; empty when the metric has no bounds.
+    :return str: Text naming each set bound, then either the best finite value among the
+        trials Optuna holds COMPLETE, infeasible ones included, with its trial number or that
+        none has one; empty when the metric has no bounds.
     """
     metric = experiment.metric
     named = [
@@ -536,11 +537,11 @@ def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: 
     ]
     note = f" Metric bounds: {', '.join(named)}."
     if not seen:
-        return note + " No COMPLETE trial recorded a finite metric value."
+        return note + " No COMPLETE or INFEASIBLE trial recorded a finite metric value."
     sign = 1.0 if metric.goal == "minimize" else -1.0
     best = min(seen, key=lambda t: (sign * _trial_value(t), t.number))
     return note + (
-        f" The best value among COMPLETE trials with a finite value is "
+        f" The best value among COMPLETE and INFEASIBLE trials with a finite value is "
         f"{_trial_value(best)!r} (trial {best.number})."
     )
 

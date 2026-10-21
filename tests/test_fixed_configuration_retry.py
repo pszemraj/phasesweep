@@ -121,9 +121,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     with pytest.raises(TrialTargetRefusedError) as repeated:
         run_experiment(attempt(3))
     assert str(repeated.value) == (
-        "Phase 'p' is a fixed configuration that already has a completed trial; n_trials=3 "
-        "would run the same configuration again. Keep n_trials at 2, or use repeats to "
-        "measure seed noise."
+        "Phase 'p' is a fixed configuration that already has a COMPLETE or INFEASIBLE trial; "
+        "n_trials=3 would run the same configuration again. Keep n_trials at 2, or use "
+        "repeats to measure seed noise."
     )
     assert _call_count(calls) == 2
 
@@ -194,7 +194,7 @@ def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Pat
         run_experiment(_fixed(tmp_path, trainer, 1, metric=bounded))
     assert _states(_fixed(tmp_path, trainer, 1)) == ["COMPLETE"]
 
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 2, metric=bounded))
     assert _call_count(calls) == 1
 
@@ -233,7 +233,7 @@ def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
     assert _call_count(calls) == 1
     assert _states(exp) == ["FAIL", "COMPLETE"]
 
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 2))
     assert _call_count(calls) == 1
 
@@ -294,7 +294,7 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
 
     run_experiment(_fixed(tmp_path, trainer, 2))
     run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
     assert _call_count(calls) == 2
 
@@ -360,7 +360,7 @@ def test_dry_run_logs_the_fixed_configuration_warning(
         (3, 0, 4, None),
         (3, 0, 5, "3 failed attempts and no completed one"),
         (1, 1, 1, None),
-        (1, 1, 2, "already has a completed trial; n_trials=2"),
+        (1, 1, 2, "already has a COMPLETE or INFEASIBLE trial; n_trials=2"),
         (2, 1, 2, None),
         (2, 1, 3, "Keep n_trials at 2"),
     ],

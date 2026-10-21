@@ -477,9 +477,9 @@ def fixed_configuration_target_refusal(
         return None
     if completed >= 1:
         return (
-            f"Phase {name!r} is a fixed configuration that already has a completed trial; "
-            f"n_trials={target} would run the same configuration again. Keep n_trials at "
-            f"{finished}, or use repeats to measure seed noise."
+            f"Phase {name!r} is a fixed configuration that already has a COMPLETE or "
+            f"INFEASIBLE trial; n_trials={target} would run the same configuration again. "
+            f"Keep n_trials at {finished}, or use repeats to measure seed noise."
         )
     if finished == 0:
         return (
@@ -515,7 +515,7 @@ def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str |
 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
-    :param int completed: Completed grid cells, feasible or not.
+    :param int completed: Grid cells whose trial completed, in bounds or not.
     :return str | None: Refusal when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, completed=completed)
@@ -524,9 +524,9 @@ def grid_target_refusal(phase: Phase, *, finished: int, completed: int) -> str |
     cardinality = grid_cardinality(phase)
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
-        f"attempts: {finished} finished attempts and {completed} completed cells in a "
-        f"{cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
-        "failed cells once each; completed cells are never repeated."
+        f"attempts: {finished} finished attempts and {completed} COMPLETE or INFEASIBLE cells "
+        f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
+        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated."
     )
 
 

@@ -38,6 +38,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _phase_study_name,
     _suggest,
+    _trial_count_state,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
@@ -126,7 +127,8 @@ def _winner_completion(
 
     :param int requested_trials: Trial target the phase was configured to reach.
     :param int finished_trials: Terminal trial count backing this completion.
-    :param int completed_trials: COMPLETE trial count backing this completion.
+    :param int completed_trials: Optuna COMPLETE trial count backing this completion,
+        infeasible trials included, so it can exceed the ``completed`` of ``status``.
     :param bool incomplete: Whether the phase stopped short of its trial target.
     :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
     :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
@@ -1399,12 +1401,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
+        # The count `status` calls completed: the finished trials that can win.
+        winnable = sum(_trial_count_state(trial) == "COMPLETE" for trial in trials_after)
         raise TimeoutError(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
-            f"after {completed_after}/{phase.n_trials} completed evaluations "
-            f"({finished_after} terminal trials). Refusing to select a winner "
-            "from an incomplete phase; set allow_incomplete_on_timeout: true "
-            "only when a partial decision is intentional."
+            f"after {finished_after}/{phase.n_trials} finished trials ({winnable} completed). "
+            "Refusing to select a winner from an incomplete phase; set "
+            "allow_incomplete_on_timeout: true only when a partial decision is intentional."
         )
     try:
         return _select_phase_winner(

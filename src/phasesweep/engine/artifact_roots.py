@@ -335,13 +335,13 @@ def _check_published_phase_studies(
                     if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
                     missing = (
-                        f"has only {finished} terminal and {completed} complete trials, below "
-                        "the published completion boundary"
+                        f"has only {finished} finished and {completed} COMPLETE or INFEASIBLE "
+                        "trials, below the published completion boundary"
                     )
                     if expected.finished_trials is not None:
-                        missing += f" ({expected.finished_trials} terminal"
+                        missing += f" ({expected.finished_trials} finished"
                         if expected.completed_trials is not None:
-                            missing += f", {expected.completed_trials} complete"
+                            missing += f", {expected.completed_trials} COMPLETE or INFEASIBLE"
                         missing += ")"
             except Exception as exc:
                 raise StudyStorageUnavailableError.rewrap(

@@ -27,6 +27,7 @@ from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    _bounded_metric,
     make_experiment,
     make_trial_context,
     write_constant_trainer,
@@ -252,7 +253,7 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     )
 
     if not allow_incomplete_on_timeout:
-        with pytest.raises(TimeoutError, match=r"after 1/2 completed evaluations \(1 terminal"):
+        with pytest.raises(TimeoutError, match=r"after 1/2 finished trials \(1 completed\)\."):
             run_experiment(exp)
         return
     completion = run_experiment(exp)["p"].completion
@@ -260,6 +261,26 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     assert completion["completed_trials"] == 1
     assert completion["finished_trials"] == 1
     assert completion["incomplete"] is True
+
+
+@pytest.mark.integration
+def test_timeout_message_counts_an_out_of_bounds_trial_as_finished_not_completed(
+    tmp_path: Path,
+) -> None:
+    """The finished trial read x=1.0 above metric.max, so `status` lists it INFEASIBLE, not completed."""
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
+    exp = make_experiment(
+        experiment="phase_timeout_infeasible",
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        metric=_bounded_metric(max=0.5),
+        n_trials=2,
+        timeout_seconds_per_phase=8.0,
+        sampler=Sampler(type="random", seed=0),
+    )
+
+    with pytest.raises(TimeoutError, match=r"after 1/2 finished trials \(0 completed\)\."):
+        run_experiment(exp)
 
 
 @pytest.mark.integration

@@ -124,8 +124,10 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
 
 
 def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of COMPLETE trials in ``trials``.
+    """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
 
+    A publication and an accepted partial decision record this count as ``completed_trials``.
+    ``status`` lists the INFEASIBLE trials apart, so its ``completed`` is this count less theirs.
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
@@ -184,7 +186,8 @@ def _meets_published_trial_history_boundary(
     """Return whether a study still holds the history a publication recorded.
 
     :param int finished: Terminal trials the study holds now.
-    :param int completed: COMPLETE trials the study holds now.
+    :param int completed: Trials the study holds now that Optuna has COMPLETE, infeasible ones
+        included.
     :param _TrialRef expected: Published trial whose recorded counts, when
         present, are the minimum.
     :return bool: ``True`` when both counts meet the recorded boundary.

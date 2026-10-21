@@ -404,7 +404,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
 
     refused = harness.experiment("refused", phase)
     (harness.gate / "hold-1").touch()
-    with pytest.raises(TimeoutError, match=r"after 1/3 completed evaluations"):
+    with pytest.raises(TimeoutError, match=r"after 1/3 finished trials \(1 completed\)"):
         run_experiment(refused)
     harness.release()
     longer = phase.model_copy(update={"timeout_seconds_per_phase": 600.0})
