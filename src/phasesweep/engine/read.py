@@ -9,6 +9,8 @@ represented generations are read permissively from their own files.
 from __future__ import annotations
 
 import logging
+import math
+import statistics
 import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -45,12 +47,14 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
+    ReduceName,
     RepeatsSummary,
     _repeats_summary,
     _validate_repeats_block,
     group_labels_for,
     repeat_axis,
 )
+from phasesweep.engine.selection import _rank_groups
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
@@ -60,6 +64,7 @@ from phasesweep.engine.state import (
     PublicationState,
     WinnerSource,
     _parse_winner_source,
+    _trial_interrupted,
     _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
@@ -632,6 +637,30 @@ def _read_status(
 
 
 @dataclass(frozen=True)
+class RepeatGroupView:
+    """Statistics over current completed members of one repeat configuration.
+
+    ``n`` counts finite measured values, including infeasible ones. Missing,
+    failed, interrupted and replaced attempts do not contribute. ``aggregate``
+    is present only when the full group is eligible under the current config;
+    ``sd`` needs at least two measurements. ``winner`` names the publication.
+    """
+
+    group: int
+    params: JsonObject
+    n: int
+    expected: int
+    reduce: ReduceName
+    aggregate: float | None
+    mean: float | None
+    sd: float | None
+    min: float | None
+    max: float | None
+    eligible: bool
+    winner: bool
+
+
+@dataclass(frozen=True)
 class TrialTable:
     """One phase's trials as table rows, in trial-number order.
 
@@ -649,6 +678,7 @@ class TrialTable:
     available: bool
     columns: tuple[str, ...]
     rows: tuple[JsonObject, ...]
+    groups: tuple[RepeatGroupView, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -710,6 +740,7 @@ def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
 
 
 def _trial_table(
+    experiment: Experiment,
     phase: Phase,
     trials: Sequence[optuna.trial.FrozenTrial],
     winner: PhaseWinnerView | None,
@@ -721,6 +752,7 @@ def _trial_table(
     A ``rerun_of`` column, naming the interrupted trial each rerun reran, appears
     once the phase holds a rerun.
 
+    :param Experiment experiment: Current metric and constraint eligibility bounds.
     :param Phase phase: The configured phase the trials belong to.
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
     :param PhaseWinnerView | None winner: The published winner for the phase, if any.
@@ -756,7 +788,74 @@ def _trial_table(
         )
         row[_WINNER_COLUMN] = "*" if marked else ""
         rows.append(row)
-    return TrialTable(phase=phase.name, available=available, columns=columns, rows=tuple(rows))
+    return TrialTable(
+        phase=phase.name,
+        available=available,
+        columns=columns,
+        rows=tuple(rows),
+        groups=_repeat_group_views(experiment, phase, trials, rows),
+    )
+
+
+def _repeat_group_views(
+    experiment: Experiment,
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    rows: Sequence[JsonObject],
+) -> tuple[RepeatGroupView, ...]:
+    """Summarize every represented configuration using the trial table's group labels.
+
+    :param Experiment experiment: Current selection bounds.
+    :param Phase phase: Configured repeat axis and reducer.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The same capture as the member rows.
+    :param Sequence[JsonObject] rows: Member rows carrying group and published-winner labels.
+    :return tuple[RepeatGroupView, ...]: Groups in ascending label order, empty without repeats.
+    """
+    axis = repeat_axis(phase)
+    if axis is None:
+        return ()
+    labels = group_labels_for(trials, axis)
+    ranking = _rank_groups(trials, experiment, axis)
+    eligible = {labels[group.representative]: group for group in ranking.groups}
+    replaced = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    marked = {row["trial"] for row in rows if row["winner"] == "*"}
+    members: dict[int, list[optuna.trial.FrozenTrial]] = {}
+    params: dict[int, JsonObject] = {}
+    for trial in trials:
+        label = labels.get(trial.number)
+        if label is None:
+            continue
+        members.setdefault(label, [])
+        params[label] = {name: value for name, value in trial.params.items() if name != axis.key}
+        if trial.number not in replaced and not _trial_interrupted(trial):
+            members[label].append(trial)
+    views: list[RepeatGroupView] = []
+    for label, found in sorted(members.items()):
+        values = [
+            float(trial.value)
+            for trial in found
+            if trial.state == optuna.trial.TrialState.COMPLETE
+            and trial.value is not None
+            and math.isfinite(trial.value)
+        ]
+        group = eligible.get(label)
+        views.append(
+            RepeatGroupView(
+                group=label,
+                params=params[label],
+                n=len(values),
+                expected=len(axis.values),
+                reduce=axis.reduce,
+                aggregate=None if group is None else group.aggregate,
+                mean=statistics.fmean(values) if values else None,
+                sd=statistics.stdev(values) if len(values) > 1 else None,
+                min=min(values) if values else None,
+                max=max(values) if values else None,
+                eligible=group is not None,
+                winner=bool(found) and all(trial.number in marked for trial in found),
+            )
+        )
+    return tuple(views)
 
 
 def read_trial_tables(experiment: Experiment) -> TrialTables:
@@ -789,10 +888,10 @@ def read_trial_tables(experiment: Experiment) -> TrialTables:
             read = read_phase_trials(ledger, phase)
         except StudyStorageUnavailableError as exc:
             log_storage_read_failure(ledger, phase, exc, logger=log)
-            tables.append(_trial_table(phase, [], None, available=False))
+            tables.append(_trial_table(experiment, phase, [], None, available=False))
             continue
         trials = [] if read is None else read.trials
-        tables.append(_trial_table(phase, trials, winners.get(phase.name)))
+        tables.append(_trial_table(experiment, phase, trials, winners.get(phase.name)))
     return TrialTables(
         experiment=experiment.experiment,
         published_generation_id=published_generation_id,

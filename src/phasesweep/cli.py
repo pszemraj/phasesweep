@@ -33,7 +33,7 @@ from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
 )
-from phasesweep.engine.read import TrialTable, TrialTables, read_trial_tables
+from phasesweep.engine.read import TrialTables, read_trial_tables
 from phasesweep.engine.run import experiment_status, run_experiment
 from phasesweep.errors import OPERATOR_STEPS, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
@@ -645,7 +645,7 @@ def _trial_cell(column: str, value: JsonValue) -> str:
 
 
 #: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner"})
+_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible"})
 
 
 def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
@@ -663,20 +663,21 @@ def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[
     return "  ".join(padded).rstrip()
 
 
-def _trial_table_lines(table: TrialTable) -> list[str]:
-    """Render one phase's trial rows as aligned plain text.
+def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str]:
+    """Render trial or group rows as aligned plain text.
 
-    :param TrialTable table: The phase's rows and columns.
-    :return list[str]: The header line followed by one line per trial, without trailing spaces.
+    :param Sequence[str] columns: Column names in display order.
+    :param Sequence[JsonObject] rows: Rows to display, with every named column present.
+    :return list[str]: The header line followed by one line per row, without trailing spaces.
     """
-    cells = [[_trial_cell(column, row[column]) for column in table.columns] for row in table.rows]
+    cells = [[_trial_cell(column, row[column]) for column in columns] for row in rows]
     widths = [
         max(len(column), *(len(row[index]) for row in cells))
-        for index, column in enumerate(table.columns)
+        for index, column in enumerate(columns)
     ]
     return [
-        _aligned_row(table.columns, table.columns, widths),
-        *(_aligned_row(table.columns, row, widths) for row in cells),
+        _aligned_row(columns, columns, widths),
+        *(_aligned_row(columns, row, widths) for row in cells),
     ]
 
 
@@ -706,7 +707,26 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
             note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
         lines.extend(["", f"=== {table.phase} === ({note})"])
         if table.rows:
-            lines.extend(_trial_table_lines(table))
+            lines.extend(_table_lines(table.columns, table.rows))
+        if table.groups:
+            groups: list[JsonObject] = [
+                {
+                    "group": group.group,
+                    "params": group.params,
+                    "n/expected": f"{group.n}/{group.expected}",
+                    "reduce": group.reduce,
+                    "aggregate": group.aggregate,
+                    "mean": group.mean,
+                    "sd": group.sd,
+                    "min": group.min,
+                    "max": group.max,
+                    "eligible": "yes" if group.eligible else "no",
+                    "winner": "*" if group.winner else "",
+                }
+                for group in table.groups
+            ]
+            lines.extend(["", "Repeat groups (statistics include infeasible measured members):"])
+            lines.extend(_table_lines(tuple(groups[0]), groups))
     return "\n".join(lines)
 
 
@@ -714,7 +734,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Print read-only trial counts and phase state for a phasesweep experiment, as YAML; "
-        "--trials prints one table of trials per phase instead."
+        "--trials prints trial and repeat-group tables per phase instead."
     ),
     short_help="Print read-only run status.",
 )
@@ -725,7 +745,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     is_flag=True,
     help=(
         "Print one aligned table of trials per phase (state, value, params, duration, "
-        "repeat group, observed values, winner) instead of the YAML status."
+        "repeat group, observed values, winner) and repeat-group statistics instead of YAML."
     ),
 )
 def status(config_path: Path, show_trials: bool) -> None:
