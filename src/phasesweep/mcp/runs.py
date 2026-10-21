@@ -112,7 +112,7 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
     """
     try:
         payload = json.loads(read_private_text(path))
-    except (OSError, UnsafePrivatePathError, UnicodeError, ValueError):
+    except (OSError, UnsafePrivatePathError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
 

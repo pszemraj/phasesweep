@@ -581,7 +581,7 @@ def _spawn_blocked_supervisor(
             raise RuntimeError("trial supervisor did not become ready before launch")
         try:
             trainer_pid = int(ready_frame[1:].decode("ascii"))
-        except (UnicodeDecodeError, ValueError) as exc:
+        except ValueError as exc:
             raise RuntimeError("trial supervisor reported an invalid trainer PID") from exc
         if trainer_pid <= 0:
             raise RuntimeError("trial supervisor reported an invalid trainer PID")

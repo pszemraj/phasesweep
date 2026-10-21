@@ -61,7 +61,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
         return None
     try:
         length = int(header.decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:
         return None
     if length < 0:
         return None
@@ -70,7 +70,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
         return None
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:
         return None
     if not isinstance(payload, dict):
         return None

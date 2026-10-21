@@ -288,7 +288,7 @@ def _read_proc_stat_result(proc_entry: Path) -> tuple[_ProcStat | None, bool]:
             pgrp=int(rest[2]),
             starttime=int(rest[19]),
         )
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:
         return None, False
     return stat, True
 

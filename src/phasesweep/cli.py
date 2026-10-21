@@ -499,7 +499,7 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
         payload = json_object(_load_yaml_mapping_from_text(path.read_text(encoding="utf-8"), path))
     except ConfigError:
         raise
-    except (UnicodeError, ValueError) as exc:
+    except ValueError as exc:
         raise ConfigError(f"{path}: {exc}") from exc
     created: list[CreatedKey] = []
     for setting in settings:
