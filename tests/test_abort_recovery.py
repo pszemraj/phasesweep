@@ -376,9 +376,12 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
     assert len(_study(initial).trials) == 2
 
 
-def _abort_fatally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Experiment, Path]:
-    """Run a three-trial random phase whose first trial hits an unexpected objective error.
+def _abort_fatally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **phase: object
+) -> tuple[Experiment, Path]:
+    """Run a three-trial phase whose first trial hits an unexpected objective error.
 
+    :param object phase: Phase fields that replace the seeded random sampler default.
     :return tuple[Experiment, Path]: The aborted experiment, and the log that gains a line
         for every trainer launch, which the abort stopped before the first.
     """
@@ -400,7 +403,7 @@ def _abort_fatally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Exp
         n_trials=3,
         max_consecutive_failures=2,
         gpu_policy="none",
-        sampler={"type": "random", "seed": 7},
+        **{"sampler": {"type": "random", "seed": 7}, **phase},
     )
 
     def explode(*args: object, **kwargs: object) -> None:
@@ -442,6 +445,28 @@ def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
     assert "consecutive" not in message
     assert "phases[p].n_trials above 3 in the config" in message
     assert "max_consecutive_failures above" not in message
+    # The abort recorded no streak, so there is no failure count to restart.
+    assert "failure count" not in message
+
+
+def test_fatal_abort_of_a_grid_advises_the_retry_target_without_a_failure_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fatal abort recorded no streak, so a grid's target advice does not promise a restart."""
+    experiment, _calls = _abort_fatally(
+        tmp_path,
+        monkeypatch,
+        sampler={"type": "grid", "seed": 0},
+        search_space={"x": IntParam(type="int", low=1, high=3)},
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        run_experiment(experiment)
+
+    message = str(refused.value)
+    assert "phases[p].n_trials from 3 to 4 in the config" in message
+    assert "retry its 1 failed cell and run its 2 remaining cells" in message
+    assert "failure count" not in message
 
 
 def test_raised_failure_limit_does_not_retire_a_fatal_abort(
@@ -462,6 +487,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
         assert "simulated objective defect" in message
         assert "phases[p].n_trials above 3 in the config" in message
         assert "max_consecutive_failures above" not in message
+        assert "failure count" not in message
     assert not calls.exists()
     assert len(_study(initial).trials) == 1
 

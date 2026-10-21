@@ -27,8 +27,8 @@ import yaml
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import ExecutionContext, Experiment, Phase
-from phasesweep.config.search import IntParam
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import fingerprints, guards, study_policy, trial
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
 from phasesweep.engine.artifacts import _load_winner
@@ -52,7 +52,7 @@ from phasesweep.engine.paths import (
     _attempts_dir,
     _generation_summary_path,
 )
-from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record
+from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -77,7 +77,7 @@ from phasesweep.errors import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
 )
-from phasesweep.evidence.models import WandbSummaryRequiredGate
+from phasesweep.evidence.models import LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
@@ -105,7 +105,7 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
 )
 from phasesweep.tracking.mlflow import require_mlflow_sdk
-from tests.conftest import make_experiment, requires_nonroot, trial_outcome
+from tests.conftest import make_experiment, requires_nonroot, trial_outcome, write_trainer
 from tests.ledger_fixtures import (
     Materialized,
     materialize,
@@ -1283,19 +1283,28 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
-def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+def _record_fatal_abort(
+    tmp_path: Path, policy: str, cause: str, attrs: Mapping[str, object]
+) -> tuple[Experiment, Phase]:
+    """Record a fatal abort on the golden fixture's phase, at an accepted target of 4.
+
+    :param Path tmp_path: Where the fixture is materialized.
+    :param str policy: The fatal abort policy to record.
+    :param str cause: The recorded cause.
+    :param Mapping[str, object] attrs: Further user attributes of the fatal trial.
+    :return tuple[Experiment, Phase]: The fixture's experiment, and its phase at that target.
+    """
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     study = _fixture_study(experiment)
     phase = experiment.phases[0].model_copy(update={"n_trials": 4})
     trials = study.get_trials(deepcopy=False)
     sequence = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials) + 1
-    outcome = trial_outcome(sequence, "fatal", policy="unsafe_process_cleanup")
+    outcome = trial_outcome(sequence, "fatal", policy=policy)
     outcome[TRIAL_OUTCOME_ABORT_KEY] = _abort_record(
-        policy="unsafe_process_cleanup",
+        policy=policy,
         completion_sequence=sequence,
         trial_target=phase.n_trials,
-        cause="trial cleanup could not be confirmed",
+        cause=cause,
     )
     study.add_trial(
         optuna.trial.create_trial(
@@ -1303,12 +1312,117 @@ def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.Monke
             user_attrs={
                 TRAINER_ENV_DIGEST_ATTR: trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR],
                 TRIAL_OUTCOME_ATTR: outcome,
-                CLEANUP_CONFIRMED_ATTR: False,
+                **attrs,
             },
         )
     )
     study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+    return experiment, phase
+
+
+_UNCONFIRMED_CLEANUP = ("unsafe_process_cleanup", "trial cleanup could not be confirmed")
+
+
+def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
+    )
     return run_experiment(experiment.model_copy(update={"phases": [phase]}), dry_run=True)
+
+
+def _finish_aborted_phase(experiment: Experiment, phase: Phase) -> object:
+    """Finish a phase the way a live run does once an outcome has recorded an abort.
+
+    A live run raises a fatal error itself before the phase is finished, so a direct call is
+    the one way to reach the abort's headline with a fatal abort on record.
+    """
+    run = SimpleNamespace(
+        experiment=experiment.model_copy(update={"phases": [phase]}),
+        phase=phase,
+        study=_fixture_study(experiment),
+        optimize_deadline=None,
+        deadline_exhausted=False,
+        aborted=True,
+    )
+    return _finish_phase(run, phase_fingerprint="unused")
+
+
+def _finish_after_fatal_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Finish a phase whose recorded abort is an unexpected objective error."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, "unexpected_objective_exception", "RuntimeError: objective defect", {}
+    )
+    return _finish_aborted_phase(experiment, phase)
+
+
+def _finish_after_unconfirmed_cleanup_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Finish a phase whose recorded abort is a cleanup that was never confirmed."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
+    )
+    return _finish_aborted_phase(experiment, phase)
+
+
+def _live_abort(
+    tmp_path: Path,
+    *,
+    body: str,
+    cells: int,
+    target: int,
+    bounded: bool = False,
+    persistent: bool = True,
+) -> object:
+    """Run a grid whose first two trials trip a failure limit of 2, and raise its abort.
+
+    :param str body: The trainer's source.
+    :param int cells: Cells in the grid.
+    :param int target: The phase's ``n_trials``.
+    :param bool bounded: Whether the metric rejects the value 5.0 the trainers print.
+    :param bool persistent: Whether the study is kept on a journal.
+    """
+    phase = Phase(
+        name="p",
+        n_trials=target,
+        max_consecutive_failures=2,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=cells)},
+    )
+    extractor = LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'studies.journal'}" if persistent else None,
+        trainer=write_trainer(tmp_path / "trainer.py", body),
+        phases=[phase],
+        metric=Metric(extractor=extractor, max=1.0) if bounded else None,
+    )
+    return run_experiment(experiment)
+
+
+_FAILS = "raise SystemExit(1)"
+_OUT_OF_BOUNDS = 'print("x=5.0")'
+
+
+def _abort_with_failed_cells(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent two-cell grid whose cells both failed."""
+    return _live_abort(tmp_path, body=_FAILS, cells=2, target=2)
+
+
+def _abort_with_unrun_cells(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent four-cell grid on an infeasible streak, leaving two cells unrun."""
+    return _live_abort(tmp_path, body=_OUT_OF_BOUNDS, cells=4, target=4, bounded=True)
+
+
+def _abort_with_every_cell_measured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent two-cell grid whose cells both measured infeasible."""
+    return _live_abort(tmp_path, body=_OUT_OF_BOUNDS, cells=2, target=2, bounded=True)
+
+
+def _abort_without_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a grid held in memory, which no later run can continue."""
+    return _live_abort(tmp_path, body=_FAILS, cells=2, target=2, persistent=False)
 
 
 def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1628,6 +1742,50 @@ ORIGIN_CASES = (
         raised=NoFeasibleTrialError,
         action=OperatorAction.RUN_RECOVER_RUN,
         message="First confirm the cleanup",
+    ),
+    # A live abort routes like the refusal that repeats it, so `fix:` agrees with its advice.
+    RoutingCase(
+        id="live_abort_with_failed_cells",
+        trigger=_abort_with_failed_cells,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].n_trials from 2 to 4 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_with_unrun_cells",
+        trigger=_abort_with_unrun_cells,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].max_consecutive_failures above 2 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_with_every_cell_measured",
+        trigger=_abort_with_every_cell_measured,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="none is feasible, so change the search space or bounds",
+    ),
+    RoutingCase(
+        id="live_abort_fatal",
+        trigger=_finish_after_fatal_abort,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].n_trials above 4 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_awaiting_cleanup_recovery",
+        trigger=_finish_after_unconfirmed_cleanup_abort,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        message="First confirm the cleanup",
+    ),
+    RoutingCase(
+        # No later run can continue an in-memory study, so only the logs are left.
+        id="live_abort_without_storage",
+        trigger=_abort_without_storage,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.INSPECT_LOGS,
+        message="for stderr logs",
     ),
     RoutingCase(
         id="failure_streak_at_limit",

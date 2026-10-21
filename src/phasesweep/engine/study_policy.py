@@ -701,23 +701,41 @@ def _awaits_cleanup_recovery(study: optuna.Study, abort: Mapping[str, object]) -
 _COUNT_RESTARTS = "the failure count starts again from zero"
 
 
-def _retry_remedy(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceiling: int) -> str:
+def _recovery_action(study: optuna.Study, abort: Mapping[str, object]) -> OperatorAction:
+    """Name the operator step the recovery advice for ``abort`` leads with.
+
+    :param optuna.Study study: The phase's study.
+    :param Mapping[str, object] abort: The recorded abort.
+    :return OperatorAction: Cleanup recovery while an unsafe-cleanup abort awaits it, else
+        a config change.
+    """
+    if _awaits_cleanup_recovery(study, abort):
+        return OperatorAction.RUN_RECOVER_RUN
+    return OperatorAction.FIX_CONFIG
+
+
+def _retry_remedy(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceiling: int, *, restarts: bool
+) -> str:
     """Name the ``n_trials`` that retries every failed cell of a grid or fixed configuration.
 
     :param Phase phase: Phase whose configured ``n_trials`` the remedy raises.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
     :param int ceiling: The target :func:`~phasesweep.config.search.retry_target_ceiling`
         allows, above ``phase.n_trials``; it also runs the cells no attempt has reached.
+    :param bool restarts: Whether the abort recorded a failure streak, which the recovery
+        restarts from zero.
     :return str: The sentence.
     """
     raise_to = (
         f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
         f"to {ceiling} in the config and rerun to"
     )
+    restart = f", and {_COUNT_RESTARTS}" if restarts else ""
     if not phase_draws(phase):
         return (
             f"{raise_to} retry its failed attempt once more; a completed attempt is not "
-            f"repeated, and {_COUNT_RESTARTS}."
+            f"repeated{restart}."
         )
     failed = len(_failed_grid_cells(trials))
     remaining = ceiling - _finished_trial_count(trials) - failed
@@ -726,21 +744,20 @@ def _retry_remedy(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial], ceil
         actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
     if remaining:
         actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
-    return (
-        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated, and "
-        f"{_COUNT_RESTARTS}."
-    )
+    return f"{raise_to} {' and '.join(actions)}; completed cells are not repeated{restart}."
 
 
 def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
-    Every recovery message takes its advice from here. An unconfirmed unsafe-cleanup abort
-    needs cleanup recovery before any target retires it. Otherwise the remedies are a
-    raised ``n_trials``, which a grid or fixed configuration may raise only as far as its
-    retry ceiling allows, and for a streak abort a ``max_consecutive_failures`` above the
-    recorded count while the target still leaves trials to run. A grid or fixed
-    configuration with every cell measured has neither, and says so.
+    Every recovery message takes its advice from here, and :func:`_recovery_action` routes
+    it. An unconfirmed unsafe-cleanup abort needs cleanup recovery before any target retires
+    it. Otherwise the remedies are a raised ``n_trials``, which a grid or fixed
+    configuration may raise only as far as its retry ceiling allows, and for a streak abort
+    a ``max_consecutive_failures`` above the recorded count while the target still leaves
+    trials to run. Only a streak abort says the failure count restarts, because a fatal
+    abort recorded none. A grid or fixed configuration with every cell measured has no
+    remedy, and says so.
 
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
@@ -759,15 +776,16 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     ceiling = retry_target_ceiling(
         phase, finished=finished, completed=_completed_trial_count(trials)
     )
+    streak = _tripped_streak(abort)
     remedies = []
     if ceiling is None:
+        restart = "" if streak is None else f"; {_COUNT_RESTARTS}"
         remedies.append(
             f"Fix the cause, then raise phases[{name}].n_trials above {target} in the config "
-            f"and rerun to schedule new attempts; {_COUNT_RESTARTS}."
+            f"and rerun to schedule new attempts{restart}."
         )
     elif ceiling > target:
-        remedies.append(_retry_remedy(phase, trials, ceiling))
-    streak = _tripped_streak(abort)
+        remedies.append(_retry_remedy(phase, trials, ceiling, restarts=streak is not None))
     if streak is not None and finished < target:
         left = target - finished
         remedies.append(

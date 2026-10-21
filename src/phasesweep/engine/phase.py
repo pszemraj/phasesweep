@@ -71,7 +71,6 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
-    _awaits_cleanup_recovery,
     _config_retires_abort,
     _consecutive_failure_threshold_tripped,
     _initialize_study_schema,
@@ -84,6 +83,7 @@ from phasesweep.engine.study_policy import (
     _record_recovery_boundary,
     _record_reruns,
     _record_trial_target,
+    _recovery_action,
     _recovery_advice,
     _validate_environment_cohort,
     _validate_study_direction,
@@ -406,9 +406,8 @@ def _as_sentence(cause: object) -> str:
 def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
     """Refuse a phase whose recorded abort the current config does not retire.
 
-    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice`. An
-    unsafe-cleanup abort whose cleanup is still unconfirmed routes to cleanup recovery
-    instead of the config.
+    The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
+    the action from :func:`~phasesweep.engine.study_policy._recovery_action`.
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
@@ -424,11 +423,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
         "Refusing to reinterpret those terminal attempts as a successful phase."
         + ("" if advice is None else f" {advice}"),
-        action=(
-            OperatorAction.RUN_RECOVER_RUN
-            if _awaits_cleanup_recovery(study, abort_record)
-            else OperatorAction.FIX_CONFIG
-        ),
+        action=_recovery_action(study, abort_record),
     )
 
 
@@ -1357,12 +1352,14 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     if run.aborted and not timed_out_incomplete:
         abort = _load_phase_policy_state(study).abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
-        # Without storage there is no study to continue.
-        advice = None if experiment.storage is None else _recovery_advice(phase, study, abort)
+        # Without storage there is no study to continue, so only the logs are left to read.
+        persistent = experiment.storage is not None
+        advice = _recovery_advice(phase, study, abort) if persistent else None
         raise NoFeasibleTrialError(
             f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} "
             f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
-            + ("" if advice is None else f" {advice}")
+            + ("" if advice is None else f" {advice}"),
+            action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
         )
     if (
         finished_after < phase.n_trials
