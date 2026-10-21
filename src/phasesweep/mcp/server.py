@@ -820,8 +820,8 @@ def build_server(app: PhaseSweepMCP) -> Any:
     ) -> ListExperimentsResult:
         """Validate the paginated catalog result.
 
-        :param limit: Maximum catalog entries to return.
-        :param cursor: Optional pagination cursor from a prior result.
+        :param ListLimit limit: Maximum catalog entries to return.
+        :param MaybeCursor cursor: Optional pagination cursor from a prior result.
         :return: Structured catalog listing.
         """
         return ListExperimentsResult.model_validate(
@@ -866,8 +866,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
     ) -> AwaitRunResult:
         """Wait for a run update and validate the result.
 
-        :param run_id: Detached run id to wait on.
-        :param timeout_seconds: Seconds to wait before returning current status.
+        :param RunId run_id: Detached run id to wait on.
+        :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current
+            status.
         :return: Structured status payload plus changed and reason.
         """
         result = AwaitRunResult.model_validate(
@@ -888,8 +889,8 @@ def build_server(app: PhaseSweepMCP) -> Any:
     ) -> LaunchRunResult:
         """Launch a detached run and validate the result.
 
-        :param experiment_id: Catalog experiment id to launch.
-        :param from_phase: Optional phase to resume from.
+        :param ExperimentId experiment_id: Catalog experiment id to launch.
+        :param MaybePhaseName from_phase: Optional phase to resume from.
         :return: Structured launch result.
         """
         return LaunchRunResult.model_validate(

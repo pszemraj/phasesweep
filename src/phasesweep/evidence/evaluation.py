@@ -199,7 +199,7 @@ def _extract_json(
 
     :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
-    :param provenance: Optional source-evidence sink.
+    :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
     :return float: Configured numeric value.
     """
@@ -340,7 +340,7 @@ def _extract_log_regex(
 
     :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
-    :param provenance: Optional source-evidence sink.
+    :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, unreadable, has no numeric match,
         or a line eligible for matching is invalid UTF-8.
     :return float: Selected match value.
@@ -512,7 +512,7 @@ def _extract_wandb(
 
     :param TrialContext ctx: Attempt whose shared capture supplies the value.
     :param WandbExtractor cfg: Remote target and exact summary key.
-    :param provenance: Optional objective-evidence sink.
+    :param dict | None provenance: Optional objective-evidence sink.
     :param float | None deadline: Absolute monotonic deadline for capture.
     :raises ExtractorError: Capture fails or the selected key is not finite numeric evidence.
     :return float: Selected metric value.
@@ -549,7 +549,7 @@ def locate_objective_position(
 
     :param TrialContext ctx: Accepted attempt.
     :param ObjectiveExtractor cfg: Objective extractor.
-    :param provenance: Objective evidence updated in place.
+    :param dict provenance: Objective evidence updated in place.
     :param float | None deadline: Remaining absolute monotonic execution deadline.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
@@ -679,7 +679,7 @@ def run_extractor(
     :param TrialContext ctx: Trial identity, outputs, and shared remote captures.
     :param ObjectiveExtractor cfg: Configured extractor.
     :param float | None deadline: Absolute monotonic phase/run deadline.
-    :param provenance: Optional sink for the evidence schema,
+    :param dict | None provenance: Optional sink for the evidence schema,
         extractor kind/fingerprint, file digest or remote capture, and capture timestamp.
     :raises ExtractorError: The kind is unregistered or extraction fails.
     :return float: Extracted numeric value.

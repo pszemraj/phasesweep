@@ -127,8 +127,8 @@ def _render_override_value(
 def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideFormat) -> str:
     """Render shell-quoted override tokens for argparse or Hydra.
 
-    :param overrides: Scalar/list values keyed by dotted parameter names.
-    :param fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
+    :param Mapping[str, object] overrides: Scalar/list values keyed by dotted parameter names.
+    :param _CliOverrideFormat fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
     :return: Space-separated ``key=value`` tokens in insertion order.
     :raises TypeError: A value has no faithful representation in the selected grammar.
     """

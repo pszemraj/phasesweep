@@ -271,10 +271,10 @@ def _warn_dropped_cuda_visibility(
     Narrowed inheritance omits ambient CUDA_VISIBLE_DEVICES. With gpu_policy: none
     and no explicit binding, the trainer may see GPUs the parent hid.
 
-    :param experiment: Experiment supplying the inheritance contract.
-    :param phase_name: Phase used for the warning identity.
-    :param env: Trainer environment after GPU assignment.
-    :param gpu_id: Assigned device token, or None when no device was leased.
+    :param Experiment experiment: Experiment supplying the inheritance contract.
+    :param str phase_name: Phase used for the warning identity.
+    :param dict[str, str] env: Trainer environment after GPU assignment.
+    :param int | str | None gpu_id: Assigned device token, or None when no device was leased.
     """
     if gpu_id is not None or "CUDA_VISIBLE_DEVICES" in env:
         return
@@ -513,20 +513,23 @@ def launch_trial(
 
     The caller persists the resolved trial_dir before launch for later recovery.
 
-    :param experiment: Experiment defining command, input format, and environment.
-    :param phase_name: Phase label for runtime placeholders and logs.
-    :param trial_id: Optuna trial number.
-    :param generation_id: Invocation identity.
-    :param attempt_id: Immutable subprocess attempt identity.
-    :param trial_dir: Resolved trial directory; created if missing.
-    :param overrides: Inherited, fixed, and sampled overrides.
-    :param timeout_seconds: Optional per-trial wallclock budget.
-    :param wallclock_deadline: Absolute phase/run deadline including launch preparation.
-    :param gpu_id: CUDA visibility token, or None to leave it unbound.
-    :param gpu_lease_fds: Lock descriptors held by the supervisor guardian until the
-        trainer group exits, including after an orchestrator exit.
-    :param prepared_input: Exact input materialized before acquiring the GPU lease.
-    :param environment_identity: Base environment validated before allocating trials.
+    :param Experiment experiment: Experiment defining command, input format, and environment.
+    :param str phase_name: Phase label for runtime placeholders and logs.
+    :param int trial_id: Optuna trial number.
+    :param str generation_id: Invocation identity.
+    :param str attempt_id: Immutable subprocess attempt identity.
+    :param Path trial_dir: Resolved trial directory; created if missing.
+    :param dict overrides: Inherited, fixed, and sampled overrides.
+    :param float | None timeout_seconds: Optional per-trial wallclock budget.
+    :param float | None wallclock_deadline: Absolute phase/run deadline including launch
+        preparation.
+    :param int | str | None gpu_id: CUDA visibility token, or None to leave it unbound.
+    :param tuple[int, ...] gpu_lease_fds: Lock descriptors held by the supervisor guardian until
+        the trainer group exits, including after an orchestrator exit.
+    :param PreparedTrainerInput prepared_input: Exact input materialized before acquiring the GPU
+        lease.
+    :param EnvironmentIdentity environment_identity: Base environment validated before
+        allocating trials.
     :return ExecutedTrial: Trial context and supervised process result.
     :raises TrialExecutionError: Configured execution.cwd is not a directory.
     :raises OSError: A pre-launch artifact or output stream could not be written.
@@ -654,12 +657,13 @@ def extract_trial_result(
     and infeasible. Observations run after acceptance; unreadable observations warn
     and are omitted without changing the result.
 
-    :param experiment: Experiment defining extractors and bounds.
-    :param executed: Trial context and supervised process result.
-    :param gates: Evidence gates required for acceptance.
-    :param deadline: Absolute monotonic phase/run deadline, checked at stage boundaries.
-        Local stages may overrun by their duration; W&B requests use the remaining budget.
-        Objective evaluation-position reads use the remainder without changing acceptance.
+    :param Experiment experiment: Experiment defining extractors and bounds.
+    :param ExecutedTrial executed: Trial context and supervised process result.
+    :param list[Gate] | None gates: Evidence gates required for acceptance.
+    :param float | None deadline: Absolute monotonic phase/run deadline, checked at stage
+        boundaries. Local stages may overrun by their duration; W&B requests use the remaining
+        budget. Objective evaluation-position reads use the remainder without changing
+        acceptance.
     :return TrialResult: Finite metric and feasibility, or no metric and a failure reason.
     """
     import time
