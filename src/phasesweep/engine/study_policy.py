@@ -778,8 +778,8 @@ def _retry_remedy(
 
 
 _FRESH_START = (
-    "If a defect you have since fixed produced those results, they stay recorded, "
-    "so set a new `experiment` name in the config to start fresh."
+    "The recorded trial results stay in the study; if a defect you have since fixed "
+    "produced them, set a new `experiment` name in the config to start fresh."
 )
 
 

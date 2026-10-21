@@ -1239,6 +1239,8 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert "A larger n_trials does not retire this abort" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
     assert "Then raise phases[p].n_trials above 2 in the config" in message
+    # The closing sentence introduces the recorded results itself, after any remedy.
+    assert "in the config. The recorded trial results stay in the study; " in message
 
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)
