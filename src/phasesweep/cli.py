@@ -54,6 +54,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
+from phasesweep.runtime.gpu import GpuPool
 from phasesweep.runtime.json import (
     JsonObject,
     JsonValue,
@@ -537,11 +538,10 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
-    """Validate static config in ``config_path`` without running anything.
-
-    A non-dry ``run`` checks the ambient execution environment before claiming work.
-    """
+    """Validate config and read-only GPU inventory without launching work."""
     config = _load_cli_config(config_path)
+    for phase in config.phases:
+        GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
     _render_experiment_phases(config)
 

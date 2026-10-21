@@ -54,6 +54,7 @@ from phasesweep.engine.study_policy import (
     _validate_trial_target,
 )
 from phasesweep.runtime.commands import render_command
+from phasesweep.runtime.gpu import GpuPool
 
 log = logging.getLogger("phasesweep.engine.preview")
 
@@ -358,6 +359,7 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
+    GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,
         phase,

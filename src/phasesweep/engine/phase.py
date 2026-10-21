@@ -1487,12 +1487,8 @@ def _run_phase(
     if experiment.mlflow is not None:
         require_mlflow_sdk()
 
-    gpu_pool = GpuPool.create(
-        n_jobs=phase.n_jobs,
-        explicit_ids=phase.gpu_ids,
-        explicit_devices=phase.gpu_devices,
-        allow_no_gpu=phase.allow_no_gpu_isolation,
-        policy=phase.gpu_policy,
+    gpu_pool = GpuPool.for_phase(
+        phase,
         cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"),
     )
     budget = _phase_budget(phase, run_deadline)

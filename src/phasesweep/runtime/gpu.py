@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from phasesweep.config.models import GpuPolicy
+from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
@@ -430,6 +430,24 @@ class GpuPool:
         if devices:
             self._available = list(devices)
         _live_pools.add(self)
+
+    @classmethod
+    def for_phase(cls, phase: Phase, *, cuda_visible_devices: str | None = None) -> GpuPool:
+        """Resolve a phase's GPU inventory without acquiring host leases.
+
+        :param Phase phase: Phase supplying isolation policy and requested devices.
+        :param str | None cuda_visible_devices: Configured visibility, or None for ambient.
+        :return GpuPool: Pool ready for acquisition, after inventory checks and diagnostics.
+        :raises GpuConfigurationError: The phase's isolation policy cannot be honored.
+        """
+        return cls.create(
+            n_jobs=phase.n_jobs,
+            explicit_ids=phase.gpu_ids,
+            explicit_devices=phase.gpu_devices,
+            allow_no_gpu=phase.allow_no_gpu_isolation,
+            policy=phase.gpu_policy,
+            cuda_visible_devices=cuda_visible_devices,
+        )
 
     @classmethod
     def create(

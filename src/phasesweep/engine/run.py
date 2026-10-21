@@ -179,7 +179,8 @@ def run_experiment(
 
     Live runs hold the experiment lock across all phases and install shutdown
     handlers. Dry runs inspect recorded state and render commands without writes
-    or subprocesses. Dry-run checks omit recovery-dependent checks, trainer
+    or trainer subprocesses; GPU checks may read local inventory through nvidia-smi.
+    Dry-run checks omit recovery-dependent checks, trainer
     environments and trial evidence. Fingerprints with placeholder ancestry
     remain unknown until the parent publishes a winner.
 
