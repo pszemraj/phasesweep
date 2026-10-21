@@ -92,7 +92,6 @@ from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime.files import (
-    PlatformCapabilityError,
     UnsafeLockPathError,
     UnsafePrivatePathError,
     lock_dir,
@@ -842,14 +841,14 @@ WRAP_CASES = (
         "UnsafePrivatePathError",
     ),
     RoutingCase(
-        id="finalize_snapshot_platform",
+        id="finalize_snapshot_unsafe_path",
         trigger=_finalize_complete_snapshot_while(
-            "write_status_file", PlatformCapabilityError("The host is not Linux.")
+            "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
         ),
         raised=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RESTORE_TREE,
         message="failed to finalize terminal result snapshot for wrap-recover: "
-        "PlatformCapabilityError",
+        "UnsafePrivatePathError",
     ),
     RoutingCase(
         # recover-run reads the same entry, so routing it back to recover-run
