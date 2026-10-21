@@ -1273,6 +1273,58 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
     assert terminal["result_snapshot_error"] == "RuntimeError"
 
 
+@pytest.mark.parametrize("terminal", [False, True], ids=["running", "cleanup-uncertain-terminal"])
+def test_registered_trial_recovery_counts_match_preflight_and_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: bool
+) -> None:
+    """Registry reconciliation contributes the same trial count preflight promised."""
+    config = _config(tmp_path)
+    run_id = "srv-registered-trial-count"
+    setup = write_uncertain_failed_trial if terminal else write_launched_stale_trial
+    trial_number = setup(config, generation_id=run_id)
+    experiment = load_experiment(config)
+    assert isinstance(experiment, Experiment)
+    phase = experiment.phases[0]
+    attempt_id = f"stale-attempt-{trial_number}"
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase.name,
+        study_name=f"{experiment.experiment}::{phase.name}",
+        trial_number=trial_number,
+        trial_dir=_trial_dir_for(
+            experiment, phase.name, trial_number, generation_id=run_id, attempt_id=attempt_id
+        ),
+        generation_id=run_id,
+    )
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    stage_dead_run(store, run_id, config, "srv", cleanup_uncertain=False)
+    write_unsafe_cleanup_status(store, run_id)
+    record_runner_cleanup(monkeypatch, module="phasesweep.mcp.recovery")
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", Mock(return_value=True)
+    )
+
+    preflight = recover_run_cli(registry.state_dir, run_id)
+
+    assert preflight.exit_code == 0, preflight.output
+    planned = "recover 1 cleanup-uncertain terminal trial" if terminal else "reap 1 stale trial"
+    assert planned in preflight.output
+    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
+
+    assert confirmed.exit_code == 0, confirmed.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["registered_attempts_reconciled"] == 1
+    assert recovery["reaped_running_trials"] == (0 if terminal else 1)
+    assert recovery["cleanup_uncertain_terminal_trials"] == (1 if terminal else 0)
+    actual = "confirmed 1 cleanup-uncertain trial" if terminal else "reaped 1 stale trial"
+    assert actual in confirmed.output
+    trial = _load_phase_trial(config, trial_number)
+    assert trial.state == optuna.trial.TrialState.FAIL
+    study = _load_first_phase_study(config)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
+
+
 @pytest.mark.parametrize(
     (
         "trial_setup_fn",

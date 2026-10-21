@@ -673,6 +673,8 @@ def _recover_trial_evidence(
         registered_attempts = _preflight_active_attempts(
             config, active_report, confirm=confirm, retain_recovery_evidence=True
         )
+        evidence.reaped += active_report.reaped_running_trials
+        evidence.cleanup_recovered += active_report.cleanup_recovered_trials
         if confirm:
             registered_evidence = active_report.recovered_attempt_generations
             # An entry without its receipt stays registered: it is still the

@@ -64,6 +64,8 @@ class _PreflightCleanupReport:
     cleanup_confirmed: bool = True
     recovered_attempt_ids: set[str] = field(default_factory=set)
     recovered_attempt_generations: dict[str, str] = field(default_factory=dict)
+    reaped_running_trials: int = 0
+    cleanup_recovered_trials: int = 0
     uncertain_attempt_ids: set[str] = field(default_factory=set)
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
@@ -609,6 +611,7 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
 def _registry_attempt_fail_stale_trial(
     entry: dict[str, Any],
     entry_path: Path,
+    report: _PreflightCleanupReport,
 ) -> str:
     """Mark the entry's Optuna trial FAIL through its saved storage locator.
 
@@ -616,6 +619,7 @@ def _registry_attempt_fail_stale_trial(
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
+    :param _PreflightCleanupReport report: Counts newly recorded trial cleanup actions.
     :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger or the entry is a tracking operation
@@ -683,6 +687,7 @@ def _registry_attempt_fail_stale_trial(
                 )
             if not recovered:
                 _record_cleanup_recovery(study, trial)
+                report.cleanup_recovered_trials += 1
             return "recovered"
         return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
@@ -709,6 +714,7 @@ def _registry_attempt_fail_stale_trial(
             "continue with an inconsistent study."
         ),
     )
+    report.reaped_running_trials += 1
     log.warning(
         "Reaped stale RUNNING trial %d in study %s via the attempt registry",
         trial.number,
@@ -757,7 +763,7 @@ def _preflight_active_attempts(
                 )
                 if not confirm:
                     continue
-                outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+                outcome = _registry_attempt_fail_stale_trial(entry, entry_path, report)
             except ProcessCleanupUncertainError as exc:
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
