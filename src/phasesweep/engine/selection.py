@@ -6,14 +6,15 @@ import contextlib
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import optuna
 
 from phasesweep.config.common import check_bounds
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import grid_search_space
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import TrialEvidenceMissingError
@@ -234,6 +235,9 @@ def select_winner(
             len(survivors),
             "; ".join(flagged),
         )
+    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
+    if phase is not None:
+        _warn_grid_edges(phase, best.params)
 
     record = (
         None
@@ -265,6 +269,41 @@ def select_winner(
         ),
         repeats=record,
     )
+
+
+def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
+    """Warn when selected params touch an endpoint of a numeric grid axis.
+
+    Numeric categorical choices are ordered by value. Mixed, boolean and
+    singleton axes have no reported boundary; the repeat axis is not searched.
+
+    :param Phase phase: Configured search space and sampler.
+    :param Mapping[str, object] params: Selected configuration's sampled values.
+    """
+    if phase.sampler.type != "grid":
+        return
+    for name, choices in grid_search_space(phase.search_space, phase_name=phase.name).items():
+        values = [
+            value
+            for value in choices
+            if isinstance(value, int | float) and not isinstance(value, bool)
+        ]
+        if len(values) != len(choices) or len(set(values)) < 2:
+            continue
+        value = params.get(name)
+        lower, upper = min(values), max(values)
+        edge = "lower" if value == lower else "upper" if value == upper else None
+        if edge is not None:
+            log.warning(
+                "[%s] winner is at the %s numeric grid boundary for %s=%s (grid %s..%s); "
+                "consider expanding this range if feasible (advisory).",
+                phase.name,
+                edge,
+                name,
+                value,
+                lower,
+                upper,
+            )
 
 
 def _rank_groups(
