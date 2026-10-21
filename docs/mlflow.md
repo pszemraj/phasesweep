@@ -124,7 +124,7 @@ Every MLflow extractor declares its selector explicitly. Selection is independen
 | `max` | Highest value; ties use earliest step then earliest timestamp |
 | `step` | Latest timestamp at the required exact `step` |
 
-For example, `{type: mlflow, metric_key: eval/loss, select: step, step: 100}` requires step 100. A `step` field with another selector is invalid. Conflicting values at an identical step and timestamp are rejected. Selected values must be finite; min/max also reject non-finite histories. Model- or dataset-scoped metric histories are outside this contract.
+For example, `{type: mlflow, metric_key: eval/loss, select: step, step: 100}` requires step 100. If it is absent, the error names the metric key, requested step, and available steps in its history. A `step` field with another selector is invalid. Conflicting values at an identical step and timestamp are rejected. Selected values must be finite; min/max also reject non-finite histories. Model- or dataset-scoped metric histories are outside this contract.
 
 The controller shares one capture across the objective, MLflow constraints, and the phase's MLflow gates. Each distinct metric's complete history serves every selector requesting that key. A presence gate separates namespaces:
 
