@@ -643,8 +643,9 @@ def _run_experiment_inner(
                 generation_id=generation_id,
             )
             group = winner.repeats
+            completion = winner.completion
             log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s%s",
+                "phase=%s WINNER trial=%d metric=%g params=%s%s%s",
                 phase.name,
                 winner.trial_number,
                 winner.metric,
@@ -656,6 +657,13 @@ def _run_experiment_inner(
                     f"{group['key']!r}: sd={group['spread']['sd']:g}, "
                     f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
                     f"members {[member['trial_number'] for member in group['members']]})"
+                ),
+                ""
+                if not completion.get("incomplete")
+                else (
+                    f" INCOMPLETE {completion['finished_trials']}/"
+                    f"{completion['requested_trials']} finished "
+                    f"timeout_scope={completion['timeout_scope']}"
                 ),
             )
         winners[phase.name] = winner
