@@ -10,11 +10,12 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.state import FAILURE_REASON_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import _bounded_metric, make_experiment, write_trainer
 
 
@@ -81,6 +82,50 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     assert all("outcome=success" in line and "reason=" not in line for line in feasible)
     assert all(re.search(r"duration=\d+\.\ds", line) for line in lines)
     assert all("repeat=" not in line for line in lines)
+
+
+@pytest.mark.parametrize("source", ["metric", "constraint"])
+@pytest.mark.parametrize(("bound", "limit", "value"), [("max", 50, 52.5), ("min", 50, 10.5)])
+def test_infeasible_reason_names_measured_value_and_violated_bound(
+    tmp_path: Path, source: str, bound: str, limit: int, value: float
+) -> None:
+    metric = _bounded_metric(**({bound: limit} if source == "metric" else {}))
+    constraint_name = "memory"
+    constraints = (
+        []
+        if source == "metric"
+        else [
+            Constraint(
+                name=constraint_name,
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.]+)"),
+                **{bound: limit},
+            )
+        ]
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_x_trainer(tmp_path),
+        metric=metric,
+        constraints=constraints,
+        n_trials=2,
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 5])},
+    )
+
+    run_experiment(experiment)
+
+    study = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+    )
+    rejected = next(trial for trial in study.trials if trial.value == value)
+    assert rejected.state == optuna.trial.TrialState.COMPLETE
+    cause = rejected.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+    assert (metric.name if source == "metric" else constraint_name) in cause
+    assert str(value) in cause
+    assert bound in cause
+    assert str(limit) in cause
+    lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
+    assert any(line.endswith(f" reason={cause}") for line in lines)
 
 
 def test_run_log_names_the_repeat_value_of_each_trial(tmp_path: Path) -> None:

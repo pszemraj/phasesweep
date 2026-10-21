@@ -1119,14 +1119,31 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     for oname, oval in result.observed.items():
         trial.set_user_attr(observed_attr(oname), oval)
 
+    assert result.metric is not None  # guaranteed when failure_reason is None
+    violations: list[str] = []
+    if not result.feasible:
+        for label, value, bounds in [
+            (f"metric {experiment.metric.name!r}", result.metric, experiment.metric),
+            *(
+                (f"constraint {constraint.name!r}", result.constraints[constraint.name], constraint)
+                for constraint in experiment.constraints
+            ),
+        ]:
+            if bounds.min is not None and value < bounds.min:
+                violations.append(f"{label}={value} < min={bounds.min}")
+            if bounds.max is not None and value > bounds.max:
+                violations.append(f"{label}={value} > max={bounds.max}")
     _record_outcome(
         run,
         trial,
         "success" if result.feasible else "failure",
-        cause=None if result.feasible else "metric or evidence constraints were infeasible",
+        cause=(
+            None
+            if result.feasible
+            else f"metric or evidence constraints were infeasible: {'; '.join(violations)}"
+        ),
     )
 
-    assert result.metric is not None  # guaranteed when failure_reason is None
     return result.metric
 
 
