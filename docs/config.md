@@ -274,9 +274,44 @@ These scoring decisions are separate:
 
 For example, in a fixed-token batch-size sweep each trial's optimizer `step` count depends on its batch size, so trials differ by design in both `step` and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting `progress={"tokens": total_tokens}` compares trials on tokens instead: the check stays `ok` when every trial reached the token budget, and flags one that stopped short. Positions within 1% of the highest count as one point, since each batch size stops within a batch of the budget. Likewise, a trainer that reports its best checkpoint reports a step that differs between trials by nature; report how far it trained on a declared axis instead, such as `progress={"trained_steps": total_steps}` with `evaluation_axis: trained_steps`.
 
-Only `json_envelope`, `wandb` and `mlflow` objectives record a position, so `evaluation_point` is `n/a` for `json` and `log_regex`; `validate` and `run --dry-run` print an `evaluation_point check:` line that says whether the configured extractor supports it. When at least two trials rank but this comparison cannot run, selection logs one advisory warning with the reason, including missing remote positions. With W&B or MLflow the position is where the metric was logged; it does not verify checkpoint identity. Under Transformers `load_best_model_at_end=True`, `train()` reloads the best checkpoint's weights, so a final evaluation scores that checkpoint, yet its logged position reads as the trainer's final global step for every trial. For remote objectives, `validate` and `run --dry-run` warn when `trainer_config` or a phase's `fixed_overrides` explicitly enables `load_best_model_at_end` (including dotted paths). If the evaluated checkpoint matters, report through `json_envelope` with `policy`, `checkpoint` (for Transformers, `trainer.state.best_model_checkpoint`) and the evaluated `step`; report total training progress in `evaluation.progress` and select that axis with `evaluation_axis`. These are trainer-reported metadata, not proof that the trainer loaded those weights. A phase that searches training length, such as epochs or `max_steps`, flags `evaluation_point` by design.
+Only `json_envelope`, `wandb` and `mlflow` objectives record a position, so `evaluation_point` is `n/a` for `json` and `log_regex`; `validate` and `run --dry-run` print an `evaluation_point check:` line that says whether the configured extractor supports it. When at least two trials rank but this comparison cannot run, selection logs one advisory warning with the reason, including missing remote positions. With W&B or MLflow the position is where the metric was logged; it does not verify checkpoint identity. Under Transformers `load_best_model_at_end=True`, `train()` reloads the best checkpoint's weights, so a final evaluation scores that checkpoint, yet its logged position reads as the trainer's final global step for every trial. For remote objectives, `validate` and `run --dry-run` warn when `trainer_config` or a phase's `fixed_overrides` explicitly enables `load_best_model_at_end` (including dotted paths). If the evaluated checkpoint matters, report through `json_envelope` with `policy`, `checkpoint` (for Transformers, `trainer.state.best_model_checkpoint`) and the evaluated `step`; report total training progress in `evaluation.progress` and select that axis with `evaluation_axis`. These are trainer-reported metadata, not proof that the trainer loaded those weights.
 
 The trainer owns evaluation cadence, early stopping, checkpoint selection, and custom aggregation. PhaseSweep has one experiment-level metric and does not prune training. `validate` and `run --dry-run` display the configured source, key/path/pattern, applicable reduction, ranking goal, and viability bounds when set.
+
+### Training-length comparison
+
+A phase that searches epochs or `max_steps` produces different final steps by design, and comparing those raw steps correctly flags `evaluation_point`. To compare whether trials reached their own planned endpoint, report a relative completion axis with the existing envelope extractor:
+
+```yaml
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: final
+    evaluation_axis: schedule_fraction
+```
+
+After evaluating the final checkpoint, report the trainer's measured `eval_loss`, checkpoint path, and actual training progress:
+
+```python
+from phasesweep import report_objective
+
+report_objective(
+    eval_loss,
+    name="eval_loss",
+    split="validation",
+    policy="final",
+    checkpoint=checkpoint_path,
+    step=actual_steps,
+    progress={"schedule_fraction": actual_steps / planned_steps},
+)
+```
+
+`planned_steps` is the positive optimizer-step target resolved for that trial before training; `actual_steps` is the number of training steps it completed, including when early stopping cuts training short. Trials finishing 100/100 and 200/200 both report `1.0`, so this check stays `ok`; a trial ending at 160/200 reports `0.8` and remains flagged against a finished trial. The usual 1% tolerance compares each position with the furthest reported position, so trials all stopping at the same fraction have matching positions. This axis compares relative completion; the trials can still use different data or compute budgets. A heterogeneous verdict remains in MCP's `confound.flagged` list.
 
 ### W&B evidence
 
