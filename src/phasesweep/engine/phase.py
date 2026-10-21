@@ -82,7 +82,8 @@ from phasesweep.engine.study_policy import (
     _record_recovery_boundary,
     _record_reruns,
     _record_trial_target,
-    _retry_advice,
+    _recovery_advice,
+    _target_advice,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
@@ -392,24 +393,29 @@ def _abort_record(
 
 
 def _raise_prior_phase_abort(
-    phase: Phase, abort_record: JsonObject, trials: Sequence[optuna.trial.FrozenTrial]
+    phase: Phase,
+    abort_record: JsonObject,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    storage: str | None,
 ) -> None:
     """Explain how to make an explicit recovery attempt after a durable abort.
 
     A grid or fixed configuration is told the exact ``n_trials`` that retries its
-    failed cells (:func:`~phasesweep.engine.study_policy._retry_advice`); a
-    sampling phase is told to raise the target above the aborted one.
+    failed cells, or that a fresh namespace is the only way out when no cell can be
+    retried (:func:`~phasesweep.engine.study_policy._recovery_advice`); a sampling
+    phase is told to raise the target above the aborted one.
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
     :param JsonObject abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param str | None storage: The experiment's ``storage`` setting.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
     trial_target = abort_record["trial_target"]
-    advice = _retry_advice(phase, trials) or (
+    advice = _recovery_advice(phase, trials, storage=storage, abort=abort_record) or (
         f"Increase n_trials above {trial_target} to explicitly schedule new recovery attempts."
     )
     raise NoFeasibleTrialError(
@@ -436,13 +442,16 @@ def _raise_streak_at_limit(
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
     """
-    advice = _retry_advice(phase, trials)
-    remedy = (
-        f"Increase n_trials above {trial_target} to explicitly schedule new recovery "
-        "attempts, or raise max_consecutive_failures."
-        if advice is None
-        else f"{advice} Or raise max_consecutive_failures."
-    )
+    advice = _target_advice(phase, trials)
+    if advice is None:
+        remedy = (
+            f"Increase n_trials above {trial_target} to explicitly schedule new recovery "
+            "attempts, or raise max_consecutive_failures."
+        )
+    elif advice.schedules:
+        remedy = f"{advice.text} Or raise max_consecutive_failures."
+    else:
+        remedy = f"{advice.text} Raise max_consecutive_failures instead."
     raise NoFeasibleTrialError(
         f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
         f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
@@ -603,7 +612,9 @@ def _judge_recorded_phase(
     # A later success or changed failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
     if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
-        _raise_prior_phase_abort(phase, active_abort, study.get_trials(deepcopy=False))
+        _raise_prior_phase_abort(
+            phase, active_abort, study.get_trials(deepcopy=False), experiment.storage
+        )
     if (
         active_abort is None
         and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
@@ -1353,7 +1364,12 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         phase.allow_incomplete_on_timeout and timeout_observed and finished_after < phase.n_trials
     )
     if run.aborted and not timed_out_incomplete:
-        advice = _retry_advice(phase, trials_after)
+        advice = _recovery_advice(
+            phase,
+            trials_after,
+            storage=experiment.storage,
+            abort=_load_phase_policy_state(study).abort,
+        )
         raise NoFeasibleTrialError(
             f"Phase {phase.name!r} aborted after "
             f"{phase.max_consecutive_failures} consecutive failures. "

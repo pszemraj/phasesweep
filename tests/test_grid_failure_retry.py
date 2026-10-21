@@ -20,7 +20,13 @@ from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError, _warn_unsuccessful_grid_cells
 from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import make_experiment, write_flaky_trainer
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    write_flaky_trainer,
+    write_trainer,
+)
+from tests.experiments import write_experiment
 
 
 def _grid(
@@ -237,18 +243,24 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     assert len(calls.read_text().splitlines()) == 6
 
 
-def test_aborted_grid_without_a_failed_cell_says_raising_n_trials_schedules_nothing(
-    tmp_path: Path,
-) -> None:
-    """Completed cells are closed, so a grid whose cells all measured infeasible has nothing to retry."""
+_NOTHING_TO_RETRY = (
+    "No grid cell has a failed attempt to retry, so raising n_trials would schedule nothing."
+)
+_REOPEN = "this study's recorded abort cannot be reopened."
+
+
+def test_fully_measured_infeasible_grid_points_to_a_fresh_namespace(tmp_path: Path) -> None:
+    """Completed cells are closed and no cell is left to run, so only a fresh study can recover."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
     bounded = Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         max=1.0,
     )
     original = _grid(tmp_path, trainer, 2, metric=bounded)
+    # The test config names an explicit journal, which a new workdir alone does not redirect.
     advice = (
-        "No grid cell has a failed attempt to retry, so raising n_trials would schedule nothing."
+        f"{_NOTHING_TO_RETRY} Fix the cause and rerun into a fresh namespace, for example "
+        f"`phasesweep run CONFIG --workdir NEW_DIR --set storage=auto`; {_REOPEN}"
     )
     with pytest.raises(NoFeasibleTrialError, match="aborted after 2") as aborted:
         run_experiment(original)
@@ -257,6 +269,71 @@ def test_aborted_grid_without_a_failed_cell_says_raising_n_trials_schedules_noth
         run_experiment(original)
     assert str(refused.value).endswith(f"as a successful phase. {advice}")
     assert len(calls.read_text().splitlines()) == 2
+
+
+def _untried_cells_config(tmp_path: Path, trainer: Path, *, limit: int, workdir: Path) -> Path:
+    """Write a four-cell grid whose first two cells measure infeasible, with auto storage."""
+    return write_experiment(
+        tmp_path / "exp.yaml",
+        experiment="t",
+        trial_command=f"python {trainer} {{overrides}}",
+        override_format="argparse",
+        metric={
+            "extractor": {"type": "log_regex", "pattern": r"loss=(?P<value>[0-9.eE+-]+)"},
+            "max": 1.0,
+        },
+        storage="auto",
+        workdir=str(workdir),
+        provenance={"revision": "test"},
+        phases=[
+            {
+                "name": "p",
+                "n_trials": 4,
+                "max_consecutive_failures": limit,
+                "sampler": {"type": "grid", "seed": 0},
+                "search_space": {"x": {"type": "int", "low": 1, "high": 4}},
+            }
+        ],
+    )
+
+
+def test_infeasible_streak_with_untried_cells_points_to_a_fresh_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recorded streak abort cannot be reopened, so the way out is a higher limit in a new workdir."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+
+        x = next(int(arg.removeprefix("--x=")) for arg in sys.argv if arg.startswith("--x="))
+        print(f"loss={5.0 if x >= 3 else 0.5}")
+        """,
+    )
+    original = _untried_cells_config(tmp_path, trainer, limit=2, workdir=tmp_path / "runs")
+    advice = (
+        f"{_NOTHING_TO_RETRY} Raise phases[p].max_consecutive_failures above 2 and rerun into a "
+        f"fresh namespace, for example `phasesweep run CONFIG --workdir NEW_DIR`; {_REOPEN}"
+    )
+
+    assert invoke_cli_boundary(["run", str(original)], monkeypatch) != 0
+    aborted = capsys.readouterr().err
+    assert "aborted after 2 consecutive failures" in aborted
+    assert advice in aborted
+    for argv in (["run", str(original)], ["run", str(original), "--dry-run"]):
+        assert invoke_cli_boundary(argv, monkeypatch) != 0
+        refused = capsys.readouterr().err
+        assert "previously aborted" in refused
+        assert advice in refused
+
+    # The raised limit alone changes nothing: the recorded abort still stands in the old namespace.
+    raised = _untried_cells_config(tmp_path, trainer, limit=3, workdir=tmp_path / "runs")
+    assert invoke_cli_boundary(["run", str(raised)], monkeypatch) != 0
+    assert "previously aborted" in capsys.readouterr().err
+
+    fresh = tmp_path / "fresh"
+    assert invoke_cli_boundary(["run", str(raised), "--workdir", str(fresh)], monkeypatch) == 0
+    assert list(fresh.rglob("winner.yaml"))
 
 
 def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> None:
@@ -425,3 +502,18 @@ def test_cell_advisory_spells_out_ten_cells_and_counts_the_rest(
     assert warning.startswith("[p] only 1 of 15 grid cells succeeded (advisory); ")
     assert "{'x': 10}" in warning and "{'x': 11}" not in warning
     assert warning.endswith("; and 4 more.")
+
+
+def test_in_memory_grid_abort_gets_no_recovery_advice(tmp_path: Path) -> None:
+    """Without storage there is no study to recover, and a raised grid target is refused at load."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        max_consecutive_failures=2,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=2)},
+    )
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(make_experiment(trainer=trainer, phases=[phase]))
+    assert str(aborted.value).endswith("for stderr logs.")

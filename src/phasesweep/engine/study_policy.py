@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, TypedDict
 
@@ -602,7 +602,17 @@ def _failed_grid_cells(
     )
 
 
-def _retry_advice(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> str | None:
+class _TargetAdvice(NamedTuple):
+    """What raising ``n_trials`` can do for a grid or fixed configuration."""
+
+    text: str
+    schedules: bool
+    """Whether a raised target schedules any attempt."""
+
+
+def _target_advice(
+    phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]
+) -> _TargetAdvice | None:
     """Name the exact ``n_trials`` that retries every failed cell of a grid or fixed configuration.
 
     The target is the ceiling :func:`~phasesweep.config.search.retry_target_ceiling`
@@ -610,7 +620,7 @@ def _retry_advice(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> s
 
     :param Phase phase: Phase whose configured ``n_trials`` the advice raises.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
-    :return str | None: A sentence, or ``None`` for a sampling phase, which has no
+    :return _TargetAdvice | None: A sentence, or ``None`` for a sampling phase, which has no
         per-cell retry rule.
     """
     finished = _finished_trial_count(trials)
@@ -626,14 +636,15 @@ def _retry_advice(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> s
             if fixed
             else "No grid cell has a failed attempt to retry"
         )
-        return f"{reason}, so raising n_trials would schedule nothing."
+        return _TargetAdvice(f"{reason}, so raising n_trials would schedule nothing.", False)
     raise_to = (
         f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
         f"to {ceiling} and rerun to"
     )
     if fixed:
-        return (
-            f"{raise_to} retry its failed attempt once more; a completed attempt is not repeated."
+        return _TargetAdvice(
+            f"{raise_to} retry its failed attempt once more; a completed attempt is not repeated.",
+            True,
         )
     failed = len(_failed_grid_cells(trials))
     remaining = ceiling - finished - failed
@@ -642,7 +653,60 @@ def _retry_advice(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> s
         actions.append(f"retry its {failed} failed cell{'' if failed == 1 else 's'}")
     if remaining:
         actions.append(f"run its {remaining} remaining cell{'' if remaining == 1 else 's'}")
-    return f"{raise_to} {' and '.join(actions)}; completed cells are not repeated."
+    return _TargetAdvice(
+        f"{raise_to} {' and '.join(actions)}; completed cells are not repeated.", True
+    )
+
+
+def _tripped_streak(abort: Mapping[str, object] | None) -> int | None:
+    """Return the consecutive-failure count a streak abort recorded.
+
+    :param Mapping[str, object] | None abort: A recorded abort, if any.
+    :return int | None: The count when ``max_consecutive_failures`` tripped, else ``None``.
+    """
+    if abort is None or abort.get("policy") != "max_consecutive_failures":
+        return None
+    streak = abort.get("consecutive_failures")
+    return streak if type(streak) is int else None
+
+
+def _recovery_advice(
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    *,
+    storage: str | None,
+    abort: Mapping[str, object] | None,
+) -> str | None:
+    """Say how to continue a grid or fixed configuration whose study recorded an abort.
+
+    A raised target retries failed cells (:func:`_target_advice`). When it can schedule
+    nothing, the recorded abort cannot be reopened, so the advice is a fresh namespace:
+    with a limit above the recorded streak when trials were still unrun, otherwise
+    after fixing the cause. Without storage there is no study to continue.
+
+    :param Phase phase: Phase that aborted.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :param str | None storage: The experiment's ``storage`` setting.
+    :param Mapping[str, object] | None abort: The recorded abort.
+    :return str | None: A sentence, or ``None`` when the phase is sampled or unstored.
+    """
+    target = _target_advice(phase, trials)
+    if storage is None or target is None:
+        return None
+    if target.schedules:
+        return target.text
+    streak = _tripped_streak(abort)
+    if streak is not None and _finished_trial_count(trials) < phase.n_trials:
+        lead = f"Raise phases[{phase.name}].max_consecutive_failures above {streak} and rerun"
+    else:
+        lead = "Fix the cause and rerun"
+    command = "phasesweep run CONFIG --workdir NEW_DIR" + (
+        "" if storage == "auto" else " --set storage=auto"
+    )
+    return (
+        f"{target.text} {lead} into a fresh namespace, for example `{command}`; "
+        "this study's recorded abort cannot be reopened."
+    )
 
 
 def _record_reruns(study: optuna.Study, phase: Phase | None = None) -> list[tuple[int, int]]:
