@@ -229,6 +229,37 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     assert len(calls.read_text().splitlines()) == 4
 
 
+@pytest.mark.parametrize(
+    ("target", "launch"),
+    [
+        pytest.param(3, "1 trial, 1 of them a rerun", id="one-retry"),
+        pytest.param(4, "2 trials, 2 of them reruns", id="both-retried"),
+    ],
+)
+def test_phase_header_counts_the_failed_cells_a_raised_target_retries(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int, launch: str
+) -> None:
+    """The header's reruns agrees with the RERUN lines, in the dry run as in the run."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(_grid(tmp_path, trainer, 2))
+    raised = _grid(tmp_path, trainer, target)
+    retried = target - 2
+    header = f"phase=p study=t::p finished=2 remaining={retried} reruns={retried} n_jobs=1"
+    caplog.set_level(logging.INFO)
+
+    run_experiment(raised, dry_run=True)
+    assert header in [record.getMessage() for record in caplog.records]
+    assert f"DRY RUN phase=p would launch {launch}" in [r.getMessage() for r in caplog.records]
+
+    caplog.clear()
+    run_experiment(raised)
+    lines = [record.getMessage() for record in caplog.records]
+    assert header in lines
+    rerun_lines = [line.split(" reason=")[0] for line in lines if " RERUN " in line]
+    assert rerun_lines == ["phase=p RERUN trial=2 of=0", "phase=p RERUN trial=3 of=1"][:retried]
+
+
 def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     """An abort that left cells untried names the target that also runs them."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=2)

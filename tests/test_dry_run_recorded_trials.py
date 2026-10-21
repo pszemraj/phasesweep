@@ -437,7 +437,7 @@ def test_running_attempt_without_a_recorded_failure_previews_as_a_rerun(
     assert _preview(experiment, tmp_path, caplog) == [
         "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
-        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun of an interrupted trial",
+        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
     ]
 
 
@@ -450,7 +450,7 @@ def test_interrupted_trial_previews_as_a_rerun_among_the_launches(
 
     assert _preview(experiment, tmp_path, caplog) == [
         "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
-        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun of an interrupted trial",
+        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
     ]
 
 
@@ -469,9 +469,7 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
         ]
 
     _preview(experiment, tmp_path, caplog)
-    assert totals() == [
-        "DRY RUN total: would launch 6 trials (1 rerun of an interrupted trial) across 3 phases"
-    ]
+    assert totals() == ["DRY RUN total: would launch 6 trials (1 rerun) across 3 phases"]
 
     caplog.clear()
     with pytest.raises(FileNotFoundError, match="Winner file missing for phase 'a'"):

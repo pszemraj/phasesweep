@@ -72,7 +72,9 @@ class RecordedPhase:
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
     #: Reruns a launch would run before any new draw: interrupted trials without one,
-    #: WAITING reruns, and RUNNING attempts that recover as interrupted.
+    #: failed grid cells a raised target retries, WAITING reruns, and RUNNING attempts that
+    #: recover as interrupted. A phase with a RUNNING attempt counts no grid retries, because
+    #: its recovery changes how many a launch schedules.
     reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
@@ -86,21 +88,19 @@ class PhasePreview:
     winner: Winner
     #: Trials a launch would run, the count the phase's "would launch" line prints.
     launches: int
-    #: How many of those launches rerun interrupted trials.
+    #: How many of those launches rerun an interrupted trial or retry a failed grid cell.
     reruns: int
     #: Whether the phase would replay a recorded result and launch no trials.
     replays: bool
 
 
 def _reruns_phrase(reruns: int) -> str:
-    """Name a count of reruns of interrupted trials in the singular or plural.
+    """Name a count of reruns in the singular or plural.
 
     :param int reruns: Reruns counted.
-    :return str: For example ``"1 rerun of an interrupted trial"``.
+    :return str: For example ``"1 rerun"``.
     """
-    if reruns == 1:
-        return "1 rerun of an interrupted trial"
-    return f"{reruns} reruns of interrupted trials"
+    return "1 rerun" if reruns == 1 else f"{reruns} reruns"
 
 
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
@@ -123,9 +123,10 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     return line
 
 
-def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
+def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     """Count one phase's snapshot study the way a launch counts it.
 
+    :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
     :return RecordedPhase: The counts and the study.
@@ -142,7 +143,9 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
         finished=_finished_trial_count(trials) + recovered_as_failed,
         completed=_completed_trial_count(trials),
         running=len(running),
-        reruns=_pending_rerun_count(trials) + len(running) - recovered_as_failed,
+        reruns=_pending_rerun_count(trials, None if running else phase)
+        + len(running)
+        - recovered_as_failed,
         study=study,
     )
 
@@ -168,7 +171,7 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
             exc,
         )
         return {phase.name: None for phase in experiment.phases}
-    return {name: _recorded_phase(study) for name, study in studies.items()}
+    return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
 
 
 def _refuse_as_a_launch_would(
@@ -391,7 +394,8 @@ def _dry_run_phase(
         inherited_winners: Winners loaded for phases earlier in the chain.
         study: An in-memory Optuna study used to ``ask`` for one sample.
         remaining: Number of trials that *would* run; logged for the user.
-        reruns: How many of them rerun interrupted trials before any new draw.
+        reruns: How many of them rerun an interrupted trial or retry a failed grid cell
+            before any new draw.
 
     Returns:
         A :class:`Winner` placeholder built from the previewed sample, or from
@@ -401,9 +405,9 @@ def _dry_run_phase(
     """
     of_them = ""
     if reruns == 1:
-        of_them = ", 1 of them a rerun of an interrupted trial"
+        of_them = ", 1 of them a rerun"
     elif reruns:
-        of_them = f", {reruns} of them reruns of interrupted trials"
+        of_them = f", {reruns} of them reruns"
     log.info(
         "DRY RUN phase=%s would launch %d %s%s",
         phase.name,

@@ -1514,7 +1514,7 @@ def _run_phase(
         study_name,
         finished=finished,
         remaining=remaining,
-        reruns=_pending_rerun_count(trials),
+        reruns=_pending_rerun_count(trials, phase),
     )
 
     if remaining == 0:
