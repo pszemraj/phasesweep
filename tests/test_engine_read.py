@@ -220,10 +220,13 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     before = tree_snapshot(root)
 
     status = read_status(experiment)
-    for phase in _status_phases(experiment, status):
+    for surface, phase in enumerate(_status_phases(experiment, status)):
         assert phase["trial_data_available"] is False
         assert phase["published_study_unavailable"] is published
-        assert not any(phase["trials"].values())
+        if surface == 2:  # MCP distinguishes unavailable counts from a known empty study.
+            assert phase["trials"] is None
+        else:
+            assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
         engine_ledger.open_existing_study(
@@ -501,9 +504,12 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         phase = payload["phases"][0]
         assert phase["published_study_unavailable"] is True
         assert phase["trial_data_available"] is (damage != "corrupt")
-        assert {state: count for state, count in phase["trials"].items() if count} == (
-            {"COMPLETE": 1} if damage == "stale-ledger" else {}
-        )
+        if payload is mcp_status and damage == "corrupt":
+            assert phase["trials"] is None
+        else:
+            assert {state: count for state, count in phase["trials"].items() if count} == (
+                {"COMPLETE": 1} if damage == "stale-ledger" else {}
+            )
     assert status["phases"][0]["running_attempts"] == (None if damage == "corrupt" else [])
     assert (ledger.read_bytes() if ledger.exists() else None) == ledger_before
     expected_error = (
