@@ -46,6 +46,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -478,10 +479,11 @@ def _regular_file(tmp_path: Path) -> Path:
 
 
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Fail a run, then lose the root before reconciliation can confirm cleanup."""
+    """Fail a run that launched work, then lose the root before reconciliation can confirm cleanup."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
-    def fail_run(*_args: object, **_kwargs: object) -> None:
+    def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         monkeypatch.setattr(guards, "validate_ledger", _raiser(OSError("root is gone")))
         raise NoFeasibleTrialError("trainer failed")
 
@@ -492,10 +494,11 @@ def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.Monk
 def _run_fails_then_registry_turns_shared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
-    """Fail a run whose reconciliation then finds the attempt registry shared."""
+    """Fail a run that launched work, whose reconciliation then finds the attempt registry shared."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
-    def fail_run(*_args: object, **_kwargs: object) -> None:
+    def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         registry = _attempts_dir(experiment)
         registry.mkdir(parents=True, exist_ok=True)
         registry.chmod(0o755)

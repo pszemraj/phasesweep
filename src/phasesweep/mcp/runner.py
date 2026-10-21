@@ -176,12 +176,6 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (PhaseAbortRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )
-# Categories that only occur at one stage, whatever stage the caller reports.
-_FIXED_STAGES: dict[FailureCode, FailureStage] = {
-    "experiment_busy": "preflight",
-    "published_study_missing": "preflight",
-    "trial_target_refused": "preflight",
-}
 
 
 def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, object]:
@@ -223,20 +217,14 @@ def _base_failure_payload(
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure.
 
-    The error's type selects ``code`` and ``stage``. For a
-    :class:`PhaseSweepError`, ``retryable``, ``actor``, and ``remediation``
-    come only from the action its raise routes; an exception without a routed
-    action keeps its type's fixed text.
+    The error's type selects ``code``. For a :class:`PhaseSweepError`,
+    ``retryable``, ``actor``, and ``remediation`` come only from the action its
+    raise routes; an exception without a routed action keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
-    :param str | None stage: Failure stage to report for most error types;
-        clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
-        falling back to ``"execution"`` for any other value. These error types
-        override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError`, :class:`UnsafeLockPathError`,
-        :class:`PublishedStudyMissingError`, :class:`TrialTargetRefusedError`, and
-        :class:`PhaseAbortRefusedError`
-        always report ``"preflight"`` and
+    :param str | None stage: Failure stage to report; clamped to one of
+        ``"preflight"``, ``"execution"``, or ``"cleanup"``, falling back to
+        ``"execution"`` for any other value.
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
         ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
@@ -253,13 +241,7 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    if isinstance(error, UnsafeLockPathError):
-        failure_stage = "preflight"
-    return {
-        "code": code,
-        "stage": _FIXED_STAGES.get(code, failure_stage),
-        **_routed_next_steps(error.action),
-    }
+    return {"code": code, "stage": failure_stage, **_routed_next_steps(error.action)}
 
 
 def _cleanup_steps(
@@ -324,19 +306,15 @@ def _terminal_error(
 ) -> tuple[BaseException, str | None]:
     """Return the engine's primary error and stage, or the caller's fallback.
 
-    A storage failure wrapped before any terminal report comes from the
-    ownership check that precedes generation allocation.
+    The engine delivers a report only from the block that can claim its generation,
+    so a failure with no report came before any claim and is a preflight failure.
 
     :param TerminalReport | None report: Engine terminal report, when one was delivered.
     :param BaseException fallback: Exception caught by the runner.
     :return tuple[BaseException, str | None]: Authoritative error and failure stage.
     """
     if report is None:
-        if isinstance(fallback, ProcessCleanupUncertainError) and isinstance(
-            fallback.__cause__, StudyStorageUnavailableError
-        ):
-            return fallback, "preflight"
-        return fallback, "execution"
+        return fallback, "preflight"
     return report.primary_error or fallback, report.failure_stage
 
 

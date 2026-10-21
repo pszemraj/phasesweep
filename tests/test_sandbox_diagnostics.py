@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from phasesweep.errors import GpuConfigurationError, OperatorAction
-from phasesweep.mcp.runner import _terminal_failure_payload
+from phasesweep.mcp.runner import _terminal_error, _terminal_failure_payload
 from phasesweep.runtime.files import UnsafeLockPathError
 from phasesweep.runtime.gpu import GpuPool
 
@@ -15,7 +15,9 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
         "Cannot access /private/host/locks: Permission denied",
         action=OperatorAction.PROVISION_LOCK_DIR,
     )
-    failure = _terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
+    # The lock is taken before the engine can report, so the runner has no report to read.
+    primary, stage = _terminal_error(None, error)
+    failure = _terminal_failure_payload(primary, stage=stage, cleanup_confirmed=True)
 
     assert failure["code"] == "storage_unavailable"
     assert failure["stage"] == "preflight"

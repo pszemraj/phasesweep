@@ -601,8 +601,9 @@ def test_terminal_callback_failure_preserves_the_engine_outcome(
     experiment = make_experiment(workdir=tmp_path / "runs")
     captured: list[TerminalReport] = []
 
-    def run_outcome(*_args, **_kwargs):
+    def run_outcome(*_args, generation, **_kwargs):
         if primary_error is not None:
+            generation.claim()
             raise primary_error
         return {}
 
@@ -627,6 +628,44 @@ def test_terminal_callback_failure_preserves_the_engine_outcome(
     assert captured[0].primary_error is primary_error
     assert captured[0].failure_stage == (None if primary_error is None else "execution")
     assert any("terminal callback failed" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("claims", "stage", "studies_reconciled"),
+    [(False, "preflight", False), (True, "execution", True)],
+    ids=["unclaimed", "claimed"],
+)
+def test_failure_stage_and_reconciliation_follow_whether_the_generation_was_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claims: bool,
+    stage: str,
+    studies_reconciled: bool,
+) -> None:
+    """A failure reports ``execution`` and reconciles the studies exactly when it claimed its generation."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    captured: list[TerminalReport] = []
+    preflight_calls = 0
+
+    def preflight(*_args, **_kwargs):
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return {}
+
+    def run_outcome(*_args, generation, **_kwargs):
+        if claims:
+            generation.claim()
+        raise NoFeasibleTrialError("phase failed")
+
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", run_outcome)
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert [report.failure_stage for report in captured] == [stage]
+    # The second call is the post-failure reconciliation.
+    assert preflight_calls == (2 if studies_reconciled else 1)
 
 
 @pytest.mark.integration

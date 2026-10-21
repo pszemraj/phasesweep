@@ -85,6 +85,8 @@ class TerminalReport:
 
     ``generation_id`` is the invocation's generation id. A generation namespace
     exists under it only when the invocation launched a trial or published.
+    ``failure_stage`` is ``"execution"`` for a failure after that claim and
+    ``"preflight"`` for one before it, and ``None`` on success.
     ``winners`` holds the winners the engine captured under the experiment lock
     on success, so a terminal-result consumer need not re-read storage. It is
     ``None`` on every failure path.
@@ -162,6 +164,15 @@ def _terminal_report_from_cleanup(
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
     )
+
+
+def _failure_stage(generation: generation_ops.InvocationGeneration) -> str:
+    """Name the stage a failed invocation was in, from whether it claimed its generation.
+
+    :param generation_ops.InvocationGeneration generation: The invocation's generation.
+    :return str: ``"execution"`` once the generation is claimed, else ``"preflight"``.
+    """
+    return "execution" if generation.claimed else "preflight"
 
 
 def run_experiment(
@@ -320,7 +331,6 @@ def _run_experiment_outcome(
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = attempt_ops._PreflightCleanupReport()
-        preflight_passed = False
         try:
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
@@ -355,7 +365,6 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 existing_studies=existing_studies,
             )
-            preflight_passed = True
             result = _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
@@ -368,7 +377,8 @@ def _run_experiment_outcome(
         except BaseException as exc:
             terminal_error = exc
             control_error: BaseException | None = None
-            if preflight_passed:
+            if generation.claimed:
+                # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
                 try:
                     guard_ops._reconcile_existing_studies(
@@ -438,7 +448,7 @@ def _run_experiment_outcome(
                 generation_id,
                 cleanup,
                 primary_error=primary_error,
-                failure_stage="execution" if preflight_passed else "preflight",
+                failure_stage=_failure_stage(generation),
             )
             if (
                 not cleanup.cleanup_confirmed
@@ -487,7 +497,7 @@ def _run_experiment_outcome(
                             generation_id,
                             cleanup,
                             primary_error=terminal_error,
-                            failure_stage=("execution" if preflight_passed else "preflight"),
+                            failure_stage=_failure_stage(generation),
                         )
                     terminal_callback(terminal_report)
                 except BaseException:

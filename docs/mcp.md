@@ -137,6 +137,8 @@ Read provenance and labels together:
 
 A run's represented generation is its run ID, but a run [writes a generation](runtime.md#timeouts-cleanup-and-continuation) only when it launches a trial or publishes. A run refused before its first trial, or one that replays the winners already published, represents a run ID that names no generation, with `is_published` and `summary_present` false. A replay still succeeds and lists the winners it matched, each `prior_generation`, and `published_generation_id` names the generation that publishes them.
 
+A failed run's `failure.stage` follows the same claim. It is `preflight` while the run has not claimed its generation, so it launched no trial and wrote no generation, and `execution` once it has. A refusal such as a fingerprint mismatch, a lowered `n_trials`, a recorded abort, an unavailable tracking target, a busy experiment or an artifact-root conflict therefore reports `preflight`, in whichever phase it arises, unless an earlier phase of the same run already launched a trial. When process cleanup could not be confirmed, the failure's stage is `cleanup` and the original failure sits under `failure.cause` with its own stage.
+
 `get_run_results` measures `missing_phases` and `all_phases_have_winners` against the represented generation's plan. Report that context with the winners rather than relabeling historical results using an edited catalog. The config-match comparison is refreshed on terminal reads; the scientific facts stay frozen.
 
 `publication_integrity` reports the publication validation recorded in the response. Terminal responses preserve snapshot-time validation and do not revalidate the current publication tree:

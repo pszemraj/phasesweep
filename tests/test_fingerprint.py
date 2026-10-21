@@ -36,6 +36,7 @@ from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
 )
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, _resolve_storage
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -1357,7 +1358,8 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     run_experiment(experiment)
     published = published_generation_id(experiment)
 
-    def lose_ledger(*_args: object, **_kwargs: object) -> None:
+    def lose_ledger(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         ledger.unlink()
         raise RuntimeError("execution failed after the ledger disappeared")
 

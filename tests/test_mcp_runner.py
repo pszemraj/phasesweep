@@ -48,7 +48,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -279,35 +279,6 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert remediation_fragment in str(failure["remediation"])
-
-
-@pytest.mark.parametrize(
-    ("error", "code", "stage"),
-    [
-        pytest.param(
-            TrialTargetRefusedError("target moved backward"),
-            "trial_target_refused",
-            "preflight",
-            id="target",
-        ),
-        pytest.param(
-            PhaseAbortRefusedError("phase previously aborted"),
-            "trial_target_refused",
-            "preflight",
-            id="prior_abort",
-        ),
-        pytest.param(
-            NoFeasibleTrialError("trainer failed"), "trainer_failed", "execution", id="trainer"
-        ),
-    ],
-)
-def test_a_refusal_before_any_launch_reports_preflight_whatever_stage_the_engine_gave(
-    error: RuntimeError, code: str, stage: str
-) -> None:
-    """The engine reports ``execution`` once its preflight passes, but a refusal raised by the phase launched no trainer."""
-    failure = mcp_runner._terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
-
-    assert (failure["code"], failure["stage"]) == (code, stage)
 
 
 def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
@@ -903,7 +874,10 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
             raise cleanup_error
         return {}
 
-    def fail_run(*args: object, **kwargs: object) -> None:
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
@@ -937,7 +911,10 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
     scan_registry = Mock(return_value=None)
     fail_discovery = Mock(side_effect=cleanup_error)
 
-    def fail_run(*args: object, **kwargs: object) -> None:
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         # Initial discovery and preflight succeeded. Only reconciliation loses
         # access to the root, before it can perform a second registry scan.
         monkeypatch.setattr("phasesweep.engine.guards.validate_ledger", fail_discovery)
@@ -994,7 +971,10 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     )
     preflight = Mock(return_value={})
 
-    def cancel_run(*args: object, **kwargs: object) -> None:
+    def cancel_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         raise shutdown
 
     captured: list[TerminalReport] = []
@@ -1053,7 +1033,10 @@ def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
     )
     preflight = Mock(side_effect=[{}, shutdown])
 
-    def fail_run(*args: object, **kwargs: object) -> None:
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         raise initial_error
 
     captured: list[TerminalReport] = []
