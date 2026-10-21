@@ -538,7 +538,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
         except ProcessLookupError:
             confirmed[pgid] = True
             continue
-        except (PermissionError, OSError) as exc:
+        except OSError as exc:
             log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
@@ -565,7 +565,7 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
         except ProcessLookupError:
             confirmed[pgid] = True
             continue
-        except (PermissionError, OSError) as exc:
+        except OSError as exc:
             log.error("Failed to send SIGKILL to process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
@@ -794,7 +794,7 @@ def kill_stale_group(
                 target_pgid = os.getpgid(pid)
             except ProcessLookupError:
                 target_pgid = None
-            except (PermissionError, OSError) as exc:
+            except OSError as exc:
                 log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
                 return False
         elif pid_alive and pgid is None:

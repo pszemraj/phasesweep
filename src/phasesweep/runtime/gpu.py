@@ -193,7 +193,7 @@ def _detect_mig_uuid_set() -> set[str]:
         )
         if out.returncode != 0:
             return set()
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         return set()
     return {match.group(1) for match in _MIG_UUID_INVENTORY.finditer(out.stdout)}
 
