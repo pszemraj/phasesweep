@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import yaml
 from pydantic import ValidationError
 
+from phasesweep.config.io import load_yaml_document
 from phasesweep.runtime.json import JsonObject, JsonValue, json_value
 
 SET_SYNTAX = (
@@ -74,7 +75,7 @@ def apply_set(payload: JsonObject, setting: str) -> CreatedKey | None:
     """
     segments, raw = _parse_key(setting)
     try:
-        value = json_value(yaml.safe_load(raw))
+        value = json_value(load_yaml_document(raw))
     except (ValueError, yaml.YAMLError) as exc:
         raise SetPathError(f"{_shown(setting)}: the value is not valid YAML: {exc}") from exc
     key = setting[: segments[-1].end]

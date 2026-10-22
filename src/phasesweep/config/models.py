@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 import string
@@ -77,11 +78,22 @@ from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
 
+TRIAL_BOUND_ENV = (
+    "PHASESWEEP_TRIAL_DIR",
+    "PHASESWEEP_TRIAL_ID",
+    "PHASESWEEP_PHASE",
+    "PHASESWEEP_RUN_NAME",
+    "PHASESWEEP_GENERATION_ID",
+    "PHASESWEEP_ATTEMPT_ID",
+    "PHASESWEEP_OVERRIDES_SHA256",
+    "PHASESWEEP_OBJECTIVE_PATH",
+)
+
 
 class Metric(_Frozen):
     """Primary optimization objective: name, direction, how to extract it, and viability bounds."""
 
-    name: str = "objective"
+    name: str = Field(default="objective", min_length=1)
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
     max: ConfigFloat | None = None
@@ -311,7 +323,7 @@ def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
 
     :param Experiment experiment: Loaded experiment.
     :return list[str]: One ``--key (where)`` entry per boolean ``trainer_config`` leaf, fixed
-        override or categorical choice, empty under any other override format.
+        override, categorical choice or repeat value, empty under any other override format.
     """
     if experiment.override_format != "argparse":
         return []
@@ -327,7 +339,8 @@ def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
             if isinstance(value, bool)
         )
         flags.extend(
-            f"--{key} (phase {phase.name!r} search_space)"
+            f"--{key} (phase {phase.name!r} "
+            f"{'repeats' if phase.repeats is not None and key == phase.repeats.key else 'search_space'})"
             for key, param in sampler_search_space(phase).items()
             if isinstance(param, CategoricalParam)
             and any(isinstance(choice, bool) for choice in param.choices)
@@ -466,7 +479,7 @@ class _NamedExtractor(_Frozen):
 
     _label: ClassVar[str]
 
-    name: str
+    name: str = Field(min_length=1)
     extractor: ObjectiveExtractor = Field(discriminator="type")
 
     @model_validator(mode="after")
@@ -929,10 +942,11 @@ class ExecutionContext(_Frozen):
     record_env: bool = Field(
         default=False,
         description=(
-            "Write the trainer environment into each trial directory as "
-            "`environment.json` (digest, inherit_env contract, and every "
-            "name-value pair, pass-through values included). Off by default "
-            "because it holds the whole composed environment, credentials "
+            "Write the exact environment the trainer process receives, including "
+            "per-attempt, GPU and run-binding variables, into each attempt directory "
+            "as `environment.json`, with the cohort digest and the inherit_env and "
+            "passthrough_env contracts. Off by default "
+            "because it holds the whole environment, credentials "
             "among it; the file is created owner-only (0600), unlike the rest "
             "of the trial directory. Regardless of this flag, every trial "
             "records the environment's SHA-256 digest and the compared "
@@ -1036,6 +1050,26 @@ class ExecutionContext(_Frozen):
             when ``inherit_env`` is ``all`` and every ambient variable is admitted.
         """
         return None if self.inherit_env == "all" else self.tracked_env_names()
+
+
+def _validate_mlflow_published_key(name: str, *, prefix: str, source: str) -> None:
+    """Mirror MLflow's metric and param key validation for a published config name.
+
+    :param str name: Configured result name or override key.
+    :param str prefix: PhaseSweep publication prefix.
+    :param str source: Config location that supplies the name.
+    :raises ValueError: The published key has invalid characters, length or path form.
+    """
+    key = prefix + name
+    if not re.fullmatch(r"[/\w.\- :]*", key):
+        rule = "characters outside alphanumerics, underscores, periods, dashes, slashes, colons and spaces"
+    elif len(key) > 250:
+        rule = f"length {len(key)}, exceeding the 250-character limit"
+    elif posixpath.normpath(key) != key or key == "." or key.startswith(("..", "/")):
+        rule = "path form that is not a normalized relative path"
+    else:
+        return
+    raise ValueError(f"{source} {name!r} produces MLflow key {key!r} with {rule}; rename it.")
 
 
 class Experiment(_Frozen):
@@ -1232,11 +1266,11 @@ class Experiment(_Frozen):
     @field_validator("env")
     @classmethod
     def _env_is_launchable(cls, value: dict[str, str]) -> dict[str, str]:
-        """Reject trainer environment entries that ``os.execve`` cannot pass.
+        """Reject unlaunchable entries and variables PhaseSweep sets per attempt.
 
         :param dict[str, str] value: Configured trainer environment overrides.
         :raises ValueError: A name is empty or contains ``=`` or NUL, or a value
-            contains NUL.
+            contains NUL, or a name is reserved for per-attempt bindings.
         :return dict[str, str]: The validated mapping, unchanged.
         """
         bad_names = [name for name in value if not _is_environment_name(name)]
@@ -1250,6 +1284,12 @@ class Experiment(_Frozen):
             raise ValueError(
                 "env values cannot contain NUL, because the trainer launch cannot pass "
                 f"them; fix the value of {bad_values!r}."
+            )
+        reserved = [name for name in value if name in TRIAL_BOUND_ENV]
+        if reserved:
+            raise ValueError(
+                f"env cannot set {reserved!r}: PhaseSweep sets these variables for "
+                "every attempt. Remove them from env."
             )
         return value
 
@@ -1328,6 +1368,40 @@ class Experiment(_Frozen):
         :return str: Validated experiment name.
         """
         return _validate_safe_name("Experiment", v)
+
+    @model_validator(mode="after")
+    def _validate_mlflow_published_keys(self) -> Experiment:
+        """Require config-authored published keys to satisfy MLflow's client rules.
+
+        :raises ValueError: A constraint, observation or override produces an invalid key.
+        :return Experiment: Self, unchanged.
+        """
+        if self.mlflow is None:
+            return self
+        for constraint in self.constraints:
+            _validate_mlflow_published_key(
+                constraint.name, prefix="phasesweep.constraint.", source="constraint"
+            )
+        for observation in self.observe:
+            _validate_mlflow_published_key(
+                observation.name, prefix="phasesweep.observed.", source="observation"
+            )
+        for phase in self.phases:
+            for source, keys in (
+                ("fixed_overrides", phase.fixed_overrides),
+                ("search_space", phase.search_space),
+            ):
+                for key in keys:
+                    _validate_mlflow_published_key(
+                        key, prefix="phasesweep.override.", source=f"phase {phase.name!r} {source}"
+                    )
+            if phase.repeats is not None:
+                _validate_mlflow_published_key(
+                    phase.repeats.key,
+                    prefix="phasesweep.override.",
+                    source=f"phase {phase.name!r} repeats",
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_phase_graph(self) -> Experiment:
@@ -1606,22 +1680,36 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
 
 
 def _format_field_names(template: str) -> set[str]:
-    """Collect str.format fields, including nested format specifications.
+    """Collect bare str.format fields, rejecting format specs and conversions.
 
     Escaped braces are excluded. Attribute and index accessors remain intact
     for the caller to reject.
 
     :param str template: A ``str.format``-style template string.
-    :raises ValueError: The template has unbalanced braces.
+    :raises ValueError: The template has unbalanced braces, format specs or conversions.
     :return set[str]: Field names actually referenced (escaped ``{{...}}`` excluded).
     """
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise ValueError(f"{exc}. Check for unbalanced braces.") from exc
     fields: set[str] = set()
-    for _literal, field_name, format_spec, _conversion in string.Formatter().parse(template):
+    formatted: list[str] = []
+    for _literal, field_name, format_spec, conversion in parsed:
         if field_name is None:
             continue
         fields.add(field_name)
-        if format_spec:
-            fields |= _format_field_names(format_spec)
+        if format_spec or conversion:
+            suffix = f"!{conversion}" if conversion else ""
+            if format_spec:
+                suffix += f":{format_spec}"
+            formatted.append(f"{{{field_name}{suffix}}}")
+    if formatted:
+        raise ValueError(
+            "trial_command placeholders take no format spec or conversion; found "
+            f"{', '.join(formatted)}. Format values in the shell instead, for example "
+            "$(printf '%05d' {trial_id})."
+        )
     return fields
 
 
@@ -1638,7 +1726,8 @@ def _validate_trial_command_template(
     :param Experiment experiment: Experiment containing the command and format.
     :param Phase phase: Phase whose command is rendered.
     :param frozenset[str] inherited_keys: Override keys supplied by direct parents.
-    :raises ValueError: The template has unknown fields, accessors, malformed braces,
+    :raises ValueError: The template has unknown fields, accessors, format specs,
+        conversions, malformed braces,
         a missing input placeholder, or trainer configuration that cannot be composed.
     """
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
@@ -1661,8 +1750,7 @@ def _validate_trial_command_template(
         fields = _format_field_names(experiment.trial_command)
     except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
-            f"Phase {phase.name!r}: trial_command failed to render — "
-            f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
+            f"Phase {phase.name!r}: trial_command failed to render — {type(exc).__name__}: {exc}"
         ) from exc
 
     accessed = sorted(name for name in fields if "." in name or "[" in name)
@@ -1737,9 +1825,9 @@ def _validate_trial_command_template(
     if required_placeholder not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
-            f"{phase.name!r} has inherited, fixed, or sampled overrides or a "
+            f"{phase.name!r} has inherited, fixed, sampled or repeat overrides, or a "
             f"trainer_config and trial_command does not reference "
-            f"{{{required_placeholder}}}. All sampled parameters and the "
+            f"{{{required_placeholder}}}. All inherited, fixed, sampled and repeat parameters and the "
             "trainer_config would be ignored — the trainer would "
             "run with the same hard-coded configuration every trial. "
             f"Add {{{required_placeholder}}} to trial_command, or use the default "

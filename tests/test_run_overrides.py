@@ -9,9 +9,26 @@ from click.testing import CliRunner
 import phasesweep.cli as cli_module
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment
+from phasesweep.config.run_overrides import SetPathError, apply_set
 from phasesweep.engine.state import Winner
 from tests.conftest import invoke_cli_boundary
 from tests.experiments import phase_payload, write_experiment
+
+
+@pytest.mark.parametrize(
+    ("setting", "problem"),
+    [
+        ("trainer_config={lr: 1, lr: 2}", "duplicate key 'lr'"),
+        ('trainer_config="\\udcff"', "lone surrogate escape.*not valid UTF-8"),
+        ("trainer_config=\udcff", "unacceptable character #xdcff"),
+    ],
+)
+def test_set_values_follow_strict_config_yaml_rules(setting: str, problem: str) -> None:
+    """Reject duplicate mapping keys and strings that cannot represent UTF-8 text."""
+    with pytest.raises(SetPathError, match=problem) as caught:
+        apply_set({}, setting)
+
+    assert f"{setting!r}: the value is not valid YAML:" in str(caught.value)
 
 
 def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(

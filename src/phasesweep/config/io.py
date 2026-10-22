@@ -101,6 +101,17 @@ def _construct_str_strict(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str
 _StrictMappingLoader.add_constructor("tag:yaml.org,2002:str", _construct_str_strict)
 
 
+def load_yaml_document(text: str) -> object:
+    """Parse one safe YAML document with unique keys and UTF-8-compatible strings.
+
+    :param str text: YAML document to parse.
+    :raises yaml.YAMLError: Invalid YAML, duplicate keys, or non-UTF-8 strings.
+    :return object: Parsed YAML value.
+    """
+    value: object = yaml.load(text, Loader=_StrictMappingLoader)
+    return value
+
+
 def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any]:
     """Load YAML text as a strict mapping.
 
@@ -110,7 +121,7 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     :return dict[str, Any]: Parsed top-level YAML mapping.
     """
     try:
-        data = yaml.load(text, Loader=_StrictMappingLoader)  # strict SafeLoader subclass
+        data = load_yaml_document(text)
     except yaml.YAMLError as exc:
         if isinstance(exc, yaml.MarkedYAMLError):
             for mark in (exc.context_mark, exc.problem_mark):

@@ -1,7 +1,7 @@
 """Format override dictionaries into the shape the trial command expects.
 
-All values are unconditionally shell-quoted via shlex.quote to prevent
-injection or misparse from shell metacharacters in paths or categorical values.
+Placeholder values are shell-quoted via shlex.quote, except the integer
+{trial_id} and {overrides}, a sequence of individually shell-quoted tokens.
 """
 
 from __future__ import annotations

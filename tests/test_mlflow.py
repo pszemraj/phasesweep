@@ -506,6 +506,89 @@ def test_no_cross_backend_publishing(tmp_path):
         Experiment.model_validate(config)
 
 
+@pytest.mark.parametrize("location", ["metric", "constraints", "observe"])
+def test_result_names_are_nonempty(tmp_path, location):
+    config = native_experiment(tmp_path).model_dump()
+    if location == "metric":
+        config[location]["name"] = ""
+    elif location == "constraints":
+        config[location][0]["name"] = ""
+    else:
+        config[location] = [
+            {"name": "", "extractor": {"type": "json", "path": "result.json", "key": "x"}}
+        ]
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(config)
+    message = str(caught.value)
+    assert location in message
+    assert "name" in message
+    assert "at least 1 character" in message or "nonempty" in message
+
+
+@pytest.mark.parametrize(
+    "source,name,prefix,rule",
+    [
+        ("constraint", "acc@1", "constraint", "characters"),
+        ("observation", "a//b", "observed", "path"),
+        ("observation", "a/./b", "observed", "path"),
+        ("constraint", "a/../b", "constraint", "path"),
+        ("constraint", "x" * 230, "constraint", "length"),
+        ("observation", "x" * 231, "observed", "length"),
+        ("fixed_overrides", "x" * 231, "override", "length"),
+        ("search_space", "x" * 231, "override", "length"),
+        ("repeats", "x" * 231, "override", "length"),
+    ],
+)
+@pytest.mark.parametrize("publishing", [True, False])
+def test_mlflow_published_keys_validated_only_with_target(
+    tmp_path, source, name, prefix, rule, publishing
+):
+    config = native_experiment(tmp_path).model_dump()
+    local_extractor = {"type": "json", "path": "result.json", "key": "x"}
+    if source == "constraint":
+        config["constraints"][0]["name"] = name
+    elif source == "observation":
+        config["observe"] = [{"name": name, "extractor": local_extractor}]
+    elif source == "repeats":
+        config["phases"][0]["repeats"] = {"key": name, "values": [1, 2]}
+        config["phases"][0]["n_trials"] = 4
+    else:
+        config["phases"][0][source] = {
+            name: 1 if source == "fixed_overrides" else {"type": "categorical", "choices": [1, 2]}
+        }
+    if not publishing:
+        config["mlflow"] = None
+        config["metric"]["extractor"] = local_extractor
+        config["constraints"][0]["extractor"] = local_extractor
+        for phase in config["phases"]:
+            phase["gates"] = []
+        Experiment.model_validate(config)
+        return
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(config)
+    message = str(caught.value)
+    assert repr(name) in message
+    assert source in message
+    assert f"phasesweep.{prefix}.{name}" in message
+    assert rule in message
+    assert "rename" in message.lower()
+    if source in {"fixed_overrides", "search_space", "repeats"}:
+        assert "depth" in message
+
+
+def test_mlflow_published_keys_accept_boundaries_and_native_characters(tmp_path):
+    config = native_experiment(tmp_path).model_dump()
+    config["constraints"][0]["name"] = "x" * (250 - len("phasesweep.constraint."))
+    config["observe"] = [
+        {
+            "name": "résultat: score/a-b.c_1",
+            "extractor": {"type": "json", "path": "result.json", "key": "x"},
+        }
+    ]
+    config["phases"][0]["fixed_overrides"] = {"x" * 230: 1}
+    Experiment.model_validate(config)
+
+
 class _ScriptedWorker:
     """A stand-in for the supervised worker that answers each action from a script."""
 

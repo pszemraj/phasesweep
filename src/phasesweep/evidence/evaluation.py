@@ -185,6 +185,7 @@ class TrialContext:
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
+    wandb_capture_error: ExtractorError | None = field(default=None, compare=False)
     mlflow_settings: MlflowTarget | None = None
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
@@ -418,7 +419,7 @@ def _extract_log_regex(
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Obtain and cache one accepted W&B capture for the attempt's consumers.
+    """Share one W&B capture or capture failure between the attempt's consumers.
 
     :param TrialContext ctx: Trial identity and optional shared query/capture.
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
@@ -431,6 +432,8 @@ def _capture_wandb(
     """
     if ctx.wandb_capture:
         return ctx.wandb_capture
+    if ctx.wandb_capture_error is not None:
+        raise ctx.wandb_capture_error
     query = ctx.wandb_query or WandbQuery(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
@@ -443,52 +446,58 @@ def _capture_wandb(
         poll_deadline = min(poll_deadline, deadline)
     target = f"{source.base_url}/{source.entity}/{source.project}/{ctx.attempt_id}"
     try:
-        capture = poll_wandb_summary(
-            base_url=source.base_url,
-            entity=source.entity,
-            project=source.project,
-            run_id=ctx.attempt_id,
-            trial_dir=ctx.trial_dir,
-            poll_seconds=source.poll_seconds,
-            timeout_seconds=source.timeout_seconds,
-            required_keys=query.numeric_keys,
-            presence_keys=query.presence_keys,
-            environment=ctx.wandb_environment,
-            deadline=poll_deadline,
-        )
-    except WandbPollTimeout as exc:
-        error = (
-            DeadlineExceededError
-            if capped and time.monotonic() >= poll_deadline
-            else ExtractorError
-        )
-        raise error(
-            f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
-            + (f" Last observation: {exc.last_error}" if exc.last_error else "")
-        ) from exc
-    except WandbSetupError as exc:
-        raise ExtractorError(
-            f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
-        ) from exc
-    except WandbRunTerminalError as exc:
-        raise ExtractorError(
-            f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
-        ) from exc
-    except WandbMissingKeysError as exc:
-        raise ExtractorError(
-            f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
-            f"available summary keys: {exc.available!r}."
-        ) from exc
-    except ImportError as exc:
-        raise ExtractorError(
-            "W&B evidence requires the optional SDK; install phasesweep[wandb]."
-        ) from exc
-    except ValueError as exc:
-        raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
-    except UnsafeProcessCleanupError:
+        try:
+            capture = poll_wandb_summary(
+                base_url=source.base_url,
+                entity=source.entity,
+                project=source.project,
+                run_id=ctx.attempt_id,
+                trial_dir=ctx.trial_dir,
+                poll_seconds=source.poll_seconds,
+                timeout_seconds=source.timeout_seconds,
+                required_keys=query.numeric_keys,
+                presence_keys=query.presence_keys,
+                environment=ctx.wandb_environment,
+                deadline=poll_deadline,
+            )
+        except WandbPollTimeout as exc:
+            error = (
+                DeadlineExceededError
+                if capped and time.monotonic() >= poll_deadline
+                else ExtractorError
+            )
+            raise error(
+                f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
+                + (f" Last observation: {exc.last_error}" if exc.last_error else "")
+            ) from exc
+        except WandbSetupError as exc:
+            raise ExtractorError(
+                f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
+            ) from exc
+        except WandbRunTerminalError as exc:
+            raise ExtractorError(
+                f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
+            ) from exc
+        except WandbMissingKeysError as exc:
+            raise ExtractorError(
+                f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
+                f"available summary keys: {exc.available!r}."
+            ) from exc
+        except ImportError as exc:
+            raise ExtractorError(
+                "W&B evidence requires the optional SDK; install phasesweep[wandb]."
+            ) from exc
+        except ValueError as exc:
+            raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
+        except (ExtractorError, UnsafeProcessCleanupError):
+            raise
+        except RuntimeError as exc:
+            raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
+    except DeadlineExceededError:
         raise
-    except RuntimeError as exc:
-        raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
+    except ExtractorError as exc:
+        object.__setattr__(ctx, "wandb_capture_error", exc)
+        raise
     ctx.wandb_capture.update(
         {
             "kind": "wandb",

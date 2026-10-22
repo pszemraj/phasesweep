@@ -14,12 +14,13 @@ import math
 import os
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from phasesweep.config.common import check_bounds
-from phasesweep.config.models import Experiment, Observation, _wandb_query
+from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
@@ -108,17 +109,6 @@ class TrialResult:
     observed: dict[str, float] = field(default_factory=dict)
 
 
-_TRIAL_BOUND_ENV = (
-    "PHASESWEEP_TRIAL_DIR",
-    "PHASESWEEP_TRIAL_ID",
-    "PHASESWEEP_PHASE",
-    "PHASESWEEP_RUN_NAME",
-    "PHASESWEEP_GENERATION_ID",
-    "PHASESWEEP_ATTEMPT_ID",
-    "PHASESWEEP_OVERRIDES_SHA256",
-    "PHASESWEEP_OBJECTIVE_PATH",
-)
-
 # How far back from the end of ``stderr.log`` a failed trial's reason reads.
 _STDERR_TAIL_BYTES = 4096
 
@@ -143,7 +133,8 @@ class EnvironmentIdentity:
 
     ``tracked`` contains semantic environment values; ``digest`` hashes that mapping.
     ``values`` also includes pass-through and untracked ambient values used at launch.
-    Only the opt-in, owner-only ``environment.json`` records the full mapping.
+    The opt-in, owner-only ``environment.json`` records the final launch mapping,
+    including per-attempt and GPU bindings composed at launch.
     """
 
     digest: str
@@ -182,9 +173,9 @@ def _environment_identity(
         ]
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
-    # These values are assigned for each trial after the base environment is
-    # recorded. Ambient copies cannot affect the trainer or its study cohort.
-    for name in _TRIAL_BOUND_ENV:
+    # Ambient copies cannot affect the trainer or its study cohort; each trial
+    # receives its own bindings at launch.
+    for name in TRIAL_BOUND_ENV:
         env.pop(name, None)
     phase = experiment.phase(phase_name)
     query = _wandb_query(experiment, phase.gates)
@@ -231,15 +222,17 @@ def _environment_identity(
 def _record_trainer_environment(
     experiment: Experiment,
     identity: EnvironmentIdentity,
+    env: Mapping[str, str],
     trial_dir: Path,
 ) -> None:
-    """Write the full composed environment to an owner-only file when record_env is enabled.
+    """Write the trainer's exact environment to an owner-only file when record_env is enabled.
 
-    Capture values before per-trial and GPU bindings. Include ambient and pass-through
-    values, and list pass-through names excluded from the cohort digest.
+    Include per-attempt, GPU and tracking bindings, with the cohort digest and
+    inheritance and pass-through contracts.
 
     :param Experiment experiment: Experiment supplying the environment contract.
     :param EnvironmentIdentity identity: Composed environment and tracked identity.
+    :param Mapping[str, str] env: Final environment passed to the trainer process.
     :param Path trial_dir: Existing trial directory.
     :raises OSError: The record could not be written.
     :raises UnsafePrivatePathError: An existing environment.json is not a private,
@@ -251,7 +244,7 @@ def _record_trainer_environment(
         "digest": identity.digest,
         "inherit_env": experiment.execution.inherit_env_contract(),
         "passthrough_env": list(experiment.execution.effective_passthrough_env()),
-        "env": identity.values,
+        "env": dict(env),
     }
     private_atomic_write_text(
         trial_dir / "environment.json",
@@ -556,8 +549,6 @@ def launch_trial(
     overrides_sha256 = trainer_input.sha256
     (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
-    # Capture the composed environment before per-trial bindings.
-    _record_trainer_environment(experiment, environment_identity, workdir)
     env = dict(environment_identity.values)
     phase = experiment.phase(phase_name)
     wandb_query = _wandb_query(experiment, phase.gates)
@@ -606,6 +597,7 @@ def launch_trial(
     _warn_dropped_cuda_visibility(
         experiment=experiment, phase_name=phase_name, env=env, gpu_id=gpu_id
     )
+    _record_trainer_environment(experiment, environment_identity, env, workdir)
 
     log.info("[%s/trial_%d] %s", phase_name, trial_id, cmd)
 

@@ -664,7 +664,7 @@ def test_trial_command_requires_live_override_placeholder(
         pytest.param(
             "echo {trail_dir} {overrides}", "unknown placeholder", id="unknown_placeholder"
         ),
-        pytest.param("echo {trial_dir", "trial_command failed to render", id="unbalanced_brace"),
+        pytest.param("echo {trial_dir", "unbalanced braces", id="unbalanced_brace"),
         pytest.param(
             "echo {trial_dir.foo} {overrides}",
             r"attribute or index access; found \{trial_dir\.foo\}",
@@ -677,7 +677,7 @@ def test_trial_command_requires_live_override_placeholder(
         ),
         pytest.param(
             "echo {trial_dir:{phase.foo}} {overrides}",
-            r"attribute or index access; found \{phase\.foo\}",
+            r"placeholders take no format spec or conversion.*\{trial_dir:\{phase\.foo\}\}",
             id="access_inside_nested_format_spec",
         ),
     ],
@@ -685,6 +685,43 @@ def test_trial_command_requires_live_override_placeholder(
 def test_trial_command_malformed_template_rejected(template: str, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         make_experiment(trial_command=template, n_trials=1)
+
+
+@pytest.mark.parametrize(
+    "placeholder", ["{trial_id:05d}", "{phase!r}", "{trial_dir:{phase}}", "{trial_dir:>10}"]
+)
+def test_trial_command_rejects_format_specs_and_conversions(placeholder: str) -> None:
+    with pytest.raises(ValueError) as caught:
+        make_experiment(trial_command=f"echo {placeholder} {{overrides}}", n_trials=1)
+    message = str(caught.value)
+    assert "placeholders take no format spec or conversion" in message
+    assert placeholder in message
+    assert "$(printf '%05d' {trial_id})" in message
+    assert "unbalanced braces" not in message
+
+
+def test_trial_command_reports_all_formatted_placeholders() -> None:
+    with pytest.raises(ValueError) as caught:
+        make_experiment(trial_command="echo {trial_id:05d} {phase!r} {overrides}")
+    assert "{trial_id:05d}" in str(caught.value)
+    assert "{phase!r}" in str(caught.value)
+
+
+def test_trial_command_missing_placeholder_names_repeat_overrides() -> None:
+    with pytest.raises(ValueError) as caught:
+        make_experiment(
+            trial_command="echo",
+            phases=[
+                Phase(
+                    name="p",
+                    repeats=Repeats(key="seed", values=[1, 2]),
+                    sampler=Sampler(type="grid"),
+                    n_trials=2,
+                )
+            ],
+        )
+    assert "repeat overrides" in str(caught.value)
+    assert "repeat parameters" in str(caught.value)
 
 
 def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error() -> None:
@@ -702,14 +739,12 @@ def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error()
 
 
 def test_trial_command_accepts_supported_templates() -> None:
-    """Accepted templates include a format spec on {overrides} and plain ones naming {trial_dir} and {overrides}."""
+    """Bare supported placeholders render successfully."""
     cases = [
         (
-            "field_format_spec",
+            "escaped_formatted_placeholders",
             lambda: make_experiment(
-                trial_command="python train.py '{overrides:>1}'",
-                n_trials=1,
-                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+                trial_command="echo '{{phase!r}}' '{{trial_id:05d}}' {overrides}"
             ),
         ),
         (

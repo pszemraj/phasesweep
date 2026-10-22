@@ -1,7 +1,7 @@
 # config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from examples/example.yaml.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
-# The MCP server rereads an edited config before its next tool call. A failed reread keeps reads on the last valid config and refuses launches until fixed.
+# The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: docs/mcp.md#the-catalog.
 # Precedence, lowest to highest: built-in defaults, the YAML, then run --set KEY=VALUE (docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
 # Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
@@ -26,7 +26,7 @@ experiment: string (required)
 # {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
-# An unknown placeholder, attribute or index access such as {trial_dir.name}, or an unbalanced brace fails config load.
+# Unknown placeholders, attribute or index access, format specs such as {trial_id:05d}, conversions such as {phase!r}, or unbalanced braces fail config load.
 trial_command: string (required)
 
 # ---------- Objective ----------
@@ -38,7 +38,7 @@ trial_command: string (required)
 # Selection records advisory confound verdicts on the winner, which never block selection or publication.
 # See: docs/runtime.md#confound-verdicts
 metric: object (required)
-  # Name the objective is published under, for example validation_loss. The name goal is reserved.
+  # Nonempty name the objective is published under, for example validation_loss. The name goal is reserved.
   # Requires: distinct from every constraints[].name and observe[].name, which are distinct from each other too.
   name: string = "objective"
 
@@ -398,7 +398,7 @@ provenance: map[string, string] = {}
 
 # Feasibility bounds on additional scalars, separate from metric ranking. Each item is one constraint.
 constraints: list[object] = []
-  # Constraint name, any string distinct from the other names metric.name lists, which labels the measured value in published results.
+  # Nonempty constraint name, distinct from the other names metric.name lists, which labels the measured value in published results.
   - name: string (required)
 
     # Scalar reader, selected by type. A json_envelope or wandb reader here must leave evaluation_axis at its default.
@@ -417,7 +417,7 @@ constraints: list[object] = []
 
 # Report-only scalars recorded from each accepted trial. Each item is one observation.
 observe: list[object] = []
-  # Observation name, any string distinct from the other names metric.name lists, which labels the value in trials.csv, winner.yaml, MLflow and MCP.
+  # Nonempty observation name, distinct from the other names metric.name lists, which labels the value in trials.csv, winner.yaml, MLflow and MCP.
   - name: string (required)
 
     # Local scalar reader, selected by type. wandb and mlflow readers fail config load, because a key the trainer never wrote would fail every trial.
@@ -426,7 +426,7 @@ observe: list[object] = []
 
 # ---------- MLflow target and ownership ----------
 # env may set MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT_ID or MLFLOW_EXPERIMENT_NAME only to the mlflow block's own normalized value, and never MLFLOW_RUN_ID.
-# Warning: constraint and observation names become MLflow metric keys, so a name MLflow rejects, such as acc@1, leaves accepted attempts' uploads pending.
+# Constraint/observation names and override keys must form valid MLflow keys after phasesweep.* prefixes or fail config load, e.g. acc@1 or overrides >230 chars.
 
 # Native MLflow integration on one existing experiment: the source of the objective's metrics and the destination of PhaseSweep's result projections.
 # Requires: metric.extractor of type mlflow, and no W&B reader or gate anywhere. Local constraints and gates stay allowed.
@@ -470,7 +470,7 @@ mlflow: object | null = null
 # See: docs/config.md#trainer-contract
 
 # Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
-# Values set here for the per-attempt PHASESWEEP_* names are discarded at launch, though they still enter the study fingerprint.
+# Setting per-attempt PHASESWEEP_* names in env fails config load. Their names are listed in docs/config.md#trainer-contract.
 # See: the MLflow section rules and WandbTarget for the tracking variables it may set.
 # Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
 # Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
@@ -498,9 +498,8 @@ execution: object = {}
   # Warning: model, data and cache settings that change what a trial means belong in env or inherit_env instead.
   passthrough_env: list[string] = []
 
-  # Write the composed environment, pass-through values included, to an owner-only environment.json in each attempt directory.
-  # Its keys are digest, inherit_env, passthrough_env and env. env holds the config-level tracking targets, even an MLFLOW_EXPERIMENT_NAME the trainer never gets.
-  # It is written before the PHASESWEEP_* names, the leased GPU variables and the per-attempt run bindings are added, so those are absent from it.
+  # Write the exact environment the trainer receives to an owner-only environment.json in each attempt directory, per-attempt and GPU variables included.
+  # Its keys are digest (the cohort checksum), inherit_env and passthrough_env (their contracts), and env (the final mapping including run bindings).
   # Warning: true stores ambient and passed-through secrets in that file.
   record_env: bool = false
 

@@ -778,6 +778,27 @@ def test_validate_and_dry_run_warn_when_argparse_renders_a_boolean(
     ]
 
 
+def test_validate_labels_boolean_repeat_values_as_repeats(tmp_path: Path) -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                repeats=Repeats(key="seed", values=[False, True]),
+                sampler=Sampler(type="grid"),
+                n_trials=2,
+            )
+        ]
+    )
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "--seed (phase 'p' repeats)" in result.output
+    assert "--seed (phase 'p' search_space)" not in result.output
+
+
 @pytest.mark.parametrize(
     ("override_format", "trial_command"),
     [

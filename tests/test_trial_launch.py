@@ -40,7 +40,9 @@ from phasesweep.engine.trial import (
 from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
+from phasesweep.tracking.session import write_record
 from tests.conftest import make_experiment, make_trial_context
+from tests.tracking_helpers import _binding, _identity
 
 #: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
 #: process identity exists, so anything else it loaded could start code that
@@ -62,6 +64,7 @@ def _capture_launch_env(
     experiment_kwargs: dict[str, Any] | None = None,
     overrides: dict[str, Any] | None = None,
     environment_identity: EnvironmentIdentity | None = None,
+    experiment: Experiment | None = None,
 ) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
@@ -79,6 +82,7 @@ def _capture_launch_env(
         gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
         captured.update(env)
+        captured["process_env"] = dict(env)
         captured["command"] = _cmd
         captured["run_supervised_attempt_id"] = attempt_id
         if cwd is not None:
@@ -92,7 +96,7 @@ def _capture_launch_env(
         )
 
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", fake_run_supervised)
-    experiment = make_experiment(
+    experiment = experiment or make_experiment(
         env=experiment_env,
         execution=execution,
         metric=metric,
@@ -877,7 +881,8 @@ def test_launch_trial_uses_prepared_environment_identity(
 
     assert captured["TZ"] == "Europe/Berlin"
     recorded = json.loads((tmp_path / "trial_0" / "environment.json").read_text())
-    assert recorded["env"] == identity.values
+    assert recorded["env"] == captured["process_env"]
+    assert recorded["env"]["TZ"] == "Europe/Berlin"
     assert recorded["digest"] == identity.digest
 
 
@@ -937,17 +942,28 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     """``record_env: true`` persists the exact environment, owner-only (0600)."""
     monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
     execution = ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"], record_env=True)
-    _capture_launch_env(
+    metric = Metric(
+        name="loss",
+        extractor=JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="reports/objective.json",
+            objective_name="loss",
+            split="validation",
+            policy="final_checkpoint",
+        ),
+    )
+    captured = _capture_launch_env(
         tmp_path,
         monkeypatch,
         experiment_env={"CONFIGURED": "value"},
         execution=execution,
+        metric=metric,
     )
 
     path = tmp_path / "trial_0" / "environment.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     identity = _environment_identity(
-        make_experiment(env={"CONFIGURED": "value"}, execution=execution), "p"
+        make_experiment(env={"CONFIGURED": "value"}, execution=execution, metric=metric), "p"
     )
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -956,7 +972,68 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert payload["passthrough_env"] == ["TMPDIR"]
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
-    assert payload["env"] == identity.values
+    assert payload["env"] == captured["process_env"]
+    assert payload["env"]["PHASESWEEP_TRIAL_DIR"] == str(path.parent)
+    assert payload["env"]["PHASESWEEP_TRIAL_ID"] == "0"
+    assert payload["env"]["PHASESWEEP_PHASE"] == "p"
+    assert payload["env"]["PHASESWEEP_RUN_NAME"] == "t-p-0-attempt-test"
+    assert payload["env"]["PHASESWEEP_GENERATION_ID"] == "generation-test"
+    assert payload["env"]["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
+    assert payload["env"]["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
+    assert payload["env"]["PHASESWEEP_OBJECTIVE_PATH"] == str(
+        path.parent / "reports/objective.json"
+    )
+    assert payload["env"]["CUDA_VISIBLE_DEVICES"] == "2"
+    assert payload["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+def test_recorded_environment_includes_wandb_attempt_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        execution=ExecutionContext(record_env=True),
+        experiment_kwargs={
+            "gates": [
+                WandbSummaryRequiredGate(
+                    type="wandb_summary_required", entity="entity", project="project", keys=["loss"]
+                )
+            ]
+        },
+    )
+    recorded = json.loads((tmp_path / "trial_0" / "environment.json").read_text())
+
+    assert recorded["env"] == captured["process_env"]
+    assert recorded["env"]["WANDB_RUN_ID"] == "attempt-test"
+
+
+def test_recorded_environment_resolves_mlflow_name_and_run_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    experiment = Experiment.model_validate(
+        {
+            **make_experiment().model_dump(),
+            "execution": {"record_env": True},
+            "mlflow": {"tracking_uri": "http://localhost:5000", "experiment_name": "existing"},
+            "metric": {
+                "name": "loss",
+                "extractor": {"type": "mlflow", "metric_key": "loss", "select": "last"},
+            },
+        }
+    )
+    trial_dir = tmp_path / "trial_0"
+    trial_dir.mkdir()
+    write_record(trial_dir / "mlflow-expected.json", _identity())
+    write_record(trial_dir / "mlflow-binding.json", _binding())
+
+    captured = _capture_launch_env(tmp_path, monkeypatch, experiment=experiment)
+    recorded = json.loads((trial_dir / "environment.json").read_text())
+
+    assert recorded["env"] == captured["process_env"]
+    assert recorded["env"]["MLFLOW_EXPERIMENT_ID"] == "1"
+    assert "MLFLOW_EXPERIMENT_NAME" not in recorded["env"]
+    assert recorded["env"]["MLFLOW_RUN_ID"] == "native-id"
 
 
 def test_passthrough_value_rotation_preserves_semantic_environment_digest(

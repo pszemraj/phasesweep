@@ -569,6 +569,88 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": None}}
 
 
+def test_wandb_gates_share_failed_capture(tmp_path, monkeypatch):
+    from phasesweep.evidence.models import WandbQuery
+    from phasesweep.evidence.wandb import WandbRunTerminalError
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    other_gate = gate.model_copy(update={"keys": ["complete"]})
+    ctx = replace(
+        make_trial_context(tmp_path),
+        wandb_query=WandbQuery(gate, (), ("done", "complete")),
+    )
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise WandbRunTerminalError(ctx.attempt_id, "failed")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    results = evaluate_gates(ctx, [gate, other_gate])
+    assert calls == 1
+    assert len(results) == 2
+    assert all(not result.passed and not result.deadline_exhausted for result in results)
+    assert results[0].detail == results[1].detail
+    assert "ended in 'failed'" in results[0].detail
+
+
+@pytest.mark.parametrize("failure_kind", ["deadline", "cleanup"])
+def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_kind):
+    from phasesweep.errors import UnsafeProcessCleanupError
+
+    extractor = WandbExtractor(type="wandb", entity="entity", project="project", metric_key="loss")
+    ctx = make_trial_context(tmp_path)
+    failure = (
+        DeadlineExceededError("capture deadline expired")
+        if failure_kind == "deadline"
+        else UnsafeProcessCleanupError("worker cleanup is uncertain")
+    )
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        return {"values": {"loss": 0.25}, "present_keys": ["loss"]}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    with pytest.raises(type(failure), match=str(failure)):
+        run_extractor(ctx, extractor)
+    assert run_extractor(ctx, extractor) == 0.25
+    assert calls == 2
+
+
+def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypatch):
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    ctx = make_trial_context(tmp_path)
+    clock = [0.0]
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            clock[0] = 1.0
+            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds)
+        return {"values": {}, "present_keys": ["done"]}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    first = evaluate_gates(ctx, [gate], deadline=1.0)[0]
+    assert not first.passed
+    assert first.deadline_exhausted
+    assert evaluate_gates(ctx, [gate], deadline=2.0)[0].passed
+    assert calls == 2
+
+
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
     from phasesweep.evidence.wandb import _poll_wandb_summary
 

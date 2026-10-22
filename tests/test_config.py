@@ -789,6 +789,41 @@ def test_env_rejects_names_and_values_the_launch_cannot_pass(
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "PHASESWEEP_TRIAL_DIR",
+        "PHASESWEEP_TRIAL_ID",
+        "PHASESWEEP_PHASE",
+        "PHASESWEEP_RUN_NAME",
+        "PHASESWEEP_GENERATION_ID",
+        "PHASESWEEP_ATTEMPT_ID",
+        "PHASESWEEP_OVERRIDES_SHA256",
+        "PHASESWEEP_OBJECTIVE_PATH",
+    ],
+)
+def test_env_rejects_per_attempt_variables(name: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        make_experiment(env={name: "ignored"})
+    message = str(caught.value)
+    assert name in message
+    assert "PhaseSweep sets" in message
+    assert "every attempt" in message
+    assert "Remove" in message
+
+
+def test_env_allows_other_phasesweep_variables() -> None:
+    experiment = make_experiment(env={"PHASESWEEP_LOCK_DIR": "/tmp/locks"})
+    assert experiment.env == {"PHASESWEEP_LOCK_DIR": "/tmp/locks"}
+
+
+def test_env_reports_all_reserved_variables_together() -> None:
+    with pytest.raises(ValidationError) as caught:
+        make_experiment(env={"PHASESWEEP_PHASE": "p", "PHASESWEEP_TRIAL_ID": "123"})
+    assert "PHASESWEEP_PHASE" in str(caught.value)
+    assert "PHASESWEEP_TRIAL_ID" in str(caught.value)
+
+
+@pytest.mark.parametrize(
     ("field", "names", "message"),
     [
         pytest.param("inherit_env", [""], "nonempty and unpadded", id="inherit_empty"),
