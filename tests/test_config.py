@@ -1283,10 +1283,11 @@ def test_observe_names_are_distinct_from_metric_and_constraints() -> None:
     ids=["wandb", "mlflow"],
 )
 def test_observe_refuses_remote_extractors(extractor: JsonObject, tmp_path: Path) -> None:
-    """Remote readers wait for every key, so an observation may only read local files."""
+    """Remote readers require every key, so an observation may only read local files."""
     reason = (
-        r"Observation 'peak' cannot use a \w+ extractor: remote extractors wait for every "
-        r"requested key.*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
+        r"Observation 'peak' cannot use a \w+ extractor: remote extractors require every "
+        r"requested key, so a value the trainer never wrote would fail the trial\. "
+        r".*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
     )
     with pytest.raises(ValidationError, match=reason):
         Observation.model_validate({"name": "peak", "extractor": extractor})

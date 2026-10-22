@@ -534,8 +534,8 @@ class Observation(_NamedExtractor):
         if kind in ("wandb", "mlflow"):
             raise ValueError(
                 f"Observation {info.data.get('name')!r} cannot use a {kind} extractor: "
-                "remote extractors wait for every requested key, so a value the trainer "
-                "never wrote would stall the trial until the poll timeout. Write the value "
+                "remote extractors require every requested key, so a value the trainer "
+                "never wrote would fail the trial. Write the value "
                 "with report_objective(..., extra=...) and read it with a local json extractor."
             )
         return value
