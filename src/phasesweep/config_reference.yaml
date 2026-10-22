@@ -12,7 +12,7 @@
 # phasesweep run flags --from-phase, --dry-run and --verbose choose what to execute or print.
 # --from-phase PHASE must name a configured phase. Earlier ancestors of the remaining phases need published winners whose fingerprints match the current config and whose evidence is intact, or the run and dry run fail. Unrelated earlier phases need no winner, but a winner one of them has published is checked and carried like an ancestor's.
 # The file is read once per invocation. Editing it later does not change work that has already started.
-# The MCP server hashes the file when it loads its catalog. At each launch it re-reads the file and refuses to start if the SHA-256 changed, until the server restarts. The detached runner loads a copy of the verified bytes.
+# The MCP server rereads its catalog and every config it lists before the next tool call after one of them changes, so an edit applies without a restart. An edit that fails validation keeps reads on the last valid config and refuses launches until it is fixed. The detached runner loads a copy of the verified bytes.
 # The file must be UTF-8 text whose top level is one mapping. That mapping describes one experiment.
 # A string whose escapes produce text that is not valid UTF-8, such as "\ud800", fails config load.
 # Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
