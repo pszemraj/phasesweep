@@ -48,7 +48,11 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -878,7 +882,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
         *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
     ) -> None:
         generation.claim()
-        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
@@ -918,7 +922,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         # Initial discovery and preflight succeeded. Only reconciliation loses
         # access to the root, before it can perform a second registry scan.
         monkeypatch.setattr("phasesweep.engine.guards.validate_ledger", fail_discovery)
-        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_active_attempts", scan_registry)
@@ -997,7 +1001,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     ("initial_error", "cleanup_confirmed"),
     [
         pytest.param(
-            NoFeasibleTrialError("trainer failed", cause="trials_failed"),
+            PhaseTrialsFailedError("trainer failed"),
             True,
             id="ordinary-failure",
         ),
@@ -1091,7 +1095,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
-    primary = NoFeasibleTrialError("trainer failed", cause="trials_failed")
+    primary = PhaseTrialsFailedError("trainer failed")
 
     def fail_with_uncertain_cleanup(
         config_obj: Experiment,

@@ -46,6 +46,9 @@ from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
     select_winner,
 )
 from phasesweep.engine.state import (
@@ -1328,7 +1331,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     :param _PhaseExecution run: The drained phase execution.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :raises NoFeasibleTrialError: An abort tripped and no timeout left work
-        undone, or no finished trial is feasible; its cause says whether a trial failed.
+        undone, or no finished trial is feasible; the subclass says whether a trial failed.
     :raises TimeoutError: The deadline left the phase incomplete and partial
         publication is disabled, or no trial completed before it.
     :raises RuntimeError: Optuna returned short of the trial target without a
@@ -1367,10 +1370,10 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             if all_infeasible
             else f"Inspect {_phase_dir(experiment, phase.name)} for stderr logs."
         )
-        raise NoFeasibleTrialError(
+        abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
+        raise abort_error(
             f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}"
             + ("" if advice is None else f" {advice}"),
-            cause="trials_infeasible" if all_infeasible else "trials_failed",
             action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
         )
     if (
@@ -1632,9 +1635,8 @@ def _replay_met_target(
         :func:`_select_phase_winner` for everything it covers.
     :raises StudySchemaMismatchError: The study accepted an abort recovery target
         but has no remaining trial slots.
-    :raises NoFeasibleTrialError: No recorded trial is complete, feasible and inside the
-        metric's bounds, or with ``repeats`` no group is complete; its cause is
-        ``replay_without_feasible_trial``.
+    :raises ReplayWithoutFeasibleTrialError: No recorded trial is complete, feasible and
+        inside the metric's bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The selected winner's evidence is missing or
         altered; only when ``verify_evidence`` is set.
     :return Winner: The winner the recorded trials select.
@@ -1663,11 +1665,10 @@ def _replay_met_target(
             verify_evidence=verify_evidence,
         )
     except NoFeasibleTrialError as exc:
-        raise NoFeasibleTrialError(
+        raise ReplayWithoutFeasibleTrialError.rewrap(
+            exc,
             f"Phase {phase.name!r} launched no trial: its recorded trials already meet "
             f"n_trials={phase.n_trials}. {exc}",
-            cause="replay_without_feasible_trial",
-            action=exc.action,
         ) from exc
 
 

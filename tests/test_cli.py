@@ -41,7 +41,7 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     GpuConfigurationError,
@@ -1702,7 +1702,7 @@ def test_cli_boundary_reports_expected_run_failure(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(
         monkeypatch,
-        NoFeasibleTrialError("no feasible trial in phase 'depth'", cause="trials_failed"),
+        PhaseTrialsFailedError("no feasible trial in phase 'depth'"),
     )
 
     argv = ["run", str(config_path)]

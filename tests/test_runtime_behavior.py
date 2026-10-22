@@ -37,7 +37,11 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.run import TerminalReport
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -583,13 +587,13 @@ def test_terminal_callback_reports_success_evidence(
     ("primary_error", "callback_error_type"),
     [
         pytest.param(
-            NoFeasibleTrialError("phase failed", cause="trials_failed"),
+            PhaseTrialsFailedError("phase failed"),
             RuntimeError,
             id="failed-exception",
         ),
         # A diagnostic callback raising KeyboardInterrupt cannot mask the primary error.
         pytest.param(
-            NoFeasibleTrialError("phase failed", cause="trials_failed"),
+            PhaseTrialsFailedError("phase failed"),
             KeyboardInterrupt,
             id="failed-keyboard-interrupt",
         ),
@@ -661,7 +665,7 @@ def test_failure_stage_and_reconciliation_follow_whether_the_generation_was_clai
     def run_outcome(*_args, generation, **_kwargs):
         if claims:
             generation.claim()
-        raise NoFeasibleTrialError("phase failed", cause="trials_failed")
+        raise PhaseTrialsFailedError("phase failed")
 
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", run_outcome)

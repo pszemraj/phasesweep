@@ -57,7 +57,13 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -144,19 +150,6 @@ def _operator_error_classes() -> list[type[PhaseSweepError]]:
     return _all_subclasses(PhaseSweepError)
 
 
-#: Keyword arguments an operator error requires beyond its message and action.
-_REQUIRED_KWARGS: dict[type[PhaseSweepError], dict[str, str]] = {
-    NoFeasibleTrialError: {"cause": "trials_failed"},
-}
-
-
-def _operator_error(
-    cls: type[PhaseSweepError], message: str, *, action: OperatorAction | None = None
-) -> PhaseSweepError:
-    """Construct ``cls`` with ``message``, ``action`` and any keyword it requires."""
-    return cls(message, action=action, **_REQUIRED_KWARGS.get(cls, {}))
-
-
 def _populated_study(name: str = "routing") -> optuna.Study:
     """Return an in-memory study holding one finished trial and no PhaseSweep attrs."""
     study = optuna.create_study(study_name=name)
@@ -176,8 +169,8 @@ def test_every_operator_error_declares_its_action():
 
     inherits_fallback = []
     for cls in classes:
-        plain = _operator_error(cls, "boom")
-        routed = _operator_error(cls, "boom", action=OperatorAction.RETRY)
+        plain = cls("boom")
+        routed = cls("boom", action=OperatorAction.RETRY)
 
         assert isinstance(cls.default_action, OperatorAction), f"{cls.__name__} has no action"
         assert plain.action is cls.default_action
@@ -216,6 +209,17 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     # A cause with no action of its own leaves the class default in place.
     foreign = RunRecoveryError.rewrap(OSError("disk"), "y")
     assert foreign.action is RunRecoveryError.default_action
+
+
+def test_no_feasible_subclasses_rewrap_with_the_donated_action():
+    inbound = PhaseTrialsFailedError("x", action=OperatorAction.FIX_CONFIG)
+
+    rewrapped = ReplayWithoutFeasibleTrialError.rewrap(inbound, "y")
+
+    assert type(rewrapped) is ReplayWithoutFeasibleTrialError
+    assert isinstance(rewrapped, NoFeasibleTrialError)
+    assert rewrapped.action is OperatorAction.FIX_CONFIG
+    assert str(rewrapped) == "y"
 
 
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
@@ -499,7 +503,7 @@ def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.Monk
     def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
         generation.claim()
         monkeypatch.setattr(guards, "validate_ledger", _raiser(OSError("root is gone")))
-        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
     return run_experiment(experiment)
@@ -516,7 +520,7 @@ def _run_fails_then_registry_turns_shared(
         registry = _attempts_dir(experiment)
         registry.mkdir(parents=True, exist_ok=True)
         registry.chmod(0o755)
-        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
     return run_experiment(experiment)
@@ -1736,35 +1740,35 @@ ORIGIN_CASES = (
     RoutingCase(
         id="live_abort_with_failed_cells",
         trigger=_abort_with_failed_cells,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
         message="phases[p].n_trials from 2 to 4 in the config",
     ),
     RoutingCase(
         id="live_abort_with_unrun_cells",
         trigger=_abort_with_unrun_cells,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsInfeasibleError,
         action=OperatorAction.FIX_CONFIG,
         message="phases[p].max_consecutive_failures above 2 in the config",
     ),
     RoutingCase(
         id="live_abort_with_every_cell_measured",
         trigger=_abort_with_every_cell_measured,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsInfeasibleError,
         action=OperatorAction.FIX_CONFIG,
         message="none is feasible, so change the search space or bounds",
     ),
     RoutingCase(
         id="live_abort_fatal",
         trigger=_finish_after_fatal_abort,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsFailedError,
         action=OperatorAction.FIX_CONFIG,
         message="phases[p].n_trials above 4 in the config",
     ),
     RoutingCase(
         id="live_abort_awaiting_cleanup_recovery",
         trigger=_finish_after_unconfirmed_cleanup_abort,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsFailedError,
         action=OperatorAction.RUN_RECOVER_RUN,
         message="First confirm the cleanup",
     ),
@@ -1772,7 +1776,7 @@ ORIGIN_CASES = (
         # No later run can continue an in-memory study, so only the logs are left.
         id="live_abort_without_storage",
         trigger=_abort_without_storage,
-        raised=NoFeasibleTrialError,
+        raised=PhaseTrialsFailedError,
         action=OperatorAction.INSPECT_LOGS,
         message="for stderr logs",
     ),
@@ -1938,16 +1942,16 @@ _UNCONFIRMED_CLEANUPS = (
     (_cleanup_refusal(_LEDGER, OSError("ledger unreadable")), None, [_LEDGER]),
     (_cleanup_refusal(None, _LEDGER_LOST), None, []),
     (_cleanup_refusal(None, None), None, []),
-    (NoFeasibleTrialError("trainer failed", cause="trials_failed"), _SHARED_REGISTRY, [_TREE]),
-    (NoFeasibleTrialError("trainer failed", cause="trials_failed"), OSError("root is gone"), []),
+    (PhaseTrialsFailedError("trainer failed"), _SHARED_REGISTRY, [_TREE]),
+    (PhaseTrialsFailedError("trainer failed"), OSError("root is gone"), []),
     (_LEDGER_LOST, None, [_LEDGER]),
     (_LEDGER_LOST, _SHARED_REGISTRY, [_LEDGER, _TREE]),
 )
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:
-    errors = [_operator_error(cls, "boom") for cls in _operator_error_classes()]
-    errors += [_operator_error(case.raised, "boom", action=case.action) for case in CASES]
+    errors = [cls("boom") for cls in _operator_error_classes()]
+    errors += [case.raised("boom", action=case.action) for case in CASES]
     for error in errors:
         failure = mcp_runner._terminal_failure_payload(
             error, stage="preflight", cleanup_confirmed=True

@@ -23,7 +23,13 @@ from phasesweep.config.search import IntParam, Sampler, fixed_configuration_targ
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
@@ -232,14 +238,18 @@ def _failure_code(error: BaseException) -> object:
 
 
 @pytest.mark.parametrize(
-    ("failures", "value", "cause"),
+    ("failures", "value", "error_type", "code"),
     [
-        pytest.param(1, 1.0, "trials_failed", id="trials-failed"),
-        pytest.param(0, 5.0, "trials_infeasible", id="out-of-bounds"),
+        pytest.param(1, 1.0, PhaseTrialsFailedError, "trials_failed", id="trials-failed"),
+        pytest.param(0, 5.0, PhaseTrialsInfeasibleError, "trials_infeasible", id="out-of-bounds"),
     ],
 )
-def test_no_feasible_failure_code_follows_the_recorded_cause(
-    tmp_path: Path, failures: int, value: float, cause: str
+def test_no_feasible_failure_code_follows_the_raised_subclass(
+    tmp_path: Path,
+    failures: int,
+    value: float,
+    error_type: type[NoFeasibleTrialError],
+    code: str,
 ) -> None:
     """A failed or out-of-bounds trial and a replay of it each report their own failure code."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
@@ -251,22 +261,28 @@ def test_no_feasible_failure_code_follows_the_recorded_cause(
         run_experiment(experiment)
 
     assert _call_count(calls) == 1
-    assert (measured.value.cause, _failure_code(measured.value)) == (cause, cause)
-    assert (replayed.value.cause, _failure_code(replayed.value)) == (
-        "replay_without_feasible_trial",
+    assert (type(measured.value), _failure_code(measured.value)) == (error_type, code)
+    assert (type(replayed.value), _failure_code(replayed.value)) == (
+        ReplayWithoutFeasibleTrialError,
         "replay_without_feasible_trial",
     )
 
 
 @pytest.mark.parametrize(
-    ("failures", "value", "cause"),
+    ("failures", "value", "error_type", "code"),
     [
-        pytest.param(1, 1.0, "trials_failed", id="failed-streak"),
-        pytest.param(0, 5.0, "trials_infeasible", id="infeasible-streak"),
+        pytest.param(1, 1.0, PhaseTrialsFailedError, "trials_failed", id="failed-streak"),
+        pytest.param(
+            0, 5.0, PhaseTrialsInfeasibleError, "trials_infeasible", id="infeasible-streak"
+        ),
     ],
 )
 def test_streak_abort_failure_code_says_whether_a_trial_failed(
-    tmp_path: Path, failures: int, value: float, cause: str
+    tmp_path: Path,
+    failures: int,
+    value: float,
+    error_type: type[NoFeasibleTrialError],
+    code: str,
 ) -> None:
     """An abort over infeasible trials is not reported as a trainer failure."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
@@ -275,7 +291,7 @@ def test_streak_abort_failure_code_says_whether_a_trial_failed(
     with pytest.raises(NoFeasibleTrialError, match="aborted") as aborted:
         run_experiment(experiment)
 
-    assert (aborted.value.cause, _failure_code(aborted.value)) == (cause, cause)
+    assert (type(aborted.value), _failure_code(aborted.value)) == (error_type, code)
 
 
 def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(

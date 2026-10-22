@@ -29,7 +29,12 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.run import PublicationHook, TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
+from phasesweep.engine.selection import (
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     OPERATOR_STEPS,
@@ -160,8 +165,7 @@ def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, o
     }
 
 
-# First matching exception type determines the durable failure code. A NoFeasibleTrialError
-# reports its own recorded cause instead.
+# First matching exception type determines the durable failure code.
 _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (ProcessCleanupUncertainError, "cleanup_uncertain"),
     (ExperimentLockBusyError, "experiment_busy"),
@@ -176,6 +180,9 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (TrialTargetRefusedError, "trial_target_refused"),
     (PhaseAbortRefusedError, "trial_target_refused"),
+    (PhaseTrialsFailedError, "trials_failed"),
+    (PhaseTrialsInfeasibleError, "trials_infeasible"),
+    (ReplayWithoutFeasibleTrialError, "replay_without_feasible_trial"),
 )
 
 
@@ -218,13 +225,11 @@ def _base_failure_payload(
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure.
 
-    The error's type selects ``code``, except that a :class:`NoFeasibleTrialError`
-    reports its recorded cause. For a :class:`PhaseSweepError`, ``retryable``,
+    The error's type selects ``code``. For a :class:`PhaseSweepError`, ``retryable``,
     ``actor``, and ``remediation`` come only from the action its raise routes; an
     exception without a routed action keeps its type's fixed text.
 
-    :param BaseException error: Exception whose type, or recorded cause, selects the
-        failure code.
+    :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report; clamped to one of
         ``"preflight"``, ``"execution"``, or ``"cleanup"``, falling back to
         ``"execution"`` for any other value.
@@ -238,13 +243,9 @@ def _base_failure_payload(
     )
     if not isinstance(error, PhaseSweepError):
         return _unrouted_failure_payload(error, stage=failure_stage)
-    code: FailureCode = (
-        error.cause
-        if isinstance(error, NoFeasibleTrialError)
-        else next(
-            (code for error_type, code in _FAILURE_CODES if isinstance(error, error_type)),
-            "internal_error",
-        )
+    code: FailureCode = next(
+        (code for error_type, code in _FAILURE_CODES if isinstance(error, error_type)),
+        "internal_error",
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
