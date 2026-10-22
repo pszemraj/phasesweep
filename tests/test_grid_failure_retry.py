@@ -247,6 +247,11 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
         "COMPLETE",
     ]
     assert len(calls.read_text().splitlines()) == 4
+    # Every cell succeeded after its retry, so survivorship lost nothing.
+    assert _published_survivorship(recovered) == {
+        "verdict": "ok",
+        "detail": {"ranked": 2, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+    }
 
 
 @pytest.mark.parametrize(
@@ -642,25 +647,6 @@ def _published_survivorship(experiment: Experiment) -> dict[str, object]:
     assert pointer.generation_id is not None
     path = _generation_winner_path(experiment, pointer.generation_id, "p")
     return yaml.safe_load(path.read_text())["confound"]["checks"]["survivorship"]
-
-
-@pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
-def test_survivorship_ignores_failures_that_a_successful_retry_replaced(
-    tmp_path: Path, repeats: bool
-) -> None:
-    """Every cell has a successful trial after the retries, so nothing was lost to survivorship."""
-    trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(_grid(tmp_path, trainer, 2, repeats=repeats))
-    recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
-    assert run_experiment(recovered)["p"].metric == 1.0
-    states = [trial.state.name for trial in phase_trials(recovered)]
-    assert states == ["FAIL"] * 2 + ["COMPLETE"] * 2
-
-    assert _published_survivorship(recovered) == {
-        "verdict": "ok",
-        "detail": {"ranked": 2, "infeasible": 0, "incomplete_group": 0, "failed": 0},
-    }
 
 
 @pytest.mark.parametrize(
