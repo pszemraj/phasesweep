@@ -49,8 +49,8 @@ from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
-    _phase_trials,
     make_experiment,
+    phase_trials,
     trial_outcome,
     write_param_echo_trainer,
     write_trainer,
@@ -291,8 +291,8 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     lines = [record.getMessage() for record in caplog.records]
     expected = run_experiment(control)["p"]
 
-    trials = _phase_trials(exp)
-    controls = _phase_trials(control)
+    trials = phase_trials(exp)
+    controls = phase_trials(control)
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert _trial_interrupted(trials[0])
     assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
@@ -364,7 +364,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
     with pytest.raises(expected[0], match=expected[1]):
         run_experiment(exp)
 
-    (trial,) = _phase_trials(exp)
+    (trial,) = phase_trials(exp)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
     assert launched.exists()
     if serviced:
@@ -404,7 +404,7 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
     with pytest.raises(RuntimeError, match="stopped after 0/1"):
         run_experiment(exp)
 
-    (trial,) = _phase_trials(exp)
+    (trial,) = phase_trials(exp)
     assert not launched.exists()
     assert _trial_count_state(trial) == "INTERRUPTED"
     assert _cause(trial) == _SIGINT_CAUSE
@@ -466,7 +466,7 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
         run_experiment(exp)
     sender.join(timeout=5.0)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
     assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)

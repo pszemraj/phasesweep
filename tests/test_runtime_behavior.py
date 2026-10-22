@@ -82,12 +82,12 @@ from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    _bounded_metric,
-    _phase_trials,
+    bounded_metric,
     copy_fake_train,
     make_experiment,
     make_trial_context,
     patch_rejected_trial_user_attr,
+    phase_trials,
     requires_nonroot,
     trial_outcome,
     write_constant_trainer,
@@ -161,7 +161,7 @@ def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     )
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
-    (trial,) = _phase_trials(experiment)
+    (trial,) = phase_trials(experiment)
     assert trial.state.name == state
     if state == "COMPLETE":
         assert trial.value == 0.25
@@ -436,7 +436,7 @@ def test_failed_trials_marked_fail_not_complete(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    for trial in _phase_trials(exp, "a"):
+    for trial in phase_trials(exp, "a"):
         # Every trial should be FAIL, not COMPLETE.
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}, expected FAIL"
@@ -545,7 +545,7 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
         run_experiment(expanded)
 
     assert _generation_path(initial).read_bytes() == generation_before
-    assert len(_phase_trials(initial, "local")) == 1
+    assert len(phase_trials(initial, "local")) == 1
 
 
 def test_terminal_callback_reports_success_evidence(
@@ -710,7 +710,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    for trial in _phase_trials(exp, "a"):
+    for trial in phase_trials(exp, "a"):
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}; expected FAIL because "
             "constraint extractor could not find param_bytes."
@@ -884,7 +884,7 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     # Verify only a small number of trials actually executed before the abort.
     # We can't predict exactly how many because Optuna may have a few in flight,
     # but it should be << 100.
-    n = len(_phase_trials(exp, "a"))
+    n = len(phase_trials(exp, "a"))
     assert n < 30, f"expected early abort, got {n} trials"
 
 
@@ -1009,7 +1009,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
 
     assert injected["n"] == 1
     assert winners["p"].metric == pytest.approx(0.5)
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [trial.state.name for trial in trials] == ["COMPLETE", "COMPLETE"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials] == [1, 2]
     assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success" for trial in trials)
@@ -1049,7 +1049,7 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
 
     assert winners["p"].metric == pytest.approx(0.5)
     sequences = sorted(
-        trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in _phase_trials(exp)
+        trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in phase_trials(exp)
     )
     assert first_failed.is_set()
     assert successful_writes[:2] == [1, 0]
@@ -1122,7 +1122,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.RUNNING]
     assert not [
         trial
@@ -1181,7 +1181,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert not [
         trial
         for trial in trials
@@ -1519,7 +1519,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
     with pytest.raises(RuntimeError, match="injected objective implementation bug"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert sorted(trial.state.name for trial in trials) == ["COMPLETE", "FAIL"]
     fatal = next(
         trial.user_attrs[TRIAL_OUTCOME_ATTR]
@@ -1681,7 +1681,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     )
 
     # (b) FrozenTrial.params, read back out of persistent storage.
-    trials = _phase_trials(exp, "pick")
+    trials = phase_trials(exp, "pick")
     assert len(trials) == len(_FIDELITY_CHOICES)
     for trial in trials:
         _assert_identical_scalar(
@@ -1776,7 +1776,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
         workdir=tmp_path / "runs",
         storage=storage,
         trainer=trainer,
-        metric=_bounded_metric(min=1.0, max=10.0),
+        metric=bounded_metric(min=1.0, max=10.0),
         n_trials=3,
         max_consecutive_failures=5,
     )
@@ -1784,7 +1784,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
     winners = run_experiment(exp)
 
     assert (winners["p"].trial_number, winners["p"].metric) == (2, 5.0)
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.value for t in trials] == [0.5, 20.0, 5.0]
     assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
@@ -1799,7 +1799,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
         workdir=tmp_path / "aborts-runs",
         storage=f"journal:///{tmp_path / 'aborts.journal'}",
         trainer=write_trainer(tmp_path / "high.py", 'print("x=20.0")'),
-        metric=_bounded_metric(max=10.0),
+        metric=bounded_metric(max=10.0),
         n_trials=6,
         max_consecutive_failures=2,
     )

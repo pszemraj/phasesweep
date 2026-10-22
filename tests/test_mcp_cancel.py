@@ -27,8 +27,6 @@ from tests.conftest import (
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
     earlier_boot_id,
     make_dead_run_handle,
     make_mcp_app,
@@ -37,6 +35,8 @@ from tests.mcp_helpers import (
     stage_dead_run,
     write_mcp_catalog,
     write_run_status,
+    write_srv_catalog,
+    write_srv_config,
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
@@ -190,12 +190,12 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     run_allows_cancel: bool,
 ) -> None:
     """Cancellation remains denied when either authority source forbids it."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     allowed = ALLOW_SIDE_EFFECTS
     if not catalog_allows_cancel:
         allowed = {"launch": True, "cancel": False, "from_phase": True}
     app, registry, store = make_mcp_app(
-        _catalog(tmp_path, config, allow=allowed),
+        write_srv_catalog(tmp_path, config, allow=allowed),
     )
     reg = registry.get("srv")
     run_id = "srv-denied"
@@ -223,9 +223,9 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
     hard deny here would leave no supported way to stop the sweep. There is no
     current policy to intersect with, and cancelling is risk-reducing.
     """
-    old_config = _config(tmp_path, name="old")
+    old_config = write_srv_config(tmp_path, name="old")
     old_snapshot = old_config.read_bytes()
-    other_config = _config(tmp_path, name="other")
+    other_config = write_srv_config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
     )
@@ -266,9 +266,9 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
 
 def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Path) -> None:
     """Removing the entry cannot grant authority the launch never had."""
-    old_config = _config(tmp_path, name="old")
+    old_config = write_srv_config(tmp_path, name="old")
     old_snapshot = old_config.read_bytes()
-    other_config = _config(tmp_path, name="other")
+    other_config = write_srv_config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, allow=ALLOW_SIDE_EFFECTS)
     )
@@ -402,10 +402,12 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
 def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     run_id = "srv-cancel-after-recovery"
     write_uncertain_failed_trial(config, generation_id=run_id)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = stage_dead_run(
         store, run_id, config, reg.id, cleanup_uncertain=True, allow_cancel=True

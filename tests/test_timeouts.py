@@ -27,7 +27,7 @@ from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
-    _bounded_metric,
+    bounded_metric,
     make_experiment,
     make_trial_context,
     write_constant_trainer,
@@ -273,7 +273,7 @@ def test_timeout_message_counts_an_out_of_bounds_trial_as_finished_not_completed
         experiment="phase_timeout_infeasible",
         workdir=tmp_path / "runs",
         trainer=trainer,
-        metric=_bounded_metric(max=0.5),
+        metric=bounded_metric(max=0.5),
         n_trials=2,
         timeout_seconds_per_phase=8.0,
         sampler=Sampler(type="random", seed=0),

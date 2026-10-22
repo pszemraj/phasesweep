@@ -669,13 +669,13 @@ def record_runner_cleanup(
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
 
-def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
+def write_srv_config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
     path = tmp_path / f"{name}.yaml"
     path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
     return path
 
 
-def _catalog(
+def write_srv_catalog(
     tmp_path: Path,
     config: Path,
     allow: dict[str, bool] | None = None,
@@ -700,12 +700,14 @@ def side_effect_app(
     :param str | None phases: Phases block for the config, or the default one-phase search.
     :return tuple[Path, PhaseSweepMCP, Registry, RunStore]: Config path, server, registry, and run store.
     """
-    config = _config(tmp_path, phases=phases)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config = write_srv_config(tmp_path, phases=phases)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     return config, app, registry, store
 
 
-def _drift_experiment(
+def drift_experiment(
     tmp_path: Path,
     trainer: Path,
     *,
@@ -741,6 +743,6 @@ def _drift_experiment(
     )
 
 
-def _write_experiment_config(config: Path, experiment: Experiment) -> None:
+def write_experiment_config(config: Path, experiment: Experiment) -> None:
     """Rewrite a cataloged config file in place, as an operator edit would."""
     config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))

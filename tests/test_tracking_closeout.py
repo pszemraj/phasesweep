@@ -14,7 +14,7 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import publication
 from phasesweep.tracking.mlflow import OperationRejectedError
-from tests.tracking_helpers import _remote_example
+from tests.tracking_helpers import remote_mlflow_example
 
 
 @pytest.mark.integration
@@ -22,7 +22,7 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The final warning names pending delivery while the committed result remains successful."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
 
     def outage(*_args: object, **_kwargs: object) -> JsonObject:

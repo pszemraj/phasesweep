@@ -13,14 +13,14 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import session
-from tests.tracking_helpers import _remote_example
+from tests.tracking_helpers import remote_mlflow_example
 
 
 def test_no_work_mlflow_replay_creates_no_empty_tracking_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A replay of the published winners writes no generation and leaves tracking alone."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path / 'study.journal'}"
     experiment = Experiment.model_validate(config)
     reports: list[TerminalReport] = []

@@ -14,7 +14,7 @@ from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import make_experiment
-from tests.mcp_helpers import SEEDED_RANDOM, _write_experiment_config, run_claimed_runner
+from tests.mcp_helpers import SEEDED_RANDOM, run_claimed_runner, write_experiment_config
 
 
 def test_a_failure_the_engine_never_reported_is_a_preflight_failure() -> None:
@@ -64,7 +64,7 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
         }
     )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, edited)
+    write_experiment_config(config_path, edited)
     store = RunStore(tmp_path / "state")
 
     with pytest.raises(StudyFingerprintMismatchError):

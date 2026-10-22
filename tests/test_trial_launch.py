@@ -42,7 +42,7 @@ from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
 from phasesweep.tracking.session import write_record
 from tests.conftest import make_experiment, make_trial_context
-from tests.tracking_helpers import _binding, _identity
+from tests.tracking_helpers import attempt_identity, mlflow_binding
 
 #: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
 #: process identity exists, so anything else it loaded could start code that
@@ -1024,8 +1024,8 @@ def test_recorded_environment_resolves_mlflow_name_and_run_bindings(
     )
     trial_dir = tmp_path / "trial_0"
     trial_dir.mkdir()
-    write_record(trial_dir / "mlflow-expected.json", _identity())
-    write_record(trial_dir / "mlflow-binding.json", _binding())
+    write_record(trial_dir / "mlflow-expected.json", attempt_identity())
+    write_record(trial_dir / "mlflow-binding.json", mlflow_binding())
 
     captured = _capture_launch_env(tmp_path, monkeypatch, experiment=experiment)
     recorded = json.loads((trial_dir / "environment.json").read_text())

@@ -170,7 +170,7 @@ def file_mode(path: Path) -> int:
 #: Optuna journal op codes this helper needs. Mirrors
 #: ``optuna.storages.journal._storage.JournalOperation`` and
 #: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
-_JOURNAL_CREATE_STUDY = 0
+JOURNAL_CREATE_STUDY = 0
 _JOURNAL_SET_STUDY_USER_ATTR = 2
 
 
@@ -192,7 +192,7 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
     study_id = None
     next_id = 0
     for record in records:
-        if record.get("op_code") == _JOURNAL_CREATE_STUDY:
+        if record.get("op_code") == JOURNAL_CREATE_STUDY:
             if record.get("study_name") == study_name:
                 study_id = next_id
             next_id += 1
@@ -246,7 +246,7 @@ def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) 
     study.tell(trial, value)
 
 
-def _bounded_metric(**bounds: float) -> Metric:
+def bounded_metric(**bounds: float) -> Metric:
     """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
     return Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
@@ -254,7 +254,7 @@ def _bounded_metric(**bounds: float) -> Metric:
     )
 
 
-def _phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
+def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
     """Read one phase's trials from the experiment's ledger.
 
     :param Experiment experiment: Experiment whose ledger is read.
@@ -533,7 +533,7 @@ def make_experiment(
         experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=metric or _bounded_metric(),
+        metric=metric or bounded_metric(),
         phases=phases,
     )
     if trainer_config is not None:

@@ -46,7 +46,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
-from tests.recovery_helpers import _new_phase_study
+from tests.recovery_helpers import new_phase_study
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -180,7 +180,7 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
     else:
         ledger = tmp_path / "study.journal"
         experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
-        _new_phase_study(experiment, "p")
+        new_phase_study(experiment, "p")
         _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     return experiment, ledger, _experiment_dir(experiment)
 

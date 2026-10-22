@@ -34,8 +34,8 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
-    _phase_trials,
     make_experiment,
+    phase_trials,
     write_constant_trainer,
     write_trainer,
 )
@@ -430,7 +430,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     experiment = _evidence_experiment(tmp_path, override_format=override_format)
     run_experiment(experiment)
     input_path = _sole_trial_dir(experiment) / filename
-    record = _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
+    record = phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
 
     assert record == {
         "schema_version": 1,
@@ -459,7 +459,7 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
     )
     run_experiment(experiment)
     trial_dir = _sole_trial_dir(experiment)
-    (trial,) = _phase_trials(experiment)
+    (trial,) = phase_trials(experiment)
     resolved = trial_dir / "overrides_resolved.json"
 
     if has_base_config:
@@ -551,7 +551,7 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     assert "trial 0" in message
     # Fails before any new trial work: the study still holds only the trial
     # whose evidence was broken, and nothing published over the damaged tree.
-    assert len(_phase_trials(topup)) == 1
+    assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -571,7 +571,7 @@ def test_present_incomplete_objective_provenance_blocks_selection(
     """Partial current provenance records cannot publish."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
-    trial = deepcopy(_phase_trials(experiment)[0])
+    trial = deepcopy(phase_trials(experiment)[0])
     record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
     if damage == "empty":
         record = {}
@@ -603,7 +603,7 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     topup = _evidence_experiment(tmp_path, n_trials=2)
     winners = run_experiment(topup)
 
-    assert len(_phase_trials(topup)) == 2
+    assert len(phase_trials(topup)) == 2
     second_generation = published_generation_id(topup)
     assert second_generation is not None
     assert second_generation != first_generation
@@ -631,7 +631,7 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     ):
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
-    assert len(_phase_trials(experiment)) == 1
+    assert len(phase_trials(experiment)) == 1
     assert _pointer_bytes(experiment) == pointer_before
 
 
@@ -671,7 +671,7 @@ def test_topup_refuses_damaged_generated_trainer_input(
     with pytest.raises(TrialEvidenceMissingError, match="trainer input"):
         run_experiment(topup)
 
-    assert len(_phase_trials(topup)) == 1
+    assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -764,7 +764,7 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     with pytest.raises(TrialEvidenceMissingError, match=expected):
         run_experiment(resumed, from_phase="q")
 
-    assert len(_phase_trials(resumed, "q")) == 2
+    assert len(phase_trials(resumed, "q")) == 2
     assert not marker.exists()
     assert _pointer_bytes(resumed) == pointer_before
 
@@ -816,7 +816,7 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
         match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
     ):
         run_experiment(experiment(3), from_phase="q")
-    assert len(_phase_trials(original, "q")) == 2
+    assert len(phase_trials(original, "q")) == 2
     assert not marker.exists()
     with pytest.raises(
         TrialEvidenceMissingError,
@@ -846,7 +846,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     payload = yaml.safe_load(
         (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
     )
-    assert payload["trainer_input"] == _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
+    assert payload["trainer_input"] == phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
         storage=_resolve_storage(experiment.storage),

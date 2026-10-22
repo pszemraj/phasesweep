@@ -21,7 +21,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, trial_outcome
-from tests.recovery_helpers import _new_phase_study
+from tests.recovery_helpers import new_phase_study
 
 
 def _experiment(tmp_path: Path, *, repeats: Repeats, n_trials: int) -> Experiment:
@@ -84,7 +84,7 @@ def test_repeat_summary_includes_losing_infeasible_and_partial_groups(
         repeats=Repeats.model_validate({"key": "seed", "values": [0, 1, 2], "reduce": reduce}),
         n_trials=9,
     )
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     for seed, value in enumerate([1.0, 2.0, 6.0]):
         _add_trial(study, x=1, seed=seed, value=value)
     for seed, value in enumerate([3.0, 4.0, 5.0]):
@@ -118,7 +118,7 @@ def test_repeat_summary_includes_losing_infeasible_and_partial_groups(
 def test_repeat_table_explains_group_numbers_while_members_arrive(tmp_path: Path) -> None:
     """An incomplete group's displayed number tracks its highest recorded member."""
     experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1]), n_trials=2)
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
 
     for seed in [0, 1]:
         _add_trial(study, x=1, seed=seed, value=1.0 + seed)
@@ -139,7 +139,7 @@ def test_repeat_summary_counts_a_rerun_once_and_keeps_random_slots_distinct(
 ) -> None:
     """A replacement completes its original slot; equal later draws stay separate."""
     experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1]), n_trials=4)
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     _add_trial(
         study,
         x=1,
@@ -163,7 +163,7 @@ def test_repeat_summary_counts_a_rerun_once_and_keeps_random_slots_distinct(
 def test_repeat_summary_keeps_an_interrupted_group_without_measurements(tmp_path: Path) -> None:
     """An interrupted-only group stays visible with no statistical estimate."""
     experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1]), n_trials=2)
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     _add_trial(
         study,
         x=1,
@@ -183,7 +183,7 @@ def test_repeat_summary_keeps_an_interrupted_group_without_measurements(tmp_path
 def test_repeat_observed_means_report_their_own_contributor_counts(tmp_path: Path) -> None:
     """Each observed mean names how many completed members actually recorded it."""
     experiment = _experiment(tmp_path, repeats=Repeats(key="seed", values=[0, 1, 2]), n_trials=3)
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     _add_trial(study, x=1, seed=0, value=0.4, attrs={"observed:heldout": 0.6})
     _add_trial(study, x=1, seed=1, value=0.5, attrs={"observed:heldout": 0.8, "observed:cost": 2.0})
     _add_trial(study, x=1, seed=2, value=0.6)

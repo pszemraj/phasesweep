@@ -197,7 +197,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
     from phasesweep.runtime.json import json_object
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
-    from tests.tracking_helpers import _binder, _identity, native_experiment
+    from tests.tracking_helpers import attempt_identity, mlflow_binder, native_experiment
 
     calls = []
 
@@ -228,7 +228,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
         }
     )
     identity = {
-        **_identity(),
+        **attempt_identity(),
         "tracking_uri": server.uri,
         "experiment": experiment.experiment,
         "experiment_id": server.experiment_id,
@@ -241,7 +241,7 @@ def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
         attempt_id=identity["attempt_id"],
     )
     trial_dir.mkdir(parents=True)
-    bind, path = _binder(trial_dir, "attempt", experiment=experiment, identity=identity)
+    bind, path = mlflow_binder(trial_dir, "attempt", experiment=experiment, identity=identity)
     return bind, path, calls, experiment
 
 

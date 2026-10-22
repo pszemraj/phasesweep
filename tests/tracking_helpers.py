@@ -28,7 +28,7 @@ from phasesweep.tracking import session
 from phasesweep.tracking.mlflow import _capture
 
 
-def _binding():
+def mlflow_binding():
     return {
         "schema_version": 1,
         "tracking_uri": "http://localhost:5000",
@@ -43,7 +43,7 @@ def _binding():
     }
 
 
-def _run(binding, *, status="FINISHED", metrics=None):
+def mlflow_run(binding, *, status="FINISHED", metrics=None):
     return SimpleNamespace(
         info=SimpleNamespace(
             run_id=binding["run_id"],
@@ -57,9 +57,9 @@ def _run(binding, *, status="FINISHED", metrics=None):
     )
 
 
-def _identity(generation_id="a" * 32, attempt_id="b" * 32):
+def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
     """Return the creation identity of one attempt, which names no native run yet."""
-    binding = {**_binding(), "generation_id": generation_id, "attempt_id": attempt_id}
+    binding = {**mlflow_binding(), "generation_id": generation_id, "attempt_id": attempt_id}
     return {k: v for k, v in binding.items() if k != "run_id"}
 
 
@@ -70,7 +70,7 @@ def native_experiment(tmp_path):
     return Experiment.model_validate(config)
 
 
-def _scripted_response(script, request):
+def scripted_response(script, request):
     """Consume the next response for an action, evaluating deferred responses."""
     if not script.get(request["action"]):
         pytest.fail(f"Unscripted {request['action']} request.")
@@ -78,10 +78,10 @@ def _scripted_response(script, request):
     return response() if callable(response) else response
 
 
-def _binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
+def mlflow_binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
     """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
     experiment = experiment or native_experiment(tmp_path)
-    identity = identity or _identity()
+    identity = identity or attempt_identity()
     if slot == "attempt":
         directory = directory or tmp_path
         path, slot_arguments = directory / "mlflow-binding.json", {"attempt_directory": directory}
@@ -102,7 +102,7 @@ def _binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
     return bind, path
 
 
-class _WorkerProcess:
+class FakeWorkerProcess:
     """A stand-in for the worker process behind the real controller and its response reader.
 
     Each request is answered with the next scripted response for its action. The controller's
@@ -139,12 +139,12 @@ class _WorkerProcess:
         request_path, response_path = (Path(part) for part in parts[-2:])
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.requests.append(request)
-        response = _scripted_response(self.script, request)
+        response = scripted_response(self.script, request)
         response_path.write_text(json.dumps(response), encoding="utf-8")
         return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
 
 
-def _leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
+def leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
     """Fail the one trial of ``depth`` with unconfirmed cleanup, recorded as recovered by nobody.
 
     The trainer really exits. The launch result reports its cleanup unconfirmed, and the engine's
@@ -180,7 +180,7 @@ def _leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
     return trial.user_attrs[ATTEMPT_ID_ATTR]
 
 
-def _remote_example(tmp_path, monkeypatch):
+def remote_mlflow_example(tmp_path, monkeypatch):
     """Patch the MLflow request operations with in-process answers; return the native example config and the list collecting uploads."""
     config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
     config.update(
@@ -196,7 +196,7 @@ def _remote_example(tmp_path, monkeypatch):
         if request["action"] == "create":
             return {**request["binding"], "run_id": "run-" + request["binding"]["attempt_id"]}
         if request["action"] == "capture":
-            run = _run(request["binding"], metrics={"eval/loss": 1.0, "cost": 1.0})
+            run = mlflow_run(request["binding"], metrics={"eval/loss": 1.0, "cost": 1.0})
             run.data.params = {"depth": "1", "rate": "0"}
             run.data.tags["trainer"] = "none"
             point = SimpleNamespace(value=1.0, step=1, timestamp=1)

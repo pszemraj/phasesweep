@@ -63,7 +63,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from tests.conftest import (
-    _JOURNAL_CREATE_STUDY,
+    JOURNAL_CREATE_STUDY,
     invoke_cli_boundary,
     make_experiment,
     mark_current_format,
@@ -447,7 +447,7 @@ def test_reopening_phase_studies_appends_no_journal_records(tmp_path: Path) -> N
 
     def created_studies() -> list[str]:
         records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
-        return [r["study_name"] for r in records if r["op_code"] == _JOURNAL_CREATE_STUDY]
+        return [r["study_name"] for r in records if r["op_code"] == JOURNAL_CREATE_STUDY]
 
     claimed = claim_ledger(validate_ledger(experiment))
     for phase in phases:

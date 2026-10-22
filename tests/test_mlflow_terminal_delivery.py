@@ -58,12 +58,12 @@ from phasesweep.tracking.session import (
 )
 from tests.conftest import trial_outcome
 from tests.tracking_helpers import (
-    _binding,
-    _leave_cleanup_uncertain_attempt,
-    _remote_example,
-    _run,
-    _WorkerProcess,
+    FakeWorkerProcess,
+    leave_cleanup_uncertain_attempt,
+    mlflow_binding,
+    mlflow_run,
     native_experiment,
+    remote_mlflow_example,
 )
 
 
@@ -72,10 +72,10 @@ from tests.tracking_helpers import (
 def test_publish_finishes_only_a_running_owned_run(actual, requested):
     """A terminal run keeps its status, so a retry or later outcome never rewrites it."""
     pytest.importorskip("mlflow")
-    binding = _binding()
+    binding = mlflow_binding()
     calls = []
     client = SimpleNamespace(
-        get_run=lambda _: _run(binding, status=actual),
+        get_run=lambda _: mlflow_run(binding, status=actual),
         log_batch=lambda *args, **kwargs: calls.append("batch"),
         log_artifact=lambda *args, **kwargs: calls.append("artifact"),
         set_terminated=lambda run_id, status: calls.append(status),
@@ -94,8 +94,8 @@ def test_publish_finishes_only_a_running_owned_run(actual, requested):
 
 def test_trainer_owned_run_is_never_terminated():
     pytest.importorskip("mlflow")
-    binding = {**_binding(), "run_mode": "trainer"}
-    client = SimpleNamespace(get_run=lambda _: _run(binding, status="RUNNING"))
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
+    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status="RUNNING"))
     with pytest.raises(ValueError, match="Only runs PhaseSweep created"):
         _publish(client, {"binding": binding, "projection": {}, "finish": "FAILED"})
 
@@ -111,7 +111,7 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
 
     def prepare(experiment, *, phase, generation_id, attempt_id, directory, **kwargs):
         binding = {
-            **_binding(),
+            **mlflow_binding(),
             "phase": phase,
             "generation_id": generation_id,
             "attempt_id": attempt_id,
@@ -134,7 +134,7 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
 @pytest.mark.parametrize("n_jobs", [1, 2])
 def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n_jobs, trainer):
     """Optuna drops callback errors in its final threaded batch; the fatal channel must not."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
     if trainer == "failed":
         config["trial_command"] = (
@@ -173,7 +173,7 @@ def _add_bound_attempt(
     )
     write_record(
         directory / BINDING_FILE,
-        {**_binding(), "phase": phase, "attempt_id": attempt, "run_mode": run_mode},
+        {**mlflow_binding(), "phase": phase, "attempt_id": attempt, "run_mode": run_mode},
     )
     trial.user_attrs.update({ATTEMPT_ID_ATTR: attempt, GENERATION_ID_ATTR: generation})
     study.add_trial(trial)
@@ -186,7 +186,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     generation = "a" * 32
     write_record(
         tracking_root(experiment) / generation / "generation-binding.json",
-        {**_binding(), "phase": "generation", "attempt_id": generation},
+        {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     ledger = claim_ledger(validate_ledger(experiment))
     study = open_phase_study(ledger, experiment.phases[0])
@@ -244,7 +244,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
 
 def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, monkeypatch):
     """Trial numbers are study-local, so one study's recovery never settles another study's attempt."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     generation = "a" * 32
@@ -273,7 +273,7 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
 
 def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypatch):
     """An interrupted trial's managed run ends KILLED; a failed one's ends FAILED."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     phase = experiment.phases[0]
@@ -301,7 +301,7 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
 @pytest.mark.parametrize("storage", ["memory", "journal"])
 def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkeypatch, storage):
     """A record write that fails after Optuna accepts a trial never turns it into a failure."""
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     if storage == "journal":
         config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
@@ -336,7 +336,7 @@ def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkey
 
 def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkeypatch):
     """A controller that dies between Optuna's commit and its callback saved no record."""
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     monkeypatch.setattr(publication, "publish_trial", lambda *args: None)
@@ -360,11 +360,11 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
 
 def test_sync_finishes_an_attempt_once_recovery_confirms_its_cleanup(tmp_path, monkeypatch):
     """Recovery never rewrites the failed trial; the study's ledger is what settles its attempt."""
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
-    attempt = _leave_cleanup_uncertain_attempt(Experiment.model_validate(config), monkeypatch)
+    attempt = leave_cleanup_uncertain_attempt(Experiment.model_validate(config), monkeypatch)
     # The same config with a larger budget, so the resumed invocation is ordinary preflight.
     config["phases"][0]["n_trials"] = 2
     experiment = Experiment.model_validate(config)
@@ -408,7 +408,7 @@ def _fail_engine(tmp_path, monkeypatch, error):
 
     def fail(*args, generation, **kwargs):
         generation_id = generation.generation_id
-        binding = {**_binding(), "phase": "generation", "generation_id": generation_id}
+        binding = {**mlflow_binding(), "phase": "generation", "generation_id": generation_id}
         write_record(tracking_root(experiment) / generation_id / "generation-binding.json", binding)
         raise error
 
@@ -533,7 +533,7 @@ def test_failure_publisher_preserves_historical_generation_outcome(
     )
     write_record(
         tracking_root(experiment) / generation / "generation-binding.json",
-        {**_binding(), "phase": "generation", "attempt_id": generation},
+        {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
     )
     pointer = _last_successful_generation_path(experiment)
     pointer_before = pointer.read_bytes()
@@ -602,7 +602,7 @@ def _fail_mirror(monkeypatch, failure):
 @pytest.mark.parametrize("failure", ["intent", "acknowledgement", "worker", "shutdown"])
 def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch, failure):
     """Publication, returned winners, and the terminal report agree; sync finishes the mirror."""
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     experiment = Experiment.model_validate(config)
     error = _fail_mirror(monkeypatch, failure)
     reports = []
@@ -649,7 +649,7 @@ def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch
 @pytest.mark.parametrize("edit", ["append", "rewire"])
 def test_rebuilt_winner_references_keep_the_generation_graph(tmp_path, monkeypatch, edit):
     """Sync rebuilds an older generation from its own phase plan and lineage, not today's."""
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     if edit == "rewire":
         config["phases"][1]["inherits"] = []
@@ -697,7 +697,7 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     from phasesweep.mcp.runs import RunStore
     from tests.mcp_helpers import run_claimed_runner
 
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     _fail_mirror(monkeypatch, failure)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(config))
@@ -728,7 +728,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     from phasesweep.engine import generation as generation_ops
     from phasesweep.engine.paths import _last_successful_generation_path
 
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"  # the replay must find the studies
     experiment = Experiment.model_validate(config)
     pointer_path = _last_successful_generation_path(experiment)
@@ -783,8 +783,8 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     """
     from phasesweep.tracking.mlflow import OperationOutcomeUnknownError
 
-    real_operation = worker.request_operation  # ``_remote_example`` replaces it
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    real_operation = worker.request_operation  # ``remote_mlflow_example`` replaces it
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     respond = session.request_operation
@@ -793,7 +793,7 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     appeared = {"late": reply == "ok"}
     creations: list[str] = []
     if reply is not None:
-        _WorkerProcess(
+        FakeWorkerProcess(
             monkeypatch,
             unreadable=["create"] if unreadable else [],
             create=[

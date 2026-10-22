@@ -22,14 +22,14 @@ from phasesweep.mcp.tool_names import TOOL_LAUNCH_RUN, TOOL_LIST_EXPERIMENTS
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
     call_mcp_tool,
     make_mcp_app,
     patch_popen_capture,
     side_effect_app,
     stage_live_run,
     write_mcp_catalog,
+    write_srv_catalog,
+    write_srv_config,
 )
 
 LOGGER = "phasesweep.mcp.server"
@@ -52,11 +52,11 @@ def test_added_entry_is_listed_and_inspected_without_a_restart(
 ) -> None:
     """A new entry is visible to the next call, through the tool adapter too, after one reload."""
     caplog.set_level(logging.INFO, logger=LOGGER)
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     app, _registry, _store = make_mcp_app(write_mcp_catalog(tmp_path, {"srv": config}))
     assert _listed_ids(app) == ["srv"]
 
-    write_mcp_catalog(tmp_path, {"srv": config, "other": _config(tmp_path, name="other")})
+    write_mcp_catalog(tmp_path, {"srv": config, "other": write_srv_config(tmp_path, name="other")})
 
     listed = call_mcp_tool(app, TOOL_LIST_EXPERIMENTS, {})
     assert not listed.isError
@@ -186,7 +186,7 @@ def test_changed_state_dir_refuses_launch_and_keeps_the_original_store(tmp_path:
     moved = tmp_path / "moved-state"
     catalog.write_text(
         catalog.read_text().replace(f"state_dir: {tmp_path}/state", f"state_dir: {moved}")
-        + f"  - id: other\n    config: {_config(tmp_path, name='other')}\n"
+        + f"  - id: other\n    config: {write_srv_config(tmp_path, name='other')}\n"
     )
 
     with pytest.raises(CatalogReloadRefusedError, match="restarts it") as excinfo:
@@ -204,12 +204,12 @@ def test_granting_launch_takes_effect_on_the_next_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Flipping allow.launch to true needs no restart."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config))
+    config = write_srv_config(tmp_path)
+    app, _registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
     with pytest.raises(PermissionDeniedError, match="applies on the next call"):
         app.launch("srv")
 
-    _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     patch_popen_capture(monkeypatch)
     handle = store.get(str(app.launch("srv")["run_id"]))
 
@@ -220,7 +220,7 @@ def test_granting_launch_takes_effect_on_the_next_call(
 def test_reloaded_max_concurrent_runs_applies_to_the_next_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    configs = {name: _config(tmp_path, name=name) for name in ("a", "b")}
+    configs = {name: write_srv_config(tmp_path, name=name) for name in ("a", "b")}
     catalog = write_mcp_catalog(tmp_path, configs, allow=ALLOW_SIDE_EFFECTS, max_concurrent_runs=1)
     app, _registry, store = make_mcp_app(catalog)
     stage_live_run(store, "a-live", configs["a"], "a")
@@ -235,9 +235,9 @@ def test_reloaded_max_concurrent_runs_applies_to_the_next_launch(
 
 def test_concurrent_calls_share_one_reload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Calls racing on an edited catalog reload it once and never see a partial registry."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     app, _registry, _store = make_mcp_app(write_mcp_catalog(tmp_path, {"srv": config}))
-    write_mcp_catalog(tmp_path, {"srv": config, "other": _config(tmp_path, name="other")})
+    write_mcp_catalog(tmp_path, {"srv": config, "other": write_srv_config(tmp_path, name="other")})
     original_load = Registry.load
     loads: list[Path] = []
 

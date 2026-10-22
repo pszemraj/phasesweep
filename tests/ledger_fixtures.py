@@ -235,7 +235,7 @@ def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setenv(name, value)
 
 
-def _write_config(config_path: Path, *, ledger_dir: Path, workdir: Path) -> Experiment:
+def write_fixture_config(config_path: Path, *, ledger_dir: Path, workdir: Path) -> Experiment:
     """Write and load the fixture experiment config for a materialized copy.
 
     The config comes from the same builder the generator used, with only the
@@ -334,7 +334,7 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         shutil.copytree(fixture.path / "ledger", root / "ledger")
         # Never created: a read path that materializes it has written.
         workdir = root / "unvisited_workdir"
-    experiment = _write_config(
+    experiment = write_fixture_config(
         tmp_path / "experiment.yaml",
         ledger_dir=root / "ledger",
         workdir=workdir,

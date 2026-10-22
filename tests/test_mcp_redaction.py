@@ -23,11 +23,11 @@ from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.conftest import make_experiment, write_trainer
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _write_experiment_config,
     assert_no_sensitive,
     make_mcp_app,
     mcp_experiment_config_text,
     patch_popen_capture,
+    write_experiment_config,
     write_mcp_catalog,
     write_mcp_config_catalog,
     write_run_status,
@@ -80,7 +80,7 @@ def _write_catalog(
         search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
     )
     config = tmp_path / "exp.yaml"
-    _write_experiment_config(config, experiment)
+    write_experiment_config(config, experiment)
     return write_mcp_catalog(tmp_path, {"redact_me": config}, allow=allow)
 
 

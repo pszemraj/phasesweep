@@ -25,7 +25,7 @@ from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
-from tests.conftest import _phase_trials, make_experiment, write_trainer
+from tests.conftest import make_experiment, phase_trials, write_trainer
 from tests.ledger_fixtures import golden_publication, reseal_winner
 
 
@@ -241,7 +241,7 @@ def test_malformed_observed_value_names_the_trial_it_came_from(
         **phase_shape,
     )
     run_experiment(experiment)
-    trials = [deepcopy(trial) for trial in _phase_trials(experiment)]
+    trials = [deepcopy(trial) for trial in phase_trials(experiment)]
     trials[0].user_attrs[observed_attr("mem")] = "3.0"
     study = optuna.create_study(direction="minimize")
     study.add_trials(trials)

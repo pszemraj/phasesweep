@@ -93,9 +93,6 @@ from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
-    _catalog,
-    _config,
-    _write_experiment_config,
     claim_runner_handle,
     live_runs,
     make_dead_run_handle,
@@ -104,8 +101,11 @@ from tests.mcp_helpers import (
     run_claimed_runner,
     runner_argv,
     runner_main,
+    write_experiment_config,
     write_mcp_catalog,
     write_slow_mcp_config,
+    write_srv_catalog,
+    write_srv_config,
 )
 from tests.recovery_helpers import recover_run_cli
 
@@ -163,7 +163,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
         search_space={},
     )
     config_path = tmp_path / f"{name}.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     return config_path, hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
@@ -320,7 +320,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         trial_command="echo x=0.5 {overrides}",
     )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     run_experiment(experiment)
     generation_before = _generation_path(experiment).read_bytes()
     (_experiment_dir(experiment) / "study.journal").unlink()
@@ -404,10 +404,10 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             }
         )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
     other_path = tmp_path / "other.yaml"
-    _write_experiment_config(other_path, other)
+    write_experiment_config(other_path, other)
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
@@ -571,7 +571,7 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
         sampler={"type": "random", "seed": 7},
     )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     store = RunStore(tmp_path / "state")
 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -623,7 +623,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
 
 @pytest.mark.integration
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
@@ -659,8 +659,8 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     changed = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"fixed_overrides": {"k": 2}})]}
     )
-    _write_experiment_config(config, changed)
-    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    write_experiment_config(config, changed)
+    registry = Registry.load(write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     run_id = "srv-preflight-failure"
     snapshot_path = store.config_snapshot_path(run_id)
@@ -697,7 +697,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
 def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     tmp_path: Path,
 ) -> None:
-    config = _config(
+    config = write_srv_config(
         tmp_path,
         phases="""\
   - name: a
@@ -1067,7 +1067,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
@@ -1091,7 +1091,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
@@ -1148,7 +1148,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
 @pytest.mark.integration
 def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
     """A terminal trial missing its attempt id remains attributable to recover-run."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r-terminal-identity"
     status_path = store.status_path(run_id)
@@ -1674,7 +1674,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "srv-recover"
     started_at = "2026-06-24T00:00:00Z"

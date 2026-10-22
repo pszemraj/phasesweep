@@ -46,14 +46,14 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
 from tests.conftest import (
-    _bounded_metric,
+    bounded_metric,
     make_experiment,
     requires_nonroot,
     trial_outcome,
     write_flaky_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
+from tests.recovery_helpers import new_phase_study, stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
@@ -109,7 +109,7 @@ def _persistent(
     tmp_path: Path, *phases: Phase, trainer: Path | None = None, maximize: bool = False
 ) -> Experiment:
     """Build an experiment whose ledger lives beside its workdir under ``tmp_path``."""
-    metric = _bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
+    metric = bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=list(phases), metric=metric)
 
 
@@ -150,7 +150,7 @@ def _record(
     as an objective that recorded its outcome just before its orchestrator died. Its
     COMPLETE trials hold no objective evidence, so selecting a winner from them fails.
     """
-    study = _new_phase_study(experiment, phase)
+    study = new_phase_study(experiment, phase)
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)

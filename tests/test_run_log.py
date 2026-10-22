@@ -23,7 +23,7 @@ from phasesweep.engine.state import FAILURE_REASON_ATTR, FEASIBLE_ATTR, TRIAL_OU
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
-from tests.conftest import _bounded_metric, make_experiment, trial_outcome, write_trainer
+from tests.conftest import bounded_metric, make_experiment, trial_outcome, write_trainer
 
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
@@ -63,7 +63,7 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
-        metric=_bounded_metric(max=50),
+        metric=bounded_metric(max=50),
         name="p",
         n_trials=4,
         sampler=Sampler(type="grid"),
@@ -98,7 +98,7 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
 def test_infeasible_reason_names_measured_value_and_violated_bound(
     tmp_path: Path, source: str, bound: str, limit: int, value: float
 ) -> None:
-    metric = _bounded_metric(**({bound: limit} if source == "metric" else {}))
+    metric = bounded_metric(**({bound: limit} if source == "metric" else {}))
     constraint_name = "memory"
     constraints = (
         []
@@ -194,7 +194,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_stderr_cause_trainer(tmp_path),
-        metric=_bounded_metric(),
+        metric=bounded_metric(),
         n_trials=4,
         sampler=Sampler(type="grid"),
         search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])},
@@ -239,7 +239,7 @@ def test_no_feasible_headline_covers_the_causes_of_infeasible_trials_too(tmp_pat
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
-        metric=_bounded_metric(max=1.0),
+        metric=bounded_metric(max=1.0),
         n_trials=2,
         max_consecutive_failures=5,
         sampler=Sampler(type="grid"),

@@ -61,10 +61,7 @@ from tests.conftest import (
 from tests.ledger_fixtures import republish_as_incomplete
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
-    _drift_experiment,
-    _write_experiment_config,
+    drift_experiment,
     live_runs,
     make_dead_run_handle,
     make_mcp_app,
@@ -74,9 +71,12 @@ from tests.mcp_helpers import (
     side_effect_app,
     stage_dead_run,
     stage_live_run,
+    write_experiment_config,
     write_mcp_catalog,
     write_run_status,
     write_runner_heartbeat,
+    write_srv_catalog,
+    write_srv_config,
 )
 
 RESUMABLE_PHASES = """\
@@ -119,7 +119,7 @@ def _launch_with_poison_project(
     :return tuple[dict[str, Any], Path, Path, dict[str, str]]: Captured spawn,
         project dir, marker dir, and the poisoned parent environment.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     project = tmp_path / "project"
     markers = tmp_path / "markers"
     markers.mkdir()
@@ -193,8 +193,8 @@ def test_capacity_refusal_guidance_matches_the_blocking_run(
     tmp_path: Path, recovery_required: bool, launch_target: str
 ) -> None:
     """Capacity blocked by cleanup uncertainty needs operator recovery instead of waiting."""
-    blocked_config = _config(tmp_path, name="blocking")
-    next_config = _config(tmp_path, name="next")
+    blocked_config = write_srv_config(tmp_path, name="blocking")
+    next_config = write_srv_config(tmp_path, name="next")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
@@ -235,8 +235,8 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
     A stale heartbeat sends the operator to recover it from a host shell, and still
     leaves the run holding its slot.
     """
-    blocked_config = _config(tmp_path, name="blocking")
-    next_config = _config(tmp_path, name="next")
+    blocked_config = write_srv_config(tmp_path, name="blocking")
+    next_config = write_srv_config(tmp_path, name="next")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
@@ -310,8 +310,8 @@ def test_launch_permission_denied_before_spawn(
     tmp_path: Path, allow: dict[str, bool] | None, kwargs: dict[str, str], action: str
 ) -> None:
     """A launch is refused for a missing permission before any validation or spawn."""
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=allow))
+    config = write_srv_config(tmp_path)
+    app, _registry, _store = make_mcp_app(write_srv_catalog(tmp_path, config, allow=allow))
 
     with pytest.raises(PermissionDeniedError, match=f"action '{action}' is not permitted"):
         app.launch("srv", **kwargs)
@@ -383,7 +383,7 @@ def test_resume_rejects_incompatible_winner_before_spawn(
     incomplete: bool,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    published = _drift_experiment(tmp_path, trainer)
+    published = drift_experiment(tmp_path, trainer)
     run_experiment(published)
     if incomplete:
         republish_as_incomplete(published)
@@ -399,8 +399,10 @@ def test_resume_rejects_incompatible_winner_before_spawn(
         search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q]))
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phases=[p, q]))
+    app, _registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
 
     with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
@@ -428,7 +430,7 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         sampler=Sampler(type="random", seed=1),
         search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
-    published = _drift_experiment(tmp_path, trainer, phases=[p, q])
+    published = drift_experiment(tmp_path, trainer, phases=[p, q])
     run_experiment(published)
     # The operator appends phase r, which resumes from q's published winner,
     # after q's source trial tree has been removed.
@@ -440,9 +442,11 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         search_space={"bs": IntParam(type="int", low=1, high=2)},
     )
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q, r]))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phases=[p, q, r]))
     shutil.rmtree(_phase_dir(published, "q"))
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, _registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
 
     validate = Mock(wraps=validation_ops._validate_generation_manifest)
     monkeypatch.setattr(validation_ops, "_validate_generation_manifest", validate)
@@ -478,9 +482,9 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
 def test_launch_passes_config_snapshot_to_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     app, registry, store = make_mcp_app(
-        _catalog(
+        write_srv_catalog(
             tmp_path,
             config,
             allow=ALLOW_SIDE_EFFECTS,
@@ -1067,7 +1071,7 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     the server-owned state directory and the project directory travels as an
     explicit argument the runner applies later.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     runner_cwd = tmp_path / "runner-cwd"
     runner_cwd.mkdir()
     app, registry, _store = make_mcp_app(
@@ -1092,13 +1096,15 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker" / "startup.py"))
     monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
     monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, _registry, _store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     captured = patch_popen_capture(monkeypatch)
 
     app.launch("srv")
@@ -1229,8 +1235,8 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
 def test_audit_log_records_side_effects_without_sensitive_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config = write_srv_config(tmp_path)
+    registry = Registry.load(write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"
     audit = AuditLogger(audit_path)
@@ -1292,8 +1298,8 @@ def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    config = write_srv_config(tmp_path)
+    catalog = write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"

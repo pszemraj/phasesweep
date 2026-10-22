@@ -27,13 +27,13 @@ from phasesweep.tracking.mlflow import (
 )
 from phasesweep.tracking.models import MlflowSettings
 from tests.tracking_helpers import (
-    _binder,
-    _binding,
-    _identity,
-    _run,
-    _scripted_response,
-    _WorkerProcess,
+    FakeWorkerProcess,
+    attempt_identity,
+    mlflow_binder,
+    mlflow_binding,
+    mlflow_run,
     native_experiment,
+    scripted_response,
 )
 
 
@@ -145,7 +145,7 @@ def test_selector_requires_explicit_step():
 
 
 def test_shared_history_once():
-    binding = _binding()
+    binding = mlflow_binding()
     selectors = [spec("last"), spec("min"), spec("step", step=1)]
     query = {
         "revision": 1,
@@ -161,7 +161,7 @@ def test_shared_history_once():
             SimpleNamespace(value=3.0, step=2, timestamp=1),
         ]
 
-    client = SimpleNamespace(get_run=lambda _: _run(binding), get_metric_history=history)
+    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding), get_metric_history=history)
     capture = _capture(
         client,
         {
@@ -181,8 +181,8 @@ def test_shared_history_once():
 def test_remote_identity_failures_name_their_cause(problem, message):
     from phasesweep.tracking.mlflow import verify_remote
 
-    binding = _binding()
-    run = _run(binding)
+    binding = mlflow_binding()
+    run = mlflow_run(binding)
     if problem == "deleted":
         run.info.lifecycle_stage = "deleted"
     else:
@@ -193,8 +193,8 @@ def test_remote_identity_failures_name_their_cause(problem, message):
 
 @pytest.mark.parametrize("status", ["FAILED", "KILLED"])
 def test_unsuccessful_remote_cannot_be_finished(status):
-    binding = _binding()
-    client = SimpleNamespace(get_run=lambda _: _run(binding, status=status))
+    binding = mlflow_binding()
+    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status=status))
     with pytest.raises(ValueError, match="unsuccessfully"):
         _capture(
             client,
@@ -229,7 +229,7 @@ class _Page(list):
 
 def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkeypatch):
     monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
-    binding = _binding()
+    binding = mlflow_binding()
     identity = {k: v for k, v in binding.items() if k != "run_id"}
     created = []
 
@@ -237,11 +237,11 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkey
         # Only the non-idempotent create is never replayed by the SDK.
         assert os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] == "0"
         created.append(kwargs["tags"])
-        return _run(binding)
+        return mlflow_run(binding)
 
     client = SimpleNamespace(
         get_experiment=lambda _: SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
-        search_runs=lambda *a, **k: _Page([_run(binding)]),
+        search_runs=lambda *a, **k: _Page([mlflow_run(binding)]),
         create_run=create_run,
     )
     request = {"binding": identity, "settings": {"experiment_id": "1"}, "run_name": "r"}
@@ -251,7 +251,7 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkey
     assert _create(client, request) == binding
     assert len(created) == 1
     assert "MLFLOW_HTTP_REQUEST_MAX_RETRIES" not in os.environ
-    client.search_runs = lambda *a, **k: _Page([_run(binding), _run(binding)])
+    client.search_runs = lambda *a, **k: _Page([mlflow_run(binding), mlflow_run(binding)])
     with pytest.raises(ValueError, match="ambiguous"):
         _create(client, request)
 
@@ -343,7 +343,7 @@ def test_worker_separates_definite_failures_from_unknown_outcomes(stage, failure
         search=fail if stage == "search_runs" else None,
         create_run=fail if stage == "create_run" else None,
     )
-    request = {"binding": _identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
+    request = {"binding": attempt_identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
     if definite:
         with pytest.raises(type(error)) as caught:
             _create(client, request)
@@ -358,8 +358,8 @@ def test_worker_separates_definite_failures_from_unknown_outcomes(stage, failure
 
 def test_verification_failure_is_unknown_only_for_a_run_this_call_created():
     """A run this call created exists whatever verification says; only its binding is in doubt."""
-    binding = _binding()
-    deleted = _run(binding)
+    binding = mlflow_binding()
+    deleted = mlflow_run(binding)
     deleted.info.lifecycle_stage = "deleted"
     created = []
 
@@ -368,7 +368,7 @@ def test_verification_failure_is_unknown_only_for_a_run_this_call_created():
         return deleted
 
     client = _creation_client(create_run=create_run)
-    request = {"binding": _identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
+    request = {"binding": attempt_identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
     with pytest.raises(OperationOutcomeUnknownError, match="not bound") as caught:
         _create(client, request)
     assert isinstance(caught.value.__cause__, ValueError)
@@ -402,10 +402,15 @@ def test_worker_reports_an_unknown_outcome_with_its_own_status(tmp_path, monkeyp
 @pytest.mark.parametrize(
     "pages,timeout_after,expected_searches,expected",
     [
-        ([[_run(_binding())]], 10, 1, {"found": True, "binding": _binding()}),
-        ([[], [], [_run(_binding())]], 10, 3, {"found": True, "binding": _binding()}),
+        ([[mlflow_run(mlflow_binding())]], 10, 1, {"found": True, "binding": mlflow_binding()}),
+        (
+            [[], [], [mlflow_run(mlflow_binding())]],
+            10,
+            3,
+            {"found": True, "binding": mlflow_binding()},
+        ),
         ([[]], 0, 1, {"found": False}),
-        ([[_run(_binding()), _run(_binding())]], 10, 1, ValueError),
+        ([[mlflow_run(mlflow_binding()), mlflow_run(mlflow_binding())]], 10, 1, ValueError),
     ],
     ids=["found", "found-late", "absent", "ambiguous"],
 )
@@ -423,7 +428,7 @@ def test_find_polls_for_the_identity_and_never_creates(
     client = _creation_client(search=search)
     request = {
         "action": "find",
-        "binding": _identity(),
+        "binding": attempt_identity(),
         "settings": {"experiment_id": "1", "poll_seconds": 0.01, "timeout_seconds": 10},
         "timeout_at": time.monotonic() + timeout_after,
     }
@@ -442,8 +447,8 @@ def test_find_action_runs_through_the_worker_entry_point(tmp_path, monkeypatch):
 
     from phasesweep.tracking import mlflow as worker
 
-    binding = _binding()
-    client = _creation_client(search=lambda *a, **k: _Page([_run(binding)]))
+    binding = mlflow_binding()
+    client = _creation_client(search=lambda *a, **k: _Page([mlflow_run(binding)]))
     monkeypatch.setitem(
         sys.modules, "mlflow", SimpleNamespace(MlflowClient=lambda **kwargs: client)
     )
@@ -458,7 +463,7 @@ def test_find_action_runs_through_the_worker_entry_point(tmp_path, monkeypatch):
             {
                 "action": "find",
                 "settings": settings,
-                "binding": _identity(),
+                "binding": attempt_identity(),
                 "timeout_at": time.monotonic() + 10,
             }
         )
@@ -605,7 +610,7 @@ class _ScriptedWorker:
 
     def __call__(self, request, **kwargs):
         self.requests.append(request)
-        outcome = _scripted_response(self.script, request)
+        outcome = scripted_response(self.script, request)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -626,15 +631,15 @@ def test_unconfirmed_creation_is_reconciled_and_never_resent(tmp_path, monkeypat
 
     from phasesweep.tracking import session
 
-    bind, path = _binder(tmp_path, slot)
+    bind, path = mlflow_binder(tmp_path, slot)
     pending = path.with_name(f"{path.stem}.pending.json")
-    binding = _binding()
+    binding = mlflow_binding()
 
     def marked_before_sending():
         record = json.loads(pending.read_text())
         assert (record["schema_version"], record["identity"], record["run_name"]) == (
             1,
-            _identity(),
+            attempt_identity(),
             "r",
         )
         return failure
@@ -644,16 +649,16 @@ def test_unconfirmed_creation_is_reconciled_and_never_resent(tmp_path, monkeypat
     )
     assert bind() == binding
     assert worker.actions == ["create", "find"]
-    assert worker.requests[1]["binding"] == _identity()
+    assert worker.requests[1]["binding"] == attempt_identity()
     assert worker.requests[1]["timeout_at"] > time.monotonic()
     assert session.read_record(path) == binding
     assert not pending.exists()
 
 
 def test_unresolved_creation_survives_restarts_until_its_run_appears(tmp_path, monkeypatch):
-    bind, path = _binder(tmp_path, "attempt")
+    bind, path = mlflow_binder(tmp_path, "attempt")
     pending = path.with_name(f"{path.stem}.pending.json")
-    binding = _binding()
+    binding = mlflow_binding()
     worker = _ScriptedWorker(
         monkeypatch,
         create=[OperationOutcomeUnknownError("response lost")],
@@ -678,15 +683,17 @@ def test_unresolved_creation_survives_restarts_until_its_run_appears(tmp_path, m
 
 
 def test_rejected_creation_leaves_no_record_and_is_not_reconciled(tmp_path, monkeypatch):
-    bind, path = _binder(tmp_path, "attempt")
+    bind, path = mlflow_binder(tmp_path, "attempt")
     rejection = "MLflow create failed (MlflowException: PERMISSION_DENIED); check access."
-    worker = _ScriptedWorker(monkeypatch, create=[OperationRejectedError(rejection), _binding()])
+    worker = _ScriptedWorker(
+        monkeypatch, create=[OperationRejectedError(rejection), mlflow_binding()]
+    )
     with pytest.raises(OperationRejectedError, match="PERMISSION_DENIED"):
         bind()
     assert worker.actions == ["create"]
     assert not path.exists() and not path.with_name(f"{path.stem}.pending.json").exists()
     # Nothing was created, so a later call sends the request afresh.
-    assert bind() == _binding()
+    assert bind() == mlflow_binding()
     assert worker.actions == ["create", "create"]
 
 
@@ -706,7 +713,7 @@ def test_rejected_creation_leaves_no_record_and_is_not_reconciled(tmp_path, monk
 def test_creation_that_cannot_be_reconciled_keeps_its_record(
     tmp_path, monkeypatch, failure, expired, error, later_actions
 ):
-    bind, path = _binder(tmp_path, "attempt")
+    bind, path = mlflow_binder(tmp_path, "attempt")
     deadline = time.monotonic() - 1 if expired else None
     worker = _ScriptedWorker(monkeypatch, create=[failure], find=[_ABSENT])
     with pytest.raises(error):
@@ -734,9 +741,9 @@ def test_unclassified_creation_failure_keeps_its_record_and_is_not_resent(
     tmp_path, monkeypatch, failure
 ):
     """Only a worker's rejection proves nothing was created; any other failure keeps the record."""
-    bind, path = _binder(tmp_path, "attempt")
+    bind, path = mlflow_binder(tmp_path, "attempt")
     pending = path.with_name(f"{path.stem}.pending.json")
-    binding = _binding()
+    binding = mlflow_binding()
     worker = _ScriptedWorker(
         monkeypatch, create=[failure], find=[_ABSENT, {"found": True, "binding": binding}]
     )
@@ -766,7 +773,7 @@ def test_unreadable_creation_response_leaves_the_run_recoverable(
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
-    identity = _identity()
+    identity = attempt_identity()
     directory = _trial_dir_for(
         experiment,
         "p",
@@ -775,17 +782,17 @@ def test_unreadable_creation_response_leaves_the_run_recoverable(
         attempt_id=identity["attempt_id"],
     )
     directory.mkdir(parents=True)
-    bind, path = _binder(
+    bind, path = mlflow_binder(
         tmp_path, slot, experiment=experiment, identity=identity, directory=directory
     )
     pending = path.with_name(f"{path.stem}.pending.json")
-    binding = _binding()
+    binding = mlflow_binding()
     created = (
         {"status": "ok", "result": binding}
         if reply == "ok"
         else {"status": "unknown", "message": "Creation may still commit."}
     )
-    worker = _WorkerProcess(
+    worker = FakeWorkerProcess(
         monkeypatch,
         unreadable=["create"],
         create=[created],
@@ -835,19 +842,22 @@ def test_sync_binds_late_runs_and_leaves_absent_ones_pending(tmp_path, monkeypat
 
     pending = {
         "generation": _write_pending(
-            root / first / "generation-binding.pending.json", _identity(first, first)
+            root / first / "generation-binding.pending.json", attempt_identity(first, first)
         ),
         "absent": _write_pending(
-            attempt_dir(first, "absent") / "mlflow-binding.pending.json", _identity(first, "absent")
+            attempt_dir(first, "absent") / "mlflow-binding.pending.json",
+            attempt_identity(first, "absent"),
         ),
         "bound": _write_pending(
-            attempt_dir(first, "bound") / "mlflow-binding.pending.json", _identity(first, "bound")
+            attempt_dir(first, "bound") / "mlflow-binding.pending.json",
+            attempt_identity(first, "bound"),
         ),
         "other": _write_pending(
-            attempt_dir(second, "late") / "mlflow-binding.pending.json", _identity(second, "late")
+            attempt_dir(second, "late") / "mlflow-binding.pending.json",
+            attempt_identity(second, "late"),
         ),
     }
-    session.write_record(pending["bound"].with_name("mlflow-binding.json"), _binding())
+    session.write_record(pending["bound"].with_name("mlflow-binding.json"), mlflow_binding())
     searched = []
 
     def find(experiment, generation_id, request, environment, deadline=None):
@@ -890,7 +900,7 @@ def test_sync_keeps_a_record_whose_search_fails(tmp_path, monkeypatch, caplog, e
     generation = "1" * 32
     path = _write_pending(
         session.tracking_root(experiment) / generation / "generation-binding.pending.json",
-        _identity(generation, generation),
+        attempt_identity(generation, generation),
     )
 
     def find(*args, **kwargs):
@@ -912,7 +922,7 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
     from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
     from phasesweep.tracking import session
 
-    binding = _binding()
+    binding = mlflow_binding()
     expected = {k: v for k, v in binding.items() if k != "run_id"}
     if field == "run_id":
         expected["run_id"] = "another-run"
@@ -947,8 +957,8 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
 
 
 def test_trainer_run_is_never_finished_by_controller():
-    binding = {**_binding(), "run_mode": "trainer"}
-    client = SimpleNamespace(get_run=lambda _: _run(binding, status="RUNNING"))
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
+    client = SimpleNamespace(get_run=lambda _: mlflow_run(binding, status="RUNNING"))
     with pytest.raises(TimeoutError, match="was still RUNNING when timeout_seconds ran out"):
         _capture(
             client,
@@ -998,7 +1008,7 @@ def _states_client(binding, *states, metrics=None, params=None, tags=None):
     """Serve one run state per ``get_run`` call, repeating the last, over the given run data."""
     runs = []
     for state in states:
-        run = _run(binding, status=state, metrics=metrics)
+        run = mlflow_run(binding, status=state, metrics=metrics)
         run.data.params = params or {}
         run.data.tags = {**run.data.tags, **(tags or {})}
         runs.append(run)
@@ -1017,7 +1027,7 @@ def _states_client(binding, *states, metrics=None, params=None, tags=None):
 
 def _finished_failure(clock, *, gates=(), metrics=None, params=None, tags=None):
     """Capture a finished run that lacks something; return the failure after proving it was at once."""
-    binding = _binding()
+    binding = mlflow_binding()
     client = _states_client(binding, "FINISHED", metrics=metrics, params=params, tags=tags)
     with pytest.raises(ValueError) as failure:
         _capture(client, _capture_request(binding, gates=gates))
@@ -1045,7 +1055,7 @@ def test_finished_run_missing_a_param_fails_at_once(clock):
 def test_finished_run_missing_a_tag_fails_at_once(clock):
     gate = MlflowRequiredGate(type="mlflow_required", tags=["dataset"])
     message = _finished_failure(clock, gates=[gate], tags={"stage": "dev"})
-    available = sorted({*_run(_binding()).data.tags, "stage"})
+    available = sorted({*mlflow_run(mlflow_binding()).data.tags, "stage"})
     assert message == f"MLflow run finished without tag 'dataset'; available tag keys: {available}."
 
 
@@ -1057,7 +1067,7 @@ def test_finished_run_missing_every_kind_names_each_once(clock):
     message = _finished_failure(
         clock, gates=gates, metrics={"accuracy": 0.9}, params={"warmup": "1", "seed": "1"}
     )
-    tags = sorted(_run(_binding()).data.tags)
+    tags = sorted(mlflow_run(mlflow_binding()).data.tags)
     assert message == (
         "MLflow run finished without metric 'loss', param 'lr', tag 'dataset'; "
         f"available metric keys: ['accuracy']; param keys: ['seed', 'warmup']; tag keys: {tags}."
@@ -1065,7 +1075,7 @@ def test_finished_run_missing_every_kind_names_each_once(clock):
 
 
 def test_finished_run_with_an_empty_metric_history_fails_at_once(clock):
-    binding = _binding()
+    binding = mlflow_binding()
     client = _states_client(binding, "FINISHED")
     client.get_metric_history = lambda run_id, key: []
     with pytest.raises(ValueError) as failure:
@@ -1075,7 +1085,7 @@ def test_finished_run_with_an_empty_metric_history_fails_at_once(clock):
 
 
 def test_item_logged_before_finishing_is_accepted_without_polling(clock):
-    binding = _binding()
+    binding = mlflow_binding()
     gate = MlflowRequiredGate(type="mlflow_required", params=["lr"], tags=["dataset"])
     client = _states_client(binding, "FINISHED", params={"lr": "0.1"}, tags={"dataset": "v2"})
     capture = _capture(client, _capture_request(binding, gates=[gate]))
@@ -1096,7 +1106,7 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
 
-    binding = _binding()
+    binding = mlflow_binding()
     session.write_record(
         tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
     )
@@ -1116,7 +1126,7 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
         mlflow_settings=experiment.mlflow.model_dump(),
         mlflow_query=compile_query(experiment, []),
     )
-    run = _run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
+    run = mlflow_run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
     monkeypatch.setattr(
         mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=lambda _: run)
     )
@@ -1136,7 +1146,7 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
 
 
 def test_running_run_is_polled_until_it_finishes_and_then_judged_at_once(clock):
-    binding = {**_binding(), "run_mode": "trainer"}
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
     accepted = _states_client(binding, "RUNNING", "RUNNING", "FINISHED")
     assert _capture(accepted, _capture_request(binding))["run_state"] == "FINISHED"
     assert clock.sleeps == [2, 2]
@@ -1150,7 +1160,7 @@ def test_running_run_is_polled_until_it_finishes_and_then_judged_at_once(clock):
 
 
 def test_running_run_times_out_at_the_deadline(clock):
-    binding = {**_binding(), "run_mode": "trainer"}
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
     client = _states_client(binding, "RUNNING")
     request = _capture_request(binding, timeout_seconds=120, timeout_at=100.0)
     with pytest.raises(TimeoutError, match="was still RUNNING when timeout_seconds ran out"):
@@ -1197,7 +1207,7 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
     from phasesweep.tracking.session import read_record, tracking_root
 
     experiment = native_experiment(tmp_path)
-    binding = _binding()
+    binding = mlflow_binding()
     projection = publication._projection(
         metrics={"phasesweep.objective": 2.0}, params={}, tags={}, summary={"metric": 2.0}
     )
@@ -1637,7 +1647,7 @@ def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch, error, expec
     experiment = native_experiment(tmp_path)
     bound = session.tracking_root(experiment) / "generation" / "generation-binding.json"
     bound.parent.mkdir(parents=True)
-    session.write_record(bound, _binding())
+    session.write_record(bound, mlflow_binding())
     actions = []
 
     def unavailable(experiment, generation_id, request, *args):
@@ -1659,14 +1669,14 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
     from phasesweep.tracking import bind_mlflow_run
     from phasesweep.tracking.session import read_binding, write_record
 
-    binding = {**_binding(), "run_mode": "trainer"}
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
     write_record(
         tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
     )
     for key in ("attempt_id", "generation_id", "overrides_sha256"):
         monkeypatch.setenv("PHASESWEEP_" + key.upper(), binding[key])
     monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(tmp_path))
-    run = _run(binding, status="FINISHED" if problem == "finished" else "RUNNING")
+    run = mlflow_run(binding, status="FINISHED" if problem == "finished" else "RUNNING")
     run.data.tags = {"mlflow.parentRunId": "trainer-parent"}
     if problem == "experiment":
         run.info.experiment_id = "foreign"

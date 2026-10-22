@@ -82,12 +82,12 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import _write_config, append_journal_tail
+from tests.ledger_fixtures import append_journal_tail, write_fixture_config
 from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
-    _new_phase_study,
     fabricate_registered_attempt,
     fabricate_stale_trial,
+    new_phase_study,
     stamp_artifact_root,
     write_trial_identity,
 )
@@ -1214,9 +1214,9 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     """
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
-    owner = _write_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
+    owner = write_fixture_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
     config_a = tmp_path / "a.yaml"
-    recovering = _write_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
+    recovering = write_fixture_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
     study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.journal"
@@ -1252,7 +1252,7 @@ def _fabricate_registered_journal_attempt(
         workdir=tmp_path / "runs",
         storage=f"journal:///{ledger}",
     )
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
