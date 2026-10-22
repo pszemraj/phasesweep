@@ -8,7 +8,7 @@ cd phasesweep
 pip install -e ".[dev,wandb,mlflow]"
 ```
 
-The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The MLflow server tests in `tests/test_mlflow_integration.py` (marked `integration`) start a local tracking server and need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally); they skip without it. Run Python-dependent commands in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The MLflow server tests in `tests/test_mlflow_integration.py` (marked `integration`) start a local tracking server and need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally); they skip without it. Run Python-dependent commands in the environment where you installed the project. `python -m phasesweep` runs the same command line when the console script is not on `PATH`.
 
 To install unreleased `main` without an editable checkout:
 
@@ -55,7 +55,7 @@ Ruff checks public docstrings and function annotations, and mypy checks source t
 
 The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 
-`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone. The hooks are a fast subset, and plain `pytest` remains the full gate.
+`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone. The hooks are a fast subset, and plain `pytest` is the full gate.
 
 ### Source prose review
 
@@ -83,7 +83,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
+Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
 
 To inspect the cost of a qualification run:
 
@@ -107,7 +107,7 @@ Mark tests explicitly according to the rules above, including tests that call sh
 
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions runs one Linux job on pull requests: Ruff linting, Ruff format checking, mypy, the module-size check, whole-suite collection, and the contract tests, with the tests importing from `src/` and no package build. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
+GitHub Actions runs one Linux job on pull requests: Ruff linting, Ruff format checking, mypy, the module-size check, whole-suite collection, and the contract tests, with the tests importing from `src/` and no package build. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests are opt-in.
 
 The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
@@ -116,6 +116,8 @@ The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decodi
 ### Shared test setup
 
 Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests.
+
+The golden ledger fixture under `tests/fixtures/ledgers` is committed output of a real run. Regenerate it when a persisted format changes; the [fixture guide](../tests/fixtures/ledgers/README.md) gives the command and what churns.
 
 ## PyPI releases
 

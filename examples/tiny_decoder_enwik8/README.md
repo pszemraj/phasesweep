@@ -17,7 +17,7 @@ For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-
 
 Review the pinned trainer's [device and precision support](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#device-selection--precision) and [requirements](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
-Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation).
+Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation). Run the commands below from the PhaseSweep repo root: `gpu_smoke.yaml`, `experiment.yaml` and `mlflow_gpu_smoke.yaml` leave `execution.cwd` unset, so their repo-relative `trial_command` resolves against the invocation directory.
 
 ## CLI smoke sweep
 
@@ -31,7 +31,7 @@ phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 
 The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. For a bounded comparison with seed noise and persistent resume, use [Learning rates over seeds](#learning-rates-over-seeds). The full config below uses an Optuna journal file for persistent status and reuse.
 
-Use the full three-phase example only when you intentionally want the longer experiment:
+Use the full three-phase example only when you want the longer experiment:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/experiment.yaml
@@ -40,13 +40,13 @@ phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.journal` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
+A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.journal` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
+
+The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
 The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 
 Checkpoint loading and final evaluation belong to this example's trainer wrapper. See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
-
-The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
 ## Learning rates over seeds
 
@@ -69,7 +69,7 @@ The last command replays a completed study without training again. After an inte
 
 To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints each winning member's seed, trial number, and exact `trial_dir` before the evidence YAML. This example saves its checkpoint at `trainer/final.pt` below that directory.
 
-Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests **five additional optimizer updates**. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
+Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests five additional optimizer updates. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
 
 ```bash
 python - /absolute/path/to/selected-member/trainer/final.pt /tmp/phasesweep-decoder-continued <<'PY'
@@ -125,7 +125,7 @@ mkdir -p /tmp/phasesweep-tiny-decoder-mcp-smoke
 cp examples/tiny_decoder_enwik8/gpu_smoke.yaml /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
 ```
 
-In that copy, replace or add these **root keys**, using your actual absolute repo path for `execution.cwd`. Keep its trainer configuration, metric, and two-trial phase unchanged:
+In that copy, replace or add these root keys, using your actual absolute repo path for `execution.cwd`. Keep its trainer configuration, metric, and two-trial phase unchanged:
 
 ```yaml
 experiment: tiny_decoder_enwik8_mcp_smoke

@@ -43,7 +43,7 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer uses [`report_objective(...)`](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective). Your own trainer can report through that helper, W&B, MLflow, ordinary JSON, or logs.
+The packaged fake trainer uses [`report_objective(...)`](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective). Your own trainer can report through that helper, `phasesweep report-objective` from a shell, W&B, MLflow, ordinary JSON, or logs.
 
 ## Install and try it
 
@@ -108,8 +108,7 @@ With persistent storage, rerun the same config after an interruption; interrupte
 
 Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates) closest to your trainer. Choose its existing [input interface](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-inputs): complete YAML, command-line flags, Hydra overrides, or nested JSON. `phasesweep explain KEY` prints the reference for one key; configuration errors name the relevant keys.
 
-> [!TIP]
-> `phasesweep run starter.yaml --dry-run` previews commands without launching work. Check it before a real run; [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) explains inherited placeholders and preview limitations.
+`phasesweep run starter.yaml --dry-run` previews commands without launching work. Check it before a real run; [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) explains inherited placeholders and preview limitations.
 
 Set `execution.cwd`, `env`, and `execution.inherit_env` for the [trainer's working directory and environment](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract). `validate` and `--dry-run` print the launch contract so you can check it before training.
 

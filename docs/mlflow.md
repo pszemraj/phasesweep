@@ -48,6 +48,8 @@ The experiment must already exist and be active. PhaseSweep never creates it imp
 
 The MLflow client retries a server that refuses or does not answer. When those retries outlast `timeout_seconds`, the refusal says the target did not answer within `timeout_seconds`; when they end sooner, it says the server refused the connection, including when MLflow wraps the transport failure. Either way, check `tracking_uri` and that the server is running.
 
+`tracking_uri`, `experiment_id`, `experiment_name` and `run_mode` are in the study fingerprint, so changing one needs a new experiment name; `poll_seconds` and `timeout_seconds` are not. `phasesweep validate` and `run --dry-run` check neither authentication nor the experiment. The credentials need write access: PhaseSweep creates runs, logs metrics, params and tags, uploads artifacts and ends runs. An `env` entry for `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID` or `MLFLOW_EXPERIMENT_NAME` must equal the block's own normalized value (lowercase scheme and host, no trailing slash), so the selector the block leaves unset cannot appear, and `env` may not set `MLFLOW_RUN_ID`; config load fails otherwise.
+
 All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation. A phase or whole-run deadline also caps experiment resolution, run creation and evidence capture; result uploads happen after acceptance and, like other publication, can extend past those deadlines. Within that bound the MLflow client retries transient HTTP failures. HTTP(S) run creation uses [identity reconciliation](#choose-run-ownership) after an unconfirmed response. The Databricks SDK keeps its own retries for creation too, so a rare lost response there can leave an extra, unbound run in the experiment. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease.
 
 ## Choose run ownership
@@ -75,7 +77,7 @@ with mlflow.start_run() as run:
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-The helper verifies the configured experiment and that the run is still RUNNING, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification.
+The helper verifies the configured experiment and that the run is still RUNNING, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification. In either mode, disable autologging and nested-run behavior that starts runs of its own: PhaseSweep reads only the bound run, never a parent or child.
 
 ### Transformers Trainer
 
@@ -111,7 +113,7 @@ Configure `trial_command` to invoke this launcher with the absolute example path
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 
-With `load_best_model_at_end=True`, the logged step does not identify the evaluated checkpoint. Use `json_envelope` when that identity matters; see [evaluation positions](config.md#objective-evidence-constraints-and-gates).
+With `load_best_model_at_end=True`, the logged step does not identify the evaluated checkpoint. Use `json_envelope` when that identity matters; [evaluation positions](config.md#objective-evidence-constraints-and-gates) also covers the `validate` warning for this setting.
 
 ## Select metrics and require evidence
 
@@ -148,7 +150,7 @@ An upload failure after acceptance warns and leaves a pending delivery record. I
 phasesweep sync-tracking examples/mlflow.yaml
 ```
 
-This requires the original target configuration and retries every generation's pending projections; `--generation GENERATION_ID` limits it to one generation, which for an MCP run is its run ID. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. A projection that was never saved, because a local write failed or the controller died, is rebuilt: an attempt's from its settled trial in the Optuna ledger, and a published generation's winner references from its committed artifacts. The command exits nonzero if uploads remain pending. An upload MLflow rejects, such as an over-long parameter key or a run deleted from MLflow, fails the same way on every retry and stays pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials, and it records a confirmed worker cleanup as a receipt under `tracking/<generation-id>/cleanup-receipts/` before retiring the registry entry; `phasesweep mcp recover-run` accepts that receipt as cleanup evidence for that generation's run, or for a run whose runner reported the worker. A damaged receipt is ignored with a warning, so recovery then refuses for lack of evidence.
+This requires the original target configuration and retries every generation's pending projections; `--generation GENERATION_ID` limits it to one generation, which for an MCP run is its run ID. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. A projection that was never saved, because a local write failed or the controller died, is rebuilt: an attempt's from its settled trial in the Optuna ledger, and a published generation's winner references from its committed artifacts. It takes the experiment lock, so it cannot run during a sweep of that experiment, and it exits nonzero while uploads remain pending, when the scope has no delivery records, or when the config has no `mlflow` block. An upload MLflow rejects, such as an over-long parameter key or a run deleted from MLflow, fails the same way on every retry and stays pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials, and it records a confirmed worker cleanup as a receipt under `tracking/<generation-id>/cleanup-receipts/` before retiring the registry entry; `phasesweep mcp recover-run` accepts that receipt as cleanup evidence for that generation's run, or for a run whose runner reported the worker. A damaged receipt is ignored with a warning, so recovery then refuses for lack of evidence.
 
 After confirmed cleanup of a failed invocation, PhaseSweep queues projections for its generation-summary run and for every attempt whose outcome was not yet recorded. The attempt's Optuna trial decides its projection: an accepted trial gets its accepted projection, and any other managed run is finished FAILED for ordinary failure, or KILLED for an interrupted trial or a shutdown or keyboard interruption. Upload failures leave these projections pending for `sync-tracking`; those runs can remain RUNNING until delivery succeeds. This does not change accepted scores or committed winners. A remote terminal status is never overwritten.
 
@@ -160,4 +162,4 @@ Databricks targets preserve URI spelling, including profile case, and delegate a
 
 In every `execution.inherit_env` mode, list rotating authentication and transport variables, such as `DATABRICKS_TOKEN`, `DATABRICKS_CLIENT_SECRET`, or `HTTPS_PROXY`, in `execution.passthrough_env`; see the [trainer environment contract](config.md#trainer-contract) and [Databricks authentication](https://docs.databricks.com/en/dev-tools/auth/index.html).
 
-Local HTTP behavior is covered by integration tests. Live Databricks access and framework integrations on Databricks remain **unverified**.
+PhaseSweep is not tested against a live Databricks workspace or with framework integrations running on Databricks.
