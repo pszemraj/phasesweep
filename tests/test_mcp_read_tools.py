@@ -155,7 +155,7 @@ def test_run_status_distinguishes_unknown_trial_counts_from_known_zero(
     counts = (
         phase.finished_trials_total,
         phase.finished_trials_before_run,
-        phase.attempts_launched_this_run,
+        phase.attempts_this_run,
         phase.finished_trials_this_run,
     )
     if snapshot_unavailable:

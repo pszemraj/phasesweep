@@ -157,7 +157,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         assert set(phases[1]["params"]) == {"lr"}
         for phase_status in awaited["phases"]:
             target = phase_status["target_finished_trials"]
-            assert phase_status["attempts_launched_this_run"] == target
+            assert phase_status["attempts_this_run"] == target
             assert phase_status["finished_trials_this_run"] == target
             assert phase_status["finished_trials_before_run"] == 0
             assert phase_status["target_already_satisfied"] is False

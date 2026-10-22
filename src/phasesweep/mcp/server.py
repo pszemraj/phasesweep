@@ -408,11 +408,12 @@ class PhaseStatusPayload(_ToolPayload):
         ge=0,
         description="Finished rows not owned by the queried run; null when unavailable.",
     )
-    attempts_launched_this_run: int | None = Field(
+    attempts_this_run: int | None = Field(
         ge=0,
         description=(
-            "All attempts owned by the queried run's generation, zero for a run that wrote "
-            "none; null when unavailable."
+            "Attempts the queried run's generation started, in any state, including any that "
+            "a deadline, abort or shutdown stopped before their trainer launched; zero for a "
+            "run that started none; null when unavailable."
         ),
     )
     finished_trials_this_run: int | None = Field(

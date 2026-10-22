@@ -268,7 +268,7 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     )
     assert payload["run_wrote_generation"] is False
     (phase,) = payload["phases"]
-    assert (phase["attempts_launched_this_run"], phase["finished_trials_this_run"]) == (0, 0)
+    assert (phase["attempts_this_run"], phase["finished_trials_this_run"]) == (0, 0)
     assert phase["finished_trials_before_run"] == 2
     assert phase["target_already_satisfied"] is True
     first_payload = status_payload(
@@ -305,5 +305,5 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
         refused_payload["run_wrote_generation"],
     ) == (False, False, False)
     (refused_phase,) = refused_payload["phases"]
-    assert refused_phase["attempts_launched_this_run"] == 0
+    assert refused_phase["attempts_this_run"] == 0
     assert refused_phase["finished_trials_before_run"] == 2

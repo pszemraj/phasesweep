@@ -154,7 +154,7 @@ def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Pat
     }
     assert phase["finished_trials_total"] == 0
     assert phase["finished_trials_before_run"] == 0
-    assert phase["attempts_launched_this_run"] == 0
+    assert phase["attempts_this_run"] == 0
     assert phase["finished_trials_this_run"] == 0
     assert phase["target_already_satisfied"] is False
     assert phase["remaining_trials"] == phase_target
@@ -206,7 +206,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     }
     assert run_status["phases"][0]["finished_trials_total"] == 3
     assert run_status["phases"][0]["finished_trials_before_run"] == 3
-    assert run_status["phases"][0]["attempts_launched_this_run"] == 0
+    assert run_status["phases"][0]["attempts_this_run"] == 0
     assert run_status["phases"][0]["finished_trials_this_run"] == 0
     assert run_status["phases"][0]["target_already_satisfied"] is True
     assert run_status["phases"][0]["remaining_trials"] == 0

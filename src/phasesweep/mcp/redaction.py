@@ -199,9 +199,7 @@ def status_payload(
                 "target_finished_trials": target_finished_trials,
                 "finished_trials_total": finished_trials_total if available else None,
                 "finished_trials_before_run": finished_trials_before_run if available else None,
-                "attempts_launched_this_run": sum(generation_counts.values())
-                if available
-                else None,
+                "attempts_this_run": sum(generation_counts.values()) if available else None,
                 "finished_trials_this_run": finished_trials_this_run if available else None,
                 "remaining_trials": (
                     max(0, target_finished_trials - finished_trials_total) if available else None

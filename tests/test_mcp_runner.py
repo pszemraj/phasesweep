@@ -687,7 +687,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
         assert payload["failure"]["actor"] == "operator"
     assert status["result_source"] == "frozen_run_snapshot"
     assert status["summary_present"] is False
-    assert status["phases"][0]["attempts_launched_this_run"] == 0
+    assert status["phases"][0]["attempts_this_run"] == 0
     assert awaited["reason"] == "terminal"
     assert winners["winner_count"] == 0
     assert winners["failure"]["code"] == "fingerprint_mismatch"
