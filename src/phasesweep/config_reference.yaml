@@ -178,7 +178,7 @@ metric: object (required)
 
     # Exact native metric name, for example eval_loss or eval/loss. Must be nonempty. Use the name the trainer actually logs, including slashes and underscores.
     # Aliases, summary fallbacks and fuzzy matching are not provided.
-    # Warning: a metric missing from a finished run is polled for until mlflow.timeout_seconds runs out, so a misspelled name costs about that long on every trial.
+    # A metric missing from a finished run fails the trial at once, naming the metric and listing the metric keys the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
     metric_key: string (required)
 
     # Which observation of the metric history is the objective. Required, with no default.
@@ -635,7 +635,7 @@ phases: list[object] (required)
 
       # Variant mlflow_required; selected by type: mlflow_required.
       # Require metrics, parameters and tags on the attempt's own MLflow run, read from the same finished capture as the objective.
-      # A name missing from a finished run is polled for until mlflow.timeout_seconds runs out, so a misspelled name costs about that long on every trial.
+      # A metric, param or tag missing from a finished run fails the trial at once, naming it and listing the keys of that kind the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
       # Requires: the top-level mlflow block with an MLflow objective, and at least one name in metrics, params or tags; config load fails otherwise.
       - type: "mlflow_required" (required)
 
@@ -870,7 +870,7 @@ constraints: list[object] = []
 
       # Exact native metric name, for example eval_loss or eval/loss. Must be nonempty. Use the name the trainer actually logs, including slashes and underscores.
       # Aliases, summary fallbacks and fuzzy matching are not provided.
-      # Warning: a metric missing from a finished run is polled for until mlflow.timeout_seconds runs out, so a misspelled name costs about that long on every trial.
+      # A metric missing from a finished run fails the trial at once, naming the metric and listing the metric keys the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
       metric_key: string (required)
 
       # Which observation of the metric history is the measured value. Required, with no default.
@@ -948,7 +948,7 @@ constraints: list[object] = []
 # A recorded value is stored on the trial as the user attribute observed:<name>, which trials.csv carries as user_attr:observed:<name>. The selected winner's values are published as observed in winner.yaml, and a winner whose trial recorded none publishes an empty map. A phases[].repeats winner publishes each name's mean over the members that recorded it, and each member's own values under repeats.members[].observed.
 # An MLflow attempt run receives each recorded value as the metric phasesweep.observed.<name>, and the MCP results view returns the winner's values as observed.
 # Excluded from the study fingerprint: adding, removing or changing an observation never invalidates a populated study, and trials that ran before it was added report nothing for it.
-# Only local extractors are accepted. wandb and mlflow extractors wait for every requested key, so a key the trainer never wrote would stall the trial until the poll timeout, and they fail config load. Write the value with report_objective(..., extra=...) and read it with a json extractor.
+# Only local extractors are accepted. wandb and mlflow extractors fail the trial when a requested key is missing from the finished run, so a key the trainer never wrote would fail every trial, and they fail config load. Write the value with report_objective(..., extra=...) and read it with a json extractor.
 # Requires: observe[].name values are distinct from metric.name, from every constraints[].name and from each other; duplicates fail config load.
 observe: list[object] = []
   # Observation name, any string the schema accepts. It labels the recorded value in trials.csv, winner.yaml, MLflow and MCP results.
@@ -1080,7 +1080,7 @@ mlflow: object | null = null
   # Recommended: managed when the trainer can honor MLFLOW_RUN_ID; trainer for code that must own start_run(). Disable autolog and nested-run behavior that creates extra runs in the trainer itself.
   run_mode: "managed" | "trainer" = "managed"
 
-  # Seconds between polls while waiting for the attempt's run to finish and its metrics, params and tags to appear. Finite and greater than 0; infinity and NaN fail config load.
+  # Seconds between polls while waiting for the attempt's run to finish. Finite and greater than 0; infinity and NaN fail config load.
   # Only the evidence capture polls. Experiment resolution, run creation and result uploads do not use it.
   # Excluded from the study fingerprint.
   poll_seconds: float = 2.0
@@ -1089,9 +1089,9 @@ mlflow: object | null = null
   # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length. A failed run creation is retried once with a fresh budget.
   # The remaining phase and run deadlines also cap resolution, run creation and capture. Result uploads ignore them and are bounded only by this value.
   # A capture that runs out of time fails the trial. An upload that runs out of time stays pending for phasesweep sync-tracking.
-  # The capture includes worker startup and stops polling min(5, timeout_seconds / 2) seconds early to report what is missing.
+  # The capture includes worker startup and stops polling min(5, timeout_seconds / 2) seconds early to report the run's state.
   # This does not limit training time.
-  # Warning: a metric, param or tag missing from a finished run is polled for until this budget runs out, so a misspelled name costs about timeout_seconds on every trial.
+  # A metric, param or tag missing from a finished run fails the trial at once, so this budget is spent only waiting for a run that has not finished.
   # Excluded from the study fingerprint.
   # Recommended: leave room for SDK startup and a slow server; the default of 120 suits most servers.
   timeout_seconds: float = 120.0

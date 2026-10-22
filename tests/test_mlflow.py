@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from phasesweep.config.models import Experiment
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
-from phasesweep.evidence.models import MlflowExtractor
+from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
@@ -873,21 +873,208 @@ def test_trainer_run_is_never_finished_by_controller():
         )
 
 
-def test_missing_metric_is_not_replaced_by_result_metric():
-    binding = _binding()
-    query = {"selections": {observation_id(spec()): spec().model_dump()}, "gates": []}
-    client = SimpleNamespace(get_run=lambda _: _run(binding, metrics={"phasesweep.objective": 1}))
-    timeout_at = time.monotonic() + 0.4
-    request = {
+class _Clock:
+    """A fake monotonic clock that a sleep advances instantly and records."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Replace the capture worker's clock, so polling to a long deadline takes no real time."""
+    from phasesweep.tracking import mlflow as worker
+
+    fake = _Clock()
+    monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=fake.monotonic, sleep=fake.sleep))
+    return fake
+
+
+def _capture_request(binding, *, gates=(), timeout_seconds=120, timeout_at=100.0):
+    """Build a capture of metric ``loss`` plus the given presence gates, on the fake clock."""
+    return {
         "binding": binding,
-        "query": query,
-        "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+        "query": {
+            "selections": {observation_id(spec()): spec().model_dump()},
+            "gates": [gate.model_dump() for gate in gates],
+        },
+        "settings": {"timeout_seconds": timeout_seconds, "poll_seconds": 2},
         "timeout_at": timeout_at,
     }
-    with pytest.raises(TimeoutError, match="finished without metric 'loss' when timeout_seconds"):
+
+
+def _states_client(binding, *states, metrics=None, params=None, tags=None):
+    """Serve one run state per ``get_run`` call, repeating the last, over the given run data."""
+    runs = []
+    for state in states:
+        run = _run(binding, status=state, metrics=metrics)
+        run.data.params = params or {}
+        run.data.tags = {**run.data.tags, **(tags or {})}
+        runs.append(run)
+    client = SimpleNamespace(
+        reads=0,
+        get_metric_history=lambda run_id, key: [SimpleNamespace(value=2.0, step=1, timestamp=2)],
+    )
+
+    def get_run(run_id):
+        client.reads += 1
+        return runs[min(client.reads, len(runs)) - 1]
+
+    client.get_run = get_run
+    return client
+
+
+def _finished_failure(clock, *, gates=(), metrics=None, params=None, tags=None):
+    """Capture a finished run that lacks something; return the failure after proving it was at once."""
+    binding = _binding()
+    client = _states_client(binding, "FINISHED", metrics=metrics, params=params, tags=tags)
+    with pytest.raises(ValueError) as failure:
+        _capture(client, _capture_request(binding, gates=gates))
+    # One read and no sleep: the finished run was not given time to gain the item.
+    assert (client.reads, clock.sleeps, clock.now) == (1, [], 0.0)
+    return str(failure.value)
+
+
+def test_missing_metric_is_not_replaced_by_result_metric(clock):
+    message = _finished_failure(clock, metrics={"phasesweep.objective": 1, "accuracy": 0.9})
+    assert message == (
+        "MLflow run finished without metric 'loss'; "
+        "available metric keys: ['accuracy', 'phasesweep.objective']."
+    )
+
+
+def test_finished_run_missing_a_param_fails_at_once(clock):
+    gate = MlflowRequiredGate(type="mlflow_required", params=["lr"])
+    message = _finished_failure(clock, gates=[gate], params={"seed": "1", "batch": "8"})
+    assert message == (
+        "MLflow run finished without param 'lr'; available param keys: ['batch', 'seed']."
+    )
+
+
+def test_finished_run_missing_a_tag_fails_at_once(clock):
+    gate = MlflowRequiredGate(type="mlflow_required", tags=["dataset"])
+    message = _finished_failure(clock, gates=[gate], tags={"stage": "dev"})
+    available = sorted({*_run(_binding()).data.tags, "stage"})
+    assert message == f"MLflow run finished without tag 'dataset'; available tag keys: {available}."
+
+
+def test_finished_run_missing_every_kind_names_each_once(clock):
+    gates = [
+        MlflowRequiredGate(type="mlflow_required", params=["lr", "warmup"], tags=["dataset"]),
+        MlflowRequiredGate(type="mlflow_required", params=["lr"]),
+    ]
+    message = _finished_failure(
+        clock, gates=gates, metrics={"accuracy": 0.9}, params={"warmup": "1", "seed": "1"}
+    )
+    tags = sorted(_run(_binding()).data.tags)
+    assert message == (
+        "MLflow run finished without metric 'loss', param 'lr', tag 'dataset'; "
+        f"available metric keys: ['accuracy']; param keys: ['seed', 'warmup']; tag keys: {tags}."
+    )
+
+
+def test_finished_run_with_an_empty_metric_history_fails_at_once(clock):
+    binding = _binding()
+    client = _states_client(binding, "FINISHED")
+    client.get_metric_history = lambda run_id, key: []
+    with pytest.raises(ValueError) as failure:
+        _capture(client, _capture_request(binding))
+    assert str(failure.value) == "MLflow run finished with metric 'loss' but no history for it."
+    assert clock.sleeps == []
+
+
+def test_item_logged_before_finishing_is_accepted_without_polling(clock):
+    binding = _binding()
+    gate = MlflowRequiredGate(type="mlflow_required", params=["lr"], tags=["dataset"])
+    client = _states_client(binding, "FINISHED", params={"lr": "0.1"}, tags={"dataset": "v2"})
+    capture = _capture(client, _capture_request(binding, gates=[gate]))
+    assert (capture["params"], capture["tags"]) == ({"lr": "0.1"}, {"dataset": "v2"})
+    assert clock.sleeps == []
+
+
+def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_error(
+    tmp_path, monkeypatch
+):
+    """The worker's report crosses the real entry point and response reader unchanged."""
+    import shlex
+
+    import mlflow
+
+    from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
+    from phasesweep.runtime import process
+    from phasesweep.tracking import mlflow as worker
+    from phasesweep.tracking import session
+
+    binding = _binding()
+    session.write_record(
+        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+    )
+    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    experiment = native_experiment(tmp_path)
+    ctx = TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=0,
+        duration_seconds=1,
+        mlflow_settings=experiment.mlflow.model_dump(),
+        mlflow_query=compile_query(experiment, []),
+    )
+    run = _run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
+    monkeypatch.setattr(
+        mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=lambda _: run)
+    )
+
+    def run_in_process(command, **kwargs):
+        request_path, response_path = shlex.split(command)[-2:]
+        assert worker.main([request_path, response_path]) == 0
+        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+    monkeypatch.setattr(process, "run_supervised", run_in_process)
+    with pytest.raises(ExtractorError) as failure:
+        _capture_mlflow(ctx, deadline=None)
+    assert str(failure.value) == (
+        "MLflow run finished without metric 'eval/loss'; "
+        "available metric keys: ['accuracy', 'cost']."
+    )
+
+
+def test_running_run_is_polled_until_it_finishes_and_then_judged_at_once(clock):
+    binding = {**_binding(), "run_mode": "trainer"}
+    accepted = _states_client(binding, "RUNNING", "RUNNING", "FINISHED")
+    assert _capture(accepted, _capture_request(binding))["run_state"] == "FINISHED"
+    assert clock.sleeps == [2, 2]
+    clock.sleeps.clear()
+    lacking = _states_client(binding, "RUNNING", "RUNNING", "FINISHED", metrics={"accuracy": 0.9})
+    with pytest.raises(ValueError, match="finished without metric 'loss'"):
+        _capture(lacking, _capture_request(binding))
+    # The first FINISHED read decides; the 120 s budget is not waited out.
+    assert lacking.reads == 3
+    assert clock.sleeps == [2, 2]
+
+
+def test_running_run_times_out_at_the_deadline(clock):
+    binding = {**_binding(), "run_mode": "trainer"}
+    client = _states_client(binding, "RUNNING")
+    request = _capture_request(binding, timeout_seconds=120, timeout_at=100.0)
+    with pytest.raises(TimeoutError, match="was still RUNNING when timeout_seconds ran out"):
         _capture(client, request)
-    # The worker reports before the parent stops it at timeout_at.
-    assert time.monotonic() < timeout_at
+    # Polling stops min(5, timeout_seconds / 2) seconds before timeout_at.
+    assert clock.now == 95.0
+    assert set(clock.sleeps) <= {1.0, 2.0}
 
 
 def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
