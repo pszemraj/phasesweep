@@ -207,6 +207,11 @@ def _best_model_reload_sources(experiment: Experiment) -> list[str]:
     """
 
     def enabled(settings: Mapping[str, JsonValue]) -> bool:
+        """Return whether a flat dotted mapping sets the flag to ``True``.
+
+        :param Mapping[str, JsonValue] settings: Flat dotted keys and their values.
+        :return bool: Whether any key ending in the flag name holds ``True``.
+        """
         return any(
             key.rsplit(".", 1)[-1] == _BEST_MODEL_RELOAD_FLAG and value is True
             for key, value in settings.items()
