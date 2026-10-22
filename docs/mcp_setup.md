@@ -72,7 +72,8 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
-- `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend, then reconnect the client.
+- `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend; the running server applies it on the next call.
+- A launch refused because the catalog or a config it lists `no longer validates`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. A launch refused for a different `state_dir`: restart the server. See [the catalog](mcp.md#the-catalog).
 - `concurrency limit reached` or an experiment that already has a running sweep: await a returned healthy blocking run ID, and never cancel or replace it automatically. Report a blocker the refusal marks as requiring operator recovery, or one whose runner liveness this server cannot verify, to the operator instead; see [run state and recovery](mcp.md#run-state-and-recovery).
 - Lock-directory access failure (`storage_unavailable`): the default host locks live under the OS account home's `.cache/phasesweep/locks`, which a sandbox can make unreachable. Follow the [lock directory rules](runtime.md#storage-and-locks) and set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox.
 - `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).

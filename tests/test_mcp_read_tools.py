@@ -37,7 +37,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
 from phasesweep.mcp.errors import (
-    ConfigChangedError,
     McpToolError,
     RunPersistentStateUnavailableError,
     RunSnapshotUnavailableError,
@@ -465,7 +464,10 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
-    """A run snapshot keeps x/minimize after the catalog changes to y/maximize."""
+    """A run snapshot keeps x/minimize after the catalog changes to y/maximize.
+
+    The same server rereads the edited config, so only the drift verdict follows it.
+    """
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     baseline_status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
@@ -477,9 +479,8 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
         config,
         _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
     )
-    restarted, _restarted_registry, _restarted_store = make_mcp_app(catalog)
-    status = GetRunStatusResult.model_validate(restarted.status(run_id=run_id))
-    results = GetRunResultsResult.model_validate(restarted.winners(run_id=run_id))
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
     assert (status.metric.name, status.metric.goal) == (results.metric.name, results.metric.goal)
@@ -1010,15 +1011,6 @@ def test_explain_config_without_a_key_lists_top_level_keys_and_needs_no_catalog(
     assert index["notes"] == "\n".join(reference_notes())
     assert "Paths: a relative workdir" in index["notes"]
     assert PhaseSweepMCP.explain_config("  ")["notes"] == index["notes"]
-
-
-def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
-    config.write_text(config.read_text() + "\n# changed after server startup\n")
-
-    with pytest.raises(ConfigChangedError, match="restart the MCP server"):
-        app.validate("srv")
 
 
 def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> None:

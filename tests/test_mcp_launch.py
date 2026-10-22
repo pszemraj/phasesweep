@@ -31,7 +31,6 @@ from phasesweep.engine.run import run_experiment
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
-    ConfigChangedError,
     ExperimentBusyError,
     InvalidPhaseError,
     PermissionDeniedError,
@@ -434,16 +433,6 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         app.launch("srv", from_phase="r")
 
     validate.assert_called_once()
-    assert store.list_handles() == []
-
-
-def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> None:
-    config, app, _registry, store = side_effect_app(tmp_path)
-    config.write_text(config.read_text().replace("python train.py", "python changed.py"))
-
-    with pytest.raises(ConfigChangedError, match="changed since server startup"):
-        app.launch("srv")
-
     assert store.list_handles() == []
 
 

@@ -1,7 +1,8 @@
 """Load an operator-authored experiment catalog.
 
-Experiment IDs map to validated configs and frozen absolute paths. Invalid entries
-refuse server startup.
+Experiment IDs map to validated configs and absolute paths resolved at load. Invalid
+entries refuse server startup. A running server reloads the catalog through
+:meth:`Registry.load` when the catalog file or a listed config changes on disk.
 """
 
 from __future__ import annotations
@@ -25,12 +26,13 @@ from phasesweep.config.io import (
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.paths import _artifact_root_identity
-from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.mcp.errors import CatalogError, StateDirChangedError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
     canonical_storage_identity,
+    file_sha256,
     require_linux_runtime,
 )
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
@@ -271,24 +273,37 @@ def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> N
         )
 
 
-def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
+def _current_sha256(path: Path) -> str | None:
+    """Hash a file's current bytes to detect an edit.
+
+    :param Path path: File to hash.
+    :return str | None: Hex SHA-256 digest, or ``None`` when the file cannot be read.
+    """
+    try:
+        return file_sha256(path)
+    except OSError:
+        return None
+
+
+def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path, str]:
     """Read and schema-validate a catalog document.
 
     :param Path catalog_path: Path to the operator-authored catalog YAML.
-    :return tuple[_Catalog, Path]: Parsed catalog and its base directory for
-        resolving relative entry paths.
-    :raises CatalogError: If the file cannot be read, is not a YAML mapping, or
-        fails catalog schema validation.
+    :return tuple[_Catalog, Path, str]: Parsed catalog, its base directory for
+        resolving relative entry paths, and the SHA-256 of the bytes parsed.
+    :raises CatalogError: If the file cannot be read, is not a UTF-8 YAML mapping,
+        or fails catalog schema validation.
     """
     try:
-        raw = _load_yaml_mapping_from_text(catalog_path.read_text(), catalog_path)
+        data = catalog_path.read_bytes()
+        raw = _load_yaml_mapping_from_text(data.decode(), catalog_path)
     except (OSError, ValueError) as exc:
         raise CatalogError(f"cannot read catalog {catalog_path}: {exc}") from exc
     try:
         catalog = _Catalog.model_validate(raw)
     except ValidationError as exc:
         raise CatalogError(f"catalog {catalog_path}: {exc}") from exc
-    return catalog, catalog_path.resolve().parent
+    return catalog, catalog_path.resolve().parent, hashlib.sha256(data).hexdigest()
 
 
 def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
@@ -467,7 +482,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
     require_linux_mcp_host()
-    catalog, base = _parse_catalog(catalog_path)
+    catalog, base, _catalog_sha256 = _parse_catalog(catalog_path)
     _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
     report = CatalogCheckReport(entries=verdicts)
     if report.ok:
@@ -476,44 +491,90 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
 
 
 class Registry:
-    """Immutable id -> RegisteredExperiment map plus the server state dir."""
+    """Immutable id -> RegisteredExperiment map, the server state dir, and the catalog it came from."""
 
     def __init__(
         self,
         state_dir: Path,
         items: dict[str, RegisteredExperiment],
         max_concurrent_runs: int = 1,
+        *,
+        catalog_path: Path,
+        catalog_sha256: str,
     ) -> None:
         """Create an immutable registry from already validated entries.
 
         :param Path state_dir: Directory used for MCP run handles and operator logs.
         :param dict[str, RegisteredExperiment] items: Validated catalog entries keyed by id.
         :param int max_concurrent_runs: Maximum live sweeps allowed across all entries.
+        :param Path catalog_path: Absolute catalog file the entries were loaded from.
+        :param str catalog_sha256: SHA-256 of the catalog bytes the entries were loaded from.
         """
         self.state_dir = state_dir
         self.max_concurrent_runs = max_concurrent_runs
+        self.catalog_path = catalog_path
+        self.catalog_sha256 = catalog_sha256
         self._items = items
 
+    def __len__(self) -> int:
+        """Count the registered experiments.
+
+        :return int: Number of catalog entries.
+        """
+        return len(self._items)
+
     @classmethod
-    def load(cls, catalog_path: Path) -> Registry:
+    def load(cls, catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
         """Load validated experiments with persistent local journal storage.
 
-        Any invalid catalog, config or state directory raises ``CatalogError``.
+        Any invalid catalog, config or state directory raises ``CatalogError``. A
+        running server reloads an edited catalog by passing the state directory its
+        run store already serves as ``bound_state_dir``. That directory is neither
+        provisioned nor probed again, so a reload writes nothing.
 
         :param Path catalog_path: Path to the operator-authored catalog YAML.
+        :param Path | None bound_state_dir: State directory a running server is bound
+            to, or ``None`` at startup, which provisions the catalog's own.
         :return Registry: Immutable registry of validated catalog entries.
+        :raises StateDirChangedError: If ``bound_state_dir`` is given and the catalog
+            resolves ``state_dir`` to another directory.
         :raises CatalogError: If the host is not a supported Linux MCP host, the
             catalog cannot be parsed, an id is duplicated, an entry fails
             validation, two entries claim one engine namespace, or the state
             directory cannot be prepared.
         """
         require_linux_mcp_host()
-        catalog, base = _parse_catalog(catalog_path)
+        catalog, base, catalog_sha256 = _parse_catalog(catalog_path)
+        if bound_state_dir is not None:
+            state_dir = _resolve_catalog_relative_path(base, catalog.state_dir)
+            if state_dir != bound_state_dir:
+                raise StateDirChangedError(
+                    f"catalog {catalog_path} now resolves state_dir to {state_dir}, but this "
+                    f"server keeps its runs in {bound_state_dir}; restart the MCP server to "
+                    "serve the new state_dir"
+                )
         items, _ = _load_catalog_entries(catalog, base, collect_errors=False)
+        if bound_state_dir is None:
+            state_dir = _prepare_state_dir(base, catalog.state_dir)
         return cls(
-            state_dir=_prepare_state_dir(base, catalog.state_dir),
+            state_dir=state_dir,
             items=items,
             max_concurrent_runs=catalog.max_concurrent_runs,
+            catalog_path=catalog_path.absolute(),
+            catalog_sha256=catalog_sha256,
+        )
+
+    def unchanged_on_disk(self) -> bool:
+        """Whether the catalog file and every config it lists still hold the loaded bytes.
+
+        A file that can no longer be read counts as changed, so a reload reports why.
+
+        :return bool: True when no current digest differs from the one recorded at load.
+        """
+        if _current_sha256(self.catalog_path) != self.catalog_sha256:
+            return False
+        return all(
+            _current_sha256(item.config_path) == item.config_sha256 for item in self._items.values()
         )
 
     def get(self, experiment_id: str) -> RegisteredExperiment:

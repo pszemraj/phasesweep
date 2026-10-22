@@ -89,7 +89,8 @@ DESCRIPTION_EXPLAIN_CONFIG = (
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
     "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
-    "Read-only: launch_run separately rechecks config identity and refuses catalog drift."
+    "Read-only: the server rereads an edited catalog or config before each call, so this "
+    "describes what launch_run would start now."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the most recently launched run for one experiment. Call only to recover a lost "
@@ -99,8 +100,10 @@ DESCRIPTION_GET_LATEST_RUN = (
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
     "inspection and explicit user authorization; monitor with the returned run_id. "
-    "Never retry permission or config-identity refusals. For capacity refusals, await healthy "
-    "named blockers; report blockers requiring recovery to the operator before retrying. "
+    "Never retry permission refusals. Retry a config-changed refusal once; report an "
+    "invalid-catalog or changed-state_dir refusal to the operator and wait for the fix. For "
+    "capacity refusals, await healthy named blockers; report blockers requiring recovery to the "
+    "operator before retrying. "
     "When runner liveness is unobservable, monitor durable progress and notify the operator "
     "if it stops."
 )
@@ -820,18 +823,20 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     mcp = FastMCP("phasesweep", instructions=agent_prompt_text())
     mcp._mcp_server.version = __version__
 
-    def list_experiments(
+    async def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
         cursor: MaybeCursor = None,
     ) -> ListExperimentsResult:
         """Validate the paginated catalog result.
+
+        The call may reread an edited catalog, so it runs off the event-loop thread.
 
         :param ListLimit limit: Maximum catalog entries to return.
         :param MaybeCursor cursor: Optional pagination cursor from a prior result.
         :return ListExperimentsResult: Structured catalog listing.
         """
         return ListExperimentsResult.model_validate(
-            app.list_experiments(limit=limit, cursor=cursor)
+            await asyncio.to_thread(app.list_experiments, limit=limit, cursor=cursor)
         )
 
     def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
@@ -982,13 +987,13 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         mime_type="application/json",
     )
     @_safe_tool
-    def catalog_resource() -> str:
+    async def catalog_resource() -> str:
         """Return the first catalog page for clients that attach MCP resources.
 
         :return str: Compact JSON catalog page.
         """
         result = ListExperimentsResult.model_validate(
-            app.list_experiments(limit=DEFAULT_LIST_LIMIT, cursor=None)
+            await asyncio.to_thread(app.list_experiments, limit=DEFAULT_LIST_LIMIT, cursor=None)
         )
         return result.model_dump_json(exclude_none=True)
 
@@ -1051,6 +1056,9 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
 
 def serve(catalog: Path) -> int:
     """Load the catalog, build the run store, and serve the nine tools over stdio.
+
+    The tools reread the catalog when it or a listed config changes; the run store
+    stays on the ``state_dir`` loaded here.
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or

@@ -23,7 +23,7 @@ experiments:
     visible_params: none
 ```
 
-The catalog is a separate YAML configuration from the experiment. Both reject unknown fields and duplicate YAML keys. The server validates and freezes the catalog and referenced experiment configurations at startup. Restart the server after editing either; a changed experiment file is refused by launch until it is reloaded. An already detached run keeps its submitted configuration snapshot.
+The catalog is a separate YAML configuration from the experiment. Both reject unknown fields and duplicate YAML keys. The server validates the catalog and the experiment configurations it lists at startup, and rereads them before the next tool call after either changes, so an added entry, a permission change or an edited experiment applies without a restart. A changed `state_dir` is the exception: the server keeps its runs in the state directory it started with, so it refuses launches until it is restarted. An edit that fails validation leaves reads on the last valid catalog and refuses launches until it is fixed; `phasesweep mcp check` shows why. The server's stderr log records each reload and each refused one. A detached run keeps the configuration snapshot it launched with.
 
 These are all accepted catalog fields. Entry paths expand `~`; relative `state_dir`, `experiments[].config` and `experiments[].cwd` paths resolve against the directory containing the catalog, independently of the server's launch directory.
 
@@ -31,7 +31,7 @@ These are all accepted catalog fields. Entry paths expand `~`; relative `state_d
 |---|---|---|
 | `state_dir` | Path; required | Private durable handles, logs, audit entries and frozen snapshots. Startup and a successful `mcp check` provision and probe the directory; see the fresh-state rules below. |
 | `max_concurrent_runs` | Integer ≥ 1; `1` | Maximum live sweeps across the shared `state_dir`, including other servers using that state. This does not set a phase's trial parallelism or assign GPUs. |
-| `experiments` | Nonempty list of objects; required | Every entry must load successfully for server startup. Each engine output/study namespace must have one catalog entry; aliases are rejected. |
+| `experiments` | Nonempty list of objects; required | Every entry must load successfully for server startup or a reload. Each engine output/study namespace must have one catalog entry; aliases are rejected. |
 | `experiments[].id` | String; required | Unique case-sensitive agent-visible identifier matching `[A-Za-z0-9_-]+`, such as `tiny_lm`. It need not equal the experiment YAML's `experiment` name. |
 | `experiments[].config` | Path; required | Existing experiment YAML file, kept operator-only. Its configuration must satisfy the detached-run storage/path rules below. |
 | `experiments[].cwd` | Path or `null`; `null` | Existing detached-run working directory. Unset/null uses the resolved experiment file's parent directory. It also supplies the trainer's working directory when experiment `execution.cwd` is unset; an explicit `execution.cwd` takes precedence for the trainer, and a relative one resolves against the experiment file's directory, not this `cwd`. |

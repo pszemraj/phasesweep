@@ -1,19 +1,25 @@
 """MCP errors for agents and operators.
 
 ``McpToolError`` messages exclude paths, commands, environment values and storage URLs.
-Startup ``CatalogError`` messages are operator-facing and may include paths.
+``CatalogError`` messages are operator-facing and may include paths.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, TypeAlias
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 
+CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
+
 
 class CatalogError(Exception):
-    """Catalog could not be loaded or validated. Fatal at startup, operator-facing."""
+    """Catalog could not be loaded or validated. Operator-facing.
+
+    Fatal at startup; a running server that cannot reload an edited catalog keeps
+    serving reads from the last valid one and refuses launches.
+    """
 
     def __init__(self, message: str, *, suggestion: str | None = None) -> None:
         """Create an operator-facing catalog error.
@@ -23,6 +29,10 @@ class CatalogError(Exception):
         """
         super().__init__(message)
         self.suggestion = suggestion
+
+
+class StateDirChangedError(CatalogError):
+    """Raised when a reloaded catalog names another state directory than the server serves."""
 
 
 class McpToolError(Exception):
@@ -82,26 +92,64 @@ class PermissionDeniedError(McpToolError):
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
         """
+        # Launch-time permission caps cancellation, so a later catalog grant cannot reach
+        # a run launched without it.
+        applies = (
+            "which applies on the next call but never to a run launched without it"
+            if action == "cancel"
+            else "which applies on the next call"
+        )
         super().__init__(
             f"action {action!r} is not permitted for experiment {experiment_id!r}; "
             "this is deliberate catalog policy. Report it to the user - only the "
-            f"operator can enable it (allow.{action}: true) and restart the server. "
+            f"operator can enable it (allow.{action}: true in the catalog), {applies}. "
             "Do not retry."
         )
 
 
 class ConfigChangedError(McpToolError):
-    """Raised when a cataloged config no longer matches the startup snapshot."""
+    """Raised when a cataloged config changes between the server's reread and its use."""
 
     def __init__(self, experiment_id: str) -> None:
         """Create a config-changed tool error.
 
-        :param str experiment_id: Catalog id whose config hash no longer matches startup.
+        :param str experiment_id: Catalog id whose config bytes changed during the call.
         """
         super().__init__(
-            f"cataloged config for experiment {experiment_id!r} changed since server startup; "
-            "the operator must restart the MCP server to reload and validate it. Do not retry."
+            f"the config for experiment {experiment_id!r} changed on disk while this call was "
+            "reading it, so the call stopped. The server rereads an edited catalog and its "
+            "configs before each call; retry this call once, and report it to the operator if "
+            "it is refused again."
         )
+
+
+class CatalogReloadRefusedError(McpToolError):
+    """Raised by launch while the server's latest reread of an edited catalog was refused."""
+
+    def __init__(self, reason: CatalogReloadRefusal) -> None:
+        """Create a refused-reload tool error.
+
+        :param CatalogReloadRefusal reason: ``invalid`` when the edited catalog or a config
+            it lists failed validation; ``state_dir_changed`` when it names another state
+            directory than the one this server was started with.
+        """
+        if reason == "state_dir_changed":
+            message = (
+                "the catalog was edited to name a different state_dir than the one this server "
+                "was started with. A running server keeps its run records in one state "
+                "directory, so it refuses launches until the operator restarts it; reads keep "
+                "using the original state directory and the last catalog loaded with it. "
+                "Report this to the operator. Do not retry."
+            )
+        else:
+            message = (
+                "the catalog or an experiment config it lists was edited and no longer "
+                "validates, so this server refuses launches until it is fixed; reads keep "
+                "using the last valid catalog. Ask the operator to fix it; `phasesweep mcp "
+                "check` shows what fails. The server rereads the catalog on the next call. "
+                "Do not retry until the operator reports the fix."
+            )
+        super().__init__(message)
 
 
 class RunSnapshotUnavailableError(McpToolError):
