@@ -37,7 +37,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.run import TerminalReport
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -1271,7 +1271,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
     # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as previewed:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as previewed:
         run_experiment(_exp(2), dry_run=True)
     message = str(previewed.value)
     assert "cleanup could not be confirmed" in message
@@ -1303,7 +1303,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
     # Once the preflight has confirmed cleanup, only the target is left to raise.
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as confirmed:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:
         run_experiment(_exp(2))
     assert "phases[p].n_trials above 2 in the config" in str(confirmed.value)
     assert "mcp recover-run" not in str(confirmed.value)
@@ -1404,7 +1404,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     assert replayed.consecutive_failures == 0
     assert replayed.abort == record
 
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
 
@@ -1525,7 +1525,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
         "phasesweep.engine.phase.extract_trial_result",
         real_extract,
     )
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
 

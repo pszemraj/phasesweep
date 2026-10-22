@@ -41,7 +41,7 @@ from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_exi
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -1920,7 +1920,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
-    with pytest.raises(NoFeasibleTrialError, match=r"phases\[p\]\.n_trials above 2 in the config"):
+    with pytest.raises(
+        PhaseAbortRefusedError, match=r"phases\[p\]\.n_trials above 2 in the config"
+    ):
         run_experiment(_exp(2))
     assert not launched.exists()
 

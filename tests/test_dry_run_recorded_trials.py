@@ -32,7 +32,7 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.phase import _placeholder_winner
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -288,7 +288,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(attempt(4))
-    _refusals_match(attempt(4), tmp_path, NoFeasibleTrialError, "aborted")
+    _refusals_match(attempt(4), tmp_path, PhaseAbortRefusedError, "aborted")
     assert len(calls.read_text().splitlines()) == 2
 
     raised = attempt(6)
@@ -723,7 +723,9 @@ def test_failure_limit_met_with_work_remaining_is_refused_as_a_run_refuses(tmp_p
     experiment = _persistent(tmp_path, _phase("a", 5, max_consecutive_failures=3))
     _record(experiment, "a", _STATE.FAIL, _STATE.FAIL, _STATE.FAIL, target=5)
 
-    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "meets max_consecutive_failures=3")
+    _refusals_match(
+        experiment, tmp_path, PhaseAbortRefusedError, "meets max_consecutive_failures=3"
+    )
 
 
 def test_refusal_is_given_before_any_phase_is_previewed(

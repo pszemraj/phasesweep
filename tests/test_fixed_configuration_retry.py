@@ -23,7 +23,7 @@ from phasesweep.config.search import IntParam, Sampler, fixed_configuration_targ
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
@@ -77,16 +77,19 @@ def _states(exp: Experiment) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("sampler", "max_failures"),
+    ("sampler", "max_failures", "repeat_error"),
     [
-        pytest.param(None, 5, id="default_tpe"),
-        pytest.param(None, 1, id="default_tpe_abort_recorded"),
-        pytest.param(Sampler(type="random", seed=0), 5, id="random"),
-        pytest.param(Sampler(type="grid"), 5, id="grid"),
+        pytest.param(None, 5, NoFeasibleTrialError, id="default_tpe"),
+        pytest.param(None, 1, PhaseAbortRefusedError, id="default_tpe_abort_recorded"),
+        pytest.param(Sampler(type="random", seed=0), 5, NoFeasibleTrialError, id="random"),
+        pytest.param(Sampler(type="grid"), 5, NoFeasibleTrialError, id="grid"),
     ],
 )
 def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
-    tmp_path: Path, sampler: Sampler | None, max_failures: int
+    tmp_path: Path,
+    sampler: Sampler | None,
+    max_failures: int,
+    repeat_error: type[Exception],
 ) -> None:
     """One failed attempt buys one retry under any sampler, and a result is final."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=1)
@@ -100,8 +103,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         run_experiment(attempt(1))
     assert _call_count(calls) == 1
 
-    # The failed attempt used the target up, so repeating it launches nothing.
-    with pytest.raises(NoFeasibleTrialError):
+    # The failed attempt used the target up, so repeating it launches nothing: it replays the
+    # failure, or the recorded abort refuses it.
+    with pytest.raises(repeat_error):
         run_experiment(attempt(1))
     assert _call_count(calls) == 1
 
@@ -166,7 +170,7 @@ def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> No
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
     _assert_advises_next_target(str(aborted.value), 1)
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
     _assert_advises_next_target(str(refused.value), 1)
 
@@ -210,7 +214,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
 
     with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible") as aborted:
         run_experiment(experiment)
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
     for message in (str(aborted.value), str(refused.value)):
         assert "Its configuration was measured and is not feasible" in message

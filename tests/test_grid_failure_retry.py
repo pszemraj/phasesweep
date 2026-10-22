@@ -81,7 +81,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(original)
     assert [trial.state.name for trial in _trials(original)] == ["FAIL", "FAIL"]
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(original)
     assert len(calls.read_text().splitlines()) == 2
 
@@ -241,7 +241,7 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
         run_experiment(original)
     messages = [str(aborted.value)]
     for dry_run in (False, True):
-        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(original, dry_run=dry_run)
         messages.append(str(refused.value))
     for message in messages:
@@ -299,7 +299,7 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
     assert [trial.state.name for trial in _trials(original)] == ["FAIL", "FAIL"]
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     for message in (str(aborted.value), str(refused.value)):
         _assert_advises_target(
@@ -325,7 +325,7 @@ def test_fully_measured_infeasible_grid_says_nothing_can_continue(tmp_path: Path
         run_experiment(original)
     messages = [str(aborted.value)]
     for dry_run in (False, True):
-        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(original, dry_run=dry_run)
         messages.append(str(refused.value))
     for message in messages:
@@ -338,7 +338,7 @@ def test_fully_measured_infeasible_grid_says_nothing_can_continue(tmp_path: Path
     roomier = original.model_copy(
         update={"phases": [original.phases[0].model_copy(update={"max_consecutive_failures": 3})]}
     )
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(roomier)
     with pytest.raises(TrialTargetRefusedError):
         run_experiment(_grid(tmp_path, trainer, 3, metric=bounded))
@@ -498,13 +498,13 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
     assert [trial.state.name for trial in _trials(original)] == ["COMPLETE", "COMPLETE"]
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     phase = original.phases[0]
     streak = phase_ops._failure_policy_abort_record(
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
-    with pytest.raises(NoFeasibleTrialError) as at_limit:
+    with pytest.raises(PhaseAbortRefusedError) as at_limit:
         phase_ops._raise_streak_at_limit(phase, streak, _study(original))
 
     for message in (str(aborted.value), str(refused.value), str(at_limit.value)):
@@ -546,7 +546,7 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(experiment)
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
     for message in (str(aborted.value), str(refused.value)):
         assert "phases[p].n_trials above 2 in the config" in message

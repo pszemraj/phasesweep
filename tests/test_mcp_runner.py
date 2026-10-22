@@ -48,7 +48,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -575,7 +575,7 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
     aborting = json.loads(store.status_path("aborting").read_text())["failure"]
     assert (aborting["code"], aborting["stage"]) == ("trainer_failed", "execution")
 
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_claimed_runner(store, "refused", config_path, experiment_id="t", cwd=tmp_path)
     refused = json.loads(store.status_path("refused").read_text())["failure"]
     assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")

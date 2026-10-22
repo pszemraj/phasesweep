@@ -335,7 +335,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     flag.touch()
     for limit in (1, 2):
         for dry_run in (True, False):
-            with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+            with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
                 run_experiment(_with_limit(initial, limit), dry_run=dry_run)
     assert len(_study(initial).trials) == 2
 
@@ -367,7 +367,7 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
 
     refusals = [str(aborted.value)]
     for dry_run in (True, False):
-        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(_with_limit(initial, 5), dry_run=dry_run)
         refusals.append(str(refused.value))
     for message in refusals:
@@ -460,7 +460,7 @@ def test_fatal_abort_of_a_grid_advises_the_retry_target_without_a_failure_count(
         search_space={"x": IntParam(type="int", low=1, high=3)},
     )
 
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
 
     message = str(refused.value)
@@ -480,7 +480,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
     roomy = _with_limit(initial, 5)
     refusals = []
     for dry_run in (True, False):
-        with pytest.raises(NoFeasibleTrialError, match="previously aborted") as refused:
+        with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(roomy, dry_run=dry_run)
         refusals.append(str(refused.value))
     for message in refusals:
@@ -500,7 +500,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
 @pytest.mark.parametrize(
     ("failing_attr", "old_target_refusal"),
     [
-        (PHASE_RECOVERY_ATTR, NoFeasibleTrialError),
+        (PHASE_RECOVERY_ATTR, PhaseAbortRefusedError),
         (TRIAL_TARGET_ATTR, TrialTargetRefusedError),
         (_ALLOCATION_CONTEXT_ATTR, TrialTargetRefusedError),
     ],

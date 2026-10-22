@@ -172,7 +172,6 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (TrialTargetRefusedError, "trial_target_refused"),
-    # Ahead of its parent: this refusal comes before any trainer runs.
     (PhaseAbortRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )
