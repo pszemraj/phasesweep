@@ -42,6 +42,7 @@ from phasesweep.engine.errors import (
     PublicationIntegrityError,
 )
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
     _generation_path,
     _generation_record_path,
@@ -1353,6 +1354,85 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Pat
 
     assert pointer_path.is_symlink()
     assert current_path.read_bytes() == current
+
+
+def _memory_publication(tmp_path: Path) -> tuple[Experiment, str]:
+    """Publish one generation from a ``storage: null`` run.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :return tuple[Experiment, str]: The in-memory experiment and its published generation id.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(workdir=tmp_path / "runs", trainer=trainer, n_trials=1)
+    assert experiment.resolved_storage is None
+    run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    return experiment, generation_id
+
+
+def _assert_memory_launches_refuse_before_any_write(
+    experiment: Experiment, error: type[Exception], match: str
+) -> None:
+    """Require a ``storage: null`` run, dry run, and resume to refuse without writing.
+
+    :param Experiment experiment: In-memory experiment whose publication was made unusable.
+    :param type[Exception] error: Refusal every launch must raise.
+    :param str match: Pattern the refusal's message must contain.
+    """
+    root = _experiment_dir(experiment)
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer_mode = stat.S_IMODE(pointer_path.lstat().st_mode)
+    before = {path: path.lstat().st_mtime_ns for path in [root, *root.rglob("*")]}
+    with pytest.raises(error, match=match):
+        run_experiment(experiment)
+    with pytest.raises(error, match=match):
+        run_experiment(experiment, dry_run=True)
+    with pytest.raises(error, match=match):
+        run_experiment(_with_later_phase(experiment), from_phase="q")
+    assert stat.S_IMODE(pointer_path.lstat().st_mode) == pointer_mode
+    assert {path: path.lstat().st_mtime_ns for path in [root, *root.rglob("*")]} == before
+
+
+@pytest.mark.parametrize("damage", ["edited_winner", "malformed_pointer"])
+def test_memory_run_refuses_a_corrupt_publication_before_any_write(
+    tmp_path: Path, damage: str
+) -> None:
+    """``storage: null`` has no ledger to check, yet a corrupt publication still blocks a rerun."""
+    experiment, generation_id = _memory_publication(tmp_path)
+    if damage == "edited_winner":
+        _tamper_winner_artifact(_generation_winner_path(experiment, generation_id, "p"))
+    else:
+        _last_successful_generation_path(experiment).write_text("not a pointer\n")
+    assert _resolve_publication_pointer(experiment).state == "failed"
+
+    _assert_memory_launches_refuse_before_any_write(
+        experiment, PublicationIntegrityError, "no longer validates"
+    )
+
+
+@requires_nonroot
+@pytest.mark.parametrize("unreadable", ["winner", "pointer"])
+def test_memory_run_refuses_an_unreadable_publication_before_any_write(
+    tmp_path: Path, unreadable: str
+) -> None:
+    """``storage: null`` refuses a publication it may not read, rather than publishing past it."""
+    experiment, generation_id = _memory_publication(tmp_path)
+    path = (
+        _generation_winner_path(experiment, generation_id, "p")
+        if unreadable == "winner"
+        else _last_successful_generation_path(experiment)
+    )
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(0o000)
+    try:
+        assert _resolve_publication_pointer(experiment).state == "permission_denied"
+        _assert_memory_launches_refuse_before_any_write(
+            experiment, PublicationAccessError, "cannot be validated as the current user"
+        )
+    finally:
+        path.chmod(original_mode)
+    assert published_generation_id(experiment) == generation_id
 
 
 def _with_later_phase(experiment: Experiment) -> Experiment:

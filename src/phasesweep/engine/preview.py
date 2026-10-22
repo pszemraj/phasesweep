@@ -16,10 +16,7 @@ import optuna
 import phasesweep.engine.resume as resume_ops
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
-from phasesweep.engine.artifact_roots import (
-    _artifact_root_binding_applies,
-    _check_published_phase_studies,
-)
+from phasesweep.engine.artifact_roots import _check_published_phase_studies
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
 from phasesweep.engine.guards import _raise_collected_errors
@@ -203,8 +200,7 @@ def _refuse_as_a_launch_would(
         descendant study already bound to its winner.
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
-    if _artifact_root_binding_applies(experiment):
-        _check_published_phase_studies(experiment, studies, from_phase=from_phase)
+    _check_published_phase_studies(experiment, studies, from_phase=from_phase)
     errors: list[Exception] = []
     reached = from_phase is None
     for phase in experiment.phases:

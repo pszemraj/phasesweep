@@ -298,7 +298,11 @@ def _check_published_phase_studies(
     *,
     from_phase: str | None = None,
 ) -> None:
-    """Require published trial identity and history for phases that would execute.
+    """Refuse an unusable publication, then require published history for phases that would execute.
+
+    The refusal applies to every storage backend, so a launch never publishes past
+    a publication that needs operator attention. Only persistent storage carries
+    published trials to require; an in-memory ledger starts empty on every launch.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
@@ -313,6 +317,8 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
+    if not _artifact_root_binding_applies(experiment):
+        return
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary
     )

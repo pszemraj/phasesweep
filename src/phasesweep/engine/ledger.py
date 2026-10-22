@@ -35,7 +35,6 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifact_roots import (
     BindingState,
-    _artifact_root_binding_applies,
     _artifact_root_claim_needed,
     _bind_study_artifact_root,
     _check_artifact_root_binding,
@@ -1064,10 +1063,11 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     """Validate all phases and claim their ledger under the experiment lock.
 
     Repair a partial final record before opening live storage. Read or ownership
-    failures abort before claims or recovery. Reached published phases require their
-    recorded trial history; skipped phases use saved winners. Recheck the tree binding,
-    create the ledger directory, bind the tree, then claim empty studies. Absent studies
-    are created by :func:`open_phase_study`; existing studies are returned for preflight.
+    failures abort before claims or recovery. An unusable publication is refused for
+    every storage backend. Reached published phases require their recorded trial
+    history; skipped phases use saved winners. Recheck the tree binding, create the
+    ledger directory, bind the tree, then claim empty studies. Absent studies are
+    created by :func:`open_phase_study`; existing studies are returned for preflight.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
@@ -1081,6 +1081,10 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
+    :raises PublicationAccessError: The last publication cannot be read as the
+        current user; nothing was written.
+    :raises PublicationIntegrityError: The last publication no longer
+        validates; nothing was written.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, carries a binding that is not a string, or the
         tree's ownership record changed after validation.
@@ -1103,12 +1107,11 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
             raise unavailable from exc
         if study is not None:
             loaded[phase.name] = study
-    claimable: list[optuna.Study] = []
-    if _artifact_root_binding_applies(experiment):
-        _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
-        claimable = [
-            study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
-        ]
+    _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
+    # An in-memory ledger loads no studies, so only persistent studies are claimed.
+    claimable = [
+        study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
+    ]
     offered = _artifact_root_identity(experiment)
     binding_state = _check_artifact_root_binding(experiment)
     if binding_state != ledger.binding_state or offered != ledger.artifact_root:
