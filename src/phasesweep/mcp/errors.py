@@ -397,7 +397,7 @@ class ResumeNotReadyError(McpToolError):
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
             f"earlier phase {missing_phase!r} {reason}. Call get_latest_run({experiment_id!r}) "
             "first; if it finds a run, call get_run_results with its run_id. Resume only after "
-            "every earlier phase has a winner."
+            "every earlier phase the remaining phases inherit has a compatible published winner."
         )
 
 

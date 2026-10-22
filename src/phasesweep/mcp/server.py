@@ -200,7 +200,10 @@ PublishedConfigMatchesCurrent = Annotated[
 MaybePhaseName = Annotated[
     str | None,
     Field(
-        description="Optional phase name to resume from after earlier phases already have winners.",
+        description=(
+            "Optional phase name to resume from once the earlier phases the remaining phases "
+            "inherit have compatible published winners."
+        ),
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]

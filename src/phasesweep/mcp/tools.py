@@ -1152,12 +1152,13 @@ class PhaseSweepMCP:
         """Start the sweep as a detached background run; return its run_id.
 
         Refuses while the latest reread of an edited catalog was refused, if launch is
-        not permitted, if a ``from_phase`` resume is not ready (an earlier phase has no
-        winner), if this experiment already has a live run, or if the server is at its
-        max_concurrent_runs cap.
+        not permitted, if a ``from_phase`` resume is not ready (an earlier phase the
+        remaining phases inherit has no compatible published winner), if this experiment
+        already has a live run, or if the server is at its max_concurrent_runs cap.
 
         :param str experiment_id: Catalog experiment id to launch.
-        :param str | None from_phase: Optional phase to resume from after earlier winners exist.
+        :param str | None from_phase: Optional phase to resume from once the earlier phases
+            the remaining phases inherit have winners.
         :return JsonObject: Launch result containing run id, experiment id, and running state.
         :raises CatalogReloadRefusedError: If the edited catalog or a config it lists
             fails validation, or it names another state directory than this server's.
