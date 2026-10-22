@@ -827,10 +827,15 @@ def _recovery_remedies(
     """
     name, target = phase.name, phase.n_trials
     if _awaits_cleanup_recovery(study, abort):
+        aborted_at = abort["trial_target"]
+        then = (
+            f"Then n_trials={target} retires it."
+            if isinstance(aborted_at, int) and target > aborted_at
+            else f"Then raise phases[{name}].n_trials above {target} in the config."
+        )
         return (
             "A larger n_trials does not retire this abort while a trial's process cleanup is "
-            f"unconfirmed. First confirm the cleanup: {RERUN_CLEANUP_RECOVERY}. Then raise "
-            f"phases[{name}].n_trials above {target} in the config."
+            f"unconfirmed. First confirm the cleanup: {RERUN_CLEANUP_RECOVERY}. {then}"
         )
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)

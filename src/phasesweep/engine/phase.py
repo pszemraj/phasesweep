@@ -78,6 +78,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
+    _awaits_cleanup_recovery,
     _config_retires_abort,
     _consecutive_failure_threshold_tripped,
     _initialize_study_schema,
@@ -527,8 +528,9 @@ def _judge_recorded_phase(
         target, or a fixed configuration asks for more attempts than it may retry.
     :raises PhaseAbortRefusedError: The phase aborted and the current config does not
         retire the abort (see :func:`~phasesweep.engine.study_policy._config_retires_abort`),
-        or its streak meets the current limit with work remaining, at an accepted
-        target its current ``n_trials`` does not exceed.
+        a trial of its unsafe-cleanup abort still awaits cleanup recovery, or its streak
+        meets the current limit with work remaining, at an accepted target its current
+        ``n_trials`` does not exceed.
     :raises WinnerIntegrityError: An accepted partial-timeout decision would
         replay while the current config disables ``allow_incomplete_on_timeout``.
     :raises TimeoutError: An accepted partial-timeout decision replays with no
@@ -574,7 +576,11 @@ def _judge_recorded_phase(
     # A later success or a lowered failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
     trials = study.get_trials(deepcopy=False)
-    if active_abort is not None and not _config_retires_abort(phase, trials, active_abort):
+    # A live run's preflight confirms cleanup before this point; a dry run cannot.
+    if active_abort is not None and (
+        _awaits_cleanup_recovery(study, active_abort)
+        or not _config_retires_abort(phase, trials, active_abort)
+    ):
         _raise_prior_phase_abort(phase, active_abort, study)
     if (
         active_abort is None
