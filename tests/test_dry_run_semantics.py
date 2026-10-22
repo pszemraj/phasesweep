@@ -13,10 +13,17 @@ from tests.conftest import make_experiment
 from tests.ledger_fixtures import tree_snapshot
 
 
-@pytest.mark.parametrize("changed", ["search_space", "trainer_config", "cwd"])
-@pytest.mark.parametrize("phase_name", ["a", "b"])
+@pytest.mark.parametrize(
+    ("changed", "phase_name"),
+    [
+        pytest.param("search_space", "a", id="search_space-a"),
+        pytest.param("search_space", "b", id="search_space-b"),
+        pytest.param("trainer_config", None, id="trainer_config"),
+        pytest.param("cwd", None, id="cwd"),
+    ],
+)
 def test_dry_run_refuses_changed_recorded_semantics(
-    tmp_path: Path, changed: str, phase_name: str
+    tmp_path: Path, changed: str, phase_name: str | None
 ) -> None:
     """First and later studies use the real run's precise fingerprint refusal."""
     experiment = make_experiment(
