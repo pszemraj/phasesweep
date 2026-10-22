@@ -863,8 +863,7 @@ def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
         patch.setattr(runtime_files.sys, "platform", "darwin")
         with pytest.raises(runtime_files.PlatformCapabilityError, match="only on Linux.*'darwin'"):
             run_experiment(exp)
-
-    winners = run_experiment(exp, dry_run=True)
+        winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
 
 

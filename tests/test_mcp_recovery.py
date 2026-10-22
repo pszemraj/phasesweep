@@ -1147,7 +1147,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     if changed_storage:
         attempt_config = tmp_path / "srv-later-storage.yaml"
         attempt_config.write_text(
-            config.read_text().replace("/srv.db", "/srv-later.db"),
+            config.read_text().replace("/srv.journal", "/srv-later.journal"),
         )
     earlier_run_id = "srv-earlier-uncertain"
     later_generation_id = "later-cli-generation"
@@ -1180,6 +1180,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     if changed_storage:
         recovery_experiment = load_experiment(config)
         assert isinstance(recovery_experiment, Experiment)
+        assert recovery_experiment.resolved_storage != experiment.resolved_storage
         _write_artifact_root_binding(recovery_experiment)
 
     app, registry, store = make_mcp_app(
