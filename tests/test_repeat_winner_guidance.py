@@ -82,22 +82,14 @@ def test_show_winners_explains_repeat_metric_and_checkpoint_choice(
     assert all(line.startswith("# ") for line in guidance.splitlines())
     assert rendered == "\n"
     assert yaml.safe_load(repeated) == yaml.safe_load(saved)
+    scalar = result.output.split("=== scalar ===\n", 1)[1]
+    assert scalar == contents["scalar"].decode("utf-8") + "\n"
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     assert (
         _generation_winner_path(experiment, generation_id, "repeated").read_bytes()
         == contents["repeated"]
     )
-
-
-def test_show_winners_leaves_scalar_winner_unannotated(tmp_path: Path) -> None:
-    _, config_path, contents = _publish_winners(tmp_path)
-
-    result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
-
-    assert result.exit_code == 0, result.output
-    scalar = result.output.split("=== scalar ===\n", 1)[1]
-    assert scalar == contents["scalar"].decode("utf-8") + "\n"
 
 
 def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path: Path) -> None:
