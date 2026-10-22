@@ -60,7 +60,7 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 8
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 9
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:

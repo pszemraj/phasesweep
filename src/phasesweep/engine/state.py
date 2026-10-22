@@ -167,7 +167,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 8
+STUDY_SCHEMA_VERSION = 9
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The

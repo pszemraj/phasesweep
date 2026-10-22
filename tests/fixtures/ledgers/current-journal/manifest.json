@@ -1,6 +1,6 @@
 {
   "backend": "journal",
-  "binding_schema_version": 8,
+  "binding_schema_version": 9,
   "derivation": "",
   "derived_from": null,
   "expect": {
@@ -20,9 +20,9 @@
     "p"
   ],
   "produced_by": {
-    "cwd": "/tmp/claude-1000/-home-pszemraj-workspace-projects-productivity-label-parakit-dictations/552bda4e-cf6a-41da-8143-b45c0c058601/scratchpad/o/phasesweep",
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.9-133-g19a6d0d-dirty",
+    "phasesweep_git": "v0.3.9-145-geb489b8-dirty",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }
