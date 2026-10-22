@@ -27,6 +27,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport
+from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import invoke_cli_boundary, make_experiment
 from tests.experiments import write_experiment
@@ -88,6 +89,7 @@ def test_a_replay_of_the_published_winners_writes_no_generation(tmp_path: Path) 
     reports: list[TerminalReport] = []
     winners = run_experiment(experiment, terminal_callback=reports.append)
     published = reports[0].generation_id
+    assert reports[0].replayed_generation_id is None
     before = _tree(experiment)
     assert before[0] == [published]
 
@@ -98,6 +100,7 @@ def test_a_replay_of_the_published_winners_writes_no_generation(tmp_path: Path) 
         )
         assert reports[-1].primary_error is None
         assert reports[-1].winners == winners
+        assert reports[-1].replayed_generation_id == published
         assert not _generation_dir(experiment, reports[-1].generation_id).exists()
         assert _tree(experiment) == before
 
@@ -216,7 +219,7 @@ def test_an_aborted_run_keeps_its_generation_and_the_refused_reruns_add_none(
 def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports(
     tmp_path: Path,
 ) -> None:
-    """A detached replay reports the winners it matched; a refused launch reports its refusal."""
+    """A detached replay represents the generation it matched; a refused launch reports its refusal."""
     config = write_experiment(
         tmp_path / "srv.yaml",
         experiment="srv",
@@ -251,10 +254,31 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     assert "result_publication_state" not in replay
     assert replay["result_snapshot"]["winners"] == first["result_snapshot"]["winners"]
     status = replay["result_snapshot"]["status"]
-    assert status["represented_generation_id"] == "srv-replay"
+    assert status["represented_generation_id"] == "srv-first"
     assert status["published_generation_id"] == "srv-first"
+    assert (status["is_published"], status["summary_present"]) == (True, True)
     assert [phase["winner_present"] for phase in status["phases"]] == [True]
     assert not any(status["phases"][0]["generation_trials"].values())
+    payload = status_payload(
+        "srv",
+        status,
+        {"run_id": "srv-replay"},
+        result_source="frozen_run_snapshot",
+        elapsed_seconds=None,
+    )
+    assert payload["run_wrote_generation"] is False
+    (phase,) = payload["phases"]
+    assert (phase["attempts_launched_this_run"], phase["finished_trials_this_run"]) == (0, 0)
+    assert phase["finished_trials_before_run"] == 2
+    assert phase["target_already_satisfied"] is True
+    first_payload = status_payload(
+        "srv",
+        first["result_snapshot"]["status"],
+        {"run_id": "srv-first"},
+        result_source="frozen_run_snapshot",
+        elapsed_seconds=None,
+    )
+    assert first_payload["run_wrote_generation"] is True
 
     lowered = config.with_name("lowered.yaml")
     lowered.write_text(config.read_text().replace("n_trials: 2", "n_trials: 1"))

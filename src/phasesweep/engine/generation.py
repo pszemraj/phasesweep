@@ -74,7 +74,9 @@ class InvocationGeneration:
     The engine calls it before the first trial allocation, or before publishing winners
     that differ from the current publication. Winners saved before the claim stay in
     memory and are written by it, so an invocation that launches nothing and publishes
-    nothing leaves no generation and leaves both pointers as they were.
+    nothing leaves no generation and leaves both pointers as they were. Such an invocation
+    sets ``replayed_generation_id`` to the published generation that already holds its
+    winners.
     """
 
     def __init__(
@@ -95,6 +97,7 @@ class InvocationGeneration:
         self.experiment = experiment
         self.generation_id = generation_id
         self.claimed = False
+        self.replayed_generation_id: str | None = None
         self._caller_owned_id = caller_owned_id
         self._from_phase = from_phase
         self._pending_winners: dict[str, Winner] = {}

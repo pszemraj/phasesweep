@@ -406,6 +406,7 @@ def read_status(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    trial_generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
@@ -425,8 +426,8 @@ def read_status(
     back to current config; ``result_context`` names the source. Semantic fingerprints
     determine ``published_config_matches_current``, or ``None`` if no fingerprint exists.
 
-    ``generation_trials`` counts the pinned generation, or current generation by default;
-    other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
+    ``generation_trials`` counts ``trial_generation_id`` when given, else the pinned
+    generation, else the current generation; other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
     Absent studies have zero counts; unreadable storage sets ``trial_data_available=False``
     and ``running_attempts=None``. ``published_study_unavailable`` marks missing/replaced
     trial identities or incomplete history when readable, otherwise incomplete inspection.
@@ -436,16 +437,20 @@ def read_status(
     :param Experiment experiment: Experiment whose artifacts and trials are inspected.
     :param str | None generation_id: Pin represented artifacts and generation counts,
         leaving pointer identities unchanged.
+    :param str | None trial_generation_id: Generation whose trials ``generation_trials``
+        counts instead of the represented one.
     :param Experiment | None comparison_experiment: Current config for drift comparison
         and fallback semantics; reads still use ``experiment``.
     :raises ArtifactRootConflictError: The root is unreadable or has different ownership.
-    :raises ValueError: ``generation_id`` is not a safe generation name.
+    :raises ValueError: ``generation_id`` or ``trial_generation_id`` is not a safe
+        generation name.
     :return EngineStatus: Identities, integrity, result semantics, progress and artifact
         presence. Path-free ``publication_error`` appears only for failed or denied validation.
     """
     status, _publication = _read_status(
         experiment,
         generation_id=generation_id,
+        trial_generation_id=trial_generation_id,
         comparison_experiment=comparison_experiment,
     )
     return status
@@ -483,6 +488,7 @@ def read_result(
     status, publication = _read_status(
         experiment,
         generation_id=generation_id,
+        trial_generation_id=None,
         comparison_experiment=comparison_experiment,
     )
     winners = _represented_winners(
@@ -498,17 +504,21 @@ def _read_status(
     experiment: Experiment,
     *,
     generation_id: str | None,
+    trial_generation_id: str | None,
     comparison_experiment: Experiment | None,
 ) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional generation to represent.
+    :param str | None trial_generation_id: Optional generation whose trials
+        ``generation_trials`` counts instead of the represented one.
     :param Experiment | None comparison_experiment: Optional current config for
         drift comparison.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
-    :raises ValueError: If ``generation_id`` is not a safe generation name.
+    :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
+        generation name.
     :return tuple[EngineStatus, PublicationPointer]: The status payload and
         the single pointer resolution every fact in it came from.
     """
@@ -524,6 +534,8 @@ def _read_status(
         _validate_safe_name("generation", generation_id)
         represented_generation_id = generation_id
         trial_scope_generation_id = generation_id
+    if trial_generation_id is not None:
+        trial_scope_generation_id = _validate_safe_name("generation", trial_generation_id)
 
     is_published = (
         represented_generation_id is not None

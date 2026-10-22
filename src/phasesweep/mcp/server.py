@@ -406,14 +406,18 @@ class PhaseStatusPayload(_ToolPayload):
     )
     finished_trials_before_run: int | None = Field(
         ge=0,
-        description="Finished rows that predate the represented generation; null when unavailable.",
+        description="Finished rows not owned by the queried run; null when unavailable.",
     )
     attempts_launched_this_run: int | None = Field(
-        ge=0, description="All attempts owned by the represented generation; null when unavailable."
+        ge=0,
+        description=(
+            "All attempts owned by the queried run's generation, zero for a run that wrote "
+            "none; null when unavailable."
+        ),
     )
     finished_trials_this_run: int | None = Field(
         ge=0,
-        description="Finished attempts owned by the represented generation; null when unavailable.",
+        description="Finished attempts owned by the queried run; null when unavailable.",
     )
     remaining_trials: int | None = Field(
         ge=0,
@@ -478,14 +482,23 @@ class GetRunStatusResult(_ToolPayload):
     )
     represented_generation_id: str | None = Field(
         description=(
-            "Generation supplying this payload's winners, summary, and this-run counts; "
-            "normally the queried run, or null for an unavailable placeholder."
+            "Generation supplying this payload's winners and summary: the queried run's own "
+            "generation, the published generation a run that launched nothing replayed, or "
+            "the queried run's ID when it wrote and replayed none; null for an unavailable "
+            "placeholder."
         )
     )
     is_published: bool = Field(
         description=(
             "True iff the non-null represented_generation_id equals published_generation_id; "
             "a run can still expose its own winners when this is false."
+        )
+    )
+    run_wrote_generation: bool | None = Field(
+        description=(
+            "Whether the queried run has written its own generation, which it does when it "
+            "launches a trial or publishes. False for a run that replayed the published "
+            "winners or was refused before its first trial; null for an unavailable placeholder."
         )
     )
     publication_integrity: PublicationIntegrity
@@ -550,7 +563,7 @@ class WinnerPhasePayload(_ToolPayload):
 
     phase: PhaseName
     winner_source: WinnerSourcePayload
-    winner_generation: Literal["current_generation", "prior_generation", "unknown"] = Field(
+    winner_generation: Literal["represented_generation", "prior_generation", "unknown"] = Field(
         description=(
             "Whether this winner was selected in the represented generation, carried from an "
             "earlier generation, or has no recorded generation provenance."

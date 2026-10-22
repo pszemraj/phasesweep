@@ -89,7 +89,9 @@ class TerminalReport:
     ``"preflight"`` for one before it, and ``None`` on success.
     ``winners`` holds the winners the engine captured under the experiment lock
     on success, so a terminal-result consumer need not re-read storage. It is
-    ``None`` on every failure path.
+    ``None`` on every failure path. ``replayed_generation_id`` names the published
+    generation whose winners a successful invocation replayed without writing a
+    generation, and is ``None`` otherwise.
     """
 
     generation_id: str
@@ -101,6 +103,7 @@ class TerminalReport:
     cleanup_error: BaseException | None = None
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
+    replayed_generation_id: str | None = None
 
 
 class PublicationHook(Protocol):
@@ -143,6 +146,7 @@ def _terminal_report_from_cleanup(
     primary_error: BaseException | None,
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
+    replayed_generation_id: str | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
 
@@ -151,6 +155,8 @@ def _terminal_report_from_cleanup(
     :param BaseException | None primary_error: Invocation's authoritative error.
     :param str | None failure_stage: Stage where the invocation failed.
     :param Mapping[str, Winner] | None winners: Successful published winners.
+    :param str | None replayed_generation_id: Published generation whose winners a successful
+        invocation replayed without writing a generation.
     :return TerminalReport: Immutable terminal outcome snapshot.
     """
     return TerminalReport(
@@ -163,6 +169,7 @@ def _terminal_report_from_cleanup(
         cleanup_error=cleanup.error,
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
+        replayed_generation_id=replayed_generation_id,
     )
 
 
@@ -487,6 +494,7 @@ def _run_experiment_outcome(
                     primary_error=None,
                     failure_stage=None,
                     winners=result,
+                    replayed_generation_id=generation.replayed_generation_id,
                 )
             return MappingProxyType(dict(result))
         finally:
@@ -687,6 +695,7 @@ def _run_experiment_inner(
                 "the publication is unchanged and no new generation was written.",
                 published_id,
             )
+            generation.replayed_generation_id = published_id
             return winners
     generation_id = generation.claim()
     summary_path = path_ops._generation_summary_path(experiment, generation_id)

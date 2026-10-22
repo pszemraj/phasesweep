@@ -382,6 +382,7 @@ def capture_result_snapshot(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    trial_generation_id: str | None = None,
     engine_winners: Mapping[str, Winner] | None = None,
 ) -> dict[str, Any]:
     """Capture path-free status and winners for the requested generation.
@@ -395,7 +396,10 @@ def capture_result_snapshot(
     An absent post-commit lifecycle record is tolerated; mismatches are logged.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
-    :param str | None generation_id: Engine generation known to own the experiment lock.
+    :param str | None generation_id: Generation to represent: the engine generation that
+        owns the experiment lock, or the published generation a replay matched.
+    :param str | None trial_generation_id: Generation whose trials ``generation_trials``
+        counts when it differs from ``generation_id``; only with ``engine_winners``.
     :param Mapping[str, Winner] | None engine_winners: The engine's own
         winner mapping from its terminal report, when the run succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
@@ -411,7 +415,9 @@ def capture_result_snapshot(
                 generation_id,
             )
     if engine_winners is not None:
-        status = read_status(experiment, generation_id=generation_id)
+        status = read_status(
+            experiment, generation_id=generation_id, trial_generation_id=trial_generation_id
+        )
         # The engine's winners count even where the generation holds no winner file.
         for phase in status["phases"]:
             phase["winner_present"] = phase["phase"] in engine_winners
@@ -523,7 +529,8 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         for attempt, _generation_id in recovered:
             phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
-        # Generation counts belong to represented_generation_id.
+        # Generation counts belong to represented_generation_id: a run that launched a
+        # trial, and so can leave one RUNNING, represents its own generation.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt

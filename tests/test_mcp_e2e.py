@@ -466,6 +466,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         "published_generation_id": None,
         "represented_generation_id": "r1",
         "is_published": False,
+        "run_wrote_generation": True,
         "publication_integrity": "absent",
         "result_context": "current_config",
         "published_config_matches_current": True,
