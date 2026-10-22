@@ -501,24 +501,6 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
 
 # --------------------------------------------------------------------------
-# No failure path leaves the current pointer non-terminal.
-# --------------------------------------------------------------------------
-
-
-def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> None:
-    """An ordinary execution failure drives the current pointer to a terminal state."""
-    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
-    experiment = make_experiment(
-        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
-    )
-
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(experiment)
-
-    assert _current_pointer_state(experiment) in generation_ops._TERMINAL_GENERATION_STATES
-
-
-# --------------------------------------------------------------------------
 # The immutable record is write-once.
 # --------------------------------------------------------------------------
 
@@ -1813,8 +1795,8 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     assert published_generation_id(experiment) == generation_id
 
 
-def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) -> None:
-    """A generation that fails mid-run still records what configuration ran.
+def test_failed_generation_ends_terminal_and_retains_its_provenance_files(tmp_path: Path) -> None:
+    """A generation that fails mid-run ends terminal and still records what configuration ran.
 
     The files are written at claim time precisely so a post-mortem of a failed
     generation can name its search spaces and trial command.
@@ -1826,6 +1808,7 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
+    assert _current_pointer_state(experiment) in generation_ops._TERMINAL_GENERATION_STATES
 
     failed_generation = yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
     snapshot_path, repro_path = _provenance_paths(experiment, failed_generation)
