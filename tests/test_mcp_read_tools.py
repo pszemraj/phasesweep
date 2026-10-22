@@ -973,8 +973,9 @@ def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
     assert app.explain_config("phases.0.sampler") == {**sampler, "key": "phases.0.sampler"}
     first = sampler["entries"][0]
     assert set(first) == {"path", "signature", "section", "description"}
-    assert first["section"] == "Required experiment fields"
-    assert "\n" in first["description"]
+    assert first["section"] == "Phases"
+    assert "\n" in sampler["entries"][1]["description"]
+    assert [(group["kind"], group["name"]) for group in sampler["rules"]] == [("section", "Phases")]
 
     variants = app.explain_config("metric.extractor.path")
     assert {"metric.extractor[type=json].path", "metric.extractor[type=json_envelope].path"} <= {

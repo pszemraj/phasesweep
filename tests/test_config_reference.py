@@ -1,7 +1,7 @@
-"""Guard documented config paths/signatures and load the starting configurations.
+"""Guard documented config paths/signatures, the reference parser and the starting configurations.
 
-Every ``Conflicts with`` and ``Overrides`` line must have its counterpart on
-the key it names.
+Shared blocks are expanded before the comparison with the schema, so every key
+path a block covers is checked at each place that uses the block.
 """
 
 from __future__ import annotations
@@ -141,27 +141,31 @@ def _schema_inventory() -> dict[str, str]:
     return inventory
 
 
-def _reference_entries() -> dict[str, tuple[str, list[str]]]:
-    """Read the packaged reference and check every entry's description and signature shape.
-
-    :return dict[str, tuple[str, list[str]]]: Signature and comment lines per documented path,
-        keeping every discriminator alternative.
-    """
-    inventory: dict[str, tuple[str, list[str]]] = {}
-    for entry in reference_entries():
-        comments = list(entry.comments)
-        assert comments, f"Description missing at {entry.path}"
-        assert not comments[-1].startswith("Variant "), f"Description missing at {entry.path}"
-        assert re.search(r" = .+| \(required\)$| \(optional\)$", entry.signature), entry.path
-        if entry.signature.endswith(" (optional)"):
-            assert any(comment.startswith("Unset:") for comment in comments), entry.path
-        inventory[entry.path] = (entry.signature, comments)
-    return inventory
+_BLOCK_NAME = re.compile(r"\b[A-Z][A-Za-z0-9]*\b")
+_VARIANT_TYPE = re.compile(r"\[type=([^\]]+)\]\.type$")
 
 
 def _reference_inventory() -> dict[str, str]:
-    """Map each documented path, with its discriminator alternative, to its signature."""
-    return {path: signature for path, (signature, _) in _reference_entries().items()}
+    """Map each documented path, with its discriminator alternative, to its signature.
+
+    A signature that names shared blocks, such as ``JsonExtractor | WandbExtractor``, is
+    rewritten to the variant tags those blocks declare in their ``type`` field, which is how
+    the schema spells the union.
+
+    :return dict[str, str]: Signature per documented path, every shared block expanded.
+    """
+    entries = reference_entries()
+    tags = {
+        entry.blocks[-1]: match[1]
+        for entry in entries
+        if entry.blocks and (match := _VARIANT_TYPE.search(entry.path))
+    }
+    inventory: dict[str, str] = {}
+    for entry in entries:
+        assert entry.comments, f"Description missing at {entry.path}"
+        assert re.search(r" = .+| \(required\)$", entry.signature), entry.path
+        inventory[entry.path] = _BLOCK_NAME.sub(lambda name: tags[name[0]], entry.signature)
+    return inventory
 
 
 def test_reference_matches_every_config_path_variant_type_and_default() -> None:
@@ -173,103 +177,6 @@ def test_reference_matches_every_config_path_variant_type_and_default() -> None:
         "extra": sorted(actual.keys() - expected.keys()),
     }
     assert actual == expected
-
-
-_TAG = re.compile(r"(\[type=[^\]]+\])")
-
-
-def _plain_path_and_tags(path: str) -> tuple[str, dict[str, str]]:
-    """Split an inventory path into the path a user types and its variant tags.
-
-    :param str path: Inventory path such as ``phases[].gates[type=sha256].path``.
-    :return tuple[str, dict[str, str]]: The path without ``[type=...]`` markers,
-        and the variant tag chosen at each plain prefix along it.
-    """
-    plain = ""
-    tags: dict[str, str] = {}
-    for segment in _TAG.split(path):
-        if segment.startswith("[type="):
-            tags[plain] = segment[len("[type=") : -1]
-        else:
-            plain += segment
-    return plain, tags
-
-
-def _labeled_paths(path: str, comments: list[str], label: str, known: set[str]) -> set[str]:
-    """Return the key paths named by one entry's lines for a pairing label.
-
-    A labeled line is ``<label>: <path>[, <path>]...`` followed by nothing, a
-    parenthesis, or a semicolon and an explanation. Every listed item must be a
-    documented key path, so a line that breaks the convention fails loudly
-    instead of being skipped.
-
-    :param str path: Inventory path of the entry, for diagnostics.
-    :param list[str] comments: Comment lines above the entry.
-    :param str label: ``Conflicts with``, ``Overrides`` or ``Overridden by``.
-    :param set[str] known: Every documented path as a user types it.
-    :return set[str]: Plain paths named by the entry's lines for this label.
-    """
-    named: set[str] = set()
-    for comment in comments:
-        if not comment.startswith(f"{label}: "):
-            continue
-        head = re.split(r" \(|;", comment[len(label) + 2 :], maxsplit=1)[0].rstrip(".")
-        for item in (part.strip() for part in head.split(",")):
-            assert item in known, f"{path}: '{label}:' names {item!r}, not a documented key path"
-            named.add(item)
-    return named
-
-
-def test_conflict_and_override_labels_are_paired_on_both_keys() -> None:
-    """Fail when one side of a Conflicts with / Overrides / Overridden by pair is missing.
-
-    Each pairing label lists key paths first, then an optional explanation after
-    a parenthesis or semicolon. Where a path exists in several discriminator
-    variants, the counterpart is looked up in the variants that agree with the
-    labeled entry on every shared variant choice.
-    """
-    entries = _reference_entries()
-    parsed = {path: _plain_path_and_tags(path) for path in entries}
-    known = {plain for plain, _ in parsed.values()}
-    labels = ("Conflicts with", "Overrides", "Overridden by")
-    named = {
-        label: {
-            path: _labeled_paths(path, comments, label, known)
-            for path, (_, comments) in entries.items()
-        }
-        for label in labels
-    }
-    assert sum(len(targets) for targets in named["Conflicts with"].values()), "no Conflicts with"
-    assert sum(len(targets) for targets in named["Overrides"].values()), "no Overrides"
-
-    def counterparts(owner: str, target: str) -> list[str]:
-        """Return entries at ``target`` whose variant tags agree with ``owner``'s.
-
-        :param str owner: Inventory path of the entry that carries the label.
-        :param str target: Plain key path the label names.
-        :return list[str]: Inventory paths of the candidate counterparts.
-        """
-        owner_tags = parsed[owner][1]
-        return [
-            path
-            for path, (plain, tags) in parsed.items()
-            if plain == target and all(owner_tags.get(k, v) == v for k, v in tags.items())
-        ]
-
-    unpaired: list[str] = []
-    for label, reverse in (
-        ("Conflicts with", "Conflicts with"),
-        ("Overrides", "Overridden by"),
-        ("Overridden by", "Overrides"),
-    ):
-        for owner, targets in named[label].items():
-            for target in targets:
-                if not any(
-                    parsed[owner][0] in named[reverse][other]
-                    for other in counterparts(owner, target)
-                ):
-                    unpaired.append(f"{owner}: '{label}: {target}' lacks '{reverse}: ...' there")
-    assert not unpaired, unpaired
 
 
 def test_minimal_starting_example_loads_through_real_loader() -> None:
@@ -367,13 +274,17 @@ def test_reference_entries_record_their_section_and_are_immutable() -> None:
     entries = reference_entries()
     assert entries[0].path == "experiment"
     markers = re.findall(
-        r"^# -{10} (.+?) -{10}$",
+        r"^ *# -{10} (.+?) -{10}$",
         _reference_resource().read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    # Each marker heads one unbroken run of entries, in file order.
-    assert [section for section, _ in itertools.groupby(e.section for e in entries)] == markers
+    # Each marker, nested ones included, heads one unbroken run of entries, in file order.
+    # The last marker holds the shared blocks, whose fields take the section of each use site.
+    assert markers[-1] == "Shared blocks"
+    assert [section for section, _ in itertools.groupby(e.section for e in entries)] == markers[:-1]
     assert len(set(markers)) == len(markers) > 1
+    wandb_entity = "metric.extractor[type=wandb].entity"
+    assert {e.path: e.section for e in entries}[wandb_entity] == "Objective"
     by_path = {entry.path: entry for entry in entries}
     assert isinstance(by_path["trial_command"].comments, tuple)
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -391,7 +302,7 @@ def test_reference_parser_rejects_unrecognized_lines_and_duplicate_paths() -> No
 
 
 def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() -> None:
-    """The first header block is for maintainers, the block after its blank line is the notes."""
+    """The first header block is the title, the block after its blank line is the notes."""
     text = (
         "# about this file\n# parsed by x\n\n# note one\n# note two\n\n"
         "# ---------- First ----------\n\n# one\nname: string (required)\n"
@@ -549,14 +460,14 @@ def test_parser_rejects_malformed_blocks_and_comments_it_cannot_place(
         _parse(text)
 
 
-def test_packaged_reference_notes_are_neither_the_maintainer_block_nor_an_entry_comment() -> None:
-    """The packaged notes are the header's second block, apart from the first block and every entry."""
+def test_packaged_reference_notes_are_neither_the_title_block_nor_an_entry_comment() -> None:
+    """The packaged notes are the header's second block, apart from the title and every entry."""
     first_block = _reference_resource().read_text(encoding="utf-8").split("\n\n", 1)[0]
-    maintainer_lines = {line.removeprefix("#").strip() for line in first_block.splitlines()}
+    title_lines = {line.removeprefix("#").strip() for line in first_block.splitlines()}
     notes = set(reference_notes())
     assert notes
-    assert maintainer_lines
-    assert not notes & maintainer_lines
+    assert title_lines
+    assert not notes & title_lines
     assert not notes & {comment for entry in reference_entries() for comment in entry.comments}
 
 
@@ -626,6 +537,12 @@ def test_closest_suggests_the_documented_key_for_a_partial_or_misspelled_one() -
     assert closest("") == ()
     assert len(closest("type")) == 3
     assert all("[type=" not in suggestion for suggestion in closest("type"))
+    # Fields expanded from shared blocks are suggested at every place that uses the block.
+    assert set(closest("extractor.entiy")) >= {
+        "metric.extractor.entity",
+        "constraints[].extractor.entity",
+    }
+    assert "phases[].gates[].entity" in closest("gates.entiy")
 
 
 @pytest.mark.parametrize(
@@ -641,8 +558,35 @@ def test_closest_suggests_the_documented_key_for_a_partial_or_misspelled_one() -
         (("phases", 0, "gates"), [{"type": "sha256", "path": "a"}], "phases[].gates[].sha256"),
         (("execution",), {"inherit_env": 3}, "execution.inherit_env"),
         (("env",), {"A": 1}, "env"),
+        (
+            ("constraints",),
+            [{"name": "c", "max": 1, "extractor": {"type": "json", "path": "r.json", "key": 5}}],
+            "constraints[].extractor.key",
+        ),
+        (
+            ("phases", 0, "gates"),
+            [
+                {
+                    "type": "wandb_summary_required",
+                    "entity": "e",
+                    "project": "p",
+                    "keys": ["k"],
+                    "poll_seconds": "soon",
+                }
+            ],
+            "phases[].gates[].poll_seconds",
+        ),
     ],
-    ids=["sampler", "extractor-path", "search-bound", "gate-digest", "inherit-env", "env-value"],
+    ids=[
+        "sampler",
+        "extractor-path",
+        "search-bound",
+        "gate-digest",
+        "inherit-env",
+        "env-value",
+        "block-field",
+        "merged-block-field",
+    ],
 )
 def test_loc_to_path_maps_variant_and_search_key_segments(path, value, expected) -> None:
     """Indexes and variant tags drop out, and a user-chosen search key maps to ``<key>``."""

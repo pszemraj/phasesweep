@@ -2,12 +2,13 @@
 # Validate: phasesweep validate examples/example.yaml
 # Run from the checkout root: phasesweep run examples/example.yaml
 # Every accepted key and default is in src/phasesweep/config_reference.yaml.
-# This disposable study is sufficient to check the trainer boundary; choose
-# durable storage and meaningful provenance before planning resumable work.
+# storage is left at its null default, a disposable study that is enough to check the trainer boundary. Set storage and provenance before planning resumable work.
 experiment: first_trial
+# Replace with your trainer's command. {config_path} names the trainer_config.yaml PhaseSweep writes for each attempt.
 trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
 metric:
   extractor:
+    # The toy trainer reports eval_loss on its validation split under policy synthetic through report_objective(). Use the names your trainer reports.
     type: json_envelope
     objective_name: eval_loss
     split: validation

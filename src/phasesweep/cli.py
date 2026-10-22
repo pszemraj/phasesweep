@@ -24,6 +24,7 @@ from phasesweep.config.io import (
 )
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
+    ReferenceEntry,
     first_sentence,
     lookup_or_suggest,
     plain_path,
@@ -575,9 +576,9 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
         "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
         "descriptions that govern it, then that key and every key below it. "
         "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
-        "The broad phases key lists its immediate children; narrow it for full details. "
-        "With --notes, print the general notes on file paths, YAML typing and environment "
-        "variables instead."
+        "The broad phases key prints the rules over the phase list and its immediate "
+        "children; narrow it for full details. With --notes, print the general notes on the "
+        "config file, paths, YAML typing and the study fingerprint instead."
     ),
     short_help="Explain config keys.",
 )
@@ -585,13 +586,14 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 @click.option(
     "--notes",
     is_flag=True,
-    help="Print the general notes on file paths, YAML typing and environment variables.",
+    help="Print the general notes on the config file, paths, YAML typing and the study fingerprint.",
 )
 def explain(key: str | None, notes: bool) -> None:
     """Print the configuration reference for one key, list the top-level keys, or print its notes.
 
     A key prints the section rules and shared-block descriptions that govern its entries
-    first, then the entries themselves; the broad ``phases`` key prints a compact index.
+    first, then the entries themselves; the broad ``phases`` key prints the rules of its own
+    section and a compact index of its fields.
 
     :param str | None key: Config key in any spelling the reference accepts, or None to list
         the top-level keys.
@@ -618,23 +620,33 @@ def explain(key: str | None, notes: bool) -> None:
         click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
         raise click.exceptions.Exit(_USAGE_EXIT)
     if plain_path(key) == "phases":
+        # The compact index carries only the rules over the whole phase list.
+        _render_rules(entries[:1])
         for entry in entries:
             if plain_path(entry.path).count(".") == 1:
                 click.echo(f"{entry.path}: {entry.signature}")
                 click.echo(f"  {first_sentence(entry, _SUMMARY_WIDTH)}")
         click.echo("Narrow with a key: phasesweep explain 'phases[].search_space'")
         return
-    for rules in rules_for(entries):
-        click.echo(f"{rules.title}:")
-        for line in rules.lines:
-            click.echo(f"  {line}")
-        click.echo()
+    _render_rules(entries)
     for index, entry in enumerate(entries):
         if index:
             click.echo()
         click.echo(f"{entry.path}: {entry.signature}")
         for line in entry.comments:
             click.echo(f"  {line}")
+
+
+def _render_rules(entries: Sequence[ReferenceEntry]) -> None:
+    """Print the section rules and shared-block descriptions that govern some entries.
+
+    :param Sequence[ReferenceEntry] entries: Entries about to be printed, in file order.
+    """
+    for rules in rules_for(entries):
+        click.echo(f"{rules.title}:")
+        for line in rules.lines:
+            click.echo(f"  {line}")
+        click.echo()
 
 
 def _render_reference_index() -> None:
@@ -657,7 +669,7 @@ def _render_reference_index() -> None:
     click.echo()
     click.echo("Narrow with a key, for example: phasesweep explain 'phases[].sampler'")
     click.echo(
-        "General notes on file paths, YAML typing and environment variables: "
+        "General notes on the config file, paths, YAML typing and the study fingerprint: "
         "phasesweep explain --notes"
     )
 

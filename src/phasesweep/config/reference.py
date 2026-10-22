@@ -405,7 +405,7 @@ def _parse_notes(text: str) -> tuple[str, ...]:
 
 @functools.cache
 def reference_notes() -> tuple[str, ...]:
-    """Return the packaged reference's general notes on paths, YAML typing and environment.
+    """Return the packaged reference's general notes on the config file, paths and YAML typing.
 
     :raises ValueError: If the packaged reference header has no notes block.
     :return tuple[str, ...]: The notes, one line each, in file order.

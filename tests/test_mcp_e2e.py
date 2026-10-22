@@ -602,6 +602,7 @@ def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Pa
     assert [entry["path"] for entry in found.structuredContent["entries"]] == [
         "phases[].sampler.type"
     ]
+    assert [group["name"] for group in found.structuredContent["rules"]] == ["Phases"]
     assert str(tmp_path) not in json.dumps(found.structuredContent)
 
     top_level = call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, {})

@@ -1,1179 +1,636 @@
-# PhaseSweep config_reference.yaml: every key the experiment YAML accepts, in signature form (key: type = default).
-# This file does not load as YAML. Start from examples/example.yaml, which does.
-# It ships inside the package as phasesweep/config_reference.yaml and is parsed by phasesweep.config.reference. It is maintained by hand. tests/test_config_reference.py compares every key path, variant, type and default with the schema.
-# That test also requires a description on every key, an Unset: line on every (optional) key, and a counterpart for every Conflicts with:, Overrides: and Overridden by: line.
-# It does not check the prose, so bounds, units and interactions are only as current as their last review against the code.
-# The comment block after the next blank line is the general notes that phasesweep explain --notes prints and the MCP explain_config tool returns without a key. Keep it to what someone writing a config needs, and put anything about this file itself in this block.
+# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from examples/example.yaml.
 
-# Config file: phasesweep run, validate, status, show-winners and sync-tracking each take the file as their CONFIG argument, and phasesweep mcp init-catalog reads one through --from. No default file is searched.
-# The path must name an existing file, not a directory.
-# Sources: YAML values override the defaults below. For run only, repeatable --set KEY=VALUE assignments override YAML values before validation; --workdir PATH takes precedence over a --set workdir=... assignment. No environment variable maps to a key.
-# --set takes a YAML value and a KEY of dot-separated names, list positions and bracketed selectors, as in env.NOTE, phases.0.n_trials, phases[NAME].n_trials or phases[NAME].search_space[model.n_layers].choices; docs/config.md, under Run-time overrides, has the full key syntax and its escapes. Missing mapping keys are created, and a validation error at one names the --set that created it. Later assignments win. The source file stays unchanged; the derived configuration is validated and recorded in the run snapshot. --workdir resolves against the shell directory; paths in --set resolve against the config directory. An explicit storage journal needs its own override for a derived run.
-# phasesweep run flags --from-phase, --dry-run and --verbose choose what to execute or print.
-# --from-phase PHASE must name a configured phase. Earlier ancestors of the remaining phases need published winners whose fingerprints match the current config and whose evidence is intact, or the run and dry run fail. Unrelated earlier phases need no winner, but a winner one of them has published is checked and carried like an ancestor's.
-# The file is read once per invocation. Editing it later does not change work that has already started.
-# The MCP server rereads its catalog and every config it lists before the next tool call after one of them changes, so an edit applies without a restart. An edit that fails validation keeps reads on the last valid config and refuses launches until it is fixed. The detached runner loads a copy of the verified bytes.
-# The file must be UTF-8 text whose top level is one mapping. That mapping describes one experiment.
-# A string whose escapes produce text that is not valid UTF-8, such as "\ud800", fails config load.
-# Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
-# trainer_config, fixed_overrides, search_space, provenance and env are maps with user-chosen keys.
-# fixed_overrides and search_space keys and phases[].repeats.key must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.
-# Paths: a relative workdir, journal path in storage, or execution.cwd resolves against the directory of this config file (after symlinks to the file are resolved), not the directory phasesweep is started from, so the CLI and MCP resolve it identically. A leading ~ is expanded in all three, and symlinks are resolved.
-# Under MCP an omitted execution.cwd becomes the catalog entry's cwd, which defaults to the config file's directory.
-# Trial-relative paths (extractor and gate path and file values) resolve inside the attempt directory.
-# There is no variable interpolation in the YAML. trial_command is a Python format string, so write a shell variable as $VAR or ${{VAR}}. ${VAR} fails config load as an unknown placeholder.
-# YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, while 1.0e-3, 0.001 and 1.0e+3 load as floats. Quote anything meant to stay a string.
-# Schema numeric fields also accept numeric strings and reject booleans, so low: 1e-5 in a search_space bound is read as the float 1e-05.
-# Values passed through unchanged to the trainer (trainer_config, fixed_overrides, categorical choices) keep their YAML type, so a bare 1e-3 there reaches the trainer as a string.
-# env and provenance values must be YAML strings. An unquoted number or boolean in either map fails config load.
-# Each list or object variant below is an alternative selected by its type. Do not combine keys from two variants.
-# A block that appears more than once, such as the extractor variants under metric.extractor, constraints[].extractor and observe[].extractor, is documented in full each time.
-# <key> in a path stands for any valid dotted override name. optimizer.lr illustrates it under phases[].search_space.
-# Conflicts with:, Overrides: and Overridden by: lines start with the full dotted paths of the other keys, separated by commas, and put any explanation after a parenthesis or a semicolon.
-# Environment variables PhaseSweep itself reads outside the YAML, in a plain phasesweep run: the ambient environment (the base of the trainer environment, filtered by execution.inherit_env), PHASESWEEP_LOCK_DIR, HOME, PATH and CUDA_VISIBLE_DEVICES.
-# CUDA_VISIBLE_DEVICES is read for GPU pool discovery, PATH to find the supervisor interpreter, and HOME for ~ expansion.
-# PHASESWEEP_LOCK_DIR selects the host-lock directory that every run uses. It must name an existing absolute directory that is safe to share. It is never created or changed. By default locks live under .cache/phasesweep/locks in the OS account home, independent of HOME and XDG variables.
-# XDG_CACHE_HOME affects only the W&B and MLflow worker processes. It must be absolute to be honored. Their scratch files go under <XDG_CACHE_HOME or ~/.cache>/phasesweep.
-# PHASESWEEP_HOME and XDG_STATE_HOME affect only the default state directory that phasesweep mcp init-catalog writes. PHASESWEEP_HOME must be an absolute path with no symlink in it; a missing directory is created with mode 0700, and an existing one must already have mode 0700.
-# Trainer cache paths, model and data downloads, training cadence and hardware use are the external trainer's responsibility.
-# The MCP catalog is a separate configuration surface: see docs/mcp.md for its fields and examples/catalog.yaml for a starting catalog.
-# Publication, cleanup and recovery are engine behavior, not YAML blocks. State written by another format version is refused.
+# Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
+# The MCP server rereads an edited config before its next tool call. A failed reread keeps reads on the last valid config and refuses launches until fixed.
+# Precedence, lowest to highest: built-in defaults, the YAML, then run --set KEY=VALUE (docs/config.md#run-time-overrides). No environment variable sets a key.
+# The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
+# Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
+# Trial paths (extractor path and file, gate path) are relative to the attempt directory, nonempty, without NUL or .. segments, and name a file below it.
+# JSON evidence is parsed strictly: duplicate names or NaN and Infinity tokens invalidate the file. A JSON key is a dotted path of nonempty object keys.
+# YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, 1.0e-3, 0.001 and 1.0e+3 as floats.
+# Numeric keys accept numeric strings, reject booleans and must be finite. Bounds are inclusive, and a lower bound may not exceed its upper bound.
+# Values passed to the trainer unchanged (trainer_config, fixed_overrides, choices, repeats.values) keep their YAML type, so quote what must stay a string.
+# Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
+# Also outside it: execution.record_env, mlflow.poll_seconds, mlflow.timeout_seconds and the run-control keys listed under Phases.
+# Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
+# Environment variables PhaseSweep reads: docs/runtime.md#environment-variables. The MCP catalog is a separate file: docs/mcp.md#the-catalog.
 
-# ---------- Required experiment fields ----------
+# ---------- Experiment ----------
 
-# Name of the experiment: nonempty, only the characters A-Z a-z 0-9 _ and -, for example bart_search.
-# It is a directory name under workdir and part of every study and lock name (<experiment>::<phase>), which is why the characters are restricted.
-# Warning: renaming an experiment starts new studies and a new artifact directory. Results recorded under the old name are not reused.
+# Name of the experiment, for example bart_search: nonempty, with only the characters A-Z a-z 0-9 _ and -.
+# It names the artifact directory under workdir and every study, <experiment>::<phase>, and it keys the experiment lock.
+# Warning: renaming starts new studies and a new artifact directory, and results recorded under the old name are not reused.
 experiment: string (required)
 
-# Shell command template that runs one trainer attempt, for example: python train.py --config {config_path}
-# It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset, or the catalog entry's cwd under MCP), with the composed trainer environment. By default that is a minimal base plus env, not the shell's environment; see execution.inherit_env.
-# Its stdout and stderr are written to stdout.log and stderr.log in the attempt directory. Both files are truncated at the start of each attempt.
-# The trainer must exit 0. A nonzero exit code fails the attempt before any evidence is read. The failure reason in run.log and trials.csv is non-zero exit code N followed by the last non-empty line of stderr.log, up to 200 characters, when the file has one.
-# Each attempt directory also holds command.txt (the rendered command), overrides_resolved.json (the flat copy of the overrides, with sorted keys; under argparse and hydra it also carries trainer_config's flattened leaves and is the trainer input), and the trainer input file that override_format selects.
-# execution.record_env true adds environment.json to that list.
-# Supported placeholders: {config_path}, {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}.
-# Unknown placeholders and malformed braces fail config load. {{ and }} write literal braces.
-# A placeholder with attribute or index access, such as {trial_dir.name} or {trial_dir[0]}, fails config load too, including inside a format spec. Use the bare placeholder.
-# {config_path}, {overrides_path}, {trial_dir}, {phase} and {run_name} are shell-quoted by PhaseSweep, so do not wrap them in your own quotes.
-# {trial_dir} is the absolute path <workdir>/<experiment>/<phase>/trial_<trial number zero-padded to 5 digits>__generation_<generation id>__attempt_<attempt id>.
-# {trial_id} is the phase-local Optuna trial number, and {run_name} is <experiment>-<phase>-<trial_id>-<attempt_id> with the immutable attempt ID.
-# Requires: override_format selects the trainer-input placeholder; yaml_file needs {config_path} and rejects {overrides} and {overrides_path}.
-# Requires: argparse and hydra need {overrides} and reject {config_path} and {overrides_path}; json_file needs {overrides_path} and rejects {config_path} and {overrides}.
-# Requires: for argparse, hydra and json_file the placeholder is needed only when the phase has at least one inherited, fixed or sampled override or the experiment has a nonempty trainer_config.
-# A placeholder that does not match override_format fails config load.
-# Recommended: set execution.cwd (execution.cwd: . for the config file's directory) or use absolute paths for the interpreter and script, so the command does not depend on the directory phasesweep was started from. The command itself is not a path field and is never rewritten.
+# Shell command template that runs one trainer attempt under /bin/sh -c in execution.cwd, with the trainer environment rather than the shell's. It must exit 0.
+# {trial_dir} is the absolute attempt directory, {trial_id} the phase's trial number, {phase} its name, {run_name} <experiment>-<phase>-<trial_id>-<attempt ID>.
+# {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
+# PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
+# An unknown placeholder, attribute or index access such as {trial_dir.name}, or an unbalanced brace fails config load.
 trial_command: string (required)
 
-# Primary objective: the finite scalar each trial reports and how trials are ranked.
-# PhaseSweep does no pruning, evaluation scheduling or checkpoint selection.
-# The whole block is part of the study fingerprint, so changing it stops a populated study from being reused.
-# Requires: metric.name, constraints[].name and observe[].name must all be distinct; duplicate names fail config load.
-# Selection records three advisory confound verdicts on the winner: evaluation_point, survivorship and tie. They cannot be disabled or tuned and never block selection or publication.
-# evaluation_point is flagged when the lowest ranked position on the evaluation axis is more than 1% short of the furthest.
-# survivorship is flagged when failed trials are at least max(1, ranked trials). Interrupted trials are not counted, because their reruns stand in for them, and neither is a failed attempt that a completed grid-cell retry replaced. Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
-# tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters. With phases[].repeats it compares complete groups: it is also flagged when another group's reduced value lies within two standard errors of the winning group's (within_noise), a heuristic rather than a significance test.
-# A verdict of n/a means not checked. evaluation_point is n/a when fewer than two trials were ranked, and tie when fewer than two trials, or with repeats fewer than two groups, were ranked.
-# evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
-# evaluation_point is also n/a when no position was recorded (for example a W&B history position that was unavailable), and when ranked trials have unreadable provenance.
-# A phase whose search space changes training length (for example epochs or max_steps) flags evaluation_point by design. Otherwise a flag means the trials were not trained to one budget. To check such a phase, report progress={"schedule_fraction": actual_steps / planned_steps} through report_objective and set metric.extractor.evaluation_axis to schedule_fraction on a json_envelope metric.
+# ---------- Objective ----------
+# A read by metric.extractor that fails, or that yields a value that is not a finite number, fails the trial.
+# Warning: under Transformers load_best_model_at_end=True, a wandb or mlflow position cannot show which checkpoint was scored. Use json_envelope then.
+# validate and run --dry-run warn when trainer_config, fixed_overrides or trial_command enables it under a wandb or mlflow metric.extractor.
+
+# Primary objective: the scalar each trial reports and how trials rank. PhaseSweep does no pruning, evaluation scheduling or checkpoint selection.
+# Selection records advisory confound verdicts on the winner, which never block selection or publication.
+# See: docs/runtime.md#confound-verdicts
 metric: object (required)
-  # Name the objective is published under, for example validation_loss.
-  # goal is reserved and rejected. No other restriction is validated.
-  # Requires: constraints[].name and observe[].name values must all be distinct from metric.name.
+  # Name the objective is published under, for example validation_loss. The name goal is reserved.
+  # Requires: distinct from every constraints[].name and observe[].name, which are distinct from each other too.
   name: string = "objective"
 
-  # Direction used to rank the per-trial scalar across trials: minimize selects the smallest, maximize the largest.
-  # It also sets the direction the Optuna sampler optimizes, and a stored persistent study with a different direction is rejected.
-  # It does not change metric.extractor.select (log_regex, mlflow), which only chooses within one trial.
-  # Exact ties select the feasible candidate with the lowest draw position, which outside reruns of interrupted trials is the lowest Optuna trial number.
+  # Direction in which trials rank and the sampler optimizes: minimize prefers the smallest value. A persistent study stored with the other direction is refused.
+  # It never changes select on a log_regex or mlflow extractor, which chooses within one trial.
   goal: "minimize" | "maximize" = "minimize"
 
-  # Scalar source, selected by type. Each variant below replaces this one object; do not combine their keys.
-  # Every accepted objective must be a finite number.
-  # Requires: the mlflow variant needs the top-level mlflow block, and the wandb variant cannot coexist with that block.
-  extractor: json | json_envelope | log_regex | mlflow | wandb (required)
-    # Variant json; selected by type: json.
-    # Read one number from a JSON file in the attempt directory.
-    # The file must be strict JSON. Duplicate member names, or NaN, Infinity or -Infinity tokens anywhere in the file, invalidate the whole file.
-    # The value must be a JSON number: a boolean, string or container fails the trial, and so does a number that converts to a non-finite float, such as 1e999.
-    # It records no evaluation position, so the evaluation_point confound check is always n/a for it. Use json_envelope, wandb or mlflow when the comparison needs one.
-    type: "json" (required)
+  # Where the objective value is read from, selected by type.
+  extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | MlflowExtractor | WandbExtractor (required)
 
-    # Path of the JSON file relative to the attempt directory, for example result.json.
-    # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-    # The trainer must write it inside its own attempt directory, which it finds through the {trial_dir} placeholder or the PHASESWEEP_TRIAL_DIR environment variable.
-    path: string (required)
-
-    # Dotted path of object keys to the number, for example eval.loss. Every segment must be nonempty.
-    # Each segment is looked up as an object key only. List indexes are not supported and a key that itself contains a dot cannot be addressed.
-    key: string (required)
-
-    # Variant json_envelope; selected by type: json_envelope.
-    # Read an attempt-bound result envelope that the trainer writes with phasesweep.report_objective() or the phasesweep report-objective command.
-    # The envelope must report schema_version 1, status "complete", and the generation ID, attempt ID and overrides_sha256 that PhaseSweep gave this attempt. Any mismatch fails the trial.
-    # overrides_sha256 is the SHA-256 of the trainer input file generated for this attempt, not a hash of the envelope.
-    # The envelope must also report a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite numeric objective.value. Extra top-level keys are allowed.
-    type: "json_envelope" (required)
-
-    # Path of the envelope file relative to the attempt directory, for example result.json.
-    # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-    # The default result.json is the file report_objective() writes: PhaseSweep exports its full path as PHASESWEEP_OBJECTIVE_PATH, but only when the metric extractor is json_envelope.
-    path: string = "result.json"
-
-    # Exact objective.name the envelope must report, for example eval_loss. Must be nonempty. A mismatch fails the trial.
-    objective_name: string (required)
-
-    # Exact objective.split the envelope must report, for example validation. Must be nonempty. A mismatch fails the trial.
-    split: string (required)
-
-    # Exact evaluation.policy the envelope must report, for example final or best. Must be nonempty. A mismatch fails the trial.
-    # This validates the reported metadata only. It does not select a checkpoint.
-    policy: string (required)
-
-    # Exact evaluation.checkpoint identity the envelope must report. Must be nonempty. It never loads weights.
-    # Unset: any nonempty checkpoint identity the trainer reports is accepted.
-    checkpoint: string | null = null
-
-    # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
-    # Unset: any nonnegative step the trainer reports is accepted.
-    expected_step: int | null = null
-
-    # Progress axis the sweep holds fixed, which the evaluation_point confound check compares across ranked trials. Must be nonempty.
-    # step reads the envelope's evaluation.step. Any other name, for example tokens, is read from evaluation.progress and must be reported with report_objective(progress={name: value}).
-    # The name step is reserved for the envelope's own step, and a reported position must be a finite number >= 0.
-    # A missing or invalid position on a custom axis makes the envelope invalid and fails the trial. It does not merely make the confound check unavailable.
-    # Only used when: this is metric.extractor. A constraints[].extractor must leave it at step or config load fails.
-    # Recommended: choose the axis the comparison holds fixed, such as tokens for a fixed-token sweep, and report every trial's position on it.
-    evaluation_axis: string = "step"
-
-    # Variant log_regex; selected by type: log_regex.
-    # Extract numbers from a log file in the attempt directory with a regular expression.
-    # A missing file, a file that is not valid UTF-8, or no numeric match fails the trial. A selected non-finite value also fails it.
-    type: "log_regex" (required)
-
-    # Log file relative to the attempt directory, for example stdout.log.
-    # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-    # stdout.log and stderr.log are written automatically and are separate files. Python logging writes to stderr by default, so a metric logged that way needs stderr.log.
-    file: string = "stdout.log"
-
-    # Python regular expression with a named group (?P<value>...) that captures the number, for example eval_loss=(?P<value>[0-9.eE+-]+).
-    # An invalid expression, or one without a group named value, fails config load.
-    # The file is split into lines at \n, \r\n and bare \r, and the expression is searched in each line separately, so a match cannot span lines. Every non-overlapping match in a line is one observation.
-    # Python's default flags apply and inline flags such as (?i) work.
-    # Captures that float() cannot parse are skipped. float() also accepts nan, inf and 1_0, so a loose capture can yield a non-finite value.
-    pattern: string (required)
-
-    # Which observation within this trial is the objective: last or first by position in the file, min or max by value (the first of equal extremes).
-    # first stops matching at the first numeric match but still reads the rest of the file for its evidence digest.
-    # metric.goal ranks the selected per-trial values across trials and does not change this selector.
-    # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, while a NaN seen after a number is ignored.
-    select: "last" | "first" | "min" | "max" = "last"
-
-    # Variant mlflow; selected by type: mlflow.
-    # Read the native unscoped metric history of the attempt's MLflow run once the run has finished.
-    # Requires: the top-level mlflow block, and no W&B extractor or gate anywhere in the config.
-    # Model-scoped and dataset-scoped metric observations are unsupported and fail the trial.
-    type: "mlflow" (required)
-
-    # Exact native metric name, for example eval_loss or eval/loss. Must be nonempty. Use the name the trainer actually logs, including slashes and underscores.
-    # Aliases, summary fallbacks and fuzzy matching are not provided.
-    # A metric missing from a finished run fails the trial at once, naming the metric and listing the metric keys the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
-    metric_key: string (required)
-
-    # Which observation of the metric history is the objective. Required, with no default.
-    # last takes the greatest step, then the latest timestamp. min and max take the extreme value, with the earliest step and then the earliest timestamp on ties.
-    # step takes the latest timestamp at the exact step given in metric.extractor.step.
-    # The selected point must be finite. min and max reject a history that contains any non-finite value. Conflicting values at one step and timestamp fail the trial.
-    # The step of the selected point is the objective's position for the evaluation_point confound check. MLflow has no evaluation_axis.
-    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config, phases[].fixed_overrides or trial_command sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
-    # metric.goal only ranks the selected values across trials and never supplies this selector.
-    # Requires: metric.extractor.step is set exactly when select is step; any other pairing fails config load.
-    select: "last" | "min" | "max" | "step" (required)
-
-    # Exact history step to read, an integer >= 0, in the units of the trainer's logged step counter.
-    # Requires: metric.extractor.select step needs this value, and setting it with last, min or max fails config load.
-    # Unset: no exact-step request.
-    step: int | null = null
-
-    # Variant wandb; selected by type: wandb.
-    # Read one scalar from the finished summary of the W&B run PhaseSweep manages for this attempt, never another run.
-    # PhaseSweep sets WANDB_RUN_ID to the attempt ID, so the run read is <entity>/<project>/<attempt ID>. The trainer must log to that run, must not choose its own run id, and must finish the run.
-    # Requires the phasesweep[wandb] extra in the controller environment.
-    # A run that has not finished is polled until timeout_seconds runs out. Failed, crashed, killed and preempted runs fail the trial at once and cannot win.
-    type: "wandb" (required)
-
-    # W&B API endpoint, with an http or https scheme and a host. Credentials, a query and a fragment are rejected.
-    # The scheme and host are lowercased and trailing slashes are stripped from the path.
-    # Requires: within each phase, its wandb_summary_required gates and the experiment-level wandb metric and constraint extractors agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load.
-    # Requires: no mlflow block anywhere in the config.
-    base_url: string = "https://api.wandb.ai"
-
-    # W&B account or team name, for example research-team. Must be nonempty and contain no slash or whitespace.
-    # Requires: all W&B consumers in a phase agree on the target and polling fields. The credentials in the composed trainer environment must be able to read this entity.
-    entity: string (required)
-
-    # W&B project name, for example bart-search. Must be nonempty and contain no slash or whitespace.
-    # Requires: all W&B consumers in a phase agree on the target and polling fields.
-    # Requires: the trainer honors the managed WANDB_ENTITY, WANDB_PROJECT, WANDB_BASE_URL and WANDB_RUN_ID, keeps WANDB_RESUME at never, and finishes its run.
-    project: string (required)
-
-    # Seconds between polls of the run state and summary. Finite and greater than 0; infinity and NaN fail config load.
-    # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
-    # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-    poll_seconds: float = 2.0
-
-    # Seconds one attempt may spend reading W&B evidence, at least 1. Finite; infinity and NaN fail config load.
-    # The budget is absolute for the attempt. It includes worker startup, SDK calls and polling, and all W&B consumers of the attempt share it. The remaining phase and run budget also caps it.
-    # An accepted objective's history-position lookup gets its own bounded wait of at most 30 seconds, still capped by the phase and run deadlines.
-    # Expiry fails the trial, or the gate.
-    # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
-    # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-    timeout_seconds: float = 120.0
-
-    # Exact key in the run's finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate. Must be nonempty.
-    # A bare key does not stand in for its aggregate suffix, and the value must be a finite number.
-    # Warning: a numeric key missing from the finished summary is polled for 30 more seconds and then fails the trial with the missing and available keys named, so a misspelled key costs about that long on every trial.
-    # Requires: metric.extractor.evaluation_axis names neither this key nor, for a dotted key, the text before its last dot.
-    metric_key: string (required)
-
-    # History key logged alongside metric_key that marks where the objective was measured, for example eval/step or tokens. Must be nonempty.
-    # _step is W&B's own history step. Log the axis in the same log() call as the metric.
-    # For an aggregate summary key the position is read at the end of the history series.
-    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config, phases[].fixed_overrides or trial_command sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
-    # Only used when: this is metric.extractor. A constraints[].extractor must leave it at _step or config load fails.
-    # The position lookup is advisory after the objective is accepted. Missing or delayed history can leave no position while the scalar is kept, and the evaluation_point check is then n/a.
-    # Requires: not equal to metric_key or to the text before its last dot; otherwise config load fails.
-    evaluation_axis: string = "_step"
-
-  # Inclusive viability ceiling on the metric value, finite, in the metric's units. A larger value makes the attempt infeasible.
-  # An infeasible attempt finishes with its real value, so the sampler still learns from it, but it cannot win. It counts toward phases[].max_consecutive_failures and as infeasible in the survivorship verdict.
-  # Selection re-checks the bound from the stored value. When no attempt is eligible, the error names the bound or bounds and the best value among COMPLETE and INFEASIBLE attempts with its trial number.
-  # Requires: min at most max when both are set, and both finite; config load fails otherwise.
-  # Unset: no upper bound.
+  # Viability ceiling in the metric's units: a larger value makes the attempt infeasible. It keeps its real value for the sampler but cannot win.
+  # Use a bound to refuse a degenerate score, such as a loss of exactly 0 from a leaked evaluation set. It never ranks or steers the search.
+  # Warning: an infeasible attempt counts toward phases[].max_consecutive_failures, so a bound inside the ordinary spread can abort the phase.
   max: float | null = null
 
-  # Inclusive viability floor on the metric value, finite, in the metric's units. A smaller value makes the attempt infeasible, with the same consequences as max.
-  # Use a bound to refuse a degenerate score, such as a loss of exactly 0 from a leaked evaluation set. It never ranks and does not steer the search.
-  # Requires: min at most max when both are set, and both finite; config load fails otherwise.
-  # Unset: no lower bound.
+  # Viability floor in the metric's units: a smaller value makes the attempt infeasible, with the same consequences as metric.max.
   min: float | null = null
 
-# Ordered list of phase objects; at least one is required. Values below describe one item.
-# Phases run strictly in declared order. A failed phase ends the run, and no later phase starts.
-# Warning: inherits transfers override values, never model weights or checkpoints. The trainer must load a checkpoint explicitly if that is intended.
+# ---------- Phases ----------
+# Phases run in declared order, and a failed phase ends the run before later phases start.
+# Which value a trainer key gets, lowest to highest: trainer_config, an inherited value, then the phase's own fixed_overrides, search_space or repeats.key.
+# A key may appear in one of fixed_overrides, search_space and repeats.key only, and no key across them and inherited keys may be a dotted prefix of another.
+# A key parents export with different origins must be fixed in fixed_overrides or be repeats.key. A key an inherited phase sampled cannot be searched again.
+# With sampler.type grid, n_trials is at least the grid size, the search_space combinations times the repeat values, unless allow_partial_grid is true.
+# On storage null a grid's n_trials is at most the grid size, and a fixed configuration (empty search_space, no repeats) needs n_trials 1.
+# With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
+# On persistent storage, launch and dry run refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
+# Run-control keys, outside the fingerprint: n_trials, comment, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
+# See: docs/config.md#phase-composition
+
+# Ordered list of phase objects, at least one.
 phases: list[object] (required)
-  # Phase identity: nonempty, only the characters A-Z a-z 0-9 _ and -, for example learning_rate.
-  # Names must be unique when compared case-insensitively.
-  # attempts, generations and tracking, in any letter case, are reserved.
-  # Requires: a phase can be named in phases[].inherits only by a phase declared after it.
-  # Renaming a phase starts a new study (<experiment>::<phase>).
+  # Phase name, for example learning_rate: nonempty, with only A-Z a-z 0-9 _ and -, unique ignoring case, and not attempts, generations or tracking in any case.
+  # Warning: renaming a phase starts a new study, <experiment>::<phase>.
   - name: string (required)
 
-    # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it ended COMPLETE, INFEASIBLE or FAIL.
-    # Failed and infeasible attempts consume the target, not only successes. If no feasible result is eligible the phase fails.
-    # An interrupted attempt (phase or run deadline, host shutdown, a phase abort before its trainer launched, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
-    # Running the same config again on persistent storage re-ranks the stored trials when the target is already reached, and publishes only when the winners differ from the published ones or nothing is published.
-    # Raising the target on persistent storage runs the remaining attempts in the same study.
-    # With storage null every invocation is a fresh in-memory study and runs the whole target again.
-    # A persistent phase cannot lower its target below the one it already accepted; the refusal names the target to set.
-    # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
-    # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
-    # A fixed configuration keeps at most one COMPLETE or INFEASIBLE result. On persistent storage a failed trial, including one stopped by timeout_seconds_per_trial, still counts toward n_trials, so running the same config again replays the failure, while an interrupted one reruns by itself. Raising n_trials by one per failed attempt retries it, under any sampler, and never once an attempt ended COMPLETE or INFEASIBLE.
-    # Warning: validate and the dry run print a warning when a fixed configuration has n_trials above 1, because only a launch can say whether the extra trials are retries. A launch and the dry run, which reads the recorded attempts, refuse a larger target before any phase runs.
-    # Raising it also recovers a phase that stopped on a durable abort or on an accepted partial timeout. Repeating the same target preserves that decision. A persistent grid, including phases[].repeats and a grid seed audit, can exceed its matrix size to retry failed cells; each cell with a COMPLETE or INFEASIBLE trial is closed. A failed retry stays spent and needs another raised target. A grid or fixed configuration that aborted with no failed attempt left to retry, because every attempt it ran was INFEASIBLE, has no target that retries it. Its abort message names the target that retries every failed cell and, while trials remain unrun, the phases[].max_consecutive_failures that runs them; when every cell was measured and none is feasible it says nothing can continue.
-    # Excluded from the study fingerprint.
-    # Requires: with phases[].sampler.type grid and a nonempty phases[].search_space or phases[].repeats, n_trials is at least the grid size unless phases[].allow_partial_grid is true. On storage null it never exceeds the grid size; config load fails otherwise. On persistent storage a launch and the dry run refuse targets above finished attempts plus cells without a COMPLETE or INFEASIBLE result. Targets up to the matrix size explore cells; targets above it retry failed cells before new draws, once per cell within the remaining target. A fixed configuration consults no sampler, so grid does not bound it.
-    # Requires: with phases[].repeats, n_trials covers every repeat of every configuration: the number of values for an empty search_space under random, a multiple of it under seeded random with a search_space, and at least the grid size (configurations times values) under persistent grid. Extra grid attempts follow the failed-cell rule above. Config load fails otherwise.
-    # Requires: with an empty phases[].search_space, no phases[].repeats and storage null, n_trials is 1, because every invocation is a fresh study that retries nothing. Use phases[].repeats to run one configuration several times. Config load fails otherwise.
-    # Requires: with an empty phases[].search_space and no phases[].repeats on persistent storage, n_trials is at most one more than the failed attempts the study holds, and at most the attempts it holds once one ended COMPLETE or INFEASIBLE. A launch and the dry run fail otherwise; config load does not.
+    # Target number of finished attempts, an integer >= 1. COMPLETE, INFEASIBLE and FAIL attempts count, and interrupted ones do not.
+    # When the target is reached with no eligible feasible attempt, the phase fails.
+    # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
+    # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Use a new experiment name then.
+    # See: docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
-    # Free-text design note for the phase, for example why this search space and what is being tested.
-    # validate prints the current note. show-winners prints the note stored with the published generation, which can be older than the file.
-    # Excluded from the study fingerprint, so editing it never invalidates a study.
-    # Unset: no note is shown.
+    # Free-text note on the phase. validate prints the current note, and show-winners the one stored with the published generation.
     comment: string | null = null
 
-    # Names of earlier phases whose complete effective overrides become fixed inputs of this phase. Nothing is inherited unless it is listed here, not even from the previous phase.
-    # A parent's effective overrides are all of its inherited, fixed and sampled keys with the winning values. trainer_config is not inherited.
-    # A value that was inherited through several phases keeps the phase that produced it as its origin.
-    # The parent winners are part of this phase's study fingerprint, so a changed parent winner stops a populated child study from being reused.
-    # Overrides: trainer_config (an inherited value replaces the base value at the same dotted path).
-    # Overridden by: phases[].fixed_overrides (a key fixed in this phase replaces the inherited value and becomes the key's new origin).
-    # Overridden by: phases[].search_space (a key that every inherited origin only fixed may be searched here, and the sampled value replaces the inherited one; a key an inherited phase sampled cannot be searched again, and config load fails).
-    # Overridden by: phases[].repeats.key (the repeat value replaces any inherited value at that key, sampled or fixed, and this phase's winner exports neither).
-    # Requires: one key inherited from parents with different origins must be fixed explicitly in phases[].fixed_overrides, unless it is the repeat key; several parents with the same origin are accepted. Config load fails otherwise.
-    # Requires: an inherited key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
-    # Warning: weights and checkpoints are never inherited. Configure checkpoint inputs in trainer_config or phases[].fixed_overrides.
+    # Earlier phases whose winners' effective overrides, their inherited, fixed and sampled keys, become fixed inputs here. Nothing is inherited unless listed.
+    # Only phases declared before this one can be listed. trainer_config is not inherited, and an inherited value keeps the phase that produced it as its origin.
+    # Warning: only override values are inherited, never weights or checkpoints. Load a checkpoint explicitly through trainer_config or fixed_overrides.
+    # Warning: the parents' winners are part of this phase's study fingerprint, so a changed parent winner stops a populated study of this phase from being reused.
     inherits: list[string] = []
 
-    # Fixed trainer-defined values applied to every trial of this phase. Any value valid for override_format is accepted.
-    # Keys are dotted paths whose segments are nonempty and use only A-Z a-z 0-9 _ and -, for example optimizer.lr or training.max_steps.
-    # Values follow override_format. yaml_file and json_file allow lists and string-keyed mappings nested to any depth; argparse and hydra accept scalars and lists of scalars only.
-    # Every format rejects non-finite numbers and YAML objects such as unquoted dates; quote a date to send it as text.
-    # String values here do not expand the {trial_dir}, {phase} style placeholders.
-    # Overrides: trainer_config, phases[].inherits (the value replaces the base value and an inherited value at the same key, and resolves a key inherited from parents with different origins; the phase then becomes the key's origin).
-    # Conflicts with: phases[].search_space (the same key cannot be both fixed and sampled in one phase; config load fails).
-    # Conflicts with: phases[].repeats.key (the repeat key cannot also be fixed; config load fails).
-    # Requires: a fixed key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
-    # Recommended: fix batch size, seed, data split and the training and evaluation budget here when comparing hyperparameters. To compare discrete finalists across seeds instead, put the seed in phases[].repeats. PhaseSweep does not equalize training between trials.
+    # Fixed trainer-defined values for every trial of the phase, keyed by dotted paths of nonempty A-Z a-z 0-9 _ - segments, for example optimizer.lr.
+    # Under argparse and hydra a value is null, a boolean, an integer, a finite float, a string, or a list of those nested to any depth.
+    # yaml_file and json_file also take string-keyed mappings. No format takes a non-finite number or an unquoted YAML date, and strings expand no placeholders.
+    # Recommended: when comparing hyperparameters, fix batch size, seed, data split and the training budget here, because PhaseSweep does not equalize training.
     fixed_overrides: map[string, any] = {}
 
-    # Map from a dotted trainer-defined override key to the parameter that is sampled for it. optimizer.lr below is an example key; replace it with any valid dotted name.
-    # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
-    # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
-    # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. phases[].n_trials above 1 only retries failed attempts, as phases[].n_trials describes. validate and the dry run say "fixed configuration, no sampler draws (resumable)", or "(not resumable: in-memory storage)" on storage: null.
-    # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value, an optional one-off for measuring how far a configuration moves with the seed.
-    # A key whose last dotted component is seed, data_seed or random_state fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix it in phases[].fixed_overrides or trainer_config. To compare finalists across seeds, use phases[].repeats. The match is case sensitive.
-    # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
-    # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
-    # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).
-    # Conflicts with: phases[].repeats.key (the repeat key cannot also be searched; config load fails).
-    # Requires: a sampled key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
-    # Requires: with phases[].sampler.type cmaes every parameter is a float or int; with grid no parameter uses log, every float has a step, and the matrix, repeat axis included, has at most 4096 combinations.
+    # Map from a dotted trainer key, under the fixed_overrides key rules, to the parameter sampled for it. The sampled value reaches the trainer like a fixed one.
+    # Empty without repeats: a fixed configuration, which draws nothing and runs fixed_overrides as they are. n_trials above 1 then only retries failed attempts.
+    # validate and run --dry-run warn about such an n_trials above 1, because only a launch can count the failed attempts it would retry.
+    # Empty with repeats: a seed audit, one configuration run once per repeat value.
+    # A key whose last component is seed, data_seed or random_state, matched case-sensitively, fails config load, because a searched seed lets noise win.
     search_space: map[string, categorical | float | int] = {}
       # Example dotted trainer key; replace optimizer.lr with your parameter name.
       optimizer.lr: categorical | float | int (required)
-        # Variant categorical; selected by type: categorical.
-        # Pick one of an explicit list of values.
+        # Variant categorical: pick one of an explicit list of values. grid enumerates every choice, and cmaes rejects this variant.
         type: "categorical" (required)
 
-        # Nonempty list of choices. Each is null, a boolean, an integer, a finite float or a string; lists and mappings are rejected.
-        # Choices must be distinct under Python equality, so [1, 1.0], [0, false] and [1, true] fail config load.
-        # Under override_format argparse and hydra the choices must also render to distinct command-line values, so [1, "1"] fails under argparse. This applies to every sampler.
-        # Requires: phases[].sampler.type is not cmaes; grid enumerates these choices.
-        # Warning: YAML scalar types are kept, so a bare 1e-3 is the string "1e-3" here. Write 1.0e-3 or 0.001 for a float and quote strings that look like numbers.
-        # phasesweep validate and run --dry-run warn about each categorical key with a string choice that Python reads as a finite float, such as 1e-3, quoted or not, naming the phase, the key and the values. The warning is advisory and stays for a string that is meant as text.
+        # Nonempty list of null, boolean, integer, finite float or string values, distinct under Python equality, so [1, 1.0] and [0, false] fail.
+        # Under override_format argparse and hydra the choices must also be distinct as command-line values, so [1, "1"] fails under argparse.
+        # Warning: YAML types are kept, so a bare 1e-3 is the string "1e-3". validate and run --dry-run warn about a string choice that Python reads as a finite float.
         choices: list[null | bool | int | float | string] (required)
 
-        # Variant float; selected by type: float.
-        # Sample a float between two bounds.
-        # The trainer receives a Python float. With a step, non-grid samplers pass Optuna's value unrounded, for example 0.7000000000000001.
+        # Variant float: sample a float between low and high. The trainer receives a Python float, unrounded by samplers other than grid even with a step.
         type: "float" (required)
 
-        # Inclusive lower bound, finite, in trainer-defined units.
-        # Requires: phases[].search_space.<key>.high is at least this value, and this value is greater than 0 when log is true.
+        # Inclusive lower bound, in trainer-defined units.
         low: float (required)
 
-        # Inclusive upper bound, finite, in trainer-defined units.
-        # Requires: this value is at least phases[].search_space.<key>.low, and any step divides high - low exactly.
+        # Inclusive upper bound, in trainer-defined units.
         high: float (required)
 
-        # Sample on a logarithmic scale instead of a linear one.
-        # Requires: phases[].search_space.<key>.low is greater than 0; the grid sampler rejects log parameters.
-        # Conflicts with: phases[].search_space.<key>.step (log true with a step fails config load).
+        # Sample on a logarithmic scale. It needs low above 0 and no step, and grid rejects it.
         log: bool = false
 
-        # Spacing between allowed values, finite and greater than 0, in trainer-defined units.
-        # The division of high - low by step is exact on the decimal spelling of the numbers, so low 0.0, high 1.0 and step 0.1 is valid.
-        # The grid sampler requires a step and rounds each point to 12 decimals. Points that collapse under that rounding fail config load.
-        # Conflicts with: phases[].search_space.<key>.log (a step with log true fails config load).
+        # Spacing between allowed values, greater than 0. high - low must be a whole number of steps, compared on Python's shortest decimal spelling.
+        # So 0.0 to 1.0 by 0.1 is valid. grid requires a step and rounds each point to 12 decimals.
+        # Under that rounding, points that collapse, leave low to high, or drift off low + i * step fail config load.
         # Unset: continuous sampling.
         step: float | null = null
 
-        # Variant int; selected by type: int.
-        # Sample an integer between two bounds.
-        # The trainer receives a Python int.
+        # Variant int: sample an integer between low and high. The trainer receives a Python int.
         type: "int" (required)
 
-        # Inclusive lower bound in trainer-defined units, an integer >= -9007199254740992.
-        # Requires: phases[].search_space.<key>.high is at least this value, and this value is greater than 0 when log is true.
+        # Inclusive lower bound, an integer of at least -9007199254740992 (-2^53).
         low: int (required)
 
-        # Inclusive upper bound in trainer-defined units, an integer <= 9007199254740992.
-        # Requires: this value is at least phases[].search_space.<key>.low, and step divides high - low exactly.
+        # Inclusive upper bound, an integer of at most 9007199254740992 (2^53).
         high: int (required)
 
-        # Sample on a logarithmic scale instead of a linear one.
-        # Requires: phases[].search_space.<key>.low is greater than 0 and phases[].search_space.<key>.step is 1; the grid sampler rejects log parameters.
+        # As in the float variant, except that a logarithmic scale needs step 1.
         log: bool = false
 
-        # Spacing between allowed values, an integer greater than 0, in trainer-defined units.
-        # Requires: step divides high - low exactly, and log true requires step 1; config load fails otherwise.
+        # Spacing between allowed values, an integer greater than 0 that divides high - low.
         step: int = 1
 
-    # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by any single trial.
-    # A targeted tool: R values multiply the phase's cost by R. Use it to compare a few discrete finalists, such as architectures or another categorical choice, whose gap is near the noise; to measure how far one configuration moves with the seed; or to report a final configuration's spread. For a continuous hyperparameter such as the learning rate, more distinct values of it, one trial each (a denser grid or more seeded random draws over a log range), cover the same ground, and the trend across neighbors shows the noise.
-    # The sampler draws the repeat value as one more axis, so a phase of N configurations with R values runs N x R trials.
-    # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive draw positions draws one configuration and runs it once per value, value number position mod R. A trial's draw position counts the trials before it that are not reruns, and an interrupted rerun or failed grid-cell retry takes its source's position. A grid target above its matrix size can retry failed members without repeating completed members; only the replacement attempt belongs to its repeat group.
-    # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member does not rank. An INFEASIBLE member is never retried, and a failed member is retried only by a persistent grid target above its matrix size, where the replacement completes the group. An interrupted member belongs to no group; its rerun takes its place.
-    # Groups rank by phases[].repeats.reduce over their member metrics. Exact ties go to the group with the lowest member draw position, and the group's highest trial number names the winner.
-    # winner.yaml records the reduced metric, observed values averaged over the members that recorded them, and a repeats block with the spread and every member. The scalar winner fields describe the last member.
-    # The winner's params and effective overrides never carry the repeat key, so a phase that inherits this one runs with its own value of that key or none.
-    # trials.csv gains a repeat_group column: the highest trial number of each trial's group so far.
-    # The block is part of the study fingerprint.
-    # Conflicts with: phases[].allow_partial_grid (a partial grid would leave most groups incomplete; config load fails).
-    # Requires: phases[].sampler.type grid, or random with phases[].sampler.seed; any other sampler fails config load.
-    # Requires: with random and an empty phases[].search_space, phases[].n_trials equals the number of values; with random and a search_space it is a multiple of it; with grid it covers the full matrix, with persistent failed-cell retries as described under phases[].n_trials.
-    # Unset (the default): one trial per configuration, and every trial ranks on its own.
+    # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by single trials.
+    # Warning: R repeat values multiply the phase's cost by R. For a continuous hyperparameter, more distinct values with one trial each cover the same ground.
+    # Recommended: keep repeats for a few discrete finalists whose gap is near the noise, a one-off seed audit, or a final configuration's spread.
+    # Requires: sampler.type grid, or random with sampler.seed on any storage, and allow_partial_grid false.
+    # See: docs/config.md#repeats and docs/runtime.md#repeat-groups
     repeats: object | null = null
-      # Dotted override key that receives the repeat value on every trial, for example seed or data.shard. The key rules are the same as for phases[].fixed_overrides.
-      # The value reaches the trainer like a sampled value and is recorded as a param, so trials.csv has a param column for it.
-      # Overrides: trainer_config, phases[].inherits (the repeat value replaces the base value and any inherited value at that key; the winner exports neither).
-      # Conflicts with: phases[].search_space, phases[].fixed_overrides (the repeat key cannot also be searched or fixed; config load fails).
-      # Requires: the key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
+      # Dotted override key, under the fixed_overrides key rules, that receives the repeat value on every trial and is recorded as a param, for example seed.
+      # The winner exports neither this key nor an inherited value it replaced, so a phase that inherits this one runs its own value or none.
       key: string (required)
 
-      # Repeat values, at least two. Each is null, a boolean, an integer, a finite float or a string, and they follow the categorical choice rules: distinct under Python equality, and under argparse and hydra distinct as command-line values.
-      # Under argparse, hydra and json_file each value reaches the trainer through the format's placeholder, so the command must carry it.
+      # Repeat values, at least two: null, booleans, integers, finite floats or strings, distinct as categorical choices must be.
       values: list[bool | int | float | string | null] (required)
 
       # How a group's member metrics combine into the value it ranks by: mean or median.
-      # The selection-time tie check flags groups whose reduced value lies within two standard errors of the winner's, with the sample standard deviation for either reducer. It is a heuristic, not a significance test.
       reduce: "mean" | "median" = "mean"
 
-    # Number of trials run at the same time in this phase, an integer >= 1.
-    # Optuna starts this many worker threads. Each takes its own device lease, so when the GPU pool is smaller than n_jobs the extra workers wait for a free device and a warning is logged.
-    # A waiting worker has already sampled its parameters and created its attempt directory.
-    # Which device a trial gets is the first free one in pool order. There is no fixed trial-to-device map.
-    # With sampler.type tpe, more than 1 turns on Optuna's constant_liar heuristic.
-    # Excluded from the study fingerprint, so it can change between invocations.
-    # Requires: phases[].gpu_policy whole_node needs 1.
-    # Requires: phases[].gpu_policy none with more than 1 needs phases[].allow_no_gpu_isolation true; config load fails otherwise.
-    n_jobs: int = 1
-
-    # CUDA visibility policy for the phase's trainer processes. It is part of the study fingerprint.
-    # single_per_trial gives each attempt one visible device token and a same-host lock on that device, held until the trainer process group exits.
-    # whole_node gives the single running attempt every device of the explicit list, comma-joined. The number of devices is part of the study fingerprint as the trainer's world size.
-    # none applies no CUDA binding and takes no GPU host lock.
-    # A single_per_trial phase leases nothing when no GPU is visible or when env.CUDA_VISIBLE_DEVICES is "" or -1 to disable CUDA. See phases[].allow_no_gpu_isolation.
-    # Requires: whole_node needs phases[].n_jobs 1 and exactly one of phases[].gpu_ids or phases[].gpu_devices, listing distinct physical devices. A missing list or a repeated token fails config load. An index and a UUID naming one card, or a multi-device list containing MIG tokens, fail at launch.
-    # Requires: none forbids phases[].gpu_ids and phases[].gpu_devices, and needs phases[].allow_no_gpu_isolation true when phases[].n_jobs is greater than 1. Config load fails otherwise.
-    # Warning: the trainer sees a leased physical GPU as its local cuda:0, so index devices locally. For whole_node the device count is semantic, while for single_per_trial the pool size only sets throughput.
-    # A leased numeric token also forces CUDA_DEVICE_ORDER=PCI_BUS_ID in the trainer environment, overriding env.CUDA_DEVICE_ORDER. A GPU- or MIG- token keeps an explicit or inherited CUDA_DEVICE_ORDER and defaults it to PCI_BUS_ID.
-    # A leased token replaces env.CUDA_VISIBLE_DEVICES. Under none, env.CUDA_VISIBLE_DEVICES reaches the trainer unchanged.
-    gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
-
-    # Explicit list of CUDA device indices, each an integer >= 0 (an empty list is rejected). Each index is checked against nvidia-smi when the phase launches, and a missing index fails the phase.
-    # Duplicate indices are collapsed under single_per_trial and rejected at config load under whole_node.
-    # Excluded from the study fingerprint, except that under whole_node its length is part of it.
-    # Unset: the pool is discovered, in order, from env.CUDA_VISIBLE_DEVICES, then the controller's ambient CUDA_VISIBLE_DEVICES, then the nvidia-smi inventory.
-    # Pool discovery reads the ambient value even when execution.inherit_env excludes it from the trainer.
-    # An explicit list takes priority over env.CUDA_VISIBLE_DEVICES and the ambient value. The trainer receives its leased token.
-    # Conflicts with: phases[].gpu_devices (setting both fails config load).
-    # Requires: phases[].gpu_policy is not none; whole_node needs exactly one explicit list of unique devices.
-    # Recommended: list one explicit index for a predictable single-GPU experiment, and avoid devices that another independent workload occupies.
-    gpu_ids: list[int] | null = null
-
-    # Explicit list of CUDA device tokens, for example ["GPU-..."] or ["MIG-..."]. An empty list is rejected.
-    # Whitespace around a token is stripped, and an empty token, a token containing a comma and -1 fail config load.
-    # Numeric strings such as "0" are accepted as indices. GPU- and MIG- tokens are matched by prefix against nvidia-smi, need exactly one match, and are rewritten to the full identifier.
-    # Any other token fails when the phase launches. MIG tokens need nvidia-smi -L to list them.
-    # Duplicate tokens are collapsed under single_per_trial, and aliases of one card (an index and its UUID) are collapsed with a warning. Under whole_node repeated tokens fail config load and aliases fail at launch.
-    # Excluded from the study fingerprint, except that under whole_node its length is part of it.
-    # Unset: the pool is discovered, in order, from env.CUDA_VISIBLE_DEVICES, then the controller's ambient CUDA_VISIBLE_DEVICES, then the nvidia-smi inventory.
-    # An explicit list takes priority over env.CUDA_VISIBLE_DEVICES and the ambient value. The trainer receives its leased token.
-    # Conflicts with: phases[].gpu_ids (setting both fails config load).
-    # Requires: phases[].gpu_policy is not none; whole_node needs exactly one explicit list of unique physical devices and rejects a multi-device list containing MIG tokens at launch.
-    gpu_devices: list[string] | null = null
-
-    # Allow a phase to run without GPU host locks or CUDA isolation where PhaseSweep would otherwise refuse.
-    # Only read while the pool is being discovered, and by the none policy check. It does nothing when GPUs are detected, when phases[].gpu_ids or phases[].gpu_devices is set, or under whole_node.
-    # With nothing to lease, a single job (n_jobs 1) proceeds without isolation when nvidia-smi finds no GPUs and the driver reports none; n_jobs greater than 1 fails unless this is true.
-    # When the NVIDIA driver reports hardware that nvidia-smi cannot enumerate, the phase fails at any n_jobs unless this is true.
-    # An env.CUDA_VISIBLE_DEVICES value of "" or -1 disables CUDA: that sentinel is pinned into every single_per_trial trainer without GPU locks, and parallel jobs need no opt-in.
-    # Requires: phases[].gpu_policy none with phases[].n_jobs greater than 1 needs true; config load fails otherwise.
-    # Warning: true can let trainers see every GPU without host locks. It does not turn a CUDA model into a CPU model.
-    # Excluded from the study fingerprint.
-    allow_no_gpu_isolation: bool = false
-
-    # Sampling strategy and its parameters. Omit the block to use the defaults.
-    # The sampler interacts with phases[].search_space, phases[].n_trials and storage; see each child key for the supported domains and for continuation.
+    # Sampling strategy and its parameters. Omit the block for the defaults.
     sampler: object = {}
-      # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid enumerates a concrete matrix, and cmaes runs CMA-ES on numeric spaces.
-      # Seeded tpe and cmaes key every random choice to the trial's draw position, so a persistent phase resumes after an interruption and grows when phases[].n_trials rises without repeating a draw because of the interruption. At n_jobs 1 the draws match an uninterrupted run, given the same trial values; above 1 they depend on which trials have finished when each is drawn, and validate and the dry run warn when a phase that draws with tpe or cmaes sets n_jobs above 1.
-      # Seeded random derives each draw from the seed, study name, draw position and parameter name, so it is independent of n_jobs and restarts. With phases[].repeats the configuration slot, the position divided by the number of repeat values, takes the place of the position.
-      # Grid runs at each draw position the grid point its seeded order puts there. Under every sampler a rerun of an interrupted trial runs its source's parameters without consulting the sampler; a persistent grid retry of a failed cell uses the same mechanism when phases[].n_trials exceeds the matrix size.
-      # Selecting a grid winner logs two advisory warnings that never change the winner: one when it sits on the smallest or largest value of a numeric axis, and one when some cell, repeat values included, has no COMPLETE or INFEASIBLE trial because its attempts failed, were interrupted or never ran.
-      # Every random draw is independent and with replacement, seeded or not, so three trials over a three-value categorical cover all three values only about 2 times in 9, and a value can repeat or never be drawn. Use grid when every value must be covered.
-      # cmaes needs the cmaes package; config load fails with an install hint when it is missing.
-      # Requires: with cmaes every phases[].search_space parameter is numeric.
-      # Requires: with grid on a phase that draws, the search space has no log parameter, every float has a step, and there are at most 4096 distinct combinations. phases[].n_trials covers the full matrix unless phases[].allow_partial_grid is true; persistent targets above the matrix size retry failed cells as described under phases[].n_trials. The repeat axis of phases[].repeats counts toward the combinations.
-      # Requires: phases[].repeats needs grid, or random with phases[].sampler.seed; config load fails otherwise.
-      # Requires: with persistent storage and a nonempty phases[].search_space, random, tpe and cmaes need phases[].sampler.seed. A phase with an empty search_space and no phases[].repeats draws nothing and is exempt.
+      # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid enumerates a matrix, and cmaes runs CMA-ES.
+      # Requires: cmaes only with float and int parameters, and the cmaes package, which the config load error names when it is missing.
+      # Requires: grid only with no log parameter, a step on every float, and at most 4096 combinations, repeat values included, even with allow_partial_grid.
+      # Warning: random draws are independent and with replacement, seeded or not, so a value can repeat or never be drawn. Use grid to cover every value.
+      # See: docs/runtime.md#interrupted-trials-rerun for draw positions and reproducibility.
       type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 
-      # Sampler random seed, an integer from 0 to 4294967295. It is independent of any trainer seed in trainer_config or phases[].fixed_overrides.
-      # Seeded random, tpe and cmaes also use the study name experiment::phase, formed from experiment and phases[].name. Renaming either changes the draws even with the same seed and search space.
-      # For grid the seed fixes the order in which Optuna visits the grid points, which also decides which points a partial grid runs.
-      # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that unless the phase draws nothing (an empty phases[].search_space without phases[].repeats).
-      # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt, and so is a phase with an empty phases[].search_space and no phases[].repeats, which draws nothing.
-      # Requires: phases[].repeats with random needs a seed on any storage, because the seed keys each configuration slot.
+      # Sampler seed, an integer from 0 to 4294967295, independent of any trainer seed.
+      # Requires: set when the phase draws with random, tpe or cmaes on persistent storage.
+      # Seeded random, tpe and cmaes draws also use the study name <experiment>::<phase>, so renaming either changes them.
+      # For grid the seed alone fixes the matrix order, which also decides which points a partial grid runs. An unset grid seed orders it as seed 0 does.
+      # Unset: random, tpe and cmaes draw unseeded.
       seed: int | null = null
 
-      # Number of random startup trials before the tpe surrogate model is fitted, an integer >= 0.
-      # Only COMPLETE and INFEASIBLE trials count toward it, so failed attempts lengthen the random phase.
-      # validate and the dry run warn when a tpe phase with a nonempty phases[].search_space has phases[].n_trials at or below this value, because then every trial is sampled at random and the model is never fitted.
-      # Only used when: phases[].sampler.type is tpe. Every other type must leave it at 10, or config load fails.
+      # Random startup trials before the tpe model is fitted, an integer >= 0. Only COMPLETE and INFEASIBLE trials count toward it.
+      # validate and run --dry-run warn when a tpe phase that draws has n_trials at or below it, because the model is then never fitted.
+      # Only used when: sampler.type is tpe. Any other type must leave it at 10, or config load fails.
       n_startup_trials: int = 10
 
-    # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
-    # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, and a fatal error.
-    # A feasible success resets the count. Interrupted attempts (phase or run deadline, host shutdown, a phase abort before the trainer launched, an attempt recovered after its orchestrator stopped) leave it unchanged.
-    # A trial the abort stops before its trainer launched is interrupted, so the raised phases[].n_trials that recovers the abort reruns it first.
-    # Failed attempts still count toward phases[].n_trials.
-    # The count and a recorded abort persist on durable storage in completion order.
-    # A recorded abort is retired by a larger phases[].n_trials, or, for an abort this limit tripped, by a limit above the consecutive-failure count that abort recorded while phases[].n_trials still leaves trials to run. Either starts the count again from zero, keeps the accepted target, and runs only those trials; completed ones are not repeated. With no trial left the limit alone retires nothing, and a fatal abort is never retired by it. A grid or fixed configuration refuses a target above its retry ceiling, so there only the limit continues a streak abort that left trials unrun.
-    # Lowering the limit to at most the replayed count refuses new work until phases[].n_trials is raised or this limit goes back above that count.
-    # Excluded from the study fingerprint.
-    # Recommended: lower it for an expensive trainer when a broken configuration should stop the phase quickly.
-    # Recommended: with phases[].repeats, keep it above the number of repeat values. At or below it, one configuration that fails on every value can abort the phase by itself (under seeded random its repeats run back to back), and validate and the dry run print a warning.
-    max_consecutive_failures: int = 5
-
-    # Wallclock limit for one trainer process, in seconds, finite and >= 0. null means no per-trial limit.
-    # The clock starts when the supervised launch starts, including supervisor startup, after the GPU lease is held. It does not cover the wait for a lease or the evidence reads after the trainer exits.
-    # A trainer killed by this limit fails the attempt and counts toward phases[].max_consecutive_failures. 0 expires immediately: the trainer never starts and every attempt fails.
-    # The phase and run deadlines also cover the lease wait and the evidence reads, and the earliest active deadline limits the work.
-    # A trainer killed because a phase or run deadline arrived first is interrupted rather than failed, and reruns once the phase continues.
-    # Part of the study fingerprint, so changing it stops a populated phase from being reused.
-    # Requires: null needs phases[].allow_unbounded_trials true; config load fails otherwise.
-    timeout_seconds_per_trial: float | null = 259200.0
-
-    # Permit an attempt with no per-trial deadline.
-    # Requires: phases[].timeout_seconds_per_trial null needs true; config load fails otherwise. Other phase and run deadlines still apply.
-    # true alone changes nothing: the 72 hour default of phases[].timeout_seconds_per_trial still applies until that key is set to null.
-    # Excluded from the study fingerprint.
-    allow_unbounded_trials: bool = false
-
-    # Wallclock budget for the phase, in seconds, finite and >= 0. 0 expires immediately.
-    # The clock starts after resume checks, environment preflight and GPU discovery, before the MLflow target check and the first trial. It covers queued GPU leases, trainer execution and evidence reads; cleanup can run past the deadline.
-    # The earliest of this deadline, timeout_seconds_per_run and the per-trial limit ends the work. When a wallclock timeout and a failure-streak abort both occur, the timeout wins.
-    # A phase with no work left, such as a replay of a finished target, never starts the clock.
-    # phases[].allow_incomplete_on_timeout decides whether a feasible partial winner may be accepted. A value of 0 raises before any trial starts and is not rescued by it.
-    # Excluded from the study fingerprint.
-    # Unset: no phase deadline.
-    timeout_seconds_per_phase: float | null = null
-
-    # Accept a feasible winner from fewer than phases[].n_trials attempts after a phase or run wallclock timeout, and persist that decision. false fails closed. Reusing a stored partial winner also requires true.
-    # Only used when: phases[].timeout_seconds_per_phase or timeout_seconds_per_run leaves the phase incomplete. It never substitutes a baseline or lets missing or infeasible evidence win.
-    # Repeating the same accepted phases[].n_trials replays the partial decision without running its unused slots or rerunning the attempts the deadline interrupted. A larger target runs those reruns first, then new work.
-    # A per-trial timeout alone does not enable partial acceptance.
-    # Excluded from the study fingerprint.
-    allow_incomplete_on_timeout: bool = false
-
-    # Allow phases[].n_trials smaller than the number of grid combinations. false requires the full matrix.
-    # Only used when: phases[].sampler.type is grid. true with tpe, random or cmaes fails config load.
-    # On storage null, phases[].n_trials must not exceed the combination count; config load fails otherwise. Persistent targets above it follow the failed-cell retry rule under phases[].n_trials.
-    # Conflicts with: phases[].repeats (the grid visits the configuration x repeat matrix in a shuffled order, so a partial grid leaves most groups incomplete; use seeded random to run a subset of configurations with all their repeats).
-    # Excluded from the study fingerprint.
+    # Allow n_trials below the grid size. The sampler seed then decides which points run.
+    # Only used when: sampler.type is grid. true with any other type fails config load.
     allow_partial_grid: bool = false
 
-    # Hard checks run after the trainer exits, selected by type. Each variant below describes one list item.
-    # Gates run only when the trainer exited 0 and the objective and every constraint were extracted finite, in the order objective, constraints, then gates.
-    # Every gate runs. Failures are joined into one message, and any failed gate fails the attempt, even when a constraint is also violated. A failed attempt counts toward phases[].max_consecutive_failures.
-    # Local paths are inside the attempt directory, and remote gates use the attempt's shared verified capture.
-    # Gates are part of the study fingerprint.
+    # ---------- Phase GPU placement ----------
+    # whole_node needs n_jobs 1 and exactly one of gpu_ids and gpu_devices, naming distinct devices.
+    # none forbids gpu_ids and gpu_devices, and with n_jobs above 1 it needs allow_no_gpu_isolation true.
+    # Without gpu_ids or gpu_devices the pool is discovered from env.CUDA_VISIBLE_DEVICES, else the controller's ambient CUDA_VISIBLE_DEVICES, else nvidia-smi.
+    # validate, the dry run and the launch check listed devices and env.CUDA_VISIBLE_DEVICES tokens against nvidia-smi, so an unknown one fails there.
+    # See: docs/runtime.md#gpu-isolation
+
+    # Number of trials run at the same time, an integer >= 1. Under single_per_trial each takes its own device lease, so extra trials queue for a smaller pool.
+    # validate, the dry run and the launch warn when it exceeds the device pool. With tpe, more than 1 turns on Optuna's constant_liar.
+    # Warning: with tpe or cmaes in a phase that draws, more than 1 makes seeded draws depend on completion order. validate and run --dry-run warn.
+    n_jobs: int = 1
+
+    # CUDA visibility policy. single_per_trial leases one device per attempt, with a same-host lock held until the trainer's process group exits.
+    # whole_node gives the one running attempt every listed device, comma-joined, so the device count is the trainer's world size and is fingerprinted.
+    # none binds no device and takes no lock. Set CUDA_VISIBLE_DEVICES in env, or name it in execution.inherit_env, when the trainer needs a restriction.
+    # Warning: the trainer sees a leased GPU as its local cuda:0, so index devices locally.
+    gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
+
+    # Explicit CUDA device indices, each an integer >= 0, used instead of discovery. An empty list is rejected.
+    # Duplicates collapse under single_per_trial and fail config load under whole_node.
+    # Conflicts with: phases[].gpu_devices (config load fails if both are set).
+    # Unset: the pool is discovered.
+    # Recommended: list one index for a predictable single-GPU experiment, because leases rotate across a larger pool. Avoid devices another workload uses.
+    gpu_ids: list[int] | null = null
+
+    # Explicit CUDA device tokens: numeric strings such as "0", or GPU- and MIG- prefixes, each matching exactly one nvidia-smi device and rewritten to its full ID.
+    # An empty list, an empty token, a token with a comma, or -1 fails config load. Whitespace around a token is stripped, and MIG tokens need nvidia-smi -L.
+    # Duplicates collapse under single_per_trial, and aliases of one card, such as an index and its UUID, collapse with a warning.
+    # Under whole_node a repeated token fails config load, and an alias or a multi-device list with a MIG token fails when the inventory is checked.
+    # Unset: the pool is discovered.
+    gpu_devices: list[string] | null = null
+
+    # Let a phase run without GPU host locks or CUDA isolation where PhaseSweep would refuse.
+    # It does nothing when GPUs are detected, when a device list is set, or under whole_node. With no GPU found, n_jobs above 1 needs it.
+    # Any n_jobs needs it when the driver lists hardware but nvidia-smi cannot enumerate it or resolve the ambient CUDA_VISIBLE_DEVICES tokens.
+    # A CUDA_VISIBLE_DEVICES of "" or -1, from env or the ambient environment, disables CUDA for single_per_trial trainers and needs no opt-in.
+    # Warning: true can let trainers see every GPU without host locks. It does not turn a CUDA model into a CPU model.
+    allow_no_gpu_isolation: bool = false
+
+    # ---------- Phase limits ----------
+    # The earliest of the per-trial, phase and run deadlines ends the work it covers. Cleanup and publication can run past a deadline.
+    # A failure a deadline causes, such as an evidence read cut short, records the attempt as interrupted, which counts toward neither n_trials nor the streak.
+    # When a deadline and a failure-streak abort stop the same phase short of n_trials, the deadline decides the outcome and the abort is retired.
+    # See: docs/runtime.md#timeouts-cleanup-and-continuation
+
+    # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
+    # A feasible success resets the count, and an interrupted attempt leaves it unchanged.
+    # A recorded abort refuses later runs until a raised n_trials retires it, or, for a streak abort with trials left to run, a limit above the count it recorded.
+    # Recommended: lower it for an expensive trainer, so a broken configuration stops the phase quickly.
+    # Recommended: with repeats, keep it above the repeat count, or one configuration failing every value aborts the phase. validate and run --dry-run warn.
+    max_consecutive_failures: int = 5
+
+    # Wallclock limit for one trainer process, in seconds, >= 0. null means no limit, and 0 expires at once, so every attempt fails.
+    # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
+    # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
+    # Requires: phases[].allow_unbounded_trials true for null.
+    timeout_seconds_per_trial: float | null = 259200.0
+
+    # Permit timeout_seconds_per_trial null. true alone changes nothing, because the 72-hour default applies until that key is null.
+    allow_unbounded_trials: bool = false
+
+    # Wallclock budget for the phase, in seconds, >= 0. Its clock starts after the resume checks and GPU discovery, before the first trial.
+    # A phase with no work left never starts the clock. 0 makes a phase with work fail before any trial starts, which allow_incomplete_on_timeout cannot rescue.
+    timeout_seconds_per_phase: float | null = null
+
+    # Accept a feasible winner from fewer than n_trials attempts when a phase or run deadline leaves the phase incomplete, and persist that decision.
+    # false fails the run as a timeout. A per-trial timeout alone never enables it, and it never lets missing or infeasible evidence win.
+    # Reusing a stored partial result, on a replay or through --from-phase, needs it true as well.
+    allow_incomplete_on_timeout: bool = false
+
+    # ---------- Phase gates ----------
+    # Gates run after the trainer exits 0 and the objective and every constraint were read, in that order. Local gates read the attempt directory.
+    # Every gate runs and failures are joined into one message. A failed gate fails the attempt, even one a violated constraint already made infeasible.
+
+    # Hard checks on the attempt's evidence, selected by type. Each item is one gate.
     gates: list[artifact_size | json_equals | json_scalar_bound | mlflow_required | required_file | sha256 | wandb_summary_required] = []
-      # Variant artifact_size; selected by type: artifact_size.
-      # Require an artifact size in bytes inside inclusive bounds.
+      # Variant artifact_size: require an artifact's size in bytes within min_bytes and max_bytes, at least one of which is set.
       - type: "artifact_size" (required)
 
-        # Where the size comes from. file is the size of one file. directory is the recursive total of all regular files below the directory, counting the target of a file symlink and never following a directory symlink. json is a nonnegative integer byte count stored in a JSON file.
-        # For json a boolean, float, string or negative value fails the gate. For directory a path that is itself a symlink fails the gate, and an unreadable entry fails it.
-        # Requires: phases[].gates[].key when source is json and not otherwise; an invalid pairing fails config load.
+        # Where the size comes from: file is one file, directory the total of regular files below a directory, json a nonnegative integer byte count in a JSON file.
+        # directory counts the targets of file symlinks, never follows a directory symlink, and skips broken symlinks and special files.
+        # directory fails on a path that is itself a symlink, an entry it cannot stat, or a subdirectory it cannot list.
+        # Requires: key exactly when source is json.
         source: "file" | "directory" | "json" (required)
 
-        # Path relative to the attempt directory. It must be nonempty, relative and free of NUL characters and .. segments.
-        # . names the attempt directory itself and is allowed only with source directory; file and json need a path to a file below it.
-        # Warning: path . with source directory includes the files PhaseSweep writes there, such as stdout.log, stderr.log, command.txt and the generated trainer input.
+        # Trial path, which names a directory when source is directory. There . names the attempt directory itself.
+        # Warning: . counts the files PhaseSweep writes there, such as stdout.log, stderr.log, command.txt and the trainer input.
         path: string (required)
 
-        # Dotted path of object keys to the byte count, for example artifact.bytes. Every segment must be nonempty.
-        # Requires: source json needs a key, and a key with file or directory fails config load.
-        # Unset: used only with source json.
+        # JSON key of the byte count, for example artifact.bytes.
         key: string | null = null
 
-        # Inclusive minimum size in bytes, an integer >= 0.
-        # Requires: at least one of phases[].gates[].min_bytes and phases[].gates[].max_bytes, and min_bytes at most max_bytes when both are set; config load fails otherwise.
-        # Unset: no lower bound.
+        # Minimum size in bytes, an integer >= 0.
         min_bytes: int | null = null
 
-        # Inclusive maximum size in bytes, an integer >= 0.
-        # Requires: at least one of phases[].gates[].min_bytes and phases[].gates[].max_bytes, and min_bytes at most max_bytes when both are set; config load fails otherwise.
-        # Unset: no upper bound.
+        # Maximum size in bytes, an integer >= 0.
         max_bytes: int | null = null
 
-      # Variant json_equals; selected by type: json_equals.
-      # Require a JSON value to equal a scalar with the same JSON type: true, 1 and 1.0 are different values.
+      # Variant json_equals: require a JSON value to equal a scalar of the same JSON type, so true, 1 and 1.0 differ. A missing file or key fails the gate.
       - type: "json_equals" (required)
 
-        # Path of the JSON file relative to the attempt directory, for example result.json.
-        # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-        # The file must be strict JSON; an unreadable file or a missing key fails the gate.
+        # JSON file to read, for example result.json.
         path: string (required)
 
-        # Dotted path of object keys to the value, for example eval.loss. Every segment must be nonempty.
-        # Each segment is an object key only; list indexes and keys containing a dot are not supported.
+        # JSON key of the value, for example eval.loss.
         key: string (required)
 
-        # Expected value: null, a boolean, an integer, a finite float or a string. Mappings, lists, YAML dates and non-finite floats are rejected at config load.
-        # Quote a date to compare it with a JSON string.
+        # Expected value: null, a boolean, an integer, a finite float or a string. A mapping, a list or a YAML date fails config load, so quote a date to compare text.
         value: bool | int | float | string | null (required)
 
-      # Variant json_scalar_bound; selected by type: json_scalar_bound.
-      # Require a finite JSON number inside inclusive bounds. A boolean, string or number outside the float range fails the gate.
+      # Variant json_scalar_bound: require a finite JSON number within min and max, at least one of which is set. A boolean or a string fails the gate.
       - type: "json_scalar_bound" (required)
 
-        # Path of the JSON file relative to the attempt directory, for example result.json.
-        # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
+        # JSON file holding the number, for example result.json.
         path: string (required)
 
-        # Dotted path of object keys to the number, for example eval.loss. Every segment must be nonempty.
-        # Each segment is an object key only; list indexes and keys containing a dot are not supported.
+        # JSON key of the number, for example eval.loss.
         key: string (required)
 
-        # Inclusive lower bound, finite, in the JSON value's units.
-        # Requires: at least one of phases[].gates[].min and phases[].gates[].max, and min at most max when both are set; config load fails otherwise.
-        # Unset: no lower bound.
+        # Lower bound, in the units of the JSON number.
         min: float | null = null
 
-        # Inclusive upper bound, finite, in the JSON value's units.
-        # Requires: at least one of phases[].gates[].min and phases[].gates[].max, and min at most max when both are set; config load fails otherwise.
-        # Unset: no upper bound.
+        # Upper bound, in the units of the JSON number.
         max: float | null = null
 
-      # Variant mlflow_required; selected by type: mlflow_required.
-      # Require metrics, parameters and tags on the attempt's own MLflow run, read from the same finished capture as the objective.
-      # A metric, param or tag missing from a finished run fails the trial at once, naming it and listing the keys of that kind the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
-      # Requires: the top-level mlflow block with an MLflow objective, and at least one name in metrics, params or tags; config load fails otherwise.
+      # Variant mlflow_required: require metrics, params and tags on the attempt's own MLflow run, from the capture the objective reads.
+      # A name missing from a finished run fails the trial at once, as an objective read error that names it and lists the run's keys of that kind.
+      # Requires: the mlflow block, and at least one name across metrics, params and tags. Every name is nonempty.
       - type: "mlflow_required" (required)
 
-        # Exact native metric names, for example [eval_loss, train_loss]. Each name must be nonempty and needs a finite last observation.
-        # Requires: metrics, params and tags together name at least one entry.
+        # Exact native metric names, for example [eval_loss, train_loss]. Each needs a finite last observation.
         metrics: list[string] = []
 
-        # Exact native parameter names, for example [learning_rate, model_name]. Each name must be nonempty. Presence is checked and the values are kept as strings.
-        # Requires: metrics, params and tags together name at least one entry.
+        # Exact native parameter names, for example [learning_rate]. Only their presence is checked.
         params: list[string] = []
 
-        # Exact native tag names, for example [trainer, dataset_revision]. Each name must be nonempty. Presence is checked and the values are kept as strings.
-        # Requires: metrics, params and tags together name at least one entry.
+        # Exact native tag names, for example [dataset_revision]. Only their presence is checked.
         tags: list[string] = []
 
-      # Variant required_file; selected by type: required_file.
-      # Require a regular file to exist in the attempt directory.
-      # A symlink to a file passes and an empty file passes. A directory, a broken symlink or a special file fails.
+      # Variant required_file: require a regular file. An empty file and a symlink to a file pass, while a directory, a broken symlink or a special file fails.
       - type: "required_file" (required)
 
-        # Path relative to the attempt directory, for example result.json.
-        # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
+        # File to require, for example result.json.
         path: string (required)
 
-      # Variant sha256; selected by type: sha256.
-      # Require the exact SHA-256 digest of a file. The file is hashed after the trainer exits.
+      # Variant sha256: require the exact SHA-256 digest of a file, hashed after the trainer exits. A directory or a missing file fails the gate.
       - type: "sha256" (required)
 
-        # Path relative to the attempt directory, for example result.json.
-        # It must be nonempty, relative, free of NUL characters and .. segments, and name a regular file below the attempt directory. A directory or missing file fails the gate.
+        # File to hash, for example model.safetensors.
         path: string (required)
 
-        # Expected digest: 64 hexadecimal characters. Uppercase is accepted and normalized to lowercase. A mismatch fails the gate.
+        # Expected digest: 64 hexadecimal characters. Uppercase is accepted and lowercased. A mismatch fails the gate.
         sha256: string (required)
 
-      # Variant wandb_summary_required; selected by type: wandb_summary_required.
-      # Require summary keys to be present in the same accepted finished W&B capture as the other W&B consumers. The values need not be numeric.
-      # With no W&B scalar consumer in the phase, the capture accepts the first finished summary and a missing key fails the gate at once.
-      # With a W&B objective or constraint in the phase, the capture first waits for all of their numeric keys, then checks gate presence.
-      # Gate-only phases may use different W&B targets from one another.
-      # Requires the phasesweep[wandb] extra in the controller environment.
+      # Variant wandb_summary_required: require summary keys, of any value type, in the finished W&B capture the phase's other W&B readers share.
+      # Without a W&B objective or constraint, the capture takes the first finished summary, so a missing key fails the gate at once.
+      # Such gate-only phases may use different W&B targets from one another.
       - type: "wandb_summary_required" (required)
-
-        # W&B API endpoint, with an http or https scheme and a host. Credentials, a query and a fragment are rejected.
-        # The scheme and host are lowercased and trailing slashes are stripped from the path.
-        # Requires: within each phase, its wandb_summary_required gates and the experiment-level wandb metric and constraint extractors agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load.
-        # Requires: no mlflow block anywhere in the config.
-        base_url: string = "https://api.wandb.ai"
-
-        # W&B account or team name, for example research-team. Must be nonempty and contain no slash or whitespace.
-        # Requires: all W&B consumers in a phase agree on the target and polling fields. The credentials in the composed trainer environment must be able to read this entity.
-        entity: string (required)
-
-        # W&B project name, for example bart-search. Must be nonempty and contain no slash or whitespace.
-        # Requires: all W&B consumers in a phase agree on the target and polling fields.
-        # Requires: the trainer honors the managed WANDB_ENTITY, WANDB_PROJECT, WANDB_BASE_URL and WANDB_RUN_ID, keeps WANDB_RESUME at never, and finishes its run.
-        project: string (required)
-
-        # Seconds between polls of the run state and summary. Finite and greater than 0; infinity and NaN fail config load.
-        # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
-        # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-        poll_seconds: float = 2.0
-
-        # Seconds one attempt may spend reading W&B evidence, at least 1. Finite; infinity and NaN fail config load.
-        # The budget is absolute for the attempt and includes worker startup, SDK calls and polling. All W&B consumers of the attempt share it, and the remaining phase and run budget also caps it.
-        # Expiry fails the gate.
-        # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
-        # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-        timeout_seconds: float = 120.0
-
-        # Exact summary keys that must be present, for example [eval/loss, trainer_revision]. The list is nonempty and each key must be nonempty. A missing key fails the gate.
+        <<: WandbTarget
+        # Exact summary keys that must be present, for example [eval/loss, trainer_revision]: a nonempty list of nonempty keys.
         keys: list[string] (required)
 
 # ---------- Trainer inputs ----------
+# override_format decides how trainer_config, with the phase's overrides applied, reaches the trainer, and which trial_command placeholder carries it:
+#   yaml_file  {config_path}     trainer_config.yaml, complete, with keys sorted at every level.
+#   json_file  {overrides_path}  overrides.json, with dotted keys expanded into nested objects. Values must be strict JSON.
+#   argparse   {overrides}       flattened leaves as shell-quoted --key=value tokens: null as None, a boolean as true or false, a string as written.
+#   hydra      {overrides}       flattened leaves as shell-quoted key=value tokens, strings double-quoted. A string with ${ or a control character fails.
+# Under argparse and hydra a float renders with Python's str() and a list as [a,b], recursively.
+# trial_command may not carry another format's placeholder, and yaml_file always needs its own.
+# The other formats need theirs once a phase has an inherited, fixed, sampled or repeat key, or trainer_config is nonempty.
+# Under argparse and hydra every flattened leaf must render: no mapping inside a list, no empty mapping, no dotted literal key colliding with a nested mapping.
 
-# Base input for the external trainer under every override_format, with the phase's overrides applied on top at their dotted paths.
-# yaml_file writes it complete to trainer_config.yaml in each attempt directory. json_file writes it, nested, to overrides.json. argparse and hydra flatten nested mappings into dotted keys and render every leaf at {overrides}.
-# PhaseSweep forwards its keys to the program in trial_command, not to a built-in training API. Common trainer-defined keys are model.name, optimizer.lr and output_dir.
-# Values must be null, booleans, integers, finite floats, strings, lists or string-keyed mappings. Quote YAML dates.
-# With argparse and hydra every flattened leaf must also render in that format: no mapping inside a list and no empty mapping, and hydra rejects control characters and ${...} in strings. A literal key containing a dot that collides with a nested mapping fails config load.
-# String values anywhere in the mapping expand {trial_dir}, {trial_id}, {phase} and {run_name} once, before overrides are applied, in every format. Keys and override values are not expanded.
-# Other braces stay literal in this mapping: {config_path} is not expanded and {{ and }} are not unescaped. Substituted values are inserted as raw text.
-# Use output_dir: "{trial_dir}/checkpoints" to give each trial its own output directory.
-# trainer_config.yaml is written with keys sorted at every level.
-# No model download, optimizer setting, batch size or step budget is supplied automatically.
-# Requires: a nonempty trainer_config makes the placeholder that matches override_format required in trial_command, because the base must reach the trainer; config load fails otherwise.
-# Overridden by: phases[].inherits, phases[].fixed_overrides, phases[].search_space, phases[].repeats.key (at their exact dotted paths; an override that must descend through an existing non-mapping value, meaning a scalar, null or list, fails config load).
+# Base trainer input under every override_format, with the phase's overrides applied at their dotted paths. PhaseSweep defines none of its keys.
+# Values are null, booleans, integers, finite floats, strings, lists or string-keyed mappings. Quote YAML dates.
+# String values expand {trial_dir}, {trial_id}, {phase} and {run_name} once, before overrides apply, as raw text without shell quoting.
+# So output_dir: "{trial_dir}/ckpt" gives each trial its own directory. Other braces stay as written, but a doubled {{trial_dir}} still expands inside them.
+# An override whose dotted path would descend through a scalar, null or list here fails config load.
 trainer_config: map[string, any] = {}
 
-# How the trainer receives its inputs.
-# yaml_file writes the complete trainer_config with the overrides applied to trainer_config.yaml; the command passes its path as {config_path}.
-# json_file writes trainer_config with the overrides applied, with dotted keys expanded into nested objects, to overrides.json; with an empty trainer_config the file holds only the overrides. The command passes its path as {overrides_path}.
-# argparse puts trainer_config's flattened leaves and the overrides in the command as shell-quoted --key=value tokens at {overrides}. null renders as None and booleans as true or false. String values are written as they are.
-# A boolean therefore reaches the trainer as --key=true or --key=false, which a plain store_true flag rejects. validate and run --dry-run warn once, naming every boolean trainer_config leaf, fixed override and categorical choice; set such a flag in trial_command or have the trainer accept a value.
-# hydra puts trainer_config's flattened leaves and the overrides in the command as shell-quoted key=value tokens at {overrides}, without importing Hydra. null renders as null, booleans as true or false, and strings are double-quoted with quotes escaped.
-# Floats render with Python's str() in both formats, and a list renders as [a,b].
-# argparse and hydra accept null, booleans, integers, finite floats, strings and lists of those. hydra also rejects control characters and ${...} in strings.
-# json_file requires strict JSON-compatible values.
-# Every attempt also gets overrides_resolved.json. For yaml_file and json_file it is the flat audit copy of the overrides alone and not the trainer input. For argparse and hydra it is the trainer input: the merged flat mapping of trainer_config and the overrides, which is the overrides alone when trainer_config is empty.
-# Requires: trial_command uses the placeholder that matches; violations fail config load.
-# Part of the study fingerprint.
+# How the trainer receives its inputs, as the section rules above describe.
+# Warning: argparse passes a boolean as --key=true or --key=false, which a plain store_true flag rejects. validate and run --dry-run name every boolean value.
 override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 
 # ---------- Storage and provenance ----------
+# <workdir>/<experiment> records its first storage: a switch between null and a journal or between journals is refused, as is a journal naming another workdir.
 
-# Where the study ledger is kept. null is disposable in-memory storage, auto is <workdir>/<experiment>/study.journal, and journal:///path selects an explicit local journal file.
-# In journal URLs three slashes start a relative path and four an absolute one: journal:///./runs/study.journal is relative to the config file's directory and journal:////tmp/study.journal is absolute.
-# A relative path is rewritten at config load to the absolute four-slash form under the config file's directory.
-# A leading ~ is expanded after three slashes, so journal:///~/x.journal is $HOME/x.journal. After four slashes it is literal, so journal:////~/x.journal is /~/x.journal.
-# The ledger identity is the path after symlinks are resolved.
-# SQLite, :memory:, external database URLs and every other form are rejected.
-# Journals support parallel trials on one host, not distributed-host execution.
-# Reuse of an existing ledger also requires current-format artifacts, matching trainer, evidence and provenance semantics, and the same trainer-environment cohort.
-# Changing semantic inputs needs a new experiment name. Run-control changes do not waive a stored abort or partial-timeout decision.
-# Requires: a journal URL spells its scheme exactly as lowercase journal and names a nonempty path. JOURNAL:///x.journal, journal:/// and journal:// fail config load.
-# Requires: a journal URL carries no ? or #, because a query or fragment would silently cut the path, and neither does the config file's directory when the path is relative. Config load fails; use auto when a directory name contains one.
-# Requires: provenance is nonempty for auto or a journal; phases with a nonempty search_space also need phases[].sampler.seed when stochastic. Config load fails otherwise.
-# Requires: workdir and the experiment name keep pointing at the same ledger. An artifact root <workdir>/<experiment> remembers its storage identity, which includes null, so switching between null and a journal or between two journals is refused, and so is opening one journal under another workdir or experiment name.
-# Excluded from the study fingerprint.
-# Warning: null cannot resume or top up a later invocation, and nothing it interrupts reruns.
+# Where the study ledger lives: null in memory, auto at <workdir>/<experiment>/study.journal, or a journal:///PATH file. Other URLs, such as SQLite, fail.
+# Three slashes start a relative path and four an absolute one, as in journal:///./runs/s.journal and journal:////tmp/s.journal. ~ expands after three slashes.
+# The scheme is lowercase journal and the URL names a file. A ? or # in the URL, or in a relative path's config directory, fails config load, so use auto then.
+# Requires: a nonempty provenance for auto or a journal.
+# Warning: null cannot resume or top up a later invocation, and nothing it interrupts reruns. Every invocation runs the whole n_trials again.
 storage: string | null = null
 
-# Directory that holds per-experiment generations, phase and attempt directories, logs and winner files.
-# A relative path, including the default ./runs, resolves against the config file's directory, not the directory phasesweep is started from or execution.cwd. A leading ~ is expanded and symlinks are resolved. Write . for the config file's directory; the empty string fails config load.
-# Requires: storage and the experiment name agree with the artifact-root binding already in <workdir>/<experiment>; a mismatch refuses reuse.
-# Excluded from the study fingerprint.
-# Warning: changing execution.cwd does not move this directory. Give trainer outputs a trial-specific path through trainer_config or trial_command.
+# Directory for per-experiment generations, attempt directories, logs and winner files. Write . for the config file's directory; "" fails config load.
+# Warning: changing execution.cwd does not move it. Give trainer outputs a trial-specific path through trainer_config or trial_command.
 workdir: string = "./runs"
 
-# Operator-defined identifiers for inputs outside this YAML that git does not capture, such as dataset_revision, tokenizer_revision and dependency versions.
-# Each generation's reproducibility.json also records code_revision on its own: the git commit of the trainer's working directory (execution.cwd) and whether tracked files differ from it, or null outside a git work tree. It is never compared, so the trainer's code revision needs no entry here.
-# Keys and values are nonblank YAML strings, and they are part of the study fingerprint.
-# Requires: storage auto or a journal needs at least one entry; blank keys or values fail config load.
-# Warning: values are copied into the shareable reproducibility.json of each generation, so they must not hold secrets.
-# Recommended: change these whenever an input outside this YAML changes. PhaseSweep does not infer downloaded model or data revisions.
-# Warning: changing a value or key changes the fingerprint of every phase, so an existing study refuses the run. Set a new experiment name to run the changed config as a new study (with storage auto a new workdir also works); the old study stays readable under the old name.
+# Operator-defined identifiers of inputs outside this YAML that git does not capture, such as dataset_revision and dependency versions.
+# Keys and values are nonblank strings. Each generation records the trainer's git revision apart and never compares it, so trainer code needs no entry.
+# Warning: values are copied into each generation's shareable reproducibility.json, so they must not hold secrets.
+# Recommended: change a value whenever its input changes. A study with trials then refuses the changed fingerprint, so run under a new experiment name.
 provenance: map[string, string] = {}
 
 # ---------- Constraints ----------
+# A measured value outside a constraint's bounds makes the attempt infeasible: it keeps its real objective value for the sampler but cannot win.
+# An infeasible attempt counts toward phases[].max_consecutive_failures. Every constraint is read even after one is violated.
+# A read that fails, or a value that is not a finite number, fails the attempt at once, before later constraints and gates are read.
 
-# Feasibility bounds on additional scalars, separate from metric ranking. Values below describe one item.
-# A measured violation leaves the attempt a normal finished trial that cannot win. It keeps its real objective value for the sampler.
-# A violation counts toward phases[].max_consecutive_failures, and a gate failure on a violating attempt still fails it.
-# Missing, invalid or non-finite evidence fails the attempt. Every constraint is evaluated even after an earlier one is violated.
-# Constraints are part of the study fingerprint.
-# Requires: constraints[].name values are distinct from metric.name, from observe[].name and from each other.
+# Feasibility bounds on additional scalars, separate from metric ranking. Each item is one constraint.
 constraints: list[object] = []
-  # Constraint name, any string the schema accepts. It labels the measured value in published results.
-  # Requires: distinct from metric.name, from every observe[].name and from every other constraints[].name; duplicates fail config load.
+  # Constraint name, any string distinct from the other names metric.name lists, which labels the measured value in published results.
   - name: string (required)
 
-    # Finite scalar reader with the same variants and keys as metric.extractor above.
-    # Requires: a json_envelope or wandb constraint leaves its evaluation_axis at the default, because only the metric extractor's axis is read; a different value fails config load.
-    extractor: json | json_envelope | log_regex | mlflow | wandb (required)
-      # Variant json; selected by type: json.
-      # Read one number from a JSON file in the attempt directory.
-      # The file must be strict JSON. Duplicate member names, or NaN, Infinity or -Infinity tokens anywhere in the file, invalidate the whole file.
-      # The value must be a JSON number: a boolean, string or container fails the trial, and so does a number that converts to a non-finite float, such as 1e999.
-      type: "json" (required)
+    # Scalar reader, selected by type. A json_envelope or wandb reader here must leave evaluation_axis at its default.
+    extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | MlflowExtractor | WandbExtractor (required)
 
-      # Path of the JSON file relative to the attempt directory, for example result.json.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # The trainer must write it inside its own attempt directory, which it finds through the {trial_dir} placeholder or the PHASESWEEP_TRIAL_DIR environment variable.
-      path: string (required)
-
-      # Dotted path of object keys to the number, for example eval.loss. Every segment must be nonempty.
-      # Each segment is looked up as an object key only. List indexes are not supported and a key that itself contains a dot cannot be addressed.
-      key: string (required)
-
-      # Variant json_envelope; selected by type: json_envelope.
-      # Read an attempt-bound result envelope that the trainer writes with phasesweep.report_objective() or the phasesweep report-objective command.
-      # The envelope must report schema_version 1, status "complete", and the generation ID, attempt ID and overrides_sha256 that PhaseSweep gave this attempt. Any mismatch fails the trial.
-      # overrides_sha256 is the SHA-256 of the trainer input file generated for this attempt, not a hash of the envelope.
-      # The envelope must also report a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite numeric objective.value. Extra top-level keys are allowed.
-      # PhaseSweep exports PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric extractor, so the trainer must write a constraint's envelope to the path configured here.
-      type: "json_envelope" (required)
-
-      # Path of the envelope file relative to the attempt directory, for example result.json.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # Use a different path from the metric extractor, or both read the same envelope.
-      path: string = "result.json"
-
-      # Exact objective.name the envelope must report, for example eval_loss. Must be nonempty. A mismatch fails the trial.
-      objective_name: string (required)
-
-      # Exact objective.split the envelope must report, for example validation. Must be nonempty. A mismatch fails the trial.
-      split: string (required)
-
-      # Exact evaluation.policy the envelope must report, for example final or best. Must be nonempty. A mismatch fails the trial.
-      # This validates the reported metadata only. It does not select a checkpoint.
-      policy: string (required)
-
-      # Exact evaluation.checkpoint identity the envelope must report. Must be nonempty. It never loads weights.
-      # Unset: any nonempty checkpoint identity the trainer reports is accepted.
-      checkpoint: string | null = null
-
-      # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
-      # Unset: any nonnegative step the trainer reports is accepted.
-      expected_step: int | null = null
-
-      # Progress axis for the evaluation_point confound check. Must be nonempty.
-      # Only used when: this is metric.extractor. A constraints[].extractor must leave it at step or config load fails, because only the objective's axis is read.
-      evaluation_axis: string = "step"
-
-      # Variant log_regex; selected by type: log_regex.
-      # Extract numbers from a log file in the attempt directory with a regular expression.
-      # A missing file, a file that is not valid UTF-8, or no numeric match fails the trial. A selected non-finite value also fails it.
-      type: "log_regex" (required)
-
-      # Log file relative to the attempt directory, for example stdout.log.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # stdout.log and stderr.log are written automatically and are separate files. Python logging writes to stderr by default, so a metric logged that way needs stderr.log.
-      file: string = "stdout.log"
-
-      # Python regular expression with a named group (?P<value>...) that captures the number, for example eval_loss=(?P<value>[0-9.eE+-]+).
-      # An invalid expression, or one without a group named value, fails config load.
-      # The file is split into lines at \n, \r\n and bare \r, and the expression is searched in each line separately, so a match cannot span lines. Every non-overlapping match in a line is one observation.
-      # Python's default flags apply and inline flags such as (?i) work.
-      # Captures that float() cannot parse are skipped. float() also accepts nan, inf and 1_0, so a loose capture can yield a non-finite value.
-      pattern: string (required)
-
-      # Which observation within this trial is the measured value: last or first by position in the file, min or max by value (the first of equal extremes).
-      # first stops matching at the first numeric match but still reads the rest of the file for its evidence digest.
-      # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, while a NaN seen after a number is ignored.
-      select: "last" | "first" | "min" | "max" = "last"
-
-      # Variant mlflow; selected by type: mlflow.
-      # Read the native unscoped metric history of the attempt's MLflow run once the run has finished.
-      # Requires: the top-level mlflow block with an MLflow metric.extractor, and no W&B extractor or gate anywhere in the config.
-      # Model-scoped and dataset-scoped metric observations are unsupported and fail the trial.
-      type: "mlflow" (required)
-
-      # Exact native metric name, for example eval_loss or eval/loss. Must be nonempty. Use the name the trainer actually logs, including slashes and underscores.
-      # Aliases, summary fallbacks and fuzzy matching are not provided.
-      # A metric missing from a finished run fails the trial at once, naming the metric and listing the metric keys the run does have, so a misspelled name costs no polling. A run that has not finished is polled until mlflow.timeout_seconds runs out.
-      metric_key: string (required)
-
-      # Which observation of the metric history is the measured value. Required, with no default.
-      # last takes the greatest step, then the latest timestamp. min and max take the extreme value, with the earliest step and then the earliest timestamp on ties.
-      # step takes the latest timestamp at the exact step given in constraints[].extractor.step.
-      # The selected point must be finite. min and max reject a history that contains any non-finite value. Conflicting values at one step and timestamp fail the trial.
-      # Requires: constraints[].extractor.step is set exactly when select is step; any other pairing fails config load.
-      select: "last" | "min" | "max" | "step" (required)
-
-      # Exact history step to read, an integer >= 0, in the units of the trainer's logged step counter.
-      # Requires: constraints[].extractor.select step needs this value, and setting it with last, min or max fails config load.
-      # Unset: no exact-step request.
-      step: int | null = null
-
-      # Variant wandb; selected by type: wandb.
-      # Read one scalar from the finished summary of the W&B run PhaseSweep manages for this attempt, never another run.
-      # PhaseSweep sets WANDB_RUN_ID to the attempt ID, so the run read is <entity>/<project>/<attempt ID>. The trainer must log to that run, must not choose its own run id, and must finish the run.
-      # Requires the phasesweep[wandb] extra in the controller environment.
-      # A run that has not finished is polled until timeout_seconds runs out. Failed, crashed, killed and preempted runs fail the trial at once and cannot win.
-      type: "wandb" (required)
-
-      # W&B API endpoint, with an http or https scheme and a host. Credentials, a query and a fragment are rejected.
-      # The scheme and host are lowercased and trailing slashes are stripped from the path.
-      # Requires: within each phase, its wandb_summary_required gates and the experiment-level wandb metric and constraint extractors agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load.
-      # Requires: no mlflow block anywhere in the config.
-      base_url: string = "https://api.wandb.ai"
-
-      # W&B account or team name, for example research-team. Must be nonempty and contain no slash or whitespace.
-      # Requires: all W&B consumers in a phase agree on the target and polling fields. The credentials in the composed trainer environment must be able to read this entity.
-      entity: string (required)
-
-      # W&B project name, for example bart-search. Must be nonempty and contain no slash or whitespace.
-      # Requires: all W&B consumers in a phase agree on the target and polling fields.
-      # Requires: the trainer honors the managed WANDB_ENTITY, WANDB_PROJECT, WANDB_BASE_URL and WANDB_RUN_ID, keeps WANDB_RESUME at never, and finishes its run.
-      project: string (required)
-
-      # Seconds between polls of the run state and summary. Finite and greater than 0; infinity and NaN fail config load.
-      # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
-      # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-      poll_seconds: float = 2.0
-
-      # Seconds one attempt may spend reading W&B evidence, at least 1. Finite; infinity and NaN fail config load.
-      # The budget is absolute for the attempt and includes worker startup, SDK calls and polling. All W&B consumers of the attempt share it, and the remaining phase and run budget also caps it.
-      # Expiry fails the trial.
-      # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
-      # Warning: unlike the mlflow block, this value is part of the study fingerprint, so changing it stops a populated phase from being reused.
-      timeout_seconds: float = 120.0
-
-      # Exact key in the run's finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate. Must be nonempty.
-      # A bare key does not stand in for its aggregate suffix, and the value must be a finite number.
-      # Warning: a numeric key missing from the finished summary is polled for 30 more seconds and then fails the trial with the missing and available keys named, so a misspelled key costs about that long on every trial.
-      # Requires: constraints[].extractor.evaluation_axis names neither this key nor, for a dotted key, the text before its last dot.
-      metric_key: string (required)
-
-      # History key that marks where the value was measured, for example eval/step or tokens. Must be nonempty. _step is W&B's own history step.
-      # Only used when: this is metric.extractor. A constraints[].extractor must leave it at _step or config load fails, because only the objective's position is read.
-      # Requires: not equal to constraints[].extractor.metric_key or to the text before its last dot; otherwise config load fails.
-      evaluation_axis: string = "_step"
-
-    # Inclusive maximum of the measured scalar, finite, in the scalar's units. A larger value makes the attempt infeasible.
-    # Requires: at least one of constraints[].min and constraints[].max, and min at most max when both are set; config load fails otherwise.
-    # Unset: no upper bound.
+    # Upper bound on the measured value, in its units. At least one of max and min is set.
     max: float | null = null
 
-    # Inclusive minimum of the measured scalar, finite, in the scalar's units. A smaller value makes the attempt infeasible.
-    # Requires: at least one of constraints[].min and constraints[].max, and min at most max when both are set; config load fails otherwise.
-    # Unset: no lower bound.
+    # Lower bound on the measured value, in its units.
     min: float | null = null
 
 # ---------- Observations ----------
+# An observation is read after the trial is accepted and its objective located, so it never spends the budget acceptance needed.
+# A read that fails, or a value that is not a finite number, logs a warning and records nothing for that name, never failing the trial or changing selection.
+# See: docs/config.md#report-only-observations for where recorded values appear.
 
-# Report-only scalars read from each accepted trial, separate from metric ranking and constraints. Values below describe one item.
-# Each observation is read with a local extractor after the trial is accepted and its objective position located, so reading one can never spend the budget acceptance needed.
-# A read that fails, or yields a non-finite value, logs a warning and records nothing for that name on that trial. It never fails the trial or changes feasibility, ranking or selection.
-# A recorded value is stored on the trial as the user attribute observed:<name>, which trials.csv carries as user_attr:observed:<name>. The selected winner's values are published as observed in winner.yaml, and a winner whose trial recorded none publishes an empty map. A phases[].repeats winner publishes each name's mean over the members that recorded it, and each member's own values under repeats.members[].observed.
-# An MLflow attempt run receives each recorded value as the metric phasesweep.observed.<name>, and the MCP results view returns the winner's values as observed.
-# Excluded from the study fingerprint: adding, removing or changing an observation never invalidates a populated study, and trials that ran before it was added report nothing for it.
-# Only local extractors are accepted. wandb and mlflow extractors fail the trial when a requested key is missing from the finished run, so a key the trainer never wrote would fail every trial, and they fail config load. Write the value with report_objective(..., extra=...) and read it with a json extractor.
-# Requires: observe[].name values are distinct from metric.name, from every constraints[].name and from each other; duplicates fail config load.
+# Report-only scalars recorded from each accepted trial. Each item is one observation.
 observe: list[object] = []
-  # Observation name, any string the schema accepts. It labels the recorded value in trials.csv, winner.yaml, MLflow and MCP results.
-  # Requires: distinct from metric.name, from every constraints[].name and from every other observe[].name; duplicates fail config load.
+  # Observation name, any string distinct from the other names metric.name lists, which labels the value in trials.csv, winner.yaml, MLflow and MCP.
   - name: string (required)
 
-    # Scalar reader with the same json, json_envelope and log_regex variants and keys as metric.extractor above. The wandb and mlflow variants are not accepted.
-    # Requires: a json_envelope observation leaves its evaluation_axis at the default, because only the metric extractor's axis is read; a different value fails config load.
-    extractor: json | json_envelope | log_regex (required)
-      # Variant json; selected by type: json.
-      # Read one number from a JSON file in the attempt directory.
-      # The file must be strict JSON. Duplicate member names, or NaN, Infinity or -Infinity tokens anywhere in the file, invalidate the whole file.
-      # The value must be a JSON number: a boolean, string or container records nothing, and so does a number that converts to a non-finite float, such as 1e999.
-      type: "json" (required)
-
-      # Path of the JSON file relative to the attempt directory, for example result.json.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # The trainer must write it inside its own attempt directory, which it finds through the {trial_dir} placeholder or the PHASESWEEP_TRIAL_DIR environment variable.
-      path: string (required)
-
-      # Dotted path of object keys to the number, for example eval.loss. Every segment must be nonempty.
-      # Each segment is looked up as an object key only. List indexes are not supported and a key that itself contains a dot cannot be addressed.
-      key: string (required)
-
-      # Variant json_envelope; selected by type: json_envelope.
-      # Read an attempt-bound result envelope that the trainer writes with phasesweep.report_objective() or the phasesweep report-objective command.
-      # The envelope must report schema_version 1, status "complete", and the generation ID, attempt ID and overrides_sha256 that PhaseSweep gave this attempt. Any mismatch records nothing.
-      # overrides_sha256 is the SHA-256 of the trainer input file generated for this attempt, not a hash of the envelope.
-      # The envelope must also report a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite numeric objective.value. Extra top-level keys are allowed.
-      # PhaseSweep exports PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric extractor, so the trainer must write an observation's envelope to the path configured here.
-      type: "json_envelope" (required)
-
-      # Path of the envelope file relative to the attempt directory, for example result.json.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # Use a different path from the metric extractor, or both read the same envelope.
-      path: string = "result.json"
-
-      # Exact objective.name the envelope must report, for example eval_loss. Must be nonempty. A mismatch records nothing.
-      objective_name: string (required)
-
-      # Exact objective.split the envelope must report, for example validation. Must be nonempty. A mismatch records nothing.
-      split: string (required)
-
-      # Exact evaluation.policy the envelope must report, for example final or best. Must be nonempty. A mismatch records nothing.
-      # This validates the reported metadata only. It does not select a checkpoint.
-      policy: string (required)
-
-      # Exact evaluation.checkpoint identity the envelope must report. Must be nonempty. It never loads weights.
-      # Unset: any nonempty checkpoint identity the trainer reports is accepted.
-      checkpoint: string | null = null
-
-      # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
-      # Unset: any nonnegative step the trainer reports is accepted.
-      expected_step: int | null = null
-
-      # Progress axis for the evaluation_point confound check. Must be nonempty.
-      # Only used when: this is metric.extractor. An observe[].extractor must leave it at step or config load fails, because only the objective's axis is read.
-      evaluation_axis: string = "step"
-
-      # Variant log_regex; selected by type: log_regex.
-      # Extract numbers from a log file in the attempt directory with a regular expression.
-      # A missing file, a file that is not valid UTF-8, or no numeric match records nothing. A selected non-finite value also records nothing.
-      type: "log_regex" (required)
-
-      # Log file relative to the attempt directory, for example stdout.log.
-      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
-      # stdout.log and stderr.log are written automatically and are separate files. Python logging writes to stderr by default, so a value logged that way needs stderr.log.
-      file: string = "stdout.log"
-
-      # Python regular expression with a named group (?P<value>...) that captures the number, for example eval_loss=(?P<value>[0-9.eE+-]+).
-      # An invalid expression, or one without a group named value, fails config load.
-      # The file is split into lines at \n, \r\n and bare \r, and the expression is searched in each line separately, so a match cannot span lines. Every non-overlapping match in a line is one candidate value.
-      # Python's default flags apply and inline flags such as (?i) work.
-      # Captures that float() cannot parse are skipped. float() also accepts nan, inf and 1_0, so a loose capture can yield a non-finite value.
-      pattern: string (required)
-
-      # Which candidate value within this trial is recorded: last or first by position in the file, min or max by value (the first of equal extremes).
-      # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, while a NaN seen after a number is ignored.
-      select: "last" | "first" | "min" | "max" = "last"
+    # Local scalar reader, selected by type. wandb and mlflow readers fail config load, because a key the trainer never wrote would fail every trial.
+    # Recommended: when metric.extractor is json_envelope, write the value with report_objective(..., extra=...) and read it with a json reader.
+    extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor (required)
 
 # ---------- MLflow target and ownership ----------
+# env may set MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT_ID or MLFLOW_EXPERIMENT_NAME only to the mlflow block's own normalized value, and never MLFLOW_RUN_ID.
+# Warning: constraint and observation names become MLflow metric keys, so a name MLflow rejects, such as acc@1, leaves accepted attempts' uploads pending.
 
-# Optional native MLflow integration: the source of the objective's metrics and the destination of PhaseSweep's result projections, on one existing MLflow experiment.
-# There is no standalone or cross-backend publishing. The block is valid only together with an MLflow metric.extractor.
-# Changing tracking_uri, experiment_id, experiment_name or run_mode changes the study fingerprint. poll_seconds and timeout_seconds do not.
-# Unset: MLflow integration is off, and MLflow extractors or gates without this block fail config load.
-# Requires: metric.extractor.type mlflow, and no W&B extractor or gate anywhere in the config. Local json and log_regex constraints and local gates remain allowed. Violations fail config load.
-# Requires: the phasesweep[mlflow] extra in the controller environment, an existing active experiment, and credentials that reach both the controller and the trainer.
-# The credentials need write access: PhaseSweep creates runs, logs metrics, params and tags, uploads artifacts and ends runs.
-# validate and --dry-run do not check authentication or the experiment. Each phase with trials left to run checks both before it allocates a trial.
-# The first phase to run creates one summary run per invocation in the experiment, and managed attempt runs are created under it.
-# Result projections are queued for each accepted trial, for generation winners and summaries, and, for managed runs, as a status-only record that ends the run of a failed or interrupted attempt.
-# A projection is written to the attempt's run as phasesweep.* metrics at step 0 (objective, feasible, duration_seconds, constraint.<name>, observed.<name>), phasesweep.override.<key> params, phasesweep.* tags and a phasesweep/<name>.json artifact.
-# A failed upload leaves a pending delivery without invalidating accepted scientific results.
-# phasesweep sync-tracking CONFIG retries every pending upload of every generation and rebuilds a published generation's unsaved winner records from its artifacts; --generation ID limits it to one generation. It trains nothing and rereads no metrics.
-# sync-tracking takes the experiment lock, so it cannot run while a sweep is active. It exits nonzero while uploads remain pending, when no deliveries exist, and when the config has no mlflow block.
-# No YAML key controls publishing or retrying.
+# Native MLflow integration on one existing experiment: the source of the objective's metrics and the destination of PhaseSweep's result projections.
+# Requires: metric.extractor of type mlflow, and no W&B reader or gate anywhere. Local constraints and gates stay allowed.
+# Requires: the phasesweep[mlflow] extra, and credentials with write access in both the controller and the trainer environment.
+# Warning: validate and run --dry-run check neither the credentials nor the experiment. Each phase with trials left checks both before its first trial.
+# See: docs/mlflow.md for run ownership, result delivery and sync-tracking.
 mlflow: object | null = null
-  # MLflow tracking server: an http or https URL, databricks, or databricks://profile.
-  # The scheme and host of an http URL are lowercased and trailing slashes are stripped. Credentials, a query and a fragment are rejected, and so is a databricks profile name that contains whitespace or a path.
-  # Local file and sqlite tracking URIs are unsupported. Use credential environment variables, not URL credentials.
-  # The value is passed unchanged to the MLflow client.
-  # Requires: mlflow.experiment_id or mlflow.experiment_name selects exactly one existing active experiment on this server. The controller verifies it before the first trial.
-  # Requires: env.MLFLOW_TRACKING_URI, if set, equals this normalized value as a string; a different spelling such as one with a trailing slash fails config load.
+  # MLflow tracking server: an http or https URL, databricks, or databricks://profile. Local file and sqlite URIs are rejected.
+  # An http URL is checked and normalized as WandbTarget.base_url is. A databricks profile with whitespace or a path is rejected.
+  # The normalized value goes to the MLflow client and to the trainer as MLFLOW_TRACKING_URI. Put credentials in environment variables, not the URI.
   tracking_uri: string (required)
 
-  # Native MLflow experiment ID, for example "123". Quote numeric IDs so YAML keeps a string; an unquoted number fails config load.
-  # PhaseSweep looks the experiment up and never creates it. A missing or deleted experiment fails before any trial. The first resolution is recorded, and a later resolution to a different experiment fails.
-  # The trainer receives this ID as MLFLOW_EXPERIMENT_ID.
-  # Unset: mlflow.experiment_name is required instead.
-  # Conflicts with: mlflow.experiment_name (setting both, or neither, fails config load).
-  # Requires: env.MLFLOW_EXPERIMENT_NAME is not set; any value fails config load when this key selects the experiment.
+  # Native MLflow experiment ID, for example "123". Quote it so YAML keeps a string.
+  # Exactly one of experiment_id and experiment_name is required. PhaseSweep looks the experiment up and never creates it.
+  # The trainer receives the resolved ID as MLFLOW_EXPERIMENT_ID under either selector.
   experiment_id: string | null = null
 
-  # Exact name of an existing active MLflow experiment, for example bart-search. Must be nonempty. No experiment is created implicitly.
-  # The trainer receives the resolved ID as MLFLOW_EXPERIMENT_ID, not the name.
-  # Unset: mlflow.experiment_id is required instead.
-  # Conflicts with: mlflow.experiment_id (setting both, or neither, fails config load).
-  # Requires: env.MLFLOW_EXPERIMENT_ID is not set; any value fails config load when this key selects the experiment.
+  # Exact nonempty name of an existing active MLflow experiment, for example bart-search.
   experiment_name: string | null = null
 
-  # Who creates and finishes each attempt's MLflow run.
-  # managed: PhaseSweep creates the run before the trainer starts and supplies MLFLOW_RUN_ID. The trainer must log to that run. PhaseSweep ends a run that is still RUNNING after a successful trainer exit, and marks it FAILED for a failed attempt or KILLED for an interrupted one.
-  # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(actual_run_id) inside the active run. PhaseSweep never ends a trainer-owned run.
-  # An attempt is ineligible when no binding exists, the run is outside the experiment or deleted, it carries another attempt's identity tags, it ended FAILED or KILLED, or it restarted during capture. A successful process exit alone does not make it eligible.
-  # Only the bound run's own metrics are read; a parent or child run is never read and unsupported as evidence.
-  # Requires: in trainer mode the trainer binds exactly the actual run in the configured experiment. A missing, foreign or conflicting binding fails the trial. The bound run may keep an existing parent.
+  # Who creates and ends each attempt's run. managed: PhaseSweep creates it before the trainer starts and supplies MLFLOW_RUN_ID.
+  # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(run_id) inside it.
   # Warning: a trainer that starts a different run instead of attaching to the managed ID logs evidence PhaseSweep does not read.
-  # Recommended: managed when the trainer can honor MLFLOW_RUN_ID; trainer for code that must own start_run(). Disable autolog and nested-run behavior that creates extra runs in the trainer itself.
+  # Recommended: managed when the trainer can honor MLFLOW_RUN_ID, and trainer for code that must own start_run(). Disable autologging and nested runs either way.
+  # See: docs/mlflow.md#choose-run-ownership
   run_mode: "managed" | "trainer" = "managed"
 
-  # Seconds between polls while waiting for the attempt's run to finish. Finite and greater than 0; infinity and NaN fail config load.
-  # Only the evidence capture polls. Experiment resolution, run creation and result uploads do not use it.
-  # Excluded from the study fingerprint.
+  # Seconds between polls while waiting for the attempt's run to finish, or for a run whose creation was not confirmed to appear. Greater than 0.
   poll_seconds: float = 2.0
 
-  # Seconds each controller tracking operation may take, at least 1. Finite; infinity and NaN fail config load.
-  # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length. A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
-  # The remaining phase and run deadlines also cap resolution, run creation and capture. Result uploads ignore them and are bounded only by this value.
-  # A capture that runs out of time fails the trial. An upload that runs out of time stays pending for phasesweep sync-tracking.
-  # The capture includes worker startup and stops polling min(5, timeout_seconds / 2) seconds early to report the run's state.
-  # This does not limit training time.
-  # A metric, param or tag missing from a finished run fails the trial at once, so this budget is spent only waiting for a run that has not finished.
-  # Excluded from the study fingerprint.
-  # Recommended: leave room for SDK startup and a slow server; the default of 120 suits most servers.
+  # Seconds each controller tracking operation may take, at least 1. It never limits training time.
+  # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length.
+  # A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
+  # Phase and run deadlines also cap resolution, creation and capture, and a capture cut short fails the trial. An upload that runs out waits for sync-tracking.
+  # Recommended: leave room for SDK startup and a slow server. The default suits most servers.
   timeout_seconds: float = 120.0
 
 # ---------- Execution environment ----------
+# Trainer environment, lowest to highest precedence: what execution.inherit_env selects, execution.passthrough_env, env, then per-attempt variables.
+# Before a phase with work left runs, its tracked environment must match the one its study's trials recorded, or the run is refused naming each difference.
+# See: docs/config.md#trainer-contract
 
-# Explicit trainer environment values, layered over the inherited environment and execution.passthrough_env values. Keys are variable names and values must be YAML strings.
-# They are semantic experiment inputs and part of the study fingerprint.
-# Requires: every key is nonempty and contains no = and no NUL character, and no value contains a NUL character, because the trainer launch cannot pass such entries. Config load fails otherwise.
-# Warning: values are written in plain text to generations/<generation id>/config.snapshot.yaml (mode 0600) and, as part of the tracked environment, with every trial in the study ledger, so rotating secrets belong in execution.passthrough_env instead.
-# PhaseSweep then assigns the per-attempt names PHASESWEEP_TRIAL_DIR, PHASESWEEP_TRIAL_ID, PHASESWEEP_PHASE, PHASESWEEP_RUN_NAME, PHASESWEEP_GENERATION_ID, PHASESWEEP_ATTEMPT_ID, PHASESWEEP_OVERRIDES_SHA256 and (for a json_envelope metric extractor) PHASESWEEP_OBJECTIVE_PATH. Values configured here for those names are discarded.
-# PHASESWEEP_TRIAL_DIR is the absolute attempt directory, PHASESWEEP_TRIAL_ID the phase-local trial number, and PHASESWEEP_GENERATION_ID the identifier of this invocation (the run ID under MCP).
-# PHASESWEEP_ATTEMPT_ID is a fresh random hex ID per attempt, PHASESWEEP_OVERRIDES_SHA256 the SHA-256 of the generated trainer input file, and PHASESWEEP_OBJECTIVE_PATH the attempt-directory path of the metric extractor's file.
-# Other PHASESWEEP_* names from the ambient environment, such as PHASESWEEP_LOCK_DIR, are inherited like any other variable.
-# PhaseSweep also assigns the leased CUDA_VISIBLE_DEVICES, and CUDA_DEVICE_ORDER where phases[].gpu_policy describes it.
-# With the mlflow block: MLFLOW_RUN_ID is forbidden here. MLFLOW_TRACKING_URI must equal mlflow.tracking_uri. MLFLOW_EXPERIMENT_ID or MLFLOW_EXPERIMENT_NAME may be set only for the selector the block uses, with the matching value. Violations fail config load.
-# With a W&B extractor or gate anywhere in the config: WANDB_BASE_URL, WANDB_ENTITY, WANDB_PROJECT and WANDB_RESUME must match the evidence target, and WANDB_RESUME must be never. WANDB_RUN_ID is forbidden, and offline or disabled settings (WANDB_MODE offline or dryrun or disabled, WANDB_DISABLED true) fail. PhaseSweep binds one fresh run ID per attempt.
-# A W&B setting taken from the ambient environment rather than env is checked when the trainer is launched, not at config load.
-# Without W&B evidence, an explicit env.WANDB_RUN_ID stays trainer-owned, an ambient WANDB_RUN_ID is removed, and other trainer-owned WANDB_* settings are kept. Without the mlflow block, MLFLOW_* variables are ordinary trainer environment.
-# Overrides: execution.inherit_env, execution.passthrough_env (a configured value replaces an inherited or passed-through value of the same name).
-# Explicit phases[].gpu_ids and phases[].gpu_devices take priority over env.CUDA_VISIBLE_DEVICES for pool discovery. The trainer receives its leased device token.
-# env.CUDA_VISIBLE_DEVICES of "" or -1 disables CUDA for the phase. Under single_per_trial any other value must name devices that exist, and an unknown token fails when the phase launches. Under none it reaches the trainer unchecked.
-# Recommended: put rotating credentials and proxy settings in execution.passthrough_env and make them available to the controller too. Trainer telemetry settings are kept when their backend is not an evidence consumer.
-# Recommended: under gpu_policy none set CUDA_VISIBLE_DEVICES here, or list it in execution.inherit_env, because the default inherit_env none drops an ambient GPU restriction. inherit_env all passes it too, but does not compare it between invocations.
-# Recommended: set cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed. A TMPDIR set here is part of the tracked environment and its digest. PhaseSweep does not provision or warm trainer caches.
+# Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
+# Values set here for the per-attempt PHASESWEEP_* names are discarded at launch, though they still enter the study fingerprint.
+# See: the MLflow section rules and WandbTarget for the tracking variables it may set.
+# Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
+# Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
 env: map[string, string] = {}
 
-# Trainer subprocess working directory and environment-selection contract. Nested defaults apply when the block is omitted.
-# Without the block the trainer runs in the directory phasesweep was started from (the catalog entry's cwd under MCP) with the minimal base environment (inherit_env none) plus env.
-# The effective working directory, the inheritance mode and names, and the pass-through names are part of the study fingerprint.
+# Trainer working directory and environment-selection contract. Nested defaults apply when the block is omitted.
 execution: object = {}
-  # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the config file's directory, not the directory phasesweep is started from. Write . for the config file's directory.
-  # The directory is not checked at config load or run start. It must exist when each trainer is launched; otherwise that attempt fails before the trainer starts and counts toward phases[].max_consecutive_failures.
-  # The effective absolute directory is part of the study fingerprint, so when it is unset two invocations from different directories do not share a study. The refusal names this key and both directories.
-  # phasesweep validate and run --dry-run print the effective directory on a trainer cwd: line.
-  # Requires: a nonempty string when set; the empty string fails config load.
-  # Unset: the trainer runs in the directory phasesweep was started from, or the catalog entry's cwd under MCP.
-  # Recommended: set it so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.
+  # Working directory of every trainer process. Write . for the config file's directory; "" fails config load.
+  # It is not checked at config load. A missing directory fails each attempt before the trainer starts, and the failures count toward max_consecutive_failures.
+  # Unset: the directory phasesweep was started from, or the catalog entry's cwd under MCP. A study with trials then refuses a run from another directory.
+  # Recommended: set it, or use absolute interpreter and script paths in trial_command, so the command resolves the same way from every invocation.
   cwd: string | null = null
 
-  # Which ambient variables the trainer inherits. none (the default) keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ, when present. A list of names adds exactly those variables to that base. all passes every variable.
-  # The default drops PYTHONPATH, virtualenv and conda settings, cache paths such as HF_HOME, proxies and credentials. A trainer that needs one of them fails or behaves differently, so name it in a list, set it under env, or choose all.
-  # phasesweep validate and run --dry-run print this contract on an environment: line. When a trial exits nonzero under none or a list, the first one in each phase whose last stderr.log line suggests a missing environment input logs a warning that names these three fixes.
-  # Such a line is a failed import (ModuleNotFoundError, ImportError, No module named), a missing command or file (command not found, No such file or directory), a KeyError on an uppercase name, or one saying environment variable or is not set. A failure whose last line names another cause, such as an out-of-memory error, gets no warning; a failure with no stderr line still does.
-  # CUDA_VISIBLE_DEVICES is never in the base set. Bind it with env.CUDA_VISIBLE_DEVICES or name it here.
-  # The same selection applies to the environment of PhaseSweep's own MLflow and W&B workers.
-  # Overridden by: env (a configured value replaces an inherited value of the same name).
-  # Conflicts with: execution.passthrough_env (a name cannot be in both; config load fails). A list that names TMPDIR also fails config load, because TMPDIR is always inherited when set and never digested. Names in a list must be unique, nonempty, unpadded and free of = and NUL characters.
-  # Warning: before each phase that still has work, the composed environment must match the one recorded for the study's earlier attempts, or the run is refused with a fingerprint mismatch. Each trial records the tracked environment in plain text in the study ledger: the base names, the names in a list, the env entries and the W&B and MLflow variables PhaseSweep composes, without TMPDIR, the execution.passthrough_env names, the PHASESWEEP_* names listed under env, or GPU bindings. The check compares a digest of those sorted name and value pairs. The refusal shows each differing variable with its old and new value, each added name with its value and each removed name with its old value; when no trial of the other cohort recorded its environment, it says so.
-  # Warning: a name in a list is recorded in plain text with each trial, and rotating its value refuses a resume. validate and run --dry-run warn about a listed name that contains TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL in any case. Credentials belong in execution.passthrough_env.
-  # PATH is in the tracked environment because it decides which interpreter and tools run, so resuming from a shell with a different PATH is refused: another environment, a shell that has not activated one, or a server or sandbox that sets its own PATH. Pin env.PATH and give trial_command an absolute interpreter path so every shell composes the same value, or add PATH to execution.passthrough_env when PATH differences are harmless.
-  # With all, the trainer inherits every variable, but the tracked environment covers the same names as with none. Variables such as PWD, SHLVL and the ambient CUDA_VISIBLE_DEVICES are inherited untracked, so unrelated shell changes cannot prevent reuse.
-  # To clear a mismatch, restore the environment, move the variable to execution.passthrough_env, or use a new experiment name.
-  # inherit_env none and an empty list give the same environment but different study fingerprints.
-  # Recommended: list the model, cache and GPU variables the trainer needs. Narrowed inheritance does not later pick up excluded credential or cache variables.
+  # Which ambient variables the trainer inherits: none, a list of names added to what none keeps, or all of them.
+  # none keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ when set, dropping PYTHONPATH, conda, HF_HOME, proxies and CUDA_VISIBLE_DEVICES.
+  # A list's names are unique, nonempty, unpadded, free of = and NUL, and neither TMPDIR nor a passthrough_env name.
+  # An empty list composes what none does but fingerprints differently.
+  # Warning: a listed name's value is recorded with each trial. validate and run --dry-run warn about names with TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL.
   inherit_env: "all" | "none" | list[string] = "none"
 
-  # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty, unpadded and free of = and NUL characters.
-  # TMPDIR is built in: it is always inherited when set and never digested, so a sandboxed and an ordinary shell agree on it, and it is not written here. A list adds names to it, and listing TMPDIR anyway changes nothing. PATH is not built in; see execution.inherit_env for why it is tracked.
-  # With inherit_env all this list adds nothing to the environment, because every ambient variable is already inherited. With none or a list, it adds these variables to the base set.
-  # The effective names, TMPDIR included, are part of the study fingerprint. Their values are neither recorded with each trial nor compared, so they can rotate without stopping reuse. A variable missing from the ambient environment is not invented.
-  # These variables also reach PhaseSweep's own MLflow and W&B workers, so they must exist in the controller's environment, including for sync-tracking.
-  # Conflicts with: execution.inherit_env (a name cannot be in both an explicit inherit_env list and this list; config load fails).
-  # Overridden by: env (a configured value replaces a passed-through value of the same name and stays semantic, TMPDIR included).
-  # Warning: model, data and cache settings that change what a trial means belong in env or execution.inherit_env instead.
-  # Recommended: add PATH only when differences in it are harmless, for example when trial_command names an absolute interpreter path.
+  # Ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. TMPDIR is built in.
+  # Their names are fingerprinted, and their values are never recorded in the study ledger or compared. With inherit_env all, the list adds no variable.
+  # Names follow the inherit_env list rules. They also reach PhaseSweep's MLflow and W&B workers, so they must exist in the controller's environment.
+  # Recommended: put rotating credentials and proxy settings here, and PATH only when its differences are harmless, as with an absolute interpreter path.
+  # Warning: model, data and cache settings that change what a trial means belong in env or inherit_env instead.
   passthrough_env: list[string] = []
 
-  # Write the composed base environment to environment.json in each attempt directory with owner-only mode 0600.
-  # The file holds the digest, the inherit_env setting, the sorted effective passthrough_env names (TMPDIR included) and the full env mapping. It is written before the per-trial PHASESWEEP_* names, the GPU bindings and the per-attempt W&B and MLflow bindings are added, so they are absent from it.
-  # Whether or not this is true, the study ledger keeps each trial's tracked environment (see execution.inherit_env) and its digest, without the pass-through values. This file holds those, and under inherit_env all the rest of the inherited shell too.
-  # Excluded from the study fingerprint.
-  # Warning: true stores ambient and passed-through secrets in the file. Use it only when keeping the full environment is intended.
+  # Write the composed environment, pass-through values included, to an owner-only environment.json in each attempt directory.
+  # Its keys are digest, inherit_env, passthrough_env and env. env holds the config-level tracking targets, even an MLFLOW_EXPERIMENT_NAME the trainer never gets.
+  # It is written before the PHASESWEEP_* names, the leased GPU variables and the per-attempt run bindings are added, so those are absent from it.
+  # Warning: true stores ambient and passed-through secrets in that file.
   record_env: bool = false
 
-# Wallclock budget for one invocation of phasesweep run, in seconds, finite and >= 0. 0 expires immediately.
-# The clock starts once the ledger is claimed, before the continuation preflight and phase work. Initial locking and ledger setup are outside it.
-# The clock restarts at every invocation: a later run, a --from-phase resume or an MCP launch gets a fresh budget, and the time earlier invocations spent does not count against it.
-# The earliest of this deadline and each phase's own deadlines limits the work. W&B evidence reads and MLflow resolution, run creation and capture are capped by the remaining budget too; MLflow result uploads are not.
-# An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
-# Cleanup and publication can run past the deadline, and the deadline never waives process-cleanup requirements.
-# A value of 0 raises at the first phase even for a replay of finished work.
-# Excluded from the study fingerprint.
-# Unset: no run deadline.
+# ---------- Run deadline ----------
+
+# Wallclock budget for one phasesweep run invocation, in seconds, >= 0. Its clock starts once the ledger is claimed and restarts at every invocation.
+# It also caps W&B evidence reads and MLflow resolution, run creation and capture, but not MLflow result uploads.
+# 0 fails the first phase before it starts, even a replay of finished work.
+# See: docs/runtime.md#timeouts-cleanup-and-continuation
 timeout_seconds_per_run: float | null = null
+
+# ---------- Shared blocks ----------
+
+JsonExtractor:
+  # Variant json: read one number from a JSON file in the attempt directory. A null, boolean, string, container or non-finite number fails the read.
+  type: "json" (required)
+
+  # JSON file, for example result.json. The trainer finds the attempt directory through {trial_dir} or PHASESWEEP_TRIAL_DIR.
+  path: string (required)
+
+  # JSON key of the number, for example eval.loss. List indexes and keys that contain a dot cannot be addressed.
+  key: string (required)
+
+JsonEnvelopeExtractor:
+  # Variant json_envelope: read an attempt-bound result envelope, as phasesweep.report_objective() writes it.
+  # It must report schema_version 1, status complete, and the generation ID, attempt ID and overrides_sha256 PhaseSweep gave the attempt, or the read fails.
+  # It also reports a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite objective.value. Extra top-level keys are allowed.
+  # See: docs/config.md#reporting-an-objective
+  type: "json_envelope" (required)
+
+  # Envelope file. report_objective() writes the metric.extractor path, exported as PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric.extractor.
+  # A constraint's or observation's envelope at another path is the trainer's to write. At the same path it reads the metric's envelope.
+  path: string = "result.json"
+
+  # Exact nonempty objective.name the envelope must report, for example eval_loss.
+  objective_name: string (required)
+
+  # Exact nonempty objective.split the envelope must report, for example validation.
+  split: string (required)
+
+  # Exact nonempty evaluation.policy the envelope must report, for example final or best. It checks metadata and never selects a checkpoint.
+  policy: string (required)
+
+  # Exact nonempty evaluation.checkpoint the envelope must report. It never loads weights.
+  checkpoint: string | null = null
+
+  # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
+  expected_step: int | null = null
+
+  # Nonempty progress axis the sweep holds fixed, which the evaluation_point verdict compares. step is the envelope's own evaluation.step.
+  # Any other name is read from evaluation.progress, and a missing position, or one that is not a finite number >= 0, fails the read.
+  # Only used when: this is metric.extractor. A constraint or observation reader must leave it at its default, or config load fails.
+  # Recommended: the axis the comparison holds fixed, such as tokens for a fixed-token sweep.
+  # See: docs/config.md#training-length-comparison
+  evaluation_axis: string = "step"
+
+LogRegexExtractor:
+  # Variant log_regex: extract numbers from a log file in the attempt directory with a regular expression.
+  # A missing or unreadable file, a searched line that is not valid UTF-8, no numeric match, or a selected value that is not finite fails the read.
+  type: "log_regex" (required)
+
+  # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
+  file: string = "stdout.log"
+
+  # Python regular expression whose named group (?P<value>...) captures the number, such as loss=(?P<value>[0-9.eE+-]+). Without that group, config load fails.
+  # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
+  # Each match in a line is one observation. float() parsing skips bad captures but accepts nan, inf and 1_0, so a loose capture can select a non-finite value.
+  pattern: string (required)
+
+  # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.
+  # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, and a NaN seen after a number is ignored.
+  select: "last" | "first" | "min" | "max" = "last"
+
+# Requires: the top-level mlflow block.
+# See: docs/mlflow.md#select-metrics-and-require-evidence
+MlflowExtractor:
+  # Variant mlflow: read the native unscoped metric history of the attempt's MLflow run once it has finished. A model- or dataset-scoped point fails the read.
+  # A FAILED or KILLED run fails the read at once. Under run_mode managed, PhaseSweep finishes a run still running after the trainer exits and reads it.
+  # Under run_mode trainer, a run that has not finished is polled until mlflow.timeout_seconds runs out.
+  type: "mlflow" (required)
+
+  # Exact nonempty metric name as the trainer logs it, for example eval_loss or eval/loss, with no alias, summary fallback or fuzzy match.
+  # A metric missing from a finished run fails the trial at once, naming it and listing the run's metric keys.
+  metric_key: string (required)
+
+  # Which point of the metric history is used: last, min, max, or the point at step. It must be finite, and its step is the evaluation_point position.
+  # Requires: step set exactly when select is step.
+  select: "last" | "min" | "max" | "step" (required)
+
+  # Exact history step to read, an integer >= 0, in the units of the trainer's logged step counter.
+  step: int | null = null
+
+WandbExtractor:
+  # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for this attempt, <entity>/<project>/<attempt ID>.
+  # The trainer must log to that run under the managed WANDB_RUN_ID and finish it.
+  # See: docs/config.md#wb-evidence
+  type: "wandb" (required)
+  <<: WandbTarget
+
+  # Exact nonempty key in the finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate.
+  # A bare key never stands in for its aggregate.
+  # Warning: a metric_key missing from the finished summary is polled up to 30 more seconds, then fails the read, so a misspelled key costs that every trial.
+  metric_key: string (required)
+
+  # Nonempty history key logged with metric_key that marks where it was measured, for example eval/step or tokens. _step is W&B's own step.
+  # Log it in the same log() call. It may be neither metric_key nor, for a dotted metric_key, the text before its last dot.
+  # An aggregate key such as eval/loss.min is positioned at the end of its history series.
+  # Only used when: this is metric.extractor, as for the json_envelope evaluation_axis.
+  evaluation_axis: string = "_step"
+
+# The W&B target and polling fields of the wandb reader and the wandb_summary_required gate. Within a phase, every W&B reader and gate agrees on all five.
+# A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out.
+# Requires: the phasesweep[wandb] extra, and a trainer that honors the managed WANDB_* variables, including WANDB_RESUME never, and finishes its run.
+# Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, env.WANDB_RESUME, when set, is never, and env has no WANDB_RUN_ID.
+# Requires: no WANDB_MODE of offline, dryrun or disabled and no WANDB_DISABLED of 1, true, yes or on, in any case, in env or, at launch, inherited.
+WandbTarget:
+  # W&B API endpoint: an http or https URL with a host. Scheme and host are lowercased and trailing slashes stripped. Credentials, a query or a fragment fail.
+  base_url: string = "https://api.wandb.ai"
+
+  # W&B account or team, for example research-team: nonempty, without slash or whitespace. The trainer environment's credentials must be able to read it.
+  entity: string (required)
+
+  # W&B project, for example bart-search: nonempty, without slash or whitespace.
+  project: string (required)
+
+  # Seconds between polls of the run state and summary, greater than 0.
+  poll_seconds: float = 2.0
+
+  # Seconds one attempt may spend capturing the finished summary, at least 1, worker startup, SDK calls and polling included. Phase and run deadlines cap it too.
+  # After the objective is accepted, locating its history position gets a fresh budget of this length, capped by the same deadlines.
+  # History has up to 30 seconds of that to catch up with the summary, and reading it may use the rest.
+  # A capture that runs out fails the read. A position lookup that runs out only leaves the position unrecorded.
+  timeout_seconds: float = 120.0

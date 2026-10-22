@@ -81,8 +81,8 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 DESCRIPTION_EXPLAIN_CONFIG = (
     "Explain the experiment configuration schema: the type, default and rules of one config key "
     "and every key below it, with the section rules and shared-block descriptions that govern "
-    "them, or the top-level keys and the general notes on paths, YAML typing "
-    "and environment variables when key is omitted. Call only when the user "
+    "them, or the top-level keys and the general notes on the config file, paths, YAML "
+    "typing and the study fingerprint when key is omitted. Call only when the user "
     "asks for config-authoring help, narrowing with a key such as phases[].sampler; when "
     "found=false, retry with one of closest. Read-only: it describes the schema, not any "
     "catalog experiment, and needs no experiment id."
@@ -332,8 +332,8 @@ class ExplainConfigResult(_ToolPayload):
     )
     notes: str = Field(
         description=(
-            "General notes on file paths, YAML typing and environment variables, one line per "
-            "paragraph. Returned only when key is omitted; otherwise empty."
+            "General notes on the config file, paths, YAML typing and the study fingerprint, "
+            "one line per paragraph. Returned only when key is omitted; otherwise empty."
         )
     )
 

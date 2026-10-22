@@ -1644,7 +1644,8 @@ def test_config_error_appends_explain_hint(
     # The hint is a command the operator can paste.
     explained = CliRunner().invoke(cli_main, shlex.split(hint.removeprefix("see: phasesweep ")))
     assert explained.exit_code == 0
-    assert explained.output.startswith("phases[].sampler.type: ")
+    assert explained.output.startswith("Section Phases:\n")
+    assert "\n\nphases[].sampler.type: " in explained.output
 
 
 def test_config_error_hints_stay_few_and_distinct(
