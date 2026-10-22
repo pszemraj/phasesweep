@@ -1159,19 +1159,6 @@ def test_spawn_refuses_unreadable_pid_namespace_before_popen(
     assert [h for h in store.list_handles() if h.launch_state == "spawned"] == []
 
 
-def test_launch_records_the_servers_pid_namespace_in_the_spawned_handle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _config, app, _registry, store = side_effect_app(tmp_path)
-    patch_popen_capture(monkeypatch)
-
-    run_id = app.launch("srv")["run_id"]
-
-    handle = store.get(run_id)
-    assert handle is not None
-    assert handle.pid_namespace == read_pid_namespace()
-
-
 def test_runner_receipt_from_another_namespace_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

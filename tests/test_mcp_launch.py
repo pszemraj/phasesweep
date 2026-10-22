@@ -1153,7 +1153,7 @@ def test_spawned_runner_cannot_execute_project_local_code(
     assert str(project) not in resolved.read_text()
 
 
-def test_launch_records_the_current_boot_id_in_the_spawned_handle(
+def test_launch_records_the_spawned_process_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1165,6 +1165,7 @@ def test_launch_records_the_current_boot_id_in_the_spawned_handle(
     handle = store.get(run_id)
     assert handle is not None
     assert handle.boot_id == read_boot_id()
+    assert handle.pid_namespace == read_pid_namespace()
 
 
 def test_launch_refuses_a_runner_receipt_without_boot_identity(

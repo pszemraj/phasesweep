@@ -6,7 +6,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Metric, Phase
-from phasesweep.config.search import CategoricalParam, Sampler
+from phasesweep.config.search import CategoricalParam, FloatParam, Sampler
 from phasesweep.engine.errors import ResumeWinnerMissingError, StudyFingerprintMismatchError
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import make_experiment
@@ -58,17 +58,45 @@ def test_dry_run_refuses_changed_recorded_semantics(
     assert tree_snapshot(tmp_path / "runs") == before
 
 
-def test_dry_run_refuses_missing_inherited_winner(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "phases",
+    [
+        pytest.param(
+            [
+                Phase(name="parent", n_trials=1, fixed_overrides={"depth": 2}),
+                Phase(name="child", n_trials=1, inherits=["parent"]),
+            ],
+            id="fixed_only",
+        ),
+        pytest.param(
+            [
+                Phase(
+                    name="arch",
+                    fixed_overrides={"model_family": "llama"},
+                    n_trials=1,
+                    search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+                ),
+                Phase(
+                    name="lr",
+                    inherits=["arch"],
+                    n_trials=1,
+                    search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+                ),
+            ],
+            id="sampled",
+        ),
+    ],
+)
+def test_dry_run_refuses_missing_inherited_winner(tmp_path: Path, phases: list[Phase]) -> None:
     """A missing required parent cannot become a plausible preview placeholder."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        phases=[
-            Phase(name="parent", n_trials=1, fixed_overrides={"depth": 2}),
-            Phase(name="child", n_trials=1, inherits=["parent"]),
-        ],
+        phases=phases,
     )
 
-    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'parent'"):
-        run_experiment(experiment, from_phase="child", dry_run=True)
+    with pytest.raises(
+        ResumeWinnerMissingError, match=f"Winner file missing for phase {phases[0].name!r}"
+    ):
+        run_experiment(experiment, from_phase=phases[1].name, dry_run=True)
 
     assert not (tmp_path / "runs").exists()

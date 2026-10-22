@@ -25,7 +25,6 @@ from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublishedStudyMissingError,
-    ResumeWinnerMissingError,
     RunRequestError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -349,30 +348,6 @@ def test_fingerprint_changes_when_parent_winner_changes():
         "Fingerprint must encode inherited winner; otherwise --from-phase replay "
         "with a different parent winner silently mixes incompatible trials."
     )
-
-
-def test_from_phase_dry_run_refuses_missing_inherited_winner(tmp_path):
-    """A preview cannot replace a required missing winner with inherited placeholders."""
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        phases=[
-            Phase(
-                name="arch",
-                fixed_overrides={"model_family": "llama"},
-                n_trials=1,
-                search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
-            ),
-            Phase(
-                name="lr",
-                inherits=["arch"],
-                n_trials=1,
-                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            ),
-        ],
-    )
-    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'arch'"):
-        run_experiment(exp, from_phase="lr", dry_run=True)
-    assert not (tmp_path / "runs").exists()
 
 
 @pytest.mark.parametrize(
