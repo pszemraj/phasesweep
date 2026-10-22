@@ -81,7 +81,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation. CI and mandatory hooks retain their existing serial collection and contract-test scope.
+Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
 
 To inspect the cost of a qualification run:
 

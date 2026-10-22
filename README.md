@@ -59,7 +59,7 @@ phasesweep validate starter.yaml    # checks it without launching anything
 phasesweep run starter.yaml         # runs four tiny toy-trainer trials
 ```
 
-`phasesweep init` never overwrites an existing file. Use `phasesweep init --list` to choose a [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates), `--template NAME` to write it, and `-o PATH` to choose its destination. The templates run on the packaged toy trainer; replace the command, keys, and extractor with your own.
+`phasesweep init` never overwrites an existing file; `phasesweep init --list` shows the other [templates](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates).
 
 The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged):
 
@@ -102,7 +102,7 @@ Inspect recorded trials without launching work:
 phasesweep status starter.yaml --trials
 ```
 
-With persistent storage, rerun the same config after an interruption; interrupted trials rerun automatically. Recover a failure-aborted phase by raising its `n_trials` in the config, or, while its target still leaves trials to run, by raising its `max_consecutive_failures` in the config above the streak the abort recorded; or start an independent later phase with `--from-phase NAME` when its required ancestors have valid winners. See [continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) for trial budgets and reproducibility, and [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for status and result views.
+With persistent storage, rerun the same config after an interruption; interrupted trials rerun automatically. See [continuation and reruns](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation) for recovering an aborted phase, `--from-phase NAME` and trial budgets, and [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for status and result views.
 
 ## Use your own trainer
 

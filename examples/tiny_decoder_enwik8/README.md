@@ -17,7 +17,7 @@ For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-
 
 Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision) and [requirements](upstream/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
-Run GPU validation, dry runs, and training from a shell with host GPU access. If an agent sandbox hides the devices from `nvidia-smi`, use host execution for these commands.
+Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation).
 
 ## CLI smoke sweep
 
@@ -63,11 +63,11 @@ phasesweep run examples/tiny_decoder_enwik8/repeats.yaml
 
 The nine trials run sequentially on CUDA device `0`, with 80 optimizer updates, batch size 4, and sequence length 128 each. The objective is the saved step-80 `final.pt` loss over eight held-out validation batches. Each learning rate is ranked by its mean over the three seeds; `status --trials` includes every group's mean and sample SD. A within-noise advisory means the current seeds do not separate the candidate rates; this short example demonstrates the workflow rather than convergence.
 
-The last command replays a completed study without training again. After an interruption, the same command keeps completed trials and reruns interrupted attempts before new cells. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [runtime recovery](../../docs/runtime.md#interrupted-trials-rerun) for failure aborts and retry budgets.
+The last command replays a completed study without training again. After an interruption, the same command keeps completed trials and reruns interrupted attempts before new cells. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for failure aborts and retry budgets.
 
 ## Continue one checkpoint
 
-PhaseSweep resumes the study by keeping completed trials and rerunning interrupted attempts from their starting configuration. To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints each winning member's seed, trial number, and exact `trial_dir` before the evidence YAML. This example saves its checkpoint at `trainer/final.pt` below that directory.
+To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints each winning member's seed, trial number, and exact `trial_dir` before the evidence YAML. This example saves its checkpoint at `trainer/final.pt` below that directory.
 
 Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests **five additional optimizer updates**. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
 
@@ -100,13 +100,7 @@ The subprocess runs from the upstream checkout so the saved relative `data_path`
 
 ## Native MLflow GPU smoke
 
-The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install the MLflow client and matching local server:
-
-```bash
-pip install "phasesweep[mlflow]" "mlflow==3.17.0"
-```
-
-Start the [local tracking server](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal, run from the PhaseSweep repository root. Create the experiment once; if it already exists, reuse it:
+The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install MLflow and start the local tracking server as in [Run the CPU example locally](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal, run from the PhaseSweep repository root. Create the experiment once; if it already exists, reuse it:
 
 ```bash
 python -c 'from mlflow import MlflowClient; c = MlflowClient(tracking_uri="http://127.0.0.1:5000"); c.get_experiment_by_name("phasesweep-tiny-decoder") or c.create_experiment("phasesweep-tiny-decoder")'
@@ -151,8 +145,7 @@ phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
 phasesweep mcp init-catalog --from /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml -o /tmp/phasesweep-tiny-decoder-mcp-smoke/catalog.yaml
 ```
 
-Review the generated catalog, enable `allow.launch`, and set `visible_params: all` if the agent should report the winning learning rate. Follow the [MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke, then use the [status response workflow](../../docs/mcp.md#reading-status-responses). A completed persistent smoke is reused on a later launch; choose a new experiment name and scratch directory when you want two fresh trials. GPU leasing does not impose a VRAM quota: verify the workload and monitor GPU memory separately when sharing a device.
-
+Review the generated catalog, enable `allow.launch`, and set `visible_params: all` if the agent should report the winning learning rate. Follow the [MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke, then use the [status response workflow](../../docs/mcp.md#reading-status-responses). A completed persistent smoke is reused on a later launch; choose a new experiment name and scratch directory when you want two fresh trials.
 ## MCP full sweep
 
 Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp_experiment.yaml`](mcp_experiment.yaml) with the PhaseSweep repo root as its runner `cwd`:

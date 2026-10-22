@@ -12,7 +12,7 @@ Install PhaseSweep and its optional MCP dependency in the Python environment tha
 pip install "phasesweep[mcp]"
 ```
 
-Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. Config validation and frozen scientific result reads do not authenticate. New work needs the selected SDK and access to its configured account or server. MLflow additionally requires an existing experiment; the client extra does not start a tracking server. See [native MLflow setup and run ownership](mlflow.md).
+Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. Config validation and frozen scientific result reads do not authenticate. New work needs the selected SDK and access to its configured account or server. See [native MLflow setup and run ownership](mlflow.md) for MLflow's tracking server and experiment.
 
 ### 2. Create and review the catalog
 
@@ -58,7 +58,7 @@ codex mcp list
 
 Restart or reconnect the client as its documentation requires. Confirm the connection with the read-only `list_experiments` operation; for example, ask the agent to list available experiments and permitted actions without launching anything. The response contains catalog-approved IDs, descriptions, phase names, metrics, and permitted actions.
 
-To check the same operation without a client, or to script or debug a single tool call from a shell, run it directly; it prints the structured result as JSON, or the tool error on stderr:
+To check the same operation without a client, run it from a shell:
 
 ```bash
 phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
@@ -74,10 +74,10 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend; the running server applies it on the next call.
 - A launch refused because the catalog or a config it lists `no longer validates`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. A launch refused for a different `state_dir`: restart the server. See [the catalog](mcp.md#the-catalog).
-- `concurrency limit reached` or an experiment that already has a running sweep: await a returned healthy blocking run ID, and never cancel or replace it automatically. Report a blocker the refusal marks as requiring operator recovery, or one whose runner liveness this server cannot verify, to the operator instead; see [run state and recovery](mcp.md#run-state-and-recovery).
-- Lock-directory access failure (`storage_unavailable`): the default host locks live under the OS account home's `.cache/phasesweep/locks`, which a sandbox can make unreachable. Follow the [lock directory rules](runtime.md#storage-and-locks) and set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox.
+- `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
+- Lock-directory access failure (`storage_unavailable`): set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox, following the [lock directory rules](runtime.md#storage-and-locks).
 - `recovery_required: true`, unresolved launch, or uncertain cleanup: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
 - Unavailable terminal snapshot: inspect run/server diagnostics; [historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
-- `runner_observable: false` or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces). With `recovery_required: true` as well, the runner's heartbeat under `state_dir/logs/` is missing or more than 120 seconds old, or its cleanup is uncertain: the runner has probably stopped, so check it and run `recover-run` from a host shell outside any sandbox. After a host suspend longer than two minutes this can read true for up to 15 seconds while the runner is alive; a later read clears it.
+- `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
 - Trainer environment cohort mismatch: the detached runner uses the server's environment; reconcile it with shell launches using the [trainer contract](config.md#trainer-contract).
