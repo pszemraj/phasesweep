@@ -8,7 +8,14 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    SkipValidation,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from phasesweep.config.common import (
     ConfigFloat,
@@ -493,7 +500,9 @@ class Phase(_Frozen):
         default_factory=list,
         description="Phase names whose winners become fixed overrides for this phase.",
     )
-    fixed_overrides: dict[str, Any] = Field(
+    # The override-format validators check these values and name the key and the fix;
+    # pydantic's own JsonValue check would refuse first with a bare "not a valid JSON value".
+    fixed_overrides: dict[str, SkipValidation[JsonValue]] = Field(
         default_factory=dict,
         description="Hard-coded overrides applied to every trial in this phase.",
     )
@@ -996,7 +1005,8 @@ class Experiment(_Frozen):
             "{trial_dir}, {trial_id}, {phase}, {run_name}."
         )
     )
-    trainer_config: dict[str, Any] = Field(
+    # Values skip pydantic's check for the reason given at Phase.fixed_overrides.
+    trainer_config: dict[str, SkipValidation[JsonValue]] = Field(
         default_factory=dict,
         description=(
             "Base trainer configuration embedded in this PhaseSweep YAML. In the default "

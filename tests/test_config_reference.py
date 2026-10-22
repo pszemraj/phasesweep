@@ -48,7 +48,7 @@ def _type_signature(node: JsonObject) -> str:
     :return str: The type as the reference spells it.
     """
     if "$ref" in node:
-        return "object"
+        return "any" if node["$ref"].endswith("/JsonValue") else "object"
     if "const" in node:
         return json.dumps(node["const"])
     if "enum" in node:
