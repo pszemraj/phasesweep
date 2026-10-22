@@ -150,15 +150,13 @@ def test_run_status_distinguishes_unknown_trial_counts_from_known_zero(
     result_type = AwaitRunResult if read_tool == "await_run" else GetRunStatusResult
     result = result_type.model_validate(payload)
     phase = result.phases[0]
-    assert phase.target_terminal_trials == registry.get("srv").experiment.phases[0].n_trials
+    assert phase.target_finished_trials == registry.get("srv").experiment.phases[0].n_trials
     assert phase.trial_data_available is not snapshot_unavailable
     counts = (
-        phase.running_trials_total,
-        phase.completed_trials_total,
-        phase.terminal_trials_total,
-        phase.terminal_trials_before_run,
+        phase.finished_trials_total,
+        phase.finished_trials_before_run,
         phase.attempts_launched_this_run,
-        phase.terminal_trials_this_run,
+        phase.finished_trials_this_run,
     )
     if snapshot_unavailable:
         assert phase.trials is None
@@ -168,7 +166,7 @@ def test_run_status_distinguishes_unknown_trial_counts_from_known_zero(
     else:
         assert phase.trials and set(phase.trials.values()) == {0}
         assert counts == (0,) * len(counts)
-        assert phase.remaining_trials == phase.target_terminal_trials
+        assert phase.remaining_trials == phase.target_finished_trials
         assert phase.target_already_satisfied is False
 
 

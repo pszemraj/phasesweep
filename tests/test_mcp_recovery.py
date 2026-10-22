@@ -562,7 +562,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         assert payload["run"]["state"] == "failed"
         assert payload["run"]["recovery_required"] is False
         assert payload["run"]["failure"] == failure
-        assert payload["phases"][0]["running_trials_total"] is None
+        assert payload["phases"][0]["trials"] is None
         assert payload["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
     assert winners["represented_generation_id"] is None
@@ -1388,7 +1388,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         status_kwargs["result_snapshot"] = capture_result_snapshot(exp)
     write_unsafe_cleanup_status(store, run_id, **status_kwargs)
     if expect_running_before_confirm:
-        assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
+        assert app.status(run_id=run_id)["phases"][0]["trials"]["RUNNING"] == 1
 
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
@@ -1453,7 +1453,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "FAIL": 0,
             "INTERRUPTED": 1,
         }
-        assert recovered_status["phases"][0]["running_trials_total"] == 0
+        assert recovered_status["phases"][0]["trials"]["RUNNING"] == 0
 
     final_status = store.status_path(run_id).read_bytes()
     final_recovery = store.cleanup_recovery_path(run_id).read_bytes()
@@ -1550,9 +1550,9 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert phase["generation_trials"]["INTERRUPTED"] == 1
     assert not store.observe(handle).recovery_required
     recovered_status = app.status(run_id=run_id)["phases"][0]
-    # An interrupted trial is not terminal for the budget: it reruns.
-    assert recovered_status["terminal_trials_this_run"] == 0
-    assert recovered_status["terminal_trials_before_run"] == 0
+    # An interrupted trial is not finished, so it spends no budget: it reruns.
+    assert recovered_status["finished_trials_this_run"] == 0
+    assert recovered_status["finished_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
 
     final_status = store.status_path(run_id).read_bytes()

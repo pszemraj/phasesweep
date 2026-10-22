@@ -108,15 +108,15 @@ def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
     )
 
 
-def test_status_floors_inconsistent_historical_terminal_count() -> None:
+def test_status_floors_inconsistent_historical_finished_count() -> None:
     """A partial snapshot cannot expose a negative pre-run trial count."""
     payload = _status_payload({"trials": {"COMPLETE": 1}, "generation_trials": {"COMPLETE": 2}})
 
-    assert payload["phases"][0]["terminal_trials_before_run"] == 0
+    assert payload["phases"][0]["finished_trials_before_run"] == 0
 
 
-def test_status_counts_infeasible_trials_as_terminal_but_not_completed() -> None:
-    """INFEASIBLE is a state of its own: it spends the target, and ``completed`` leaves it out."""
+def test_status_counts_infeasible_trials_as_finished_but_not_complete() -> None:
+    """INFEASIBLE is a state of its own: it spends the target, and ``COMPLETE`` leaves it out."""
     payload = _status_payload(
         {
             "trials": {"COMPLETE": 1, "INFEASIBLE": 1, "FAIL": 1},
@@ -133,9 +133,8 @@ def test_status_counts_infeasible_trials_as_terminal_but_not_completed() -> None
         "FAIL": 1,
         "INTERRUPTED": 0,
     }
-    assert phase["completed_trials_total"] == 1
-    assert phase["terminal_trials_total"] == 3
-    assert phase["terminal_trials_this_run"] == 1
+    assert phase["finished_trials_total"] == 3
+    assert phase["finished_trials_this_run"] == 1
     assert phase["remaining_trials"] == 0
 
 
@@ -153,10 +152,10 @@ def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Pat
         "FAIL": 0,
         "INTERRUPTED": 0,
     }
-    assert phase["terminal_trials_total"] == 0
-    assert phase["terminal_trials_before_run"] == 0
+    assert phase["finished_trials_total"] == 0
+    assert phase["finished_trials_before_run"] == 0
     assert phase["attempts_launched_this_run"] == 0
-    assert phase["terminal_trials_this_run"] == 0
+    assert phase["finished_trials_this_run"] == 0
     assert phase["target_already_satisfied"] is False
     assert phase["remaining_trials"] == phase_target
 
@@ -205,10 +204,10 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         "FAIL": 1,
         "INTERRUPTED": 0,
     }
-    assert run_status["phases"][0]["terminal_trials_total"] == 3
-    assert run_status["phases"][0]["terminal_trials_before_run"] == 3
+    assert run_status["phases"][0]["finished_trials_total"] == 3
+    assert run_status["phases"][0]["finished_trials_before_run"] == 3
     assert run_status["phases"][0]["attempts_launched_this_run"] == 0
-    assert run_status["phases"][0]["terminal_trials_this_run"] == 0
+    assert run_status["phases"][0]["finished_trials_this_run"] == 0
     assert run_status["phases"][0]["target_already_satisfied"] is True
     assert run_status["phases"][0]["remaining_trials"] == 0
     assert run_status["result_source"] == "frozen_run_snapshot"

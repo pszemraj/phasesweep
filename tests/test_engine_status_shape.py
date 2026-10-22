@@ -56,9 +56,7 @@ payload carries no empty error field.
 
 PHASE_STATUS_KEYS = {
     "trials",
-    "running",
     "n_trials",
-    "completed",
     "generation_trials",
     "published_study_unavailable",
     "trial_data_available",
@@ -121,7 +119,7 @@ def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
     assert phase["name"] == "p"
     assert phase["winner"] is not None
-    assert phase["completed"] == 2
+    assert phase["trials"] == {"COMPLETE": 2}
 
 
 def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path) -> None:
@@ -173,8 +171,8 @@ def _mixed_outcome_experiment(tmp_path: Path) -> Experiment:
 def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> None:
     """A trial that completed out of bounds reads INFEASIBLE in the counts, as in ``status --trials``.
 
-    ``completed`` is the COMPLETE count: trials that finished within every bound and
-    constraint. Infeasible and failed trials are terminal and count toward ``n_trials``.
+    ``COMPLETE`` counts the trials that finished within every bound and constraint.
+    Infeasible and failed trials are finished too and count toward ``n_trials``.
     """
     experiment = _mixed_outcome_experiment(tmp_path)
     run_experiment(experiment)
@@ -185,7 +183,6 @@ def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> Non
     expected = {"COMPLETE": 1, "INFEASIBLE": 1, "FAIL": 1}
     assert phase_status["trials"] == expected
     assert phase_status["generation_trials"] == expected
-    assert phase_status["completed"] == 1
     assert read_phase["trials"] == expected
     assert next(iter(phase_status)) == "name"
     (table,) = read_trial_tables(experiment).phases

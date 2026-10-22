@@ -162,10 +162,7 @@ def _phase_status_payloads(
         counts = stats.counts
         payload: dict[str, Any] = {
             "trials": counts,
-            "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
-            # The COMPLETE count: infeasible trials are counted apart, under INFEASIBLE.
-            "completed": counts.get("COMPLETE", 0),
             "generation_trials": (
                 stats.generation_counts.get(trial_scope_generation_id, {})
                 if trial_scope_generation_id

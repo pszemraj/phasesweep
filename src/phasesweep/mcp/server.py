@@ -392,35 +392,26 @@ class PhaseStatusPayload(_ToolPayload):
     trials: dict[TrialStateName, int] | None = Field(
         description=(
             "Dense cumulative study counts, or null when unavailable. Every state key is "
-            "present when counts are known. INFEASIBLE counts trials that finished outside "
+            "present when counts are known. COMPLETE counts trials that finished inside every "
+            "metric bound and constraint. INFEASIBLE counts trials that finished outside "
             "the metric bounds or constraints; they can never win. INTERRUPTED "
             "counts trials a deadline, shutdown or orchestrator death cut short; they are "
             "not finished, and WAITING counts their scheduled reruns."
         )
     )
-    running_trials_total: int | None = Field(
-        ge=0, description="Cumulative RUNNING study rows; null when unavailable."
-    )
-    target_terminal_trials: int = Field(ge=0, description="Configured finished-trial target.")
-    completed_trials_total: int | None = Field(
+    target_finished_trials: int = Field(ge=0, description="Configured finished-trial target.")
+    finished_trials_total: int | None = Field(
         ge=0,
-        description=(
-            "Cumulative COMPLETE study rows, those within every bound and constraint; "
-            "null when unavailable."
-        ),
+        description="Cumulative COMPLETE + INFEASIBLE + FAIL study rows; null when unavailable.",
     )
-    terminal_trials_total: int | None = Field(
-        ge=0,
-        description=("Cumulative COMPLETE + INFEASIBLE + FAIL study rows; null when unavailable."),
-    )
-    terminal_trials_before_run: int | None = Field(
+    finished_trials_before_run: int | None = Field(
         ge=0,
         description="Finished rows that predate the represented generation; null when unavailable.",
     )
     attempts_launched_this_run: int | None = Field(
         ge=0, description="All attempts owned by the represented generation; null when unavailable."
     )
-    terminal_trials_this_run: int | None = Field(
+    finished_trials_this_run: int | None = Field(
         ge=0,
         description="Finished attempts owned by the represented generation; null when unavailable.",
     )

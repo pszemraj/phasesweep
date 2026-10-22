@@ -187,31 +187,26 @@ def status_payload(
         generation_counts = {
             state: int(raw_generation_counts.get(state, 0)) for state in TRIAL_STATE_NAMES
         }
-        terminal_trials_total = sum(counts[state] for state in FINISHED_TRIAL_STATES)
-        terminal_trials_this_run = sum(generation_counts[state] for state in FINISHED_TRIAL_STATES)
-        terminal_trials_before_run = max(
-            0,
-            terminal_trials_total - terminal_trials_this_run,
-        )
-        target_terminal_trials = int(phase["n_trials"])
+        finished_trials_total = sum(counts[state] for state in FINISHED_TRIAL_STATES)
+        finished_trials_this_run = sum(generation_counts[state] for state in FINISHED_TRIAL_STATES)
+        finished_trials_before_run = max(0, finished_trials_total - finished_trials_this_run)
+        target_finished_trials = int(phase["n_trials"])
         phases.append(
             {
                 "phase": phase["phase"],
                 "trials": counts if available else None,
-                "running_trials_total": counts["RUNNING"] if available else None,
-                "target_terminal_trials": target_terminal_trials,
-                "completed_trials_total": counts["COMPLETE"] if available else None,
-                "terminal_trials_total": terminal_trials_total if available else None,
-                "terminal_trials_before_run": terminal_trials_before_run if available else None,
+                "target_finished_trials": target_finished_trials,
+                "finished_trials_total": finished_trials_total if available else None,
+                "finished_trials_before_run": finished_trials_before_run if available else None,
                 "attempts_launched_this_run": sum(generation_counts.values())
                 if available
                 else None,
-                "terminal_trials_this_run": terminal_trials_this_run if available else None,
+                "finished_trials_this_run": finished_trials_this_run if available else None,
                 "remaining_trials": (
-                    max(0, target_terminal_trials - terminal_trials_total) if available else None
+                    max(0, target_finished_trials - finished_trials_total) if available else None
                 ),
                 "target_already_satisfied": (
-                    terminal_trials_before_run >= target_terminal_trials if available else None
+                    finished_trials_before_run >= target_finished_trials if available else None
                 ),
                 "winner_present": phase["winner_present"],
                 "trial_data_available": available,

@@ -87,9 +87,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
 
     phase: str
     trials: dict[str, NonNegativeInt]
-    running: NonNegativeInt
     n_trials: NonNegativeInt
-    completed: NonNegativeInt
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
@@ -367,9 +365,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
                 PhaseStatusSnapshot(
                     phase=phase.name,
                     trials=dict(zero_counts),
-                    running=0,
                     n_trials=phase.n_trials,
-                    completed=0,
                     generation_trials={},
                     winner_present=False,
                     trial_data_available=False,
@@ -527,7 +523,6 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         for attempt, _generation_id in recovered:
             phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
-        phase.running = phase.trials["RUNNING"]
         # Generation counts belong to represented_generation_id.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [

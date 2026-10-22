@@ -172,7 +172,7 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
                 f"runner exited early ({proc.returncode}); log:\n{log_path.read_text()}"
             )
         status = read_status(experiment)
-        if status["phases"][0]["running"] >= 1:
+        if status["phases"][0]["trials"].get("RUNNING", 0) >= 1:
             phase_dir = _trial_dir_for(experiment, "p", 0).parent
             for trial_dir in phase_dir.glob("trial_00000__*"):
                 if (trial_dir / PROCESS_IDENTITY_FILE).is_file():
