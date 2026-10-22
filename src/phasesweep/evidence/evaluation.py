@@ -185,7 +185,8 @@ class TrialContext:
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
-    wandb_capture_error: ExtractorError | None = field(default=None, compare=False)
+    # Holds at most one failed capture.
+    wandb_capture_failure: list[ExtractorError] = field(default_factory=list, compare=False)
     mlflow_settings: MlflowTarget | None = None
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
@@ -432,8 +433,8 @@ def _capture_wandb(
     """
     if ctx.wandb_capture:
         return ctx.wandb_capture
-    if ctx.wandb_capture_error is not None:
-        raise ctx.wandb_capture_error
+    if ctx.wandb_capture_failure:
+        raise ctx.wandb_capture_failure[0]
     query = ctx.wandb_query or WandbQuery(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
@@ -496,7 +497,7 @@ def _capture_wandb(
     except DeadlineExceededError:
         raise
     except ExtractorError as exc:
-        object.__setattr__(ctx, "wandb_capture_error", exc)
+        ctx.wandb_capture_failure.append(exc)
         raise
     ctx.wandb_capture.update(
         {
