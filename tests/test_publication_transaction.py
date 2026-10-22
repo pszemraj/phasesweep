@@ -1807,6 +1807,41 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
             "config_snapshot artifact names a different experiment",
             id="snapshot-names-another-experiment",
         ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {
+                key: value for key, value in payload.items() if key != "code_revision"
+            },
+            "reproducibility artifact has a malformed code_revision (the member is missing)",
+            id="reproducibility-drops-the-code-revision",
+        ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {**payload, "code_revision": "a" * 40},
+            "reproducibility artifact has a malformed code_revision "
+            "(Expected a JSON object, not str.)",
+            id="reproducibility-records-a-bare-commit",
+        ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {**payload, "code_revision": {"commit": "a" * 40}},
+            "reproducibility artifact has a malformed code_revision "
+            "(it must be null or hold exactly commit and dirty)",
+            id="reproducibility-omits-the-dirty-flag",
+        ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {**payload, "code_revision": {"commit": "abc123", "dirty": False}},
+            "reproducibility artifact has a malformed code_revision "
+            "(commit must be a full lowercase hex git commit id)",
+            id="reproducibility-records-a-short-commit",
+        ),
+        pytest.param(
+            _REPRODUCIBILITY_NAME,
+            lambda payload: {**payload, "code_revision": {"commit": "a" * 40, "dirty": "no"}},
+            "reproducibility artifact has a malformed code_revision (dirty must be a boolean)",
+            id="reproducibility-records-a-non-boolean-dirty",
+        ),
     ],
 )
 def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(

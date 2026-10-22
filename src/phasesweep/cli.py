@@ -686,6 +686,12 @@ def show_winners(config_path: Path) -> None:
                 f"{validated.generation_id} does not match the current config."
             )
             click.echo("# Rendering the saved phase plan and annotations.")
+        revision = validated.code_revision
+        if revision is None:
+            click.echo("# code revision: unknown (not a git work tree or git unavailable)")
+        else:
+            dirty = " (dirty)" if revision["dirty"] else ""
+            click.echo(f"# code revision: {revision['commit']}{dirty}")
         if validated.argparse_trainer_config is not None:
             click.echo("# Producing argparse trainer base, before phase overrides.")
             click.echo(

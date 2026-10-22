@@ -8,8 +8,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import cli
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import _generation_reproducibility_path
 from phasesweep.engine.provenance import _code_revision
@@ -201,3 +204,38 @@ def test_generation_records_no_revision_for_a_trainer_cwd_outside_git(
     record = _published_record(experiment)
     assert "code_revision" in record
     assert record["code_revision"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("state", ["clean", "dirty", "outside-git"])
+def test_show_winners_names_the_code_revision_that_produced_the_winners(
+    tmp_path: Path, hermetic_git: None, state: str
+) -> None:
+    """The printed revision is the producing generation's, not the checkout's today."""
+    cwd = tmp_path / "repo"
+    if state == "outside-git":
+        cwd.mkdir()
+        head = None
+    else:
+        head = _committed_repo(cwd)
+    if state == "dirty":
+        (cwd / "tracked.txt").write_text("v2\n")
+    experiment = _experiment_running_in(tmp_path, cwd)
+    run_experiment(experiment)
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+
+    # A later commit must not change what an earlier generation reports.
+    if head is not None:
+        (cwd / "tracked.txt").write_text("v3\n")
+        _git(cwd, "commit", "-q", "-am", "later")
+
+    result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+    assert result.exit_code == 0, result.output
+    expected = {
+        "clean": f"# code revision: {head}\n",
+        "dirty": f"# code revision: {head} (dirty)\n",
+        "outside-git": "# code revision: unknown (not a git work tree or git unavailable)\n",
+    }[state]
+    assert expected in result.output
+    assert result.output.index(expected) < result.output.index("=== p ===")

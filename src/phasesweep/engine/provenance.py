@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TypedDict
 
@@ -22,6 +23,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.runtime.files import atomic_text_writer, file_sha256, private_atomic_write_text
+from phasesweep.runtime.json import json_object, json_text
 
 _GIT_COMMAND_TIMEOUT_SECONDS = 10
 # SHA-1 repositories name commits with 40 hex digits and SHA-256 repositories with 64.
@@ -114,6 +116,34 @@ def _code_revision(cwd: Path) -> CodeRevision | None:
     if changes is None:
         return None
     return {"commit": commit, "dirty": bool(changes)}
+
+
+def _parse_code_revision(record: Mapping[str, object]) -> CodeRevision | None:
+    """Validate the ``code_revision`` member of a published reproducibility record.
+
+    The member is mandatory: ``null`` is a recorded "unreadable", never a stand-in for
+    absence.
+
+    :param Mapping[str, object] record: The decoded ``reproducibility.json``.
+    :raises ValueError: The member is absent, or is neither ``null`` nor an object holding
+        exactly a full lowercase hex ``commit`` and a boolean ``dirty``.
+    :return CodeRevision | None: The recorded revision, or ``None`` when none was readable.
+    """
+    if "code_revision" not in record:
+        raise ValueError("the member is missing")
+    raw = record["code_revision"]
+    if raw is None:
+        return None
+    revision = json_object(raw)
+    if set(revision) != {"commit", "dirty"}:
+        raise ValueError("it must be null or hold exactly commit and dirty")
+    commit = json_text(revision, "commit")
+    if _GIT_COMMIT_PATTERN.fullmatch(commit) is None:
+        raise ValueError("commit must be a full lowercase hex git commit id")
+    dirty = revision["dirty"]
+    if not isinstance(dirty, bool):
+        raise ValueError("dirty must be a boolean")
+    return {"commit": commit, "dirty": dirty}
 
 
 def _phase_config_fingerprint(phase: Phase) -> str:
