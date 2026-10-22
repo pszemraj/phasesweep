@@ -34,6 +34,7 @@ from phasesweep.evidence.models import (
     _WandbSummarySource,
 )
 from phasesweep.evidence.wandb import (
+    WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunTerminalError,
     WandbSetupError,
@@ -423,7 +424,8 @@ def _capture_wandb(
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
     :raises DeadlineExceededError: The execution deadline prevents capture.
-    :raises ExtractorError: Polling, authentication, SDK setup, run state, or evidence is invalid.
+    :raises ExtractorError: Polling, authentication, SDK setup, or run state fails, the
+        finished summary lacks required keys, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
@@ -471,6 +473,11 @@ def _capture_wandb(
     except WandbRunTerminalError as exc:
         raise ExtractorError(
             f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
+        ) from exc
+    except WandbMissingKeysError as exc:
+        raise ExtractorError(
+            f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
+            f"available summary keys: {exc.available!r}."
         ) from exc
     except ImportError as exc:
         raise ExtractorError(

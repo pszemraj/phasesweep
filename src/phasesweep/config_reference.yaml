@@ -233,7 +233,7 @@ metric: object (required)
 
     # Exact key in the run's finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate. Must be nonempty.
     # A bare key does not stand in for its aggregate suffix, and the value must be a finite number.
-    # Warning: a numeric key missing from the summary is polled for until timeout_seconds runs out, so a misspelled key costs about that long on every trial.
+    # Warning: a numeric key missing from the finished summary is polled for 30 more seconds and then fails the trial with the missing and available keys named, so a misspelled key costs about that long on every trial.
     # Requires: metric.extractor.evaluation_axis names neither this key nor, for a dotted key, the text before its last dot.
     metric_key: string (required)
 
@@ -920,7 +920,7 @@ constraints: list[object] = []
 
       # Exact key in the run's finished summary, for example eval/loss, or eval/loss.min for a define_metric summary=min aggregate. Must be nonempty.
       # A bare key does not stand in for its aggregate suffix, and the value must be a finite number.
-      # Warning: a numeric key missing from the summary is polled for until timeout_seconds runs out, so a misspelled key costs about that long on every trial.
+      # Warning: a numeric key missing from the finished summary is polled for 30 more seconds and then fails the trial with the missing and available keys named, so a misspelled key costs about that long on every trial.
       # Requires: constraints[].extractor.evaluation_axis names neither this key nor, for a dotted key, the text before its last dot.
       metric_key: string (required)
 
