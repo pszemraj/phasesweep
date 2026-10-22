@@ -186,7 +186,7 @@ metric: object (required)
     # step takes the latest timestamp at the exact step given in metric.extractor.step.
     # The selected point must be finite. min and max reject a history that contains any non-finite value. Conflicting values at one step and timestamp fail the trial.
     # The step of the selected point is the objective's position for the evaluation_point confound check. MLflow has no evaluation_axis.
-    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config or phases[].fixed_overrides sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
+    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config, phases[].fixed_overrides or trial_command sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
     # metric.goal only ranks the selected values across trials and never supplies this selector.
     # Requires: metric.extractor.step is set exactly when select is step; any other pairing fails config load.
     select: "last" | "min" | "max" | "step" (required)
@@ -240,7 +240,7 @@ metric: object (required)
     # History key logged alongside metric_key that marks where the objective was measured, for example eval/step or tokens. Must be nonempty.
     # _step is W&B's own history step. Log the axis in the same log() call as the metric.
     # For an aggregate summary key the position is read at the end of the history series.
-    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config or phases[].fixed_overrides sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
+    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. validate and the dry run warn when trainer_config, phases[].fixed_overrides or trial_command sets it to true under a wandb or mlflow metric.extractor. Report through json_envelope with checkpoint and step when that matters.
     # Only used when: this is metric.extractor. A constraints[].extractor must leave it at _step or config load fails.
     # The position lookup is advisory after the objective is accepted. Missing or delayed history can leave no position while the scalar is kept, and the evaluation_point check is then n/a.
     # Requires: not equal to metric_key or to the text before its last dot; otherwise config load fails.

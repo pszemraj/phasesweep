@@ -176,7 +176,7 @@ def test_best_model_reload_warns_about_remote_evaluation_position(backend, sourc
 
     assert len(warnings) == 1
     warning = warnings[0]
-    assert "load_best_model_at_end=True" in warning
+    assert f"load_best_model_at_end=True (set in {source})" in warning
     assert "scored best-checkpoint weights may differ from the terminal training step" in warning
     assert "does not verify checkpoint identity" in warning
     assert all(
@@ -217,6 +217,119 @@ def test_best_model_envelope_does_not_warn_about_remote_history():
     )
 
     assert experiment_warnings(experiment) == []
+
+
+def _best_model_command_experiment(
+    trial_command: str,
+    *,
+    backend: str = "wandb",
+    override_format: str = "argparse",
+    trainer_config: JsonObject | None = None,
+) -> Experiment:
+    """Build an experiment with ``trial_command`` as the flag's source unless told otherwise."""
+    extractor = (
+        WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        if backend == "wandb"
+        else JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="best"
+        )
+    )
+    return make_experiment(
+        trial_command=trial_command,
+        override_format=override_format,
+        trainer_config=trainer_config,
+        metric=Metric(extractor=extractor),
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "python train.py --load_best_model_at_end {overrides}", id="bare-then-placeholder"
+        ),
+        pytest.param("python train.py {overrides} --load_best_model_at_end", id="bare-at-end"),
+        pytest.param(
+            "python train.py --load_best_model_at_end --lr 1e-4 {overrides}",
+            id="bare-then-flag",
+        ),
+        pytest.param("python train.py --load_best_model_at_end true {overrides}", id="true"),
+        pytest.param("python train.py --load_best_model_at_end True {overrides}", id="True"),
+        pytest.param("python train.py --load_best_model_at_end 1 {overrides}", id="one"),
+        pytest.param("python train.py --load_best_model_at_end yes {overrides}", id="yes"),
+        pytest.param("python train.py --load_best_model_at_end=true {overrides}", id="equals-true"),
+        pytest.param("python train.py --load_best_model_at_end=1 {overrides}", id="equals-one"),
+        pytest.param(
+            "python train.py training.load_best_model_at_end=true {overrides}", id="hydra"
+        ),
+        pytest.param(
+            "python train.py +training.load_best_model_at_end=True {overrides}", id="hydra-plus"
+        ),
+        pytest.param(
+            "python train.py ++load_best_model_at_end=true {overrides}", id="hydra-plus-plus"
+        ),
+        pytest.param(
+            "python train.py ~trainer.args.load_best_model_at_end=true {overrides}",
+            id="hydra-tilde",
+        ),
+        pytest.param(
+            'python train.py --note "unbalanced --load_best_model_at_end {overrides}',
+            id="unbalanced-quote-falls-back-to-whitespace-split",
+        ),
+    ],
+)
+def test_best_model_warning_reads_trial_command(command):
+    warnings = experiment_warnings(_best_model_command_experiment(command))
+
+    assert len(warnings) == 1
+    assert "load_best_model_at_end=True (set in trial_command)" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("python train.py {overrides}", id="absent"),
+        pytest.param("python train.py --load_best_model_at_end false {overrides}", id="false"),
+        pytest.param("python train.py --load_best_model_at_end False {overrides}", id="False"),
+        pytest.param("python train.py --load_best_model_at_end 0 {overrides}", id="zero"),
+        pytest.param("python train.py --load_best_model_at_end no {overrides}", id="no"),
+        pytest.param(
+            "python train.py --load_best_model_at_end=false {overrides}", id="equals-false"
+        ),
+        pytest.param("python train.py --load_best_model_at_end=0 {overrides}", id="equals-zero"),
+        pytest.param(
+            "python train.py training.load_best_model_at_end=false {overrides}", id="hydra-false"
+        ),
+        pytest.param(
+            "python train.py --load_best_model_at_end_strategy true {overrides}",
+            id="longer-flag-name",
+        ),
+        pytest.param(
+            "python train.py --metric_for_best_model=load_best_model_at_end {overrides}",
+            id="name-only-in-value",
+        ),
+    ],
+)
+def test_best_model_warning_ignores_disabled_or_unrelated_trial_command(command):
+    assert experiment_warnings(_best_model_command_experiment(command)) == []
+
+
+def test_best_model_trial_command_does_not_warn_under_envelope():
+    command = "python train.py --load_best_model_at_end {overrides}"
+
+    assert experiment_warnings(_best_model_command_experiment(command, backend="envelope")) == []
+
+
+def test_best_model_warning_names_every_source_in_one_warning():
+    experiment = _best_model_command_experiment(
+        "python train.py --load_best_model_at_end {overrides}",
+        override_format="hydra",
+        trainer_config={"load_best_model_at_end": True},
+    )
+
+    (warning,) = experiment_warnings(experiment)
+
+    assert "load_best_model_at_end=True (set in trainer_config, trial_command)" in warning
 
 
 def test_wandb_query_normalizes_targets_and_collects_exact_keys():
