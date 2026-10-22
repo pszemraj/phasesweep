@@ -19,7 +19,6 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import (
@@ -33,6 +32,8 @@ from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
+    phase_study,
+    phase_trials,
     write_flaky_trainer,
     write_trainer,
 )
@@ -60,19 +61,6 @@ def _grid(
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase], metric=metric)
 
 
-def _study(experiment: Experiment) -> optuna.Study:
-    """Open the grid's recorded study."""
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::p",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
-
-
-def _trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
-    """Read the grid's recorded attempts."""
-    return _study(experiment).get_trials(deepcopy=False)
-
-
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
 def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repeats: bool) -> None:
     """A recorded abort stays refused until a raised target buys failed-cell retries."""
@@ -80,7 +68,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     original = _grid(tmp_path, trainer, 2, repeats=repeats)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(original)
-    assert [trial.state.name for trial in _trials(original)] == ["FAIL", "FAIL"]
+    assert [trial.state.name for trial in phase_trials(original)] == ["FAIL", "FAIL"]
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(original)
     assert len(calls.read_text().splitlines()) == 2
@@ -91,14 +79,14 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
             run_experiment(raised)
     else:
         assert run_experiment(raised)["p"].metric == 1.0
-    trials = _trials(raised)
+    trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
     assert trials[2].params == trials[0].params
     assert len(calls.read_text().splitlines()) == 3
 
     recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
     assert run_experiment(recovered)["p"].metric == 1.0
-    trials = _trials(recovered)
+    trials = phase_trials(recovered)
     assert trials[3].params == trials[1].params
     assert len(calls.read_text().splitlines()) == 4
     assert run_experiment(recovered)["p"].metric == 1.0
@@ -125,7 +113,7 @@ def test_partly_failed_grid_retries_the_failed_cell_only(tmp_path: Path, repeats
 
     raised = _grid(tmp_path, trainer, 3, repeats=repeats)
     assert run_experiment(raised)["p"].metric == 1.0
-    trials = _trials(raised)
+    trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "COMPLETE", "COMPLETE"]
     assert trials[2].params == trials[0].params
     assert trials[2].params != trials[1].params
@@ -155,7 +143,7 @@ def test_failed_grid_retry_consumes_the_explicit_extra_attempt(tmp_path: Path) -
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(raised)
     assert len(calls.read_text().splitlines()) == 3
-    assert [trial.state.name for trial in _trials(raised)] == ["FAIL", "FAIL", "FAIL"]
+    assert [trial.state.name for trial in phase_trials(raised)] == ["FAIL", "FAIL", "FAIL"]
     assert run_experiment(_grid(tmp_path, trainer, 4))["p"].metric == 1.0
     assert len(calls.read_text().splitlines()) == 4
 
@@ -176,7 +164,7 @@ def test_grid_retry_queue_recovers_after_target_was_accepted(
         patch.setattr(phase_ops, "_record_reruns", fail_before_enqueue)
         with pytest.raises(RuntimeError, match="stopped before enqueue"):
             run_experiment(raised)
-    assert len(_trials(raised)) == 2
+    assert len(phase_trials(raised)) == 2
     assert run_experiment(raised)["p"].metric == 1.0
     assert len(calls.read_text().splitlines()) == 3
 
@@ -199,7 +187,7 @@ def test_grid_seed_audit_retries_only_its_failed_repeat(tmp_path: Path) -> None:
         run_experiment(attempt(2))
     recovered = attempt(3)
     assert run_experiment(recovered)["p"].metric == 1.0
-    trials = _trials(recovered)
+    trials = phase_trials(recovered)
     assert trials[2].params == trials[0].params
     assert len(calls.read_text().splitlines()) == 3
 
@@ -252,7 +240,7 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     # The advertised target is exactly the one that retries both failed cells.
     recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
     assert run_experiment(recovered)["p"].metric == 1.0
-    assert [trial.state.name for trial in _trials(recovered)] == [
+    assert [trial.state.name for trial in phase_trials(recovered)] == [
         "FAIL",
         "FAIL",
         "COMPLETE",
@@ -298,7 +286,7 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     original = _grid(tmp_path, trainer, 4, cells=4)
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
-    assert [trial.state.name for trial in _trials(original)] == ["FAIL", "FAIL"]
+    assert [trial.state.name for trial in phase_trials(original)] == ["FAIL", "FAIL"]
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     for message in (str(aborted.value), str(refused.value)):
@@ -309,7 +297,9 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
 
     recovered = _grid(tmp_path, trainer, 6, cells=4)
     assert run_experiment(recovered)["p"].metric == 1.0
-    assert [trial.state.name for trial in _trials(recovered)] == ["FAIL", "FAIL"] + ["COMPLETE"] * 4
+    assert [trial.state.name for trial in phase_trials(recovered)] == ["FAIL", "FAIL"] + [
+        "COMPLETE"
+    ] * 4
     assert len(calls.read_text().splitlines()) == 6
 
 
@@ -438,10 +428,10 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     # Each cell ran exactly once: the completed ones were not repeated.
     assert ran() == ["1", "2", "3", "4"]
     experiment = load_experiment(recovered)
-    trials = _trials(experiment)
+    trials = phase_trials(experiment)
     assert [trial.state.name for trial in trials] == ["COMPLETE"] * 4
     assert sorted(trial.params["x"] for trial in trials[2:]) == [1, 2]
-    study = _study(experiment)
+    study = phase_study(experiment)
     assert _load_phase_policy_state(study).abort is None
     assert study.user_attrs[PHASE_RECOVERY_ATTR]["trial_target"] == 4
 
@@ -466,7 +456,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     )
 
     with pytest.raises(PhaseAbortRefusedError) as refused:
-        phase_ops._raise_streak_at_limit(phase, streak, _study(original))
+        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
     message = str(refused.value)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
@@ -497,7 +487,7 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
     original = _grid(tmp_path, trainer, 4, cells=4, metric=_out_of_bounds_metric())
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
-    assert [trial.state.name for trial in _trials(original)] == ["COMPLETE", "COMPLETE"]
+    assert [trial.state.name for trial in phase_trials(original)] == ["COMPLETE", "COMPLETE"]
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     phase = original.phases[0]
@@ -505,7 +495,7 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
     with pytest.raises(PhaseAbortRefusedError) as at_limit:
-        phase_ops._raise_streak_at_limit(phase, streak, _study(original))
+        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
 
     for message in (str(aborted.value), str(refused.value), str(at_limit.value)):
         _assert_advises_limit(message, 2, 2, 4)
@@ -526,7 +516,7 @@ def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is
     original = _grid(tmp_path, trainer, 4, cells=4, metric=_out_of_bounds_metric())
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
-    assert [trial.state.name for trial in _trials(original)] == ["FAIL", "COMPLETE"]
+    assert [trial.state.name for trial in phase_trials(original)] == ["FAIL", "COMPLETE"]
     message = str(aborted.value)
     assert " for stderr logs." in message
     assert "completed outside the metric bounds" not in message
@@ -575,7 +565,7 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    trials = _trials(raised)
+    trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
     expected = (
         "[p] only 1 of 2 grid cells succeeded (advisory); the winner was chosen without a "
@@ -601,7 +591,9 @@ def test_grid_winner_warns_about_cells_the_abort_never_reached(
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    succeeded = {trial.params["x"] for trial in _trials(raised) if trial.state.name == "COMPLETE"}
+    succeeded = {
+        trial.params["x"] for trial in phase_trials(raised) if trial.state.name == "COMPLETE"
+    }
     (missing,) = {1, 2, 3, 4} - succeeded
     assert _coverage_warnings(caplog) == [
         "[p] only 3 of 4 grid cells succeeded (advisory); the winner was chosen without a "
@@ -625,7 +617,7 @@ def test_repeat_grid_winner_warns_about_the_failed_member(
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(experiment)["p"].metric == 1.0
-    (failed,) = (trial for trial in _trials(experiment) if trial.state.name == "FAIL")
+    (failed,) = (trial for trial in phase_trials(experiment) if trial.state.name == "FAIL")
     (warning,) = _coverage_warnings(caplog)
     assert warning.startswith("[p] only 3 of 4 grid cells succeeded (advisory); ")
     assert f"'x': {failed.params['x']}" in warning and f"'seed': {failed.params['seed']}" in warning
@@ -663,7 +655,9 @@ def test_survivorship_ignores_failures_that_a_successful_retry_replaced(
         run_experiment(_grid(tmp_path, trainer, 2, repeats=repeats))
     recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
     assert run_experiment(recovered)["p"].metric == 1.0
-    assert [trial.state.name for trial in _trials(recovered)] == ["FAIL"] * 2 + ["COMPLETE"] * 2
+    assert [trial.state.name for trial in phase_trials(recovered)] == ["FAIL"] * 2 + [
+        "COMPLETE"
+    ] * 2
 
     assert _published_survivorship(recovered) == {
         "verdict": "ok",
@@ -690,7 +684,9 @@ def test_survivorship_still_counts_the_failures_of_a_cell_that_never_succeeded(
             run_experiment(_grid(tmp_path, trainer, 3))
     raised = _grid(tmp_path, trainer, target)
     assert run_experiment(raised)["p"].metric == 1.0
-    succeeded = {trial.params["x"] for trial in _trials(raised) if trial.state.name == "COMPLETE"}
+    succeeded = {
+        trial.params["x"] for trial in phase_trials(raised) if trial.state.name == "COMPLETE"
+    }
     assert len(succeeded) == 1
 
     assert _published_survivorship(raised) == {

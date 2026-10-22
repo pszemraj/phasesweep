@@ -22,7 +22,6 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -35,7 +34,7 @@ from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import invoke_cli_boundary, make_experiment, write_flaky_trainer
+from tests.conftest import invoke_cli_boundary, make_experiment, phase_trials, write_flaky_trainer
 from tests.experiments import write_experiment
 from tests.recovery_helpers import fabricate_stale_trial
 
@@ -76,10 +75,7 @@ def _fixed(
 
 def _states(exp: Experiment) -> list[str]:
     """Return the state name of every trial in the experiment's only phase."""
-    study = optuna.load_study(
-        study_name=f"{exp.experiment}::p", storage=_resolve_storage(exp.resolved_storage)
-    )
-    return [trial.state.name for trial in study.get_trials(deepcopy=False)]
+    return [trial.state.name for trial in phase_trials(exp)]
 
 
 @pytest.mark.parametrize(

@@ -18,7 +18,6 @@ from phasesweep import run_experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
@@ -50,6 +49,7 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
+    phase_study,
     phase_trials,
     trial_outcome,
     write_param_echo_trainer,
@@ -365,7 +365,7 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
         run_experiment(exp)
 
     (trial,) = phase_trials(exp)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+    study = phase_study(exp)
     assert launched.exists()
     if serviced:
         assert _trial_count_state(trial) == "INTERRUPTED"

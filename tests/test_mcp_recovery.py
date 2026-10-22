@@ -35,7 +35,6 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.guards import _reconcile_existing_studies
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -66,6 +65,7 @@ from phasesweep.tracking.publication import sync_tracking
 from phasesweep.tracking.session import tracking_root
 from tests.conftest import (
     mark_current_format,
+    phase_study,
     reaped_pid,
 )
 from tests.mcp_helpers import (
@@ -132,10 +132,7 @@ def _load_first_phase_study(config: Path) -> optuna.Study:
     exp = load_experiment(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
-    return optuna.load_study(
-        study_name=f"{exp.experiment}::{phase.name}",
-        storage=_resolve_storage(exp.resolved_storage),
-    )
+    return phase_study(exp, phase.name)
 
 
 def _load_phase_trial(config: Path, trial_number: int) -> optuna.trial.FrozenTrial:

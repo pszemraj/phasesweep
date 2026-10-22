@@ -13,7 +13,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import optuna
 import pytest
 
 from phasesweep.config.io import load_experiment
@@ -22,7 +21,6 @@ from phasesweep.config.reference import reference_notes
 from phasesweep.engine.generation import (
     _write_generation_state,
 )
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_summary_path,
@@ -53,6 +51,7 @@ from phasesweep.mcp.server import (
 from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
+    phase_study,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import tree_snapshot
@@ -322,10 +321,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
     experiment = registry.get("srv").experiment
-    study = optuna.load_study(
-        study_name=f"{experiment.experiment}::p",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    study = phase_study(experiment)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
 
     with pytest.raises(RunPersistentStateUnavailableError) as excinfo:

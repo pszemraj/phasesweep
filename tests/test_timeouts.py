@@ -30,6 +30,7 @@ from tests.conftest import (
     bounded_metric,
     make_experiment,
     make_trial_context,
+    phase_study,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -219,7 +220,7 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     assert run_experiment(exp)["p"].completion["incomplete"] is True
 
     def load() -> optuna.Study:
-        return optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+        return phase_study(exp)
 
     trials_before = len(load().trials)
     decision_before = load().user_attrs[PHASE_DECISION_ATTR]

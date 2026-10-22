@@ -78,6 +78,7 @@ from tests.conftest import (
     drop_artifact_root_binding,
     make_experiment,
     mark_current_format,
+    phase_study,
     write_constant_trainer,
     write_trainer,
 )
@@ -770,9 +771,7 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     run_experiment(control)
 
     trials = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).trials
-    expected = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
-    ).trials
+    expected = phase_study(control).trials
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert [t.params for t in trials] == [t.params for t in expected]
 

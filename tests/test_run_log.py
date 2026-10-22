@@ -16,14 +16,19 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine import phase as phase_ops
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import FAILURE_REASON_ATTR, FEASIBLE_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
-from tests.conftest import bounded_metric, make_experiment, trial_outcome, write_trainer
+from tests.conftest import (
+    bounded_metric,
+    make_experiment,
+    phase_study,
+    trial_outcome,
+    write_trainer,
+)
 
 
 def _trial_lines(experiment_log: Path, phase: str) -> list[str]:
@@ -123,9 +128,7 @@ def test_infeasible_reason_names_measured_value_and_violated_bound(
 
     run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
+    study = phase_study(experiment)
     rejected = next(trial for trial in study.trials if trial.value == value)
     assert rejected.state == optuna.trial.TrialState.COMPLETE
     cause = rejected.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
@@ -202,9 +205,7 @@ def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_enviro
 
     run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
+    study = phase_study(experiment)
     x_by_trial = {trial.number: trial.params["x"] for trial in study.trials}
     causes = {
         1: "non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. "
@@ -370,9 +371,7 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
+    study = phase_study(experiment)
     triggering = next(
         trial for trial in study.trials if "abort" in trial.user_attrs[TRIAL_OUTCOME_ATTR]
     )

@@ -48,6 +48,7 @@ from phasesweep.engine.trial import _environment_identity
 from tests.conftest import (
     bounded_metric,
     make_experiment,
+    phase_study,
     requires_nonroot,
     trial_outcome,
     write_flaky_trainer,
@@ -113,14 +114,6 @@ def _persistent(
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=list(phases), metric=metric)
 
 
-def _study(experiment: Experiment, phase: str) -> optuna.Study:
-    """Load one phase's live study from the experiment's ledger."""
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::{phase}",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
-
-
 def _stand_ins(experiment: Experiment, phase: Phase) -> dict[str, Winner]:
     """Build stand-in winners for every phase ``phase`` inherits, so it can be fingerprinted."""
     winners: dict[str, Winner] = {}
@@ -175,7 +168,7 @@ def _record(
 
 def _terminal_trials(experiment: Experiment, phase: str) -> int:
     """Count the terminal trials the ledger holds for one phase."""
-    trials = _study(experiment, phase).get_trials(deepcopy=False)
+    trials = phase_study(experiment, phase).get_trials(deepcopy=False)
     return sum(trial.state.is_finished() for trial in trials)
 
 
@@ -310,7 +303,7 @@ def _accept_partial_timeout(tmp_path: Path) -> tuple[Experiment, Winner]:
         winner the first run selected from its two trials.
     """
     winner = run_experiment(_persistent(tmp_path, _phase("a", 2)))["a"]
-    study = _study(_persistent(tmp_path, _phase("a", 2)), "a")
+    study = phase_study(_persistent(tmp_path, _phase("a", 2)), "a")
     study.set_user_attr(TRIAL_TARGET_ATTR, 4)
     study.set_user_attr(
         PHASE_DECISION_ATTR,

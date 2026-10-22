@@ -16,14 +16,12 @@ import stat
 from pathlib import Path
 from typing import Any
 
-import optuna
 import pytest
 import yaml
 
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRIAL_DIR_ATTR
 from phasesweep.engine.trial import (
@@ -41,7 +39,7 @@ from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequir
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
 from phasesweep.tracking.session import write_record
-from tests.conftest import make_experiment, make_trial_context
+from tests.conftest import make_experiment, make_trial_context, phase_study
 from tests.tracking_helpers import attempt_identity, mlflow_binding
 
 #: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
@@ -1248,9 +1246,7 @@ def test_trial_directory_and_allocated_lifecycle_precede_launch(
 
     def inspect_before_launch(**kwargs: object) -> ExecutedTrial:
         trial_dir = Path(str(kwargs["trial_dir"]))
-        study = optuna.load_study(
-            study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-        )
+        study = phase_study(experiment)
         trial = next(trial for trial in study.trials if trial.number == kwargs["trial_id"])
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=str(kwargs["attempt_id"]))
         observed["trial_dir"] = str(trial_dir)

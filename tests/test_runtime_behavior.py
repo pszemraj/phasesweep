@@ -87,6 +87,7 @@ from tests.conftest import (
     make_experiment,
     make_trial_context,
     patch_rejected_trial_user_attr,
+    phase_study,
     phase_trials,
     requires_nonroot,
     trial_outcome,
@@ -929,9 +930,7 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
+    study = phase_study(experiment)
     previous = study.trials
     assert [_trial_count_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
     stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
@@ -1137,7 +1136,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     winners = run_experiment(exp)
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+    study = phase_study(exp)
     trials = study.get_trials(deepcopy=False)
     # Recovery cannot prove what the unrecorded trial measured, so it is
     # interrupted and reruns (trial 1) before the second draw (trial 2).

@@ -29,6 +29,7 @@ from phasesweep.engine.study_policy import (
 )
 from tests.conftest import (
     make_experiment,
+    phase_study,
     trial_outcome,
     write_flag_gated_trainer,
     write_flaky_trainer,
@@ -244,9 +245,7 @@ def test_retry_that_fails_again_aborts_after_a_fresh_failure_count(tmp_path: Pat
         )
 
     def policy_state() -> tuple[list[str], _PhasePolicyState]:
-        study = optuna.load_study(
-            study_name="t::p", storage=_resolve_storage(grid(2).resolved_storage)
-        )
+        study = phase_study(grid(2))
         return [trial.state.name for trial in study.trials], _load_phase_policy_state(study)
 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -291,9 +290,7 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
 
     first = run_experiment(original)
     assert run_experiment(lowered)["p"].attempt_id == first["p"].attempt_id
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(original.resolved_storage)
-    )
+    study = phase_study(original)
     assert _load_phase_policy_state(study).consecutive_failures == 1
     assert _load_phase_policy_state(study).abort is None
     assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
@@ -303,13 +300,6 @@ def _with_limit(experiment: Experiment, limit: int) -> Experiment:
     """Return ``experiment`` with phase ``p``'s ``max_consecutive_failures`` set to ``limit``."""
     phase = experiment.phases[0].model_copy(update={"max_consecutive_failures": limit})
     return experiment.model_copy(update={"phases": [phase]})
-
-
-def _study(experiment: Experiment) -> optuna.Study:
-    """Open the experiment's only phase study."""
-    return optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
 
 
 def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_path: Path) -> None:
@@ -325,7 +315,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     )
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(initial)
-    assert [trial.state.name for trial in _study(initial).trials] == ["FAIL", "FAIL"]
+    assert [trial.state.name for trial in phase_study(initial).trials] == ["FAIL", "FAIL"]
     message = str(aborted.value)
     assert "phases[p].max_consecutive_failures above 2 in the config" in message
     assert "run the 2 trials still left at n_trials=4" in message
@@ -337,13 +327,13 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
         for dry_run in (True, False):
             with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
                 run_experiment(_with_limit(initial, limit), dry_run=dry_run)
-    assert len(_study(initial).trials) == 2
+    assert len(phase_study(initial).trials) == 2
 
     raised = _with_limit(initial, 3)
     run_experiment(raised, dry_run=True)
-    assert len(_study(initial).trials) == 2
+    assert len(phase_study(initial).trials) == 2
     assert run_experiment(raised)["p"].metric == pytest.approx(0.5)
-    study = _study(initial)
+    study = phase_study(initial)
     assert [trial.state.name for trial in study.trials] == ["FAIL", "FAIL", "COMPLETE", "COMPLETE"]
     state = _load_phase_policy_state(study)
     assert (state.abort, state.consecutive_failures) == (None, 0)
@@ -373,7 +363,7 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
     for message in refusals:
         assert "phases[p].n_trials above 2 in the config" in message
         assert "max_consecutive_failures above" not in message
-    assert len(_study(initial).trials) == 2
+    assert len(phase_study(initial).trials) == 2
 
 
 def _abort_fatally(
@@ -413,7 +403,7 @@ def _abort_fatally(
         patch.setattr(phase_module, "prepare_trainer_input", explode)
         with pytest.raises(RuntimeError, match="simulated objective defect"):
             run_experiment(experiment)
-    abort = _load_phase_policy_state(_study(experiment)).abort
+    abort = _load_phase_policy_state(phase_study(experiment)).abort
     assert abort is not None
     assert abort["policy"] == "unexpected_objective_exception"
     return experiment, calls
@@ -431,7 +421,7 @@ def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
     run = SimpleNamespace(
         experiment=experiment,
         phase=experiment.phases[0],
-        study=_study(experiment),
+        study=phase_study(experiment),
         optimize_deadline=None,
         deadline_exhausted=False,
         aborted=True,
@@ -489,7 +479,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
         assert "max_consecutive_failures above" not in message
         assert "failure count" not in message
     assert not calls.exists()
-    assert len(_study(initial).trials) == 1
+    assert len(phase_study(initial).trials) == 1
 
     raised_target = roomy.phases[0].model_copy(update={"n_trials": 4})
     recovered = roomy.model_copy(update={"phases": [raised_target]})
@@ -568,9 +558,7 @@ def test_interrupted_recovery_keeps_the_raised_target_authorization(
             run_experiment(with_target(3))
 
     def trial_states() -> list[str]:
-        study = optuna.load_study(
-            study_name="t::p", storage=_resolve_storage(initial.resolved_storage)
-        )
+        study = phase_study(initial)
         return [trial.state.name for trial in study.trials]
 
     assert trial_states() == ["FAIL"]
