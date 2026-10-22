@@ -28,6 +28,7 @@ from phasesweep.config.reference import (
     lookup_or_suggest,
     plain_path,
     reference_notes,
+    rules_for,
     sub_key_count,
     top_level_entries,
 )
@@ -571,7 +572,8 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
-        "keys; with a KEY such as 'phases[].sampler', print that key and every key below it. "
+        "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
+        "descriptions that govern it, then that key and every key below it. "
         "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
         "The broad phases key lists its immediate children; narrow it for full details. "
         "With --notes, print the general notes on file paths, YAML typing and environment "
@@ -587,6 +589,9 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 )
 def explain(key: str | None, notes: bool) -> None:
     """Print the configuration reference for one key, list the top-level keys, or print its notes.
+
+    A key prints the section rules and shared-block descriptions that govern its entries
+    first, then the entries themselves; the broad ``phases`` key prints a compact index.
 
     :param str | None key: Config key in any spelling the reference accepts, or None to list
         the top-level keys.
@@ -619,6 +624,11 @@ def explain(key: str | None, notes: bool) -> None:
                 click.echo(f"  {first_sentence(entry, _SUMMARY_WIDTH)}")
         click.echo("Narrow with a key: phasesweep explain 'phases[].search_space'")
         return
+    for rules in rules_for(entries):
+        click.echo(f"{rules.title}:")
+        for line in rules.lines:
+            click.echo(f"  {line}")
+        click.echo()
     for index, entry in enumerate(entries):
         if index:
             click.echo()

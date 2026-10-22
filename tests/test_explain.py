@@ -2,11 +2,83 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
 from click.testing import CliRunner
 
+import phasesweep.config.reference as reference
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.reference import reference_entries, reference_notes, top_level_entries
+from phasesweep.mcp.tools import PhaseSweepMCP
+
+_SAMPLE = """\
+# sample reference
+
+# note one
+
+# ---------- Objective ----------
+# A bad read fails the trial.
+
+# Scalar source.
+extractor: JsonX | WandbX (required)
+
+# ---------- Gates ----------
+
+# Hard checks.
+gates: list[wb] = []
+  # W&B gate.
+  - type: "wb" (required)
+    <<: Target
+    # Keys that must be present.
+    keys: list[string] (required)
+
+# ---------- Shared blocks ----------
+
+# Read one number from a JSON file.
+JsonX:
+  # Selects the JSON reader.
+  type: "json" (required)
+  # JSON file.
+  path: string (required)
+
+# Read a W&B summary.
+WandbX:
+  # Selects the W&B reader.
+  type: "wandb" (required)
+  <<: Target
+
+# The W&B run every consumer in a phase reads.
+Target:
+  # Seconds to wait.
+  timeout_seconds: float = 120.0
+"""
+
+
+@pytest.fixture
+def sample_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Serve a small reference with section rules and shared blocks in place of the packaged one.
+
+    :param Path tmp_path: Directory for the sample file.
+    :param pytest.MonkeyPatch monkeypatch: Replaces the packaged resource lookup.
+    :return Iterator[None]: Yields while the sample is served, then restores the packaged one.
+    """
+    path = tmp_path / "config_reference.yaml"
+    path.write_text(_SAMPLE, encoding="utf-8")
+    caches = (
+        reference._packaged,
+        reference.reference_notes,
+        reference._display_by_segments,
+        reference._variant_tags,
+    )
+    monkeypatch.setattr(reference, "_reference_resource", lambda: path)
+    for cache in caches:
+        cache.cache_clear()
+    yield
+    monkeypatch.undo()
+    for cache in caches:
+        cache.cache_clear()
 
 
 def _explain(*args: str) -> tuple[int, str, str]:
@@ -164,3 +236,44 @@ def test_explain_unknown_key_without_neighbours_points_at_the_listing(key: str) 
     assert out == ""
     assert "no config key matches" in err
     assert "Run `phasesweep explain` to list the top-level keys." in err
+
+
+@pytest.mark.usefixtures("sample_reference")
+def test_explain_prints_section_rules_and_block_descriptions_before_the_entries() -> None:
+    """A key's section rules and the blocks its entries came from head the output, once each."""
+    code, out, err = _explain("extractor.timeout_seconds")
+    assert code == 0
+    assert err == ""
+    assert out == (
+        "Section Objective:\n  A bad read fails the trial.\n\n"
+        "Shared block WandbX:\n  Read a W&B summary.\n\n"
+        "Shared block Target:\n  The W&B run every consumer in a phase reads.\n\n"
+        "extractor[type=wandb].timeout_seconds: float = 120.0\n  Seconds to wait.\n"
+    )
+    code, out, _ = _explain("gates[].timeout_seconds")
+    assert code == 0
+    assert out.startswith("Shared block Target:\n")
+    assert "Section" not in out
+    assert PhaseSweepMCP.explain_config("extractor.timeout_seconds")["rules"] == [
+        {"kind": "section", "name": "Objective", "description": "A bad read fails the trial."},
+        {"kind": "block", "name": "WandbX", "description": "Read a W&B summary."},
+        {
+            "kind": "block",
+            "name": "Target",
+            "description": "The W&B run every consumer in a phase reads.",
+        },
+    ]
+    assert PhaseSweepMCP.explain_config(None)["rules"] == []
+
+
+@pytest.mark.usefixtures("sample_reference")
+def test_typo_suggestions_and_validation_hints_reach_shared_block_fields() -> None:
+    """Expanded block fields are ordinary keys for suggestions and error locations."""
+    assert set(reference.closest("timeout_secnds")) == {
+        "extractor.timeout_seconds",
+        "gates[].timeout_seconds",
+    }
+    assert reference.loc_to_path(("extractor", "wandb", "timeout_seconds")) == (
+        "extractor.timeout_seconds"
+    )
+    assert reference.loc_to_path(("gates", 0, "wb", "timeout_seconds")) == "gates[].timeout_seconds"

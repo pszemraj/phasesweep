@@ -80,7 +80,8 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 )
 DESCRIPTION_EXPLAIN_CONFIG = (
     "Explain the experiment configuration schema: the type, default and rules of one config key "
-    "and every key below it, or the top-level keys and the general notes on paths, YAML typing "
+    "and every key below it, with the section rules and shared-block descriptions that govern "
+    "them, or the top-level keys and the general notes on paths, YAML typing "
     "and environment variables when key is omitted. Call only when the user "
     "asks for config-authoring help, narrowing with a key such as phases[].sampler; when "
     "found=false, retry with one of closest. Read-only: it describes the schema, not any "
@@ -299,11 +300,30 @@ class ConfigEntryPayload(_ToolPayload):
     )
 
 
+class ConfigRulesPayload(_ToolPayload):
+    """Reference lines that govern a group of keys rather than one key."""
+
+    kind: Literal["section", "block"] = Field(
+        description=(
+            "section for the rules at the head of a reference section; block for the "
+            "description of a shared block whose fields several keys reuse."
+        )
+    )
+    name: str = Field(description="Section title, matching entries' section, or block name.")
+    description: str = Field(description="The rules, one line per paragraph.")
+
+
 class ExplainConfigResult(_ToolPayload):
     """Structured output for explain_config."""
 
     key: str | None = Field(description="The requested key, echoed; null when it was omitted.")
     found: bool = Field(description="Whether the key matches a documented config key.")
+    rules: list[ConfigRulesPayload] = Field(
+        description=(
+            "Section rules and shared-block descriptions that govern the returned entries, "
+            "each once, in order of first use; empty when key is omitted or not found."
+        )
+    )
     entries: list[ConfigEntryPayload] = Field(
         description="The key and every key below it in reference order; empty when not found."
     )

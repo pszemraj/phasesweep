@@ -32,6 +32,7 @@ from phasesweep.config.reference import (
     first_sentence,
     lookup_or_suggest,
     reference_notes,
+    rules_for,
     top_level_entries,
 )
 from phasesweep.engine.errors import (
@@ -496,12 +497,14 @@ class PhaseSweepMCP:
 
         A blank key returns top-level keys, their first description sentence and general notes.
         A supplied key returns full descriptions for it and its descendants, with one entry per
-        discriminator variant and no general notes.
+        discriminator variant, and the section rules and shared-block descriptions that govern
+        them, with no general notes.
 
         :param str | None key: Config key as the reference spells it, such as ``phases[].sampler``,
             ``phases.sampler`` or ``phases.0.sampler``.
-        :return JsonObject: The echoed key, whether it matched, the entries, the closest
-            documented keys when it did not, and the general notes when no key was given.
+        :return JsonObject: The echoed key, whether it matched, the governing rules, the entries,
+            the closest documented keys when it did not, and the general notes when no key was
+            given.
         """
         entries: list[JsonValue]
         if key is None or not key.strip():
@@ -512,16 +515,22 @@ class PhaseSweepMCP:
             return {
                 "key": key,
                 "found": True,
+                "rules": [],
                 "entries": entries,
                 "closest": [],
                 "notes": "\n".join(reference_notes()),
             }
         matches, near = lookup_or_suggest(key)
+        rules: list[JsonValue] = [
+            {"kind": group.kind, "name": group.name, "description": "\n".join(group.lines)}
+            for group in rules_for(matches)
+        ]
         entries = [_config_entry_payload(entry, "\n".join(entry.comments)) for entry in matches]
         suggestions: list[JsonValue] = list(near)
         return {
             "key": key,
             "found": bool(matches),
+            "rules": rules,
             "entries": entries,
             "closest": suggestions,
             "notes": "",

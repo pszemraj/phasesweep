@@ -387,7 +387,7 @@ def test_reference_parser_rejects_unrecognized_lines_and_duplicate_paths() -> No
     with pytest.raises(ValueError, match="Duplicate documented path: name"):
         _parse("# one\nname: string (required)\n\n# two\nname: string (required)\n")
     parsed = _parse("# ---------- First ----------\n\n# one\nname: string (required)\n")
-    assert parsed == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+    assert parsed.entries == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
 
 
 def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() -> None:
@@ -397,9 +397,156 @@ def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() 
         "# ---------- First ----------\n\n# one\nname: string (required)\n"
     )
     assert _parse_notes(text) == ("note one", "note two")
-    assert _parse(text) == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+    assert _parse(text).entries == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
     with pytest.raises(ValueError, match="no general notes"):
         _parse_notes("# about this file\n\n# ---------- First ----------\n\n# one\nname: string\n")
+
+
+_SAMPLE = """\
+# sample reference
+
+# note one
+
+# ---------- Objective ----------
+# A bad read fails the trial.
+
+# Scalar source.
+extractor: JsonX | WandbX (required)
+
+# Upper bound.
+max: float | null = null
+
+# ---------- Gates ----------
+
+# Hard checks.
+gates: list[sha | wb] = []
+  # Hash gate.
+  - type: "sha" (required)
+    # File to hash.
+    path: string (required)
+  # W&B gate.
+  - type: "wb" (required)
+    <<: Target
+    # Keys that must be present.
+    keys: list[string] (required)
+
+# ---------- Shared blocks ----------
+
+# Read one number from a JSON file.
+JsonX:
+  # Selects the JSON reader.
+  type: "json" (required)
+
+  # JSON file.
+  path: string (required)
+
+# Read a W&B summary.
+WandbX:
+  # Selects the W&B reader.
+  type: "wandb" (required)
+  <<: Target
+  # Summary key.
+  metric_key: string (required)
+
+# The W&B run every consumer in a phase reads; all of them agree on these fields.
+Target:
+  # W&B entity.
+  entity: string (required)
+  # Seconds to wait.
+  timeout_seconds: float = 120.0
+"""
+
+
+def test_parser_expands_a_union_of_shared_blocks_into_variant_paths() -> None:
+    """A use site naming blocks gets each block's fields below it, tagged by the block's type."""
+    entries = {entry.path: entry for entry in _parse(_SAMPLE).entries}
+    assert entries["extractor"] == ReferenceEntry(
+        "extractor", "JsonX | WandbX (required)", ("Scalar source.",), "Objective"
+    )
+    assert entries["extractor[type=json].path"] == ReferenceEntry(
+        "extractor[type=json].path", "string (required)", ("JSON file.",), "Objective", ("JsonX",)
+    )
+    assert entries["extractor[type=wandb].type"].comments == ("Selects the W&B reader.",)
+    assert entries["max"].section == "Objective"
+    assert entries["max"].blocks == ()
+
+
+def test_parser_expands_merges_at_every_use_site() -> None:
+    """A ``<<:`` merge inlines the block's fields, inside another block and inside a list variant."""
+    entries = {entry.path: entry for entry in _parse(_SAMPLE).entries}
+    nested = entries["extractor[type=wandb].timeout_seconds"]
+    assert nested.signature == "float = 120.0"
+    assert nested.comments == ("Seconds to wait.",)
+    assert nested.blocks == ("WandbX", "Target")
+    gate = entries["gates[][type=wb].entity"]
+    assert gate.section == "Gates"
+    assert gate.blocks == ("Target",)
+    assert list(entries)[-3:] == [
+        "gates[][type=wb].entity",
+        "gates[][type=wb].timeout_seconds",
+        "gates[][type=wb].keys",
+    ]
+    assert not any(path.startswith(("JsonX", "WandbX", "Target")) for path in entries)
+
+
+def test_parser_keeps_section_rules_and_block_descriptions_in_order_of_use() -> None:
+    """Rules come once per group: the entry's section, then its blocks from the outermost."""
+    reference = _parse(_SAMPLE)
+    assert reference.section_rules == {"Objective": ("A bad read fails the trial.",)}
+    wandb = [entry for entry in reference.entries if entry.path.startswith("extractor[type=wandb]")]
+    assert [(group.title, group.lines) for group in reference.rules_for(wandb)] == [
+        ("Section Objective", ("A bad read fails the trial.",)),
+        ("Shared block WandbX", ("Read a W&B summary.",)),
+        (
+            "Shared block Target",
+            ("The W&B run every consumer in a phase reads; all of them agree on these fields.",),
+        ),
+    ]
+    gates = [entry for entry in reference.entries if entry.path.startswith("gates")]
+    assert [group.title for group in reference.rules_for(gates)] == ["Shared block Target"]
+
+
+@pytest.mark.parametrize(
+    "text,message",
+    [
+        ("# ---------- S ----------\n\n# x\nkey: Missing | null = null\n", "Unrecognized|Unknown"),
+        ("# x\nkey: string = ''\n\n# y\nUnused:\n  # z\n  a: int = 1\n", "never used"),
+        (
+            "# x\nkey: A | B (required)\n\n# a\nA:\n  # f\n  f: int = 1\n\n# b\nB:\n  # g\n  g: int = 1\n",
+            "type field",
+        ),
+        ("# x\nkey: list[A] = []\n\n# a\nA:\n  # f\n  f: int = 1\n", "inside another type"),
+        (
+            "# x\nkey: A (required)\n  # y\n  extra: int = 1\n\n# a\nA:\n  # f\n  f: int = 1\n",
+            "below a shared-block use site",
+        ),
+        (
+            "# x\nkey: object = {}\n  # y\n  <<: A\n\n# a\nA:\n  # f\n  f: int = 1\n",
+            "above a merge",
+        ),
+        ("# ---------- S ----------\n\n# x\nkey: int = 1\n# loose\n\n# y\nb: int = 1\n", "no key"),
+        (
+            "# ---------- S ----------\n# rule\n\n# ---------- T ----------\n\n# x\nk: int = 1\n",
+            "no keys",
+        ),
+    ],
+    ids=[
+        "unknown-block",
+        "unused-block",
+        "union-without-type",
+        "block-in-list",
+        "keys-below-use-site",
+        "comment-above-merge",
+        "orphan-comment",
+        "rules-without-keys",
+    ],
+)
+def test_parser_rejects_malformed_blocks_and_comments_it_cannot_place(
+    text: str, message: str
+) -> None:
+    """Nothing in the file is silently dropped: a line the parser cannot place is an error."""
+    with pytest.raises(ValueError, match=message):
+        _parse(text)
 
 
 def test_packaged_reference_notes_are_neither_the_maintainer_block_nor_an_entry_comment() -> None:

@@ -985,6 +985,7 @@ def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
     assert missing == {
         "key": "inherit_env",
         "found": False,
+        "rules": [],
         "entries": [],
         "closest": ["execution.inherit_env"],
         "notes": "",
