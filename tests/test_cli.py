@@ -1700,7 +1700,10 @@ def test_cli_boundary_reports_expected_run_failure(
     """Expected failures gain a traceback only when verbose logging is active."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
+    _stub_run_command(
+        monkeypatch,
+        NoFeasibleTrialError("no feasible trial in phase 'depth'", cause="trials_failed"),
+    )
 
     argv = ["run", str(config_path)]
     if verbose:

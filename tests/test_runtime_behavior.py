@@ -582,10 +582,16 @@ def test_terminal_callback_reports_success_evidence(
 @pytest.mark.parametrize(
     ("primary_error", "callback_error_type"),
     [
-        pytest.param(NoFeasibleTrialError("phase failed"), RuntimeError, id="failed-exception"),
+        pytest.param(
+            NoFeasibleTrialError("phase failed", cause="trials_failed"),
+            RuntimeError,
+            id="failed-exception",
+        ),
         # A diagnostic callback raising KeyboardInterrupt cannot mask the primary error.
         pytest.param(
-            NoFeasibleTrialError("phase failed"), KeyboardInterrupt, id="failed-keyboard-interrupt"
+            NoFeasibleTrialError("phase failed", cause="trials_failed"),
+            KeyboardInterrupt,
+            id="failed-keyboard-interrupt",
         ),
         pytest.param(None, RuntimeError, id="published-success"),
     ],
@@ -655,7 +661,7 @@ def test_failure_stage_and_reconciliation_follow_whether_the_generation_was_clai
     def run_outcome(*_args, generation, **_kwargs):
         if claims:
             generation.claim()
-        raise NoFeasibleTrialError("phase failed")
+        raise NoFeasibleTrialError("phase failed", cause="trials_failed")
 
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", run_outcome)

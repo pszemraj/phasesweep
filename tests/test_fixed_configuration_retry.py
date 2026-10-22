@@ -186,13 +186,18 @@ def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> No
     assert _states(_fixed(tmp_path, trainer, 3)) == ["FAIL", "FAIL", "COMPLETE"]
 
 
-def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
-    """A COMPLETE trial out of the metric bounds still measured the configuration."""
-    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
-    bounded = Metric(
+def _bounded() -> Metric:
+    """Return a ``x=<value>`` metric whose upper bound a logged 5.0 exceeds."""
+    return Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         max=1.0,
     )
+
+
+def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
+    """A COMPLETE trial out of the metric bounds still measured the configuration."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    bounded = _bounded()
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1, metric=bounded))
@@ -206,11 +211,7 @@ def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Pat
 def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_path: Path) -> None:
     """An abort over a completed infeasible attempt offers no setting that retries it."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
-    bounded = Metric(
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-        max=1.0,
-    )
-    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=bounded)
+    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=_bounded())
 
     with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible") as aborted:
         run_experiment(experiment)
@@ -221,6 +222,60 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
         assert "phases[p]" not in message
         assert "workdir" not in message
     assert _call_count(calls) == 1
+
+
+def _failure_code(error: BaseException) -> object:
+    """Return the failure code the MCP runner records for ``error``."""
+    return mcp_runner._terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)[
+        "code"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failures", "value", "cause"),
+    [
+        pytest.param(1, 1.0, "trials_failed", id="trials-failed"),
+        pytest.param(0, 5.0, "trials_infeasible", id="out-of-bounds"),
+    ],
+)
+def test_no_feasible_failure_code_follows_the_recorded_cause(
+    tmp_path: Path, failures: int, value: float, cause: str
+) -> None:
+    """A failed or out-of-bounds trial and a replay of it each report their own failure code."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
+    experiment = _fixed(tmp_path, trainer, 1, metric=_bounded())
+
+    with pytest.raises(NoFeasibleTrialError) as measured:
+        run_experiment(experiment)
+    with pytest.raises(NoFeasibleTrialError, match="launched no trial") as replayed:
+        run_experiment(experiment)
+
+    assert _call_count(calls) == 1
+    assert (measured.value.cause, _failure_code(measured.value)) == (cause, cause)
+    assert (replayed.value.cause, _failure_code(replayed.value)) == (
+        "replay_without_feasible_trial",
+        "replay_without_feasible_trial",
+    )
+
+
+@pytest.mark.parametrize(
+    ("failures", "value", "cause"),
+    [
+        pytest.param(1, 1.0, "trials_failed", id="failed-streak"),
+        pytest.param(0, 5.0, "trials_infeasible", id="infeasible-streak"),
+    ],
+)
+def test_streak_abort_failure_code_says_whether_a_trial_failed(
+    tmp_path: Path, failures: int, value: float, cause: str
+) -> None:
+    """An abort over infeasible trials is not reported as a trainer failure."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
+    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=_bounded())
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted") as aborted:
+        run_experiment(experiment)
+
+    assert (aborted.value.cause, _failure_code(aborted.value)) == (cause, cause)
 
 
 def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(

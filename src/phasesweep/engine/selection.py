@@ -9,7 +9,7 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import optuna
 
@@ -20,7 +20,7 @@ from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
-from phasesweep.engine.optuna import _draw_positions
+from phasesweep.engine.optuna import _draw_positions, _trial_count_state
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -85,10 +85,42 @@ class SelectedTrial:
     repeats: RepeatsRecord | None = None
 
 
+#: Why a phase holds no feasible trial; the MCP runner reports it as the failure code.
+NoFeasibleCause = Literal["trials_failed", "trials_infeasible", "replay_without_feasible_trial"]
+
+
 class NoFeasibleTrialError(PhaseSweepError):
     """Raised when no trial in a completed phase satisfies all constraints."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
+
+    def __init__(
+        self, *args: object, cause: NoFeasibleCause, action: OperatorAction | None = None
+    ) -> None:
+        """Create the error with the recorded cause that left the phase without a winner.
+
+        :param object args: Standard exception arguments; the first is the message.
+        :param NoFeasibleCause cause: ``trials_failed`` when a counted trial failed,
+            ``trials_infeasible`` when only infeasible trials kept the phase from a winner,
+            or ``replay_without_feasible_trial`` when the run launched no trial and the
+            recorded trials it replayed hold no feasible one.
+        :param OperatorAction | None action: Remediation for this one raise, overriding
+            :attr:`default_action`.
+        """
+        super().__init__(*args, action=action)
+        self.cause: NoFeasibleCause = cause
+
+
+def _no_feasible_cause(trials: Sequence[optuna.trial.FrozenTrial]) -> NoFeasibleCause:
+    """Return why a phase's finished trials hold no winner.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :return NoFeasibleCause: ``trials_failed`` when any trial counts as ``FAIL``,
+        otherwise ``trials_infeasible``.
+    """
+    if any(_trial_count_state(trial) == "FAIL" for trial in trials):
+        return "trials_failed"
+    return "trials_infeasible"
 
 
 class PhaseAbortRefusedError(PhaseSweepError):
@@ -137,7 +169,8 @@ def select_winner(
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
     :raises NoFeasibleTrialError: No trial in the study is both COMPLETE and within every
         constraint and the metric's bounds, or with ``repeats`` no group is complete. When
-        the metric has bounds, the message names them and the best COMPLETE value seen.
+        the metric has bounds, the message names them and the best COMPLETE value seen. Its
+        cause comes from :func:`_no_feasible_cause`.
     :raises TrialEvidenceMissingError: The winning trial's (with ``repeats``, any winning
         group member's) persisted gate results, objective provenance, or observed values are
         missing, corrupt, or malformed.
@@ -163,13 +196,15 @@ def select_winner(
             f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
             "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
             "why each failed or infeasible trial finished that way."
-            + _metric_bounds_note(trials, experiment)
+            + _metric_bounds_note(trials, experiment),
+            cause=_no_feasible_cause(trials),
         )
     if not survivors:
         raise NoFeasibleTrialError(
             "No completed trials in phase. The phase's trials.csv records why each "
             "failed or infeasible trial finished that way; trainer output is in its "
-            "trial_* directory." + _metric_bounds_note(trials, experiment)
+            "trial_* directory." + _metric_bounds_note(trials, experiment),
+            cause=_no_feasible_cause(trials),
         )
 
     winning: RankedGroup | None = None

@@ -515,7 +515,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         if changed_fact == "generation_claimed":
             unrelated.pop("generation_unavailable_reason")
         elif changed_fact == "unrelated_failure":
-            unrelated["failure"]["cause"]["code"] = "trainer_failed"
+            unrelated["failure"]["cause"]["code"] = "trials_failed"
         else:
             unrelated["failure"]["cause"]["stage"] = "execution"
         store.status_path(run_id).write_text(json.dumps(unrelated))
@@ -573,7 +573,7 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_claimed_runner(store, "aborting", config_path, experiment_id="t", cwd=tmp_path)
     aborting = json.loads(store.status_path("aborting").read_text())["failure"]
-    assert (aborting["code"], aborting["stage"]) == ("trainer_failed", "execution")
+    assert (aborting["code"], aborting["stage"]) == ("trials_failed", "execution")
 
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_claimed_runner(store, "refused", config_path, experiment_id="t", cwd=tmp_path)
@@ -878,7 +878,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
         *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
     ) -> None:
         generation.claim()
-        raise NoFeasibleTrialError("trainer failed")
+        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
@@ -918,7 +918,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         # Initial discovery and preflight succeeded. Only reconciliation loses
         # access to the root, before it can perform a second registry scan.
         monkeypatch.setattr("phasesweep.engine.guards.validate_ledger", fail_discovery)
-        raise NoFeasibleTrialError("trainer failed")
+        raise NoFeasibleTrialError("trainer failed", cause="trials_failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_active_attempts", scan_registry)
@@ -996,7 +996,11 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
 @pytest.mark.parametrize(
     ("initial_error", "cleanup_confirmed"),
     [
-        pytest.param(NoFeasibleTrialError("trainer failed"), True, id="ordinary-failure"),
+        pytest.param(
+            NoFeasibleTrialError("trainer failed", cause="trials_failed"),
+            True,
+            id="ordinary-failure",
+        ),
         pytest.param(
             UnsafeProcessCleanupError("trial cleanup could not be confirmed"),
             False,
@@ -1087,7 +1091,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
-    primary = NoFeasibleTrialError("trainer failed")
+    primary = NoFeasibleTrialError("trainer failed", cause="trials_failed")
 
     def fail_with_uncertain_cleanup(
         config_obj: Experiment,
@@ -1133,7 +1137,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["failure"]["stage"] == "cleanup"
     assert status["failure"]["retryable"] is False
     assert status["failure"]["actor"] == "operator"
-    assert status["failure"]["cause"]["code"] == "trainer_failed"
+    assert status["failure"]["cause"]["code"] == "trials_failed"
     assert status["failure"]["cause"]["stage"] == "execution"
 
 
