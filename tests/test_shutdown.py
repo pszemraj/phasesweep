@@ -38,6 +38,25 @@ from tests.conftest import (
 
 
 @pytest.mark.integration
+def test_cli_imports_without_sighup_so_the_platform_gate_names_the_host() -> None:
+    """A host without SIGHUP, such as Windows, gets the Linux refusal, not an import error."""
+    code = (
+        "import signal, sys\n"
+        "del signal.SIGHUP\n"
+        "from phasesweep.cli import cli\n"
+        "from phasesweep.runtime.files import require_linux_runtime\n"
+        "sys.platform = 'win32'\n"
+        "require_linux_runtime()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], text=True, capture_output=True, timeout=60.0, check=False
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "PlatformCapabilityError" in proc.stderr
+    assert "phasesweep runs only on Linux, and this host reports 'win32'" in proc.stderr
+
+
+@pytest.mark.integration
 def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
     tmp_path: Path,
 ) -> None:

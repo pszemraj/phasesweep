@@ -31,7 +31,11 @@ _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 # The handler waits until each in-flight launch registers its PGID or fails.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
-_SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# Execution is Linux-only, but the package must import anywhere so that
+# require_linux_runtime(), not an AttributeError, reports a host without SIGHUP.
+_SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
+    signal.Signals[name] for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name)
+)
 
 
 @dataclass(frozen=True)
