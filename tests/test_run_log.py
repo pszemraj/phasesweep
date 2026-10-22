@@ -79,14 +79,16 @@ def test_run_log_records_one_line_per_finished_trial(tmp_path: Path) -> None:
     assert sorted(by_state) == ["COMPLETE", "FAIL", "INFEASIBLE"]
 
     failed = by_state["FAIL"]
-    assert "outcome=failure value=none" in failed
+    assert "state=FAIL value=none" in failed
     assert failed.endswith(" reason=non-zero exit code 3; stderr: second line")
     infeasible = by_state["INFEASIBLE"]
-    assert "outcome=failure value=52.5" in infeasible
+    assert "state=INFEASIBLE value=52.5" in infeasible
     assert "reason=metric or evidence constraints were infeasible" in infeasible
     feasible = [line for line in lines if "state=COMPLETE" in line]
     assert len(feasible) == 2
-    assert all("outcome=success" in line and "reason=" not in line for line in feasible)
+    assert all(re.search(r"state=COMPLETE value=\d", line) for line in feasible)
+    assert all("reason=" not in line for line in feasible)
+    assert all("outcome=" not in line for line in lines)
     assert all(re.search(r"duration=\d+\.\ds", line) for line in lines)
     assert all("repeat=" not in line for line in lines)
 

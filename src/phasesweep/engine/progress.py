@@ -67,9 +67,11 @@ def _log_phase_header(
 
 
 def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished: int) -> None:
-    """Log one finished trial's state, outcome reason, and duration.
+    """Log one finished trial's state, value, duration, and first cause line.
 
-    Use ``INFEASIBLE`` or ``INTERRUPTED`` where applicable. Repeat values and rerun
+    The state is the one :func:`~phasesweep.engine.optuna._trial_count_state` reports, which
+    fixes the trial's recorded outcome: ``COMPLETE`` is a success, ``INFEASIBLE`` and
+    ``FAIL`` are failures, and ``INTERRUPTED`` is an interruption. Repeat values and rerun
     sources are included; params remain on the phase's WINNER line.
 
     :param Phase phase: The phase the trial belongs to.
@@ -77,7 +79,6 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
     :param int finished: Trials of the phase's study that counted toward its target when
         this trial's outcome was recorded, this one included unless it was interrupted.
     """
-    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     value = "none" if trial.value is None else f"{trial.value:g}"
     duration = "none" if trial.duration is None else f"{trial.duration.total_seconds():.1f}s"
     axis = repeat_axis(phase)
@@ -88,11 +89,10 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
     rerun = "" if source is None else f" rerun_of={source}"
     reason = _first_cause_line(trial)
     log.info(
-        "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s%s (%d/%d finished)%s",
+        "phase=%s TRIAL trial=%d state=%s value=%s duration=%s%s%s (%d/%d finished)%s",
         phase.name,
         trial.number,
         _trial_count_state(trial),
-        "unknown" if parsed is None else parsed.outcome,
         value,
         duration,
         repeat,
