@@ -8,7 +8,7 @@ current-journal/ledger/study.journal   journal ledger
 current-journal/artifact_root/t/...    the artifact tree that claimed that ledger
 ```
 
-It is consumed by `tests/test_ledger_read_paths.py` through `tests/ledger_fixtures.py`, which copies the fixture into a temporary directory, rebuilds the experiment config from `tests/fixtures/make_ledger_fixtures.py`, and snapshots the bytes before the read.
+It is consumed through `tests/ledger_fixtures.py`: `tests/test_ledger_read_paths.py` runs its read-path matrix over it, and other test modules (publication, error routing, format cutover, CLI, observations, fingerprints, status shape, read views, MLflow delivery) copy it as a ready-made published generation with `golden_publication` or `materialize`. The helper copies the fixture into a temporary directory, rebuilds the experiment config from `tests/fixtures/make_ledger_fixtures.py`, rewrites the copy's artifact-root binding and per-study root records in `tree` mode, and snapshots the bytes before the read.
 
 ## Inventory
 

@@ -11,11 +11,11 @@ git submodule update --init examples/tiny_decoder_enwik8/upstream
 pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
-The submodule checkout also brings the [dataset](upstream/data/README.md): `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. The wrapper runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
+The submodule checkout also brings the [dataset](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/data/README.md): `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. The wrapper runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
-Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision) and [requirements](upstream/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
+Review the pinned trainer's [device and precision support](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#device-selection--precision) and [requirements](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
 Run GPU validation, dry runs, and training from a shell with [host GPU access](../../docs/runtime.md#gpu-isolation).
 
@@ -50,7 +50,7 @@ The example sweeps only supported trainer controls. The upstream template does n
 
 ## Learning rates over seeds
 
-The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. When copying this YAML outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After the setup above, run from the PhaseSweep repository root:
+The runnable [`repeats.yaml`](repeats.yaml) demonstrates the repeats workflow: three learning rates, each run over seeds 7, 17, and 27. For a continuous key such as the learning rate, [more distinct values with one trial each](../../docs/config.md#noisy-objectives-and-small-budgets) usually tell more; repeats suit a few discrete finalists. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. When copying this YAML outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After the setup above, run from the PhaseSweep repository root:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/repeats.yaml
@@ -110,7 +110,7 @@ phasesweep show-winners examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 phasesweep status examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 ```
 
-The wrapper's `--mlflow` option logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The pinned upstream trainer is unchanged.
+The wrapper's `--mlflow` option logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The upstream trainer runs as pinned, with no modification.
 
 The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. The wrapper then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
 
@@ -154,6 +154,6 @@ Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path, then verify the read-only catalog operation as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client).
+Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client), then [verify the read-only catalog operation](../../docs/mcp_setup.md#4-verify-the-connection).
 
 The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first run as described in the [fresh MCP state](../../docs/mcp.md#fresh-mcp-state) section.

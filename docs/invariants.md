@@ -8,7 +8,7 @@ Module paths below drop the `phasesweep.` prefix; test paths are relative to the
 
 ### Lock and ledger order
 
-Every path into the ledger passes through `engine.ledger`, and the handle each step returns is the proof the earlier steps ran. The diagram shows where each caller enters and where it must stop.
+Every path into the ledger passes through `engine.ledger`, and for the configured ledger the handle each step returns is the proof the earlier steps ran; `open_registry_study`, which opens the ledger an attempt-registry entry recorded, takes no handle and scans and repairs that ledger itself. The diagram shows where each caller enters and where it must stop.
 
 `engine.ledger` alone constructs Optuna storage. Read paths use validated snapshots; live study creation requires a claimed ledger. [Development](development.md#quality-gates) describes the contract checks.
 
@@ -24,14 +24,15 @@ flowchart TD
     end
     scan --> handle["ValidatedLedger<br/>records whether the scan completed"]
     handle -->|"read paths stop here"| ro["read_trial_stats<br/>phase unavailable if the scan did not complete"]
-    handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
+    handle -->|"recover-run, never claims; repairs first when confirmed"| existing["open_existing_study<br/>refuses a scan that did not complete"]
     handle -->|"run"| rescan
     subgraph claim["claim_ledger"]
         rescan["strict rescan if the scan did not complete"] --> repair["cut a partial final journal record<br/>under the PhaseSweep inode lock"]
         repair --> discover["load every existing phase study"]
-        discover --> roots["check every study's root, all phases before any write"]
+        discover --> roots["check every study's root, all phases before any binding or claim"]
         roots --> recheck["re-check the tree binding is unchanged"]
-        recheck --> bind["write the tree binding if unbound"]
+        recheck --> mkdir["create the ledger's directory"]
+        mkdir --> bind["write the tree binding if unbound"]
         bind --> claimst["claim empty studies for this root"]
     end
     claimst --> claimed["ClaimedLedger"]
@@ -45,7 +46,7 @@ flowchart TD
 
 #### 1. Mutations hold the experiment lock
 
-A run, and a `recover-run` the operator confirms, hold the experiment lock before they read or write the artifact tree or the ledger. `sync-tracking` holds it too: it retires tracking attempts and writes the tracking tree, reading the ledger only through `validate_ledger` and `read_phase_trials`.
+A run, and a `recover-run` the operator confirms, hold the experiment lock before they write the artifact tree or the ledger or read anything such a write depends on; only a run's fresh-tree checks (invariant 11) read earlier. `sync-tracking` holds it too: it retires tracking attempts and writes the tracking tree, reading the ledger only through `validate_ledger` and `read_phase_trials`.
 
 **Held by:** `engine.locking._experiment_lock`, entered as the outermost durable-state context in `engine.run._run_experiment_outcome`, in `mcp.recovery.recover_run` only when the operator confirms, and in `tracking.publication.sync_tracking` inside `runtime.shutdown.signal_handler_scope` for its whole body: tracking-only attempt resolution, record rebuilds, and deliveries\
 **Test:** `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration`
@@ -70,16 +71,16 @@ Only a `ClaimedLedger` can open a study that runs new trials, and `claim_ledger`
 **Held by:** `engine.ledger.claim_ledger` returning `ClaimedLedger`; `engine.ledger.open_phase_study`, which raises `TypeError` for any other handle; `engine.ledger.open_preview_study`, which is in-memory and serves dry runs\
 **Tests:** `tests/test_format_cutover.py::test_live_openers_reject_unvalidated_storage`, `tests/test_format_cutover.py::test_claim_ledger_binds_tree_then_returns_bound_handle`, `tests/test_format_cutover.py::test_claim_rescans_an_unverified_ledger_before_discovery`, `tests/test_ledger_contract.py::test_storage_constructors_are_called_only_in_the_ledger_module`
 
-#### 4. Both ownership directions agree before any write
+#### 4. Both ownership directions agree before any binding or claim
 
-The tree binding must name this ledger and every existing phase study must name this root, checked for all phases before anything is written.
+The tree binding must name this ledger and every existing phase study must name this root, checked for all phases before anything is bound or claimed; only the repair of a partial final journal record, which changes nothing a reader sees, comes earlier.
 
 **Held by:** `engine.artifact_roots._check_artifact_root_binding` in `validate_ledger`, then `engine.artifact_roots._artifact_root_claim_needed` for every loaded study and a re-check of the binding in `claim_ledger`\
 **Tests:** `tests/test_fingerprint.py::test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched`, `tests/test_fingerprint.py::test_refused_multi_phase_binding_claims_nothing`
 
 #### 5. The tree is bound before any study
 
-`claim_ledger` writes the tree binding before it claims any study, so a crash between the two cannot leave a study naming a tree that does not name its ledger. Its first write, before the binding, creates the ledger's parent directory, so a ledger path that cannot hold a file fails while the tree is still unbound and the path can be corrected.
+`claim_ledger` writes the tree binding before it claims any study, so a crash between the two cannot leave a study naming a tree that does not name its ledger. Before the binding it creates the ledger's parent directory, so a ledger path that cannot hold a file fails while the tree is still unbound and the path can be corrected.
 
 **Held by:** `engine.ledger.claim_ledger`, creating the ledger's parent directory, then calling `engine.artifact_roots._write_artifact_root_binding` before its `_claim_study_artifact_root` loop\
 **Tests:** `tests/test_format_cutover.py::test_claim_ledger_writes_tree_binding_before_claiming_studies`, `tests/test_format_cutover.py::test_claim_ledger_creates_ledger_parent_but_validate_does_not`, `tests/test_format_cutover.py::test_unwritable_ledger_directory_fails_before_the_tree_is_bound`
@@ -127,10 +128,10 @@ Recovery signals nothing for an attempt only on a durable lifecycle state that p
 
 A generation exists only for an invocation that [launches a trial or publishes winners that differ from the current publication](runtime.md#timeouts-cleanup-and-continuation); a generation that names no work would make `status` report an invocation that did nothing. Every check that can refuse a launch therefore finishes before the claim: environment preflight and the continuation preflight run before any phase, and each phase's resume, cohort, SDK, GPU, budget and tracking-target checks run before that phase claims the generation, ahead of its first trial-target write and any attempt registration. A run that launched nothing compares its winners with the validated publication and claims only when they differ or nothing validates as published. The claim writes the namespace and its provenance before it moves the current pointer to `running`, so a crash never leaves that pointer naming a missing generation.
 
-**Held by:** `engine.run._run_experiment_outcome`, which picks the id with `engine.generation._new_generation_id`, runs `_preflight_missing_reached_phase_environments`, `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` with nothing claimed, records a failure and reconciles the studies only for a claimed generation, and reports the failure stage `execution` through `engine.run._failure_stage` only for one; `engine.phase._run_phase`, which calls `engine.generation.InvocationGeneration.claim` after `engine.phase._resume_phase` and the launch checks; `engine.run._run_experiment_inner`, which claims at publication only when `engine.generation._publication_holds` finds no matching publication; `engine.generation.InvocationGeneration.save_winner`, which holds winners until the claim\
+**Held by:** `engine.run.run_experiment`, which on a fresh tree runs `engine.resume._preflight_skipped_winners` and `engine.run._preflight_missing_reached_phase_environments` before the lock; `engine.run._run_experiment_outcome`, which picks the id with `engine.generation._new_generation_id`, runs `engine.run._preflight_missing_reached_phase_environments` on an existing tree, `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._reject_fixed_targets_without_study`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` with nothing claimed, records a failure and reconciles the studies only for a claimed generation, and reports the failure stage `execution` through `engine.run._failure_stage` only for one; `engine.phase._run_phase`, which calls `engine.generation.InvocationGeneration.claim` after `engine.phase._resume_phase` and the launch checks; `engine.run._run_experiment_inner`, which claims at publication only when `engine.generation._publication_holds` finds no matching publication; `engine.generation.InvocationGeneration.save_winner`, which holds winners until the claim\
 **Tests:** `tests/test_generation_claim.py::test_a_refused_run_leaves_no_generation_and_both_pointers_as_they_were`, `tests/test_generation_claim.py::test_an_aborted_run_keeps_its_generation_and_the_refused_reruns_add_none`, `tests/test_generation_claim.py::test_a_replay_of_the_published_winners_writes_no_generation`, `tests/test_generation_claim.py::test_a_replay_publishes_a_generation_when_nothing_is_published`, `tests/test_generation_claim.py::test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports`, `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`, `tests/test_runtime_behavior.py::test_failure_stage_and_reconciliation_follow_whether_the_generation_was_claimed`, `tests/test_mcp_failure_stage.py::test_fingerprint_refusal_on_an_existing_tree_reports_preflight`, `tests/test_trial_evidence.py::test_topup_refuses_a_candidate_whose_evidence_left_the_tree`
 
-`claim_ledger` runs before environment preflight, so these checks guard the generation and the attempts, not the ledger claim.
+On an existing tree, `claim_ledger` runs before environment preflight, so these checks guard the generation and the attempts, not the ledger claim. On a fresh tree, `run_experiment` checks the reached phases' launch environments and any `--from-phase` winners before it takes the lock, so those refusals create no tree.
 
 #### 12. A persistent study holds one environment cohort
 
@@ -155,7 +156,7 @@ A phase abort is written in the same record as the outcome that trips it, and re
 
 #### 15. An unreadable ledger means cleanup is uncertain
 
-A ledger that cannot be read makes cleanup uncertain, never confirmed, and the attempt stays registered for a later retry. A journal's partial final record does not make it unreadable: the registry opener repairs it first, as invariant 2 ("Validation writes nothing") describes, and reads the attempt as it would on a healthy journal.
+A ledger that cannot be read never lets a stale trial's cleanup read as confirmed: the stale-trial reaper refuses with `ProcessCleanupUncertainError` and preflight marks the cleanup report uncertain. An attempt-registry entry whose recorded ledger cannot be read stays registered for a later retry once its process is resolved, so its trial's `FAIL` is never dropped. A journal's partial final record does not make it unreadable: the registry opener repairs it first, as invariant 2 ("Validation writes nothing") describes, and reads the attempt as it would on a healthy journal.
 
 **Held by:** `engine.cleanup._reap_stale_trials`, which raises `ProcessCleanupUncertainError`; `engine.attempts._registry_attempt_fail_stale_trial`, which opens through `engine.ledger.open_registry_study` and retains the entry when storage is unreachable; `engine.guards._preflight_existing_studies`, which marks the cleanup report uncertain\
 **Tests:** `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain`, `tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`, `tests/test_stale_reaper.py::test_registry_reads_its_attempt_after_repairing_a_partial_journal_record`
@@ -217,17 +218,17 @@ A process is identified by PID, start time, boot id, and PID namespace together,
 
 A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes a run. The one exception is a runner from a boot that has ended: nothing from that boot survived, and a boot never comes back, so the run reads `failed` without a signal. Deriving state writes nothing, so a read tool never creates or removes a marker: the writers that must reserve cleanup (cancel, failed-spawn cleanup, `recover-run`) persist their own marker, and a marker that a later status or boot supersedes is read as inert. A runner recorded in a PID namespace the server cannot observe is neither alive nor dead: it stays live on durable evidence alone, is never reaped, probed, or signalled, and `cancel_run` and `recover-run` refuse it. Its stale heartbeat only makes agent reports and launch refusals ask for operator recovery; it changes no state and drives no write, signal, or recovery. When the host's initial namespace proves its processes gone, it reads as a dead runner that needs recovery, never as terminal, because that proof says nothing of its trials and a later reader may be unable to repeat it; only `recover-run` settles the run, and the status it writes outlives any later proof.
 
-**Held by:** `mcp.runs.RunStore.observe` and `mcp.runs.RunStore.runner_view`, resolved only by `mcp.recovery.recover_run`\
-**Tests:** `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence`, `tests/test_pid_namespace.py::test_foreign_namespace_runner_reads_running_and_writes_nothing`, `tests/test_pid_namespace.py::test_a_stale_heartbeat_asks_for_recovery_without_settling_the_run`, `tests/test_pid_namespace.py::test_absent_runner_reads_as_a_dead_runner_that_needs_recovery`, `tests/test_pid_namespace.py::test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run`, `tests/test_pid_namespace.py::test_recover_run_settles_an_absent_runner_without_signalling`, `tests/test_pid_namespace.py::test_cancel_refuses_foreign_namespace_without_signalling_or_marker`
+**Held by:** `mcp.runs.RunStore.observe` and `mcp.runs.RunStore.runner_view`, resolved only by `mcp.recovery.recover_run`; `mcp.runner._RunnerHeartbeat`, which `mcp.runner.main` starts before `mcp.runner._persist_spawned_handle` and stops only after the terminal status is written; `mcp.runs.RunStore._runner_heartbeat_stale`, which `RunStore.observe` reads only for an unobservable runner and reports as `RunObservation.runner_heartbeat_stale` without changing `state` or `recovery_required`; its only readers, `mcp.tools.PhaseSweepMCP._run_payload` and `mcp.tools.PhaseSweepMCP.launch`, which fold it into the reported `recovery_required` and the busy and capacity refusals\
+**Tests:** `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence`, `tests/test_pid_namespace.py::test_an_observable_runner_is_judged_by_its_process_not_its_heartbeat`, `tests/test_pid_namespace.py::test_only_a_runner_still_owing_its_final_status_is_judged_by_its_heartbeat`, `tests/test_pid_namespace.py::test_runner_heartbeat_starts_before_launch_ready_and_refreshes_until_exit`, `tests/test_pid_namespace.py::test_foreign_namespace_runner_reads_running_and_writes_nothing`, `tests/test_pid_namespace.py::test_a_stale_heartbeat_asks_for_recovery_without_settling_the_run`, `tests/test_pid_namespace.py::test_absent_runner_reads_as_a_dead_runner_that_needs_recovery`, `tests/test_pid_namespace.py::test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run`, `tests/test_pid_namespace.py::test_recover_run_settles_an_absent_runner_without_signalling`, `tests/test_pid_namespace.py::test_cancel_refuses_foreign_namespace_without_signalling_or_marker`
 
 ### Errors and fixtures
 
 #### 24. Wraps keep the operator's remediation
 
-Operator-facing errors carry a remediation action, preserved by wrapping. Aggregated refusals use their shared action, or `INSPECT_LOGS` when actions differ. CLI errors and MCP failure payloads render next steps from shared action phrases; exception strings retain the diagnostic. Unconfirmed cleanup also requires recovery. A recovery refusal directs the operator to a repair or confirmed recovery rather than repeating the same inspection.
+Operator-facing errors carry a remediation action, preserved by wrapping. Aggregated refusals use the action every collected refusal shares, or `INSPECT_LOGS` when the actions differ or any collected error names none. CLI errors and MCP failure payloads render next steps from shared action phrases; exception strings retain the diagnostic. Unconfirmed cleanup also requires recovery. A recovery refusal directs the operator to a repair or confirmed recovery rather than repeating the same inspection.
 
-**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.default_action` with the `action` each instance carries, `errors.PhaseSweepError.rewrap`, `errors.OPERATOR_STEPS`, `mcp.runner._cleanup_steps`\
-**Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`, `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`, `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
+**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.default_action` with the `action` each instance carries, `errors.PhaseSweepError.rewrap`, `engine.guards._raise_collected_errors`, `errors.OPERATOR_STEPS`, `mcp.runner._cleanup_steps`\
+**Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`, `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`, `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`, `tests/test_stale_reaper.py::test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable`
 
 #### 25. Refusals are tested against a real ledger
 
@@ -249,7 +250,7 @@ The confound block is computed once per selection and frozen onto the winner; `n
 
 A repeat group holds exactly one trial per repeat value: under grid its key is the trial's params without the repeat key, and under seeded random it is also the configuration slot, the trial's draw position divided by R and rounded down, so a later top-up can add groups but never a member to a complete one. An interrupted trial belongs to no group; its rerun has the same params and position, so it takes the trial's place, and a complete group has no interrupted member to rerun. A failed member that a persistent grid retry replaced leaves its group to the retry in the same way. The [winner's scalar fields](runtime.md#repeat-groups) describe the group's highest-numbered member, so a winning group cites the generation that ran its last member. Manifest validation re-derives the reduced metric, spread and observed means from the members and requires the snapshot's repeat key, reducer and exactly one member per repeat value. It reads no trial evidence; selection and resume verify every member's evidence directly.
 
-**Held by:** `engine.repeats.group_key`, keyed by `engine.optuna._draw_positions`, `engine.repeats.ranked_group` naming the group by its last member, `engine.selection._rank_groups`, which skips interrupted and replaced trials, `engine.repeats._validate_repeats_block`, called by `engine.publication_validation._validate_generation_manifest`, and `engine.repeats.evidence_members`, iterated by `engine.evidence._verify_winner_evidence`\
+**Held by:** `engine.repeats.group_key`, keyed by `engine.optuna._draw_positions`, `engine.repeats.ranked_group` naming the group by its last member, `engine.selection._rank_groups`, which skips interrupted and replaced trials, `engine.repeats._validate_repeats_block` and `engine.repeats._check_repeats_axis`, called by `engine.publication_validation._validate_generation_manifest`, and `engine.repeats.evidence_members`, iterated by `engine.evidence._verify_winner_evidence`\
 **Tests:** `tests/test_timeouts.py::test_group_completed_after_partial_timeout_publishes_from_completing_generation`, `tests/test_selector.py::test_seeded_random_duplicate_configs_rank_as_separate_slots`, `tests/test_selector.py::test_repeats_tie_goes_to_lowest_group_and_highest_member_names_it`, `tests/test_selector.py::test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position`, `tests/test_trial_evidence.py::test_group_winner_verifies_every_member_evidence`, `tests/test_repeats_runtime.py::test_carried_repeat_winner_reads_without_older_publication`, `tests/test_grid_failure_retry.py::test_partly_failed_grid_retries_the_failed_cell_only`, `tests/test_rerun_real_runs.py::test_seeded_random_repeats_rerun_a_chain_of_interruptions`
 
 ### Budget and reruns

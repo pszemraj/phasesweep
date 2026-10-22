@@ -72,7 +72,7 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 
 - `MCP support is not installed`: install the MCP extra in the environment that supplies `phasesweep-mcp`.
 - The client cannot start the server: verify its client-owned stdio entry has absolute executable and catalog paths, then run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml`.
-- `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend; the running server applies it on the next call.
+- `action 'launch' is not permitted`, `action 'cancel' is not permitted` or `action 'from_phase' is not permitted`: change the catalog only if that is the authority you intend; the running server applies it on the next call, but a grant never reaches [a run launched without cancel permission](mcp.md#the-catalog).
 - A launch refused because the catalog or a config it lists `no longer validates`: run `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` and fix what it reports; the server's stderr log names the file. A launch refused for a different `state_dir`: restart the server. See [the catalog](mcp.md#the-catalog).
 - `concurrency limit reached` or an experiment that already has a running sweep: [run state and recovery](mcp.md#run-state-and-recovery) says which blockers to await and which need the operator.
 - Lock-directory access failure (`storage_unavailable`): set the same `PHASESWEEP_LOCK_DIR` for every participating shell, MCP server, and sandbox, following the [lock directory rules](runtime.md#storage-and-locks).
@@ -80,4 +80,4 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - Unavailable terminal snapshot: inspect run/server diagnostics; [historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
-- Trainer environment cohort mismatch: the detached runner uses the server's environment; reconcile it with shell launches using the [trainer contract](config.md#trainer-contract).
+- Trainer environment cohort mismatch: the detached runner composes the trainer's environment from [the server's](mcp.md#the-catalog), not your shell's; reconcile the two using the [trainer contract](config.md#trainer-contract).

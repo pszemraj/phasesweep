@@ -8,7 +8,7 @@ This is useful when a full joint sweep is too expensive or hard to interpret. Fo
 
 ## How it works
 
-The `starter.yaml` that `phasesweep init` writes searches depth before learning rate (abridged; the full file also sets storage, the working directory, and the metric extractor):
+The `starter.yaml` that `phasesweep init` writes searches depth before learning rate (abridged; the full file also sets storage, provenance, the working directory, the trainer's execution context, the metric extractor, per-phase comments, and explanatory comments):
 
 ```yaml
 experiment: phasesweep_starter
@@ -61,7 +61,7 @@ phasesweep run starter.yaml         # runs four tiny toy-trainer trials
 
 `phasesweep init` never overwrites an existing file; `phasesweep init --list` shows the other [templates](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates).
 
-The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged):
+The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged to the message text: the timestamp, level and logger prefix of each line and each phase's header line are omitted):
 
 ```text
 [depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
@@ -76,7 +76,7 @@ phase=learning_rate TRIAL trial=1 state=COMPLETE value=0.413822 duration=0.8s (2
 phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
 ```
 
-The `depth` winner's `model.n_layers: 8` is injected into every `learning_rate` trial's complete YAML. Winners persist in the working directory, so you can inspect them any time (abridged):
+The `depth` winner's `model.n_layers: 8` is injected into every `learning_rate` trial's complete YAML. Winners persist in the working directory, so you can inspect them any time. The output starts with a `# code revision:` line, then holds one `=== PHASE ===` block per phase with that phase's winner file; this is the winner file in the `learning_rate` block (abridged):
 
 ```bash
 phasesweep show-winners starter.yaml
