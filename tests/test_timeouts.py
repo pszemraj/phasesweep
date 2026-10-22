@@ -96,7 +96,6 @@ def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_p
     assert "Run wallclock deadline" not in str(refused.value)
 
 
-@pytest.mark.integration
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -882,7 +881,6 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
         run_experiment(experiment)
 
 
-@pytest.mark.integration
 def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
