@@ -289,3 +289,21 @@ def test_an_mcp_replay_succeeds_without_a_generation_and_a_refusal_still_reports
     refused = json.loads(store.status_path("srv-lowered").read_text())
     assert refused["failure"]["code"] == "trial_target_refused"
     assert refused["result_snapshot"]["winners"] == []
+    # The refused run's ID names no generation, so it represents none.
+    refused_payload = status_payload(
+        "srv",
+        refused["result_snapshot"]["status"],
+        {"run_id": "srv-lowered"},
+        result_source="frozen_run_snapshot",
+        elapsed_seconds=None,
+    )
+    assert refused_payload["represented_generation_id"] is None
+    assert refused_payload["published_generation_id"] == "srv-first"
+    assert (
+        refused_payload["is_published"],
+        refused_payload["summary_present"],
+        refused_payload["run_wrote_generation"],
+    ) == (False, False, False)
+    (refused_phase,) = refused_payload["phases"]
+    assert refused_phase["attempts_launched_this_run"] == 0
+    assert refused_phase["finished_trials_before_run"] == 2

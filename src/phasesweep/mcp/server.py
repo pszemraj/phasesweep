@@ -483,9 +483,9 @@ class GetRunStatusResult(_ToolPayload):
     represented_generation_id: str | None = Field(
         description=(
             "Generation supplying this payload's winners and summary: the queried run's own "
-            "generation, the published generation a run that launched nothing replayed, or "
-            "the queried run's ID when it wrote and replayed none; null for an unavailable "
-            "placeholder."
+            "generation, named by its run ID, or the published generation a run that launched "
+            "nothing replayed. Null for a run refused before it wrote a generation, and for an "
+            "unavailable placeholder."
         )
     )
     is_published: bool = Field(

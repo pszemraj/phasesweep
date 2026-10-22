@@ -1710,9 +1710,10 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         *,
         generation_id: str,
         trial_generation_id: str | None = None,
+        generation_claimed: bool = True,
         engine_winners: object = None,
     ) -> dict[str, object]:
-        del trial_generation_id
+        del trial_generation_id, generation_claimed
         return capture_result_snapshot(
             experiment,
             generation_id=generation_id,

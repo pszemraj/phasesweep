@@ -383,6 +383,7 @@ def capture_result_snapshot(
     *,
     generation_id: str | None = None,
     trial_generation_id: str | None = None,
+    generation_claimed: bool = True,
     engine_winners: Mapping[str, Winner] | None = None,
 ) -> dict[str, Any]:
     """Capture path-free status and winners for the requested generation.
@@ -400,6 +401,9 @@ def capture_result_snapshot(
         owns the experiment lock, or the published generation a replay matched.
     :param str | None trial_generation_id: Generation whose trials ``generation_trials``
         counts when it differs from ``generation_id``; only with ``engine_winners``.
+    :param bool generation_claimed: ``False`` when ``generation_id`` is the id of an
+        invocation that never claimed its generation; that id names no files, so the
+        snapshot represents no generation while still counting its trials.
     :param Mapping[str, Winner] | None engine_winners: The engine's own
         winner mapping from its terminal report, when the run succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
@@ -427,6 +431,8 @@ def capture_result_snapshot(
     else:
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
+    if not generation_claimed:
+        status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(
         status=StatusSnapshot.model_validate(
             {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}

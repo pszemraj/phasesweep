@@ -803,11 +803,13 @@ def main(argv: list[str] | None = None) -> int:
                     result_snapshot = dict(publication_hook.snapshot)
                 else:
                     try:
-                        # A replay that wrote no generation represents the one it matched.
+                        # A replay that wrote no generation represents the one it matched;
+                        # a failure before the claim represents none.
                         result_snapshot = capture_result_snapshot(
                             config,
                             generation_id=report.replayed_generation_id or report.generation_id,
                             trial_generation_id=report.generation_id,
+                            generation_claimed=report.failure_stage != "preflight",
                             engine_winners=report.winners,
                         )
                     except Exception as exc:  # preserve engine terminal cause
