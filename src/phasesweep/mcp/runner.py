@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -45,6 +46,7 @@ from phasesweep.errors import (
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
+    RUNNER_HEARTBEAT_INTERVAL_SECONDS,
     RunHandle,
     RunStore,
     load_experiment_snapshot,
@@ -56,7 +58,7 @@ from phasesweep.mcp.snapshots import (
     finalize_result_snapshot,
     mark_result_snapshot_published,
 )
-from phasesweep.runtime.files import UnsafeLockPathError
+from phasesweep.runtime.files import UnsafeLockPathError, open_private_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -586,6 +588,54 @@ def _write_status(
         return True
 
 
+class _RunnerHeartbeat:
+    """Refresh one run's heartbeat file from a daemon thread until stopped.
+
+    A reader that cannot observe this runner's PID namespace takes a stale heartbeat
+    as a sign that the runner has probably stopped. A refresh only advances the file's
+    modification time: it writes no data and syncs nothing.
+    """
+
+    def __init__(self, path: Path, interval_seconds: float) -> None:
+        """Create the private heartbeat file and start refreshing it.
+
+        :param Path path: The run's heartbeat path in the MCP state directory.
+        :param float interval_seconds: Seconds between refreshes.
+        :raises OSError: If the heartbeat file cannot be created.
+        :raises UnsafePrivatePathError: If the heartbeat path or its directory is unsafe.
+        """
+        self._handle = open_private_text(path, "w")
+        self._interval_seconds = interval_seconds
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._refresh, name="phasesweep-runner-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def _refresh(self) -> None:
+        """Advance the heartbeat's modification time once per interval until stopped."""
+        failing = False
+        while not self._stopped.wait(self._interval_seconds):
+            try:
+                os.utime(self._handle.fileno())
+            except OSError:
+                if not failing:
+                    logging.getLogger("phasesweep.mcp.runner").warning(
+                        "could not refresh the runner heartbeat; a reader in another PID "
+                        "namespace may report that this runner has probably stopped",
+                        exc_info=True,
+                    )
+                failing = True
+            else:
+                failing = False
+
+    def stop(self) -> None:
+        """Stop refreshing and close the heartbeat file, which stays with the run's records."""
+        self._stopped.set()
+        self._thread.join()
+        self._handle.close()
+
+
 def _persist_spawned_handle(
     *,
     state_dir: Path,
@@ -741,7 +791,13 @@ def main(argv: list[str] | None = None) -> int:
     config: Experiment | None = None
     status_persisted = False
     publication_hook = _RunnerPublicationHook(status_path, status)
+    heartbeat: _RunnerHeartbeat | None = None
     try:
+        # The heartbeat starts before the identity is durable, so no reader finds a
+        # spawned runner without one, and stops only once terminal status is durable.
+        heartbeat = _RunnerHeartbeat(
+            RunStore(state_dir).heartbeat_path(args.run_id), RUNNER_HEARTBEAT_INTERVAL_SECONDS
+        )
         # Persist identity even if the spawning server has exited.
         handle = _persist_spawned_handle(
             state_dir=state_dir,
@@ -872,26 +928,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise
     finally:
-        if publication_hook.snapshot is not None and result_snapshot is None:
-            result_snapshot = dict(publication_hook.snapshot)
-        if publication_hook.state == "prepared" and status["returncode"] != 0:
-            # Reported non-commit clears the marker; a hard exit leaves it for recovery.
-            publication_hook.clear_uncommitted_marker()
-        if result_snapshot is None and terminal_report is None and config is not None:
-            try:
-                result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
-                    mode="json"
-                )
-            except Exception as exc:  # preserve the terminal engine failure
-                result_snapshot_error = type(exc).__name__
-            else:
-                status["generation_unavailable_reason"] = "engine_generation_not_claimed"
-        status_persisted = _write_status(
-            status_path,
-            status,
-            result_snapshot=result_snapshot,
-            result_snapshot_error=result_snapshot_error,
-        )
+        try:
+            if publication_hook.snapshot is not None and result_snapshot is None:
+                result_snapshot = dict(publication_hook.snapshot)
+            if publication_hook.state == "prepared" and status["returncode"] != 0:
+                # Reported non-commit clears the marker; a hard exit leaves it for recovery.
+                publication_hook.clear_uncommitted_marker()
+            if result_snapshot is None and terminal_report is None and config is not None:
+                try:
+                    result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
+                        mode="json"
+                    )
+                except Exception as exc:  # preserve the terminal engine failure
+                    result_snapshot_error = type(exc).__name__
+                else:
+                    status["generation_unavailable_reason"] = "engine_generation_not_claimed"
+            status_persisted = _write_status(
+                status_path,
+                status,
+                result_snapshot=result_snapshot,
+                result_snapshot_error=result_snapshot_error,
+            )
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop()
     # Missing terminal evidence makes an otherwise successful run exit nonzero.
     return 0 if status_persisted else 1
 

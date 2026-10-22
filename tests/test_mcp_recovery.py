@@ -82,6 +82,7 @@ from tests.mcp_helpers import (
     side_effect_app,
     stage_dead_run,
     write_run_status,
+    write_runner_heartbeat,
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
@@ -265,11 +266,14 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
     recovered_log = log_path.with_suffix(".log.recovered")
     log_bytes = b"runner failed before persisting its process identity\n"
     log_path.write_bytes(log_bytes)
+    # The runner starts its heartbeat before it persists its process identity.
+    heartbeat_path = write_runner_heartbeat(store, run_id)
     artifacts = (
         registry.state_dir / "runs" / f"{run_id}.json",
         store.config_snapshot_path(run_id),
         store.launch_lease_path(run_id),
         store._logs_dir / f"{run_id}.transition.lock",
+        heartbeat_path,
         log_path,
     )
     original = {path: path.read_bytes() for path in artifacts}

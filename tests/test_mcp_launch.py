@@ -76,6 +76,7 @@ from tests.mcp_helpers import (
     stage_live_run,
     write_mcp_catalog,
     write_run_status,
+    write_runner_heartbeat,
 )
 
 RESUMABLE_PHASES = """\
@@ -224,11 +225,16 @@ def test_capacity_refusal_guidance_matches_the_blocking_run(
             assert "only after that run is terminal" in message
 
 
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh-heartbeat", "stale-heartbeat"])
 @pytest.mark.parametrize("launch_target", ["next", "blocking"], ids=["capacity", "same-experiment"])
 def test_capacity_refusal_qualifies_unobservable_runner_liveness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_target: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_target: str, stale: bool
 ) -> None:
-    """A hidden runner keeps its reservation without a false claim that it is alive or dead."""
+    """A hidden runner keeps its reservation without a false claim that it is alive or dead.
+
+    A stale heartbeat sends the operator to recover it from a host shell, and still
+    leaves the run holding its slot.
+    """
     blocked_config = _config(tmp_path, name="blocking")
     next_config = _config(tmp_path, name="next")
     app, _registry, store = make_mcp_app(
@@ -240,6 +246,11 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
         )
     )
     handle = stage_live_run(store, "hidden-run", blocked_config, "blocking")
+    write_runner_heartbeat(
+        store,
+        handle.run_id,
+        age_seconds=mcp_runs.RUNNER_HEARTBEAT_STALE_SECONDS + 30.0 if stale else 0.0,
+    )
     monkeypatch.setattr(
         RunStore,
         "runner_view",
@@ -248,6 +259,7 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
     before = store.observe(handle)
     assert before.state == "running"
     assert before.recovery_required is False
+    assert before.runner_heartbeat_stale is stale
 
     expected_error = ConcurrencyLimitError if launch_target == "next" else ExperimentBusyError
     with pytest.raises(expected_error) as refused:
@@ -255,12 +267,18 @@ def test_capacity_refusal_qualifies_unobservable_runner_liveness(
 
     message = str(refused.value)
     assert handle.run_id in message
-    assert "cannot verify" in message
-    assert "host" in message
-    assert "progress" in message
+    assert "host shell" in message
+    if stale:
+        assert "recover-run" in message
+        assert "await_run" not in message
+        assert "Monitor durable progress" not in message
+    else:
+        assert "cannot verify" in message
+        assert "progress" in message
     after = store.observe(handle)
     assert after.state == "running"
     assert after.recovery_required is False
+    assert live_runs(store) == [handle]
 
 
 def test_safe_tool_redacts_unexpected_exception() -> None:

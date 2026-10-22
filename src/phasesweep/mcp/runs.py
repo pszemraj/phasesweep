@@ -10,6 +10,8 @@ import hashlib
 import json
 import logging
 import os
+import stat
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -66,6 +68,11 @@ RunnerVisibility: TypeAlias = Literal["observable", "absent", "gone", "unobserva
 # receipt, settling ownership of the spawned process.
 LAUNCH_READY_BYTE = b"R"
 LAUNCH_ACK_BYTE = b"A"
+#: Seconds between the detached runner's heartbeat refreshes.
+RUNNER_HEARTBEAT_INTERVAL_SECONDS = 15.0
+#: Heartbeat age, several missed refreshes, past which a reader that cannot
+#: observe the runner reports that it has probably stopped.
+RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
 
 log = logging.getLogger("phasesweep.mcp.runs")
 
@@ -81,6 +88,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".cleanup_recovery.json",
     ".launch.lock",
     ".transition.lock",
+    ".heartbeat",
 )
 MCP_STATE_FORMAT_VERSION = 4
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
@@ -220,6 +228,11 @@ class RunObservation:
     cleanup_recovery_required: bool
     snapshot_recovery_required: bool
     terminal_status: TerminalStatus | None
+    #: The runner is ``unobservable``, so it was taken as possibly alive, and its
+    #: heartbeat is missing or older than ``RUNNER_HEARTBEAT_STALE_SECONDS``.
+    #: Only agent-facing reports use this guess, to ask for operator recovery;
+    #: it never changes ``state``, drives a write or signal, or authorizes recovery.
+    runner_heartbeat_stale: bool
 
 
 @dataclass(frozen=True)
@@ -591,6 +604,10 @@ class RunStore:
         """Return the private kernel-backed launch lease path."""
         return self._logs_dir / f"{run_id}.launch.lock"
 
+    def heartbeat_path(self, run_id: str) -> Path:
+        """Return the private heartbeat path whose mtime the live runner refreshes."""
+        return self._logs_dir / f"{run_id}.heartbeat"
+
     def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
         """Reserve and durably prepare one run without spawning a process.
 
@@ -877,6 +894,7 @@ class RunStore:
                 paths = (
                     self._runs_dir / f"{run_id}.json",
                     self._logs_dir / f"{run_id}.transition.lock",
+                    self.heartbeat_path(run_id),
                     self.config_snapshot_path(run_id),
                     self.launch_lease_path(run_id),
                 )
@@ -967,9 +985,13 @@ class RunStore:
         Pending snapshots reserve capacity until finalization; only a dead
         runner makes that pending state require operator recovery.
 
+        Only an ``unobservable`` runner's heartbeat is read, and its staleness
+        changes neither the state nor any recovery requirement.
+
         :param RunHandle handle: Run whose state and recovery facts are needed.
         :param RunnerView | None view: Runner visibility already derived for this decision.
-        :return RunObservation: State, recovery requirements and the same terminal status.
+        :return RunObservation: State, recovery requirements, the same terminal
+            status, and whether an unobservable runner's heartbeat is stale.
         """
         if view is None:
             view = self.runner_view(handle)
@@ -1035,12 +1057,20 @@ class RunStore:
             state = "running"
         else:
             state = "failed" if gone or cleanup_recovered else "running"
+        # Probes cannot reach an unobservable runner, so the decision above took it
+        # as possibly alive; its heartbeat is the only hint left that it stopped.
+        heartbeat_stale = (
+            runner_alive
+            and view.visibility == "unobservable"
+            and self._runner_heartbeat_stale(handle)
+        )
         return RunObservation(
             state,
             launch_outcome_unknown or dead_without_status or cleanup_recovery or snapshot_recovery,
             cleanup_recovery,
             snapshot_recovery,
             status,
+            heartbeat_stale,
         )
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict[str, object] | None:
@@ -1217,6 +1247,25 @@ class RunStore:
         if view.visibility != "observable":
             return view.visibility == "unobservable"
         return is_same_live_process(handle.pid, handle.pid_starttime)
+
+    def _runner_heartbeat_stale(self, handle: RunHandle) -> bool:
+        """Return whether a spawned runner's heartbeat is missing or too old.
+
+        The runner creates its heartbeat before its spawned identity is durable,
+        so a missing one counts as stale. A host suspend pauses refreshes, so a
+        resumed runner can read stale until its next refresh.
+
+        :param RunHandle handle: Spawned run whose heartbeat is checked.
+        :return bool: Whether no regular heartbeat file exists or its
+            modification time is more than ``RUNNER_HEARTBEAT_STALE_SECONDS`` old.
+        """
+        try:
+            info = os.stat(self.heartbeat_path(handle.run_id), follow_symlinks=False)
+        except OSError:
+            return True
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        return time.time() - info.st_mtime > RUNNER_HEARTBEAT_STALE_SECONDS
 
     def _read_status(self, handle: RunHandle) -> TerminalStatus | None:
         """Read the runner-written terminal status payload.

@@ -359,16 +359,19 @@ class RunPayload(_ToolPayload):
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
     recovery_required: bool = Field(
         description=(
-            "True when the agent must stop monitoring and report an unresolved launch, "
-            "uncertain cleanup, or interrupted snapshot finalization to the operator. "
-            "A launch handoff observed mid-transition can still settle."
+            "True when the agent must stop monitoring and report to the operator an unresolved "
+            "launch, uncertain cleanup, interrupted snapshot finalization, or a runner in "
+            "another PID namespace whose heartbeat stopped. A launch handoff observed "
+            "mid-transition, or a heartbeat paused by a host suspend, can still settle."
         )
     )
     runner_observable: bool = Field(
         description=(
             "False for a running runner in another PID namespace: liveness and cancellation "
             "are unavailable. Monitor durable trial counts, do not call cancel_run, and "
-            "notify the user if counts stop advancing."
+            "notify the user if counts stop advancing. With recovery_required also true, the "
+            "runner has probably stopped or left cleanup uncertain: ask the operator to check "
+            "and recover it from a host shell."
         )
     )
     failure: FailurePayload | None = Field(

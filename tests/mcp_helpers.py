@@ -26,6 +26,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
+from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
@@ -480,6 +481,21 @@ def run_claimed_runner(
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)
+
+
+def write_runner_heartbeat(store: RunStore, run_id: str, *, age_seconds: float = 0.0) -> Path:
+    """Create a run's heartbeat as its runner does, last refreshed ``age_seconds`` ago.
+
+    :param RunStore store: Store owning the run.
+    :param str run_id: Run whose heartbeat is written.
+    :param float age_seconds: How long before now the runner last refreshed it.
+    :return Path: The heartbeat path.
+    """
+    path = store.heartbeat_path(run_id)
+    open_private_text(path, "w").close()
+    refreshed = time.time() - age_seconds
+    os.utime(path, (refreshed, refreshed))
+    return path
 
 
 def _stage_run(

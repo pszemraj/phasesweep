@@ -160,9 +160,9 @@ Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-ve
 
 `observed` contains [report-only measurements](config.md#objective-evidence-constraints-and-gates), never reasons a winner won. With non-null `repeats`, `metric` is the group's reduced value: report it with `sd`, `min`, `max`, and `n`. The [repeat-group contract](runtime.md#repeat-groups) explains aggregation; MCP returns the reducer, spread and `member_trials`, but never the repeat key or values.
 
-`recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
+`recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery, or that a runner in another PID namespace stopped refreshing its [heartbeat](#pid-namespaces). Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
-`runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.
+`runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing. With `recovery_required: true` as well, the runner's heartbeat has gone stale or its cleanup is uncertain: the runner has probably stopped, and the operator should check it and recover from a host shell. [PID namespaces](#pid-namespaces) explains the cause and the heartbeat.
 
 Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
@@ -172,7 +172,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials`; tools do not return raw logs, and agents need separate authorization to open them.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, heartbeat, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials`; tools do not return raw logs, and agents need separate authorization to open them.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
@@ -189,7 +189,7 @@ flowchart TD
     unsettled -->|"operator runs recover-run and confirms, once no runner can still start"| removed["abandoned launch removed"]
 ```
 
-In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. Busy and capacity refusals direct these blockers to operator recovery; healthy blockers can be monitored with `await_run`. When runner liveness cannot be verified across PID namespaces, the refusal explains that uncertainty and directs the operator to inspect from a host shell if durable progress stops. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
+In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. Busy and capacity refusals direct these blockers to operator recovery; healthy blockers can be monitored with `await_run`. When runner liveness cannot be verified across PID namespaces, the refusal explains that uncertainty: it directs the operator to recover from a host shell once the runner's heartbeat is stale, and otherwise to inspect from there if durable progress stops. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
 
 Operator recovery is deliberately a CLI operation, not an agent tool. Its counts distinguish stale RUNNING trials reaped from cleanup confirmations for trials that were already terminal, including attempts reconciled through the registry:
 
@@ -200,11 +200,13 @@ phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --
 Without `--confirm`, the command only inspects the run and reports the actions it would take. Read that report, then repeat the command with `--confirm` to perform them.
 
 > [!WARNING]
-> Do not delete run-handle files individually: a run history consists of its handle and matching log/status/config sidecars. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
+> Do not delete run-handle files individually: a run history consists of its handle and every `logs/` sidecar named after its run ID, such as its log, status, config, and heartbeat. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
 
 ### PID namespaces
 
 Runners and trials belong to the PID namespace that launched them; when a sandbox's namespace ends, so do its processes. A reader in another namespace cannot use the recorded PIDs to establish liveness or signal them. The run stays `running`, holds its slot, and reports `runner_observable: false`; cancellation and recovery refuse when they cannot establish cleanup. While the launching sandbox runs, an operator can cancel or recover from inside it.
+
+The runner refreshes a heartbeat file under `state_dir/logs/` every 15 seconds, from before its process identity is saved until its final status is written. A reader that cannot observe the runner, finds no final status, and sees that heartbeat missing or more than 120 seconds old reports `recovery_required: true`: the runner has probably stopped, so the agent stops monitoring and the operator should check it and recover from a host shell. The run still reads `running` and keeps its slot, because a stale heartbeat is not proof of death; no read writes, signals, or recovers anything on the strength of it, and a reader that can check the recorded process, from the runner's own namespace or by a host shell's proof that it is gone, relies on that check instead. A host suspend pauses refreshes, so after resuming from one longer than two minutes the flag can read true for up to 15 seconds while the runner is alive; a later read clears it.
 
 After that sandbox ends, run `recover-run` from a host shell outside any sandbox. The host's initial namespace can prove the recorded runner and stale trials gone without signalling across namespaces. A read proving only the runner gone reports `recovery_required: true`; only recovery checks trial cleanup and settles the run. If a host process blocks that proof, recovery names it: inspect it with the supplied `ps` command and retry after it exits. See [process identity](invariants.md#22-a-pid-alone-is-never-authority) and [dead-runner reservations](invariants.md#23-a-dead-runner-stays-live-until-recovery-decides) for the matching rules.
 

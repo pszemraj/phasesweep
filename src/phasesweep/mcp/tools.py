@@ -590,7 +590,8 @@ class PhaseSweepMCP:
             reported its terminal snapshot unavailable, so the failure says so too.
         :return JsonObject: Run id, state, launch timestamp, and recovery flag.
             ``runner_observable`` is False for a running run whose runner is in
-            another PID namespace and cannot be proven gone.
+            another PID namespace and cannot be proven gone; ``recovery_required``
+            is then also True once that runner's heartbeat is stale.
         """
         if view is None:
             view = self._runs.runner_view(handle)
@@ -600,7 +601,11 @@ class PhaseSweepMCP:
             "run_id": handle.run_id,
             "state": state,
             "started_at": handle.started_at,
-            "recovery_required": observation.recovery_required,
+            # A stale heartbeat only asks the operator to check from a host shell;
+            # the run stays running until recover-run settles it there.
+            "recovery_required": (
+                observation.recovery_required or observation.runner_heartbeat_stale
+            ),
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
             "failure": self._run_failure_payload(
                 handle,
@@ -1223,7 +1228,8 @@ class PhaseSweepMCP:
                     if observation.state != "running":
                         continue
                     live.append(inventory_handle)
-                    if observation.recovery_required:
+                    # Refusal advice only: a stale heartbeat never frees the slot.
+                    if observation.recovery_required or observation.runner_heartbeat_stale:
                         recovery_required_run_ids.append(inventory_handle.run_id)
                     if view.visibility == "unobservable":
                         unobservable_run_ids.append(inventory_handle.run_id)

@@ -216,7 +216,8 @@ class ExperimentBusyError(McpToolError):
 
         :param str experiment_id: Catalog id that already has a live run.
         :param str run_id: Existing live run id blocking a new launch.
-        :param bool recovery_required: Whether the blocker requires operator recovery.
+        :param bool recovery_required: Whether the blocker requires operator recovery,
+            including an unobservable runner whose heartbeat is stale.
         :param bool runner_observable: Whether this server can verify runner liveness.
         """
         if recovery_required:
@@ -224,18 +225,24 @@ class ExperimentBusyError(McpToolError):
                 "Ask the operator to inspect this run with `phasesweep mcp recover-run` "
                 "and complete its reported recovery before retrying the launch."
             )
+            if not runner_observable:
+                advice += (
+                    " Its runner is in another PID namespace and has probably stopped or left "
+                    "cleanup uncertain; the operator must check and recover it from a host "
+                    "shell outside the sandbox."
+                )
         else:
             advice = (
                 "If you just launched and lost the response, this is likely that run; "
                 f"monitor it with await_run using run_id {run_id!r}. "
                 "Cancel it only if the user wants to stop it."
             )
-        if not runner_observable:
-            advice += (
-                " This server cannot verify runner liveness across PID namespaces. "
-                "Monitor durable progress; if it stops, ask the operator to inspect "
-                "and recover from a host shell outside the sandbox."
-            )
+            if not runner_observable:
+                advice += (
+                    " This server cannot verify runner liveness across PID namespaces. "
+                    "Monitor durable progress; if it stops, ask the operator to inspect "
+                    "and recover from a host shell outside the sandbox."
+                )
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
             f"(run_id {run_id!r}). {advice}"
@@ -259,7 +266,8 @@ class ConcurrencyLimitError(McpToolError):
         :param int running: Number of currently live runs.
         :param int limit: Configured maximum number of concurrent runs.
         :param Sequence[str] blocking_run_ids: Live run ids the agent can await.
-        :param Sequence[str] recovery_required_run_ids: Blockers requiring operator recovery.
+        :param Sequence[str] recovery_required_run_ids: Blockers requiring operator
+            recovery, including unobservable runners whose heartbeat is stale.
         :param Sequence[str] unobservable_run_ids: Blockers with unverifiable runner liveness.
         """
         recovery_ids = set(recovery_required_run_ids)
@@ -282,7 +290,13 @@ class ConcurrencyLimitError(McpToolError):
                 "Call await_run with one of these run_ids, then retry this launch only "
                 "after that run is terminal. Ask the user before cancelling a blocking run."
             )
-        if unobservable_run_ids:
+        unobservable_ids = set(unobservable_run_ids)
+        if unobservable_ids & recovery_ids:
+            advice += (
+                " The operator must recover blockers whose runner is in another PID "
+                "namespace from a host shell outside the sandbox."
+            )
+        if unobservable_ids - recovery_ids:
             advice += (
                 " This server cannot verify runner liveness for blockers in another PID "
                 "namespace. Monitor durable progress; if it stops, ask the operator to "
