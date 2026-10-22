@@ -572,8 +572,9 @@ class WinnerPhasePayload(_ToolPayload):
     winner_source: WinnerSourcePayload
     winner_generation: Literal["represented_generation", "prior_generation", "unknown"] = Field(
         description=(
-            "Whether this winner was selected in the represented generation, carried from an "
-            "earlier generation, or has no recorded generation provenance."
+            "Whether this winner was selected in the represented generation or carried from an "
+            "earlier generation; unknown when no represented generation is available to "
+            "compare against."
         )
     )
     metric: float = Field(

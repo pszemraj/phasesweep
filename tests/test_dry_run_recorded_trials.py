@@ -74,8 +74,8 @@ _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 _RUNNING_WARNING = (
     "DRY RUN warning: phase={name} has 1 RUNNING attempt(s) that a real run recovers before it "
     "checks the phase, as failed where the trial recorded a failure and otherwise as "
-    "interrupted, which reruns; they are counted that way, and its accepted target and abort "
-    "state are not checked"
+    "interrupted, which reruns; they are counted that way, and its accepted target, abort "
+    "state and partial decision are not checked"
 )
 
 

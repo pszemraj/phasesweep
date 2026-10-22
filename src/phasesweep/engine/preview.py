@@ -339,7 +339,7 @@ def _preview_phase(
             "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
             "before it checks the phase, as failed where the trial recorded a failure and "
             "otherwise as interrupted, which reruns; they are counted that way, and its "
-            "accepted target and abort state are not checked",
+            "accepted target, abort state and partial decision are not checked",
             phase.name,
             recorded.running,
         )

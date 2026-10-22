@@ -1086,7 +1086,7 @@ mlflow: object | null = null
   poll_seconds: float = 2.0
 
   # Seconds each controller tracking operation may take, at least 1. Finite; infinity and NaN fail config load.
-  # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length. A failed run creation is retried once with a fresh budget.
+  # Experiment resolution, run creation, evidence capture and each result upload get a separate budget of this length. A creation whose outcome is unconfirmed is never sent again; a search for its identity tags gets a fresh budget of this length to find the run.
   # The remaining phase and run deadlines also cap resolution, run creation and capture. Result uploads ignore them and are bounded only by this value.
   # A capture that runs out of time fails the trial. An upload that runs out of time stays pending for phasesweep sync-tracking.
   # The capture includes worker startup and stops polling min(5, timeout_seconds / 2) seconds early to report the run's state.
