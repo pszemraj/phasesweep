@@ -1264,7 +1264,8 @@ class Experiment(_Frozen):
         if self.resolved_storage is not None and not self.provenance:
             raise ValueError(
                 "Persistent storage requires a nonempty provenance mapping that identifies "
-                "the trainer, data, and dependency revision used by this experiment."
+                "the data and dependency revisions used by this experiment; each generation "
+                "records the trainer's git commit on its own."
             )
         return self
 

@@ -765,7 +765,8 @@ storage: string | null = null
 # Warning: changing execution.cwd does not move this directory. Give trainer outputs a trial-specific path through trainer_config or trial_command.
 workdir: string = "./runs"
 
-# Operator-defined identifiers for inputs outside this YAML, such as trainer_revision, dataset_revision and tokenizer_revision.
+# Operator-defined identifiers for inputs outside this YAML that git does not capture, such as dataset_revision, tokenizer_revision and dependency versions.
+# Each generation's reproducibility.json also records code_revision on its own: the git commit of the trainer's working directory (execution.cwd) and whether tracked files differ from it, or null outside a git work tree. It is never compared, so the trainer's code revision needs no entry here.
 # Keys and values are nonblank YAML strings, and they are part of the study fingerprint.
 # Requires: storage auto or a journal needs at least one entry; blank keys or values fail config load.
 # Warning: values are copied into the shareable reproducibility.json of each generation, so they must not hold secrets.
