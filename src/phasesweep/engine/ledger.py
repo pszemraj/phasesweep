@@ -167,24 +167,45 @@ def _resolve_storage(url: str) -> JournalStorage:
     return JournalStorage(JournalFileBackend(str(path), lock_obj=_JournalLock(path)))
 
 
-def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
-    """Create or load a phase's Optuna study in already-resolved storage.
+def _build_phase_study(
+    experiment: Experiment, phase: Phase, storage: optuna.storages.BaseStorage | None
+) -> optuna.Study:
+    """Load a phase's Optuna study from already-resolved storage, creating it only if absent.
+
+    Journal storage appends a creation record on every ``create_study`` call and
+    only afterwards finds that the name exists, so creating with ``load_if_exists``
+    on each open grows the journal by one record per open. Loading first leaves an
+    existing study's journal untouched; the creating call stays as the fallback for
+    a missing study, and its ``load_if_exists`` still loads the study when another
+    process creates it first.
 
     :param Experiment experiment: Parsed experiment config supplying the metric direction.
     :param Phase phase: Phase whose sampler, search space, and study name are used.
-    :param Any storage: Resolved Optuna storage, or ``None`` for in-memory.
-    :return optuna.Study: Created or loaded Optuna study for the phase.
+    :param optuna.storages.BaseStorage | None storage: Resolved Optuna storage, or
+        ``None`` for a fresh in-memory study.
+    :return optuna.Study: Loaded or newly created Optuna study for the phase.
     """
+    study_name = _phase_study_name(experiment, phase)
+    sampler = _build_sampler(
+        phase.sampler,
+        sampler_search_space(phase),
+        n_jobs=phase.n_jobs,
+        repeats=phase.repeats,
+    )
+    pruner = optuna.pruners.NopPruner()
+    if storage is not None:
+        try:
+            return optuna.load_study(
+                study_name=study_name, storage=storage, sampler=sampler, pruner=pruner
+            )
+        except KeyError:
+            # Optuna signals a study absent from the storage with KeyError.
+            pass
     return optuna.create_study(
-        study_name=_phase_study_name(experiment, phase),
+        study_name=study_name,
         storage=storage,
-        sampler=_build_sampler(
-            phase.sampler,
-            sampler_search_space(phase),
-            n_jobs=phase.n_jobs,
-            repeats=phase.repeats,
-        ),
-        pruner=optuna.pruners.NopPruner(),
+        sampler=sampler,
+        pruner=pruner,
         direction=experiment.metric.goal,
         load_if_exists=True,
     )

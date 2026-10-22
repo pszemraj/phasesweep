@@ -20,7 +20,8 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
@@ -62,6 +63,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from tests.conftest import (
+    _JOURNAL_CREATE_STUDY,
     invoke_cli_boundary,
     make_experiment,
     mark_current_format,
@@ -415,6 +417,53 @@ def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path) -> No
     assert list(reclaimed.studies) == [experiment.phases[0].name]
     with pytest.raises(TypeError):
         reclaimed.studies["other"] = study  # type: ignore[index]
+
+
+def test_reopening_phase_studies_appends_no_journal_records(tmp_path: Path) -> None:
+    """Only the first open of a phase study writes its ``CREATE_STUDY`` record.
+
+    Optuna's journal appends a creation record on every create call and only then
+    finds that the name exists, so opening an existing study through a
+    ``load_if_exists`` create would grow the journal on every rerun. Reopening
+    through the same handle and through a freshly claimed one must leave the
+    journal's bytes unchanged.
+    """
+    journal = tmp_path / "study.journal"
+    phases = [
+        Phase(
+            name=name,
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+        for name in ("first", "second")
+    ]
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{journal}",
+        trainer=write_constant_trainer(tmp_path),
+        phases=phases,
+    )
+
+    def created_studies() -> list[str]:
+        records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        return [r["study_name"] for r in records if r["op_code"] == _JOURNAL_CREATE_STUDY]
+
+    claimed = claim_ledger(validate_ledger(experiment))
+    for phase in phases:
+        open_phase_study(claimed, phase)
+    assert created_studies() == ["t::first", "t::second"]
+    opened = journal.read_bytes()
+
+    for phase in phases:
+        open_phase_study(claimed, phase)
+    reclaimed = claim_ledger(validate_ledger(experiment))
+    assert list(reclaimed.studies) == ["first", "second"]
+    for phase in phases:
+        open_phase_study(reclaimed, phase)
+
+    assert created_studies() == ["t::first", "t::second"]
+    assert journal.read_bytes() == opened
 
 
 def test_claim_ledger_writes_tree_binding_before_claiming_studies(
