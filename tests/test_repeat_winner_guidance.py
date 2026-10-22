@@ -109,5 +109,7 @@ def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path
     assert "# trial_number 2 names the group's last member." in guidance
     assert "# Choose a checkpoint explicitly from repeats.members." in guidance
     _assert_member_directories(experiment, contents["repeated"], guidance)
-    assert "fold" not in guidance
-    assert "mean" not in guidance
+    # Trial directories sit under tmp_path, whose name can contain either word.
+    described = "\n".join(line.split(" trial_dir=", 1)[0] for line in guidance.splitlines())
+    assert "fold" not in described
+    assert "mean" not in described
