@@ -8,7 +8,7 @@ This is useful when a full joint sweep is too expensive or hard to interpret. Fo
 
 ## How it works
 
-The `starter.yaml` that `phasesweep init` writes searches depth before learning rate (abridged; the full file also sets storage, provenance, the working directory, the trainer's execution context, the metric extractor, per-phase comments, and explanatory comments):
+The `starter.yaml` that `phasesweep init` writes searches depth before learning rate (abridged; the generated file adds storage, provenance, execution settings, the metric extractor, and comments):
 
 ```yaml
 experiment: phasesweep_starter
@@ -49,6 +49,8 @@ The packaged fake trainer uses [`report_objective(...)`](https://github.com/psze
 
 Requirements: Python 3.11+ and a Linux host for real runs. GPUs are optional.
 
+PhaseSweep runs on one host. It drives Optuna's grid, random, TPE and CMA-ES samplers, keeps an [Optuna journal](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna) as its ledger, and can run trials in parallel on that host's GPUs. It does not spread trials across machines or prune them early.
+
 ```bash
 pip install phasesweep
 phasesweep --version
@@ -61,7 +63,7 @@ phasesweep run starter.yaml         # runs four tiny toy-trainer trials
 
 `phasesweep init` never overwrites an existing file; `phasesweep init --list` shows the other [templates](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates).
 
-The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged to the message text: the timestamp, level and logger prefix of each line and each phase's header line are omitted):
+The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining (abridged to the trial commands, results and winners, without timestamps):
 
 ```text
 [depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
@@ -76,13 +78,20 @@ phase=learning_rate TRIAL trial=1 state=COMPLETE value=0.413822 duration=0.8s (2
 phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
 ```
 
-The `depth` winner's `model.n_layers: 8` is injected into every `learning_rate` trial's complete YAML. Winners persist in the working directory, so you can inspect them any time. The output starts with a `# code revision:` line, then holds one `=== PHASE ===` block per phase with that phase's winner file; this is the winner file in the `learning_rate` block (abridged):
+The `depth` winner's `model.n_layers: 8` is injected into every `learning_rate` trial's complete YAML. Winners persist in the working directory, so you can inspect them any time (abridged):
 
 ```bash
 phasesweep show-winners starter.yaml
 ```
 
-```yaml
+```text
+# code revision: unknown (not a git work tree or git unavailable)
+=== depth ===
+# Compare two model depths before tuning the learning rate.
+phase: depth
+...
+=== learning_rate ===
+# Keep the winning depth fixed and compare two learning rates.
 phase: learning_rate
 metric:
   eval_loss: 0.3
@@ -93,7 +102,7 @@ params:
 effective_overrides:
   model.n_layers: 8
   optimizer.lr: 0.0003
-# ... completion state and evidence follow
+...
 ```
 
 Inspect recorded trials without launching work:
@@ -132,7 +141,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 - [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
-- [Toy experiment and MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
+- [Toy experiment and MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/experiment.yaml): a checkout-local CLI example on the packaged fake trainer, plus an [MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/catalog.yaml) that keeps its state and outputs under `/tmp`.
 - [Tiny Decoder Enwik8 example](https://github.com/pszemraj/phasesweep/blob/main/examples/tiny_decoder_enwik8/README.md): real-trainer integration.
 - [Durability invariants](https://github.com/pszemraj/phasesweep/blob/main/docs/invariants.md): the ordering rules the ledger, publication, and recovery paths must hold, and the test that owns each one.
 - [Development](https://github.com/pszemraj/phasesweep/blob/main/docs/development.md): source checkout, contributor setup, quality gates, and declined requests.
