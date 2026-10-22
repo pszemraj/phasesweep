@@ -31,7 +31,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
-from phasesweep.engine.phase import _placeholder_winner
+from phasesweep.engine.preview import _placeholder_winner
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,

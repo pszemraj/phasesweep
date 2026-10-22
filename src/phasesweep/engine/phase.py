@@ -8,7 +8,6 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -16,7 +15,7 @@ from uuid import uuid4
 import optuna
 
 from phasesweep.config.models import Constraint, Experiment, Metric, Phase
-from phasesweep.config.search import _placeholder_values_for, sampler_search_space
+from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _register_active_attempt,
@@ -305,38 +304,6 @@ def _winner_overrides(
     if phase.repeats is not None:
         effective.pop(phase.repeats.key, None)
     return effective
-
-
-def _inherited_placeholder_keys(
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-    *,
-    replaced: Collection[str],
-) -> dict[str, list[str]]:
-    """Name the inherited override keys whose values are dry-run stand-ins, by parent.
-
-    A key belongs to the last parent in ``inherits`` order that sets it, as in
-    :func:`_composed_overrides`, and drops out when ``replaced`` sets it afresh.
-
-    :param Phase phase: The phase whose inheritance order decides which parent supplies a key.
-    :param dict[str, Winner] inherited_winners: Parent-phase winners, or stand-ins for them.
-    :param Collection[str] replaced: Keys the phase sets itself, which replace any inherited value.
-    :return dict[str, list[str]]: Sorted stand-in keys per parent, in inheritance order, without
-        the parents that supply none.
-    """
-    supplier: dict[str, str] = {}
-    for parent in phase.inherits:
-        supplier.update(dict.fromkeys(inherited_winners[parent].effective_overrides, parent))
-    by_parent: dict[str, list[str]] = {}
-    for parent in phase.inherits:
-        keys = sorted(
-            key
-            for key in inherited_winners[parent].placeholder_keys
-            if supplier.get(key) == parent and key not in replaced
-        )
-        if keys:
-            by_parent[parent] = keys
-    return by_parent
 
 
 def _failure_policy_abort_record(
@@ -1731,49 +1698,4 @@ def _select_phase_winner(
         confound=selected.confound,
         observed=selected.observed,
         repeats=selected.repeats,
-    )
-
-
-def _placeholder_winner(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-    *,
-    sampled_params: dict[str, Any] | None = None,
-) -> Winner:
-    """Build a dry-run winner from preview samples or deterministic parameter defaults.
-
-    Carry inherited overrides, omit the repeat key, and mark searched or inherited
-    stand-in keys unless fixed overrides replace them.
-
-    :param Experiment experiment: Experiment defining the phase graph.
-    :param Phase phase: Phase needing a placeholder.
-    :param dict[str, Winner] inherited_winners: Winners from earlier phases.
-    :param dict | None sampled_params: Preview samples, or None for low bounds and first choices.
-    :return Winner: Placeholder with trial number -1 and a NaN metric.
-    """
-    placeholder_params = (
-        _placeholder_values_for(phase.search_space)
-        if sampled_params is None
-        else {name: value for name, value in sampled_params.items() if name in phase.search_space}
-    )
-    effective = _winner_overrides(experiment, phase, placeholder_params, inherited_winners)
-    carried = _inherited_placeholder_keys(
-        phase, inherited_winners, replaced=[*phase.fixed_overrides, *placeholder_params]
-    )
-    stand_ins = set(placeholder_params).union(*carried.values())
-    return Winner(
-        trial_number=-1,
-        params=placeholder_params,
-        effective_overrides=effective,
-        placeholder_keys=frozenset(stand_ins & effective.keys()),
-        metric=float("nan"),
-        completion=_winner_completion(
-            requested_trials=phase.n_trials,
-            finished_trials=0,
-            completed_trials=0,
-            incomplete=True,
-            reason="dry_run",
-            timeout_scope=None,
-        ),
     )
