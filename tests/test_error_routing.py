@@ -48,6 +48,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.optuna import _completed_trial_count
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -1437,9 +1438,7 @@ def _replay_partial_decision_without_opt_in(
                 trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
             ),
             "finished_trials": len(trials),
-            "completed_trials": sum(
-                trial.state is optuna.trial.TrialState.COMPLETE for trial in trials
-            ),
+            "completed_trials": _completed_trial_count(trials),
             "timeout_scope": "phase",
             "recovered_abort_sequence": None,
         },

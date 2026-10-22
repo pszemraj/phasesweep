@@ -1,6 +1,6 @@
 experiment: t
-storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
-workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
+storage: journal:////tmp/claude-1000/-home-pszemraj-workspace-projects-productivity-label-parakit-dictations/552bda4e-cf6a-41da-8143-b45c0c058601/scratchpad/o/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
+workdir: /tmp/claude-1000/-home-pszemraj-workspace-projects-productivity-label-parakit-dictations/552bda4e-cf6a-41da-8143-b45c0c058601/scratchpad/o/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
 trial_command: printf 'PSWOBJ=0.5\n' {overrides}
 trainer_config: {}
 provenance:

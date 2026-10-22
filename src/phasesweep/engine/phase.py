@@ -35,11 +35,10 @@ from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
+    _completed_trial_count,
     _finished_trial_count,
-    _measured_trial_count,
     _phase_study_name,
     _suggest,
-    _trial_count_state,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
@@ -132,8 +131,8 @@ def _winner_completion(
 
     :param int requested_trials: Trial target the phase was configured to reach.
     :param int finished_trials: Finished trial count backing this completion.
-    :param int completed_trials: Optuna COMPLETE trial count backing this completion,
-        infeasible trials included, so it can exceed the ``completed`` of ``status``.
+    :param int completed_trials: Completed trial count backing this completion, the
+        finished trials inside every metric bound and constraint.
     :param bool incomplete: Whether the phase stopped short of its trial target.
     :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
     :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
@@ -158,7 +157,7 @@ def _partial_completion_for_replay(
 ) -> dict[str, Any]:
     """Re-prove and return the frozen completion metadata for a decision replay.
 
-    :param optuna.Study study: Study whose current finished and measured counts are verified.
+    :param optuna.Study study: Study whose current finished and completed counts are verified.
     :param _AcceptedPartialDecision decision: Persisted accepted-partial decision.
     :param int outcome_sequence: Current durable outcome sequence for the study.
     :raises StudySchemaMismatchError: Trial counts or the outcome sequence changed
@@ -166,12 +165,10 @@ def _partial_completion_for_replay(
     :return dict[str, Any]: Frozen incomplete-completion metadata for publication.
     """
     trials = study.get_trials(deepcopy=False)
-    finished_trials = _finished_trial_count(trials)
-    measured_trials = _measured_trial_count(trials)
     if (
         outcome_sequence != decision.outcome_sequence
-        or finished_trials != decision.finished_trials
-        or measured_trials != decision.completed_trials
+        or _finished_trial_count(trials) != decision.finished_trials
+        or _completed_trial_count(trials) != decision.completed_trials
     ):
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} changed after its accepted partial-timeout "
@@ -1343,7 +1340,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     study = run.study
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    measured_after = _measured_trial_count(trials_after)
+    completed_after = _completed_trial_count(trials_after)
     # An expired budget with unfinished slots takes precedence over a failure-streak abort.
     scheduler_deadline_exhausted = (
         run.optimize_deadline is not None
@@ -1399,7 +1396,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 "trial_target": phase.n_trials,
                 "outcome_sequence": current_policy_state.max_sequence,
                 "finished_trials": finished_after,
-                "completed_trials": measured_after,
+                "completed_trials": completed_after,
                 "timeout_scope": run.timeout_source,
                 "recovered_abort_sequence": recovered_abort_sequence,
             },
@@ -1408,11 +1405,10 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
-        # The count `status` calls completed: the finished trials that can win.
-        winnable = sum(_trial_count_state(trial) == "COMPLETE" for trial in trials_after)
         raise TimeoutError(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
-            f"after {finished_after}/{phase.n_trials} finished trials ({winnable} completed). "
+            f"after {finished_after}/{phase.n_trials} finished trials "
+            f"({completed_after} completed). "
             "Refusing to select a winner from an incomplete phase; set "
             "allow_incomplete_on_timeout: true only when a partial decision is intentional."
         )
@@ -1426,7 +1422,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             completion=_winner_completion(
                 requested_trials=phase.n_trials,
                 finished_trials=finished_after,
-                completed_trials=measured_after,
+                completed_trials=completed_after,
                 incomplete=accepted_partial_timeout,
                 reason="timeout" if accepted_partial_timeout else None,
                 timeout_scope=run.timeout_source if accepted_partial_timeout else None,
@@ -1655,7 +1651,7 @@ def _replay_met_target(
         completion=_winner_completion(
             requested_trials=phase.n_trials,
             finished_trials=_finished_trial_count(trials),
-            completed_trials=_measured_trial_count(trials),
+            completed_trials=_completed_trial_count(trials),
             incomplete=False,
             reason=None,
             timeout_scope=None,

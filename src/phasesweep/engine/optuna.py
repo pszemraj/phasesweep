@@ -53,7 +53,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their finished and measured count boundary, and a RUNNING row the
+    carry their finished and completed count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -123,11 +123,19 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     return sum(1 for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES)
 
 
-def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
+def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the number of trials that finished inside every metric bound and constraint.
 
     A publication and an accepted partial decision record this count as ``completed_trials``.
-    ``status`` lists the INFEASIBLE trials apart, so its ``completed`` is this count less theirs.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :return int: Number of trials :func:`_trial_count_state` counts as ``COMPLETE``.
+    """
+    return sum(1 for trial in trials if _trial_count_state(trial) == "COMPLETE")
+
+
+def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
@@ -142,8 +150,8 @@ def _published_phase_trial_refs(
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
-        their known finished-count boundary; None when a published phase does
-        not record a complete identity.
+        their known finished and completed count boundary; None when a published
+        phase does not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}
     for item in (summary or {}).get("phases", ()):
@@ -182,19 +190,19 @@ def _published_phase_trial_refs(
 
 
 def _meets_published_trial_history_boundary(
-    finished: int, measured: int, expected: _TrialRef
+    finished: int, completed: int, expected: _TrialRef
 ) -> bool:
     """Return whether a study still holds the history a publication recorded.
 
     :param int finished: Finished trials the study holds now.
-    :param int measured: Trials the study holds now that Optuna has COMPLETE, infeasible ones
-        included.
+    :param int completed: Completed trials the study holds now, those inside every metric
+        bound and constraint.
     :param _TrialRef expected: Published trial whose recorded counts, when
         present, are the minimum.
     :return bool: ``True`` when both counts meet the recorded boundary.
     """
     return (expected.finished_trials is None or finished >= expected.finished_trials) and (
-        expected.completed_trials is None or measured >= expected.completed_trials
+        expected.completed_trials is None or completed >= expected.completed_trials
     )
 
 
@@ -210,9 +218,9 @@ def _published_trial_history_available(
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
     finished = sum(stats.counts.get(state, 0) for state in FINISHED_TRIAL_STATES)
-    # A publication records Optuna's COMPLETE count, which includes the INFEASIBLE trials.
-    measured = stats.counts.get("COMPLETE", 0) + stats.counts.get("INFEASIBLE", 0)
-    return _meets_published_trial_history_boundary(finished, measured, published_trial)
+    return _meets_published_trial_history_boundary(
+        finished, stats.counts.get("COMPLETE", 0), published_trial
+    )
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:

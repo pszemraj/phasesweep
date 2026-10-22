@@ -167,7 +167,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 7
+STUDY_SCHEMA_VERSION = 8
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -192,7 +192,7 @@ PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
 # Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
-PHASE_DECISION_SCHEMA_VERSION = 1
+PHASE_DECISION_SCHEMA_VERSION = 2
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance; written when metric
@@ -480,7 +480,7 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 4
+GENERATION_SUMMARY_SCHEMA_VERSION = 5
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time. The
 # summary keeps only the config *fingerprint*: once the operator edits or loses

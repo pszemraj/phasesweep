@@ -18,8 +18,8 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
+    _completed_trial_count,
     _finished_trial_count,
-    _measured_trial_count,
     _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
@@ -60,7 +60,7 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 7
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 8
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -331,18 +331,21 @@ def _check_published_phase_studies(
                 )
                 if matched and expected is not None:
                     finished = _finished_trial_count(trials)
-                    measured = _measured_trial_count(trials)
-                    if _meets_published_trial_history_boundary(finished, measured, expected):
+                    completed = _completed_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
-                    missing = (
-                        f"has only {finished} finished and {measured} COMPLETE or INFEASIBLE "
-                        "trials, below the published completion boundary"
+                    boundary = ", ".join(
+                        f"{count} {label}"
+                        for count, label in (
+                            (expected.finished_trials, "finished"),
+                            (expected.completed_trials, "completed"),
+                        )
+                        if count is not None
                     )
-                    if expected.finished_trials is not None:
-                        missing += f" ({expected.finished_trials} finished"
-                        if expected.completed_trials is not None:
-                            missing += f", {expected.completed_trials} COMPLETE or INFEASIBLE"
-                        missing += ")"
+                    missing = (
+                        f"has only {finished} finished and {completed} completed trials, "
+                        f"below the published completion boundary ({boundary})"
+                    )
             except Exception as exc:
                 raise StudyStorageUnavailableError.rewrap(
                     exc,

@@ -17,13 +17,13 @@ from typing import IO
 
 import optuna
 import pytest
-import yaml
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment
 from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
+    ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
 )
 from phasesweep.engine.errors import (
@@ -47,9 +47,6 @@ from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _experiment_dir,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_path,
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import (
@@ -75,9 +72,6 @@ from tests.conftest import (
 from tests.ledger_fixtures import (
     append_journal_tail,
     materialize,
-    published_generation_id,
-    reanchor_summary_pointer,
-    reseal_winner,
     tree_snapshot,
 )
 from tests.recovery_helpers import load_only_recovery_needs
@@ -115,29 +109,19 @@ def test_unmarked_output_root_is_refused_before_mutation(
 def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     tmp_path: Path,
 ) -> None:
-    """An artifact root whose binding records an unsupported format version is refused before any write."""
+    """An artifact root whose binding records the previous format version is refused before any write."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    generation = published_generation_id(experiment)
-    assert generation is not None
-    winner_path = _generation_winner_path(experiment, generation, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["trainer_inherit_env"] = "none"
-    reseal_winner(experiment, generation, winner)
-    summary_path = _generation_summary_path(experiment, generation)
-    summary = yaml.safe_load(summary_path.read_text())
-    summary["schema_version"] = 3
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    previous = ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1
     binding_path = _artifact_root_binding_path(experiment)
     binding = json.loads(binding_path.read_text())
-    binding["schema_version"] = 6
+    binding["schema_version"] = previous
     binding_path.write_text(json.dumps(binding) + "\n")
     before = tree_snapshot(materialized.root)
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match="unsupported PhaseSweep format 6",
+        match=f"unsupported PhaseSweep format {previous}",
     ) as excinfo:
         run_experiment(experiment)
 

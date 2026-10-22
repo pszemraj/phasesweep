@@ -584,8 +584,8 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     with pytest.raises(PublishedStudyMissingError) as refused:
         run_experiment(experiment)
     assert (
-        "has only 1 finished and 1 COMPLETE or INFEASIBLE trials, below the published "
-        "completion boundary (3 finished, 3 COMPLETE or INFEASIBLE)"
+        "has only 1 finished and 1 completed trials, below the published "
+        "completion boundary (3 finished, 3 completed)"
     ) in str(refused.value)
 
     study = optuna.load_study(
