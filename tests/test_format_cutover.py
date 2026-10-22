@@ -67,6 +67,7 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     mark_current_format,
+    phase_study,
     requires_nonroot,
     temporary_umask,
     write_constant_trainer,
@@ -699,7 +700,7 @@ def test_empty_unstamped_phase_study_can_resume_in_current_ledger(tmp_path: Path
 
     run_experiment(resumed)
 
-    study = optuna.load_study(study_name="t::q", storage=_resolve_storage(resumed.resolved_storage))
+    study = phase_study(resumed, "q")
     assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
     assert len(study.trials) == 1
 

@@ -26,7 +26,7 @@ from phasesweep.mcp.tools import (
 )
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, single_trial_confound, tell_feasible
+from tests.conftest import mark_current_format, phase_study, single_trial_confound, tell_feasible
 from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
@@ -164,10 +164,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
     _complete_trials(experiment, n=2)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    study = phase_study(experiment, experiment.phases[0].name)
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
     winner = Winner(
         trial_number=1,

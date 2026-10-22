@@ -112,7 +112,13 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
 )
 from phasesweep.tracking.mlflow import require_mlflow_sdk
-from tests.conftest import make_experiment, requires_nonroot, trial_outcome, write_trainer
+from tests.conftest import (
+    make_experiment,
+    phase_study,
+    requires_nonroot,
+    trial_outcome,
+    write_trainer,
+)
 from tests.ledger_fixtures import (
     Materialized,
     materialize,
@@ -1261,17 +1267,10 @@ def _append_failure_outcomes(
         )
 
 
-def _fixture_study(experiment: Experiment) -> optuna.Study:
-    """Open the golden fixture's phase study for direct edits."""
-    return optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
-    )
-
-
 def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Re-run a phase whose outcome ledger recorded an abort at its current trial target."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     phase = experiment.phases[0].model_copy(update={"n_trials": 4})
     _append_failure_outcomes(study, 2, abort_for=phase)
     study.set_user_attr(TRIAL_TARGET_ATTR, 4)
@@ -1290,7 +1289,7 @@ def _record_fatal_abort(
     :return tuple[Experiment, Phase]: The fixture's experiment, and its phase at that target.
     """
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     phase = experiment.phases[0].model_copy(update={"n_trials": 4})
     trials = study.get_trials(deepcopy=False)
     sequence = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials) + 1
@@ -1335,7 +1334,7 @@ def _finish_aborted_phase(experiment: Experiment, phase: Phase) -> object:
     run = SimpleNamespace(
         experiment=experiment.model_copy(update={"phases": [phase]}),
         phase=phase,
-        study=_fixture_study(experiment),
+        study=phase_study(experiment),
         optimize_deadline=None,
         deadline_exhausted=False,
         aborted=True,
@@ -1429,7 +1428,7 @@ def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     """
     pin_fixture_environment(monkeypatch)
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     _append_failure_outcomes(study, 2)
     study.set_user_attr(TRIAL_TARGET_ATTR, 5)
     phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
@@ -1441,7 +1440,7 @@ def _replay_partial_decision_without_opt_in(
 ) -> object:
     """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     trials = study.get_trials(deepcopy=False)
     target = len(trials) + 1
     study.set_user_attr(TRIAL_TARGET_ATTR, target)

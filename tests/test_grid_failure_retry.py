@@ -297,9 +297,8 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
 
     recovered = _grid(tmp_path, trainer, 6, cells=4)
     assert run_experiment(recovered)["p"].metric == 1.0
-    assert [trial.state.name for trial in phase_trials(recovered)] == ["FAIL", "FAIL"] + [
-        "COMPLETE"
-    ] * 4
+    states = [trial.state.name for trial in phase_trials(recovered)]
+    assert states == ["FAIL"] * 2 + ["COMPLETE"] * 4
     assert len(calls.read_text().splitlines()) == 6
 
 
@@ -655,9 +654,8 @@ def test_survivorship_ignores_failures_that_a_successful_retry_replaced(
         run_experiment(_grid(tmp_path, trainer, 2, repeats=repeats))
     recovered = _grid(tmp_path, trainer, 4, repeats=repeats)
     assert run_experiment(recovered)["p"].metric == 1.0
-    assert [trial.state.name for trial in phase_trials(recovered)] == ["FAIL"] * 2 + [
-        "COMPLETE"
-    ] * 2
+    states = [trial.state.name for trial in phase_trials(recovered)]
+    assert states == ["FAIL"] * 2 + ["COMPLETE"] * 2
 
     assert _published_survivorship(recovered) == {
         "verdict": "ok",

@@ -49,6 +49,7 @@ from tests.conftest import (
     bounded_metric,
     make_experiment,
     phase_study,
+    phase_trials,
     requires_nonroot,
     trial_outcome,
     write_flaky_trainer,
@@ -168,8 +169,7 @@ def _record(
 
 def _terminal_trials(experiment: Experiment, phase: str) -> int:
     """Count the terminal trials the ledger holds for one phase."""
-    trials = phase_study(experiment, phase).get_trials(deepcopy=False)
-    return sum(trial.state.is_finished() for trial in trials)
+    return sum(trial.state.is_finished() for trial in phase_trials(experiment, phase))
 
 
 def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:

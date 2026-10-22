@@ -40,6 +40,7 @@ from phasesweep.evidence.models import (
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    phase_trials,
     tell_feasible,
     trial_outcome,
     write_constant_trainer,
@@ -588,10 +589,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
         "completion boundary (3 finished, 3 completed)"
     ) in str(refused.value)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
-    )
-    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert [trial.number for trial in phase_trials(experiment)] == [0]
     assert _generation_path(experiment).read_bytes() == generation_before
     assert published_generation_id(experiment) == published
     assert {

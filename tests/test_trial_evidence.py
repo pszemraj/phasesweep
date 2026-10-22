@@ -35,6 +35,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
     make_experiment,
+    phase_study,
     phase_trials,
     write_constant_trainer,
     write_trainer,
@@ -289,9 +290,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         )
         with pytest.raises(PhaseSweepError, match="optional SDK"):
             run_experiment(increased)
-        study = optuna.load_study(
-            study_name="t::next", storage=_resolve_storage(experiment.resolved_storage)
-        )
+        study = phase_study(experiment, "next")
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
