@@ -268,6 +268,15 @@ def test_publication_commit_failure_keeps_prior_publication(
     assert published.source is not None
     assert published.source.generation_id == first_generation
 
+    # A pinned read of the failed generation is honest about its status.
+    status = read_status(experiment, generation_id=second_generation)
+    assert status["represented_generation_id"] == second_generation
+    assert status["is_published"] is False
+    assert status["published_generation_id"] == first_generation
+    assert status["current_generation_id"] == second_generation
+    # The generation's own (unpublished) winner is still readable pinned.
+    assert status["phases"][0]["winner_present"] is True
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
@@ -1517,45 +1526,8 @@ def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Pat
 
 
 # --------------------------------------------------------------------------
-# Identity fields (read_status): pinned reads of a failed-publication
-# generation, and single-capture consistency.
+# Identity fields (read_status): single-capture consistency.
 # --------------------------------------------------------------------------
-
-
-@pytest.mark.integration
-def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pinned read of a failed-publication generation is honest about its status."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
-
-    def fail_validation(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("simulated pre-commit validation failure")
-
-    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
-
-    captured: list[str] = []
-
-    def capture(report: TerminalReport) -> None:
-        captured.append(report.generation_id)
-
-    with pytest.raises(RuntimeError):
-        run_experiment(_topped_up(experiment), terminal_callback=capture)
-
-    failed_generation = captured[0]
-    assert failed_generation != first_generation
-
-    status = read_status(experiment, generation_id=failed_generation)
-    assert status["represented_generation_id"] == failed_generation
-    assert status["is_published"] is False
-    assert status["published_generation_id"] == first_generation
-    assert status["current_generation_id"] == failed_generation
-    # The generation's own (unpublished) winner is still readable pinned.
-    assert status["phases"][0]["winner_present"] is True
 
 
 def test_read_status_single_captures_the_published_pointer(
