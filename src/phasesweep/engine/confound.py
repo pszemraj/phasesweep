@@ -592,7 +592,11 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"{detail['axis']} values ({_logged_values(groups)}), the lowest more than "
                 f"{_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
                 "search space changes training length (for example epochs or max_steps); "
-                "otherwise the trials were not trained to one budget"
+                "otherwise the trials were not trained to one budget. A training-length phase "
+                "checks cleanly on a relative axis, which still flags a run that stopped early: "
+                'report progress={"schedule_fraction": actual_steps / planned_steps} through '
+                "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
+                "on a json_envelope metric"
             )
         elif name == "survivorship":
             lines.append(

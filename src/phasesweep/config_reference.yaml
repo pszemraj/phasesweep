@@ -76,7 +76,7 @@ trial_command: string (required)
 # A verdict of n/a means not checked. evaluation_point is n/a when fewer than two trials were ranked, and tie when fewer than two trials, or with repeats fewer than two groups, were ranked.
 # evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
 # evaluation_point is also n/a when no position was recorded (for example a W&B history position that was unavailable), and when ranked trials have unreadable provenance.
-# A phase whose search space changes training length (for example epochs or max_steps) flags evaluation_point by design. Otherwise a flag means the trials were not trained to one budget.
+# A phase whose search space changes training length (for example epochs or max_steps) flags evaluation_point by design. Otherwise a flag means the trials were not trained to one budget. To check such a phase, report progress={"schedule_fraction": actual_steps / planned_steps} through report_objective and set metric.extractor.evaluation_axis to schedule_fraction on a json_envelope metric.
 metric: object (required)
   # Name the objective is published under, for example validation_loss.
   # goal is reserved and rejected. No other restriction is validated.

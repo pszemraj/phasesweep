@@ -294,7 +294,11 @@ def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
     assert "2 distinct step values (400, 1000)" in line
     assert line.endswith(
         "Expected when this phase's search space changes training length "
-        "(for example epochs or max_steps); otherwise the trials were not trained to one budget"
+        "(for example epochs or max_steps); otherwise the trials were not trained to one budget. "
+        "A training-length phase checks cleanly on a relative axis, which still flags a run "
+        "that stopped early: report "
+        'progress={"schedule_fraction": actual_steps / planned_steps} through report_objective '
+        "and set metric.extractor.evaluation_axis to schedule_fraction on a json_envelope metric"
     )
 
 
