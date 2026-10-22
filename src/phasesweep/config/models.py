@@ -1726,9 +1726,8 @@ def _validate_trial_command_template(
     :param Experiment experiment: Experiment containing the command and format.
     :param Phase phase: Phase whose command is rendered.
     :param frozenset[str] inherited_keys: Override keys supplied by direct parents.
-    :raises ValueError: The template has unknown fields, accessors, format specs,
-        conversions, malformed braces,
-        a missing input placeholder, or trainer configuration that cannot be composed.
+    :raises ValueError: The template has unknown fields, accessors, format specs, conversions,
+        malformed braces, a missing input placeholder, or trainer configuration that cannot be composed.
     """
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
     overrides.update(phase.fixed_overrides)

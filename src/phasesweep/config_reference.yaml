@@ -426,7 +426,7 @@ observe: list[object] = []
 
 # ---------- MLflow target and ownership ----------
 # env may set MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT_ID or MLFLOW_EXPERIMENT_NAME only to the mlflow block's own normalized value, and never MLFLOW_RUN_ID.
-# Constraint/observation names and override keys must form valid MLflow keys after phasesweep.* prefixes or fail config load, e.g. acc@1 or overrides >230 chars.
+# Requires: constraint and observation names and override keys make valid MLflow keys after their phasesweep.* prefix, so acc@1 fails config load.
 
 # Native MLflow integration on one existing experiment: the source of the objective's metrics and the destination of PhaseSweep's result projections.
 # Requires: metric.extractor of type mlflow, and no W&B reader or gate anywhere. Local constraints and gates stay allowed.
@@ -470,7 +470,7 @@ mlflow: object | null = null
 # See: docs/config.md#trainer-contract
 
 # Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
-# Setting per-attempt PHASESWEEP_* names in env fails config load. Their names are listed in docs/config.md#trainer-contract.
+# The per-attempt PHASESWEEP_* names, listed in docs/config.md#trainer-contract, fail config load.
 # See: the MLflow section rules and WandbTarget for the tracking variables it may set.
 # Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
 # Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
