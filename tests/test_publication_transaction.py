@@ -71,6 +71,7 @@ from tests.conftest import (
     requires_nonroot,
     temporary_umask,
     write_constant_trainer,
+    write_experiment_config,
     write_param_echo_trainer,
     write_trainer,
 )
@@ -997,7 +998,7 @@ def test_published_reads_consume_the_bytes_validation_read(
     )
     assert resumed.metric == validated_metric
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+    write_experiment_config(config_path, experiment)
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
     assert validated_bytes.decode("utf-8") in result.output

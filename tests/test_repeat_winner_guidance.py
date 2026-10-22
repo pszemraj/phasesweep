@@ -13,7 +13,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import Repeats, Sampler
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.repeats import ReduceName
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, write_experiment_config
 from tests.ledger_fixtures import published_generation_id
 
 
@@ -41,7 +41,7 @@ def _publish_winners(
         for phase in experiment.phases
     }
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+    write_experiment_config(config_path, experiment)
     return experiment, config_path, contents
 
 

@@ -13,8 +13,8 @@ from phasesweep.engine.paths import _generation_path
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
-from tests.conftest import make_experiment
-from tests.mcp_helpers import SEEDED_RANDOM, run_claimed_runner, write_experiment_config
+from tests.conftest import make_experiment, write_experiment_config
+from tests.mcp_helpers import SEEDED_RANDOM, run_claimed_runner
 
 
 def test_a_failure_the_engine_never_reported_is_a_preflight_failure() -> None:

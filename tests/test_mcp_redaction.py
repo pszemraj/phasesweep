@@ -20,14 +20,13 @@ from phasesweep.engine.state import WinnerSource
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import make_experiment, write_experiment_config, write_trainer
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     assert_no_sensitive,
     make_mcp_app,
     mcp_experiment_config_text,
     patch_popen_capture,
-    write_experiment_config,
     write_mcp_catalog,
     write_mcp_config_catalog,
     write_run_status,

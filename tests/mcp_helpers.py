@@ -741,8 +741,3 @@ def drift_experiment(
             )
         ],
     )
-
-
-def write_experiment_config(config: Path, experiment: Experiment) -> None:
-    """Rewrite a cataloged config file in place, as an operator edit would."""
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))

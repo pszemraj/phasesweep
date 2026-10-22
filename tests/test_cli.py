@@ -60,6 +60,7 @@ from tests.conftest import (
     make_experiment,
     requires_nonroot,
     write_constant_trainer,
+    write_experiment_config,
     write_param_echo_trainer,
 )
 from tests.experiments import write_experiment
@@ -162,7 +163,7 @@ def test_validate_and_dry_run_explain_scoring_without_sdk(
     else:
         experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, metric=metric)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     assert result.exit_code == 0, result.output
     assert "goal=minimize" in result.output
@@ -192,7 +193,7 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
         ),
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
     monkeypatch.setenv("WANDB_MODE", "offline")
 
     result = CliRunner().invoke(cli_main, ["validate", str(config_path)])
@@ -278,7 +279,7 @@ def test_validate_discloses_environment_contract(
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
     experiment = _environment_contract_experiment(tmp_path, case)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -321,7 +322,7 @@ def test_validate_and_dry_run_disclose_the_trainer_cwd(
     )
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, execution=execution)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     with caplog.at_level(logging.INFO):
@@ -762,7 +763,7 @@ def test_validate_and_dry_run_warn_when_argparse_renders_a_boolean(
     """One warning lists every flag argparse would hand the trainer as ``--key=true``."""
     experiment = _boolean_experiment(tmp_path)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -790,7 +791,7 @@ def test_validate_labels_boolean_repeat_values_as_repeats(tmp_path: Path) -> Non
         ]
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -815,7 +816,7 @@ def test_boolean_warning_is_only_for_argparse(
         tmp_path, override_format=override_format, trial_command=trial_command
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -860,7 +861,7 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
         execution=ExecutionContext(inherit_env=inherit_env, passthrough_env=["HF_PASSTHROUGH_KEY"]),
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     expected = [] if named is None else [_CREDENTIAL_WARNING.format(names=named)]
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
@@ -944,7 +945,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
             n_trials=1,
             sampler=Sampler(type="random", seed=0),
         )
-        cfg.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(cfg, experiment)
         return cfg
 
     runner = CliRunner()
@@ -1264,7 +1265,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         n_trials=1,
     )
     p = tmp_path / "exp.yaml"
-    p.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    write_experiment_config(p, experiment)
     run_experiment(load_experiment(p))
 
     result = CliRunner().invoke(cli_main, ["status", str(p)])
@@ -1296,7 +1297,7 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
         n_trials=1,
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
 
     result = subprocess.run(
         [sys.executable, "-m", "phasesweep", "status", str(config_path)],
@@ -1335,7 +1336,7 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
             n_trials=1,
             sampler=Sampler(type="random", seed=0),
         )
-        config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(config_path, experiment)
 
     write_config("original hypothesis", "x")
     run_experiment(load_experiment(config_path))
@@ -1453,7 +1454,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     """A healthy publication and a never-published tree both stay exit 0."""
     fresh_config = tmp_path / "fresh.yaml"
     experiment = make_experiment(workdir=tmp_path / "runs")
-    fresh_config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(fresh_config, experiment)
 
     assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
     fresh = capsys.readouterr()
@@ -1814,7 +1815,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
         ),
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
     monkeypatch.setenv(env_name, env_value)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)

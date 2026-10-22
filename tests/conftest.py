@@ -17,6 +17,7 @@ from typing import Any, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
@@ -565,6 +566,19 @@ def make_experiment(
         kwargs["execution"] = execution
 
     return Experiment(**kwargs)
+
+
+def write_experiment_config(path: Path, experiment: Experiment) -> Path:
+    """Write an experiment model to a YAML config file.
+
+    :param Path path: Output config path.
+    :param Experiment experiment: Experiment model to serialize.
+    :return Path: The written config path.
+    """
+    path.write_text(
+        yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
+    )
+    return path
 
 
 def write_yaml(tmp_path: Path, body: str) -> Path:

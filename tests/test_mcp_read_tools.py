@@ -53,6 +53,7 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
     phase_study,
     write_constant_trainer,
+    write_experiment_config,
 )
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
@@ -63,7 +64,6 @@ from tests.mcp_helpers import (
     side_effect_app,
     stage_dead_run,
     stage_live_run,
-    write_experiment_config,
     write_mcp_catalog,
     write_run_status,
     write_srv_catalog,

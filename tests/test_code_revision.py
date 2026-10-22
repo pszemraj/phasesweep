@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-import yaml
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
@@ -17,7 +16,7 @@ from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import _generation_reproducibility_path
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
-from tests.conftest import make_experiment, write_param_echo_trainer
+from tests.conftest import make_experiment, write_experiment_config, write_param_echo_trainer
 from tests.ledger_fixtures import published_generation_id
 
 
@@ -223,7 +222,7 @@ def test_show_winners_names_the_code_revision_that_produced_the_winners(
     experiment = _experiment_running_in(tmp_path, cwd)
     run_experiment(experiment)
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+    write_experiment_config(config_path, experiment)
 
     # A later commit must not change what an earlier generation reports.
     if head is not None:

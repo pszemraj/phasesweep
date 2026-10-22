@@ -22,7 +22,6 @@ from pathlib import Path
 
 import optuna
 import pytest
-import yaml
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Phase
@@ -43,6 +42,7 @@ from tests.conftest import (
     copy_fake_train,
     make_experiment,
     phase_trials,
+    write_experiment_config,
     write_trainer,
 )
 
@@ -108,7 +108,7 @@ class _Harness:
         assert experiment.workdir is not None
         path = Path(experiment.workdir).parent / "experiment.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(path, experiment)
         return path
 
     def _spawn(self, config: Path) -> subprocess.Popen[bytes]:

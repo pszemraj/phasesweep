@@ -25,7 +25,7 @@ from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
-from tests.conftest import make_experiment, phase_trials, write_trainer
+from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
 from tests.ledger_fixtures import golden_publication, reseal_winner
 
 
@@ -116,7 +116,7 @@ def test_validate_and_dry_run_name_each_observation(
         ],
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     expected = [
         "observe heldout_f05: json result.json key heldout_f05 (report-only)",
         "observe mem: log_regex stdout.log pattern 'mem=(?P<value>[0-9.]+)' select last "

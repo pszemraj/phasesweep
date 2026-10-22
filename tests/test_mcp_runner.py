@@ -87,6 +87,7 @@ from tests.conftest import (
     mark_current_format,
     requires_nonroot,
     write_constant_trainer,
+    write_experiment_config,
     write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
@@ -101,7 +102,6 @@ from tests.mcp_helpers import (
     run_claimed_runner,
     runner_argv,
     runner_main,
-    write_experiment_config,
     write_mcp_catalog,
     write_slow_mcp_config,
     write_srv_catalog,
