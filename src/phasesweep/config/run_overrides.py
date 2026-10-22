@@ -76,6 +76,14 @@ def apply_set(payload: JsonObject, setting: str) -> CreatedKey | None:
     segments, raw = _parse_key(setting)
     try:
         value = json_value(load_yaml_document(raw))
+    except yaml.MarkedYAMLError as exc:
+        # Its text quotes the offending line of the value, which may be a secret.
+        problem = ", ".join(part for part in (exc.context, exc.problem) if part)
+        mark = exc.problem_mark
+        where = "" if mark is None else f" at column {mark.column + 1} of the value"
+        raise SetPathError(
+            f"{_shown(setting)}: the value is not valid YAML: {problem}{where}"
+        ) from None
     except (ValueError, yaml.YAMLError) as exc:
         raise SetPathError(f"{_shown(setting)}: the value is not valid YAML: {exc}") from exc
     key = setting[: segments[-1].end]
@@ -250,10 +258,27 @@ def _path_error(setting: str, problem: str) -> SetPathError:
 
 
 def _shown(setting: str) -> str:
-    """Quote an assignment for a message, shortening a long value."""
-    if len(setting) > _SHOWN_LIMIT:
-        setting = f"{setting[:_SHOWN_LIMIT]}..."
-    return repr(setting)
+    """Quote an assignment's key for a message, shortening a long one.
+
+    The value is never shown: like the config itself, it can hold a credential. The key
+    ends at the first ``=`` outside ``[...]``, or at the first ``=`` when a ``[`` never
+    closes.
+    """
+    key = setting.partition("=")[0]
+    pos, inside = 0, False
+    while pos < len(setting):
+        char = setting[pos]
+        if inside and char == "\\":
+            pos += 1
+        elif char == "[" or char == "]":
+            inside = char == "["
+        elif char == "=" and not inside:
+            key = setting[:pos]
+            break
+        pos += 1
+    if len(key) > _SHOWN_LIMIT:
+        key = f"{key[:_SHOWN_LIMIT]}..."
+    return repr(key)
 
 
 def _kind(value: JsonValue) -> str:

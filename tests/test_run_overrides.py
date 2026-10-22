@@ -28,7 +28,7 @@ def test_set_values_follow_strict_config_yaml_rules(setting: str, problem: str) 
     with pytest.raises(SetPathError, match=problem) as caught:
         apply_set({}, setting)
 
-    assert f"{setting!r}: the value is not valid YAML:" in str(caught.value)
+    assert "'trainer_config': the value is not valid YAML:" in str(caught.value)
 
 
 def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(
@@ -268,7 +268,7 @@ def test_set_refuses_an_unknown_phase_name_and_lists_the_phases(
     """An unknown phase name stops at ``--set`` with the argument, segment and syntax named."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, "phases[wd2].n_trials=2")
 
-    assert "'phases[wd2].n_trials=2'" in message
+    assert "'phases[wd2].n_trials'" in message
     assert "'[wd2]'" in message
     assert "lr, wd" in message
     assert "Accepted syntax" in message
@@ -296,8 +296,35 @@ def test_set_names_the_argument_that_created_a_key_validation_rejects(
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, setting)
 
     assert "Extra inputs are not permitted" in message
-    assert f"--set {setting!r} created {created!r}" in message
+    assert f"--set {setting.partition('=')[0]!r} created {created!r}" in message
     assert not (tmp_path / "original").exists()
+
+
+@pytest.mark.parametrize(
+    ("setting", "key"),
+    [
+        # A created key whose value validation rejects.
+        ("env.ACCESS_TOKEN=123456789", "env.ACCESS_TOKEN"),
+        # A path that addresses nothing.
+        ("phases[nope].env.ACCESS_TOKEN=123456789", "phases[nope].env.ACCESS_TOKEN"),
+        # A value that is not valid YAML, which the parser's own message would quote.
+        ("env.ACCESS_TOKEN='123456789", "env.ACCESS_TOKEN"),
+        # A '=' inside brackets belongs to the key.
+        ("trainer_config[a=b]={c: 1, c: 123456789}", "trainer_config[a=b]"),
+    ],
+)
+def test_set_diagnostics_name_the_key_but_never_the_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    setting: str,
+    key: str,
+) -> None:
+    """Values can be credentials, so refusals quote the key as config errors hide input."""
+    message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, setting)
+
+    assert repr(key) in message
+    assert "123456789" not in message
 
 
 def test_set_does_not_blame_an_override_for_an_error_elsewhere(
@@ -338,6 +365,6 @@ def test_set_path_errors_name_the_argument_the_segment_and_the_syntax(
     """Every refused path quotes its argument, says what failed and repeats the syntax."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, setting)
 
-    assert repr(setting) in message
+    assert repr(setting.partition("=")[0]) in message
     assert fragment in message
     assert "Accepted syntax" in message
