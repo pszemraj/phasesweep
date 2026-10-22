@@ -54,7 +54,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction
-from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.json import JsonObject, json_text_map
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -959,21 +959,6 @@ _NO_RECORDED_ENVIRONMENT = (
 )
 
 
-def _recorded_environment(trial: optuna.trial.FrozenTrial) -> dict[str, str] | None:
-    """Read the tracked environment a trial recorded.
-
-    :param optuna.trial.FrozenTrial trial: Trial from another environment cohort.
-    :return dict[str, str] | None: The recorded name-to-value mapping, or ``None`` when the
-        trial recorded none (an allocation that died before it landed) or holds a malformed one.
-    """
-    recorded = trial.user_attrs.get(TRAINER_ENV_ATTR)
-    if not isinstance(recorded, dict) or not all(
-        isinstance(name, str) and isinstance(value, str) for name, value in recorded.items()
-    ):
-        return None
-    return dict(recorded)
-
-
 def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
     """Render how a tracked environment differs, with the values on both sides.
 
@@ -1018,8 +1003,9 @@ def _environment_difference(
         or one saying no trial of the other cohort recorded its environment.
     """
     for trial in reversed(trials):
-        recorded = _recorded_environment(trial)
+        recorded = json_text_map(trial.user_attrs.get(TRAINER_ENV_ATTR))
         if recorded is None:
+            # Allocation stopped before recording the mapping, or the mapping is malformed.
             continue
         description = _describe_environment_changes(recorded, current.tracked)
         if description:
