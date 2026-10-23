@@ -27,8 +27,7 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import read_result, read_status, read_trial_tables
-from phasesweep.engine.run import experiment_status
+from phasesweep.engine.read import experiment_status, read_result, read_status, read_trial_tables
 from phasesweep.engine.state import TRIAL_OUTCOME_ATTR
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import (

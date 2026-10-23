@@ -45,16 +45,16 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
 )
 from phasesweep.engine.publication import (
-    _resolve_publication_pointer,
     raise_for_unusable_publication,
 )
 from phasesweep.engine.read import (
     TrialTables,
-    _current_pointer_generation_id,
+    _read_generation_selection,
     _represented_winners,
+    experiment_status,
     read_trial_tables,
 )
-from phasesweep.engine.run import experiment_status, run_experiment
+from phasesweep.engine.run import run_experiment
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -536,18 +536,6 @@ def _require_study(experiment: Experiment) -> None:
         )
 
 
-def _inspection_generation(experiment: Experiment) -> str | None:
-    """Find an existing namespace for the latest claimed generation.
-
-    :param Experiment experiment: Config whose current-generation pointer is read.
-    :return str | None: Claimed generation id, or None so the caller can use the publication.
-    """
-    generation_id = _current_pointer_generation_id(experiment)
-    if generation_id is not None and _generation_dir(experiment, generation_id).is_dir():
-        return generation_id
-    return None
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Validate a phasesweep experiment config without launching any trials.",
@@ -726,11 +714,10 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     experiment = _command_config(config_path, settings=settings)
     _require_study(experiment)
     validate_ledger(experiment)
-    publication = _resolve_publication_pointer(experiment)
+    _, generation_id, publication = _read_generation_selection(experiment, latest=True)
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    generation_id = _inspection_generation(experiment) or publication.generation_id
     is_published = publication.validated is not None and generation_id == publication.generation_id
     validated = publication.validated if is_published else None
     producing = (
@@ -991,9 +978,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     click.get_current_context().ensure_object(dict)["read_only"] = True
     config = _command_config(config_path, settings=settings)
     _require_study(config)
-    generation_id = _inspection_generation(config)
     if show_trials:
-        tables = read_trial_tables(config, generation_id=generation_id)
+        tables = read_trial_tables(config, latest=True)
         click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
         raise_for_unusable_publication(
             tables.experiment,
@@ -1002,7 +988,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
             _experiment_dir(config),
         )
         return
-    payload = experiment_status(config, generation_id=generation_id)
+    payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),

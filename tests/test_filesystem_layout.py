@@ -15,7 +15,8 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _phase_dir,
 )
-from phasesweep.engine.run import experiment_status, run_experiment
+from phasesweep.engine.read import experiment_status
+from phasesweep.engine.run import run_experiment
 from phasesweep.runtime.files import (
     atomic_create_text,
     atomic_text_writer,

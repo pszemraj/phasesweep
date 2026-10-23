@@ -196,7 +196,7 @@ def test_root_facade_exports_definition_objects() -> None:
     from phasesweep._metadata import __version__
     from phasesweep.config.io import load_experiment
     from phasesweep.config.models import Experiment
-    from phasesweep.engine.run import experiment_status
+    from phasesweep.engine.read import experiment_status
     from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.engine.state import Winner
     from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError

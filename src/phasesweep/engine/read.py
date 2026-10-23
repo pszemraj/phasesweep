@@ -34,6 +34,7 @@ from phasesweep.engine.ledger import (
     log_storage_read_failure,
     read_phase_trials,
     read_trial_stats,
+    resolved_ledger_path,
     validate_ledger,
 )
 from phasesweep.engine.optuna import (
@@ -44,6 +45,8 @@ from phasesweep.engine.optuna import (
     _TrialRef,
 )
 from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_dir,
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
@@ -75,7 +78,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
-from phasesweep.runtime.json import JsonObject, JsonValue
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
 log = logging.getLogger(__name__)
 
@@ -411,6 +414,36 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     return None
 
 
+def _read_generation_selection(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+    latest: bool = False,
+) -> tuple[str | None, str | None, PublicationPointer]:
+    """Capture both pointers and choose the represented generation.
+
+    :param Experiment experiment: Experiment whose pointers are inspected.
+    :param str | None generation_id: Explicit generation pin, overriding latest selection.
+    :param bool latest: Prefer the captured current generation when its namespace exists.
+    :raises ValueError: An explicit generation name is unsafe.
+    :return tuple[str | None, str | None, PublicationPointer]: Current id, represented id and publication.
+    """
+    current_id = _current_pointer_generation_id(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
+    elif (
+        latest
+        and publication.state in {"ok", "absent"}
+        and current_id is not None
+        and _generation_dir(experiment, current_id).is_dir()
+    ):
+        generation_id = current_id
+    else:
+        generation_id = _published_generation_id(publication)
+    return current_id, generation_id, publication
+
+
 def read_status(
     experiment: Experiment,
     *,
@@ -515,6 +548,7 @@ def _read_status(
     generation_id: str | None,
     trial_generation_id: str | None,
     comparison_experiment: Experiment | None,
+    latest: bool = False,
 ) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
@@ -524,6 +558,7 @@ def _read_status(
         ``generation_trials`` counts instead of the represented one.
     :param Experiment | None comparison_experiment: Optional current config for
         drift comparison.
+    :param bool latest: Represent the captured current generation when its namespace exists.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
@@ -532,17 +567,14 @@ def _read_status(
         the single pointer resolution every fact in it came from.
     """
     ledger = validate_ledger(experiment)
-    current_generation_id = _current_pointer_generation_id(experiment)
-    publication = _resolve_publication_pointer(experiment)
+    current_generation_id, represented_generation_id, publication = _read_generation_selection(
+        experiment, generation_id=generation_id, latest=latest
+    )
     published_generation_id = _published_generation_id(publication)
 
-    if generation_id is None:
-        represented_generation_id = published_generation_id
-        trial_scope_generation_id = current_generation_id
-    else:
-        _validate_safe_name("generation", generation_id)
-        represented_generation_id = generation_id
-        trial_scope_generation_id = generation_id
+    trial_scope_generation_id = (
+        represented_generation_id if generation_id is not None or latest else current_generation_id
+    )
     if trial_generation_id is not None:
         trial_scope_generation_id = _validate_safe_name("generation", trial_generation_id)
 
@@ -715,6 +747,86 @@ class TrialTables:
     publication_error: str | None
     phases: tuple[TrialTable, ...]
     represented_generation_id: str | None = None
+
+
+def _cli_phase_payloads(
+    experiment: Experiment,
+    phases: Sequence[JsonObject],
+    represented_generation_id: str | None,
+) -> list[JsonObject]:
+    """Add winner paths to the captured phase status for CLI inspection.
+
+    :param Experiment experiment: Experiment supplying artifact paths.
+    :param Sequence[JsonObject] phases: Path-free phase payloads from the shared read.
+    :param str | None represented_generation_id: Generation whose winner paths appear.
+    :return list[JsonObject]: CLI phase payloads with name and winner path fields.
+    """
+    cli_phases: list[JsonObject] = []
+    for phase in phases:
+        name = phase["phase"]
+        if not isinstance(name, str):
+            raise TypeError("Phase status name must be a string.")
+        winner_path = (
+            _generation_winner_path(experiment, represented_generation_id, name)
+            if phase["winner_present"] and represented_generation_id is not None
+            else None
+        )
+        cli_phases.append(
+            {
+                "name": name,
+                **{
+                    key: value
+                    for key, value in phase.items()
+                    if key not in {"phase", "winner_present", "running_attempts"}
+                },
+                "winner": None if winner_path is None else str(winner_path),
+            }
+        )
+    return cli_phases
+
+
+def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:
+    """Collect CLI status and winner paths from one read-only generation capture.
+
+    :param Experiment experiment: Parsed experiment config to inspect.
+    :param str | None generation_id: Generation pin, defaulting to the latest existing namespace.
+    :return JsonObject: Experiment paths, publication identity and phase counts.
+    """
+    status, _ = _read_status(
+        experiment,
+        generation_id=generation_id,
+        trial_generation_id=None,
+        comparison_experiment=None,
+        latest=True,
+    )
+    integrity = status["publication_integrity"]
+    ledger_path = resolved_ledger_path(experiment)
+    payload: dict[str, object] = {
+        "kind": "experiment",
+        "experiment": status["experiment"],
+        "workdir": str(_experiment_dir(experiment)),
+        "ledger_path": None if ledger_path is None else str(ledger_path),
+        "current_generation_id": status["current_generation_id"],
+        "published_generation_id": status["published_generation_id"],
+        "represented_generation_id": status["represented_generation_id"],
+        "is_published": status["is_published"],
+        "publication_integrity": integrity,
+        **(
+            {"publication_error": status["publication_error"]}
+            if integrity in {"failed", "permission_denied"}
+            else {}
+        ),
+        "phases": _cli_phase_payloads(
+            experiment,
+            status["phases"],
+            status["represented_generation_id"] if integrity in {"ok", "absent"} else None,
+        ),
+    }
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.publication import delivery_status
+
+        payload["tracking_delivery"] = delivery_status(experiment)
+    return json_object(payload)
 
 
 def _recorded_number(value: object) -> float | None:
@@ -909,7 +1021,9 @@ def _repeat_group_views(
     return tuple(views)
 
 
-def read_trial_tables(experiment: Experiment, *, generation_id: str | None = None) -> TrialTables:
+def read_trial_tables(
+    experiment: Experiment, *, generation_id: str | None = None, latest: bool = False
+) -> TrialTables:
     """Read configured phases' trial tables without creating storage or writing files.
 
     Resolve publication once before capturing trials; winner marks identify the
@@ -918,16 +1032,16 @@ def read_trial_tables(experiment: Experiment, *, generation_id: str | None = Non
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
     :param str | None generation_id: Generation whose winners are marked, defaulting to publication.
+    :param bool latest: Mark the captured current generation when its namespace exists.
     :raises ArtifactRootConflictError: The artifact root cannot be read or is bound to another ledger.
     :raises StudySchemaMismatchError: A phase's study is populated under an unsupported schema.
     :return TrialTables: One table per configured phase, in declaration order.
     """
     ledger = validate_ledger(experiment)
-    publication = _resolve_publication_pointer(experiment)
+    _, represented_generation_id, publication = _read_generation_selection(
+        experiment, generation_id=generation_id, latest=latest
+    )
     published_generation_id = _published_generation_id(publication)
-    if generation_id is not None:
-        _validate_safe_name("generation", generation_id)
-    represented_generation_id = generation_id or published_generation_id
     if publication.state not in {"ok", "absent"}:
         represented_generation_id = None
     winners = {
