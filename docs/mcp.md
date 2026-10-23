@@ -82,6 +82,7 @@ Launch returns a top-level `run_id`; `get_latest_run` nests it under `run`, and 
 ```json
 {
   "experiment_id": "tiny_lm",
+  "catalog_status": {"stale": false, "reload_refusal": null, "remediation": null},
   "found": true,
   "run": {
     "run_id": "tiny_lm-0123456789abcdef0123456789abcdef",
@@ -130,7 +131,7 @@ The loop ends when the run reaches a terminal state, requires recovery, or a cal
 
 Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned. When `trial_data_available` is false, `trials`, trial counters, `remaining_trials`, and `target_already_satisfied` are `null`; the configured `target_finished_trials` remains known. A confirmed empty study reports zero counts. `trials` counts each state under the same names as [`phasesweep status`](runtime.md#inspection-commands). `COMPLETE`, `INFEASIBLE` and `FAIL` are the finished trials that `finished_trials_total`, `finished_trials_before_run` and `finished_trials_this_run` count. [`INTERRUPTED`](runtime.md#interrupted-trials-rerun) trials never count toward `n_trials`; each reruns before any new draw, `WAITING` counts those scheduled reruns, and `remaining_trials` includes them. `attempts_this_run` counts every attempt the queried run's generation started, in any state, including any that a deadline, abort or shutdown stopped before their trainer launched; it is zero for a run that started none.
 
-For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
+For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. `catalog_status` describes the current catalog reload state separately from those frozen scientific facts. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
 Read provenance and labels together; each tool's output schema also describes every field:
 

@@ -31,7 +31,7 @@ The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-r
 
 ![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
-Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints the validated generation directory and winners; `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
+Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints concise phase winners, the generation directory, and publication state; finished phases appear as unpublished while later phases run. `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
 
 ## Use your own trainer
 

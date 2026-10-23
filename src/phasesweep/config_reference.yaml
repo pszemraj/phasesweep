@@ -1,6 +1,7 @@
 # config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/v0.3.11/examples/example.yaml.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
+# Installed reference links and explain's See links target the installed release tag or source revision.
 # The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mcp.md#the-catalog.
 # Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
@@ -82,7 +83,7 @@ phases: list[object] (required)
     # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
-    # Free-text note on the phase. validate prints the current note, and show-winners the one stored with the published generation.
+    # Free-text note on the phase. validate prints the current note, and show-winners the one stored with the represented generation.
     comment: string | null = null
 
     # Numeric sampled parameter whose smaller values cost less, for example model.depth.
@@ -244,7 +245,7 @@ phases: list[object] (required)
     # A feasible success resets the count, and an interrupted attempt leaves it unchanged.
     # A recorded abort refuses later runs until a raised n_trials retires it, or, for a streak abort with trials left to run, a limit above the count it recorded.
     # Recommended: lower it for an expensive trainer, so a broken configuration stops the phase quickly.
-    # Recommended: with repeats, keep it above the repeat count, or one configuration failing every value aborts the phase. validate and run --dry-run warn.
+    # Recommended: when repeats compares multiple configurations, keep it above the repeat count so one failing configuration cannot abort the phase. validate and run --dry-run warn.
     max_consecutive_failures: int = 5
 
     # Wallclock limit for one trainer process, in seconds, >= 0. null means no limit, and 0 expires at once, so every attempt fails.
@@ -493,7 +494,7 @@ execution: object = {}
   cwd: string | null = null
 
   # Which ambient variables the trainer inherits: none, a list of names added to what none keeps, or all of them.
-  # none keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ when set, dropping PYTHONPATH, conda, HF_HOME, proxies and CUDA_VISIBLE_DEVICES.
+  # none keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ when set, dropping PYTHONPATH, HF_HOME, proxies and CUDA_VISIBLE_DEVICES.
   # A list's names are unique, nonempty, unpadded, free of = and NUL, and neither TMPDIR nor a passthrough_env name.
   # An empty list composes what none does but fingerprints differently.
   # Warning: a listed name's value is recorded with each trial. validate and run --dry-run warn about names with TOKEN, KEY, SECRET, PASSWORD or CREDENTIAL.

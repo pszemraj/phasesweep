@@ -145,11 +145,11 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 
 ## Package map
 
-- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and the `run --set` path edits (`run_overrides`).
+- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and shared config `--set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
-- `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
+- `phasesweep.tracking`: MLflow run bindings, the `mlflow_launch` trainer-script launcher, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
@@ -215,7 +215,7 @@ The principal test groups and what each covers:
 
 - `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
 - `tests/test_config.py`, `tests/test_param_validation.py`, and `tests/test_overrides.py`: Experiment validation, composition, parameter domains, and retained input boundaries.
-- `tests/test_run_overrides.py`: `run --set` key syntax, created-key notes, and the derived config's validation.
+- `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
@@ -239,7 +239,7 @@ The principal test groups and what each covers:
 
 These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
 
-- **Reading or migrating trees and ledgers written in an older format.** PhaseSweep keeps no compatibility layer. Each persisted-format change bumps the study and artifact-root stamps, so older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
+- **Reading or migrating trees and ledgers written in an older format.** PhaseSweep is still unstable and does not support backward compatibility until it stabilizes. Ledger and artifact format changes bump their record schemas and the respective study or artifact-root stamp; frozen MCP snapshot changes bump the MCP state-format marker. Older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
 - **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
 - **An `await_run` limit above 600 seconds, or a streaming watch tool.** MCP tool calls are request and response, and clients bound how long one may block. An agent repeats `await_run` with the same `run_id`; [MCP](mcp.md) gives the loop.
 - **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials answered a different question. Derive the new configuration with `run --set` under a new `experiment` name and run it.

@@ -67,7 +67,7 @@ The last command replays a completed study without training again. After an inte
 
 ## Continue one checkpoint
 
-To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints each winning member's seed, trial number, and exact `trial_dir` before the evidence YAML. This example saves its checkpoint at `trainer/final.pt` below that directory.
+To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints the winning member trial numbers and a `# full record:` path. Open that record's `repeats.members` for the seeds and checkpoint evidence, then match the chosen `trial_number` to the phase's `trials.csv` column `user_attr:phasesweep_trial_dir`. This example saves its checkpoint at `trainer/final.pt` below that directory.
 
 Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests five additional optimizer updates. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
 

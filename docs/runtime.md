@@ -77,12 +77,12 @@ The CLI shows PhaseSweep's trial outcomes and causes by default, while Optuna lo
 2026-01-01 12:00:02 I phasesweep.engine.phase phase=lr RERUN trial=3 of=2 reason=orchestrator interrupted by signal 2
 2026-01-01 12:00:03 I phasesweep.engine.phase phase=lr TRIAL trial=3 state=COMPLETE value=0.3 duration=0.4s params={'lr': 0.0003} rerun_of=2 (3/6 finished)
 2026-01-01 12:00:04 I phasesweep.engine.phase phase=lr TRIAL trial=4 state=FAIL value=none duration=0.5s params={'lr': 0.001} (4/6 finished) reason=non-zero exit code 1; stderr: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB
-2026-01-01 12:00:09 I phasesweep.engine.run phase=lr WINNER trial=3 metric=0.3 params={'lr': 0.001}
+2026-01-01 12:00:09 I phasesweep.engine.run phase=lr WINNER trial=3 metric=0.3 params={'lr': 0.0003}
 ```
 
 The header counts the phase's `finished` trials, the trials still `remaining` to its `n_trials`, and the `reruns` it schedules: [interrupted trials](#interrupted-trials-rerun) and the failed grid cells a raised `n_trials` retries. Reruns are among the `remaining` trials and run before any new draw. Each one the run schedules gets a `RERUN` line naming the trial it reruns and the first line of that trial's cause, and the rerun's `TRIAL` line carries its `rerun_of`; a rerun an earlier run queued but never started counts in `reruns` without a new `RERUN` line.
 
-`state` reads as in [`status --trials`](#inspection-commands). In `(N/M finished)`, `M` is `n_trials` and `N` is the trial's own place in the phase's completion order: the trials counting toward `n_trials` when its outcome was recorded, itself included unless it was interrupted. With `n_jobs` above 1 every finished trial therefore gets a distinct `N`, though the lines may print out of order. `FAIL` and `INFEASIBLE` trials count toward the phase's `max_consecutive_failures`, a `COMPLETE` one resets that count, and an `INTERRUPTED` one leaves it unchanged. `value` is the metric, or `none` when the trial produced none. A phase with [`repeats`](config.md#repeats) adds `repeat=<key>=<value>`, which names the seed or other repeat value that trial ran. The line carries no params; the `WINNER` line closing each phase gives them with the winning `trial` and `metric`. In a repeats phase it adds the reducer, repeat count, `sd`, range and member trials, and an accepted partial result adds `INCOMPLETE <finished>/<requested> finished timeout_scope=<scope>`.
+`state` reads as in [`status --trials`](#inspection-commands). In `(N/M finished)`, `M` is `n_trials` and `N` is the trial's own place in the phase's completion order: the trials counting toward `n_trials` when its outcome was recorded, itself included unless it was interrupted. With `n_jobs` above 1 every finished trial therefore gets a distinct `N`, though the lines may print out of order. `FAIL` and `INFEASIBLE` trials count toward the phase's `max_consecutive_failures`, a `COMPLETE` one resets that count, and an `INTERRUPTED` one leaves it unchanged. `value` is the metric, or `none` when the trial produced none. `params` names the sampled configuration, excluding the repeat key. A phase with [`repeats`](config.md#repeats) adds `repeat=<key>=<value>`, which names the seed or other repeat value that trial ran. The `WINNER` line closing each phase gives the winning `trial`, `metric` and params. In a repeats phase it adds the reducer, repeat count, `sd`, range and member trials, and an accepted partial result adds `INCOMPLETE <finished>/<requested> finished timeout_scope=<scope>`.
 
 A trial whose outcome recorded a cause adds `reason=` with its first line. A trainer that exits nonzero records `non-zero exit code N`, followed by `; stderr: ` and the last non-empty line of the trial's `stderr.log` when it has one, so a crash is named without opening the trial directory. The line is read from the last few KiB of the file, stripped of control characters and cut at 200 characters with a trailing `...`. A reason the supervisor records itself, such as `timeout after Ns` or descendants still alive in the process group, replaces that text. The same text is the `user_attr:phasesweep_failure_reason` column of `trials.csv` and the `cause` of the trial's recorded outcome. It is whatever the trainer printed, so it stays in these operator-owned records and no MCP tool returns it.
 
@@ -252,11 +252,9 @@ A phase whose recorded trials cannot be read is previewed as a fresh phase, with
 For the packaged starter, the learning-rate winner contains this result (abridged; trial numbers depend on grid order):
 
 ```yaml
-phase: learning_rate
+trial_number: 0
 metric:
   eval_loss: 0.3
-  goal: minimize
-trial_number: 0
 params:
   optimizer.lr: 0.0003
 effective_overrides:
@@ -264,7 +262,7 @@ effective_overrides:
   optimizer.lr: 0.0003
 ```
 
-`params` contains what this phase sampled; `effective_overrides` also contains the inherited and fixed values applied to the trainer's base configuration. Repeat summaries identify member trial numbers; choose a checkpoint explicitly from `repeats.members` in the printed full winner record. The [output layout](#output-layout) describes the generation's `summary.yaml` and phase winner files.
+`params` contains what this phase sampled; `effective_overrides` also contains the inherited and fixed values applied to the trainer's base configuration. Repeat summaries identify member trial numbers; choose a checkpoint explicitly from `repeats.members` in the full winner record named by `# full record:`. The [output layout](#output-layout) describes the generation's `summary.yaml` and phase winner files.
 
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root or ledger, so they are safe to run while a sweep is active.
