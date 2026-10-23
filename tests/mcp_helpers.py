@@ -19,8 +19,11 @@ from typing import Any, Required, TypedDict, Unpack
 import pytest
 import yaml
 
+import phasesweep.engine.ledger as engine_ledger
+import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine.paths import _generation_summary_path
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
@@ -37,6 +40,36 @@ if typing.TYPE_CHECKING:
 
 # Persistent storage rejects an unseeded stochastic sampler.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
+
+
+def fail_prepared_snapshot_reads(monkeypatch: pytest.MonkeyPatch, generation_id: str) -> list[None]:
+    """Fail journal reads during result capture once the generation summary exists.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the capture failure.
+    :param str generation_id: Generation whose prepared result cannot read storage.
+    :return list[None]: One entry for each capture that encountered the failure.
+    """
+    original_stats = engine_ledger.read_trial_stats
+    capture_reads: list[None] = []
+
+    def transient_capture_failure(
+        ledger: engine_ledger.ValidatedLedger,
+        published_trials: Mapping[str, engine_optuna._TrialRef | None],
+    ) -> dict[str, engine_optuna._PhaseTrialStats]:
+        if _generation_summary_path(ledger.experiment, generation_id).is_file():
+            capture_reads.append(None)
+
+            def locked_read(*_args: object, **_kwargs: object) -> None:
+                raise OSError("journal storage is locked")
+
+            with monkeypatch.context() as capture_patch:
+                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
+                return original_stats(ledger, published_trials)
+
+        return original_stats(ledger, published_trials)
+
+    monkeypatch.setattr("phasesweep.engine.read.read_trial_stats", transient_capture_failure)
+    return capture_reads
 
 
 def write_mcp_catalog(

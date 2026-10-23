@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
@@ -47,6 +47,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import log_regex_provenance, make_experiment, write_constant_trainer
+from tests.ledger_fixtures import winner_payload
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
 _FAIL = optuna.trial.TrialState.FAIL
@@ -140,16 +141,26 @@ def _json() -> JsonObject:
     return {**log_regex_provenance(), "extractor": {"kind": "json", "config_sha256": "0" * 64}}
 
 
-def _trials(*specs: tuple[optuna.trial.TrialState, float | None, int]) -> list[Any]:
-    """Build numbered frozen trials from ``(state, value, x)`` specs."""
+def _trials(
+    *specs: tuple[optuna.trial.TrialState, float | None, int]
+    | tuple[optuna.trial.TrialState, float | None, int, int],
+) -> list[optuna.trial.FrozenTrial]:
+    """Build numbered frozen trials from ``(state, value, x[, seed])`` specs."""
     study = optuna.create_study()
-    for state, value, x in specs:
+    for state, value, x, *seed in specs:
+        params = {"x": x}
+        distributions: dict[str, optuna.distributions.BaseDistribution] = {
+            "x": optuna.distributions.IntDistribution(0, 100)
+        }
+        if seed:
+            params["seed"] = seed[0]
+            distributions["seed"] = optuna.distributions.CategoricalDistribution([0, 1, 2])
         study.add_trial(
             optuna.trial.create_trial(
                 state=state,
                 value=value,
-                params={"x": x},
-                distributions={"x": optuna.distributions.IntDistribution(0, 100)},
+                params=params,
+                distributions=distributions,
             )
         )
     return study.get_trials(deepcopy=False)
@@ -376,26 +387,6 @@ def test_tie_between_repeats_of_one_config_is_ok() -> None:
     }
 
 
-def _seeded_trials(
-    *specs: tuple[optuna.trial.TrialState, float | None, int, int],
-) -> list[optuna.trial.FrozenTrial]:
-    """Build numbered frozen trials from ``(state, value, x, seed)`` specs."""
-    study = optuna.create_study()
-    for state, value, x, seed in specs:
-        study.add_trial(
-            optuna.trial.create_trial(
-                state=state,
-                value=value,
-                params={"x": x, "seed": seed},
-                distributions={
-                    "x": optuna.distributions.IntDistribution(0, 100),
-                    "seed": optuna.distributions.CategoricalDistribution([0, 1, 2]),
-                },
-            )
-        )
-    return study.get_trials(deepcopy=False)
-
-
 def _assess_groups(
     trials: list[optuna.trial.FrozenTrial],
     groups: list[list[int]],
@@ -427,7 +418,7 @@ def _assess_groups(
 
 def test_repeats_tie_flags_groups_within_noise() -> None:
     """A group whose mean sits within two standard errors of the winner's is flagged."""
-    trials = _seeded_trials(
+    trials = _trials(
         (_COMPLETE, 0.50, 1, 0),
         (_COMPLETE, 0.60, 1, 1),
         (_COMPLETE, 0.52, 2, 0),
@@ -454,7 +445,7 @@ def test_repeats_tie_flags_groups_within_noise() -> None:
 
 
 def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> None:
-    trials = _seeded_trials(
+    trials = _trials(
         (_COMPLETE, 0.5, 1, 0),
         (_COMPLETE, 0.5, 1, 1),
         (_COMPLETE, 0.5, 2, 0),
@@ -464,7 +455,7 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
     assert tied["checks"]["tie"]["detail"] == {"tied_trials": [3], "within_noise": [3]}
     assert "lowest draw position won" in _describe_flagged(tied)[0]
 
-    clear = _seeded_trials(
+    clear = _trials(
         (_COMPLETE, 0.50, 1, 0),
         (_COMPLETE, 0.51, 1, 1),
         (_COMPLETE, 0.90, 2, 0),
@@ -479,7 +470,7 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
 
 def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_error() -> None:
     """Equal medians are an exact tie under the median reducer, and the SD still sets within_noise."""
-    trials = _seeded_trials(
+    trials = _trials(
         (_COMPLETE, 1.0, 1, 0),
         (_COMPLETE, 1.0, 1, 1),
         (_COMPLETE, 1.0, 1, 2),
@@ -498,7 +489,7 @@ def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_e
 
 def test_repeats_single_group_leaves_tie_unchecked() -> None:
     """One group is one unit: there is nothing to tie with, though its members compare."""
-    trials = _seeded_trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
+    trials = _trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
     block = _assess_groups(trials, [[0, 1]])
 
     assert block["checks"]["tie"] == {
@@ -516,7 +507,7 @@ def test_repeats_single_group_leaves_tie_unchecked() -> None:
 
 def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
     """A feasible trial whose group never completed is not an infeasible one."""
-    trials = _seeded_trials(
+    trials = _trials(
         (_COMPLETE, 0.5, 1, 0),
         (_COMPLETE, 0.6, 1, 1),
         (_COMPLETE, 0.4, 2, 0),
@@ -597,7 +588,7 @@ def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() 
 def test_validator_rejects_malformed_repeat_groups(
     path: tuple[str, ...], value: object, error: str
 ) -> None:
-    trials = _seeded_trials(
+    trials = _trials(
         (_COMPLETE, 0.50, 1, 0),
         (_COMPLETE, 0.60, 1, 1),
         (_COMPLETE, 0.52, 2, 0),
@@ -613,7 +604,7 @@ def test_validator_rejects_malformed_repeat_groups(
 
 def test_validator_requires_the_winner_to_name_its_group() -> None:
     """The highest-numbered member names a group; a lower member is not a winner."""
-    trials = _seeded_trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
+    trials = _trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1))
     block = _assess_groups(trials, [[0, 1]])
     with pytest.raises(ValueError, match="no group whose last member is the winner, trial 0"):
         _validate_confound_block(block, winner_trial=0)
@@ -1004,13 +995,13 @@ def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
     _validate_confound_block(selected.confound, winner_trial=selected.trial_number)
 
 
-def _published_winner(experiment: Any) -> tuple[Path, dict[str, Any]]:
+def _published_winner(experiment: Experiment) -> tuple[Path, JsonObject]:
     """Return the published winner path and payload for phase ``p``."""
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "ok"
     assert pointer.generation_id is not None
     path = _generation_winner_path(experiment, pointer.generation_id, "p")
-    return path, yaml.safe_load(path.read_text())
+    return path, winner_payload(experiment, pointer.generation_id)
 
 
 @pytest.mark.integration

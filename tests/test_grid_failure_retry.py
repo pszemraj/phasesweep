@@ -12,14 +12,12 @@ from pathlib import Path
 
 import optuna
 import pytest
-import yaml
 
 import phasesweep.engine.phase as phase_ops
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -30,6 +28,7 @@ from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
+    assert_advises_target,
     invoke_cli_boundary,
     make_experiment,
     phase_study,
@@ -38,6 +37,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.experiments import write_experiment
+from tests.ledger_fixtures import winner_payload
 
 
 def _grid(
@@ -192,13 +192,6 @@ def test_grid_seed_audit_retries_only_its_failed_repeat(tmp_path: Path) -> None:
     assert len(calls.read_text().splitlines()) == 3
 
 
-def _assert_advises_target(message: str, from_target: int, to_target: int, action: str) -> None:
-    """Assert the message tells the operator to raise phase ``p``'s target in the config."""
-    assert f"phases[p].n_trials from {from_target} to {to_target} in the config" in message
-    assert action in message
-    assert "the failure count starts again from zero" in message
-
-
 def _assert_advises_limit(message: str, above: int, left: int, target: int) -> None:
     """Assert the message tells the operator to raise phase ``p``'s failure limit in the config."""
     assert f"phases[p].max_consecutive_failures above {above} in the config" in message
@@ -233,7 +226,7 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
             run_experiment(original, dry_run=dry_run)
         messages.append(str(refused.value))
     for message in messages:
-        _assert_advises_target(message, 2, 4, "retry its 2 failed cells")
+        assert_advises_target(message, 2, 4, "retry its 2 failed cells")
         # No cell is unrun, so a higher failure limit would schedule nothing.
         assert "max_consecutive_failures above" not in message
 
@@ -295,7 +288,7 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
     for message in (str(aborted.value), str(refused.value)):
-        _assert_advises_target(
+        assert_advises_target(
             message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells"
         )
         _assert_advises_limit(message, 2, 2, 4)
@@ -465,7 +458,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
     assert "at its accepted n_trials=4" in message
-    _assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
+    assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
     _assert_advises_limit(message, 2, 2, 4)
 
 
@@ -644,8 +637,13 @@ def _published_survivorship(experiment: Experiment) -> dict[str, object]:
     """Read the survivorship check that phase ``p``'s published winner.yaml records."""
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.generation_id is not None
-    path = _generation_winner_path(experiment, pointer.generation_id, "p")
-    return yaml.safe_load(path.read_text())["confound"]["checks"]["survivorship"]
+    confound = winner_payload(experiment, pointer.generation_id)["confound"]
+    assert isinstance(confound, dict)
+    checks = confound["checks"]
+    assert isinstance(checks, dict)
+    survivorship = checks["survivorship"]
+    assert isinstance(survivorship, dict)
+    return survivorship
 
 
 @pytest.mark.parametrize(

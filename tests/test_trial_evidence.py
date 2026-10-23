@@ -40,7 +40,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import published_generation_id
+from tests.ledger_fixtures import published_generation_id, winner_payload
 
 pytestmark = pytest.mark.integration
 
@@ -480,12 +480,6 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
     }
 
 
-def _published_winner_payload(experiment: Experiment, generation_id: str) -> dict:
-    """Read one generation's published winner record for phase ``p``."""
-    path = _generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml"
-    return yaml.safe_load(path.read_text())
-
-
 # --------------------------------------------------------------------------
 # Launch preflight: a candidate whose evidence is gone stops the run before
 # any new trial launches and before the publication pointer can advance.
@@ -842,9 +836,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     shutil.rmtree(_generations_dir(experiment) / source_generation)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    payload = yaml.safe_load(
-        (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
-    )
+    payload = winner_payload(experiment, generation_id)
     assert payload["trainer_input"] == phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
@@ -929,6 +921,6 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
     assert winners["p"].generation_id == crashed_generation
     published = published_generation_id(recovering)
     assert published is not None
-    payload = _published_winner_payload(recovering, published)
+    payload = winner_payload(recovering, published)
     assert payload["winner_source"]["generation_id"] == crashed_generation
     assert read_status(recovering)["publication_integrity"] == "ok"

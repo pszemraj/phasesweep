@@ -76,6 +76,7 @@ from tests.conftest import (
     drop_artifact_root_binding,
     make_experiment,
     mark_current_format,
+    patch_published_trial_read_failure,
     phase_study,
     write_constant_trainer,
     write_trainer,
@@ -1171,8 +1172,6 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The published-phase existence read keeps strict storage-error semantics."""
-    import phasesweep.engine.ledger as ledger
-
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     published = published_generation_id(experiment)
@@ -1182,17 +1181,9 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     }
 
-    def fail_trial_read(*_args: object, **_kwargs: object) -> list[optuna.trial.FrozenTrial]:
-        raise RuntimeError("storage went away during trial read")
-
-    real_check = ledger._check_published_phase_studies
-
-    def check_while_reads_fail(*args: object, **kwargs: object) -> None:
-        with monkeypatch.context() as reads:
-            reads.setattr(optuna.Study, "get_trials", fail_trial_read)
-            real_check(*args, **kwargs)
-
-    monkeypatch.setattr(ledger, "_check_published_phase_studies", check_while_reads_fail)
+    patch_published_trial_read_failure(
+        monkeypatch, RuntimeError("storage went away during trial read")
+    )
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)

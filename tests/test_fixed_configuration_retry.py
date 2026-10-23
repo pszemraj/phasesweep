@@ -34,7 +34,13 @@ from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import invoke_cli_boundary, make_experiment, phase_trials, write_flaky_trainer
+from tests.conftest import (
+    assert_advises_target,
+    invoke_cli_boundary,
+    make_experiment,
+    phase_trials,
+    write_flaky_trainer,
+)
 from tests.experiments import write_experiment
 from tests.recovery_helpers import fabricate_stale_trial
 
@@ -158,9 +164,9 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
 
 def _assert_advises_next_target(message: str, from_target: int) -> None:
     """Assert the message tells the operator to raise phase ``p``'s target by one in the config."""
-    assert f"phases[p].n_trials from {from_target} to {from_target + 1} in the config" in message
-    assert "retry its failed attempt once more" in message
-    assert "the failure count starts again from zero" in message
+    assert_advises_target(
+        message, from_target, from_target + 1, "retry its failed attempt once more"
+    )
     # The one attempt the target allowed is spent, so a higher limit would schedule nothing.
     assert "max_consecutive_failures above" not in message
 

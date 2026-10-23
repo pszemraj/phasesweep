@@ -10,16 +10,12 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
 from pathlib import Path
 
 import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.generation as generation_ops
-import phasesweep.engine.ledger as engine_ledger
-import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -45,6 +41,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.snapshots import RunResultSnapshot
 from tests.conftest import (
+    fail_pointer_commit,
     make_experiment,
     mark_current_format,
     single_trial_confound,
@@ -53,7 +50,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
-from tests.mcp_helpers import SEEDED_RANDOM, write_slow_mcp_config
+from tests.mcp_helpers import SEEDED_RANDOM, fail_prepared_snapshot_reads, write_slow_mcp_config
 
 
 def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
@@ -394,37 +391,9 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         n_trials=1,
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
-    capture_reads = 0
-    original_stats = engine_ledger.read_trial_stats
-
-    def transient_capture_failure(
-        ledger: engine_ledger.ValidatedLedger,
-        published_trials: Mapping[str, engine_optuna._TrialRef | None],
-    ) -> dict[str, engine_optuna._PhaseTrialStats]:
-        nonlocal capture_reads
-        if _generation_summary_path(ledger.experiment, generation_id).is_file():
-            capture_reads += 1
-
-            def locked_read(*_args: object, **_kwargs: object) -> None:
-                raise OSError("journal storage is locked")
-
-            with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, published_trials)
-
-        return original_stats(ledger, published_trials)
-
-    monkeypatch.setattr("phasesweep.engine.read.read_trial_stats", transient_capture_failure)
+    capture_reads = fail_prepared_snapshot_reads(monkeypatch, generation_id)
     if not pointer_commits:
-        pointer_path = _last_successful_generation_path(experiment)
-        original_write = generation_ops.artifact_io._write_yaml_atomic
-
-        def fail_pointer_write(path: Path, payload: object) -> None:
-            if path == pointer_path:
-                raise OSError("simulated publication abort")
-            original_write(path, payload)
-
-        monkeypatch.setattr(generation_ops.artifact_io, "_write_yaml_atomic", fail_pointer_write)
+        fail_pointer_commit(monkeypatch, experiment, OSError("simulated publication abort"))
 
     hook = mcp_runner._RunnerPublicationHook(
         tmp_path / "status.json",
@@ -442,7 +411,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         with pytest.raises(OSError, match="simulated publication abort"):
             run_experiment(experiment, generation_id=generation_id, publication_hook=hook)
 
-    assert capture_reads == 1
+    assert len(capture_reads) == 1
     assert hook.snapshot is not None
     phase = hook.snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is False

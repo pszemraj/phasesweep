@@ -390,36 +390,51 @@ def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
 
 
+def winner_payload(experiment: Experiment, generation_id: str, phase: str = "p") -> JsonObject:
+    """Read one phase's raw winner payload from the selected generation.
+
+    :param Experiment experiment: Experiment holding the publication.
+    :param str generation_id: Generation whose winner is read.
+    :param str phase: Phase owning the winner, defaults to ``p``.
+    :return JsonObject: The winner YAML mapping, without publication validation.
+    """
+    loaded = yaml.safe_load(_generation_winner_path(experiment, generation_id, phase).read_text())
+    assert isinstance(loaded, dict)
+    return loaded
+
+
 def reseal_winner(
     experiment: Experiment,
     generation_id: str,
     winner: JsonObject,
     *,
+    phase: str = "p",
     mirror_summary: bool = False,
 ) -> None:
-    """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
+    """Rewrite a phase winner and re-anchor the manifest to its new bytes.
 
     The hashes then match, so only payload validation can refuse the winner.
 
     :param Experiment experiment: Experiment whose golden publication is rewritten.
     :param str generation_id: Published generation holding the winner.
-    :param JsonObject winner: Replacement winner payload for phase ``p``.
+    :param JsonObject winner: Replacement winner payload.
+    :param str phase: Phase owning the winner, defaults to ``p``.
     :param bool mirror_summary: Also write the winner's ``winner_source`` into the
         summary's own per-phase copy, so the two copies agree and the summary
         cross-check cannot be the reason the winner is refused.
     """
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_path = _generation_winner_path(experiment, generation_id, phase)
     winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
     summary_path = _generation_summary_path(experiment, generation_id)
     summary = yaml.safe_load(summary_path.read_text())
     artifact = next(
-        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == phase
     )
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
     if mirror_summary:
         winner_source = winner["winner_source"]
         assert isinstance(winner_source, dict)
-        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+        phase_item = next(item for item in summary["phases"] if item["name"] == phase)
         phase_item["winner_source"] = dict(winner_source)
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
@@ -429,23 +444,16 @@ def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
     """Reseal the last-success publication so ``phase``'s winner is a partial result that still validates."""
     generation = published_generation_id(experiment)
     assert generation is not None
-    winner_path = _generation_winner_path(experiment, generation, phase)
+    winner = winner_payload(experiment, generation, phase)
+    completion = winner["completion"]
+    assert isinstance(completion, dict)
+    completion["incomplete"] = True
     summary_path = _generation_summary_path(experiment, generation)
-    winner = yaml.safe_load(winner_path.read_text())
     summary = yaml.safe_load(summary_path.read_text())
-    # Only the named phase: the summary mirrors every phase's completion.
     (mirrored,) = [entry for entry in summary["phases"] if entry["name"] == phase]
-    for payload in (winner, mirrored):
-        payload["completion"]["incomplete"] = True
-    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-    (listed,) = [
-        artifact
-        for artifact in summary["artifacts"]
-        if artifact["kind"] == "winner" and artifact["phase"] == phase
-    ]
-    listed["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    mirrored["completion"]["incomplete"] = True
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    reseal_winner(experiment, generation, winner, phase=phase)
 
 
 def forbid_file_backed_storage(

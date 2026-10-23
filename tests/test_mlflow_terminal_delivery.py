@@ -6,7 +6,6 @@ import json
 import shlex
 import signal
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -56,7 +55,7 @@ from phasesweep.tracking.session import (
     tracking_root,
     write_record,
 )
-from tests.conftest import trial_outcome
+from tests.conftest import lose_record_writes, trial_outcome
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     leave_cleanup_uncertain_attempt,
@@ -725,7 +724,6 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     later no-work replay leaves it there, and ``sync-tracking`` rebuilds its
     winner and summary uploads.
     """
-    from phasesweep.engine import generation as generation_ops
     from phasesweep.engine.paths import _last_successful_generation_path
 
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
@@ -733,15 +731,8 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     experiment = Experiment.model_validate(config)
     pointer_path = _last_successful_generation_path(experiment)
 
-    original = generation_ops.atomic_create_text
-
-    def die_before_record(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml":
-            raise OSError("controller died after the pointer commit")
-        return original(path, text)
-
     with monkeypatch.context() as crash:
-        crash.setattr(generation_ops, "atomic_create_text", die_before_record)
+        lose_record_writes(crash, OSError("controller died after the pointer commit"))
         crash.setattr(publication, "publish_generation", lambda *args: None)
         run_experiment(experiment)
     first = yaml.safe_load(pointer_path.read_text())["generation_id"]

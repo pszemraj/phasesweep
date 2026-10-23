@@ -22,7 +22,6 @@ import yaml
 
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.ledger as engine_ledger
-import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.engine.artifact_roots import _bind_study_artifact_root
@@ -83,6 +82,7 @@ from phasesweep.runtime.reaper import (
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import (
+    lose_record_writes,
     make_experiment,
     mark_current_format,
     requires_nonroot,
@@ -95,6 +95,7 @@ from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
     claim_runner_handle,
+    fail_prepared_snapshot_reads,
     live_runs,
     make_dead_run_handle,
     make_mcp_app,
@@ -758,14 +759,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "record_fail")
 
-    real_write = generation_ops.atomic_create_text
-
-    def fail_record_write(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml":
-            raise OSError("simulated record write failure")
-        return real_write(path, text)
-
-    monkeypatch.setattr(generation_ops, "atomic_create_text", fail_record_write)
+    lose_record_writes(monkeypatch)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"
@@ -1449,26 +1443,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
     experiment = load_experiment(config_path)
-    original_stats = engine_ledger.read_trial_stats
-
-    def unavailable_during_prepared_capture(
-        ledger: engine_ledger.ValidatedLedger,
-        published_trials: Mapping[str, engine_optuna._TrialRef | None],
-    ) -> dict[str, engine_optuna._PhaseTrialStats]:
-        if _generation_summary_path(ledger.experiment, run_id).is_file():
-
-            def locked_read(*_args: object, **_kwargs: object) -> None:
-                raise OSError("journal storage is locked")
-
-            with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, published_trials)
-
-        return original_stats(ledger, published_trials)
-
-    monkeypatch.setattr(
-        "phasesweep.engine.read.read_trial_stats", unavailable_during_prepared_capture
-    )
+    fail_prepared_snapshot_reads(monkeypatch, run_id)
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare
