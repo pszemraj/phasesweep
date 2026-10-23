@@ -74,24 +74,13 @@ def test_package_data_covers_shipped_resources() -> None:
             )
 
 
-def test_readme_repository_links_are_relative_and_resolve() -> None:
-    """README links and images address repository files through relative paths."""
+def test_readme_links_do_not_depend_on_a_checkout_path() -> None:
+    """Packaged README links and images retain their targets when rendered on PyPI."""
     readme = PYPROJECT_PATH.parent / _pyproject()["project"]["readme"]
     targets = re.findall(r"\]\(([^)]+)\)", readme.read_text(encoding="utf-8"))
     assert targets
     for target in targets:
-        parsed = urlsplit(target)
-        if parsed.scheme:
-            assert not target.startswith(
-                (
-                    "https://github.com/pszemraj/phasesweep/",
-                    "https://raw.githubusercontent.com/pszemraj/phasesweep/",
-                )
-            ), target
-        elif parsed.path:
-            resolved = (readme.parent / parsed.path).resolve()
-            assert resolved.is_relative_to(readme.parent), target
-            assert resolved.is_file(), target
+        assert target.startswith("#") or urlsplit(target).scheme, target
 
 
 @pytest.mark.integration
