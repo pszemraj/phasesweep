@@ -15,6 +15,7 @@ from phasesweep.engine.confound import (
     ConfoundCheck,
     ConfoundVerdict,
     _confound_summary,
+    _evaluation_point_remedy,
     _validate_confound_block,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
@@ -163,6 +164,12 @@ class EvaluationPointSummary(_SnapshotModel):
             "were measured at; null when not checked."
         )
     )
+    axis: str | None = Field(
+        description="Declared axis compared across ranked objectives; null when not checked."
+    )
+    remedy: str | None = Field(
+        description="Reporting remedy for a training-length comparison; null when no mismatch was found."
+    )
     winner_value: NonNegativeInt | NonNegativeFloat | None = Field(
         description=(
             "Position on the configured evaluation axis the winning objective was "
@@ -198,6 +205,9 @@ class TieSummary(_SnapshotModel):
     """
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    remedy: str | None = Field(
+        description="Explains a missing noise estimate and phases[].repeats; null with repeat groups."
+    )
     tied_trials: NonNegativeInt | None = Field(
         description=(
             "Units tying the winner's metric exactly with other params; null when not checked."
@@ -216,8 +226,8 @@ class ConfoundSummary(_SnapshotModel):
     """Advisory verdicts on the population the winner was selected from.
 
     Frozen when the winner was selected. The evidence behind each verdict
-    stays in the operator-facing winner file; this summary carries only
-    verdicts and counts.
+    stays in the operator-facing winner file; this summary carries verdicts,
+    counts, the evaluation axis and reporting guidance.
     """
 
     flagged: list[ConfoundCheck] = Field(
@@ -286,6 +296,11 @@ def _winner_snapshot(
             _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
             winner_trial=winner.trial_number,
         )
+        provenance = winner.objective_provenance
+        extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
+        kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
+        if isinstance(kind, str) and confound["evaluation_point"]["verdict"] == "heterogeneous":
+            confound["evaluation_point"]["remedy"] = _evaluation_point_remedy(kind)
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
     else:
         gates_passed = winner.gates_passed

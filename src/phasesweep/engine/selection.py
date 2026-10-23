@@ -17,7 +17,11 @@ from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import grid_search_space, phase_draws, sampler_search_space
 from phasesweep.engine.artifacts import _winner_common_payload
-from phasesweep.engine.confound import _assess_population, _describe_flagged
+from phasesweep.engine.confound import (
+    _assess_population,
+    _describe_flagged,
+    _evaluation_point_remedy,
+)
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import _draw_positions, _trial_count_state
@@ -148,6 +152,7 @@ def select_winner(
     *,
     phase_name: str | None = None,
     repeats: RepeatAxis | None = None,
+    emit_advisories: bool = True,
 ) -> SelectedTrial:
     """Select the best feasible COMPLETE trial, or complete repeat group.
 
@@ -170,6 +175,7 @@ def select_winner(
         the grid advisories are skipped.
     :param RepeatAxis | None repeats: The phase's repeat axis
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
+    :param bool emit_advisories: Whether this fresh selection should log advisories; replay retains verdicts silently.
     :raises NoFeasibleTrialError: No trial in the study is both COMPLETE and within every
         constraint and the metric's bounds, or with ``repeats`` no group is complete. When
         the metric has bounds, the message names them and the best COMPLETE value seen. The
@@ -272,16 +278,18 @@ def select_winner(
         incomplete_group=() if ranking is None else ranking.incomplete_group,
     )
     flagged = _describe_flagged(confound)
+    if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
+        flagged.append(_evaluation_point_remedy(experiment.metric.extractor.type))
     if winning is not None and ranking is not None:
         for group in ranking.groups:
             if dict(group.params) != dict(winning.params) and within_noise(winning, group):
                 flagged.append(
-                    f"tie: group {group.representative} params={dict(group.params)} versus "
+                    f"group {group.representative} params={dict(group.params)} versus "
                     f"winner params={dict(winning.params)}, "
                     f"gap={abs(group.aggregate - winning.aggregate):.6g}, "
                     f"combined_se={combined_standard_error(winning, group):.6g}"
                 )
-    if flagged:
+    if flagged and emit_advisories:
         log.warning(
             "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "
             "winner's confound block): %s.",
@@ -289,17 +297,12 @@ def select_winner(
             len(survivors),
             "; ".join(flagged),
         )
-    evaluation = confound["checks"]["evaluation_point"]
-    if len(survivors) >= 2 and evaluation["verdict"] == "n/a":
-        log.warning(
-            "[%s] evaluation_point not checked (advisory): %s.",
-            phase_name or study.study_name,
-            evaluation["reason"],
-        )
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
-    if phase is not None:
+    if phase is not None and emit_advisories:
         _warn_grid_edges(phase, best.params)
         _warn_unsuccessful_grid_cells(phase, trials)
+        if winning is not None and ranking is not None and phase.cost_key is not None:
+            _warn_cheaper_within_error(phase, winning, ranking.groups)
 
     record = (
         None
@@ -333,11 +336,55 @@ def select_winner(
     )
 
 
+def _warn_cheaper_within_error(
+    phase: Phase, winner: RankedGroup, groups: Sequence[RankedGroup]
+) -> None:
+    """Advise a cheaper mean-repeat configuration within one combined standard error.
+
+    :param Phase phase: Phase declaring a numeric sampled cost key and mean repeats.
+    :param RankedGroup winner: Configuration selected by the objective.
+    :param Sequence[RankedGroup] groups: Complete feasible configuration groups.
+    """
+    key = phase.cost_key
+    assert key is not None
+    eligible = [
+        group
+        for group in groups
+        if abs(group.aggregate - winner.aggregate) <= combined_standard_error(winner, group)
+    ]
+
+    def cost(group: RankedGroup) -> float:
+        """Read the numeric parameter guaranteed by the phase's cost-key validator.
+
+        :param RankedGroup group: Configuration group.
+        :return float: Its declared cost.
+        """
+        value = group.params[key]
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            raise ValueError(f"cost_key {key!r} is not numeric in group {group.representative}.")
+        return float(value)
+
+    cheapest = min(eligible, key=lambda group: (cost(group), group.numbers))
+    if cost(cheapest) < cost(winner):
+        log.warning(
+            "[%s] one-standard-error cost advisory: params=%s has %s=%s versus winner %s=%s, "
+            "gap=%g <= combined_se=%g. The selected winner is unchanged.",
+            phase.name,
+            dict(cheapest.params),
+            key,
+            cost(cheapest),
+            key,
+            cost(winner),
+            abs(cheapest.aggregate - winner.aggregate),
+            combined_standard_error(winner, cheapest),
+        )
+
+
 def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
     """Warn when selected params touch an endpoint of a numeric grid axis.
 
     Numeric categorical choices are ordered by value. Mixed, boolean and
-    singleton axes have no reported boundary; the repeat axis is not searched.
+    axes with fewer than three values have no reported boundary; the repeat axis is not searched.
 
     :param Phase phase: Configured search space and sampler.
     :param Mapping[str, object] params: Selected configuration's sampled values.
@@ -350,7 +397,7 @@ def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
             for value in choices
             if isinstance(value, int | float) and not isinstance(value, bool)
         ]
-        if len(values) != len(choices) or len(set(values)) < 2:
+        if len(values) != len(choices) or len(set(values)) < 3:
             continue
         value = params.get(name)
         lower, upper = min(values), max(values)

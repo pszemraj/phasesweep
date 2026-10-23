@@ -21,7 +21,9 @@ from phasesweep.engine.confound import (
     _assess_population,
     _confound_summary,
     _describe_flagged,
+    _evaluation_point_remedy,
     _flagged_checks,
+    _noise_remedy,
     _validate_confound_block,
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
@@ -295,11 +297,27 @@ def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
     assert line.endswith(
         "Expected when this phase's search space changes training length "
         "(for example epochs or max_steps); otherwise the trials were not trained to one budget. "
-        "A training-length phase checks cleanly on a relative axis, which still flags a run "
-        "that stopped early: report "
-        'progress={"schedule_fraction": actual_steps / planned_steps} through report_objective '
-        "and set metric.extractor.evaluation_axis to schedule_fraction on a json_envelope metric"
+        "A training-length phase checks relative completion on a schedule_fraction axis, "
+        "which still flags a run that stopped early"
     )
+
+
+@pytest.mark.parametrize("kind", ["json_envelope", "wandb", "mlflow"])
+def test_evaluation_point_remedy_uses_the_current_reader(kind: str) -> None:
+    """Reporting remedies retain each reader's own evaluation-position contract."""
+    remedy = _evaluation_point_remedy(kind)
+    assert "actual_steps / planned_steps" in remedy
+    if kind == "wandb":
+        assert "same wandb.log() call" in remedy
+        assert "evaluation_axis" in remedy
+        assert "json_envelope" not in remedy
+    elif kind == "mlflow":
+        assert "integer step" in remedy
+        assert "int(10000 *" in remedy
+        assert "evaluation_axis" not in remedy
+    else:
+        assert "report_objective" in remedy
+        assert "evaluation_axis" in remedy
 
 
 @pytest.mark.parametrize(
@@ -429,6 +447,7 @@ def test_repeats_tie_flags_groups_within_noise() -> None:
     assert "repeat group(s) ending at trial(s) 3 are within two standard errors" in line
     assert _confound_summary(block, winner_trial=1)["tie"] == {
         "verdict": "heterogeneous",
+        "remedy": None,
         "tied_trials": 0,
         "within_noise": 1,
     }
@@ -489,6 +508,7 @@ def test_repeats_single_group_leaves_tie_unchecked() -> None:
     assert _validate_confound_block(block, winner_trial=1) == block
     assert _confound_summary(block, winner_trial=1)["tie"] == {
         "verdict": "n/a",
+        "remedy": None,
         "tied_trials": None,
         "within_noise": None,
     }
@@ -757,7 +777,7 @@ def test_validator_anchors_the_block_to_its_own_winner() -> None:
         _validate_confound_block(block, winner_trial=1)
 
 
-def test_summary_keeps_only_verdicts_and_numbers() -> None:
+def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
     """The agent-visible projection drops every reported or configured string."""
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
     block = _assess(
@@ -775,6 +795,11 @@ def test_summary_keeps_only_verdicts_and_numbers() -> None:
         "flagged": ["evaluation_point", "tie"],
         "evaluation_point": {
             "verdict": "heterogeneous",
+            "axis": "tokens",
+            "remedy": (
+                "For training-length comparisons, report schedule_fraction=actual_steps / "
+                "planned_steps as the evaluation axis; retain lower fractions for early stops."
+            ),
             "distinct_values": 2,
             "winner_value": 2000,
         },
@@ -785,11 +810,16 @@ def test_summary_keeps_only_verdicts_and_numbers() -> None:
             "incomplete_group": 0,
             "failed": 1,
         },
-        "tie": {"verdict": "heterogeneous", "tied_trials": 1, "within_noise": None},
+        "tie": {
+            "verdict": "heterogeneous",
+            "remedy": _noise_remedy(),
+            "tied_trials": 1,
+            "within_noise": None,
+        },
     }
     rendered = json.dumps(summary)
     assert "/abs/ckpt.pt" not in rendered
-    assert "tokens" not in rendered
+    assert summary["evaluation_point"]["axis"] == "tokens"
 
 
 def test_summary_reports_unchecked_counts_as_null() -> None:
@@ -798,10 +828,17 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
 
     assert summary["evaluation_point"] == {
         "verdict": "n/a",
+        "axis": None,
+        "remedy": None,
         "distinct_values": None,
         "winner_value": None,
     }
-    assert summary["tie"] == {"verdict": "n/a", "tied_trials": None, "within_noise": None}
+    assert summary["tie"] == {
+        "verdict": "n/a",
+        "remedy": _noise_remedy(),
+        "tied_trials": None,
+        "within_noise": None,
+    }
 
 
 def test_validator_rejects_an_absent_block() -> None:
@@ -904,7 +941,7 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     ids=["json", "log_regex", "wandb-unlocated", "envelope"],
 )
 @pytest.mark.parametrize("count", [1, 2])
-def test_selection_warns_when_multiple_ranked_trials_have_no_evaluation_comparison(
+def test_selection_retains_unchecked_verdict_without_repeating_reader_disclosure(
     caplog: pytest.LogCaptureFixture, record: JsonObject, count: int
 ) -> None:
     experiment = make_experiment(phases=[_seeded_phase(n_trials=count)])
@@ -936,11 +973,7 @@ def test_selection_warns_when_multiple_ranked_trials_have_no_evaluation_comparis
     assert isinstance(extractor, dict)
     if count == 2 and extractor["kind"] != "json_envelope":
         assert check["verdict"] == "n/a"
-        assert len(warnings) == 1
-        assert "not checked" in warnings[0]
-        assert check["reason"] in warnings[0]
-    else:
-        assert warnings == []
+    assert warnings == []
 
 
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
@@ -1032,10 +1065,10 @@ def _inheritance_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 
 @pytest.mark.integration
-def test_inheriting_phases_are_warned_and_from_phase_carries_the_block(
+def test_inheriting_phases_keep_verdicts_without_repeating_warnings(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The flag reaches every phase that builds on it, whichever path resolved the parent."""
+    """Inherited verdicts remain intact in both launch paths without repeated warnings."""
     caplog.set_level(logging.WARNING, logger="phasesweep")
     experiment = make_experiment(
         persistent=tmp_path,
@@ -1068,6 +1101,4 @@ def test_inheriting_phases_are_warned_and_from_phase_carries_the_block(
     assert second["parent"].confound == first["parent"].confound
     assert set(CONFOUND_CHECKS) == set(second["parent"].confound["checks"])
     for warnings in (in_process, resumed):
-        assert len(warnings) == 1
-        assert warnings[0].startswith("[child] inherits the winner of phase 'parent'")
-        assert "tie: trial(s) 1 matched" in warnings[0]
+        assert warnings == []

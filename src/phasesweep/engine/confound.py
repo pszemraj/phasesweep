@@ -593,10 +593,8 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"{_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
                 "search space changes training length (for example epochs or max_steps); "
                 "otherwise the trials were not trained to one budget. A training-length phase "
-                "checks cleanly on a relative axis, which still flags a run that stopped early: "
-                'report progress={"schedule_fraction": actual_steps / planned_steps} through '
-                "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
-                "on a json_envelope metric"
+                "checks relative completion on a schedule_fraction axis, which still flags "
+                "a run that stopped early"
             )
         elif name == "survivorship":
             lines.append(
@@ -611,6 +609,42 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
     return lines
+
+
+def _evaluation_point_remedy(kind: str) -> str:
+    """Describe relative completion using the objective reader in use.
+
+    :param str kind: Objective extractor kind.
+    :return str: Trainer reporting and evaluation-axis instructions.
+    """
+    if kind == "wandb":
+        return (
+            "Log schedule_fraction=actual_steps / planned_steps alongside the objective in "
+            "the same wandb.log() call and set metric.extractor.evaluation_axis to schedule_fraction."
+        )
+    if kind == "mlflow":
+        return (
+            "MLflow compares the selected metric's integer step. For a training-length "
+            "comparison, log the objective at a common scaled relative-completion step "
+            "(for example int(10000 * actual_steps / planned_steps)), retaining lower "
+            "steps for early stops."
+        )
+    return (
+        'Report progress={"schedule_fraction": actual_steps / planned_steps} through '
+        "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
+        "on the json_envelope metric."
+    )
+
+
+def _noise_remedy() -> str:
+    """Return guidance when the selected configurations carry no repeat noise estimate.
+
+    :return str: Repeats guidance shared by winner output and MCP results.
+    """
+    return (
+        "No noise estimate: single trials cannot establish whether the gap is seed noise. "
+        "Use phases[].repeats to compare configurations across seeds and rank group means."
+    )
 
 
 def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
@@ -630,7 +664,8 @@ def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
     untied = [number for number in noisy if number not in tied]
     if untied:
         lines.append(
-            f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
+            ("tie: " if not lines else "")
+            + f"the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
             "within two standard errors of the winning group's aggregate, so their order "
             "may be seed noise (an advisory heuristic, not a significance test)"
         )
@@ -640,14 +675,12 @@ def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
 def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[str, Any]:
     """Project a validated block onto the enums and numbers agents may see.
 
-    Evidence holds operator- and trainer-authored strings -- the axis is a
-    config key, like the metric keys MCP never returns -- so the projection
-    keeps only verdicts, check names, counts, and the winner's position. The
-    full evidence stays in ``winner.yaml`` for operators.
+    Include the declared evaluation axis and actionable guidance alongside counts.
+    The full trial evidence stays in ``winner.yaml`` for operators.
 
     :param Mapping[str, Any] block: A validated confound block.
     :param int winner_trial: Trial number of the winner the block belongs to.
-    :return dict[str, Any]: The string-free summary, one entry per check plus
+    :return dict: The summary, one entry per check plus
         the ``flagged`` check names.
     """
     checks = block["checks"]
@@ -658,6 +691,13 @@ def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[st
         "flagged": list(_flagged_checks(block)),
         "evaluation_point": {
             "verdict": evaluation["verdict"],
+            "axis": evaluation["detail"]["axis"] if "detail" in evaluation else None,
+            "remedy": (
+                "For training-length comparisons, report schedule_fraction=actual_steps / "
+                "planned_steps as the evaluation axis; retain lower fractions for early stops."
+                if evaluation["verdict"] == "heterogeneous"
+                else None
+            ),
             "distinct_values": len(groups) if groups is not None else None,
             "winner_value": (
                 next(
@@ -674,6 +714,7 @@ def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[st
         },
         "tie": {
             "verdict": tie["verdict"],
+            "remedy": _noise_remedy() if block["ranked_groups"] is None else None,
             "tied_trials": len(tie["detail"]["tied_trials"]) if "detail" in tie else None,
             "within_noise": (
                 len(tie["detail"]["within_noise"])

@@ -23,7 +23,11 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.artifacts import read_yaml_or_none
-from phasesweep.engine.confound import _confound_summary, _validate_confound_block
+from phasesweep.engine.confound import (
+    _confound_summary,
+    _evaluation_point_remedy,
+    _validate_confound_block,
+)
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import (
@@ -123,7 +127,7 @@ class PhaseWinnerView:
     incomplete: bool  # True when a wallclock timeout produced a partial winner
     source: WinnerSource | None = None
     # Path-free projection of the winner's confound block: verdicts, check
-    # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
+    # names, counts and evaluation guidance (:func:`phasesweep.engine.confound._confound_summary`).
     confound: dict[str, Any] | None = None
     # Report-only values the winning trial recorded, by observation name.
     observed: dict[str, float] = field(default_factory=dict)
@@ -247,6 +251,11 @@ def _winner_view(
             repeats = validated.repeats
             observed = dict(validated.observed)
         confound = _confound_summary(confound_block, winner_trial=trial_number)
+        provenance = data.get("objective_provenance")
+        extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
+        kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
+        if isinstance(kind, str) and confound["evaluation_point"]["verdict"] == "heterogeneous":
+            confound["evaluation_point"]["remedy"] = _evaluation_point_remedy(kind)
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=trial_number,

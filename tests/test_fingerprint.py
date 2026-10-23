@@ -214,7 +214,7 @@ def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None
     payload = make_experiment().model_dump()
     payload["storage"] = f"journal:///{tmp_path / 'studies.journal'}"
 
-    with pytest.raises(ValueError, match="Persistent storage requires.*provenance"):
+    with pytest.raises(ValueError, match=r"Persistent storage \(storage: journal:.*provenance"):
         Experiment.model_validate(payload)
 
 

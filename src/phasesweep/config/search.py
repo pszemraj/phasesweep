@@ -349,7 +349,13 @@ def sampler_warnings(phase: Phase) -> list[str]:
             "Set sampler.seed and use n_jobs: 1 for reproducible draws given the same trial values."
         )
     repeats = phase.repeats
-    if repeats is not None and phase.max_consecutive_failures <= len(repeats.values):
+    if (
+        repeats is not None
+        and phase.search_space
+        and phase.n_trials > len(repeats.values)
+        and (phase.sampler.type != "grid" or grid_cardinality(phase) > len(repeats.values))
+        and phase.max_consecutive_failures <= len(repeats.values)
+    ):
         count = len(repeats.values)
         warnings.append(
             f"Phase {phase.name!r}: max_consecutive_failures={phase.max_consecutive_failures} "

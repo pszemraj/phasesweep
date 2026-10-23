@@ -577,11 +577,10 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
     )
     assert _coverage_warnings(caplog) == [expected]
 
-    # A replay selects from the recorded trials again and repeats the advisory.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    assert _coverage_warnings(caplog) == [expected]
+    assert _coverage_warnings(caplog) == []
 
 
 def test_grid_winner_warns_about_cells_the_abort_never_reached(

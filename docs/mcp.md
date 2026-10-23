@@ -164,7 +164,7 @@ Besides `code`, `stage` and any `cause`, a `failure` carries `retryable`, the `a
 | `permission_denied` | The server process could not read the publishing tree for validation. |
 | `unknown` | The run's terminal snapshot cannot establish an answer. |
 
-Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `evaluation_point` exposes `distinct_values` and `winner_value`; `survivorship` includes `incomplete_group`; `tie` exposes `tied_trials` and `within_noise`, counting groups in a repeats phase. MCP returns only enums and numbers; evidence strings stay private. `incomplete: true` means a wallclock timeout left a partial population, which the checks do not cover.
+Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `evaluation_point` exposes `axis`, `distinct_values`, `winner_value` and a `remedy` for the reader in use when positions differ. `survivorship` includes `incomplete_group`; `tie` exposes `tied_trials` and `within_noise`, counting groups in a repeats phase, plus a `remedy` when there is no noise estimate. The trial evidence stays in the full winner record. `incomplete: true` means a wallclock timeout left a partial population, which the checks do not cover.
 
 `observed` contains [report-only measurements](config.md#report-only-observations), never reasons a winner won. With non-null `repeats`, `metric` is the group's reduced value: report it with `sd`, `min`, `max`, and `n`. The [repeat-group contract](runtime.md#repeat-groups) explains aggregation; MCP returns the reducer, spread and `member_trials`, but never the repeat key or values.
 

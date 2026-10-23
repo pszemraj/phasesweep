@@ -28,7 +28,6 @@ from phasesweep.config.models import (
     _metric_semantics_payload,
     experiment_disclosures,
 )
-from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
@@ -641,7 +640,6 @@ def _run_experiment_inner(
             continue
         skip_until = False
 
-        _warn_flagged_inheritance(phase.name, inherited)
         if ledger is None:
             previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
             winner = previews[-1].winner
@@ -728,32 +726,6 @@ def _run_experiment_inner(
     log.info("Wrote %s", summary_path)
 
     return winners
-
-
-def _warn_flagged_inheritance(phase_name: str, inherited: Mapping[str, Winner]) -> None:
-    """Warn when a phase is about to build on a winner whose selection flagged confounds.
-
-    Downstream phases inherit a winner's values, not its file, so without this
-    the verdict stays invisible unless someone opens the upstream winner. The
-    in-process and ``--from-phase`` paths both resolve ``inherited`` before
-    running a phase, so this one call covers both.
-
-    :param str phase_name: Phase about to run.
-    :param Mapping[str, Winner] inherited: Winners the phase inherits, by phase.
-    """
-    for parent, winner in inherited.items():
-        if winner.confound is None:  # dry-run placeholder
-            continue
-        flagged = _describe_flagged(winner.confound)
-        if flagged:
-            log.warning(
-                "[%s] inherits the winner of phase %r, whose selection flagged potential "
-                "confounds: %s. Its winner's confound block has the evidence; confirm they do "
-                "not undermine that choice before relying on this phase's results.",
-                phase_name,
-                parent,
-                "; ".join(flagged),
-            )
 
 
 def _cli_phase_payloads(

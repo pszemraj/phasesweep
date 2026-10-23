@@ -593,6 +593,14 @@ class Phase(_Frozen):
             "configurations by a reducer over their complete groups."
         ),
     )
+    cost_key: str | None = Field(
+        default=None,
+        description=(
+            "Numeric sampled parameter whose smaller values cost less. With mean repeats, "
+            "advise the cheapest configuration within one combined standard error of the "
+            "winner without changing the winner. Excluded from study fingerprints."
+        ),
+    )
     n_trials: ConfigInt = Field(ge=1)
     n_jobs: ConfigInt = Field(
         default=1,
@@ -831,6 +839,31 @@ class Phase(_Frozen):
                     "repeat axis supplies that key's value on every trial; remove it from "
                     f"{field}."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cost_key(self) -> Phase:
+        """Require mean repeats and a numeric sampled parameter for the cost advisory.
+
+        :raises ValueError: The cost key is not a numeric search-space key or repeats do not use the mean reducer.
+        :return Phase: Self, unchanged.
+        """
+        if self.cost_key is None:
+            return self
+        if self.repeats is None or self.repeats.reduce != "mean":
+            raise ValueError("cost_key requires repeats with reduce: mean.")
+        parameter = self.search_space.get(self.cost_key)
+        if parameter is None or (
+            isinstance(parameter, CategoricalParam)
+            and not all(
+                isinstance(value, int | float) and not isinstance(value, bool)
+                for value in parameter.choices
+            )
+        ):
+            raise ValueError(
+                f"cost_key {self.cost_key!r} must name a numeric search_space parameter "
+                "whose smaller values cost less."
+            )
         return self
 
     @model_validator(mode="after")

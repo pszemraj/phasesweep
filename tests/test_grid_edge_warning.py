@@ -8,7 +8,7 @@ import logging
 import optuna
 import pytest
 
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Phase, Repeats
 from phasesweep.config.search import (
     CategoricalParam,
     FloatParam,
@@ -16,8 +16,10 @@ from phasesweep.config.search import (
     Sampler,
     SearchParam,
     grid_search_space,
+    sampler_warnings,
 )
-from phasesweep.engine.selection import select_winner
+from phasesweep.engine.repeats import ranked_group
+from phasesweep.engine.selection import _warn_cheaper_within_error, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -44,6 +46,8 @@ from tests.conftest import log_regex_provenance, make_experiment
         (CategoricalParam(type="categorical", choices=[True, False]), True, None),
         (CategoricalParam(type="categorical", choices=[1, "large"]), 1, None),
         (CategoricalParam(type="categorical", choices=[0.1]), 0.1, None),
+        (CategoricalParam(type="categorical", choices=[8, 16]), 16, None),
+        (IntParam(type="int", low=8, high=16, step=8), 16, None),
     ],
 )
 def test_grid_endpoint_warning_uses_the_concrete_numeric_axis(
@@ -92,3 +96,48 @@ def test_grid_endpoint_warning_uses_the_concrete_numeric_axis(
         assert len(warnings) == 1
         assert "[p]" in warnings[0] and "x" in warnings[0] and edge in warnings[0]
         assert str(value) in warnings[0] and "expand" in warnings[0].lower()
+
+
+@pytest.mark.parametrize(("gap", "advised"), [(0.005, True), (0.05, False)])
+def test_cost_advisory_uses_one_combined_error_and_keeps_the_winner(
+    caplog: pytest.LogCaptureFixture, gap: float, advised: bool
+) -> None:
+    """A cheaper group between one and two errors gets no one-error recommendation."""
+    phase = Phase(
+        name="epochs",
+        n_trials=4,
+        repeats=Repeats(key="seed", values=[1, 2]),
+        cost_key="epochs",
+        sampler=Sampler(type="grid"),
+        search_space={"epochs": CategoricalParam(type="categorical", choices=[8, 16])},
+    )
+    winner = ranked_group([(0, 0.48), (1, 0.52)], {"epochs": 16}, "mean")
+    cheaper = ranked_group([(2, 0.48 + gap), (3, 0.52 + gap)], {"epochs": 8}, "mean")
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        _warn_cheaper_within_error(phase, winner, [winner, cheaper])
+    warnings = [record.message for record in caplog.records if "cost advisory" in record.message]
+    assert bool(warnings) == advised
+    assert winner.params == {"epochs": 16}
+    assert winner.aggregate == 0.5
+    if advised:
+        assert "epochs=8" in warnings[0]
+        assert "selected winner is unchanged" in warnings[0]
+
+
+@pytest.mark.parametrize("sampler", ["grid", "random"])
+@pytest.mark.parametrize("sampled", [False, True])
+def test_one_configuration_repeat_phase_has_no_failure_streak_advice(
+    sampler: str, sampled: bool
+) -> None:
+    """An unrankable single group cannot benefit from more failed repeat attempts."""
+    phase = Phase(
+        name="audit",
+        n_trials=3,
+        max_consecutive_failures=2,
+        repeats=Repeats(key="seed", values=[1, 2, 3]),
+        sampler=Sampler(type=sampler, seed=0),
+        search_space={"epochs": CategoricalParam(type="categorical", choices=[16])}
+        if sampled
+        else {},
+    )
+    assert not any("max_consecutive_failures" in warning for warning in sampler_warnings(phase))

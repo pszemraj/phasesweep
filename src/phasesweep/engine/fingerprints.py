@@ -34,6 +34,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_no_gpu_isolation",
         "max_consecutive_failures",
         "comment",
+        "cost_key",
         "allow_unbounded_trials",
         "timeout_seconds_per_phase",
         "allow_incomplete_on_timeout",

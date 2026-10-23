@@ -119,6 +119,8 @@ With `load_best_model_at_end=True`, the logged step does not identify the evalua
 
 Every MLflow extractor declares its selector explicitly. Selection is independent of `metric.goal`, which ranks the selected scalars across trials.
 
+For a few finalists that need ranking over seeds, use `phases[].repeats` with `key: seed` and the desired seed values. PhaseSweep launches one trial and one tracked run per seed, reads each run's scalar objective, and ranks configurations by their group mean (or the configured `reduce`). A trainer that creates several MLflow runs inside one trial does not supply a repeat group; the reader uses only the bound attempt run. See [repeats](config.md#repeats) for the complete configuration.
+
 | Selector | Selection from native metric history |
 | --- | --- |
 | `last` | Greatest step, then latest timestamp at that step |

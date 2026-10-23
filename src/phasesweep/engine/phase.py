@@ -1636,6 +1636,7 @@ def _replay_met_target(
                 timeout_scope=None,
             ),
             verify_evidence=verify_evidence,
+            emit_advisories=False,
         )
     except NoFeasibleTrialError as exc:
         raise ReplayWithoutFeasibleTrialError.rewrap(
@@ -1654,6 +1655,7 @@ def _select_phase_winner(
     phase_fingerprint: str,
     completion: dict[str, Any],
     verify_evidence: bool = True,
+    emit_advisories: bool = True,
 ) -> Winner:
     """Select the phase winner and preserve its execution identity.
 
@@ -1665,6 +1667,7 @@ def _select_phase_winner(
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
     :param bool verify_evidence: Whether to verify the selected trial against its
         frozen evidence and warn if its environment differs from the current run.
+    :param bool emit_advisories: Whether to log fresh selection diagnostics instead of silently replaying them.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
@@ -1673,7 +1676,13 @@ def _select_phase_winner(
         frozen when its metric was extracted.
     :return Winner: The selected winner with composed overrides and source identity.
     """
-    selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
+    selected = select_winner(
+        study,
+        experiment,
+        phase_name=phase.name,
+        repeats=repeat_axis(phase),
+        emit_advisories=emit_advisories,
+    )
     if verify_evidence:
         _verify_winner_evidence(experiment, phase, selected)
         # Replayed winners may predate the current environment cohort.

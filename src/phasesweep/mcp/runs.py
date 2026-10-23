@@ -90,7 +90,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".transition.lock",
     ".heartbeat",
 )
-MCP_STATE_FORMAT_VERSION = 5
+MCP_STATE_FORMAT_VERSION = 6
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
