@@ -1667,8 +1667,12 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
 
 
 def test_process_group_alive_uses_cached_members(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Linux procfs probes reuse live cached members without rescanning."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr("phasesweep.runtime.reaper._PROC", tmp_path)
     monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
     monkeypatch.setattr(
         "phasesweep.runtime.reaper._group_member_pids",
@@ -1680,8 +1684,12 @@ def test_process_group_alive_uses_cached_members(
 
 
 def test_process_group_alive_refreshes_when_cached_members_are_gone(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Linux procfs probes replace exhausted cached members with the current scan."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr("phasesweep.runtime.reaper._PROC", tmp_path)
     member_sets: list[set[int]] = []
     scans: list[int] = []
 
@@ -1727,9 +1735,14 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
     ],
 )
 def test_process_group_absence_requires_complete_terminal_evidence(
-    monkeypatch: pytest.MonkeyPatch, scan: _GroupMemberScan, expected_alive: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scan: _GroupMemberScan,
+    expected_alive: bool,
 ) -> None:
-    """A kernel-visible group is dead only with complete evidence of terminal members."""
+    """Linux procfs marks a visible group dead only with complete terminal evidence."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr("phasesweep.runtime.reaper._PROC", tmp_path)
     monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
     monkeypatch.setattr("phasesweep.runtime.reaper._group_member_pids", lambda pgid: scan)
     monkeypatch.setattr("phasesweep.runtime.reaper._member_pids_alive", lambda pgid, pids: False)
