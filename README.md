@@ -6,6 +6,8 @@ Requires Python 3.11+ and Linux or macOS. GPUs are optional; the starter uses a 
 
 ## Install and try it
 
+Install from [PyPI](https://pypi.org/project/phasesweep/):
+
 ```bash
 pip install phasesweep
 phasesweep --version
