@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from importlib.resources.abc import Traversable
 from typing import Literal
 
+from phasesweep._metadata import __version__
+
 _SECTION = re.compile(r"# -{10} (.+?) -{10}")
 _ENTRY = re.compile(r"( *)(- )?([\w.-]+): (.+)")
 _BLOCK = re.compile(r"([A-Z][A-Za-z0-9]*):")
@@ -30,6 +32,7 @@ _BRACKETS = re.compile(r"\[[^\]]*\]")
 _TAG = re.compile(r"\[type=[^\]]*\]")
 _TAG_NAME = re.compile(r"\[type=([^\]]*)\]")
 _MAP_KEY = "<key>"
+_DOC_URL = re.compile(r"https://github\.com/pszemraj/phasesweep/blob/[^/]+/")
 
 
 @dataclass(frozen=True)
@@ -410,7 +413,20 @@ def reference_notes() -> tuple[str, ...]:
     :raises ValueError: If the packaged reference header has no notes block.
     :return tuple[str, ...]: The notes, one line each, in file order.
     """
-    return _parse_notes(_reference_resource().read_text(encoding="utf-8"))
+    return _parse_notes(_reference_text())
+
+
+def _reference_text() -> str:
+    """Read the reference with documentation links pinned to the installed source.
+
+    :return str: Reference text with release-tag or setuptools-scm revision URLs.
+    """
+    revision = re.search(r"\+g([0-9a-f]+)(?:\.|$)", __version__)
+    ref = revision[1] if revision else f"v{__version__}"
+    return _DOC_URL.sub(
+        f"https://github.com/pszemraj/phasesweep/blob/{ref}/",
+        _reference_resource().read_text(encoding="utf-8"),
+    )
 
 
 @functools.cache
@@ -420,7 +436,7 @@ def _packaged() -> _Reference:
     :raises ValueError: If the packaged reference does not parse.
     :return _Reference: The packaged reference with its shared blocks expanded.
     """
-    return _parse(_reference_resource().read_text(encoding="utf-8"))
+    return _parse(_reference_text())
 
 
 def reference_entries() -> tuple[ReferenceEntry, ...]:

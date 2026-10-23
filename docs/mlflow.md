@@ -81,35 +81,14 @@ The helper verifies the configured experiment and that the run is still RUNNING,
 
 ### Transformers Trainer
 
-For native Transformers logging, set `report_to: [mlflow]` in the trainer's arguments. Keep the managed run active across both training and any subsequent evaluation:
+For native Transformers logging with managed ownership, set `report_to: [mlflow]` in the trainer's arguments and invoke the packaged launcher from `trial_command`:
 
-```python
-import os
-import mlflow
-
-run_id = os.environ.pop("MLFLOW_RUN_ID")
-with mlflow.start_run(run_id=run_id):
-    trainer.train()
-    trainer.evaluate()
+```yaml
+trial_command: "python -m phasesweep.tracking.mlflow_launch /absolute/path/to/run_seq2seq.py --report_to mlflow {overrides}"
+override_format: argparse
 ```
 
-Here `trainer` is your configured Transformers Trainer. Removing `MLFLOW_RUN_ID` before its MLflow callback starts lets the callback use the active run without taking ownership of closing it. Otherwise, the callback can close the run when training ends, and a later evaluation can log to a different run. When wrapping an official example script, keep its entire execution inside this context. For example, save this small launcher next to your experiment configuration:
-
-```python
-import os
-import runpy
-import sys
-
-import mlflow
-
-script = sys.argv[1]
-sys.argv = sys.argv[1:]  # Preserve the example's own argument parsing.
-run_id = os.environ.pop("MLFLOW_RUN_ID")
-with mlflow.start_run(run_id=run_id):
-    runpy.run_path(script, run_name="__main__")
-```
-
-Configure `trial_command` to invoke this launcher with the absolute example path followed by its normal arguments and `{overrides}`; set `override_format: argparse` for command-line Transformers arguments. This launcher is for managed ownership only. It preserves native logging through `report_to: [mlflow]`, and an exception exits the context as a failed run. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
+Pass the absolute trainer script path, its normal arguments, and `{overrides}`. The launcher preserves the script's argument parsing and sibling imports, removes `MLFLOW_RUN_ID` before the Transformers callback starts, and keeps the supplied managed run active across the entire script, including final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. An exception exits the context as a failed run. The launcher requires `mlflow.run_mode: managed` and the `phasesweep[mlflow]` extra. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 

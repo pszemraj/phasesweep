@@ -99,6 +99,26 @@ def _explain(*args: str) -> tuple[int, str, str]:
     return result.exit_code, result.stdout, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("version", "ref"),
+    [("0.3.11", "v0.3.11"), ("0.3.12.dev4+g123abcd.d20261023", "123abcd")],
+)
+def test_explain_links_pin_installed_release_or_source_revision(
+    monkeypatch: pytest.MonkeyPatch, version: str, ref: str
+) -> None:
+    """Installed help opens documentation for its release or exact SCM source revision."""
+    with monkeypatch.context() as patch:
+        patch.setattr(reference, "__version__", version)
+        reference._packaged.cache_clear()
+        try:
+            code, out, err = _explain("metric.extractor")
+            assert code == 0 and not err
+            assert f"https://github.com/pszemraj/phasesweep/blob/{ref}/docs/mlflow.md#" in out
+            assert "See: docs/" not in out
+        finally:
+            reference._packaged.cache_clear()
+
+
 def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:
     """Every top-level key appears once under its section, with signature, summary and count."""
     code, out, err = _explain()
