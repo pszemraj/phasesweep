@@ -73,69 +73,99 @@ class _SdkExperiment(Protocol):
     """The experiment fields read from the public client."""
 
     @property
-    def experiment_id(self) -> str: ...
+    def experiment_id(self) -> str:
+        """Return the MLflow experiment identifier."""
+        ...
 
     @property
-    def lifecycle_stage(self) -> str: ...
+    def lifecycle_stage(self) -> str:
+        """Return whether the experiment is active or deleted."""
+        ...
 
 
 class _SdkRunInfo(Protocol):
     """The run metadata read from the public client."""
 
     @property
-    def run_id(self) -> str: ...
+    def run_id(self) -> str:
+        """Return the MLflow run identifier."""
+        ...
 
     @property
-    def experiment_id(self) -> str: ...
+    def experiment_id(self) -> str:
+        """Return the identifier of the experiment that owns the run."""
+        ...
 
     @property
-    def lifecycle_stage(self) -> str: ...
+    def lifecycle_stage(self) -> str:
+        """Return whether the run is active or deleted."""
+        ...
 
     @property
-    def status(self) -> str: ...
+    def status(self) -> str:
+        """Return the run's execution status, independently of its lifecycle stage."""
+        ...
 
 
 class _SdkRunData(Protocol):
     """The logged run data read from the public client."""
 
     @property
-    def metrics(self) -> Mapping[str, float]: ...
+    def metrics(self) -> Mapping[str, float]:
+        """Return the run's metric names and latest scalar values."""
+        ...
 
     @property
-    def params(self) -> Mapping[str, str]: ...
+    def params(self) -> Mapping[str, str]:
+        """Return the run's logged parameter names and string values."""
+        ...
 
     @property
-    def tags(self) -> Mapping[str, str]: ...
+    def tags(self) -> Mapping[str, str]:
+        """Return the run's tag names and string values."""
+        ...
 
 
 class _SdkRun(Protocol):
     """A public MLflow Run entity."""
 
     @property
-    def info(self) -> _SdkRunInfo: ...
+    def info(self) -> _SdkRunInfo:
+        """Return the run's identity, lifecycle stage and execution status."""
+        ...
 
     @property
-    def data(self) -> _SdkRunData: ...
+    def data(self) -> _SdkRunData:
+        """Return the run's logged metrics, parameters and tags."""
+        ...
 
 
 class _SdkMetric(Protocol):
     """One logged point of a metric history."""
 
     @property
-    def value(self) -> float: ...
+    def value(self) -> float:
+        """Return the scalar value of this metric history point."""
+        ...
 
     @property
-    def step(self) -> int: ...
+    def step(self) -> int:
+        """Return the training step recorded with this metric point."""
+        ...
 
     @property
-    def timestamp(self) -> int: ...
+    def timestamp(self) -> int:
+        """Return the metric point's Unix timestamp in milliseconds."""
+        ...
 
 
 class _SdkRunPage(Protocol):
     """One page of run-search results, with the token of the next page."""
 
     @property
-    def token(self) -> str | None: ...
+    def token(self) -> str | None:
+        """Return the continuation token, or no token when search results are exhausted."""
+        ...
 
     def __iter__(self) -> Iterator[_SdkRun]: ...
 
@@ -143,23 +173,78 @@ class _SdkRunPage(Protocol):
 class _SdkClient(Protocol):
     """The public MLflow client methods PhaseSweep calls, and nothing else."""
 
-    def get_experiment(self, experiment_id: str) -> _SdkExperiment: ...
+    def get_experiment(self, experiment_id: str) -> _SdkExperiment:
+        """Look up an MLflow experiment by its identifier.
 
-    def get_experiment_by_name(self, name: str) -> _SdkExperiment | None: ...
+        :param str experiment_id: Remote experiment identifier.
+        :return _SdkExperiment: Experiment identity and lifecycle stage.
+        """
+        ...
+
+    def get_experiment_by_name(self, name: str) -> _SdkExperiment | None:
+        """Look up an MLflow experiment by its exact name.
+
+        :param str name: Remote experiment name.
+        :return _SdkExperiment | None: Matching experiment, or None when absent.
+        """
+        ...
 
     def search_runs(
         self, experiment_ids: list[str], *, filter_string: str, page_token: str | None
-    ) -> _SdkRunPage: ...
+    ) -> _SdkRunPage:
+        """Search one page of runs matching a remote filter.
 
-    def create_run(self, experiment_id: str, *, tags: dict[str, str], run_name: str) -> _SdkRun: ...
+        :param list[str] experiment_ids: Experiments whose runs may match.
+        :param str filter_string: MLflow run-search filter expression.
+        :param str | None page_token: Previous page's continuation token, or None for the first page.
+        :return _SdkRunPage: Matching runs and the next page's token.
+        """
+        ...
 
-    def get_run(self, run_id: str) -> _SdkRun: ...
+    def create_run(self, experiment_id: str, *, tags: dict[str, str], run_name: str) -> _SdkRun:
+        """Create a run with its identity tags and display name.
 
-    def get_metric_history(self, run_id: str, key: str) -> Sequence[_SdkMetric]: ...
+        :param str experiment_id: Experiment that will own the run.
+        :param dict[str, str] tags: Initial tags, including the PhaseSweep attempt identity.
+        :param str run_name: Human-readable run name.
+        :return _SdkRun: Newly created remote run.
+        """
+        ...
 
-    def set_terminated(self, run_id: str, *, status: str) -> None: ...
+    def get_run(self, run_id: str) -> _SdkRun:
+        """Read a run's current metadata and logged data.
 
-    def set_tag(self, run_id: str, key: str, value: str) -> object: ...
+        :param str run_id: Remote run identifier.
+        :return _SdkRun: Run identity, status, metrics, parameters and tags.
+        """
+        ...
+
+    def get_metric_history(self, run_id: str, key: str) -> Sequence[_SdkMetric]:
+        """Read the logged history of one metric.
+
+        :param str run_id: Run whose metric history is read.
+        :param str key: Logged metric name.
+        :return Sequence[_SdkMetric]: Metric points with their values, steps and timestamps.
+        """
+        ...
+
+    def set_terminated(self, run_id: str, *, status: str) -> None:
+        """Finish a managed run with the requested terminal status.
+
+        :param str run_id: Remote run identifier.
+        :param str status: Terminal execution status to record.
+        """
+        ...
+
+    def set_tag(self, run_id: str, key: str, value: str) -> object:
+        """Write one tag on an existing run.
+
+        :param str run_id: Remote run identifier.
+        :param str key: Tag name.
+        :param str value: Tag value.
+        :return object: SDK response, unused by PhaseSweep.
+        """
+        ...
 
     def log_batch(
         self,
@@ -169,9 +254,26 @@ class _SdkClient(Protocol):
         params: Sequence[Param],
         tags: Sequence[RunTag],
         synchronous: bool,
-    ) -> object: ...
+    ) -> object:
+        """Log a batch of metrics, parameters and tags to an existing run.
 
-    def log_artifact(self, run_id: str, local_path: str, *, artifact_path: str) -> None: ...
+        :param str run_id: Remote run identifier.
+        :param Sequence[Metric] metrics: Timestamped metric points to log.
+        :param Sequence[Param] params: Parameters to log.
+        :param Sequence[RunTag] tags: Tags to log.
+        :param bool synchronous: Whether to wait for the SDK to complete the batch.
+        :return object: SDK response, unused by PhaseSweep.
+        """
+        ...
+
+    def log_artifact(self, run_id: str, local_path: str, *, artifact_path: str) -> None:
+        """Upload one local file to a run's artifact directory.
+
+        :param str run_id: Remote run identifier.
+        :param str local_path: Local file to upload.
+        :param str artifact_path: Destination directory relative to the run's artifact root.
+        """
+        ...
 
 
 def require_mlflow_sdk() -> None:
