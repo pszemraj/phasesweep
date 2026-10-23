@@ -49,8 +49,12 @@ from phasesweep.runtime.json import JsonObject, strict_json_loads
 from phasesweep.runtime.process import AttemptLifecycle, read_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
+    _process_group_alive,
     cleanup_stale_trial_process,
+    is_same_live_process,
+    read_boot_id,
     read_stale_process_identity,
+    same_pid_namespace,
 )
 
 log = logging.getLogger(__name__)
@@ -877,6 +881,30 @@ def _resolve_attempt(
             action=evidence_action,
         ) from exc
     if not confirm:
+        action = "--confirm must verify process-birth identity before signalling."
+        if (
+            identity.boot_id is not None
+            and identity.boot_id == read_boot_id()
+            and same_pid_namespace(identity.pid_namespace)
+        ):
+            state = "live" if _process_group_alive(identity.pgid) else "exited"
+            if state == "live":
+                if identity.proc_starttime is not None and is_same_live_process(
+                    identity.pid, identity.proc_starttime
+                ):
+                    action = "--confirm will terminate it if still alive before reconciling this attempt."
+                else:
+                    state = "live, but its process-birth identity is unverified or mismatched"
+        else:
+            state = "not observable from this boot/PID namespace"
+        log.warning(
+            "%s: training process group is %s (pid=%s pgid=%s); %s",
+            context,
+            state,
+            identity.pid,
+            identity.pgid,
+            action,
+        )
         return
     if not cleanup_stale_trial_process(identity):
         raise ProcessCleanupUncertainError(

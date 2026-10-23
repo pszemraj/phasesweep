@@ -776,14 +776,19 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
         assert payload["result_source"] == "terminal_snapshot_unavailable"
         assert payload["publication_integrity"] == "unknown"
         assert payload["represented_generation_id"] is None
+        expected_code = (
+            "cleanup_uncertain"
+            if transition.startswith("no_status_runner_exit")
+            else "result_snapshot_unavailable"
+        )
         if read_tool == "winners":
             assert payload["winner_count"] == 0
-            assert payload["failure"]["code"] == "result_snapshot_unavailable"
+            assert payload["failure"]["code"] == expected_code
         else:
             assert payload["phases"][0]["trial_data_available"] is False
             assert payload["phases"][0]["winner_present"] is False
             assert payload["run"]["recovery_required"] is True
-            assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
+            assert payload["run"]["failure"]["code"] == expected_code
         assert store.observe(handle).recovery_required
         if read_tool == "await_run":
             assert payload["reason"] == "recovery_required"
@@ -1019,6 +1024,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
         "experiment_id": "srv",
         "found": False,
         "run": None,
+        "catalog_status": {"stale": False, "reload_refusal": None, "remediation": None},
     }
 
     handle = make_run_handle(

@@ -144,8 +144,9 @@ class CatalogReloadRefusedError(McpToolError):
         else:
             message = (
                 "the catalog or an experiment config it lists was edited and no longer "
-                "validates, so this server refuses launches until it is fixed; reads keep "
-                "using the last valid catalog. Ask the operator to fix it; `phasesweep mcp "
+                "validates, so this server refuses launches and inspection of changed configs "
+                "until it is fixed; other reads keep using the last valid catalog and saved "
+                "run snapshots. Ask the operator to fix it; `phasesweep mcp "
                 "check` shows what fails. The server rereads the catalog on the next call. "
                 "Do not retry until the operator reports the fix."
             )
@@ -369,8 +370,11 @@ class RunNamespaceMismatchError(McpToolError):
         super().__init__(
             f"run {run_id!r} was launched in another PID namespace, where its recorded "
             "process ids name unrelated processes for this server, so nothing was "
-            "signalled. Do not retry. Keep monitoring the run with await_run, and tell the "
-            "user this server cannot cancel it: the operator can cancel it from the "
+            "signalled. Do not retry cancellation. If get_run_status reports recovery_required, "
+            "stop monitoring and ask the operator to inspect and recover it with "
+            "phasesweep mcp recover-run from a host shell outside the sandbox. Otherwise "
+            "keep monitoring with await_run and tell the user this server cannot cancel it: "
+            "the operator can cancel it from the "
             "environment that launched it while that environment runs, or recover it with "
             "phasesweep mcp recover-run from the host once that environment has ended."
         )

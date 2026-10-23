@@ -271,10 +271,19 @@ class ExperimentSummaryPayload(_ToolPayload):
     capabilities: CapabilitiesPayload
 
 
+class CatalogStatusPayload(_ToolPayload):
+    """Freshness of the catalog used to answer a read."""
+
+    stale: bool
+    reload_refusal: Literal["invalid", "state_dir_changed"] | None
+    remediation: str | None
+
+
 class ListExperimentsResult(_ToolPayload):
     """Structured output for list_experiments."""
 
     experiments: list[ExperimentSummaryPayload]
+    catalog_status: CatalogStatusPayload
     total_count: int = Field(ge=0, description="Total catalog entries exposed by this server.")
     next_cursor: str | None = Field(
         default=None,
@@ -369,6 +378,7 @@ class InspectExperimentResult(_ToolPayload):
     """Structured output for inspect_experiment."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     metric: MetricSnapshot
     capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
@@ -410,6 +420,7 @@ class GetLatestRunResult(_ToolPayload):
     """Newest durable run handle for one experiment."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     found: bool = Field(description="Whether any MCP run is recorded for this experiment.")
     run: RunPayload | None
 
@@ -492,6 +503,7 @@ class GetRunStatusResult(_ToolPayload):
     """Structured output for get_run_status."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     result_source: ResultSource = Field(
         description=(
             "Result source: mutable shared study, immutable terminal snapshot, or unavailable "
@@ -657,6 +669,7 @@ class GetRunResultsResult(_ToolPayload):
     """
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     run_id: RunId
     result_source: ResultSource = Field(
         description=(

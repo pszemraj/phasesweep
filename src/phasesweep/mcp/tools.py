@@ -407,6 +407,20 @@ class PhaseSweepMCP:
         registry, _refusal = self._refresh_registry()
         return registry
 
+    def _catalog_status(self) -> JsonObject:
+        """Describe whether this response uses a catalog whose reload was refused.
+
+        :return JsonObject: Path-free catalog freshness and operator remedy.
+        """
+        refusal = self._reload_refusal
+        return {
+            "stale": refusal is not None,
+            "reload_refusal": refusal.reason if refusal is not None else None,
+            "remediation": str(CatalogReloadRefusedError(refusal.reason))
+            if refusal is not None
+            else None,
+        }
+
     def _audit_success(
         self,
         tool: str,
@@ -489,6 +503,7 @@ class PhaseSweepMCP:
             "experiments": page,
             "total_count": total_count,
             "next_cursor": str(next_offset) if next_offset < total_count else None,
+            "catalog_status": self._catalog_status(),
         }
 
     @staticmethod
@@ -566,6 +581,7 @@ class PhaseSweepMCP:
             "metric": reg.metric_payload,
             "capabilities": reg.capabilities,
             "phases": phases,
+            "catalog_status": self._catalog_status(),
         }
 
     def latest_run(self, experiment_id: str) -> dict[str, Any]:
@@ -581,6 +597,7 @@ class PhaseSweepMCP:
             "experiment_id": reg.id,
             "found": run is not None,
             "run": run,
+            "catalog_status": self._catalog_status(),
         }
 
     def _run_payload(
@@ -618,6 +635,7 @@ class PhaseSweepMCP:
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
             "failure": self._run_failure_payload(
                 handle,
+                view=view,
                 observation=observation,
                 force_snapshot_unavailable=force_snapshot_unavailable,
             ),
@@ -647,9 +665,59 @@ class PhaseSweepMCP:
             snapshot-unavailable failure; otherwise returns ``None`` when no
             valid failure was recorded.
         """
+        if view is None:
+            view = self._runs.runner_view(handle)
         if observation is None:
             observation = self._runs.observe(handle, view=view)
         terminal: Mapping[str, object] = observation.terminal_status or {}
+        runner_ended_with_boot = (
+            observation.terminal_status is None
+            and handle.launch_state == "spawned"
+            and view.visibility == "gone"
+        )
+        runner_exited = terminal.get("error_class") == "RunnerExitedWithoutStatus" or (
+            observation.terminal_status is None
+            and handle.launch_state == "spawned"
+            and observation.recovery_required
+            and not observation.runner_heartbeat_stale
+            and not self._runs.runner_may_be_alive(handle, view=view)
+        )
+        if runner_exited or runner_ended_with_boot or observation.runner_heartbeat_stale:
+            recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
+            if runner_ended_with_boot:
+                remedy = (
+                    "The runner ended with an earlier host boot. No process from that boot "
+                    "remains, so process cleanup and recover-run are not required. This "
+                    "run's historical results are unavailable; do not substitute mutable "
+                    "experiment-level results."
+                )
+            elif observation.runner_heartbeat_stale:
+                remedy = (
+                    "The runner is in another PID namespace and its heartbeat is stale; "
+                    "it may have stopped. Stop monitoring and ask the operator to inspect "
+                    "this run with `phasesweep mcp recover-run` from a host shell outside "
+                    "the sandbox. Liveness and trial cleanup must be checked there."
+                )
+            else:
+                remedy = (
+                    "The runner exited without writing a final status; its trial processes may "
+                    "still be alive. Stop monitoring and ask the operator to inspect this run "
+                    "with `phasesweep mcp recover-run` from a host shell, then repeat with "
+                    "`--confirm` after reviewing the process cleanup preview."
+                    if recovery_required
+                    else "The runner exited without writing a final status. Operator recovery "
+                    "settled process cleanup; this run's historical results remain unavailable. "
+                    "Do not substitute mutable experiment-level results."
+                )
+            return {
+                "code": (
+                    "cleanup_uncertain" if recovery_required else "result_snapshot_unavailable"
+                ),
+                "stage": "cleanup",
+                "retryable": False,
+                "actor": "operator",
+                "remediation": remedy,
+            }
         persisted: dict[str, Any] | None = None
         try:
             if terminal.get("failure") is not None:
@@ -963,13 +1031,15 @@ class PhaseSweepMCP:
         :return dict[str, Any]: Agent-safe status response.
         """
         elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
-        return status_payload(
+        result = status_payload(
             target_id,
             dict(status),
             run,
             result_source=result_source,
             elapsed_seconds=elapsed_seconds,
         )
+        result["catalog_status"] = self._catalog_status()
+        return result
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load the exact config snapshot pinned by the run handle.
@@ -1041,6 +1111,7 @@ class PhaseSweepMCP:
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
         )
+        result["catalog_status"] = self._catalog_status()
         return result
 
     def _effective_visible_params(

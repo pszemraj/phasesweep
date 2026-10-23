@@ -385,6 +385,11 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     run_id = "srv-operator-recover"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
 
+    before = app.status(run_id=run_id)
+    assert before["run"]["failure"]["code"] == "cleanup_uncertain"
+    assert "runner exited without writing a final status" in before["run"]["failure"]["remediation"]
+    assert "phasesweep mcp recover-run" in before["run"]["failure"]["remediation"]
+
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
@@ -413,12 +418,51 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     unavailable = app.status(run_id=run_id)
     assert unavailable["result_source"] == "terminal_snapshot_unavailable"
     assert unavailable["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert (
+        "runner exited without writing a final status"
+        in unavailable["run"]["failure"]["remediation"]
+    )
+    assert "settled process cleanup" in unavailable["run"]["failure"]["remediation"]
     assert unavailable["phases"][0]["trial_data_available"] is False
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+@pytest.mark.parametrize(("alive", "birth_matches"), [(False, False), (True, False), (True, True)])
+def test_recovery_preview_names_trial_group_liveness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    alive: bool,
+    birth_matches: bool,
+) -> None:
+    """Inspection names the training group and its termination without signalling it."""
+    write_trial_identity(tmp_path, attempt_id="preview", pid=12345, starttime=1)
+    monkeypatch.setattr(attempts_module, "_process_group_alive", lambda _pgid: alive)
+    monkeypatch.setattr(attempts_module, "is_same_live_process", lambda _pid, _start: birth_matches)
+
+    def forbid_cleanup(_identity: StaleProcessIdentity) -> bool:
+        raise AssertionError("inspection must not signal")
+
+    monkeypatch.setattr(attempts_module, "cleanup_stale_trial_process", forbid_cleanup)
+    attempts_module._resolve_attempt(
+        _AttemptRecord("preview", tmp_path, "generation", "p", 0),
+        context="RUNNING trial 0",
+        evidence_action=OperatorAction.RESTORE_TREE,
+        lifecycle_settles=True,
+        confirm=False,
+    )
+    assert f"training process group is {'live' if alive else 'exited'}" in caplog.text
+    assert "pid=12345 pgid=12345" in caplog.text
+    assert ("--confirm will terminate it if still alive" in caplog.text) is (
+        alive and birth_matches
+    )
+    if alive and not birth_matches:
+        assert "process-birth identity is unverified or mismatched" in caplog.text
+        assert "must verify process-birth identity before signalling" in caplog.text
 
 
 def test_recovery_preserves_status_written_after_initial_read(
@@ -556,9 +600,10 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "Report that this run's historical results are unavailable and ask "
-            "the operator to inspect the PhaseSweep run or server diagnostics; "
-            "do not substitute mutable experiment-level results."
+            "The runner ended with an earlier host boot. No process from that boot "
+            "remains, so process cleanup and recover-run are not required. This "
+            "run's historical results are unavailable; do not substitute mutable "
+            "experiment-level results."
         ),
     }
     for payload in (status, awaited):

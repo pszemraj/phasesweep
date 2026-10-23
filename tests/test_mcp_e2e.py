@@ -461,6 +461,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     app, _registry, _store = make_mcp_app(catalog)
     awaited = {
         "experiment_id": "e2e_lm",
+        "catalog_status": {"stale": False, "reload_refusal": None, "remediation": None},
         "result_source": "current_shared_study",
         "current_generation_id": "r1",
         "published_generation_id": None,
