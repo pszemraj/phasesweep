@@ -178,7 +178,12 @@ def _write_result(metric_record: Mapping[str, Any]) -> None:
         policy="final_checkpoint",
         checkpoint="final.pt",
         step=metric_record["step"],
-        extra={"runtime": {"device_type": metric_record["device_type"]}},
+        extra={
+            "runtime": {
+                "device_type": metric_record["device_type"],
+                "accelerated": metric_record["device_type"] in {"cuda", "mps"},
+            }
+        },
     )
 
 

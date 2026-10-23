@@ -1,4 +1,4 @@
-# Two-trial CUDA smoke sweep for validating the real trainer integration quickly.
+# Two-trial CUDA/MPS smoke sweep for validating the real trainer integration quickly.
 # It uses the upstream test model and writes its experiment outputs under /tmp.
 
 experiment: tiny_decoder_enwik8_gpu_smoke
@@ -48,17 +48,16 @@ metric:
 
 phases:
   - name: learning_rate_smoke
-    comment: "Run two short CUDA trials to verify GPU leasing, typed overrides, training, checkpoint evaluation, and objective evidence."
+    comment: "Run two short GPU trials to verify GPU leasing, typed overrides, training, checkpoint evaluation, and objective evidence."
     n_trials: 2
     n_jobs: 1
-    gpu_ids: [0]
     timeout_seconds_per_trial: 120
     sampler:
       type: grid
     gates:
       - type: json_equals
         path: result.json
-        key: runtime.device_type
-        value: cuda
+        key: runtime.accelerated
+        value: true
     search_space:
       learning_rate: { type: categorical, choices: [0.0003, 0.001] }

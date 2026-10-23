@@ -14,6 +14,10 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 
+from phasesweep import load_experiment
+from phasesweep.evidence.evaluation import evaluate_gates
+from tests.conftest import make_trial_context
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WRAPPER_PATH = REPO_ROOT / "examples" / "tiny_decoder_enwik8" / "run_trial.py"
 
@@ -26,7 +30,10 @@ def _load_wrapper() -> ModuleType:
     return module
 
 
-def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("device_type", ["cuda", "mps", "cpu"])
+def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
+    tmp_path, monkeypatch, device_type
+):
     wrapper = _load_wrapper()
     monkeypatch.setitem(sys.modules, "mlflow", None)
     template_root = tmp_path / "upstream"
@@ -54,7 +61,7 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         assert (run_dir / "final.pt").read_bytes() == b"checkpoint"
         return {
             "checkpoint": "final.pt",
-            "device_type": "cuda",
+            "device_type": device_type,
             "policy": "final_checkpoint",
             "step": 1000,
             "val_loss": 0.25,
@@ -93,11 +100,15 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "generation_id": "generation-test",
         "objective": {"name": "val_loss", "split": "validation", "value": 0.25},
         "overrides_sha256": config_sha256,
-        "runtime": {"device_type": "cuda"},
+        "runtime": {"device_type": device_type, "accelerated": device_type in {"cuda", "mps"}},
         "schema_version": 1,
         "status": "complete",
     }
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
+    smoke = load_experiment(WRAPPER_PATH.parent / "gpu_smoke.yaml")
+    gates = evaluate_gates(make_trial_context(trial_dir), smoke.phases[0].gates)
+    assert len(gates) == 1
+    assert gates[0].passed is (device_type != "cpu")
 
 
 @pytest.mark.parametrize("managed", [True, False])
