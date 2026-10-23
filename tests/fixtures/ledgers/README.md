@@ -16,7 +16,7 @@ Use `golden_publication` or `materialize` from [`ledger_fixtures.py`](../../ledg
 | --- | --- | --- | --- | --- | --- |
 | `current-journal` | journal | tree, ledger-only | 12 | ok | ok |
 
-`tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, which is the case no binding can answer and the ledger format scan must.
+`tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, testing the ledger format scan without a binding. The table reports direct-reader format verdicts; CLI `status`, `status --trials` and `show-winners` instead refuse the missing study directory, which the read-path matrix classifies as `study-absent`.
 
 The manifest records the generating toolchain: PhaseSweep Git revision, Optuna, SQLite library version, Python, and working directory.
 

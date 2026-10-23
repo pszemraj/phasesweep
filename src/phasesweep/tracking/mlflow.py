@@ -588,11 +588,8 @@ def _finished_without(
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
 
-    A run that reads FINISHED is never polled for evidence it lacks. The trainer
-    process has exited before capture starts, and the MLflow client sends all of
-    that process's logged data, including asynchronous batches, before it marks
-    a run FINISHED, so the run already holds everything the trainer logged.
-    A run that is not yet FINISHED is polled until just before ``timeout_at``.
+    FINISHED runs fail immediately when required evidence is missing. Unfinished
+    runs are polled until just before ``timeout_at``.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CaptureRequest request: Trusted target, bound run, and shared query.

@@ -793,10 +793,7 @@ _FRESH_START = (
 def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
-    Every recovery message takes its advice from here, and :func:`_recovery_action` routes
-    it. Each remedy keeps the recorded results, and PhaseSweep cannot know that the trainer
-    changed since, so the advice always ends by saying how to discard them: a new
-    ``experiment`` name.
+    Recovery messages take their advice from here, and :func:`_recovery_action` routes it. Recovery retains recorded results; starting fresh uses a new ``experiment`` name.
 
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.

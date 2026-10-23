@@ -171,12 +171,8 @@ def _build_phase_study(
 ) -> optuna.Study:
     """Load a phase's Optuna study from already-resolved storage, creating it only if absent.
 
-    Journal storage appends a creation record on every ``create_study`` call and
-    only afterwards finds that the name exists, so creating with ``load_if_exists``
-    on each open grows the journal by one record per open. Loading first leaves an
-    existing study's journal untouched; the creating call stays as the fallback for
-    a missing study, and its ``load_if_exists`` still loads the study when another
-    process creates it first.
+    Load existing studies first because journal storage appends a creation record
+    even when ``create_study(load_if_exists=True)`` finds an existing name.
 
     :param Experiment experiment: Parsed experiment config supplying the metric direction.
     :param Phase phase: Phase whose sampler, search space, and study name are used.

@@ -361,11 +361,8 @@ def _register_active_attempt(
 def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     """Best-effort removal of a registry entry whose trial is durably terminal.
 
-    Deletion stays best-effort even though creation is fail-closed: a retained
-    entry is safe by construction. It names an already-terminal trial, so
-    preflight resolves it against a durable ``exited`` lifecycle, changes
-    nothing in the study, and garbage-collects the file. Only a *missing*
-    entry loses information.
+    A failed deletion leaves the entry for the next preflight, which resolves
+    its terminal trial's ``exited`` lifecycle without changing the study.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Attempt whose trial reached a terminal state.
@@ -550,10 +547,9 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
 def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
     """Return whether a terminal trial still lacks positive cleanup evidence.
 
-    The explicit cleanup attribute is forensic redundancy, not the sole
-    authority: its best-effort write can fail after the fatal outcome ledger
-    durably records ``unsafe_process_cleanup``. The study-level recovery ledger
-    is the only transition that consumes either form of uncertainty.
+    A false cleanup attribute or a fatal ``unsafe_process_cleanup`` outcome
+    requires recovery. The outcome covers a failed best-effort attribute write.
+    Confirmed recovery is recorded in the study-level recovery ledger.
 
     :param optuna.trial.FrozenTrial trial: Trial whose durable cleanup state is inspected.
     :return bool: Whether ordinary preflight must confirm cleanup before new work.

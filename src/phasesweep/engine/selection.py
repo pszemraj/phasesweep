@@ -237,7 +237,7 @@ def select_winner(
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
     }
     selected_value = best.value
-    assert selected_value is not None  # same invariant
+    assert selected_value is not None
     raw_gates = best.user_attrs.get(GATES_ATTR)
     gates: list[dict[str, Any]] = []
     if raw_gates is not None:

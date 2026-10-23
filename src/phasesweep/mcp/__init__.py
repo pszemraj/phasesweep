@@ -14,7 +14,7 @@ MCP_EXTRA_INSTALL_COMMAND = 'pip install "phasesweep[mcp]"'
 
 @functools.cache
 def agent_prompt_text() -> str:
-    """Return the canonical packaged instructions for agents using the MCP server.
+    """Return the packaged instructions for agents using the MCP server.
 
     :return str: Contents of the packaged ``agent_prompt.md`` resource.
     """

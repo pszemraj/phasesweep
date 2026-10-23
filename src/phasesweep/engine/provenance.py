@@ -98,8 +98,7 @@ def _code_revision(cwd: Path) -> CodeRevision | None:
     """Read the git commit checked out in ``cwd`` and whether tracked files differ from it.
 
     The record is provenance only: it enters no fingerprint, environment cohort, or
-    resume check, so a commit that touches nothing the trainer reads never refuses a
-    resume. A failed read must not stop a claim, so every failure is ``None``.
+    resume check.
 
     :param Path cwd: Effective trainer working directory.
     :return CodeRevision | None: ``commit`` is HEAD's full hex id and ``dirty`` is true
@@ -177,12 +176,10 @@ def _write_generation_provenance(
 
     ``reproducibility.json`` uses ordinary umask permissions and contains versions,
     semantic fingerprints, public configured provenance, the snapshot's SHA-256,
-    ``generation_id_source`` (``caller`` or ``engine``), and ``code_revision``. It
-    exposes no environment or snapshot values. The source field preserves external
-    launch provenance if launcher state is lost; it does not grant authority to a
-    reader. ``code_revision`` is the git commit of the effective trainer cwd and
-    whether tracked files differ from it, or ``null`` when that is unreadable; it is
-    recorded and never compared.
+    ``generation_id_source`` (``caller`` or ``engine``), and ``code_revision`` from
+    :func:`_code_revision`. It exposes no environment or snapshot values. The source
+    field preserves external launch provenance if launcher state is lost; it does
+    not grant authority to a reader.
 
     Both files are required and hash-covered by the generation manifest.
 

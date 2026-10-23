@@ -43,9 +43,7 @@ def _catalog_relative_config(config: Path, catalog_dir: Path) -> str:
 
     :param Path config: Experiment config being cataloged.
     :param Path catalog_dir: Directory the catalog file will live in.
-    :return str: ``./``-prefixed relative path for configs under the catalog
-        directory, otherwise the absolute path (explicit beats a ``..`` chain
-        that breaks when the catalog moves).
+    :return str: ``./``-prefixed relative path for configs under the catalog directory, otherwise the absolute path.
     """
     resolved = config.resolve()
     try:
@@ -92,7 +90,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         config_path = _yaml_string_scalar(_catalog_relative_config(config, catalog_dir))
         entries.append(
             f"""\
-  - id: {experiment_id_scalar}          # the only token the agent ever sends
+  - id: {experiment_id_scalar}          # catalog experiment identifier for inspection and launch
     config: {config_path}   # resolved relative to this catalog file
     cwd: "."                     # detached runner cwd, relative to this catalog; the trainer's only when execution.cwd is unset
     # description: "Human-curated one-line purpose shown to the agent"
@@ -120,9 +118,10 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
 # Then configure your MCP client to run the absolute `phasesweep-mcp` executable
 # with `--catalog` and this absolute catalog path.
 #
-# The agent only ever sends an experiment `id`. It cannot pass a path, author a
-# config, or reach trial_command / env / storage / workdir. You curate which
-# experiments exist by editing this file (same trust as the experiment YAML).
+# Inspect and launch an experiment by its catalog `id`. Status, results, waiting,
+# and cancellation take the returned `run_id`. Tools accept no config paths,
+# commands, environment values, storage URLs, or workdir. Edit this file to choose
+# the available experiments and permissions.
 
 state_dir: {_yaml_string_scalar(state_dir)}   # run handles, logs, audit.jsonl (operator-owned)
 max_concurrent_runs: 1          # sweeps at once across all experiments; 1 keeps a single GPU sane

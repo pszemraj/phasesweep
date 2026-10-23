@@ -448,7 +448,7 @@ def prepare_trainer_input(
 ) -> PreparedTrainerInput:
     """Atomically write and identify the exact input one trainer will consume.
 
-    One serialized byte string is used for the atomic write, environment
+    One serialized byte string is used for the atomic write, trainer-input
     digest, and durable trial record. Argparse and hydra consume the flat
     ``overrides_resolved.json``, which holds the base trainer config merged
     with the overrides; YAML and JSON modes consume their generated file and

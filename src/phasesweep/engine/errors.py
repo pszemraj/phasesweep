@@ -96,8 +96,8 @@ class StudyStorageUnavailableError(PhaseSweepError):
 class IncompleteJournalRecordError(StudyStorageUnavailableError):
     """Raised when a partial final journal record cannot be repaired before writing.
 
-    Causes include lock timeout or replacement, multiple journal hard links, backup
-    or truncation failure, and journal changes during repair. Intact records remain;
+    Causes include lock timeout or replacement, backup or truncation failure,
+    and journal changes during repair. Intact records remain;
     lock replacement or concurrent changes carry ``OperatorAction.RETRY``.
     """
 

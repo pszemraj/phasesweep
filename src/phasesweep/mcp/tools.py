@@ -230,8 +230,7 @@ def _cursor_offset(cursor: str | None) -> int:
 
     :param str | None cursor: Cursor supplied by the agent.
     :return int: Zero-based catalog offset.
-    :raises McpToolError: If the cursor is not a non-negative integer produced
-        by ``list_experiments``.
+    :raises McpToolError: If the cursor cannot be parsed as a non-negative integer offset.
     """
     if cursor is None:
         return 0
@@ -489,8 +488,7 @@ class PhaseSweepMCP:
         :param int limit: Maximum catalog entries to return.
         :param str | None cursor: Optional pagination cursor returned by a prior call.
         :return dict[str, Any]: Catalog page safe for the agent.
-        :raises McpToolError: If ``limit`` is outside ``1..MAX_LIST_LIMIT``, or
-            the cursor is not one this tool returned.
+        :raises McpToolError: If ``limit`` is outside ``1..MAX_LIST_LIMIT`` or the cursor is not a non-negative integer offset.
         """
         if limit < 1 or limit > MAX_LIST_LIMIT:
             raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
@@ -1044,8 +1042,6 @@ class PhaseSweepMCP:
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load the exact config snapshot pinned by the run handle.
 
-        Reject missing, unreadable, altered or non-experiment snapshots, including after restart.
-
         :param RunHandle handle: Persisted run identity whose snapshot should be loaded.
         :return Experiment: Parsed experiment from the launched per-run snapshot.
         :raises RunSnapshotUnavailableError: If the snapshot is missing,
@@ -1221,11 +1217,6 @@ class PhaseSweepMCP:
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> JsonObject:
         """Start the sweep as a detached background run; return its run_id.
-
-        Refuses while the latest reread of an edited catalog was refused, if launch is
-        not permitted, if a ``from_phase`` resume is not ready (an earlier phase the
-        remaining phases inherit has no compatible published winner), if this experiment
-        already has a live run, or if the server is at its max_concurrent_runs cap.
 
         :param str experiment_id: Catalog experiment id to launch.
         :param str | None from_phase: Optional phase to resume from once the earlier phases
@@ -1601,9 +1592,6 @@ class PhaseSweepMCP:
         reg: RegisteredExperiment, refusal: _CatalogReloadRefusal | None = None
     ) -> bytes:
         """Read a cataloged config only while it still holds the bytes its registry validated.
-
-        The call's reread makes the bytes match, unless the file changed after it or
-        that reread was refused and the served registry is the last valid one.
 
         :param RegisteredExperiment reg: Catalog entry to verify.
         :param _CatalogReloadRefusal | None refusal: Refusal of this call's reread, if any.

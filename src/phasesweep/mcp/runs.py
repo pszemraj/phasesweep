@@ -248,7 +248,7 @@ class RunHandle:
     config_dir: str
     pid: int | None
     pgid: int | None
-    # PID-reuse-safe /proc start time; None only before spawn.
+    # Native process start time; None only before spawn.
     pid_starttime: int | None
     started_at: str  # ISO-8601 UTC
     visible_params_at_launch: Literal["none", "all"] | list[str]
@@ -256,7 +256,7 @@ class RunHandle:
     allow_cancel: bool = False
     # Boot that numbered the PID; None only before spawn.
     boot_id: str | None = None
-    # Namespace inode and PID 1 start time; None only before spawn.
+    # Platform PID-space identity; None only before spawn.
     pid_namespace: str | None = None
 
     @property

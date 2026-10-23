@@ -82,4 +82,4 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - Unavailable terminal snapshot: follow `failure.remediation`; it distinguishes a runner that exited without final status from one whose host boot ended, for which process cleanup is unnecessary. Other capture failures require inspection of run/server diagnostics. [Historical results](mcp.md#reading-status-responses) cannot be reconstructed from the current ledger.
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
-- Trainer environment cohort mismatch: the detached runner composes the trainer's environment from [the server's](mcp.md#the-catalog), not your shell's; reconcile the two using the [trainer contract](config.md#trainer-contract).
+- Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment; reconcile it using the [trainer contract](config.md#trainer-contract).

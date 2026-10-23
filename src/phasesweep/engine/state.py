@@ -482,17 +482,10 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 5
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
-# Provenance files frozen into every generation namespace at claim time. The
-# summary keeps only the config *fingerprint*: once the operator edits or loses
-# the YAML, the digest can prove a mismatch but cannot reconstruct the search
-# spaces, fixed overrides, execution context, env, or trial command behind a
-# published winner. These files keep that.
+# Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
-# The reproducibility record carries ``generation_id_source``: "caller" marks a
-# generation whose identity -- and therefore launch authority -- was granted by
-# an external launcher, durably enough to survive the loss of that launcher's
-# own state directory.
+# generation_id_source records whether the caller supplied the generation ID or the engine minted it.
 REPRODUCIBILITY_SCHEMA_VERSION = 3
 
 WINNER_FILENAME = "winner.yaml"

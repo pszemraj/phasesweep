@@ -251,6 +251,8 @@ Every trial has a draw position. A trial that is not a rerun takes the next one,
 
 Use `validate`, `run --dry-run`, `status`, and `show-winners` to inspect an experiment without launching work. The dry run captures the journal once without writing and reports each phase's `finished`, `remaining` and [rerun](#interrupted-trials-rerun) counts. A met target or accepted partial target replays its recorded winner, so children preview with real inherited values. Otherwise their sample commands use stand-ins: `DRY RUN example command` names those keys and the parent that must publish, as in `(placeholders until 'architecture' publishes a winner: model.name)`. Keys the child fixes itself are real values.
 
+Pass the same `--set` assignments used for `run` to each inspection command so it resolves the same study; see [run-time overrides](config.md#run-time-overrides) for the syntax and config-relative path rules.
+
 After the phase lines, `DRY RUN total: would launch 30 trials (2 reruns) across 3 phases (2 other phases replay)` sums new work, including reruns, and counts replaying phases separately. Phases skipped by `--from-phase` are omitted. A refused preview prints no total.
 
 For readable, settled studies, the dry run applies the run's checks and messages before previewing phases:

@@ -413,13 +413,10 @@ class _ThreadRandomState(threading.local):
 class _PositionTPESampler(optuna.samplers.TPESampler):
     """Seeded TPE whose every random choice is a function of the trial's draw position.
 
-    Stock TPE draws its startup trials and its candidates from two streams
-    that restart at the seed in every process, so a resumed study would draw
-    its first configurations again. Here the startup draws come from
-    :class:`_PositionRandomSampler` and each candidate draw from a stream
-    seeded by its position, per thread, so a resumed or enlarged study draws
-    no configuration twice, and at ``n_jobs: 1`` draws what an uninterrupted
-    one would have, given the same trial values.
+    Startup draws use :class:`_PositionRandomSampler`; candidate draws use
+    thread-local streams seeded by position. At ``n_jobs: 1``, resume and top-up
+    reproduce an uninterrupted run given the same trial values. Distinct draws
+    can sample the same configuration.
     """
 
     def __init__(self, *, seed: int, n_startup_trials: int, constant_liar: bool) -> None:

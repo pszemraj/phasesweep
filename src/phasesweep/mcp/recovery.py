@@ -430,14 +430,14 @@ def _require_dead_runner(
     """Reject live runners and identities without a safe process-visibility proof.
 
     Ended boots and host-proven foreign-namespace absence need no PID probe. Other cleanup
-    requires a recorded Linux start time before checking liveness.
+    requires a recorded native process start time before checking liveness.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
     :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
     """
-    # PID and /proc start time are unique only within one boot and PID
+    # PID and native process start time are unique only within one boot and PID
     # namespace, and only this namespace's numbers may be probed.
     if view.visibility != "observable":
         return

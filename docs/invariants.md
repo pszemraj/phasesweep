@@ -66,7 +66,7 @@ Every PhaseSweep append and repair locks the journal inode. Writers wait without
 
 **Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`, `tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`, `tests/test_format_cutover.py::test_journal_hard_link_names_share_lock_and_repair`, `tests/test_format_cutover.py::test_repair_refuses_a_journal_that_grew_under_its_lock`
 
-The scan may treat a missing journal file as an absent ledger only because config load already refused every other storage form: `storage` other than `null`, `auto`, or a `journal:///` URL is refused at config load (`config.models.Experiment._storage_is_local`, tested by `tests/test_storage_urls.py::test_non_journal_storage_is_refused_at_config_load`).
+The scan treats a missing journal file as an absent ledger after config loading restricts `storage` to `null`, `auto`, or a `journal:///` URL (`config.models.Experiment._storage_is_local`, tested by `tests/test_storage_urls.py::test_non_journal_storage_is_refused_at_config_load`).
 
 #### 3. Only a claimed ledger runs trials
 
@@ -140,7 +140,7 @@ Recovery signals nothing for an attempt only on a durable lifecycle state that p
 
 A generation exists only for an invocation that [launches a trial or publishes winners that differ from the current publication](runtime.md#timeouts-cleanup-and-continuation). Every check that can refuse a launch finishes before the claim: environment preflight and the continuation preflight run before any phase, and each phase's resume, cohort, SDK, GPU, budget and tracking-target checks run before that phase claims the generation, ahead of its first trial-target write and any attempt registration. A run that launched nothing compares its winners with the validated publication and claims only when they differ or nothing validates as published. The claim writes the namespace and its provenance before it moves the current pointer to `running`, so a crash never leaves that pointer naming a missing generation.
 
-**Held by:** `engine.run._run_experiment_outcome`, `engine.phase._run_phase`, `engine.generation.InvocationGeneration.claim` and `_publication_holds`
+**Held by:** `engine.run._run_experiment_outcome`, `engine.phase._run_phase`, `engine.generation.InvocationGeneration.claim` and `engine.generation._publication_holds`
 
 **Tests:** `tests/test_generation_claim.py::test_a_refused_run_leaves_no_generation_and_both_pointers_as_they_were`, `tests/test_generation_claim.py::test_a_replay_of_the_published_winners_writes_no_generation`, `tests/test_generation_claim.py::test_a_replay_publishes_a_generation_when_nothing_is_published`
 
@@ -190,7 +190,6 @@ A process group whose cleanup is not confirmed stops all further work until reco
 
 A GPU lease excludes the physical card the trainer actually uses for as long as any process in the trainer's group can run on it. Host locks key on the card's canonical identity from the `nvidia-smi` inventory, so a numeric index and its UUID contend for one lock. A trainer handed numeric tokens always gets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, overriding a configured value, because those indices were locked in PCI order and another order could bind a different card. Apple silicon's discovered MPS device uses `gpu_mps.lock` without assigning CUDA visibility; the trainer selects its compute backend. The lease descriptors pass to the supervisor guardian, which stays outside the trainer's process group, keeps them until the whole group is gone, and closes them in the trainer child before `exec`, so the exclusion survives an orchestrator hard exit.
 
-
 **Held by:** `runtime.gpu.GpuPool.acquire`, `GpuDevice.lock_identity` and `_bind_lock_identities`; `engine.trial.launch_trial`; `runtime.supervisor.main` and `_close_trainer_fds`
 
 **Tests:** `tests/test_gpu_pool.py::test_index_and_uuid_share_one_host_lock`, `tests/test_trial_launch.py::test_launch_trial_cuda_environment`, `tests/test_gpu_pool.py::test_gpu_lease_survives_orchestrator_hard_exit`
@@ -221,7 +220,7 @@ One status or result read uses one generation's recorded labels and publication 
 
 CLI commands locate a study through the same config-relative `--set` overrides and refuse a missing study directory with its path. Inspection represents the latest claimed generation when available, marks unpublished winners explicitly, and retains the publication's integrity refusal. `show-winners` takes an unpublished generation's metric name, phase annotations and argparse base from its saved config snapshot, so current-config edits cannot relabel saved measurements.
 
-Catalog-backed MCP reads expose `catalog_status` separately from frozen scientific facts. A refused catalog reload preserves the last valid catalog, marks reads stale and reports the operator remedy; it never silently presents the retained catalog as current.
+Catalog-backed MCP reads expose `catalog_status` separately from frozen scientific facts. A refused catalog reload preserves the last valid catalog, marks reads stale and reports the operator remedy.
 
 **Held by:** `engine.read._read_status` and `read_result`; `cli.show_winners`; `mcp.snapshots.capture_result_snapshot`; `mcp.tools.PhaseSweepMCP._refresh_registry` and `_catalog_status`; `tracking.publication._save_generation_intents`
 

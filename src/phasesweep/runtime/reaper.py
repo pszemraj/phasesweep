@@ -336,7 +336,7 @@ def read_proc_starttime(pid: int) -> int | None:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Check if a PID exists (best-effort; race-free check is impossible).
+    """Check whether a PID exists.
 
     :param int pid: The process ID to probe via ``kill(pid, 0)``.
     :return bool: ``True`` if the PID exists (or exists but is owned by another user);

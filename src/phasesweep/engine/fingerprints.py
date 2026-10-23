@@ -21,12 +21,7 @@ log = logging.getLogger(__name__)
 
 _RUN_CONTROL_KEYS = frozenset(
     {
-        # Fields excluded from the fingerprint because they don't change trial
-        # meaning. Top-up workflow (re-run with a higher n_trials) must work;
-        # throughput knobs (n_jobs / gpu_ids) and circuit breakers
-        # (max_consecutive_failures) likewise must not invalidate a study.
-        # `comment` is operator-facing documentation — editing it is never a
-        # semantic change to the experiment.
+        # Run-control settings do not change trial semantics and stay outside fingerprints.
         "n_trials",
         "n_jobs",
         "gpu_ids",

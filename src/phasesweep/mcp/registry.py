@@ -528,8 +528,7 @@ class Registry:
     def load(cls, catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
         """Load validated experiments with persistent local journal storage.
 
-        Any invalid catalog, config or state directory raises ``CatalogError``. A
-        running server reloads an edited catalog by passing the state directory its
+        A running server reloads an edited catalog by passing the state directory its
         run store already serves as ``bound_state_dir``. That directory is neither
         provisioned nor probed again, so a reload writes nothing.
 

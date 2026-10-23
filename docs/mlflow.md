@@ -15,17 +15,17 @@ mlflow server --host 127.0.0.1 --port 5000 \
   --artifacts-destination /tmp/phasesweep-mlflow-demo/artifacts
 ```
 
-In another terminal, provision the experiment explicitly, then run the example from the repository root:
+In another terminal, save the [complete configuration](../examples/mlflow.yaml) as `mlflow.yaml` in your working directory, then provision the experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
 
 ```bash
 python -c 'from mlflow import MlflowClient; MlflowClient(tracking_uri="http://127.0.0.1:5000").create_experiment("phasesweep-native")'
-phasesweep validate examples/mlflow.yaml
-phasesweep run examples/mlflow.yaml
-phasesweep show-winners examples/mlflow.yaml
-phasesweep status examples/mlflow.yaml
+phasesweep validate mlflow.yaml
+phasesweep run mlflow.yaml
+phasesweep show-winners mlflow.yaml
+phasesweep status mlflow.yaml
 ```
 
-The [complete configuration](../examples/mlflow.yaml) launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
+This configuration launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
 For real training on a GPU, the [Tiny Decoder MLflow smoke guide](../examples/tiny_decoder_enwik8/README.md#native-mlflow-gpu-smoke) provides a complete two-trial, ten-batch configuration using native final-checkpoint metrics, with both run ownership modes supported.
 
@@ -44,7 +44,7 @@ metric:
   extractor: {type: mlflow, metric_key: eval/loss, select: last}
 ```
 
-The experiment must already exist and be active. Quote a numeric `experiment_id` so YAML keeps it a string. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`; HTTP credentials belong in SDK authentication or the environment rather than the URI. Before a phase allocates its first trial, PhaseSweep resolves the experiment; the first such phase also creates the generation-summary run. A server, credential or experiment failure stops there without spending trial slots or writing a generation. The refusal names the target. The resolved ID is saved in `<workdir>/<experiment>/tracking/source.json`; an experiment deleted and recreated under a different ID is refused. Losing the target after a phase starts fails its remaining trials, which count toward `n_trials`.
+The experiment must already exist and be active. Quote a numeric `experiment_id` so YAML keeps it a string. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`; HTTP credentials belong in SDK authentication or the environment rather than the URI. Before a phase allocates its first trial, PhaseSweep resolves the experiment; the first such phase also creates the generation-summary run. A server, credential or experiment failure spends none of that phase's trial slots; when no trial has launched, it writes no generation. The refusal names the target. The resolved ID is saved in `<workdir>/<experiment>/tracking/source.json`; an experiment deleted and recreated under a different ID is refused. Losing the target after a phase starts fails its remaining trials, which count toward `n_trials`.
 
 The MLflow client retries a server that refuses or does not answer. When those retries outlast `timeout_seconds`, the refusal says the target did not answer within `timeout_seconds`; when they end sooner, it says the server refused the connection, including when MLflow wraps the transport failure. Either way, check `tracking_uri` and that the server is running.
 
@@ -125,10 +125,12 @@ At least one namespace must be nonempty. A finished run missing a required metri
 
 Accepted trials receive reserved `phasesweep.*` metrics, parameters, and tags: objective, measured constraints, report-only `observe` values (`phasesweep.observed.<name>`), feasibility, trainer duration, effective fixed/inherited/sampled overrides, and phase/inheritance references. Trainers should leave this namespace to PhaseSweep. The `phasesweep.*` metrics are logged at step 0. MLflow truncates a parameter value longer than 6000 characters, so the attempt's summary artifact below is the full record of its overrides; with the `mlflow` block set, config load refuses constraint names, observation names and override keys whose published key contains characters outside alphanumerics, underscores, periods, dashes, slashes, colons and spaces, exceeds 250 characters, or is not a normalized relative path. The `phasesweep.override.` prefix bounds an override key to 230 characters. A generation-summary run in the same experiment groups managed attempts and holds `phasesweep/generation.json` plus winner references. Each attempt run holds `phasesweep/attempt-<attempt-id>.json`, and a winning run also holds `phasesweep/winner-<phase>.json`. For a phase with [`repeats`](config.md#repeats), the winning run is the last member of the winning group, and its winner reference records the group's reduced metric, while every member's run keeps its own objective. Trainer-owned attempts retain their own parents.
 
-After confirmed cleanup, PhaseSweep queues result projections for accepted trials and for failed invocations' generation-summary and outstanding attempt runs. Upload failures leave pending records without changing accepted scores, trial states or winners. Once published, the local result stays successful even when a winner reference could not be saved or sent, or upload-worker cleanup is uncertain. A `PENDING` closeout names the generation, upload count and retry command. CLI `status` reports `tracking_delivery` counts across generations; MCP status reports its run's uploads separately from its frozen scientific result:
+After confirmed cleanup of a failed invocation, PhaseSweep queues a FAILED generation-summary projection for an ordinary failure, or KILLED for shutdown or keyboard interruption. Accepted attempts keep their accepted projections; interrupted attempts are KILLED, and other unaccepted managed attempts receive the invocation's status. A failed delivery can leave native runs RUNNING until retrying.
+
+Result uploads leave pending records on failure without changing accepted scores, trial states or winners. Once published, the local result stays successful even when a winner reference could not be saved or sent, or upload-worker cleanup is uncertain. A `PENDING` closeout names the generation, upload count and retry command. CLI `status` reports `tracking_delivery` counts across generations; MCP status reports its run's uploads separately from its frozen scientific result:
 
 ```bash
-phasesweep sync-tracking examples/mlflow.yaml
+phasesweep sync-tracking mlflow.yaml
 ```
 
 `sync-tracking` retries uploads only, using the original target configuration. `--generation GENERATION_ID` limits retries to one generation, whose ID is the MCP run ID for detached runs. `sync-tracking` holds the experiment lock, skips delivered projections, and exits nonzero while uploads remain pending, when no delivery records exist in scope, or without an `mlflow` block. Permanent remote refusals, such as a deleted run, remain pending.
