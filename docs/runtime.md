@@ -14,7 +14,6 @@ demo/
   study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
-  summary.yaml
   attempts/
   generations/
     <generation-id>/
@@ -24,7 +23,6 @@ demo/
       summary.yaml
       phases/<phase>/winner.yaml
   <phase>/
-    winner.yaml
     trials.csv
     trial_00000__generation_<id>__attempt_<id>/
       attempt_lifecycle.json
@@ -38,7 +36,9 @@ demo/
       result.json               # when produced by the trainer
 ```
 
-The root `summary.yaml` and per-phase `winner.yaml` files are convenience projections. Each summary phase entry retains its winner's `observed`, `repeats` and `confound` blocks, so the reduced metric can be read beside its spread, observations and comparison verdicts. Under `override_format: argparse` it also carries the recorded `trainer_config` base at the top level ([trainer inputs](config.md#trainer-inputs)). The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-continuation) and its `state`: `running`, `published`, `failed` or `publication_failed`. `last_successful_generation.yaml` points to the immutable generation that authoritatively represents the latest successful result. A failed invocation does not replace that pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
+`last_successful_generation.yaml` points to the immutable generation that represents the latest successful result. Read its `generation_id` to locate `generations/<generation-id>/summary.yaml` and `generations/<generation-id>/phases/<phase>/winner.yaml`, or use `phasesweep show-winners CONFIG`, which validates the publication and prints that generation's directory. Each summary phase entry retains its winner's `observed`, `repeats` and `confound` blocks, so the reduced metric can be read beside its spread, observations and comparison verdicts. Under `override_format: argparse` the generation summary also carries the recorded `trainer_config` base at the top level ([trainer inputs](config.md#trainer-inputs)).
+
+The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-continuation) and its `state`: `running`, `published`, `failed` or `publication_failed`. A failed invocation does not replace the last-success pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
 
 `trials.csv` lists every trial with its sampled parameters and user attributes, including the `user_attr:observed:<name>` values that [`observe`](config.md#report-only-observations) recorded. Its `state` column reads as in `status --trials`, `INTERRUPTED` and `INFEASIBLE` included, and a rerun's `user_attr:phasesweep_rerun_of` names the trial it reran: an [interrupted trial](#interrupted-trials-rerun) or a failed grid cell a raised `n_trials` retries. A phase with [`repeats`](config.md#repeats) adds a `repeat_group` column. Each `winner.yaml` carries the selected trial's `observed` map, which is empty when the experiment declares none or the trial recorded none, and a `repeats` block that is `null` outside a repeats phase. Its `completion` block records the counts the ledger checks against the publication: `finished_trials` is the `COMPLETE`, `INFEASIBLE` and `FAIL` trials, and `completed_trials` is the `COMPLETE` trials alone, the same count `status` reports.
 
@@ -244,7 +244,7 @@ A phase whose recorded trials cannot be read is previewed as a fresh phase, with
 
 `status CONFIG --trials` prints a header line and one aligned plain-text table per phase instead, one row per trial: `trial`, `state`, `value`, `params`, `duration_s`, `repeat_group` for a [`repeats`](config.md#repeats) phase, `rerun_of` once the phase holds a [rerun](#interrupted-trials-rerun), one `observed:<name>` column per [`observe`](config.md#report-only-observations) name any trial recorded, a `reason` column when any trial has a recorded failure, interruption or infeasibility cause, and `winner`. A [`repeats`](config.md#repeats) phase follows its rows with one [summary per repeat group](#repeat-groups). `state` is the Optuna state, except that a COMPLETE trial that violated a constraint or the metric's `min`/`max` bounds reads `INFEASIBLE` and an interrupted trial reads `INTERRUPTED`. `rerun_of` names the trial a rerun reran. `duration_s` is the trainer subprocess's wall-clock runtime, and it reads `-` for a trial that never ran one; the `duration` on a trial's `TRIAL` line in `run.log` spans the whole trial, GPU queue and evidence extraction included. `winner` is `*` on the trials the published winner stands on: the one trial, or every member of the winning repeat group. It reflects the published generation named in the header line, so it is stale while a later run has not published, and it is blank when nothing validates as published. A table prints even when the publication is corrupt or unreadable, followed by the same error and exit status as plain `status`. For plots and the dashboard, point Optuna's own tools at the ledger as described in [Inspect the ledger with Optuna](#inspect-the-ledger-with-optuna).
 
-`show-winners CONFIG` prints the published generation under its own saved phase plan: a `# Historical experiment result` note when its config fingerprint differs from the current config; the [`# code revision:`](#output-layout) line; the producing `trainer_config` base under `override_format: argparse`; then per phase `=== <phase> ===`, the phase comment, any [repeat-group comments](#repeat-groups) and the validated `winner.yaml` bytes, or `=== <phase> === (no winner yet)`. A publication that does not validate or cannot be read prints no winners, and the command exits 1 with the verdict.
+`show-winners CONFIG` prints the published generation under its own saved phase plan: a `# generation:` line with its directory; a `# Historical experiment result` note when its config fingerprint differs from the current config; the [`# code revision:`](#output-layout) line; the producing `trainer_config` base under `override_format: argparse`; then per phase `=== <phase> ===`, the phase comment, any [repeat-group comments](#repeat-groups) and the validated `winner.yaml` bytes, or `=== <phase> === (no winner yet)`. A publication that does not validate or cannot be read prints no winners, and the command exits 1 with the verdict.
 
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root or ledger, so they are safe to run while a sweep is active.

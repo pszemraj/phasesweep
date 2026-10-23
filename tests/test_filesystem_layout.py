@@ -11,8 +11,9 @@ import pytest
 
 from phasesweep.engine.paths import (
     _experiment_dir,
+    _generation_summary_path,
+    _generation_winner_path,
     _phase_dir,
-    _summary_path,
 )
 from phasesweep.engine.run import experiment_status, run_experiment
 from phasesweep.runtime.files import (
@@ -23,6 +24,7 @@ from phasesweep.runtime.files import (
     private_atomic_write_text,
 )
 from tests.conftest import make_experiment, temporary_umask, write_constant_trainer
+from tests.ledger_fixtures import published_generation_id
 
 
 def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> None:
@@ -32,7 +34,13 @@ def test_experiment_artifact_paths_share_namespaced_layout(tmp_path: Path) -> No
 
     assert _experiment_dir(exp) == root
     assert _phase_dir(exp, "p") == root / "p"
-    assert _summary_path(exp) == root / "summary.yaml"
+    assert (
+        _generation_summary_path(exp, "generation") == root / "generations/generation/summary.yaml"
+    )
+    assert (
+        _generation_winner_path(exp, "generation", "p")
+        == root / "generations/generation/phases/p/winner.yaml"
+    )
 
 
 def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
@@ -61,9 +69,7 @@ def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
 def test_run_experiment_writes_summary_at_namespaced_path(
     tmp_path: Path, workdir_name: str, existing_workdir: bool
 ) -> None:
-    """End-to-end: a real run must write ``summary.yaml`` under the
-    ``<workdir>/<experiment>/`` tree, not directly under ``<workdir>``.
-    """
+    """A run publishes generation results without experiment-root or phase-root copies."""
     # Keep the test fixture's host lock directory outside this source repository.
     tmp_path = tmp_path / "repository"
     tmp_path.mkdir()
@@ -75,7 +81,12 @@ def test_run_experiment_writes_summary_at_namespaced_path(
     if existing_workdir:
         Path(exp.workdir).mkdir(exist_ok=True)
     run_experiment(exp)
-    assert (_summary_path(exp)).is_file()
+    generation_id = published_generation_id(exp)
+    assert generation_id is not None
+    assert _generation_summary_path(exp, generation_id).is_file()
+    assert _generation_winner_path(exp, generation_id, "p").is_file()
+    assert not (_experiment_dir(exp) / "summary.yaml").exists()
+    assert not (_phase_dir(exp, "p") / "winner.yaml").exists()
     # Nothing is written directly under the bare workdir.
     assert not (Path(exp.workdir).resolve() / "summary.yaml").exists()
     assert (_experiment_dir(exp) / ".gitignore").read_text() == "*\n"

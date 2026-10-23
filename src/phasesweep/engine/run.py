@@ -793,8 +793,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     Return experiment and ledger paths, current/published/represented generation
     ids, publication integrity, and phase counts and winner paths. MLflow configs
     also include delivery counts across generations. Winner paths use the captured
-    published generation. Fresh experiments have null generation ids; root-level
-    projections do not establish publication authority. Failed trial inspection is
+    published generation. Fresh experiments have null generation ids. Failed trial inspection is
     distinguished from confirmed absence by ``trial_data_available``.
 
     CLI callers escalate failed or inaccessible publications after rendering the

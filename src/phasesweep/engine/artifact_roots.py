@@ -60,7 +60,7 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 10
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 11
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -113,7 +113,6 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generations",
         "last_successful_generation.yaml",
         "study.journal",
-        "summary.yaml",
         *(phase.name.casefold() for phase in experiment.phases),
     }
     staging_prefix = f".{binding_name}."

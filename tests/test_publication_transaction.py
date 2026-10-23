@@ -339,7 +339,7 @@ def test_publication_sidecar_observes_the_pointer_commit_boundary(
     "fault",
     [
         pytest.param("atomic_create_text", id="immutable-record-write"),
-        pytest.param("_copy_yaml_projection", id="convenience-projection"),
+        pytest.param("current-pointer", id="current-pointer-write"),
     ],
 )
 def test_postcommit_write_failure_leaves_run_successful(
@@ -355,13 +355,17 @@ def test_postcommit_write_failure_leaves_run_successful(
     assert first_generation is not None
     record_write = fault == "atomic_create_text"
 
-    def fail_write(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated projection failure")
-
     if record_write:
         _lose_record_writes(monkeypatch)
     else:
-        monkeypatch.setattr(generation_ops, fault, fail_write)
+        original = generation_ops._write_generation_state
+
+        def fail_current_pointer(*args: object, **kwargs: object) -> None:
+            if kwargs.get("state") == "published" and kwargs.get("publish_current"):
+                raise OSError("simulated current-pointer failure")
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(generation_ops, "_write_generation_state", fail_current_pointer)
 
     with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(_topped_up(experiment))
@@ -380,9 +384,7 @@ def test_postcommit_write_failure_leaves_run_successful(
     else:
         assert _record_state(experiment, second_generation) == "published"
         assert any(
-            "failed to refresh the current-generation pointer or convenience projections"
-            in r.message
-            for r in caplog.records
+            "failed to refresh the current-generation pointer" in r.message for r in caplog.records
         )
         # The seeded second trial measures better, so the new publication selected its own winner.
         published_winner_path = _generation_winner_path(experiment, second_generation, "p")

@@ -21,7 +21,7 @@ from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _phase_dir, _winner_path
+from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
 from phasesweep.engine.study_policy import _validate_environment_cohort
@@ -34,6 +34,7 @@ from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
 from tests.conftest import make_experiment, write_constant_trainer
+from tests.ledger_fixtures import published_generation_id
 
 _AMBIENT = {
     "PATH": "/opt/first/bin:/usr/bin",
@@ -443,7 +444,9 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     run_experiment(experiment)
 
     identity = _identity(experiment)
-    winner_text = _winner_path(experiment, "p").read_text()
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    winner_text = _generation_winner_path(experiment, generation_id, "p").read_text()
     winner = yaml.safe_load(winner_text)
     assert winner["trainer_env_digest"] == identity.digest
     assert "trainer_inherit_env" not in winner

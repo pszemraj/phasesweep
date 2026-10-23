@@ -29,10 +29,9 @@ from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
     _generation_summary_path,
+    _generation_winner_path,
     _generations_dir,
     _last_successful_generation_path,
-    _summary_path,
-    _winner_path,
 )
 from phasesweep.engine.repeats import RepeatMember, spread
 from phasesweep.engine.run import TerminalReport, run_experiment
@@ -778,7 +777,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     tmp_path: Path,
     from_phase: str | None,
 ) -> None:
-    """A refused resume writes no generation and leaves every pointer and projection alone.
+    """A refused resume writes no generation and leaves pointers and published artifacts alone.
 
     Its terminal snapshot represents the refused run's own id, which names no
     generation, and reports the prior publication unchanged.
@@ -799,8 +798,8 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     protected_paths = [
         _generation_path(experiment),
         _last_successful_generation_path(experiment),
-        _summary_path(experiment),
-        *(_winner_path(experiment, phase.name) for phase in phases),
+        _generation_summary_path(experiment, first_generation),
+        *(_generation_winner_path(experiment, first_generation, phase.name) for phase in phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
     generations_before = set(_generations_dir(experiment).iterdir())

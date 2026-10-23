@@ -38,7 +38,7 @@ from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
+from phasesweep.engine.paths import _experiment_dir, _generation_dir, _trial_dir_for
 from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
@@ -699,6 +699,7 @@ def show_winners(config_path: Path) -> None:
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if validated is not None:
         phase_plan = [(phase.name, phase.comment) for phase in validated.phase_plan]
+        click.echo(f"# generation: {_generation_dir(experiment, validated.generation_id)}")
         stored_fingerprint = validated.summary.get("config_fingerprint")
         if isinstance(
             stored_fingerprint, str

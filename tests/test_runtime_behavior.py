@@ -30,9 +30,9 @@ from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _generation_path,
+    _generation_summary_path,
+    _generation_winner_path,
     _last_successful_generation_path,
-    _summary_path,
-    _winner_path,
 )
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.read import read_result, read_status
@@ -469,11 +469,13 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     phase_dir = workdir / "t" / "p"
     first_trial_dir = next(phase_dir.glob("trial_*"))
     assert (first_trial_dir / "r.json").is_file()
+    generation_id = winner.generation_id
+    assert generation_id is not None
     protected = {
         path: path.read_bytes()
         for path in (
-            _winner_path(first, "p"),
-            _summary_path(first),
+            _generation_winner_path(first, generation_id, "p"),
+            _generation_summary_path(first, generation_id),
             _last_successful_generation_path(first),
         )
     }
@@ -1706,7 +1708,9 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         )
 
     # (d) The published winner: the bool-valued trial won, and says so.
-    winner_doc = yaml.safe_load(_winner_path(exp, "pick").read_text())
+    generation_id = winners["pick"].generation_id
+    assert generation_id is not None
+    winner_doc = yaml.safe_load(_generation_winner_path(exp, generation_id, "pick").read_text())
     _assert_identical_scalar(
         live[winner_doc["trial_number"]], True, surface="live value of the winning trial"
     )
@@ -1723,7 +1727,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         _assert_identical_scalar(
             payload["x"], True, surface=f"inherited overrides_resolved.json[{number}]"
         )
-    child_doc = yaml.safe_load(_winner_path(exp, "child").read_text())
+    child_doc = yaml.safe_load(_generation_winner_path(exp, generation_id, "child").read_text())
     _assert_identical_scalar(
         child_doc["effective_overrides"]["x"], True, surface="child winner.yaml"
     )
