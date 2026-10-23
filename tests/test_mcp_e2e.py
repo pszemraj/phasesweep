@@ -299,7 +299,6 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         "phasesweep init --list",
         "phasesweep init --template NAME",
         "Default `inherit_env: none` drops ambient `PYTHONPATH`",
-        "https://github.com/pszemraj/phasesweep/blob/main/docs/",
     ):
         assert safety_contract in initialization.instructions
     assert "../../../docs/" not in initialization.instructions

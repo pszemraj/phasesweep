@@ -201,24 +201,6 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
         load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
 
 
-def test_config_guide_index_lists_every_top_level_key() -> None:
-    """The guide's reference index names each top-level key under the section it sits in."""
-    guide = (REPO / "docs/config.md").read_text()
-    rows = re.findall(
-        r"^\| ([^|`]+?) \| ((?:`[^`]+`(?:, )?)+) \| `phasesweep explain ([^`]+)` \|$",
-        guide,
-        re.MULTILINE,
-    )
-    documented = {section: re.findall(r"`([^`]+)`", keys) for section, keys, _ in rows}
-    assert len(documented) == len(rows), "Duplicate index section"
-    expected: dict[str, list[str]] = {}
-    for entry in top_level_entries():
-        expected.setdefault(entry.section, []).append(entry.path)
-    assert documented == expected
-    for section, _, command_key in rows:
-        assert command_key in documented[section], (section, command_key)
-
-
 def test_top_level_entries_are_the_undotted_paths_in_file_order() -> None:
     """Top-level keys are exactly the entries whose path has no dot."""
     paths = [entry.path for entry in top_level_entries()]

@@ -29,7 +29,7 @@ The command writes `catalog.yaml`, validates it, and provisions a fresh [private
 The scaffold records an absolute `state_dir` under `PHASESWEEP_HOME/mcp/<catalog-digest>`, or `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>` when unset; later environment changes do not move it. A missing absolute `PHASESWEEP_HOME` is created mode 0700; relative paths, symlink components and existing directories with another mode are refused. To place state elsewhere, edit `state_dir`. It must be writable by each participating shell, including sandboxes. Give the server and `phasesweep mcp call` the same catalog, and `recover-run` the same `--state-dir`; see [state ownership and format rules](mcp.md#fresh-mcp-state).
 
 > [!IMPORTANT]
-> Review the generated file against [the catalog fields and permission model](mcp.md#the-catalog) before connecting a client. The catalog decides which experiments an agent can see, which sampled values it can read, and which side effects it may request.
+> Review the generated file against [the catalog fields and permission model](mcp.md#the-catalog) before connecting a client.
 
 Validate the reviewed catalog with its absolute path:
 
@@ -41,7 +41,7 @@ This exercises server startup validation and provisions/probes its private state
 
 ### 3. Configure your client
 
-You manage the client files; PhaseSweep does not create, edit, inspect, or remove them. Follow your client's official documentation for its configuration file, scope, and restart behavior. Configure a stdio server with the absolute `phasesweep-mcp` executable and the absolute reviewed catalog path:
+Configure your client's stdio server with the absolute `phasesweep-mcp` executable and reviewed catalog path, following its documentation for configuration scope and restart behavior:
 
 ```text
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml

@@ -1,12 +1,12 @@
 # MCP operator guide
 
-The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
+The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
 The server runs over local stdio on Linux and macOS. Cancellation and recovery require the trial launcher's [native process identity reads](runtime.md): exact process start time, boot identity and host PID namespace. An unreadable or mismatched identity refuses signalling.
 
 ## The catalog
 
-The catalog maps opaque agent-visible IDs to operator-owned experiment YAML paths. Paths, commands, environments, storage URLs, and raw logs never appear in normal tool responses.
+The catalog maps opaque agent-visible IDs to operator-owned experiment YAML paths.
 
 ```yaml
 state_dir: /absolute/path/to/phasesweep-mcp-state
@@ -129,7 +129,7 @@ The loop ends when the run reaches a terminal state, requires recovery, or a cal
 
 ## Reading status responses
 
-Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned. When `trial_data_available` is false, `trials`, trial counters, `remaining_trials`, and `target_already_satisfied` are `null`; the configured `target_finished_trials` remains known. A confirmed empty study reports zero counts. `trials` counts each state under the same names as [`phasesweep status`](runtime.md#inspection-commands). `COMPLETE`, `INFEASIBLE` and `FAIL` are the finished trials that `finished_trials_total`, `finished_trials_before_run` and `finished_trials_this_run` count. [`INTERRUPTED`](runtime.md#interrupted-trials-rerun) trials never count toward `n_trials`; each reruns before any new draw, `WAITING` counts those scheduled reruns, and `remaining_trials` includes them. `attempts_this_run` counts every attempt the queried run's generation started, in any state, including any that a deadline, abort or shutdown stopped before their trainer launched; it is zero for a run that started none.
+Run status and results expose the run state, phase counts, winner presence, metric semantics, and sampled winner parameters under the [visibility policy](#security-boundary). When `trial_data_available` is false, `trials`, trial counters, `remaining_trials`, and `target_already_satisfied` are `null`; the configured `target_finished_trials` remains known. A confirmed empty study reports zero counts. `trials` counts each state under the same names as [`phasesweep status`](runtime.md#inspection-commands). `COMPLETE`, `INFEASIBLE` and `FAIL` are the finished trials that `finished_trials_total`, `finished_trials_before_run` and `finished_trials_this_run` count. [`INTERRUPTED`](runtime.md#interrupted-trials-rerun) trials never count toward `n_trials`; each reruns before any new draw, `WAITING` counts those scheduled reruns, and `remaining_trials` includes them. `attempts_this_run` counts every attempt the queried run's generation started, in any state, including any that a deadline, abort or shutdown stopped before their trainer launched; it is zero for a run that started none.
 
 For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. `catalog_status` describes the current catalog reload state separately from those frozen scientific facts. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
@@ -173,9 +173,7 @@ Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-ve
 
 `runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone; [PID namespaces](#pid-namespaces) explains the consequences and the heartbeat.
 
-Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
-
-Frozen scientific reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. Follow the [objective evidence contract](config.md#objective-evidence-constraints-and-gates) when interpreting them: all-false flags for JSON/log sources mean identities are not enforced, not failed, and their `evaluation_point` is always `n/a`. W&B and MLflow record selected history positions; only envelopes validate evaluation metadata. `expected_step_declared` and `expected_step_value_bound` remain false for native MLflow exact-step selection.
+Frozen scientific reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. Interpret those fields using the [objective evidence contract](config.md#objective-evidence-constraints-and-gates).
 
 For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Missing or null delivery information does not establish successful delivery. [Result delivery and recovery](mlflow.md#result-delivery-and-recovery) covers pending uploads and the operator's retry.
 
@@ -198,7 +196,7 @@ flowchart TD
     unsettled -->|"operator runs recover-run and confirms, or the next launch_run finds that no runner can still start"| removed["abandoned launch removed"]
 ```
 
-In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. A runner that exits without recording final status is named in the run's `failure.remediation`, which tells the agent to stop monitoring and request operator recovery; after recovery it retains that diagnosis and explains that process cleanup is settled while historical results remain unavailable. The next `launch_run` settles one case itself: it removes a launch whose runner provably exited or never started before saving its identity, and keeps its log as `<run-id>.log.recovered` under `state_dir/logs/`. Busy and capacity refusals direct these blockers to operator recovery; healthy blockers can be monitored with `await_run`. When runner liveness cannot be verified across PID namespaces, the refusal explains that uncertainty: it directs the operator to recover from a host shell once the runner's heartbeat is stale, and otherwise to inspect from there if durable progress stops. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
+In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. A runner that exits without recording final status is named in the run's `failure.remediation`, which tells the agent to stop monitoring and request operator recovery; after recovery it retains that diagnosis and explains that process cleanup is settled while historical results remain unavailable. The next `launch_run` settles one case itself: it removes a launch whose runner provably exited or never started before saving its identity, and keeps its log as `<run-id>.log.recovered` under `state_dir/logs/`. Busy and capacity refusals name the blockers and their remedy; follow [PID namespaces](#pid-namespaces) for an unobservable runner. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
 
 Operator recovery is deliberately a CLI operation, not an agent tool. Its counts distinguish stale RUNNING trials reaped from cleanup confirmations for trials that were already terminal, including attempts reconciled through the registry:
 
@@ -221,7 +219,7 @@ After that sandbox ends, run `recover-run` from a host shell outside any sandbox
 
 ## Security boundary
 
-The server does not accept configuration YAML, paths, commands, storage URLs, environment values, search ranges, sampler settings, gates, or safety waivers as tool input. Only the operator-authored catalog maps an experiment ID to a config. A catalog permission is not a grant to alter its config.
+Tools take catalog experiment IDs, run IDs and their documented control arguments; the operator-authored catalog maps experiments to configs. A catalog permission is not a grant to alter its config.
 
 No tool returns raw trainer logs, a failed trial's reason (which quotes the last line of its `stderr.log`), result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
 

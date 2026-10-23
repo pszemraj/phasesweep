@@ -51,8 +51,6 @@ phasesweep explain
 phasesweep explain 'phases[].sampler'
 ```
 
-The [inspection guide](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) covers inherited placeholders and preview limits.
-
 W&B and MLflow require their optional extras, `phasesweep[wandb]` and `phasesweep[mlflow]`; follow the [W&B setup](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence) or [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md). For noisy measurements, see [small-budget advice and repeats](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets).
 
 ## Scope and continuation
