@@ -246,6 +246,23 @@ A phase whose recorded trials cannot be read is previewed as a fresh phase, with
 
 `show-winners CONFIG` prints the published generation under its own saved phase plan: a `# generation:` line with its directory; a `# Historical experiment result` note when its config fingerprint differs from the current config; the [`# code revision:`](#output-layout) line; the producing `trainer_config` base under `override_format: argparse`; then per phase `=== <phase> ===`, the phase comment, any [repeat-group comments](#repeat-groups) and the validated `winner.yaml` bytes, or `=== <phase> === (no winner yet)`. A publication that does not validate or cannot be read prints no winners, and the command exits 1 with the verdict.
 
+For the packaged starter, the learning-rate winner contains this result (abridged; trial numbers depend on grid order):
+
+```yaml
+phase: learning_rate
+metric:
+  eval_loss: 0.3
+  goal: minimize
+trial_number: 0
+params:
+  optimizer.lr: 0.0003
+effective_overrides:
+  model.n_layers: 8
+  optimizer.lr: 0.0003
+```
+
+`params` contains what this phase sampled; `effective_overrides` also contains the inherited and fixed values applied to the trainer's base configuration. The full output includes the phase comment, completion state, objective evidence, observations, repeats, and confound checks. Use the printed generation directory to locate its `summary.yaml` and `phases/<phase>/winner.yaml` files; the [output layout](#output-layout) describes them.
+
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root or ledger, so they are safe to run while a sweep is active.
 

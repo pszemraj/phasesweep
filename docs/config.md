@@ -381,6 +381,8 @@ report_objective(
 
 ### W&B evidence
 
+Install the optional SDK with `pip install "phasesweep[wandb]"`.
+
 ```yaml
 metric:
   name: validation_loss
