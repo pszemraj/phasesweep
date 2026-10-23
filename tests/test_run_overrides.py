@@ -49,41 +49,19 @@ def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(
         phases=[phase_payload(n_trials=0)],
     )
     original = path.read_bytes()
-    received: list[Experiment] = []
     caller = tmp_path / "caller"
     caller.mkdir()
     monkeypatch.chdir(caller)
 
-    def capture(
-        experiment: Experiment, *, from_phase: str | None, dry_run: bool
-    ) -> dict[str, Winner]:
-        assert dry_run
-        assert from_phase is None
-        received.append(experiment)
-        return {}
-
-    monkeypatch.setattr(cli_module, "run_experiment", capture)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "run",
-            str(path),
-            "--dry-run",
-            "--set",
-            "workdir=derived",
-            "--set",
-            "experiment=smoke",
-            "--set",
-            "phases.0.n_trials=2",
-            "--set",
-            "phases.0.fixed_overrides={seed: 9, enabled: true}",
-            "--set",
-            "env.NOTE='a=b'",
-        ],
+    experiment = _derived(
+        path,
+        monkeypatch,
+        "workdir=derived",
+        "experiment=smoke",
+        "phases.0.n_trials=2",
+        "phases.0.fixed_overrides={seed: 9, enabled: true}",
+        "env.NOTE='a=b'",
     )
-
-    assert result.exit_code == 0, result.output
-    (experiment,) = received
     assert experiment.experiment == "smoke"
     assert Path(experiment.workdir) == tmp_path / "derived"
     assert experiment.execution.cwd == str(tmp_path)
@@ -276,6 +254,8 @@ def _derived(path: Path, monkeypatch: pytest.MonkeyPatch, *settings: str) -> Exp
     def capture(
         experiment: Experiment, *, from_phase: str | None, dry_run: bool
     ) -> dict[str, Winner]:
+        assert dry_run
+        assert from_phase is None
         received.append(experiment)
         return {}
 
