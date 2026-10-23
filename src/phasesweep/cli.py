@@ -38,12 +38,22 @@ from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.paths import _experiment_dir, _generation_dir, _trial_dir_for
+from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_config_snapshot_path,
+    _generation_dir,
+    _generation_winner_path,
+)
 from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
 )
-from phasesweep.engine.read import TrialTables, read_trial_tables
+from phasesweep.engine.read import (
+    TrialTables,
+    _current_pointer_generation_id,
+    _represented_winners,
+    read_trial_tables,
+)
 from phasesweep.engine.run import experiment_status, run_experiment
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
@@ -71,6 +81,19 @@ from phasesweep.runtime.shutdown import (
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
+CONFIG_OVERRIDES = click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
+        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
+        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
+        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
+        "Paths resolve against the config file's directory, just as in the config."
+    ),
+)
 
 # Exit taxonomy for the process-level boundary in main(). Commands that already
 # choose an exit status keep it; these are the codes the boundary itself uses.
@@ -409,25 +432,7 @@ def report_objective_cmd(
         "what a run would refuse over the recorded trials, without launching trials."
     ),
 )
-@click.option(
-    "--workdir",
-    type=click.Path(file_okay=False, path_type=Path),
-    help="Override the output workdir for this invocation (relative to the current directory).",
-)
-@click.option(
-    "--set",
-    "settings",
-    multiple=True,
-    metavar="KEY=VALUE",
-    help=(
-        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
-        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
-        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
-        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
-        "Inside [...], write \\] and \\\\ for a literal ] and \\. Missing mapping keys are "
-        "created; a validation error at one names the --set that created it."
-    ),
-)
+@CONFIG_OVERRIDES
 @click.option(
     "-v",
     "--verbose",
@@ -439,7 +444,6 @@ def run(
     config_path: Path,
     from_phase: str | None,
     dry_run: bool,
-    workdir: Path | None,
     settings: tuple[str, ...],
     verbose: bool,
 ) -> None:
@@ -451,7 +455,6 @@ def run(
     :param bool dry_run: Preview the trials each phase would launch, refuse most of what a
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
-    :param Path | None workdir: Invocation-relative output directory override.
     :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
@@ -464,7 +467,7 @@ def run(
     # codes remain structured throughout startup, including dry-run previews.
     # run_experiment() repeats this idempotently for direct library callers.
     install_signal_handlers()
-    config = _run_config(config_path, workdir=workdir, settings=settings)
+    config = _command_config(config_path, settings=settings)
     if from_phase is not None:
         valid = [p.name for p in config.phases]
         if from_phase not in valid:
@@ -482,11 +485,10 @@ def run(
         raise
 
 
-def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) -> Experiment:
+def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:
     """Apply invocation overrides and validate the derived configuration.
 
     :param Path path: Original config file, which remains unchanged.
-    :param Path | None workdir: Output directory relative to this invocation.
     :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values; the key
         syntax is :data:`phasesweep.config.run_overrides.SET_SYNTAX`.
     :raises click.BadParameter: An assignment cannot address a config value.
@@ -495,7 +497,7 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
     """
     from pydantic import ValidationError
 
-    if workdir is None and not settings:
+    if not settings:
         return _load_cli_config(path)
     try:
         payload = json_object(_load_yaml_mapping_from_text(path.read_text(encoding="utf-8"), path))
@@ -511,15 +513,30 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
             raise click.BadParameter(str(exc), param_hint="--set") from exc
         if new_key is not None:
             created.append(new_key)
-    if workdir is not None:
-        payload["workdir"] = str(workdir.expanduser().resolve())
     try:
         return Experiment.model_validate(
             payload, context={CONFIG_DIR_CONTEXT: path.resolve().parent}
         )
     except ValidationError as exc:
         detail = "\n".join([describe_validation_error(exc), *created_key_notes(exc, created)])
-        raise ConfigError(f"{path} (run overrides): {detail}") from exc
+        raise ConfigError(f"{path} (overrides): {detail}") from exc
+
+
+def _require_study(experiment: Experiment) -> None:
+    """Refuse an inspection of a study directory that does not exist."""
+    path = _experiment_dir(experiment)
+    if not path.is_dir():
+        raise click.ClickException(
+            f"No study directory at {path}. Use the same config and --set overrides as run."
+        )
+
+
+def _inspection_generation(experiment: Experiment) -> str | None:
+    """Inspect the latest claimed generation, falling back to the publication."""
+    generation_id = _current_pointer_generation_id(experiment)
+    if generation_id is not None and _generation_dir(experiment, generation_id).is_dir():
+        return generation_id
+    return None
 
 
 @cli.command(
@@ -528,9 +545,10 @@ def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) 
     short_help="Validate a config file.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
-def validate(config_path: Path) -> None:
+@CONFIG_OVERRIDES
+def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     """Validate config and read-only GPU inventory without launching work."""
-    config = _load_cli_config(config_path)
+    config = _command_config(config_path, settings=settings)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
@@ -677,80 +695,116 @@ def _render_reference_index() -> None:
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
-    help="Print published experiment winners.",
+    help="Print concise phase winners, including unpublished results from the latest run.",
     short_help="Print saved phase winners.",
 )
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
-def show_winners(config_path: Path) -> None:
-    """Print winners using their generation's recorded phase plan and validated bytes.
+@CONFIG_OVERRIDES
+def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
+    """Print concise winners from published or unfinished generation records.
 
     :param Path config_path: Config used to locate the publication and label drift as historical.
+    :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
-    experiment = _load_cli_config(config_path)
+    experiment = _command_config(config_path, settings=settings)
+    _require_study(experiment)
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    validated = publication.validated
-    phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
+    generation_id = _inspection_generation(experiment) or publication.generation_id
+    is_published = publication.validated is not None and generation_id == publication.generation_id
+    validated = publication.validated if is_published else None
+    producing = (
+        _load_cli_config(_generation_config_snapshot_path(experiment, generation_id))
+        if generation_id is not None and not is_published
+        else experiment
+    )
+    phase_names = (
+        [phase.name for phase in validated.phase_plan]
+        if validated is not None
+        else [phase.name for phase in producing.phases]
+    )
+    views = _represented_winners(experiment, publication, generation_id, phase_names)
+    winners = {view.phase: view for view in views}
+    phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in producing.phases]
+    if generation_id is not None:
+        label = "" if is_published else " (unpublished)"
+        click.echo(f"# generation: {_generation_dir(experiment, generation_id)}{label}")
     if validated is not None:
         phase_plan = [(phase.name, phase.comment) for phase in validated.phase_plan]
-        click.echo(f"# generation: {_generation_dir(experiment, validated.generation_id)}")
         stored_fingerprint = validated.summary.get("config_fingerprint")
         if isinstance(
             stored_fingerprint, str
         ) and stored_fingerprint != _experiment_semantic_fingerprint(experiment):
-            click.echo(
-                "# Historical experiment result: published generation "
-                f"{validated.generation_id} does not match the current config."
+            published_prefix = experiment.model_copy(
+                update={"phases": experiment.phases[: len(validated.phase_plan)]}
             )
-            click.echo("# Rendering the saved phase plan and annotations.")
+            if stored_fingerprint == _experiment_semantic_fingerprint(published_prefix):
+                click.echo("# Published phase results; appended phases have not run yet.")
+                phase_plan.extend(
+                    (phase.name, phase.comment)
+                    for phase in experiment.phases[len(validated.phase_plan) :]
+                )
+            else:
+                click.echo(
+                    "# Historical experiment result: published generation "
+                    f"{validated.generation_id} does not match the current config."
+                )
+                click.echo("# Rendering the saved phase plan and annotations.")
         revision = validated.code_revision
         if revision is None:
             click.echo("# code revision: unknown (not a git work tree or git unavailable)")
         else:
             dirty = " (dirty)" if revision["dirty"] else ""
             click.echo(f"# code revision: {revision['commit']}{dirty}")
-        if validated.argparse_trainer_config is not None:
-            click.echo("# Producing argparse trainer base, before phase overrides.")
-            click.echo(
-                yaml.safe_dump(
-                    {"trainer_config": validated.argparse_trainer_config}, sort_keys=False
-                )
-            )
+    trainer_base = (
+        validated.argparse_trainer_config
+        if validated is not None
+        else producing.trainer_config
+        if generation_id is not None and producing.override_format == "argparse"
+        else None
+    )
+    if trainer_base is not None:
+        click.echo("# Producing argparse trainer base, before phase overrides.")
+        click.echo(yaml.safe_dump({"trainer_config": trainer_base}, sort_keys=False))
 
     for name, comment in phase_plan:
-        winner = None if validated is None else validated.winners.get(name)
+        winner = winners.get(name)
         if winner is not None:
             click.echo(f"=== {name} ===")
             _render_phase_comment(comment, prefix="# ")
             if winner.repeats is not None:
                 repeats = winner.repeats
+                click.echo(f"# metric is the {repeats['reduce']} over {repeats['n']} repeats.")
+                click.echo(f"# trial_number {winner.trial_number} names the group's last member.")
                 click.echo(
-                    f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} "
-                    f"values of repeat key {repeats['key']!r}."
+                    "# Choose a checkpoint explicitly from repeats.members in the full record."
                 )
+            if generation_id is not None:
                 click.echo(
-                    f"# trial_number {winner.source.trial_number} names the group's last member."
+                    f"# full record: {_generation_winner_path(experiment, generation_id, name)}"
                 )
-                click.echo("# Choose a checkpoint explicitly from repeats.members.")
-                for member in repeats["members"]:
-                    trial_dir = _trial_dir_for(
-                        experiment,
-                        name,
-                        member["trial_number"],
-                        generation_id=member["generation_id"],
-                        attempt_id=member["attempt_id"],
-                    )
-                    click.echo(
-                        f"# {repeats['key']}={member['repeat']!r} "
-                        f"trial_number={member['trial_number']} trial_dir={trial_dir}"
-                    )
-            click.echo(winner.content.decode("utf-8"))
+            payload: JsonObject = {
+                "trial_number": winner.trial_number,
+                "metric": {
+                    str(validated.metric["name"])
+                    if validated is not None
+                    else producing.metric.name: winner.metric
+                },
+                "params": json_object(winner.params),
+                "effective_overrides": json_object(winner.effective_overrides),
+                "gates_passed": winner.gates_passed,
+                "incomplete": winner.incomplete,
+                "observed": dict(winner.observed),
+                "confound": None if winner.confound is None else json_object(winner.confound),
+                "repeats": None if winner.repeats is None else json_object(dict(winner.repeats)),
+            }
+            click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
         else:
             click.echo(f"=== {name} === (no winner yet)")
             _render_phase_comment(comment, prefix="# ")
@@ -830,13 +884,13 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     :param bool persisted: Whether the experiment keeps its trials in a ledger.
     :return str: The header line, then each phase's heading and table.
     """
-    if tables.published_generation_id is None:
+    represented = tables.represented_generation_id or tables.published_generation_id
+    if represented is None:
         marks = "no generation is published, so no winner is marked"
+    elif represented != tables.published_generation_id:
+        marks = f"winner (*) marks unpublished generation {represented}"
     else:
-        marks = (
-            f"winner (*) marks published generation {tables.published_generation_id}; "
-            "it does not follow a later run until that run publishes"
-        )
+        marks = f"winner (*) marks published generation {represented}"
     lines = [f"experiment {tables.experiment}: {marks}"]
     for table in tables.phases:
         if not table.available:
@@ -854,6 +908,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
             groups: list[JsonObject] = [
                 {
                     "group": group.group,
+                    "winner": "*" if group.winner else "",
                     "params": group.params,
                     "n/expected": f"{group.n}/{group.expected}",
                     "reduce": group.reduce,
@@ -871,7 +926,6 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
                 for name in observed_names:
                     row[f"observed:{name}"] = group.observed.get(name)
                     row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
-                row["winner"] = "*" if group.winner else ""
             lines.extend(
                 [
                     "",
@@ -893,6 +947,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     short_help="Print read-only run status.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@CONFIG_OVERRIDES
 @click.option(
     "--trials",
     "show_trials",
@@ -903,7 +958,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
         "instead of YAML."
     ),
 )
-def status(config_path: Path, show_trials: bool) -> None:
+def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> None:
     """Print read-only run status for ``config_path``.
 
     The payload is printed first and in full even when it reports a corrupt
@@ -914,14 +969,17 @@ def status(config_path: Path, show_trials: bool) -> None:
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
+    :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises PublicationAccessError: The reported publication cannot be
         validated as the current user.
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
-    config = _load_cli_config(config_path)
+    config = _command_config(config_path, settings=settings)
+    _require_study(config)
+    generation_id = _inspection_generation(config)
     if show_trials:
-        tables = read_trial_tables(config)
+        tables = read_trial_tables(config, generation_id=generation_id)
         click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
         raise_for_unusable_publication(
             tables.experiment,
@@ -930,7 +988,7 @@ def status(config_path: Path, show_trials: bool) -> None:
             _experiment_dir(config),
         )
         return
-    payload = experiment_status(config)
+    payload = experiment_status(config, generation_id=generation_id)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),
@@ -946,23 +1004,26 @@ def status(config_path: Path, show_trials: bool) -> None:
     help="Retry pending MLflow uploads without training or metric selection.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@CONFIG_OVERRIDES
 @click.option(
     "--generation",
     "generation_id",
     default=None,
     help="Retry only this generation's uploads instead of every pending one.",
 )
-def sync_tracking(config_path: Path, generation_id: str | None) -> None:
+def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
     """Retry retained native MLflow result projections.
 
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
+    :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises ClickException: The generation name or a delivery record is malformed.
     :raises PhaseSweepError: Nothing matching can be synchronized, or uploads remain pending.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
 
-    config = _load_cli_config(config_path)
+    config = _command_config(config_path, settings=settings)
+    _require_study(config)
     try:
         counts = sync(config, generation_id)
     except ValueError as exc:

@@ -10,9 +10,15 @@ import phasesweep.cli as cli_module
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment
 from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.engine.paths import (
+    _generation_dir,
+    _generation_path,
+    _last_successful_generation_path,
+)
 from phasesweep.engine.state import Winner
 from tests.conftest import invoke_cli_boundary
 from tests.experiments import phase_payload, write_experiment
+from tests.ledger_fixtures import materialize, published_generation_id
 
 
 @pytest.mark.parametrize(
@@ -63,10 +69,8 @@ def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(
             "run",
             str(path),
             "--dry-run",
-            "--workdir",
-            "derived",
             "--set",
-            "workdir=ignored",
+            "workdir=derived",
             "--set",
             "experiment=smoke",
             "--set",
@@ -81,7 +85,7 @@ def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(
     assert result.exit_code == 0, result.output
     (experiment,) = received
     assert experiment.experiment == "smoke"
-    assert Path(experiment.workdir) == caller / "derived"
+    assert Path(experiment.workdir) == tmp_path / "derived"
     assert experiment.execution.cwd == str(tmp_path)
     assert experiment.phases[0].n_trials == 2
     assert experiment.phases[0].fixed_overrides == {"seed": 9, "enabled": True}
@@ -105,8 +109,8 @@ def test_derived_run_writes_its_overrides_to_the_config_snapshot(tmp_path: Path)
         [
             "run",
             str(path),
-            "--workdir",
-            str(tmp_path / "derived"),
+            "--set",
+            "workdir=derived",
             "--set",
             "experiment=smoke",
             "--set",
@@ -124,6 +128,46 @@ def test_derived_run_writes_its_overrides_to_the_config_snapshot(tmp_path: Path)
     assert recorded["workdir"] == str(tmp_path / "derived")
     assert path.read_bytes() == original
     assert not (tmp_path / "original").exists()
+
+    for command in ("validate", "status", "show-winners"):
+        inspected = CliRunner().invoke(
+            cli, [command, str(path), "--set", "workdir=derived", "--set", "experiment=smoke"]
+        )
+        assert inspected.exit_code == 0, inspected.output
+        assert "smoke" in inspected.output or "trial_number: 0" in inspected.output
+
+
+@pytest.mark.parametrize("command", ["status", "show-winners", "sync-tracking"])
+def test_study_reads_name_the_missing_directory(tmp_path: Path, command: str) -> None:
+    """Study reads refuse a missing output tree instead of inventing empty results."""
+    path = write_experiment(tmp_path / "sweep.yaml", workdir="absent")
+    result = CliRunner().invoke(cli, [command, str(path)])
+    assert result.exit_code == 1
+    assert "No study directory at" in result.output
+    assert str(tmp_path / "absent" / "t") in result.output
+
+
+def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:
+    """Appending a phase keeps finished phase results current and names the pending phase."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    path = materialized.config_path
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["phases"].append({"name": "next", "inherits": ["p"], "n_trials": 1})
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    result = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "appended phases have not run yet" in result.output
+    assert "Historical experiment result" not in result.output
+    assert "=== next === (no winner yet)" in result.output
+    _last_successful_generation_path(materialized.experiment).unlink()
+    status = CliRunner().invoke(cli, ["status", str(path)])
+    assert status.exit_code == 0, status.output
+    payload = yaml.safe_load(status.output)
+    assert payload["is_published"] is False
+    assert payload["phases"][0]["winner"].endswith("/phases/p/winner.yaml")
+    table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
+    assert table.exit_code == 0, table.output
+    assert "marks unpublished generation" in table.output
 
 
 @pytest.mark.parametrize(
@@ -149,6 +193,63 @@ def test_run_override_errors_refuse_before_launch(
     assert result == 2
     assert message in capsys.readouterr().err
     assert not (tmp_path / "original").exists()
+
+
+def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
+    """Finished phase results remain visible before the run publishes."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment, config_path = materialized.experiment, materialized.config_path
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    generation_path = _generation_dir(experiment, generation_id)
+    _generation_path(experiment).write_text("generation_id: interrupted\n")
+
+    published = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+
+    assert published.exit_code == 0
+    assert "trial_number: 0" in published.output
+    assert f"# generation: {generation_path}" in published.output
+    assert (generation_path / "summary.yaml").is_file()
+    assert (generation_path / "phases/p/winner.yaml").is_file()
+
+    _last_successful_generation_path(experiment).unlink()
+    _generation_path(experiment).write_text(f"generation_id: {generation_id}\n")
+    unpublished = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+
+    assert unpublished.exit_code == 0
+    assert "trial_number: 0" in unpublished.output
+    assert "(unpublished)" in unpublished.output
+    assert "ranked_trials:" not in unpublished.output
+
+
+def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:
+    """Config edits cannot relabel an unfinished generation's objective, phases or base."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    _last_successful_generation_path(materialized.experiment).unlink()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "show-winners",
+            str(materialized.config_path),
+            "--set",
+            "metric.name=renamed_objective",
+            "--set",
+            "phases.0.name=renamed_phase",
+            "--set",
+            "phases.0.comment=Changed annotation",
+            "--set",
+            "trainer_config={changed_base: 17}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "(unpublished)" in result.output
+    assert "metric:\n  objective: 0.5" in result.output
+    assert "=== p ===" in result.output
+    assert "trainer_config: {}" in result.output
+    for edited in ("renamed_objective", "renamed_phase", "Changed annotation", "changed_base"):
+        assert edited not in result.output
 
 
 def _two_phase_config(tmp_path: Path) -> Path:

@@ -705,6 +705,7 @@ class TrialTables:
     #: Validation diagnostic beside a ``failed`` or ``permission_denied`` integrity.
     publication_error: str | None
     phases: tuple[TrialTable, ...]
+    represented_generation_id: str | None = None
 
 
 def _recorded_number(value: object) -> float | None:
@@ -899,14 +900,15 @@ def _repeat_group_views(
     return tuple(views)
 
 
-def read_trial_tables(experiment: Experiment) -> TrialTables:
+def read_trial_tables(experiment: Experiment, *, generation_id: str | None = None) -> TrialTables:
     """Read configured phases' trial tables without creating storage or writing files.
 
-    Resolve publication once before capturing trials; winner marks identify that
-    publication, excluding uncommitted reruns. Absent studies and in-memory ledgers
+    Resolve publication once before capturing trials; winner marks identify the
+    requested generation, or that publication by default. Absent studies and in-memory ledgers
     have no rows. Unreadable phases are reported unavailable.
 
     :param Experiment experiment: Parsed experiment config whose phases are read.
+    :param str | None generation_id: Generation whose winners are marked, defaulting to publication.
     :raises ArtifactRootConflictError: The artifact root cannot be read or is bound to another ledger.
     :raises StudySchemaMismatchError: A phase's study is populated under an unsupported schema.
     :return TrialTables: One table per configured phase, in declaration order.
@@ -914,12 +916,17 @@ def read_trial_tables(experiment: Experiment) -> TrialTables:
     ledger = validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = _published_generation_id(publication)
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
+    represented_generation_id = generation_id or published_generation_id
+    if publication.state not in {"ok", "absent"}:
+        represented_generation_id = None
     winners = {
         view.phase: view
         for view in _represented_winners(
             experiment,
             publication,
-            published_generation_id,
+            represented_generation_id,
             [phase.name for phase in experiment.phases],
         )
     }
@@ -939,4 +946,5 @@ def read_trial_tables(experiment: Experiment) -> TrialTables:
         publication_integrity=publication.state,
         publication_error=publication.error,
         phases=tuple(tables),
+        represented_generation_id=represented_generation_id,
     )

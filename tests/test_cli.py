@@ -36,9 +36,8 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
-    _generation_path,
-    _last_successful_generation_path,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
@@ -376,7 +375,7 @@ def test_help_registers_commands_and_options() -> None:
 
     winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
     assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
-    assert "Print published experiment winners." in winners_help
+    assert "including unpublished results from the latest run" in winners_help
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
@@ -960,36 +959,10 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert metric_line in result_with.output
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
 
-    # Without a winner (different workdir → no winner.yaml): comment is still surfaced.
+    # A missing study directory is a path error.
     result_without = runner.invoke(cli_main, ["show-winners", str(make_cfg(tmp_path / "empty_wd"))])
-    assert result_without.exit_code == 0
-    assert "(no winner yet)" in result_without.output
-    assert comment_line in result_without.output
-
-
-def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
-    """Winner display locates the validated generation even when the current pointer differs."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    experiment, config_path = materialized.experiment, materialized.config_path
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    generation_path = _generation_dir(experiment, generation_id)
-    _generation_path(experiment).write_text("generation_id: interrupted\n")
-
-    published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
-
-    assert published.exit_code == 0
-    assert "trial_number: 0" in published.output
-    assert f"# generation: {generation_path}" in published.output
-    assert (generation_path / "summary.yaml").is_file()
-    assert (generation_path / "phases/p/winner.yaml").is_file()
-
-    _last_successful_generation_path(experiment).unlink()
-    unpublished = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
-
-    assert unpublished.exit_code == 0
-    assert "(no winner yet)" in unpublished.output
-    assert "# generation:" not in unpublished.output
+    assert result_without.exit_code == 1
+    assert "No study directory at" in result_without.output
 
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
@@ -1302,6 +1275,8 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
     config_path = tmp_path / "experiment.yaml"
     write_experiment_config(config_path, experiment)
 
+    _experiment_dir(experiment).mkdir(parents=True)
+
     result = subprocess.run(
         [sys.executable, "-m", "phasesweep", "status", str(config_path)],
         capture_output=True,
@@ -1454,15 +1429,15 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A healthy publication and a never-published tree both stay exit 0."""
+    """Absent studies fail clearly while a healthy publication remains readable."""
     fresh_config = tmp_path / "fresh.yaml"
     experiment = make_experiment(workdir=tmp_path / "runs")
     write_experiment_config(fresh_config, experiment)
 
-    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 1
     fresh = capsys.readouterr()
-    assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
-    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
+    assert "No study directory at" in fresh.err
+    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 1
     capsys.readouterr()
 
     config_path = materialize("current-journal", tmp_path, mode="tree").config_path
@@ -1941,6 +1916,7 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
 ) -> None:
     """A config with nothing to sync is refused as `phasesweep:` plus a fix line, not Click's `Error:`."""
     config = write_experiment(tmp_path / "exp.yaml")
+    _experiment_dir(load_experiment(config)).mkdir(parents=True)
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 
@@ -1961,10 +1937,10 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
         "phasesweep.tracking.publication.sync_tracking",
         lambda *_args: {"pending": 2, "delivered": 1},
     )
+    config = write_experiment(tmp_path / "exp.yaml")
+    _experiment_dir(load_experiment(config)).mkdir(parents=True)
 
-    status = invoke_cli_boundary(
-        ["sync-tracking", str(write_experiment(tmp_path / "exp.yaml"))], monkeypatch
-    )
+    status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 
     captured = capsys.readouterr()
     assert status == 1

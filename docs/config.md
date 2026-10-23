@@ -4,7 +4,7 @@ A PhaseSweep configuration is one operator-authored YAML document for one ordere
 
 Run `phasesweep validate <config>` before launching. The loader rejects duplicate YAML mapping keys and unsupported fields before it creates run artifacts.
 
-Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which `phasesweep explain` prints key by key; the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with a [template](#templates) written by `phasesweep init`, or with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Because relative paths resolve against the YAML file's directory, the same file writes the same artifact tree from any directory, through the CLI or MCP; an `Experiment` built in Python has no file and resolves them against the process working directory. `--workdir` takes precedence over a `--set workdir=...` assignment, and no other CLI execution flag overrides a config key. MCP's separate catalog paths are documented in the [MCP operator guide](mcp.md#the-catalog).
+Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which `phasesweep explain` prints key by key; the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with a [template](#templates) written by `phasesweep init`, or with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Because relative paths resolve against the YAML file's directory, the same file writes the same artifact tree from any directory, through the CLI or MCP; an `Experiment` built in Python has no file and resolves them against the process working directory. Every CLI command that takes a config accepts the same `--set KEY=VALUE` overrides, with the same path resolution. Use the same overrides to run and inspect a study. MCP's separate catalog paths are documented in the [MCP operator guide](mcp.md#the-catalog).
 
 ## Reference index
 
@@ -142,7 +142,7 @@ Derive a smoke run without copying or editing its YAML:
 
 ```bash
 phasesweep init --template argparse -o smoke-source.yaml
-phasesweep run smoke-source.yaml --dry-run --workdir /tmp/phasesweep-smoke \
+phasesweep run smoke-source.yaml --dry-run --set workdir=/tmp/phasesweep-smoke \
   --set experiment=smoke --set phases.0.n_trials=1
 ```
 
@@ -161,7 +161,7 @@ Inside `[...]`, write `\]` for a literal `]` and `\\` for a literal `\`. On a li
 
 A mapping key that the config does not have is created, so an absent optional block can be filled in and `trainer_config` takes any new key. If validation then fails at or below a key an assignment created, which is what a misspelled schema key produces, the error adds a note naming that `--set` argument's key and the key it created. A block written as `null` is not absent: replace it whole, as in `--set 'phases[NAME].repeats={key: seed, values: [0, 1]}'`.
 
-`--workdir PATH` resolves against the invoking shell's directory. Paths inside `--set` retain the YAML file's directory as their base. Changing `workdir` alone does not redirect an explicit journal in `storage`; use `--set storage=auto` or a fresh journal path for a derived run. Semantic edits cannot reuse a populated study; choose a fresh experiment/output namespace. Apply `--dry-run` to the same overrides before launching.
+Paths inside `--set` retain the YAML file's directory as their base, including `--set workdir=...`. Pass the same assignments to `validate`, `run`, `status`, `show-winners` and `sync-tracking`. A read that finds no study directory fails and names the path it searched. Changing `workdir` alone does not redirect an explicit journal in `storage`; use `--set storage=auto` or a fresh journal path for a derived run. Semantic edits cannot reuse a populated study; choose a fresh experiment/output namespace. Apply `--dry-run` to the same overrides before launching.
 
 ## Search spaces and samplers
 

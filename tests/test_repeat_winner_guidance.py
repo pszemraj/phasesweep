@@ -1,4 +1,4 @@
-"""Explain repeated winners beside the CLI's unchanged publication YAML."""
+"""Concise repeated winners expose ranking and point to complete checkpoint evidence."""
 
 import csv
 from pathlib import Path
@@ -45,7 +45,7 @@ def _publish_winners(
     return experiment, config_path, contents
 
 
-def _assert_member_directories(experiment: Experiment, saved: bytes, guidance: str) -> None:
+def _assert_member_directories(experiment: Experiment, saved: bytes) -> None:
     repeats = yaml.safe_load(saved)["repeats"]
     with (_phase_dir(experiment, "repeated") / "trials.csv").open(encoding="utf-8") as handle:
         rows = {int(row["number"]): row for row in csv.DictReader(handle)}
@@ -57,10 +57,38 @@ def _assert_member_directories(experiment: Experiment, saved: bytes, guidance: s
         assert row["param:seed"] == str(member["repeat"])
         assert member["generation_id"] in directory.name
         assert member["attempt_id"] in directory.name
-        assert (
-            f"# seed={member['repeat']!r} trial_number={member['trial_number']} "
-            f"trial_dir={directory}"
-        ) in guidance.splitlines()
+
+
+def _assert_full_record(experiment: Experiment, phase: str, saved: bytes, output: str) -> None:
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    path = _generation_winner_path(experiment, generation_id, phase)
+    assert f"# full record: {path}" in output.splitlines()
+    assert path.read_bytes() == saved
+
+
+def _assert_repeat_summary(saved: bytes, output: str) -> None:
+    full = yaml.safe_load(saved)
+    compact = yaml.safe_load(output)
+    repeats = full["repeats"]
+    assert compact["trial_number"] == full["trial_number"]
+    assert compact["metric"] == {"objective": full["metric"]["objective"]}
+    assert compact["params"] == full["params"]
+    assert compact["effective_overrides"] == full["effective_overrides"]
+    assert compact["repeats"] == {
+        "reduce": repeats["reduce"],
+        **repeats["spread"],
+        "member_trials": [member["trial_number"] for member in repeats["members"]],
+    }
+    assert (
+        f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} repeats."
+    ) in output.splitlines()
+    assert (
+        f"# trial_number {full['trial_number']} names the group's last member."
+    ) in output.splitlines()
+    assert (
+        "# Choose a checkpoint explicitly from repeats.members in the full record."
+    ) in output.splitlines()
 
 
 @pytest.mark.parametrize("reducer", ["mean", "median"])
@@ -73,23 +101,16 @@ def test_show_winners_explains_repeat_metric_and_checkpoint_choice(
 
     assert result.exit_code == 0, result.output
     repeated = result.output.split("=== repeated ===\n", 1)[1].split("=== scalar ===", 1)[0]
-    saved = contents["repeated"].decode("utf-8")
-    guidance, rendered = repeated.split(saved, 1)
-    assert f"# metric is the {reducer} over 3 values of repeat key 'seed'." in guidance
-    assert "# trial_number 2 names the group's last member." in guidance
-    assert "# Choose a checkpoint explicitly from repeats.members." in guidance
-    _assert_member_directories(experiment, contents["repeated"], guidance)
-    assert all(line.startswith("# ") for line in guidance.splitlines())
-    assert rendered == "\n"
-    assert yaml.safe_load(repeated) == yaml.safe_load(saved)
+    _assert_repeat_summary(contents["repeated"], repeated)
+    _assert_member_directories(experiment, contents["repeated"])
+    _assert_full_record(experiment, "repeated", contents["repeated"], repeated)
     scalar = result.output.split("=== scalar ===\n", 1)[1]
-    assert scalar == contents["scalar"].decode("utf-8") + "\n"
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    assert (
-        _generation_winner_path(experiment, generation_id, "repeated").read_bytes()
-        == contents["repeated"]
-    )
+    scalar_full = yaml.safe_load(contents["scalar"])
+    scalar_compact = yaml.safe_load(scalar)
+    assert scalar_compact["trial_number"] == scalar_full["trial_number"]
+    assert scalar_compact["metric"] == {"objective": scalar_full["metric"]["objective"]}
+    assert scalar_compact["repeats"] is None
+    _assert_full_record(experiment, "scalar", contents["scalar"], scalar)
 
 
 def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path: Path) -> None:
@@ -97,6 +118,7 @@ def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path
     changed = experiment.model_dump(mode="json")
     changed["phases"][0]["repeats"] = {"key": "fold", "values": [1, 2], "reduce": "mean"}
     changed["phases"][0]["n_trials"] = 2
+    changed["metric"]["name"] = "changed_objective"
     config_path.write_text(yaml.safe_dump(changed), encoding="utf-8")
 
     result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
@@ -104,12 +126,10 @@ def test_show_winners_uses_published_repeat_metadata_after_config_drift(tmp_path
     assert result.exit_code == 0, result.output
     assert "# Historical experiment result:" in result.output
     repeated = result.output.split("=== repeated ===\n", 1)[1].split("=== scalar ===", 1)[0]
-    guidance = repeated.split(contents["repeated"].decode("utf-8"), 1)[0]
-    assert "# metric is the median over 3 values of repeat key 'seed'." in guidance
-    assert "# trial_number 2 names the group's last member." in guidance
-    assert "# Choose a checkpoint explicitly from repeats.members." in guidance
-    _assert_member_directories(experiment, contents["repeated"], guidance)
-    # Trial directories sit under tmp_path, whose name can contain either word.
-    described = "\n".join(line.split(" trial_dir=", 1)[0] for line in guidance.splitlines())
-    assert "fold" not in described
-    assert "mean" not in described
+    _assert_repeat_summary(contents["repeated"], repeated)
+    _assert_member_directories(experiment, contents["repeated"])
+    _assert_full_record(experiment, "repeated", contents["repeated"], repeated)
+    compact = yaml.safe_load(repeated)
+    assert compact["repeats"]["reduce"] == "median"
+    assert compact["repeats"]["n"] == 3
+    assert "changed_objective" not in compact["metric"]

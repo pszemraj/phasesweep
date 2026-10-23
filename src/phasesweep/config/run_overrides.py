@@ -1,4 +1,4 @@
-"""Apply ``run --set KEY=VALUE`` assignments to a raw config mapping before validation."""
+"""Apply CLI ``--set KEY=VALUE`` assignments to a raw config mapping before validation."""
 
 from __future__ import annotations
 

@@ -141,7 +141,7 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     )
 
     status = invoke_cli_boundary(
-        ["run", "--workdir", str(tmp_path / "alt"), "--from-phase", "child", str(config)],
+        ["run", "--set", f"workdir={tmp_path / 'alt'}", "--from-phase", "child", str(config)],
         monkeypatch,
     )
 

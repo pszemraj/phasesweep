@@ -44,6 +44,7 @@ from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import ensure_artifact_dir, require_supported_runtime
+from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
@@ -758,23 +759,23 @@ def _warn_flagged_inheritance(phase_name: str, inherited: Mapping[str, Winner]) 
 def _cli_phase_payloads(
     experiment: Experiment,
     phases: list[dict[str, Any]],
-    published_generation_id: str | None,
+    represented_generation_id: str | None,
 ) -> list[dict[str, Any]]:
     """Rebuild ``read_status``'s path-free phase payloads into the CLI's view.
 
-    Use the unpinned published generation for winner paths. Replace MCP's ``phase``,
+    Use the represented generation for winner paths. Replace MCP's ``phase``,
     ``winner_present`` and ``running_attempts`` with CLI ``name`` and ``winner`` fields.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param list[dict[str, Any]] phases: Path-free phase payloads from ``read_status``.
-    :param str | None published_generation_id: Already-resolved last-success generation id.
+    :param str | None represented_generation_id: Already-resolved generation whose winners appear.
     :return list[dict[str, Any]]: Path-bearing phase payloads for the CLI status view.
     """
     cli_phases: list[dict[str, Any]] = []
     for phase in phases:
         winner_path = (
-            path_ops._generation_winner_path(experiment, published_generation_id, phase["phase"])
-            if phase["winner_present"] and published_generation_id is not None
+            path_ops._generation_winner_path(experiment, represented_generation_id, phase["phase"])
+            if phase["winner_present"] and represented_generation_id is not None
             else None
         )
         cli_phases.append(
@@ -787,22 +788,23 @@ def _cli_phase_payloads(
     return cli_phases
 
 
-def experiment_status(experiment: Experiment) -> dict[str, Any]:
+def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:
     """Collect CLI status from one read-only generation snapshot.
 
     Return experiment and ledger paths, current/published/represented generation
     ids, publication integrity, and phase counts and winner paths. MLflow configs
     also include delivery counts across generations. Winner paths use the captured
-    published generation. Fresh experiments have null generation ids. Failed trial inspection is
+    represented generation. Fresh experiments have null generation ids. Failed trial inspection is
     distinguished from confirmed absence by ``trial_data_available``.
 
     CLI callers escalate failed or inaccessible publications after rendering the
     payload. Metric and result-context fields remain in the MCP read view.
 
     :param Experiment experiment: Parsed experiment config to inspect.
+    :param str | None generation_id: Generation to inspect, defaulting to the publication.
     :return dict: Status payload with generation identity and per-phase results.
     """
-    status = read_status(experiment)
+    status = read_status(experiment, generation_id=generation_id)
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
     payload: dict[str, object] = {
@@ -821,11 +823,13 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
             else {}
         ),
         "phases": _cli_phase_payloads(
-            experiment, status["phases"], status["published_generation_id"]
+            experiment,
+            status["phases"],
+            status["represented_generation_id"] if integrity in {"ok", "absent"} else None,
         ),
     }
     if experiment.mlflow is not None:
         from phasesweep.tracking.publication import delivery_status
 
         payload["tracking_delivery"] = delivery_status(experiment)
-    return payload
+    return json_object(payload)

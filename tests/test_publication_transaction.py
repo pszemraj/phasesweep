@@ -994,7 +994,8 @@ def test_published_reads_consume_the_bytes_validation_read(
     write_experiment_config(config_path, experiment)
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
-    assert validated_bytes.decode("utf-8") in result.output
+    rendered = yaml.safe_load(result.output.split("=== p ===\n", 1)[1])
+    assert rendered["metric"][experiment.metric.name] == validated_metric
 
 
 # --------------------------------------------------------------------------
