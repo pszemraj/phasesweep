@@ -259,6 +259,7 @@ def _warn_dropped_cuda_visibility(
     phase_name: str,
     env: dict[str, str],
     gpu_id: int | str | None,
+    gpu_lease_fds: tuple[int, ...],
 ) -> None:
     """Warn once per phase when an unleased trainer loses the parent's GPU restriction.
 
@@ -268,9 +269,10 @@ def _warn_dropped_cuda_visibility(
     :param Experiment experiment: Experiment supplying the inheritance contract.
     :param str phase_name: Phase used for the warning identity.
     :param dict[str, str] env: Trainer environment after GPU assignment.
-    :param int | str | None gpu_id: Assigned device token, or None when no device was leased.
+    :param int | str | None gpu_id: Assigned CUDA visibility token, or None for unbound visibility.
+    :param tuple[int, ...] gpu_lease_fds: Host-lock descriptors, including MPS leases without CUDA visibility.
     """
-    if gpu_id is not None or "CUDA_VISIBLE_DEVICES" in env:
+    if gpu_id is not None or gpu_lease_fds or "CUDA_VISIBLE_DEVICES" in env:
         return
     ambient = os.environ.get("CUDA_VISIBLE_DEVICES")
     if ambient is None:
@@ -595,7 +597,11 @@ def launch_trial(
         log.debug("[%s/trial_%d] GPU assigned: %s", phase_name, trial_id, gpu_id)
 
     _warn_dropped_cuda_visibility(
-        experiment=experiment, phase_name=phase_name, env=env, gpu_id=gpu_id
+        experiment=experiment,
+        phase_name=phase_name,
+        env=env,
+        gpu_id=gpu_id,
+        gpu_lease_fds=gpu_lease_fds,
     )
     _record_trainer_environment(experiment, environment_identity, env, workdir)
 

@@ -39,7 +39,6 @@ from phasesweep.engine.paths import (
     _generation_dir,
     _generation_path,
     _last_successful_generation_path,
-    _winner_path,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
@@ -438,7 +437,7 @@ def test_recover_run_surfaces_host_error_suggestion(
 ) -> None:
     """An unusable host must report the remediation, not only the diagnosis.
 
-    ``require_linux_mcp_host`` carries its fix in ``CatalogError.suggestion``;
+    ``require_supported_mcp_host`` carries its fix in ``CatalogError.suggestion``;
     rendering only the message would leave the operator with a run stuck in
     ``recovery_required`` and nothing to act on.
     """
@@ -450,7 +449,7 @@ def test_recover_run_surfaces_host_error_suggestion(
             suggestion="mount /proc with process stat access",
         )
 
-    monkeypatch.setattr("phasesweep.cli.require_linux_mcp_host", refuse_host)
+    monkeypatch.setattr("phasesweep.cli.require_supported_mcp_host", refuse_host)
 
     result = recover_run_cli(tmp_path / "state", "missing")
 
@@ -969,24 +968,28 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
-    """Root cache files must not outrank immutable generation results."""
+    """Winner display locates the validated generation even when the current pointer differs."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
-    _winner_path(experiment, "p").write_text("trial_number: 99\n")
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    generation_path = _generation_dir(experiment, generation_id)
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
     published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
 
     assert published.exit_code == 0
     assert "trial_number: 0" in published.output
-    assert "trial_number: 99" not in published.output
+    assert f"# generation: {generation_path}" in published.output
+    assert (generation_path / "summary.yaml").is_file()
+    assert (generation_path / "phases/p/winner.yaml").is_file()
 
     _last_successful_generation_path(experiment).unlink()
     unpublished = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
 
     assert unpublished.exit_code == 0
     assert "(no winner yet)" in unpublished.output
-    assert "trial_number: 99" not in unpublished.output
+    assert "# generation:" not in unpublished.output
 
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:

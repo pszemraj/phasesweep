@@ -8,6 +8,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,35 @@ def test_default_locks_contend_across_state_and_cache_environments(
             pytest.fail("a different launch environment bypassed the held lock")
     assert not (first / "locks").exists()
     assert not (second / "locks").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="uses macOS root-owned system temp aliases")
+@pytest.mark.parametrize("alias", ["var", "tmp"])
+def test_macos_system_temp_aliases_share_physical_host_locks(monkeypatch, alias):
+    """System temp aliases preserve lock contention without accepting user symlinks."""
+    parent = Path("/private/var/tmp" if alias == "var" else "/private/tmp")
+    with tempfile.TemporaryDirectory(prefix="phasesweep-lock-alias-", dir=parent) as directory:
+        physical = Path(directory)
+        aliased = Path("/").joinpath(*physical.parts[2:])
+        monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(aliased))
+        assert runtime_files.lock_dir() == physical
+        held = runtime_files.try_lock_file(runtime_files.lock_dir() / "shared.lock")
+        assert held is not None
+        with held:
+            monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(physical))
+            assert runtime_files.try_lock_file(runtime_files.lock_dir() / "shared.lock") is None
+        released = runtime_files.try_lock_file(runtime_files.lock_dir() / "shared.lock")
+        assert released is not None
+        runtime_files.unlock_file(released)
+
+        (physical / "linked").symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(aliased / "linked"))
+        with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe path component"):
+            runtime_files.lock_dir()
+        monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(aliased))
+        monkeypatch.setattr(runtime_files, "sys", SimpleNamespace(platform="linux"))
+        with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe path component"):
+            runtime_files.lock_dir()
 
 
 @pytest.mark.parametrize("account_home", [None, "", "relative"])
@@ -725,6 +755,9 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
 
 
 @pytest.mark.signals_own_pid
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="counts descriptors through Linux /proc/self/fd"
+)
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

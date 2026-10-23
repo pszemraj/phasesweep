@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -46,6 +47,7 @@ def deterministic_gpu_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests that exercise inventory discovery replace this probe or restore the
     real one.
     """
+    monkeypatch.setattr("phasesweep.config.models.sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(
         "phasesweep.runtime.gpu._detect_gpu_inventory",
         lambda: ([], dict(_TEST_UUID_MAP)),

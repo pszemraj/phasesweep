@@ -6,6 +6,7 @@ import posixpath
 import re
 import shlex
 import string
+import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
@@ -604,11 +605,10 @@ class Phase(_Frozen):
     gpu_policy: GpuPolicy = Field(
         default="single_per_trial",
         description=(
-            "CUDA visibility policy for trial subprocesses. single_per_trial leases "
-            "one visible CUDA token per trial. whole_node requires n_jobs=1 plus an "
-            "explicit gpu_ids or gpu_devices list and leases every configured token "
-            "for the trial. none disables phasesweep CUDA isolation and GPU host "
-            "locks."
+            "GPU leasing policy for trial subprocesses. single_per_trial leases "
+            "one discovered or configured device per trial. whole_node requires n_jobs=1 "
+            "and an explicit CUDA device list on Linux; macOS discovers its MPS device. "
+            "none disables phasesweep GPU host locks and CUDA isolation."
         ),
     )
     gpu_ids: list[ConfigInt] | None = Field(
@@ -680,7 +680,7 @@ class Phase(_Frozen):
 
         :raises ValueError: If ``gpu_ids`` and ``gpu_devices`` are both set, if
             ``gpu_policy='whole_node'`` is combined with ``n_jobs != 1``, lacks an
-            explicit device list, or repeats a device token, or if
+            explicit device list on Linux, or repeats a device token, or if
             ``gpu_policy='none'`` is combined with a device list or with
             ``n_jobs > 1`` without ``allow_no_gpu_isolation``.
         :return Phase: Self, unchanged.
@@ -690,9 +690,14 @@ class Phase(_Frozen):
         if self.gpu_policy == "whole_node" and self.n_jobs != 1:
             raise ValueError(
                 "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
-                "the full configured CUDA-visible device set."
+                "the full configured CUDA device set or discovered MPS device."
             )
-        if self.gpu_policy == "whole_node" and self.gpu_ids is None and self.gpu_devices is None:
+        if (
+            self.gpu_policy == "whole_node"
+            and self.gpu_ids is None
+            and self.gpu_devices is None
+            and sys.platform != "darwin"
+        ):
             raise ValueError(
                 "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
                 "list because its device count defines the trainer's world size."

@@ -18,7 +18,7 @@ from phasesweep.config.models import Observation, Phase
 from phasesweep.config.search import Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _generation_winner_path, _winner_path
+from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import _winner_view, read_result
 from phasesweep.engine.repeats import repeat_axis
@@ -26,7 +26,7 @@ from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
 from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
-from tests.ledger_fixtures import golden_publication, reseal_winner
+from tests.ledger_fixtures import golden_publication, published_generation_id, reseal_winner
 
 
 def _log_observation(name: str, pattern: str) -> Observation:
@@ -83,12 +83,16 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
     # The best metric wins whatever was observed, and its own values are published.
     assert winners["p"].trial_number == 0
     assert winners["p"].observed == {"mem": 3.0}
-    assert yaml.safe_load(_winner_path(experiment, "p").read_text())["observed"] == {"mem": 3.0}
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    assert yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())[
+        "observed"
+    ] == {"mem": 3.0}
     _, (published,) = read_result(experiment, phase_names=["p"])
     assert published is not None
     assert published.observed == {"mem": 3.0}
 
-    with (_winner_path(experiment, "p").parent / "trials.csv").open(newline="") as handle:
+    with (_phase_dir(experiment, "p") / "trials.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["user_attr:observed:mem"] for row in rows] == ["3.0", "", "5.0"]
     assert "user_attr:observed:absent" not in rows[0]
@@ -143,7 +147,14 @@ def test_winner_without_observations_publishes_an_empty_map(tmp_path: Path) -> N
     winners = run_experiment(experiment)
 
     assert winners["p"].observed == {}
-    assert yaml.safe_load(_winner_path(experiment, "p").read_text())["observed"] == {}
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    assert (
+        yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())[
+            "observed"
+        ]
+        == {}
+    )
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,7 @@ Run GPU validation, dry runs, and training from a shell with [host GPU access](.
 
 ## CLI smoke sweep
 
-For a short GPU integration check, run the two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. The wrapper passes its `trainer_config` keys to the upstream trainer and requires `run_dir` for checkpoint output. The config leases CUDA device `0`, runs 10 training batches per trial, sets trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`:
+For a short GPU integration check, run the two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. The wrapper passes its `trainer_config` keys to the upstream trainer and requires `run_dir` for checkpoint output. The config leases one discovered GPU, runs 10 training batches per trial, sets trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`. The same commands use CUDA on Linux or MPS on Apple silicon macOS; the trainer chooses the device, and PhaseSweep holds its host lease:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/gpu_smoke.yaml
@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. For a bounded comparison with seed noise and persistent resume, use [Learning rates over seeds](#learning-rates-over-seeds). The full config below uses an Optuna journal file for persistent status and reuse.
+The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.accelerated == true` evidence gate, which verifies that final-checkpoint evaluation used CUDA or MPS; a CPU fallback cannot win. `result.json` retains the exact `runtime.device_type`. macOS discovers its MPS pool and refuses explicit CUDA device lists. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. For a bounded comparison with seed noise and persistent resume, use [Learning rates over seeds](#learning-rates-over-seeds). The full config below uses an Optuna journal file for persistent status and reuse.
 
 Use the full three-phase example only when you want the longer experiment:
 

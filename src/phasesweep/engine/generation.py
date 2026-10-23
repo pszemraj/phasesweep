@@ -256,16 +256,6 @@ def _write_generation_state(
         artifact_io._write_yaml_atomic(path_ops._generation_path(experiment), payload)
 
 
-def _copy_yaml_projection(source: Path, destination: Path) -> None:
-    """Atomically project one immutable YAML artifact to its convenience path.
-
-    :param Path source: Immutable generation-scoped YAML file to read.
-    :param Path destination: Convenience projection path to atomically overwrite.
-    """
-    payload = yaml.safe_load(source.read_text())
-    artifact_io._write_yaml_atomic(destination, payload)
-
-
 def _validate_publishable_summary(
     *,
     summary_path: Path,
@@ -377,7 +367,7 @@ def _publish_generation(
     Validate immutable artifacts, save any missing prior publication record and prepare
     the runner hook before atomically replacing ``last_successful_generation.yaml``.
     This write commits publication; earlier failures retain the old pointer and record
-    ``publication_failed`` best-effort. Later sidecar, lifecycle, pointer and projection
+    ``publication_failed`` best-effort. Later sidecar, lifecycle and current-pointer
     updates are best-effort with logged failures; readers use immutable artifacts.
 
     Shutdown before this window cancels publication. Signals absorbed inside it are
@@ -449,8 +439,8 @@ def _publish_generation(
             "the published result is unaffected",
         )
 
-        def _refresh_published_pointer_and_projections() -> None:
-            """Drive the current pointer and refresh convenience projections."""
+        def _refresh_published_pointer() -> None:
+            """Drive the current pointer to the committed publication."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
@@ -459,24 +449,10 @@ def _publish_generation(
                 publish_current=True,
                 write_record=False,
             )
-            for phase in experiment.phases:
-                source_winner = path_ops._generation_winner_path(
-                    experiment, generation_id, phase.name
-                )
-                projected_winner = path_ops._winner_path(experiment, phase.name)
-                if source_winner.is_file():
-                    _copy_yaml_projection(source_winner, projected_winner)
-                else:
-                    projected_winner.unlink(missing_ok=True)
-
-            _copy_yaml_projection(
-                path_ops._generation_summary_path(experiment, generation_id),
-                path_ops._summary_path(experiment),
-            )
 
         _log_on_failure(
-            _refresh_published_pointer_and_projections,
-            "failed to refresh the current-generation pointer or convenience projections "
+            _refresh_published_pointer,
+            "failed to refresh the current-generation pointer "
             "after publication; the published result is unaffected",
         )
 

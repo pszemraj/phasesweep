@@ -27,11 +27,6 @@ def _phase_dir(experiment: Experiment, phase_name: str) -> Path:
     return _experiment_dir(experiment) / phase_name
 
 
-def _summary_path(experiment: Experiment) -> Path:
-    """Return the experiment-root summary.yaml convenience copy path."""
-    return _experiment_dir(experiment) / "summary.yaml"
-
-
 def _run_log_path(experiment: Experiment) -> Path:
     """Return the experiment-root run.log path."""
     return _experiment_dir(experiment) / "run.log"
@@ -114,8 +109,3 @@ def _generation_config_snapshot_path(experiment: Experiment, generation_id: str)
 def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
     """Return one generation's shareable reproducibility record path."""
     return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
-
-
-def _winner_path(experiment: Experiment, phase_name: str) -> Path:
-    """Return the phase-root winner.yaml convenience copy path."""
-    return _phase_dir(experiment, phase_name) / WINNER_FILENAME

@@ -1,6 +1,6 @@
 # Runtime behavior
 
-PhaseSweep runs one ordered Experiment on a Linux host for a trusted researcher or team. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. Every trial's process identity records the PID namespace its numbers belong to, so `/proc` must be the procfs of the orchestrator's own PID namespace, with that namespace's PID 1 readable; the trial launcher refuses to start a trial otherwise. On a host whose `/proc` hides other users' processes (`hidepid`), exempt the operator through its `gid=` option. GPUs are optional; the core CLI can run CPU-only work.
+PhaseSweep runs one ordered Experiment on a Linux or macOS host for a trusted researcher or team. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. Every process identity records its boot, start time and PID namespace. Linux requires `/proc` to be the procfs of the orchestrator's own PID namespace, with that namespace's PID 1 readable; on hosts using `hidepid`, exempt the operator through its `gid=` option. macOS reads exact microsecond start times through native `libproc`, the boot UUID through `kern.bootsessionuuid`, and records the host PID space as `darwin`. Unreadable identities never authorize a stale-process signal. GPUs are optional; the core CLI can run CPU-only work.
 
 ## Output layout
 
@@ -14,7 +14,6 @@ demo/
   study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
-  summary.yaml
   attempts/
   generations/
     <generation-id>/
@@ -24,7 +23,6 @@ demo/
       summary.yaml
       phases/<phase>/winner.yaml
   <phase>/
-    winner.yaml
     trials.csv
     trial_00000__generation_<id>__attempt_<id>/
       attempt_lifecycle.json
@@ -38,7 +36,9 @@ demo/
       result.json               # when produced by the trainer
 ```
 
-The root `summary.yaml` and per-phase `winner.yaml` files are convenience projections. Each summary phase entry retains its winner's `observed`, `repeats` and `confound` blocks, so the reduced metric can be read beside its spread, observations and comparison verdicts. Under `override_format: argparse` it also carries the recorded `trainer_config` base at the top level ([trainer inputs](config.md#trainer-inputs)). The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-continuation) and its `state`: `running`, `published`, `failed` or `publication_failed`. `last_successful_generation.yaml` points to the immutable generation that authoritatively represents the latest successful result. A failed invocation does not replace that pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
+`last_successful_generation.yaml` points to the immutable generation that represents the latest successful result. Read its `generation_id` to locate `generations/<generation-id>/summary.yaml` and `generations/<generation-id>/phases/<phase>/winner.yaml`, or use `phasesweep show-winners CONFIG`, which validates the publication and prints that generation's directory. Each summary phase entry retains its winner's `observed`, `repeats` and `confound` blocks, so the reduced metric can be read beside its spread, observations and comparison verdicts. Under `override_format: argparse` the generation summary also carries the recorded `trainer_config` base at the top level ([trainer inputs](config.md#trainer-inputs)).
+
+The root `generation.yaml` names the latest [generation](#timeouts-cleanup-and-continuation) and its `state`: `running`, `published`, `failed` or `publication_failed`. A failed invocation does not replace the last-success pointer. Each generation embeds its carried winners; result reads do not reopen older publications. Selection and resume verify retained trial evidence.
 
 `trials.csv` lists every trial with its sampled parameters and user attributes, including the `user_attr:observed:<name>` values that [`observe`](config.md#report-only-observations) recorded. Its `state` column reads as in `status --trials`, `INTERRUPTED` and `INFEASIBLE` included, and a rerun's `user_attr:phasesweep_rerun_of` names the trial it reran: an [interrupted trial](#interrupted-trials-rerun) or a failed grid cell a raised `n_trials` retries. A phase with [`repeats`](config.md#repeats) adds a `repeat_group` column. Each `winner.yaml` carries the selected trial's `observed` map, which is empty when the experiment declares none or the trial recorded none, and a `repeats` block that is `null` outside a repeats phase. Its `completion` block records the counts the ledger checks against the publication: `finished_trials` is the `COMPLETE`, `INFEASIBLE` and `FAIL` trials, and `completed_trials` is the `COMPLETE` trials alone, the same count `status` reports.
 
@@ -137,7 +137,7 @@ MLflow delivery retries use the experiment lock and validate their saved target 
 
 A run, `sync-tracking` or confirmed `recover-run` takes the same-host experiment lock without waiting, and is refused with the lock file's path while another process holds it. The lock covers the artifact root and, with persistent storage, the experiment's ledger studies, so two configs sharing either cannot run at once; an MCP launch for an experiment with a live run is refused as busy before it spawns. Only PhaseSweep writes the live ledger; external Optuna writers do not participate in its lock.
 
-Host locks default to `.cache/phasesweep/locks` beneath the effective user's OS account home, independently of `HOME` and `XDG_CACHE_HOME`. `PHASESWEEP_LOCK_DIR` selects an existing absolute directory provisioned by the operator; PhaseSweep validates its path, ownership, and permissions without creating or changing it. The directory must be owner-only (mode `0700`) or an administrator-owned shared directory with mode `03770` and a group the user belongs to. When the OS refuses access to the lock directory or a lock file, as in a sandbox that cannot reach the account home's `.cache`, the refusal names the path and the OS error and tells the operator to point `PHASESWEEP_LOCK_DIR` at one existing writable directory shared by every shell, MCP server, and sandbox that launches work on the host, or to run on the host. Separate lock directories bypass coordination, and PhaseSweep never prunes lock files, so do not remove them to clear a permission failure.
+Host locks default to `.cache/phasesweep/locks` beneath the effective user's OS account home, independently of `HOME` and `XDG_CACHE_HOME`. `PHASESWEEP_LOCK_DIR` selects an existing absolute directory provisioned by the operator; PhaseSweep validates its path, ownership, and permissions without creating or changing it. On macOS, the root-owned `/var` and `/tmp` aliases resolve to their physical paths before validation; other symlink components are refused. The directory must be owner-only (mode `0700`) or an administrator-owned shared directory with mode `03770` and a group the user belongs to. When the OS refuses access to the lock directory or a lock file, as in a sandbox that cannot reach the account home's `.cache`, the refusal names the path and the OS error and tells the operator to point `PHASESWEEP_LOCK_DIR` at one existing writable directory shared by every shell, MCP server, and sandbox that launches work on the host, or to run on the host. Separate lock directories bypass coordination, and PhaseSweep never prunes lock files, so do not remove them to clear a permission failure.
 
 ### Inspect the ledger with Optuna
 
@@ -188,11 +188,13 @@ W&B and MLflow workers run with the composed trainer environment, except that ev
 
 ## GPU isolation
 
-By default, `gpu_policy: single_per_trial` leases one visible CUDA device per parallel trial. Discovery uses explicit phase `gpu_ids`/`gpu_devices`, then top-level `env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value, then local inventory. Visibility tokens may be numeric, GPU UUIDs, or MIG tokens. Discovery reads ambient visibility even when `inherit_env` excludes it. The policy rebinds a leased device token, or preserves an empty/`-1` CUDA-disable sentinel, in each trainer. The lease controls visibility and same-host locking, not GPU memory allocation. Leases rotate through the pool: a trial takes the first free device whose host lock it can get, skipping devices another process holds, and a released device rejoins the back of the free list, so no trial is tied to a device. A trial queued for a lease has already drawn its parameters and created its attempt directory. A leased numeric token sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` over any configured or inherited value, while a GPU- or MIG- token keeps a configured or inherited `CUDA_DEVICE_ORDER` and otherwise sets `PCI_BUS_ID`. When `allow_no_gpu_isolation` admits an ambient `CUDA_VISIBLE_DEVICES` whose tokens `nvidia-smi` cannot resolve, trainers get `CUDA_VISIBLE_DEVICES` set to an empty string.
+By default, `gpu_policy: single_per_trial` leases one device per parallel trial. On Apple silicon macOS, discovery returns one `mps` device without importing a trainer framework. Its `gpu_mps.lock` serializes trials and separate sweeps until the trainer process group exits, without assigning `CUDA_VISIBLE_DEVICES`. PhaseSweep does not select the trainer's device or verify framework MPS availability. macOS refuses explicit `gpu_ids` and `gpu_devices`; Intel Macs discover no GPU. `gpu_policy: none` opts out of the lease.
+
+On Linux, discovery uses explicit phase `gpu_ids`/`gpu_devices`, then top-level `env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value, then local inventory. Visibility tokens may be numeric, GPU UUIDs, or MIG tokens. Discovery reads ambient visibility even when `inherit_env` excludes it. The policy rebinds a leased device token, or preserves an empty/`-1` CUDA-disable sentinel, in each trainer. The lease controls visibility and same-host locking, not GPU memory allocation. Leases rotate through the pool: a trial takes the first free device whose host lock it can get, skipping devices another process holds, and a released device rejoins the back of the free list, so no trial is tied to a device. A trial queued for a lease has already drawn its parameters and created its attempt directory. A leased numeric token sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` over any configured or inherited value, while a GPU- or MIG- token keeps a configured or inherited `CUDA_DEVICE_ORDER` and otherwise sets `PCI_BUS_ID`. When `allow_no_gpu_isolation` admits an ambient `CUDA_VISIBLE_DEVICES` whose tokens `nvidia-smi` cannot resolve, trainers get `CUDA_VISIBLE_DEVICES` set to an empty string.
 
 `validate` checks GPU inventory for every phase; `run --dry-run` checks only phases that would launch trials. These read-only checks may invoke `nvidia-smi`, refuse explicit device IDs absent from the local inventory, and warn when workers exceed available devices. They acquire no GPU leases. A sandbox can hide the GPU inventory even when the host has CUDA devices; run GPU validation, dry runs, and training from a host shell with GPU access in that case. Missing-inventory refusals include this remedy, and for intentional CPU-only work they name `gpu_policy: none` with CUDA disabled in the trainer environment. Launch applies the same inventory checks. During a run, a trial blocked by local slots or another orchestrator's host locks logs one `Waiting for GPU lease` line at INFO level; retries do not repeat it.
 
-`gpu_policy: whole_node` requires `n_jobs: 1` and a unique explicit device list. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be combined with an explicit device list; parallel use requires the explicit `allow_no_gpu_isolation: true` acknowledgement. For CPU-only parallel work, make that acknowledgement deliberately rather than relying on failed device detection.
+`gpu_policy: whole_node` requires `n_jobs: 1` and, on Linux, a unique explicit device list; on macOS it leases the discovered pool. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be combined with an explicit device list; parallel use requires the explicit `allow_no_gpu_isolation: true` acknowledgement. For CPU-only parallel work, make that acknowledgement deliberately rather than relying on failed device detection.
 
 `gpu_policy: none` assigns no binding. Include ambient visibility in the trainer inheritance contract or set it in `env` if it must be retained.
 
@@ -242,7 +244,24 @@ A phase whose recorded trials cannot be read is previewed as a fresh phase, with
 
 `status CONFIG --trials` prints a header line and one aligned plain-text table per phase instead, one row per trial: `trial`, `state`, `value`, `params`, `duration_s`, `repeat_group` for a [`repeats`](config.md#repeats) phase, `rerun_of` once the phase holds a [rerun](#interrupted-trials-rerun), one `observed:<name>` column per [`observe`](config.md#report-only-observations) name any trial recorded, a `reason` column when any trial has a recorded failure, interruption or infeasibility cause, and `winner`. A [`repeats`](config.md#repeats) phase follows its rows with one [summary per repeat group](#repeat-groups). `state` is the Optuna state, except that a COMPLETE trial that violated a constraint or the metric's `min`/`max` bounds reads `INFEASIBLE` and an interrupted trial reads `INTERRUPTED`. `rerun_of` names the trial a rerun reran. `duration_s` is the trainer subprocess's wall-clock runtime, and it reads `-` for a trial that never ran one; the `duration` on a trial's `TRIAL` line in `run.log` spans the whole trial, GPU queue and evidence extraction included. `winner` is `*` on the trials the published winner stands on: the one trial, or every member of the winning repeat group. It reflects the published generation named in the header line, so it is stale while a later run has not published, and it is blank when nothing validates as published. A table prints even when the publication is corrupt or unreadable, followed by the same error and exit status as plain `status`. For plots and the dashboard, point Optuna's own tools at the ledger as described in [Inspect the ledger with Optuna](#inspect-the-ledger-with-optuna).
 
-`show-winners CONFIG` prints the published generation under its own saved phase plan: a `# Historical experiment result` note when its config fingerprint differs from the current config; the [`# code revision:`](#output-layout) line; the producing `trainer_config` base under `override_format: argparse`; then per phase `=== <phase> ===`, the phase comment, any [repeat-group comments](#repeat-groups) and the validated `winner.yaml` bytes, or `=== <phase> === (no winner yet)`. A publication that does not validate or cannot be read prints no winners, and the command exits 1 with the verdict.
+`show-winners CONFIG` prints the published generation under its own saved phase plan: a `# generation:` line with its directory; a `# Historical experiment result` note when its config fingerprint differs from the current config; the [`# code revision:`](#output-layout) line; the producing `trainer_config` base under `override_format: argparse`; then per phase `=== <phase> ===`, the phase comment, any [repeat-group comments](#repeat-groups) and the validated `winner.yaml` bytes, or `=== <phase> === (no winner yet)`. A publication that does not validate or cannot be read prints no winners, and the command exits 1 with the verdict.
+
+For the packaged starter, the learning-rate winner contains this result (abridged; trial numbers depend on grid order):
+
+```yaml
+phase: learning_rate
+metric:
+  eval_loss: 0.3
+  goal: minimize
+trial_number: 0
+params:
+  optimizer.lr: 0.0003
+effective_overrides:
+  model.n_layers: 8
+  optimizer.lr: 0.0003
+```
+
+`params` contains what this phase sampled; `effective_overrides` also contains the inherited and fixed values applied to the trainer's base configuration. The full output includes the phase comment, completion state, objective evidence, observations, repeats, and confound checks. Use the printed generation directory to locate its `summary.yaml` and `phases/<phase>/winner.yaml` files; the [output layout](#output-layout) describes them.
 
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root or ledger, so they are safe to run while a sweep is active.

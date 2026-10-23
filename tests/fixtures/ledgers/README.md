@@ -14,7 +14,7 @@ It is consumed through `tests/ledger_fixtures.py`: `tests/test_ledger_read_paths
 
 | Fixture | Backend | Modes | Binding schema | tree verdict | ledger-only verdict |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 9 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 11 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, which is the case no binding can answer and the ledger format scan must.
 

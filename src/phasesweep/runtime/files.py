@@ -20,9 +20,9 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
-LINUX_RUNTIME_ERROR = (
-    "phasesweep runs only on Linux, and this host reports {platform!r}. It relies on /proc "
-    "process identities, fcntl.flock host locks and POSIX process groups."
+SUPPORTED_RUNTIME_ERROR = (
+    "phasesweep runs on Linux and macOS, and this host reports {platform!r}. It requires "
+    "kernel process identities, fcntl.flock host locks and POSIX process groups."
 )
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
 _LOCK_ACCESS_GUIDANCE = (
@@ -98,18 +98,18 @@ class _LockPolicy:
     file_mode: int
 
 
-def require_linux_runtime() -> None:
-    """Raise a clear error when execution is attempted on a non-Linux host.
+def require_supported_runtime() -> None:
+    """Require Linux or macOS process and filesystem primitives.
 
-    This is the only platform check. Everything below it may use Linux-only
+    This is the filesystem platform check. Everything below it may use POSIX
     primitives (``fcntl``, ``os.killpg``, ``os.O_NOFOLLOW``, ``signal.pthread_sigmask``)
     without a per-call fallback; ``fcntl`` is imported after the gate so that
     importing this module still works elsewhere.
 
-    :raises PlatformCapabilityError: The host is not Linux.
+    :raises PlatformCapabilityError: The host is neither Linux nor macOS.
     """
-    if not sys.platform.startswith("linux"):
-        raise PlatformCapabilityError(LINUX_RUNTIME_ERROR.format(platform=sys.platform))
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        raise PlatformCapabilityError(SUPPORTED_RUNTIME_ERROR.format(platform=sys.platform))
 
 
 def xdg_home(variable: str, fallback: Path) -> Path:
@@ -154,13 +154,15 @@ def lock_dir() -> Path:
     account home, independent of environment-based state/cache placement.
     ``PHASESWEEP_LOCK_DIR`` selects an existing operator-provisioned directory
     and is never created or chmodded by phasesweep.
+    macOS's root-owned ``/var`` and ``/tmp`` aliases resolve before the
+    no-symlink walk; operator-controlled path components still cannot be links.
 
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
         ownership-and-mode check; the OS account has no absolute home; or
         the default lock directory fails the owner-only checks; or the OS refuses access.
-    :raises PlatformCapabilityError: The host is not Linux.
+    :raises PlatformCapabilityError: The host is neither Linux nor macOS.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -171,6 +173,10 @@ def lock_dir() -> Path:
                 action=OperatorAction.FIX_CONFIG,
             )
         try:
+            if sys.platform == "darwin" and len(path.parts) > 1 and path.parts[1] in {"var", "tmp"}:
+                system_root = Path(path.anchor, path.parts[1])
+                if system_root.is_symlink() and system_root.lstat().st_uid == 0:
+                    path = system_root.resolve(strict=True).joinpath(*path.parts[2:])
             _lock_policy(path)
         except OSError as exc:
             raise UnsafeLockPathError(
@@ -179,7 +185,7 @@ def lock_dir() -> Path:
             ) from exc
         return path
 
-    require_linux_runtime()
+    require_supported_runtime()
     import pwd
 
     # Shells and services for one account must contend even when HOME or XDG
@@ -284,7 +290,7 @@ def open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises PlatformCapabilityError: The host is not Linux.
+    :raises PlatformCapabilityError: The host is neither Linux nor macOS.
     :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks, or the OS refuses access.
@@ -310,12 +316,12 @@ def _open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises PlatformCapabilityError: The host is not Linux.
+    :raises PlatformCapabilityError: The host is neither Linux nor macOS.
     :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks.
     """
-    require_linux_runtime()
+    require_supported_runtime()
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
@@ -392,7 +398,7 @@ def try_flock(handle: IO[str]) -> bool:
     :param IO[str] handle: File descriptor whose inode all contenders open.
     :return bool: Whether the lock was acquired; the caller owns the handle.
     """
-    require_linux_runtime()
+    require_supported_runtime()
     import fcntl
 
     try:

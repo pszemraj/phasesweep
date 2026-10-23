@@ -1174,7 +1174,7 @@ class PhaseSweepMCP:
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
         :raises ConfigChangedError: If the cataloged config changed after this call's reread.
         :raises RuntimeError: If no unused run id could be minted, or the spawned
-            runner has no Linux ``/proc`` start time to make cancellation PID-reuse safe.
+            runner has no kernel process start time to make cancellation PID-reuse safe.
         """
         args: JsonObject = {"experiment_id": experiment_id, "from_phase": from_phase}
         resolved: JsonObject = {}
@@ -1784,12 +1784,12 @@ class PhaseSweepMCP:
                 handle = replace(handle, boot_id=boot_id)
                 if handle.pid_starttime is None:
                     raise RuntimeError(
-                        "spawned runner has no Linux /proc start time; refused launch because "
+                        "spawned runner has no process start time; refused launch because "
                         "later cancellation could not distinguish PID reuse"
                     )
                 if handle.boot_id is None:
                     raise RuntimeError(
-                        "spawned runner has no Linux boot id; refused launch because later "
+                        "spawned runner has no boot id; refused launch because later "
                         "cancellation could not distinguish PID reuse after reboot"
                     )
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)

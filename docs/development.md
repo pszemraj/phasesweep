@@ -43,7 +43,7 @@ pre-commit install
 | Hook | Stage | Runs on |
 | --- | --- | --- |
 | `ruff check --fix`, `ruff format` | pre-commit | changed Python files |
-| `pathlint` | pre-commit | changed `src/` and `tests/` Python files |
+| `pathlint check` | pre-commit | changed `src/` and `tests/` Python files |
 | module size | pre-commit | changed `src/` and `tests/` Python files |
 | typing escapes | pre-commit | lines the commit adds to `src/` and `tests/` Python files |
 | review-provenance tags | pre-commit | changed `src/` and `tests/` Python files |
@@ -83,7 +83,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
+Both lanes run on Linux and macOS. Tests whose subject requires real Linux procfs or PID namespaces skip on macOS; synthetic procfs tests retain their Linux provider explicitly, and macOS native identity and MPS lease tests cover the host paths. Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
 
 To inspect the cost of a qualification run:
 

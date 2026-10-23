@@ -20,7 +20,7 @@ from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _check_artifact_root_binding,
 )
-from phasesweep.engine.artifacts import _load_winner, _save_winner
+from phasesweep.engine.artifacts import _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
@@ -47,11 +47,9 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
     _phase_dir,
-    _summary_path,
-    _winner_path,
 )
 from phasesweep.engine.read import read_result, read_status
-from phasesweep.engine.resume import _published_for_resume, _reject_bound_descendant_topups
+from phasesweep.engine.resume import _reject_bound_descendant_topups
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -241,11 +239,16 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
         storage=f"journal:///{tmp_path / 'studies.journal'}",
     )
     run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
     protected_paths = [
-        _summary_path(experiment),
+        _generation_summary_path(experiment, generation_id),
         _generation_path(experiment),
         _last_successful_generation_path(experiment),
-        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+        *(
+            _generation_winner_path(experiment, generation_id, phase.name)
+            for phase in experiment.phases
+        ),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
     generations = _experiment_dir(experiment) / "generations"
@@ -260,61 +263,6 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
 
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert set(generations.iterdir()) == generations_before
-
-
-@pytest.mark.integration
-def test_interrupted_first_publication_still_publishes_and_reads_resolve_correctly(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A projection failure during the very first publication is diagnostic-only.
-
-    Convenience projections (root ``winner.yaml`` etc.) are a
-    best-effort, post-commit cache: a failure
-    partway through them must not fail the run or block the pointer commit,
-    even on a generation's first-ever publication. Reads must still resolve
-    correctly via the generation-scoped artifacts regardless of which root
-    copies did or didn't complete -- there is no "partial projection" for a
-    read to be exposed to.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
-    generation_ops = importlib.import_module("phasesweep.engine.generation")
-    real_copy = generation_ops._copy_yaml_projection
-    copied = 0
-
-    def interrupt_after_first_projection(source: Path, destination: Path) -> None:
-        nonlocal copied
-        if copied == 1:
-            raise OSError("publication interrupted")
-        real_copy(source, destination)
-        copied += 1
-
-    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", interrupt_after_first_projection)
-
-    winners = run_experiment(experiment)
-
-    assert set(winners) == {"arch", "lr"}
-    assert _last_successful_generation_path(experiment).is_file()
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    # The first (arch) convenience copy completed before the injected failure; the
-    # second one (lr, or the summary) did not.
-    assert {
-        view.phase
-        for view in read_result(
-            experiment, phase_names=[phase.name for phase in experiment.phases]
-        )[1]
-    } == {"arch", "lr"}
-    assert (
-        _load_winner(
-            experiment,
-            experiment.phases[0],
-            {},
-            publication=_published_for_resume(experiment),
-        )
-        is not None
-    )
 
 
 def test_fingerprint_changes_when_parent_winner_changes():
@@ -802,7 +750,10 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
         persistent=tmp_path, trainer=trainer, n_trials=3, sampler=Sampler(type="random", seed=0)
     )
     winners = run_experiment(experiment)
-    winner_before = _winner_path(experiment, "p").read_bytes()
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner_before = winner_path.read_bytes()
 
     lowered = _with_trial_target(experiment, 1)
     with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
@@ -812,7 +763,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 3
     assert winners["p"].completion["finished_trials"] == 3
-    assert _winner_path(experiment, "p").read_bytes() == winner_before
+    assert winner_path.read_bytes() == winner_before
 
 
 @pytest.mark.integration
@@ -827,10 +778,15 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
         arch_n_trials=1,
     )
     run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
     protected_paths = [
-        _summary_path(experiment),
+        _generation_summary_path(experiment, generation_id),
         _last_successful_generation_path(experiment),
-        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
+        *(
+            _generation_winner_path(experiment, generation_id, phase.name)
+            for phase in experiment.phases
+        ),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
     parent_before = optuna.load_study(
@@ -1576,7 +1532,9 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     exp = make_experiment(workdir=tmp_path / "runs", trainer=trainer)
     run_experiment(exp)
 
-    data = yaml.safe_load(_winner_path(exp, "p").read_text())
+    generation_id = published_generation_id(exp)
+    assert generation_id is not None
+    data = yaml.safe_load(_generation_winner_path(exp, generation_id, "p").read_text())
     assert "phase_fingerprint" in data
     assert isinstance(data["phase_fingerprint"], str)
     assert len(data["phase_fingerprint"]) == 64  # SHA-256 hex digest

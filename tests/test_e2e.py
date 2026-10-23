@@ -81,11 +81,12 @@ def test_full_sweep_and_replay(tmp_path):
     assert 0.0 <= reg["optimizer.weight_decay"] <= 0.3
     assert 0.0 <= reg["model.dropout"] <= 0.3
 
-    # Persistence on disk. Outputs are namespaced as
-    # <workdir>/<experiment>/<phase>/, summary at <workdir>/<experiment>/summary.yaml.
+    # The last-success pointer locates immutable summary and winner artifacts.
     runs_dir = tmp_path / "runs"
     exp_dir = runs_dir / exp.experiment
-    summary = yaml.safe_load((exp_dir / "summary.yaml").read_text())
+    pointer = yaml.safe_load((exp_dir / "last_successful_generation.yaml").read_text())
+    generation_dir = exp_dir / "generations" / pointer["generation_id"]
+    summary = yaml.safe_load((generation_dir / "summary.yaml").read_text())
     assert {p["name"] for p in summary["phases"]} == {"depth", "lr", "regularization"}
 
     # Frozen objective evidence provenance: the
@@ -101,7 +102,7 @@ def test_full_sweep_and_replay(tmp_path):
     assert len(winner_trial_dirs) == 1
     evidence = winner_trial_dirs[0] / provenance["source"]["path"]
     assert provenance["source"]["sha256"] == hashlib.sha256(evidence.read_bytes()).hexdigest()
-    stored = yaml.safe_load((exp_dir / "depth" / "winner.yaml").read_text())
+    stored = yaml.safe_load((generation_dir / "phases/depth/winner.yaml").read_text())
     assert stored["objective_provenance"] == provenance
 
     # Replay from regularization with its durable study intact. The depth and

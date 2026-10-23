@@ -443,7 +443,7 @@ def _require_dead_runner(
         return
     if cleanup_needed and identity.pid is not None and identity.pid_starttime is None:
         raise RunRecoveryError(
-            "runner process identity has no Linux /proc start time; refusing automated "
+            "runner process identity has no process start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
     # The live runner holds the run: once cancel_run stops it, the same request

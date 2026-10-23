@@ -109,13 +109,6 @@ def test_seeded_random_repeats_share_draws_per_slot_across_batches_and_workers(
     assert expected == sampled(tmp_path / "parallel.journal", [6], n_jobs=3)
 
 
-def _published_winner(experiment_root: Path, phase: str) -> dict[str, object]:
-    """Return the published winner.yaml payload of one phase."""
-    loaded = yaml.safe_load((experiment_root / phase / "winner.yaml").read_text())
-    assert isinstance(loaded, dict)
-    return loaded
-
-
 def test_repeats_phase_runs_children_without_the_repeat_key(tmp_path: Path) -> None:
     experiment = make_experiment(
         persistent=tmp_path,
@@ -150,8 +143,9 @@ def test_repeats_phase_runs_children_without_the_repeat_key(tmp_path: Path) -> N
     assert winners["c"].effective_overrides["x"] == parent.params["x"]
     assert _resolve_publication_pointer(experiment).state == "ok"
 
-    root = Path(experiment.workdir) / experiment.experiment
-    published = _published_winner(root, "p")
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    published = _winner_payload(experiment, generation_id)
     assert published["trial_number"] == numbers[-1]
     assert published["confound"]["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
     with (_phase_dir(experiment, "p") / "trials.csv").open() as handle:

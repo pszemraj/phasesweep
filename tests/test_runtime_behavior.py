@@ -30,9 +30,9 @@ from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _generation_path,
+    _generation_summary_path,
+    _generation_winner_path,
     _last_successful_generation_path,
-    _summary_path,
-    _winner_path,
 )
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.read import read_result, read_status
@@ -469,11 +469,13 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     phase_dir = workdir / "t" / "p"
     first_trial_dir = next(phase_dir.glob("trial_*"))
     assert (first_trial_dir / "r.json").is_file()
+    generation_id = winner.generation_id
+    assert generation_id is not None
     protected = {
         path: path.read_bytes()
         for path in (
-            _winner_path(first, "p"),
-            _summary_path(first),
+            _generation_winner_path(first, generation_id, "p"),
+            _generation_summary_path(first, generation_id),
             _last_successful_generation_path(first),
         )
     }
@@ -844,13 +846,17 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
         root.setLevel(saved_level)
 
 
-def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
+def test_runtime_platform_gate_refuses_an_unsupported_host_but_not_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real execution needs Linux; dry-run launches nothing and takes no locks."""
+    """Real execution needs a supported host; dry-run launches nothing and takes no locks."""
     from phasesweep.runtime import files as runtime_files
 
-    runtime_files.require_linux_runtime()
+    runtime_files.require_supported_runtime()
+    for platform in ("linux", "darwin"):
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_files.sys, "platform", platform)
+            runtime_files.require_supported_runtime()
 
     exp = make_experiment(
         experiment="platform_check",
@@ -860,8 +866,8 @@ def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
     )
 
     with monkeypatch.context() as patch:
-        patch.setattr(runtime_files.sys, "platform", "darwin")
-        with pytest.raises(runtime_files.PlatformCapabilityError, match="only on Linux.*'darwin'"):
+        patch.setattr(runtime_files.sys, "platform", "win32")
+        with pytest.raises(runtime_files.PlatformCapabilityError, match="Linux.*macOS.*'win32'"):
             run_experiment(exp)
         winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
@@ -1702,7 +1708,9 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         )
 
     # (d) The published winner: the bool-valued trial won, and says so.
-    winner_doc = yaml.safe_load(_winner_path(exp, "pick").read_text())
+    generation_id = winners["pick"].generation_id
+    assert generation_id is not None
+    winner_doc = yaml.safe_load(_generation_winner_path(exp, generation_id, "pick").read_text())
     _assert_identical_scalar(
         live[winner_doc["trial_number"]], True, surface="live value of the winning trial"
     )
@@ -1719,7 +1727,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         _assert_identical_scalar(
             payload["x"], True, surface=f"inherited overrides_resolved.json[{number}]"
         )
-    child_doc = yaml.safe_load(_winner_path(exp, "child").read_text())
+    child_doc = yaml.safe_load(_generation_winner_path(exp, generation_id, "child").read_text())
     _assert_identical_scalar(
         child_doc["effective_overrides"]["x"], True, surface="child winner.yaml"
     )

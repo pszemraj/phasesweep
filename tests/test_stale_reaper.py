@@ -117,6 +117,7 @@ def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
     assert stat.starttime == 987654
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="denies reads from the real Linux procfs")
 def test_is_same_live_process_fails_closed_when_proc_entry_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,6 +255,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="trainer observes its orphan through Linux procfs"
+)
 def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) -> None:
     """A new generation starts only after every existing phase is recovered."""
     trainer = write_trainer(
@@ -877,6 +881,7 @@ def test_kill_stale_group_pid_pgid_decision_matrix(
     case: _KillStaleGroupCase,
 ) -> None:
     """Exercise every PID/PGID identity branch and its signal decision."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
     calls: list[int] = []
     if case.pid_alive is not _MISSING:
         monkeypatch.setattr(

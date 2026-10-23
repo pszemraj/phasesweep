@@ -1,6 +1,6 @@
 """Process-group probes, termination, and stale trial cleanup.
 
-Reads ``/proc`` to decide whether a recorded PID or process group is still the
+Reads kernel identity to decide whether a recorded PID or process group is still the
 one phasesweep launched, terminates groups SIGTERM -> grace -> SIGKILL, and
 cleans a stale trial's group only when the boot- and process-bound identity in
 ``process_identity.json`` proves that signalling it cannot hit a reused PID.
@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import signal
+import sys
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
+from phasesweep.runtime.darwin import read_boot_session_uuid, read_process_info
 from phasesweep.runtime.json import strict_json_loads
 
 # Process supervision logs on one channel, whichever module does the work.
@@ -26,7 +28,7 @@ log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
-PROCESS_IDENTITY_SCHEMA_VERSION = 2
+PROCESS_IDENTITY_SCHEMA_VERSION = 3
 
 #: The kernel constant ``PROC_PID_INIT_INO``: the ``ns/pid`` link text of the
 #: initial PID namespace, fixed since Linux 3.8. That namespace is never freed.
@@ -51,7 +53,9 @@ class StaleProcessIdentity:
 
 
 def read_boot_id() -> str | None:
-    """Return the current Linux boot identity, or ``None`` when unavailable."""
+    """Return this Linux or macOS boot's identity, or unknown when unreadable."""
+    if sys.platform == "darwin":
+        return read_boot_session_uuid()
     try:
         boot_id_file = _PROC / "sys" / "kernel" / "random" / "boot_id"
         value = boot_id_file.read_text(encoding="ascii").strip()
@@ -77,9 +81,11 @@ def is_pid_namespace(value: object) -> TypeGuard[str]:
     """Return whether ``value`` is a PID namespace as phasesweep records it.
 
     :param object value: Candidate namespace identity.
-    :return bool: Whether it has the form ``pid:[<inode>]@<PID 1 start time>``.
+    :return bool: Whether it is ``darwin`` or ``pid:[<inode>]@<PID 1 start time>``.
     """
-    return isinstance(value, str) and _PID_NAMESPACE_PATTERN.fullmatch(value) is not None
+    return isinstance(value, str) and (
+        value == "darwin" or _PID_NAMESPACE_PATTERN.fullmatch(value) is not None
+    )
 
 
 def _pid_namespace_link(pid_namespace: str) -> str:
@@ -101,10 +107,15 @@ def read_pid_namespace() -> str | None:
     then this namespace's PID 1, whose start time keeps a reused inode from
     naming a namespace that has ended.
 
-    :return str | None: ``pid:[<inode>]@<PID 1 start time>``, or ``None`` when
+    macOS has one host PID space, named ``darwin`` to keep its microsecond
+    start times distinct from Linux clock ticks.
+
+    :return str | None: ``darwin``, ``pid:[<inode>]@<PID 1 start time>``, or ``None`` when
         ``/proc`` is missing, unreadable, mounted from another PID namespace,
         or hides this namespace's PID 1.
     """
+    if sys.platform == "darwin":
+        return "darwin"
     try:
         if os.readlink(_PROC / "self") != str(os.getpid()):
             return None
@@ -119,13 +130,15 @@ def read_pid_namespace() -> str | None:
 
 
 def in_initial_pid_namespace() -> bool:
-    """Return whether this process runs in the host's initial PID namespace.
+    """Return whether this process runs in the host's PID space.
 
-    :return bool: Whether this process's namespace is the host's initial one;
+    :return bool: Whether this is macOS's host PID space or Linux's initial namespace;
         ``False`` when the namespace is unreadable.
     """
     current = read_pid_namespace()
-    return current is not None and _pid_namespace_link(current) == INITIAL_PID_NAMESPACE_LINK
+    return current == "darwin" or (
+        current is not None and _pid_namespace_link(current) == INITIAL_PID_NAMESPACE_LINK
+    )
 
 
 def same_pid_namespace(pid_namespace: str) -> bool:
@@ -158,6 +171,8 @@ def recorded_process_blocker(
     :return str | None: ``None`` when no candidate remains; otherwise a clause
         naming what blocked the proof, including every blocking host PID.
     """
+    if read_pid_namespace() == "darwin":
+        return "macOS cannot inspect processes recorded in a Linux PID namespace"
     if not in_initial_pid_namespace():
         return (
             "only the host's initial PID namespace can see another namespace's processes, "
@@ -306,18 +321,17 @@ def _read_proc_stat(proc_entry: Path) -> _ProcStat | None:
 
 
 def read_proc_starttime(pid: int) -> int | None:
-    """Read the start time of a process from /proc/<pid>/stat.
+    """Read the kernel's exact start time for a process on Linux or macOS.
 
     Within one boot and PID namespace, (pid, starttime) identifies a process for its
     whole lifetime. That pair guards against PID reuse when killing stale processes
     from a prior orchestrator run.
 
     :param int pid: The process ID to inspect.
-    :return int | None: The starttime in clock ticks (``/proc/<pid>/stat`` field 22), or
-        ``None`` when the proc entry is missing or unreadable (hidepid, a container
-        without procfs access, or an exited process).
+    :return int | None: Clock ticks on Linux (``/proc/<pid>/stat`` field 22),
+        microseconds since the epoch on macOS, or unknown when unreadable.
     """
-    stat = _read_proc_stat(_PROC / str(pid))
+    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
     return None if stat is None else stat.starttime
 
 
@@ -341,12 +355,12 @@ def is_same_live_process(pid: int | None, saved_starttime: int | None) -> bool:
     """Return whether a PID identifies the same live, non-zombie process.
 
     :param int | None pid: Process identifier, if one was recorded.
-    :param int | None saved_starttime: Recorded Linux process start time.
+    :param int | None saved_starttime: Recorded kernel process start time.
     :return bool: Whether the identity still names a live non-zombie process.
     """
     if pid is None or not is_pid_alive(pid):
         return False
-    stat = _read_proc_stat(_PROC / str(pid))
+    stat = read_process_info(pid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pid))
     if saved_starttime is not None and (stat is None or stat.starttime != saved_starttime):
         return False
     return stat is None or stat.state != "Z"
@@ -494,7 +508,7 @@ def cleanup_stale_trial_process(
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
         log.warning(
             "Refusing automatic cleanup for attempt %s because robust process-birth identity "
-            "(boot id or /proc start time) is unavailable.",
+            "(boot id or process start time) is unavailable.",
             identity.attempt_id,
         )
         return False
@@ -550,6 +564,10 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
     while pending and time.monotonic() < deadline:
         still_alive = []
         for pgid in pending:
+            if sys.platform == "darwin":
+                # An owned zombie keeps killpg(0) positive until its parent reaps it.
+                # Other parents' children remain untouched; their groups stay uncertain.
+                reap_child(pgid)
             if _process_group_alive_with_members(pgid, members[pgid]):
                 still_alive.append(pgid)
             else:
@@ -560,6 +578,11 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
 
     survivors: list[int] = []
     for pgid in pending:
+        if sys.platform == "darwin":
+            reap_child(pgid)
+            if not _process_group_exists(pgid):
+                confirmed[pgid] = True
+                continue
         log.warning("Stale process group %d survived SIGTERM — sending SIGKILL", pgid)
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -578,6 +601,8 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []
         for pgid in survivors:
+            if sys.platform == "darwin":
+                reap_child(pgid)
             if _process_group_alive_with_members(pgid, members[pgid]):
                 still_alive.append(pgid)
             else:
@@ -638,7 +663,9 @@ def _stored_pgid_is_reused_group_leader(pgid: int, saved_starttime: int) -> bool
         leader exists or its identity is compatible, and ``None`` when a live
         leader's proc identity is unreadable.
     """
-    stat = _read_proc_stat(_PROC / str(pgid))
+    stat = (
+        read_process_info(pgid) if sys.platform == "darwin" else _read_proc_stat(_PROC / str(pgid))
+    )
     if stat is None:
         return None if is_pid_alive(pgid) else False
     return stat.pgrp == pgid and stat.starttime != saved_starttime
@@ -653,7 +680,7 @@ def _process_group_alive_with_members(pgid: int, member_pids: set[int] | None) -
     """
     if not _process_group_exists(pgid):
         return False
-    if not _PROC.exists():
+    if sys.platform == "darwin" or not _PROC.exists():
         return True
     if member_pids is not None and _member_pids_alive(pgid, member_pids):
         return True
@@ -679,6 +706,9 @@ def _group_member_pids(pgid: int) -> _GroupMemberScan:
         entry was inspectable, and whether all observed members were zombies
         or exited.
     """
+    if sys.platform == "darwin":
+        # macOS has no procfs scan; killpg(0) remains the conservative proof.
+        return _GroupMemberScan(pids=(), complete=False, all_members_terminal=False)
     member_pids: list[int] = []
     all_members_terminal = True
     complete = True
@@ -752,7 +782,7 @@ def kill_stale_group(
     means no cleanup is needed; uncertain cleanup must block state advancement.
 
     :param int | None pid: Root PID from a durable process identity, or ``None`` if absent.
-    :param int | None saved_starttime: Saved Linux process start time, or ``None`` when
+    :param int | None saved_starttime: Saved kernel process start time, or ``None`` when
         identity cannot be verified. A live PID/PGID is never signalled in that case.
     :param int | None pgid: Process-group ID from the same durable identity.
     :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL;
@@ -782,7 +812,7 @@ def kill_stale_group(
             current_starttime = read_proc_starttime(pid)
             if current_starttime is None:
                 log.warning(
-                    "PID %d is alive but its /proc start time is unreadable; "
+                    "PID %d is alive but its process start time is unreadable; "
                     "refusing cleanup because process identity is unknown.",
                     pid,
                 )

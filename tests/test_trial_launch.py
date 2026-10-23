@@ -523,10 +523,18 @@ def test_launch_trial_warns_once_when_ambient_visibility_is_dropped(
     assert "env.CUDA_VISIBLE_DEVICES" in warnings[0].getMessage()
 
 
+@pytest.mark.parametrize(
+    ("gpu_id", "gpu_lease_fds"),
+    [pytest.param(2, (), id="cuda"), pytest.param(None, (17,), id="mps")],
+)
 def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    gpu_id: int | None,
+    gpu_lease_fds: tuple[int, ...],
 ) -> None:
-    """An assigned device already binds visibility and holds a lock."""
+    """CUDA visibility or an MPS host lease prevents an unleased-device warning."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
@@ -535,10 +543,15 @@ def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
             tmp_path,
             monkeypatch,
             execution=ExecutionContext(inherit_env="none"),
-            gpu_id=2,
+            gpu_id=gpu_id,
+            gpu_lease_fds=gpu_lease_fds,
         )
 
-    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    if gpu_id is not None:
+        assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    else:
+        assert "CUDA_VISIBLE_DEVICES" not in env
+        assert env["gpu_lease_fds"] == gpu_lease_fds
     assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
 
 
