@@ -18,7 +18,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
+from phasesweep.config.common import ConfigInt, _validate_safe_name
 from phasesweep.config.io import (
     _load_yaml_mapping_from_text,
     describe_validation_error,
@@ -108,9 +108,7 @@ class _Entry(_CatalogModel):
         :return str: The validated id.
         :raises ValueError: If the id is not ``[A-Za-z0-9_-]+``.
         """
-        if not SAFE_NAME_PATTERN.fullmatch(value):
-            raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
-        return value
+        return _validate_safe_name("catalog id", value)
 
     @field_validator("visible_params")
     @classmethod
