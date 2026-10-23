@@ -524,7 +524,11 @@ def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:
 
 
 def _require_study(experiment: Experiment) -> None:
-    """Refuse an inspection of a study directory that does not exist."""
+    """Refuse an inspection of a study directory that does not exist.
+
+    :param Experiment experiment: Config whose workdir and name locate the study.
+    :raises click.ClickException: The study directory does not exist.
+    """
     path = _experiment_dir(experiment)
     if not path.is_dir():
         raise click.ClickException(
@@ -533,7 +537,11 @@ def _require_study(experiment: Experiment) -> None:
 
 
 def _inspection_generation(experiment: Experiment) -> str | None:
-    """Inspect the latest claimed generation, falling back to the publication."""
+    """Find an existing namespace for the latest claimed generation.
+
+    :param Experiment experiment: Config whose current-generation pointer is read.
+    :return str | None: Claimed generation id, or None so the caller can use the publication.
+    """
     generation_id = _current_pointer_generation_id(experiment)
     if generation_id is not None and _generation_dir(experiment, generation_id).is_dir():
         return generation_id
@@ -548,7 +556,12 @@ def _inspection_generation(experiment: Experiment) -> str | None:
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES
 def validate(config_path: Path, settings: tuple[str, ...]) -> None:
-    """Validate config and read-only GPU inventory without launching work."""
+    """Validate config and read-only GPU inventory without launching work.
+
+    :param Path config_path: Experiment YAML whose relative paths anchor to its directory.
+    :param tuple[str, ...] settings: Config overrides applied before validation.
+    :raises ConfigError: The derived configuration cannot be loaded or validated.
+    """
     config = _command_config(config_path, settings=settings)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))

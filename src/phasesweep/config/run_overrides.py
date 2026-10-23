@@ -148,6 +148,10 @@ def _at_or_below(loc: Location, location: Location) -> bool:
 
     Pydantic inserts union tags (such as ``int`` for a search-space entry) into a
     ``loc``; text elements that do not match are skipped once the path has started.
+
+    :param Location loc: Validation error location, including any union tags.
+    :param Location location: Created config key's location without union tags.
+    :return bool: Whether the error belongs to the created key or one of its descendants.
     """
     matched = 0
     for part in loc:
@@ -161,7 +165,12 @@ def _at_or_below(loc: Location, location: Location) -> bool:
 
 
 def _parse_key(setting: str) -> tuple[list[_Segment], str]:
-    """Split ``KEY=VALUE`` into key segments and the raw value text."""
+    """Split ``KEY=VALUE`` into key segments and the raw value text.
+
+    :param str setting: Assignment containing a path and YAML value separated by equals.
+    :raises SetPathError: The assignment lacks a key/value separator or has malformed selectors.
+    :return tuple[list[_Segment], str]: Parsed path segments and the unparsed value.
+    """
     segments: list[_Segment] = []
     pos = 0
     expect_name = True
@@ -201,7 +210,13 @@ def _parse_key(setting: str) -> tuple[list[_Segment], str]:
 
 
 def _read_bracket(setting: str, start: int) -> tuple[int, str]:
-    """Read ``[...]`` from ``start`` and return the offset past ``]`` and its contents."""
+    """Read ``[...]`` from ``start`` and resolve escapes in its contents.
+
+    :param str setting: Assignment containing the bracketed selector.
+    :param int start: Offset of its opening bracket.
+    :raises SetPathError: The selector has no closing bracket.
+    :return tuple[int, str]: Offset after the closing bracket and the unescaped selector.
+    """
     chars: list[str] = []
     pos = start + 1
     while pos < len(setting):
@@ -218,7 +233,15 @@ def _read_bracket(setting: str, start: int) -> tuple[int, str]:
 
 
 def _list_position(setting: str, segment: _Segment, prefix: str, items: list[JsonValue]) -> int:
-    """Resolve an index or, for a bracketed name, the element whose ``name`` matches."""
+    """Resolve an index or, for a bracketed name, the element whose ``name`` matches.
+
+    :param str setting: Original assignment used to label path errors.
+    :param _Segment segment: Numeric index or bracketed name to resolve.
+    :param str prefix: Path identifying the list in an error message.
+    :param list[JsonValue] items: Existing list elements; resolution never extends the list.
+    :raises SetPathError: The index is out of range or the name does not identify exactly one element.
+    :return int: Zero-based position of the selected element.
+    """
     if _INDEX.fullmatch(segment.name):
         position = int(segment.name)
         if position >= len(items):
@@ -253,7 +276,12 @@ def _list_position(setting: str, segment: _Segment, prefix: str, items: list[Jso
 
 
 def _path_error(setting: str, problem: str) -> SetPathError:
-    """Build a path error that quotes the assignment and repeats the accepted syntax."""
+    """Build a path error that quotes the assignment key and repeats the accepted syntax.
+
+    :param str setting: Assignment whose value is omitted from the message.
+    :param str problem: Explanation of the invalid path.
+    :return SetPathError: Error containing the bounded key, problem and accepted syntax.
+    """
     return SetPathError(f"{_shown(setting)}: {problem}. {SET_SYNTAX}")
 
 
@@ -263,6 +291,9 @@ def _shown(setting: str) -> str:
     The value is never shown: like the config itself, it can hold a credential. The key
     ends at the first ``=`` outside ``[...]``, or at the first ``=`` when a ``[`` never
     closes.
+
+    :param str setting: Assignment whose key should be displayed.
+    :return str: Repr-quoted key truncated to the display limit, excluding its value.
     """
     key = setting.partition("=")[0]
     pos, inside = 0, False
@@ -282,5 +313,9 @@ def _shown(setting: str) -> str:
 
 
 def _kind(value: JsonValue) -> str:
-    """Name a scalar's JSON type for a message."""
+    """Name a scalar's type for a path error message.
+
+    :param JsonValue value: Value that cannot be traversed as a mapping or list.
+    :return str: The Python type name, or 'null' for None.
+    """
     return "null" if value is None else type(value).__name__

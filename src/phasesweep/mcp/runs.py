@@ -581,31 +581,59 @@ class RunStore:
         return f"{experiment_id}-{uuid4().hex}"
 
     def log_path(self, run_id: str) -> Path:
-        """Return the operator-only captured stdout/stderr log path."""
+        """Return the operator-only captured stdout/stderr log path.
+
+        :param str run_id: Run whose log is located.
+        :return Path: Captured output path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.log"
 
     def status_path(self, run_id: str) -> Path:
-        """Return the operator-only runner terminal-status path."""
+        """Return the operator-only runner terminal-status path.
+
+        :param str run_id: Run whose terminal status is located.
+        :return Path: Terminal-status JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.status.json"
 
     def config_snapshot_path(self, run_id: str) -> Path:
-        """Return the operator-only immutable runner config path."""
+        """Return the operator-only immutable runner config path.
+
+        :param str run_id: Run whose immutable config is located.
+        :return Path: Config snapshot YAML path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.config.yaml"
 
     def cleanup_uncertain_path(self, run_id: str) -> Path:
-        """Return the operator-only unconfirmed-cleanup marker path."""
+        """Return the operator-only unconfirmed-cleanup marker path.
+
+        :param str run_id: Run whose cleanup marker is located.
+        :return Path: Unconfirmed-cleanup JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
 
     def cleanup_recovery_path(self, run_id: str) -> Path:
-        """Return the operator-only cleanup recovery evidence path."""
+        """Return the operator-only cleanup recovery evidence path.
+
+        :param str run_id: Run whose cleanup recovery evidence is located.
+        :return Path: Cleanup recovery JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
     def launch_lease_path(self, run_id: str) -> Path:
-        """Return the private kernel-backed launch lease path."""
+        """Return the private kernel-backed launch lease path.
+
+        :param str run_id: Run whose launch lease is located.
+        :return Path: Launch lock path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.launch.lock"
 
     def heartbeat_path(self, run_id: str) -> Path:
-        """Return the private heartbeat path whose mtime the live runner refreshes."""
+        """Return the private heartbeat path whose mtime the live runner refreshes.
+
+        :param str run_id: Run whose heartbeat is located.
+        :return Path: Heartbeat file path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.heartbeat"
 
     def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
@@ -1413,17 +1441,29 @@ def _valid_cleanup_recovery(
 
 
 def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
-    """Accept None or a positive integer, excluding booleans."""
+    """Accept None or a positive integer, excluding booleans.
+
+    :param object value: Candidate optional integer.
+    :return TypeGuard[int | None]: Whether the value is None or a positive built-in integer.
+    """
     return value is None or (type(value) is int and value > 0)
 
 
 def _valid_config_dir(value: object) -> TypeGuard[str]:
-    """Accept absolute path strings without NUL."""
+    """Accept absolute path strings without NUL.
+
+    :param object value: Candidate configuration-directory path.
+    :return TypeGuard[str]: Whether the value is a built-in string naming an absolute path without NUL.
+    """
     return type(value) is str and "\0" not in value and Path(value).is_absolute()
 
 
 def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:
-    """Accept None or canonical lowercase Linux boot UUID text."""
+    """Accept None or canonical lowercase boot UUID text.
+
+    :param object value: Candidate optional boot identifier.
+    :return TypeGuard[str | None]: Whether the value is None or canonical UUID text.
+    """
     if value is None:
         return True
     if type(value) is not str:
