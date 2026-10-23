@@ -9,6 +9,7 @@ For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under `runs/demo
 ```text
 demo/
   .gitignore
+  .ignore
   artifact_root_binding.json
   run.log                         # PhaseSweep's log: phase headers, RERUN, TRIAL, ABORTED and WINNER lines, warnings
   study.journal                   # storage: auto
@@ -63,7 +64,7 @@ Private records inside the tree have these additional requirements:
 The two files are owner-only while their directories keep ordinary permissions. The same validated, no-follow path handling protects the runtime lock namespace and the MCP `state_dir`.
 
 > [!WARNING]
-> `config.snapshot.yaml` is private because it can contain command and environment values. PhaseSweep writes a `.gitignore` containing `*` whenever the experiment namespace lacks one, but it never replaces an existing ignore file, so keep generated outputs, ledgers, and MCP state out of commits yourself.
+> `config.snapshot.yaml` is private because it can contain command and environment values. PhaseSweep writes a `.gitignore` containing `*` and a `.ignore` that permits ripgrep searches, without replacing existing files. Keep generated outputs, ledgers, and MCP state out of commits yourself.
 
 ## Following a run
 

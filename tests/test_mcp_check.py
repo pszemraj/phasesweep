@@ -52,6 +52,19 @@ def test_check_catalog_read_only_entry_has_no_actions(tmp_path: Path) -> None:
     assert report.entries[0].actions == ()
 
 
+def test_check_catalog_schema_errors_name_fields_without_library_dump(tmp_path: Path) -> None:
+    """Catalog schema failures expose concise field messages without raw input or help URLs."""
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text("bogus: true\n")
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+    assert result.exit_code == 2
+    assert "state_dir: Field required" in result.output
+    assert "experiments: Field required" in result.output
+    assert "bogus: Extra inputs are not permitted" in result.output
+    assert "errors.pydantic.dev" not in result.output
+    assert "input_value" not in result.output
+
+
 def test_check_catalog_rejects_unsafe_existing_state_layout_without_mutation(
     tmp_path: Path,
 ) -> None:

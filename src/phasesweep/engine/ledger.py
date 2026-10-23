@@ -160,7 +160,7 @@ def _resolve_storage(url: str) -> JournalStorage:
     :raises ValueError: ``url`` selects an unsupported local storage backend.
     """
     path = journal_file_path(url)
-    log.info("Using JournalFileStorage at %s", path)
+    log.debug("Using JournalFileStorage at %s", path)
     from optuna.storages.journal import JournalFileBackend
 
     return JournalStorage(JournalFileBackend(str(path), lock_obj=_JournalLock(path)))

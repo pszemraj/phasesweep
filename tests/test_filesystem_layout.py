@@ -90,6 +90,7 @@ def test_run_experiment_writes_summary_at_namespaced_path(
     # Nothing is written directly under the bare workdir.
     assert not (Path(exp.workdir).resolve() / "summary.yaml").exists()
     assert (_experiment_dir(exp) / ".gitignore").read_text() == "*\n"
+    assert (_experiment_dir(exp) / ".ignore").read_text() == "!**\n"
     assert not (Path(exp.workdir) / ".gitignore").exists()
     visible = subprocess.run(
         [
@@ -119,6 +120,7 @@ def test_existing_artifact_dir_adds_only_missing_ignore(
         ignore.write_text(existing_ignore)
     ensure_artifact_dir(artifact_dir)
     assert ignore.read_text() == (existing_ignore if existing_ignore is not None else "*\n")
+    assert (artifact_dir / ".ignore").read_text() == "!**\n"
 
 
 def test_new_artifact_dir_does_not_modify_repository_ignore(tmp_path: Path) -> None:

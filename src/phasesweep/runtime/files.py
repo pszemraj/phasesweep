@@ -44,16 +44,17 @@ def cache_dir() -> Path:
 
 
 def ensure_artifact_dir(path: Path) -> None:
-    """Create a self-ignoring artifact namespace without replacing its ignore file.
+    """Keep artifacts out of Git while allowing ripgrep to search their contents.
 
     :param Path path: Managed experiment directory, not its shared workdir.
     """
     path.mkdir(parents=True, exist_ok=True)
-    try:
-        with (path / ".gitignore").open("x", encoding="utf-8") as handle:
-            handle.write("*\n")
-    except FileExistsError:
-        pass
+    for name, rule in ((".gitignore", "*\n"), (".ignore", "!**\n")):
+        try:
+            with (path / name).open("x", encoding="utf-8") as handle:
+                handle.write(rule)
+        except FileExistsError:
+            pass
 
 
 def file_sha256(path: Path) -> str:

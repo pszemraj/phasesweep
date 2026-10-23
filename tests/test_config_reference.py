@@ -609,10 +609,16 @@ def test_describe_validation_error_adds_distinct_quoted_hints() -> None:
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
     assert len(caught.value.errors()) == 3
-    assert describe_validation_error(caught.value) == (
-        f"{caught.value}\nsee: phasesweep explain 'phases[].sampler.type'"
+    text = describe_validation_error(caught.value)
+    assert text == (
+        "phases.0.sampler.type: Input should be 'tpe', 'random', 'grid' or 'cmaes'"
+        "\nenv.A: Input should be a valid string"
+        "\nenv.B: Input should be a valid string"
+        "\nsee: phasesweep explain 'phases[].sampler.type'"
         "\nsee: phasesweep explain env"
     )
+    assert "errors.pydantic.dev" not in text
+    assert "input_value" not in text
 
 
 def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
@@ -622,7 +628,9 @@ def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
     assert [error["loc"] for error in caught.value.errors()] == [()]
-    assert describe_validation_error(caught.value) == str(caught.value)
+    assert describe_validation_error(caught.value) == (
+        "Phase 'baseline' inherits from 'baseline', which is not a prior phase."
+    )
 
 
 def test_loc_to_path_has_no_key_for_unknown_or_model_level_locations() -> None:

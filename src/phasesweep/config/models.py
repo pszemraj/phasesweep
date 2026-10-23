@@ -1346,7 +1346,7 @@ class Experiment(_Frozen):
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
         if self.resolved_storage is not None and not self.provenance:
             raise ValueError(
-                "Persistent storage requires a nonempty provenance mapping that identifies "
+                f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
                 "the data and dependency revisions used by this experiment; each generation "
                 "records the trainer's git commit on its own."
             )

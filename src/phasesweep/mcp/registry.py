@@ -22,6 +22,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import (
     _load_yaml_mapping_from_text,
     describe_validation_error,
+    format_validation_error,
     load_experiment_bytes,
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
@@ -302,7 +303,7 @@ def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path, str]:
     try:
         catalog = _Catalog.model_validate(raw)
     except ValidationError as exc:
-        raise CatalogError(f"catalog {catalog_path}: {exc}") from exc
+        raise CatalogError(f"catalog {catalog_path}: {format_validation_error(exc)}") from exc
     return catalog, catalog_path.resolve().parent, hashlib.sha256(data).hexdigest()
 
 
