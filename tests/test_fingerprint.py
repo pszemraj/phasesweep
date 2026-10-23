@@ -35,6 +35,7 @@ from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
 )
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.ledger import ClaimedLedger, _resolve_storage
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -77,6 +78,7 @@ from tests.conftest import (
     drop_artifact_root_binding,
     make_experiment,
     mark_current_format,
+    phase_study,
     write_constant_trainer,
     write_trainer,
 )
@@ -171,7 +173,7 @@ def _two_phase_experiment(
 def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
     """Build a stand-in study exposing only what the top-up guard reads.
 
-    :param int completed: Number of terminal trials the study reports.
+    :param int completed: Number of Optuna COMPLETE trials the study reports.
     :param str | None fingerprint: Bound phase fingerprint, or ``None`` for a
         study that has not been bound to a published winner yet.
     :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
@@ -231,7 +233,7 @@ def test_in_memory_storage_does_not_require_provenance() -> None:
 def test_late_child_fingerprint_failure_preserves_last_successful_results(
     tmp_path: Path,
 ) -> None:
-    """A child mismatch after phase one cannot publish a mixed result view."""
+    """A child mismatch after phase one replays cannot publish a mixed result view."""
     trainer = write_constant_trainer(tmp_path)
     experiment = _two_phase_experiment(
         workdir=tmp_path / "runs",
@@ -241,10 +243,13 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     run_experiment(experiment)
     protected_paths = [
         _summary_path(experiment),
+        _generation_path(experiment),
         _last_successful_generation_path(experiment),
         *(_winner_path(experiment, phase.name) for phase in experiment.phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
+    generations = _experiment_dir(experiment) / "generations"
+    generations_before = set(generations.iterdir())
     changed_child = experiment.phases[1].model_copy(
         update={"search_space": {"lr": IntParam(type="int", low=1, high=5)}}
     )
@@ -254,11 +259,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
         run_experiment(changed)
 
     assert {path: path.read_bytes() for path in protected_paths} == before
-    current = yaml.safe_load(_generation_path(experiment).read_text())
-    assert current["state"] == "failed"
-    assert yaml.safe_load(
-        _last_successful_generation_path(experiment).read_text()
-    ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
+    assert set(generations.iterdir()) == generations_before
 
 
 @pytest.mark.integration
@@ -298,8 +299,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     # The first (arch) convenience copy completed before the injected failure; the
-    # second one (lr, or the summary) did not. Either way, reads resolve via
-    # the generation-scoped artifact once any generation has published.
+    # second one (lr, or the summary) did not.
     assert {
         view.phase
         for view in read_result(
@@ -349,39 +349,6 @@ def test_fingerprint_changes_when_parent_winner_changes():
         "Fingerprint must encode inherited winner; otherwise --from-phase replay "
         "with a different parent winner silently mixes incompatible trials."
     )
-
-
-def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
-    """--from-phase dry-run with missing winner.yaml falls back to placeholder.
-
-    The placeholder must still compose inherited overrides for its descendants.
-    """
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        phases=[
-            Phase(
-                name="arch",
-                fixed_overrides={"model_family": "llama"},
-                n_trials=1,
-                search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
-            ),
-            Phase(
-                name="lr",
-                inherits=["arch"],
-                n_trials=1,
-                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            ),
-        ],
-    )
-    # No winner files on disk; dry-run from phase 'lr' must synthesize a placeholder
-    # for arch that still carries its fixed_overrides.
-    winners = run_experiment(exp, from_phase="lr", dry_run=True)
-    assert winners["arch"].effective_overrides.get("model_family") == "llama"
-    assert "n_layers" in winners["arch"].effective_overrides
-    lr_eff = winners["lr"].effective_overrides
-    assert lr_eff["model_family"] == "llama"
-    assert "n_layers" in lr_eff
-    assert "lr" in lr_eff
 
 
 @pytest.mark.parametrize(
@@ -804,16 +771,14 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     run_experiment(control)
 
     trials = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).trials
-    expected = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
-    ).trials
+    expected = phase_study(control).trials
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert [t.params for t in trials] == [t.params for t in expected]
 
 
 @pytest.mark.integration
 def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
-    """A TPE study that reached its accepted target republishes without new trials."""
+    """A TPE study that reached its accepted target replays its winner without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = make_experiment(
@@ -1249,11 +1214,7 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The published-phase existence read keeps strict storage-error semantics.
-
-    Opening a study reads its trials too, so the failure is confined to the
-    published check rather than raised from every ``get_trials`` call.
-    """
+    """The published-phase existence read keeps strict storage-error semantics."""
     import phasesweep.engine.ledger as ledger
 
     materialized = materialize("current-journal", tmp_path, mode="tree")
@@ -1314,18 +1275,16 @@ def test_published_study_requirement_starts_at_from_phase(
     if missing_phase == "lr":
         with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
             run_experiment(experiment, from_phase="lr")
-        assert _generation_path(experiment).read_bytes() == generation_before
-        assert published_generation_id(experiment) == published
     else:
-        winners = run_experiment(experiment, from_phase="lr")
-        assert winners["arch"].params == original["arch"].params
-        assert winners["arch"].trial_number == original["arch"].trial_number
-        assert published_generation_id(experiment) != published
+        # The resume replays the published winners, so it publishes nothing new.
+        assert run_experiment(experiment, from_phase="lr") == original
         if replacement == "absent":
             assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
         else:
             assert not optuna.load_study(study_name="t::arch", storage=resolved).trials
         assert len(optuna.load_study(study_name="t::lr", storage=resolved).trials) == 1
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert published_generation_id(experiment) == published
 
 
 @pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])
@@ -1373,7 +1332,8 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     run_experiment(experiment)
     published = published_generation_id(experiment)
 
-    def lose_ledger(*_args: object, **_kwargs: object) -> None:
+    def lose_ledger(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         ledger.unlink()
         raise RuntimeError("execution failed after the ledger disappeared")
 
@@ -1874,8 +1834,6 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
     fingerprint, or the *corrected* config would be rejected with
     StudyFingerprintMismatchError even though nothing ever ran.
     """
-    from tests.conftest import make_experiment, write_trainer
-
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     db = tmp_path / "fp.journal"
 
@@ -1947,8 +1905,6 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
 @pytest.mark.integration
 def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -> None:
     """The empty-study rebind must not weaken identity once results exist."""
-    from tests.conftest import make_experiment, write_trainer
-
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     db = tmp_path / "fp2.journal"
 

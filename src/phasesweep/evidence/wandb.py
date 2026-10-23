@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from phasesweep.runtime.json import json_text, progress_position
+from phasesweep.runtime.json import json_text, json_text_list, progress_position
 from phasesweep.runtime.remote_worker import run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
@@ -24,8 +24,10 @@ _HistoryRead = Literal["settled", "lagging", "retry"]
 transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-# History catch-up budget; complete history reads may use the remaining deadline.
-_HISTORY_SETTLE_SECONDS = 30.0
+# How long the public API may lag a run it already reports finished: a summary
+# still missing required keys, or history behind the summary. Complete history
+# reads may use the remaining deadline.
+_FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
@@ -54,6 +56,15 @@ class WandbSetupError(RuntimeError):
 
     run_id: str
     cause: str
+
+
+@dataclass(eq=False)
+class WandbMissingKeysError(RuntimeError):
+    """The finished run's summary still lacked required keys after the settle window."""
+
+    run_id: str
+    missing: list[str]
+    available: list[str]
 
 
 def require_wandb_sdk() -> None:
@@ -185,6 +196,8 @@ def poll_wandb_summary(
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
+    :raises WandbMissingKeysError: The finished run's summary still lacked
+        required keys once the settle window passed.
     :raises ValueError: A requested scalar is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
@@ -213,6 +226,7 @@ def poll_wandb_summary(
                 "summary",
                 "setup_error",
                 "terminal_error",
+                "missing_keys",
                 "invalid_evidence",
                 "import_error",
                 "timeout",
@@ -228,6 +242,14 @@ def poll_wandb_summary(
         raise WandbSetupError(run_id, json_text(response, "cause"))
     if response.get("status") == "terminal_error":
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
+    if response.get("status") == "missing_keys":
+        missing = json_text_list(response.get("missing"))
+        available = json_text_list(response.get("available"))
+        if missing is None or available is None:
+            raise RuntimeError(
+                f"W&B evidence worker returned a malformed missing-keys report for attempt {run_id!r}."
+            )
+        raise WandbMissingKeysError(run_id, missing, available)
     if response.get("status") == "invalid_evidence":
         raise ValueError(response["cause"])
     if response.get("status") == "import_error":
@@ -429,6 +451,12 @@ def _poll_wandb_summary(
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
 
+    A finished summary may still gain values while the public API catches up,
+    so missing required keys are polled for ``_FINISH_SETTLE_SECONDS`` from the
+    first finished read that lacked them; once that window passes before the
+    deadline, the latest finished summary's missing and available keys are
+    reported instead of waiting out the deadline.
+
     :param str base_url: Normalized W&B API endpoint.
     :param str entity: W&B entity that owns the project.
     :param str project: W&B project containing the run.
@@ -442,6 +470,8 @@ def _poll_wandb_summary(
     :raises WandbPollTimeout: The run did not finish with the required keys in time.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
+    :raises WandbMissingKeysError: The finished run's summary still lacked
+        required keys once the settle window passed.
     :raises ValueError: A requested scalar is invalid or non-finite.
     """
     from wandb.apis.public import Api
@@ -452,6 +482,8 @@ def _poll_wandb_summary(
 
     deadline = time.monotonic() + timeout_seconds if deadline is None else deadline
     last_error: Exception | None = None
+    missing_keys: WandbMissingKeysError | None = None
+    settle_by = math.inf
     required = tuple(required_keys)
     while time.monotonic() < deadline:
         try:
@@ -499,7 +531,19 @@ def _poll_wandb_summary(
                         if time.monotonic() >= deadline:
                             break
                         return capture
-        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+                    missing = sorted(key for key in required if key not in summary)
+                    available = sorted(summary)
+                    missing_keys = WandbMissingKeysError(run_id, missing, available)
+                    last_error = RuntimeError(
+                        f"Missing required summary keys: {missing!r}; "
+                        f"available summary keys: {available!r}."
+                    )
+                    settle_by = min(settle_by, time.monotonic() + _FINISH_SETTLE_SECONDS)
+        # A window still open at the deadline ends as a timeout, like any late read.
+        if missing_keys is not None and settle_by <= time.monotonic() < deadline:
+            raise missing_keys
+        wake_by = min(deadline, settle_by)
+        time.sleep(min(poll_seconds, max(0.0, wake_by - time.monotonic())))
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
 
 
@@ -517,7 +561,7 @@ def _locate_wandb_position(
 ) -> int | float | None:
     """Read a finished run's objective position within the parent's deadline.
 
-    History has _HISTORY_SETTLE_SECONDS to catch up; reads and transient retries
+    History has _FINISH_SETTLE_SECONDS to catch up; reads and transient retries
     may use the rest of the deadline. Other failures return no position.
 
     :param str base_url: Normalized W&B API endpoint.
@@ -535,7 +579,7 @@ def _locate_wandb_position(
     """
     from wandb.apis.public import Api
 
-    settle_by = min(deadline, time.monotonic() + _HISTORY_SETTLE_SECONDS)
+    settle_by = min(deadline, time.monotonic() + _FINISH_SETTLE_SECONDS)
     interval = min(poll_seconds, _HISTORY_RETRY_SECONDS)
     run: Any = None
     while True:
@@ -590,6 +634,9 @@ def main(argv: list[str] | None = None) -> int:
         if task == "position":
             response = {"status": "position", "value": _locate_wandb_position(**request)}
         else:
+            # Leave time to report missing keys before the supervisor's deadline.
+            remaining = max(0.0, request["deadline"] - time.monotonic())
+            request["deadline"] -= min(0.1, remaining / 2)
             response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}
@@ -597,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         response = {"status": "setup_error", "cause": exc.cause}
     except WandbRunTerminalError as exc:
         response = {"status": "terminal_error", "state": exc.state}
+    except WandbMissingKeysError as exc:
+        response = {"status": "missing_keys", "missing": exc.missing, "available": exc.available}
     except WandbPollTimeout as exc:
         response = {"status": "timeout", "cause": str(exc.last_error) if exc.last_error else None}
     except ValueError:

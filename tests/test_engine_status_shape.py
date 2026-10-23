@@ -9,11 +9,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep import experiment_status
-from phasesweep.config.models import Experiment
+import yaml
+
+from phasesweep import experiment_status, run_experiment
+from phasesweep.config.models import Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.read import read_status
-from tests.conftest import make_experiment
+from phasesweep.engine.read import read_status, read_trial_tables
+from phasesweep.evidence.models import LogRegexExtractor
+from tests.conftest import make_experiment, write_trainer
 from tests.ledger_fixtures import materialize, published_generation_id
 
 EXPERIMENT_STATUS_KEYS = [
@@ -52,9 +56,7 @@ payload carries no empty error field.
 
 PHASE_STATUS_KEYS = {
     "trials",
-    "running",
     "n_trials",
-    "completed",
     "generation_trials",
     "published_study_unavailable",
     "trial_data_available",
@@ -117,7 +119,7 @@ def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
     assert phase["name"] == "p"
     assert phase["winner"] is not None
-    assert phase["completed"] == 2
+    assert phase["trials"] == {"COMPLETE": 2}
 
 
 def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path) -> None:
@@ -139,10 +141,79 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
     assert set(cli_phase) == PHASE_STATUS_KEYS
 
 
+def _mixed_outcome_experiment(tmp_path: Path) -> Experiment:
+    """Build a three-trial grid whose trials finish COMPLETE, FAIL and INFEASIBLE in turn."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+
+        x = next(int(arg.removeprefix("--x=")) for arg in sys.argv if arg.startswith("--x="))
+        if x == 2:
+            sys.exit(1)
+        print(f"x={5.0 if x == 3 else 0.5}")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=3,
+        max_consecutive_failures=3,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=3)},
+    )
+    metric = Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        max=1.0,
+    )
+    return make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase], metric=metric)
+
+
+def test_status_counts_follow_the_trial_table_state_names(tmp_path: Path) -> None:
+    """A trial that completed out of bounds reads INFEASIBLE in the counts, as in ``status --trials``.
+
+    ``COMPLETE`` counts the trials that finished within every bound and constraint.
+    Infeasible and failed trials are finished too and count toward ``n_trials``.
+    """
+    experiment = _mixed_outcome_experiment(tmp_path)
+    run_experiment(experiment)
+
+    (phase_status,) = experiment_status(experiment)["phases"]
+    (read_phase,) = read_status(experiment)["phases"]
+
+    expected = {"COMPLETE": 1, "INFEASIBLE": 1, "FAIL": 1}
+    assert phase_status["trials"] == expected
+    assert phase_status["generation_trials"] == expected
+    assert read_phase["trials"] == expected
+    assert next(iter(phase_status)) == "name"
+    (table,) = read_trial_tables(experiment).phases
+    assert sorted(str(row["state"]) for row in table.rows) == sorted(expected)
+
+
+def test_published_completion_counts_the_trials_status_calls_complete(tmp_path: Path) -> None:
+    """``completed_trials`` leaves out the INFEASIBLE trial, and a rerun replays that record."""
+    experiment = _mixed_outcome_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    published = winner_path.read_bytes()
+    completion = yaml.safe_load(published)["completion"]
+    (phase_status,) = read_status(experiment)["phases"]
+
+    assert completion["finished_trials"] == 3
+    assert completion["completed_trials"] == phase_status["trials"]["COMPLETE"] == 1
+
+    replayed = run_experiment(experiment)["p"]
+
+    assert replayed.completion == completion
+    assert published_generation_id(experiment) == generation_id
+    assert winner_path.read_bytes() == published
+
+
 def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     tmp_path: Path,
 ) -> None:
-    """A publication that no longer validates adds two keys and invents nothing.
+    """A publication that no longer validates adds one key, ``publication_error``, and invents nothing.
 
     The payload for a corrupt publication must differ from the one for a tree
     that never published; if the two were identical, the operator's natural

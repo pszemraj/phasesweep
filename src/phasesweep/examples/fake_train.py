@@ -20,9 +20,10 @@ from typing import Any
 import yaml
 
 from phasesweep import report_objective
+from phasesweep.runtime.json import JsonObject, JsonValue
 
 #: Standard deviation of the loss noise a ``seed`` adds, comparable to the loss gap between
-#: neighboring learning rates, so close configurations scatter about the trend.
+#: neighboring learning rates.
 SEED_NOISE_SCALE = 0.02
 
 
@@ -73,20 +74,32 @@ def _load_config(path: Path) -> dict[str, Any]:
     return loaded
 
 
-def _get(config: dict[str, Any], path: str, default: Any) -> Any:
+def _get(config: JsonObject, path: str, default: JsonValue) -> JsonValue:
     """Read one dotted path from a nested trainer config.
 
-    :param dict[str, Any] config: Parsed trainer configuration.
+    :param JsonObject config: Parsed trainer configuration.
     :param str path: Dotted mapping path.
-    :param Any default: Value returned when the path is absent.
-    :return Any: Resolved value or ``default``.
+    :param JsonValue default: Value returned when the path is absent.
+    :return JsonValue: Resolved value or ``default``.
     """
-    current: Any = config
+    current: JsonValue = config
     for part in path.split("."):
         if not isinstance(current, dict) or part not in current:
             return default
         current = current[part]
     return current
+
+
+def _scalar(value: JsonValue) -> str | int | float:
+    """Require a config value that a numeric constructor accepts.
+
+    :param JsonValue value: Value read from the trainer config.
+    :raises ValueError: The value is null, a list, or a mapping.
+    :return str | int | float: The value, unchanged.
+    """
+    if value is None or isinstance(value, (list, dict)):
+        raise ValueError(f"Trainer config value {value!r} must be a number.")
+    return value
 
 
 def main() -> None:
@@ -122,27 +135,32 @@ def main() -> None:
     overrides = {k: v for k, v in overrides.items() if v is not None}
     overrides.update(_parse_kv(remaining))
     sleep_seconds = float(
-        args.sleep if args.sleep is not None else _get(config, "runtime.sleep", 0.0)
+        args.sleep if args.sleep is not None else _scalar(_get(config, "runtime.sleep", 0.0))
     )
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
 
     n_layers = int(
         overrides.get(
-            "model.n_layers", overrides.get("n_layers", _get(config, "model.n_layers", 8))
+            "model.n_layers",
+            overrides.get("n_layers", _scalar(_get(config, "model.n_layers", 8))),
         )
     )
     lr = float(
-        overrides.get("optimizer.lr", overrides.get("lr", _get(config, "optimizer.lr", 3e-4)))
+        overrides.get(
+            "optimizer.lr", overrides.get("lr", _scalar(_get(config, "optimizer.lr", 3e-4)))
+        )
     )
     weight_decay = float(
         overrides.get(
             "optimizer.weight_decay",
-            overrides.get("weight_decay", _get(config, "optimizer.weight_decay", 0.05)),
+            overrides.get("weight_decay", _scalar(_get(config, "optimizer.weight_decay", 0.05))),
         )
     )
     dropout = float(
-        overrides.get("model.dropout", overrides.get("dropout", _get(config, "model.dropout", 0.1)))
+        overrides.get(
+            "model.dropout", overrides.get("dropout", _scalar(_get(config, "model.dropout", 0.1)))
+        )
     )
 
     loss = (

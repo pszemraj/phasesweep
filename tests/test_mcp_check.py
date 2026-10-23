@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry, check_catalog
+from phasesweep.runtime.files import PlatformCapabilityError
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_config_catalog
 
 
@@ -186,14 +187,18 @@ def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
         check_catalog(catalog)
 
 
+def _platform_gate_refuses() -> None:
+    raise PlatformCapabilityError("phasesweep runs only on Linux, and this host reports 'test'.")
+
+
 @pytest.mark.parametrize(
     ("patch_target", "value", "match"),
     [
         pytest.param(
-            "phasesweep.mcp.registry.sys.platform",
-            "darwin",
-            "supported only on Linux",
-            id="off_linux",
+            "phasesweep.mcp.registry.require_linux_runtime",
+            _platform_gate_refuses,
+            "runs only on Linux",
+            id="platform_gate_refuses",
         ),
         pytest.param(
             "phasesweep.mcp.registry.read_proc_starttime",

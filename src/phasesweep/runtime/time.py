@@ -14,7 +14,8 @@ def utc_now_iso(
 ) -> str:
     """Return the current UTC time as an ISO-8601 string.
 
-    :param timespec: Timestamp precision accepted by :meth:`datetime.isoformat`.
+    :param Literal["auto", "hours", "minutes", "seconds", "milliseconds", "microseconds"] timespec:
+        Timestamp precision accepted by :meth:`datetime.isoformat`.
     :return str: Timezone-aware UTC timestamp.
     """
     return datetime.now(UTC).isoformat(timespec=timespec)

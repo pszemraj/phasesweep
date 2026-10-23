@@ -31,7 +31,6 @@ from phasesweep.engine.run import run_experiment
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
-    ConfigChangedError,
     ExperimentBusyError,
     InvalidPhaseError,
     PermissionDeniedError,
@@ -41,7 +40,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     _safe_tool,
 )
@@ -58,14 +57,12 @@ from tests.conftest import (
     file_mode,
     requires_nonroot,
     write_constant_trainer,
+    write_experiment_config,
 )
 from tests.ledger_fixtures import republish_as_incomplete
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
-    _drift_experiment,
-    _write_experiment_config,
+    drift_experiment,
     live_runs,
     make_dead_run_handle,
     make_mcp_app,
@@ -73,8 +70,13 @@ from tests.mcp_helpers import (
     patch_popen_capture,
     record_runner_cleanup,
     side_effect_app,
+    stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
+    write_runner_heartbeat,
+    write_srv_catalog,
+    write_srv_config,
 )
 
 RESUMABLE_PHASES = """\
@@ -117,7 +119,7 @@ def _launch_with_poison_project(
     :return tuple[dict[str, Any], Path, Path, dict[str, str]]: Captured spawn,
         project dir, marker dir, and the poisoned parent environment.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     project = tmp_path / "project"
     markers = tmp_path / "markers"
     markers.mkdir()
@@ -185,6 +187,100 @@ def test_concurrency_limit_error_bounds_actionable_run_ids() -> None:
     assert "only after that run is terminal" in message
 
 
+@pytest.mark.parametrize("recovery_required", [False, True], ids=["healthy", "needs-recovery"])
+@pytest.mark.parametrize("launch_target", ["next", "blocking"], ids=["capacity", "same-experiment"])
+def test_capacity_refusal_guidance_matches_the_blocking_run(
+    tmp_path: Path, recovery_required: bool, launch_target: str
+) -> None:
+    """Capacity blocked by cleanup uncertainty needs operator recovery instead of waiting."""
+    blocked_config = write_srv_config(tmp_path, name="blocking")
+    next_config = write_srv_config(tmp_path, name="next")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"blocking": blocked_config, "next": next_config},
+            allow=ALLOW_SIDE_EFFECTS,
+            max_concurrent_runs=1,
+        )
+    )
+    blocker_id = "blocking-run"
+    if recovery_required:
+        stage_dead_run(store, blocker_id, blocked_config, "blocking", cleanup_uncertain=False)
+    else:
+        stage_live_run(store, blocker_id, blocked_config, "blocking")
+
+    expected_error = ConcurrencyLimitError if launch_target == "next" else ExperimentBusyError
+    with pytest.raises(expected_error) as refused:
+        app.launch(launch_target)
+
+    message = str(refused.value)
+    assert blocker_id in message
+    if recovery_required:
+        assert "operator" in message
+        assert "recover-run" in message
+        assert "await_run" not in message
+    else:
+        assert "await_run" in message
+        if launch_target == "next":
+            assert "only after that run is terminal" in message
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["fresh-heartbeat", "stale-heartbeat"])
+@pytest.mark.parametrize("launch_target", ["next", "blocking"], ids=["capacity", "same-experiment"])
+def test_capacity_refusal_qualifies_unobservable_runner_liveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_target: str, stale: bool
+) -> None:
+    """A hidden runner keeps its reservation without a false claim that it is alive or dead.
+
+    A stale heartbeat sends the operator to recover it from a host shell, and still
+    leaves the run holding its slot.
+    """
+    blocked_config = write_srv_config(tmp_path, name="blocking")
+    next_config = write_srv_config(tmp_path, name="next")
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"blocking": blocked_config, "next": next_config},
+            allow=ALLOW_SIDE_EFFECTS,
+            max_concurrent_runs=1,
+        )
+    )
+    handle = stage_live_run(store, "hidden-run", blocked_config, "blocking")
+    write_runner_heartbeat(
+        store,
+        handle.run_id,
+        age_seconds=mcp_runs.RUNNER_HEARTBEAT_STALE_SECONDS + 30.0 if stale else 0.0,
+    )
+    monkeypatch.setattr(
+        RunStore,
+        "runner_view",
+        lambda _self, _handle: RunnerView("unobservable", "another PID namespace"),
+    )
+    before = store.observe(handle)
+    assert before.state == "running"
+    assert before.recovery_required is False
+    assert before.runner_heartbeat_stale is stale
+
+    expected_error = ConcurrencyLimitError if launch_target == "next" else ExperimentBusyError
+    with pytest.raises(expected_error) as refused:
+        app.launch(launch_target)
+
+    message = str(refused.value)
+    assert handle.run_id in message
+    assert "host shell" in message
+    if stale:
+        assert "recover-run" in message
+        assert "await_run" not in message
+        assert "Monitor durable progress" not in message
+    else:
+        assert "cannot verify" in message
+        assert "progress" in message
+    after = store.observe(handle)
+    assert after.state == "running"
+    assert after.recovery_required is False
+    assert live_runs(store) == [handle]
+
+
 def test_safe_tool_redacts_unexpected_exception() -> None:
     @_safe_tool
     def boom() -> None:
@@ -214,8 +310,8 @@ def test_launch_permission_denied_before_spawn(
     tmp_path: Path, allow: dict[str, bool] | None, kwargs: dict[str, str], action: str
 ) -> None:
     """A launch is refused for a missing permission before any validation or spawn."""
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=allow))
+    config = write_srv_config(tmp_path)
+    app, _registry, _store = make_mcp_app(write_srv_catalog(tmp_path, config, allow=allow))
 
     with pytest.raises(PermissionDeniedError, match=f"action '{action}' is not permitted"):
         app.launch("srv", **kwargs)
@@ -287,7 +383,7 @@ def test_resume_rejects_incompatible_winner_before_spawn(
     incomplete: bool,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    published = _drift_experiment(tmp_path, trainer)
+    published = drift_experiment(tmp_path, trainer)
     run_experiment(published)
     if incomplete:
         republish_as_incomplete(published)
@@ -303,8 +399,10 @@ def test_resume_rejects_incompatible_winner_before_spawn(
         search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q]))
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phases=[p, q]))
+    app, _registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
 
     with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
@@ -332,7 +430,7 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         sampler=Sampler(type="random", seed=1),
         search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
-    published = _drift_experiment(tmp_path, trainer, phases=[p, q])
+    published = drift_experiment(tmp_path, trainer, phases=[p, q])
     run_experiment(published)
     # The operator appends phase r, which resumes from q's published winner,
     # after q's source trial tree has been removed.
@@ -344,9 +442,11 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         search_space={"bs": IntParam(type="int", low=1, high=2)},
     )
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q, r]))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phases=[p, q, r]))
     shutil.rmtree(_phase_dir(published, "q"))
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, _registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
 
     validate = Mock(wraps=validation_ops._validate_generation_manifest)
     monkeypatch.setattr(validation_ops, "_validate_generation_manifest", validate)
@@ -355,16 +455,6 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
         app.launch("srv", from_phase="r")
 
     validate.assert_called_once()
-    assert store.list_handles() == []
-
-
-def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> None:
-    config, app, _registry, store = side_effect_app(tmp_path)
-    config.write_text(config.read_text().replace("python train.py", "python changed.py"))
-
-    with pytest.raises(ConfigChangedError, match="changed since server startup"):
-        app.launch("srv")
-
     assert store.list_handles() == []
 
 
@@ -392,9 +482,9 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
 def test_launch_passes_config_snapshot_to_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     app, registry, store = make_mcp_app(
-        _catalog(
+        write_srv_catalog(
             tmp_path,
             config,
             allow=ALLOW_SIDE_EFFECTS,
@@ -981,7 +1071,7 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     the server-owned state directory and the project directory travels as an
     explicit argument the runner applies later.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     runner_cwd = tmp_path / "runner-cwd"
     runner_cwd.mkdir()
     app, registry, _store = make_mcp_app(
@@ -1006,13 +1096,15 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker" / "startup.py"))
     monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
     monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, _registry, _store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     captured = patch_popen_capture(monkeypatch)
 
     app.launch("srv")
@@ -1031,7 +1123,6 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     assert env["PHASESWEEP_KEEP_ME"] == "kept"
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
 @pytest.mark.integration
 def test_spawned_runner_cannot_execute_project_local_code(
     tmp_path: Path,
@@ -1068,7 +1159,7 @@ def test_spawned_runner_cannot_execute_project_local_code(
     assert str(project) not in resolved.read_text()
 
 
-def test_launch_records_the_current_boot_id_in_the_spawned_handle(
+def test_launch_records_the_spawned_process_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1080,6 +1171,7 @@ def test_launch_records_the_current_boot_id_in_the_spawned_handle(
     handle = store.get(run_id)
     assert handle is not None
     assert handle.boot_id == read_boot_id()
+    assert handle.pid_namespace == read_pid_namespace()
 
 
 def test_launch_refuses_a_runner_receipt_without_boot_identity(
@@ -1109,7 +1201,6 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     assert terminal["returncode"] == 1
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
 @pytest.mark.integration
 def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,
@@ -1144,11 +1235,12 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
 def test_audit_log_records_side_effects_without_sensitive_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config = write_srv_config(tmp_path)
+    registry = Registry.load(write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"
-    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    audit = AuditLogger(audit_path)
+    app = PhaseSweepMCP(registry, store, audit=audit)
     captured = patch_popen_capture(monkeypatch)
 
     app.validate("srv")
@@ -1166,7 +1258,7 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
         TOOL_LAUNCH_RUN,
         TOOL_LAUNCH_RUN,
     ]
-    assert {record["session_id"] for record in records}
+    assert {record["session_id"] for record in records} == {audit.session_id}
     assert all(record["actor"] == "local-stdio" for record in records)
     assert all(record["transport"] == "stdio" for record in records)
 
@@ -1206,8 +1298,8 @@ def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    config = write_srv_config(tmp_path)
+    catalog = write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     audit_path = registry.state_dir / "audit.jsonl"

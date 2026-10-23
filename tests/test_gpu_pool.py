@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -696,6 +697,58 @@ def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
         [0, 1, 2, 3],
         {"2": "GPU-abc123", "3": "MIG-def456"},
     )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(FileNotFoundError("nvidia-smi"), id="missing-binary"),
+        pytest.param(PermissionError("nvidia-smi"), id="not-executable"),
+        pytest.param(subprocess.TimeoutExpired("nvidia-smi", 5), id="timeout"),
+    ],
+)
+def test_inventory_probe_without_a_usable_nvidia_smi_is_empty(monkeypatch, failure) -> None:
+    """A missing, unrunnable or hung nvidia-smi is an empty inventory, which callers refuse on."""
+
+    def run(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr("phasesweep.runtime.gpu.subprocess.run", run)
+
+    assert _real_detect_gpu_inventory() == ([], {})
+
+
+def test_inventory_probe_with_a_nonzero_exit_is_empty(monkeypatch) -> None:
+    """An nvidia-smi that fails reports no inventory, whatever it printed."""
+
+    class _Out:
+        returncode = 9
+        stdout = "0, GPU-abc123\n"
+
+    monkeypatch.setattr("phasesweep.runtime.gpu.subprocess.run", lambda *args, **kwargs: _Out())
+
+    assert _real_detect_gpu_inventory() == ([], {})
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        pytest.param(
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), id="undecodable"
+        ),
+        pytest.param(RuntimeError("probe defect"), id="internal-error"),
+    ],
+)
+def test_inventory_probe_defect_is_not_swallowed(monkeypatch, defect) -> None:
+    """Only "no usable nvidia-smi" is an empty inventory; any other failure must surface."""
+
+    def run(*_args, **_kwargs):
+        raise defect
+
+    monkeypatch.setattr("phasesweep.runtime.gpu.subprocess.run", run)
+
+    with pytest.raises(type(defect)):
+        _real_detect_gpu_inventory()
 
 
 @pytest.mark.parametrize(

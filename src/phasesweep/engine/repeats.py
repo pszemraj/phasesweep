@@ -314,9 +314,19 @@ def within_noise(winner: RankedGroup, other: RankedGroup) -> bool:
     :param RankedGroup other: Another ranked group.
     :return bool: Whether the aggregates differ by at most two combined standard errors.
     """
-    first, second = winner.spread, other.spread
-    error = math.sqrt(first["sd"] ** 2 / first["n"] + second["sd"] ** 2 / second["n"])
+    error = combined_standard_error(winner, other)
     return abs(winner.aggregate - other.aggregate) <= _NOISE_STANDARD_ERRORS * error
+
+
+def combined_standard_error(first: RankedGroup, second: RankedGroup) -> float:
+    """Return the combined standard error used by the repeat-group noise heuristic.
+
+    :param RankedGroup first: First complete group's sample statistics.
+    :param RankedGroup second: Second complete group's sample statistics.
+    :return float: Square root of the summed variances of their sample means.
+    """
+    a, b = first.spread, second.spread
+    return math.sqrt(a["sd"] ** 2 / a["n"] + b["sd"] ** 2 / b["n"])
 
 
 def observed_means(members: Sequence[Mapping[str, float]]) -> dict[str, float]:

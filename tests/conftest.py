@@ -17,6 +17,7 @@ from typing import Any, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
@@ -37,6 +38,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
+    FEASIBLE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -169,7 +171,7 @@ def file_mode(path: Path) -> int:
 #: Optuna journal op codes this helper needs. Mirrors
 #: ``optuna.storages.journal._storage.JournalOperation`` and
 #: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
-_JOURNAL_CREATE_STUDY = 0
+JOURNAL_CREATE_STUDY = 0
 _JOURNAL_SET_STUDY_USER_ATTR = 2
 
 
@@ -191,7 +193,7 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
     study_id = None
     next_id = 0
     for record in records:
-        if record.get("op_code") == _JOURNAL_CREATE_STUDY:
+        if record.get("op_code") == JOURNAL_CREATE_STUDY:
             if record.get("study_name") == study_name:
                 study_id = next_id
             next_id += 1
@@ -231,7 +233,21 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
         _write_artifact_root_binding(experiment)
 
 
-def _bounded_metric(**bounds: float) -> Metric:
+def tell_feasible(study: optuna.Study, trial: optuna.Trial, value: float = 0.5) -> None:
+    """Complete a hand-built trial as a run completes one inside every bound.
+
+    A run records the feasibility attr before a trial completes, and a COMPLETE trial
+    without it reads ``INFEASIBLE`` in counts and tables.
+
+    :param optuna.Study study: Study that owns ``trial``.
+    :param optuna.Trial trial: Asked trial to complete.
+    :param float value: Objective value to tell.
+    """
+    trial.set_user_attr(FEASIBLE_ATTR, True)
+    study.tell(trial, value)
+
+
+def bounded_metric(**bounds: float) -> Metric:
     """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
     return Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
@@ -239,17 +255,27 @@ def _bounded_metric(**bounds: float) -> Metric:
     )
 
 
-def _phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
+def phase_study(experiment: Experiment, phase_name: str = "p") -> optuna.Study:
+    """Read one phase's study from the experiment's ledger.
+
+    :param Experiment experiment: Experiment whose ledger is read.
+    :param str phase_name: Phase whose study is read.
+    :return optuna.Study: Its recorded study.
+    """
+    return optuna.load_study(
+        study_name=f"{experiment.experiment}::{phase_name}",
+        storage=_resolve_storage(experiment.resolved_storage),
+    )
+
+
+def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.trial.FrozenTrial]:
     """Read one phase's trials from the experiment's ledger.
 
     :param Experiment experiment: Experiment whose ledger is read.
     :param str phase_name: Phase whose study is read.
     :return list[optuna.trial.FrozenTrial]: Its trials in number order.
     """
-    storage = _resolve_storage(experiment.resolved_storage)
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::{phase_name}", storage=storage
-    ).get_trials(deepcopy=False)
+    return phase_study(experiment, phase_name).get_trials(deepcopy=False)
 
 
 @pytest.fixture(autouse=True)
@@ -258,6 +284,14 @@ def isolate_phasesweep_homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("PHASESWEEP_HOME", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache-home"))
+
+
+@pytest.fixture(autouse=True)
+def isolate_working_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run each test from its own empty directory, so a default relative ``./runs`` stays out of the repo."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
 
 
 @pytest.fixture(autouse=True)
@@ -305,21 +339,19 @@ def restored_signal_ownership() -> Iterator[None]:
 
     # Bound at entry so a replacement a test installs cannot do the restoring.
     restore_signal = signal.signal
-    restore_mask = getattr(signal, "pthread_sigmask", None)
+    restore_mask = signal.pthread_sigmask
     prior_owner = shutdown._process_lifetime_owner
     prior_depth = shutdown._scope_depth
     prior_servicing = shutdown._servicing_signum
     prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
-    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
+    prior_mask = restore_mask(signal.SIG_BLOCK, set())
     try:
         yield
     finally:
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_BLOCK, set(shutdown._SHUTDOWN_SIGNALS))
+        restore_mask(signal.SIG_BLOCK, set(shutdown._SHUTDOWN_SIGNALS))
         for sig, handler in prior_handlers.items():
             restore_signal(sig, handler)
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_SETMASK, prior_mask)
+        restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
         shutdown._servicing_signum = prior_servicing
@@ -512,7 +544,7 @@ def make_experiment(
         experiment=experiment,
         trial_command=trial_command,
         override_format=override_format,
-        metric=metric or _bounded_metric(),
+        metric=metric or bounded_metric(),
         phases=phases,
     )
     if trainer_config is not None:
@@ -536,8 +568,21 @@ def make_experiment(
     return Experiment(**kwargs)
 
 
+def write_experiment_config(path: Path, experiment: Experiment) -> Path:
+    """Write an experiment model to a YAML config file.
+
+    :param Path path: Output config path.
+    :param Experiment experiment: Experiment model to serialize.
+    :return Path: The written config path.
+    """
+    path.write_text(
+        yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
+    )
+    return path
+
+
 def write_yaml(tmp_path: Path, body: str) -> Path:
-    """Write a YAML body verbatim to ``tmp_path/exp.yaml``; return the path.
+    """Write a YAML body, dedented, to ``tmp_path/exp.yaml``; return the path.
 
     Body is passed through ``textwrap.dedent`` so callers can use indented
     triple-quoted strings naturally. No ``.format()`` magic — if a test

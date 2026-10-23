@@ -17,13 +17,14 @@ from typing import IO
 
 import optuna
 import pytest
-import yaml
 
 from phasesweep import run_experiment
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
+    ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
 )
 from phasesweep.engine.errors import (
@@ -47,12 +48,14 @@ from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _experiment_dir,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_path,
 )
 from phasesweep.engine.read import read_status
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    FEASIBLE_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+)
 from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import (
@@ -60,8 +63,11 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 from tests.conftest import (
+    JOURNAL_CREATE_STUDY,
+    invoke_cli_boundary,
     make_experiment,
     mark_current_format,
+    phase_study,
     requires_nonroot,
     temporary_umask,
     write_constant_trainer,
@@ -69,9 +75,6 @@ from tests.conftest import (
 from tests.ledger_fixtures import (
     append_journal_tail,
     materialize,
-    published_generation_id,
-    reanchor_summary_pointer,
-    reseal_winner,
     tree_snapshot,
 )
 from tests.recovery_helpers import load_only_recovery_needs
@@ -109,34 +112,81 @@ def test_unmarked_output_root_is_refused_before_mutation(
 def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     tmp_path: Path,
 ) -> None:
-    """A publication with the preceding winner format is refused before any write."""
+    """An artifact root whose binding records the previous format version is refused before any write."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    generation = published_generation_id(experiment)
-    assert generation is not None
-    winner_path = _generation_winner_path(experiment, generation, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["trainer_inherit_env"] = "none"
-    reseal_winner(experiment, generation, winner)
-    summary_path = _generation_summary_path(experiment, generation)
-    summary = yaml.safe_load(summary_path.read_text())
-    summary["schema_version"] = 3
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    previous = ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1
     binding_path = _artifact_root_binding_path(experiment)
     binding = json.loads(binding_path.read_text())
-    binding["schema_version"] = 6
+    binding["schema_version"] = previous
     binding_path.write_text(json.dumps(binding) + "\n")
     before = tree_snapshot(materialized.root)
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match="unsupported PhaseSweep format 6",
+        match=f"unsupported PhaseSweep format {previous}",
     ) as excinfo:
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     assert tree_snapshot(materialized.root) == before
+
+
+@pytest.mark.parametrize("format_record", ["artifact-root", "study"])
+@pytest.mark.parametrize(
+    "command, options, read_only",
+    [
+        ("status", [], True),
+        ("status", ["--trials"], True),
+        ("show-winners", [], True),
+        ("run", ["--dry-run"], True),
+        ("run", [], False),
+    ],
+)
+def test_format_refusal_guidance_matches_cli_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    format_record: str,
+    command: str,
+    options: list[str],
+    read_only: bool,
+) -> None:
+    """Unsupported formats give inspection advice on reads and fresh-state advice on runs."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    if format_record == "artifact-root":
+        binding_path = _artifact_root_binding_path(materialized.experiment)
+        binding = json.loads(binding_path.read_text())
+        binding["schema_version"] -= 1
+        binding_path.write_text(json.dumps(binding) + "\n")
+    else:
+        records = [json.loads(line) for line in materialized.ledger_path.read_text().splitlines()]
+        changed = False
+        for record in records:
+            attrs = record.get("user_attr", {})
+            if STUDY_SCHEMA_ATTR in attrs:
+                attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
+                changed = True
+        assert changed
+        materialized.ledger_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
+    before = tree_snapshot(materialized.root)
+
+    code = invoke_cli_boundary([command, str(materialized.config_path), *options], monkeypatch)
+
+    output = capsys.readouterr()
+    assert code == 1
+    assert "unsupported" in output.err
+    assert "Traceback" not in output.err
+    assert tree_snapshot(materialized.root) == before
+    if read_only:
+        assert "inspect the raw artifacts" in output.err
+        assert "exact checkout that produced" in output.err
+        assert "if available" in output.err
+        assert "fresh namespace" not in output.err
+    else:
+        assert "fresh namespace" in output.err
 
 
 @pytest.mark.parametrize(
@@ -370,6 +420,53 @@ def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path) -> No
         reclaimed.studies["other"] = study  # type: ignore[index]
 
 
+def test_reopening_phase_studies_appends_no_journal_records(tmp_path: Path) -> None:
+    """Only the first open of a phase study writes its ``CREATE_STUDY`` record.
+
+    Optuna's journal appends a creation record on every create call and only then
+    finds that the name exists, so opening an existing study through a
+    ``load_if_exists`` create would grow the journal on every rerun. Reopening
+    through the same handle and through a freshly claimed one must leave the
+    journal's bytes unchanged.
+    """
+    journal = tmp_path / "study.journal"
+    phases = [
+        Phase(
+            name=name,
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+        for name in ("first", "second")
+    ]
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{journal}",
+        trainer=write_constant_trainer(tmp_path),
+        phases=phases,
+    )
+
+    def created_studies() -> list[str]:
+        records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        return [r["study_name"] for r in records if r["op_code"] == JOURNAL_CREATE_STUDY]
+
+    claimed = claim_ledger(validate_ledger(experiment))
+    for phase in phases:
+        open_phase_study(claimed, phase)
+    assert created_studies() == ["t::first", "t::second"]
+    opened = journal.read_bytes()
+
+    for phase in phases:
+        open_phase_study(claimed, phase)
+    reclaimed = claim_ledger(validate_ledger(experiment))
+    assert list(reclaimed.studies) == ["first", "second"]
+    for phase in phases:
+        open_phase_study(reclaimed, phase)
+
+    assert created_studies() == ["t::first", "t::second"]
+    assert journal.read_bytes() == opened
+
+
 def test_claim_ledger_writes_tree_binding_before_claiming_studies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -430,7 +527,11 @@ def _bound_tree_with_foreign_study(tmp_path: Path, *, foreign: bool = True) -> E
     storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     study = optuna.create_study(study_name="t::p", storage=_resolve_storage(storage))
-    study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=0.5, state=optuna.trial.TrialState.COMPLETE, user_attrs={FEASIBLE_ATTR: True}
+        )
+    )
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
     mark_current_format(experiment, study)
     if foreign:
@@ -599,7 +700,7 @@ def test_empty_unstamped_phase_study_can_resume_in_current_ledger(tmp_path: Path
 
     run_experiment(resumed)
 
-    study = optuna.load_study(study_name="t::q", storage=_resolve_storage(resumed.resolved_storage))
+    study = phase_study(resumed, "q")
     assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
     assert len(study.trials) == 1
 
@@ -766,7 +867,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
     def repair() -> None:
         try:
             repair_incomplete_journal_record(ledger)
-        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+        except BaseException as exc:  # handed to the assertions below
             raised.append(exc)
 
     worker = threading.Thread(target=repair, daemon=True)

@@ -17,6 +17,7 @@ from phasesweep.config.models import (
     Metric,
     Observation,
     Phase,
+    experiment_warnings,
 )
 from phasesweep.config.search import Sampler, sampler_capability_line
 from phasesweep.evidence.models import (
@@ -139,6 +140,196 @@ def test_evaluation_axis_is_part_of_study_identity():
         return _phase_fingerprint(experiment, experiment.phases[0], {})
 
     assert fingerprint("_step") != fingerprint("eval/step")
+
+
+@pytest.mark.parametrize("backend", ["wandb", "mlflow"])
+@pytest.mark.parametrize("source", ["trainer_config", "fixed_overrides"])
+@pytest.mark.parametrize("key", ["load_best_model_at_end", "training.load_best_model_at_end"])
+def test_best_model_reload_warns_about_remote_evaluation_position(backend, source, key):
+    settings = {key: True}
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config=settings if source == "trainer_config" else {},
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                fixed_overrides=settings if source == "fixed_overrides" else {},
+            )
+        ],
+    ).model_dump(mode="json")
+    experiment["metric"]["extractor"] = (
+        {
+            "type": "wandb",
+            "entity": "e",
+            "project": "p",
+            "metric_key": "eval/loss",
+            "evaluation_axis": "train/global_step",
+        }
+        if backend == "wandb"
+        else {"type": "mlflow", "metric_key": "eval/loss", "select": "last"}
+    )
+    if backend == "mlflow":
+        experiment["mlflow"] = {"tracking_uri": "databricks", "experiment_id": "1"}
+
+    warnings = experiment_warnings(Experiment.model_validate(experiment))
+
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert f"load_best_model_at_end=True (set in {source})" in warning
+    assert "scored best-checkpoint weights may differ from the terminal training step" in warning
+    assert "does not verify checkpoint identity" in warning
+    assert all(
+        field in warning
+        for field in (
+            "json_envelope",
+            "policy",
+            "checkpoint",
+            "step",
+            "evaluation.progress",
+            "evaluation_axis",
+        )
+    )
+
+
+@pytest.mark.parametrize("value", [None, False, "true", 1])
+def test_best_model_warning_requires_explicit_true(value):
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config={} if value is None else {"load_best_model_at_end": value},
+        metric=Metric(
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        ),
+    )
+
+    assert experiment_warnings(experiment) == []
+
+
+def test_best_model_envelope_does_not_warn_about_remote_history():
+    experiment = make_experiment(
+        override_format="hydra",
+        trainer_config={"training": {"load_best_model_at_end": True}},
+        metric=Metric(
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="validation", policy="best"
+            )
+        ),
+    )
+
+    assert experiment_warnings(experiment) == []
+
+
+def _best_model_command_experiment(
+    trial_command: str,
+    *,
+    backend: str = "wandb",
+    override_format: str = "argparse",
+    trainer_config: JsonObject | None = None,
+) -> Experiment:
+    """Build an experiment with ``trial_command`` as the flag's source unless told otherwise."""
+    extractor = (
+        WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        if backend == "wandb"
+        else JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="best"
+        )
+    )
+    return make_experiment(
+        trial_command=trial_command,
+        override_format=override_format,
+        trainer_config=trainer_config,
+        metric=Metric(extractor=extractor),
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "python train.py --load_best_model_at_end {overrides}", id="bare-then-placeholder"
+        ),
+        pytest.param("python train.py {overrides} --load_best_model_at_end", id="bare-at-end"),
+        pytest.param(
+            "python train.py --load_best_model_at_end --lr 1e-4 {overrides}",
+            id="bare-then-flag",
+        ),
+        pytest.param("python train.py --load_best_model_at_end true {overrides}", id="true"),
+        pytest.param("python train.py --load_best_model_at_end True {overrides}", id="True"),
+        pytest.param("python train.py --load_best_model_at_end 1 {overrides}", id="one"),
+        pytest.param("python train.py --load_best_model_at_end yes {overrides}", id="yes"),
+        pytest.param("python train.py --load_best_model_at_end=true {overrides}", id="equals-true"),
+        pytest.param("python train.py --load_best_model_at_end=1 {overrides}", id="equals-one"),
+        pytest.param(
+            "python train.py training.load_best_model_at_end=true {overrides}", id="hydra"
+        ),
+        pytest.param(
+            "python train.py +training.load_best_model_at_end=True {overrides}", id="hydra-plus"
+        ),
+        pytest.param(
+            "python train.py ++load_best_model_at_end=true {overrides}", id="hydra-plus-plus"
+        ),
+        pytest.param(
+            "python train.py ~trainer.args.load_best_model_at_end=true {overrides}",
+            id="hydra-tilde",
+        ),
+        pytest.param(
+            'python train.py --note "unbalanced --load_best_model_at_end {overrides}',
+            id="unbalanced-quote-falls-back-to-whitespace-split",
+        ),
+    ],
+)
+def test_best_model_warning_reads_trial_command(command):
+    warnings = experiment_warnings(_best_model_command_experiment(command))
+
+    assert len(warnings) == 1
+    assert "load_best_model_at_end=True (set in trial_command)" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("python train.py {overrides}", id="absent"),
+        pytest.param("python train.py --load_best_model_at_end false {overrides}", id="false"),
+        pytest.param("python train.py --load_best_model_at_end False {overrides}", id="False"),
+        pytest.param("python train.py --load_best_model_at_end 0 {overrides}", id="zero"),
+        pytest.param("python train.py --load_best_model_at_end no {overrides}", id="no"),
+        pytest.param(
+            "python train.py --load_best_model_at_end=false {overrides}", id="equals-false"
+        ),
+        pytest.param("python train.py --load_best_model_at_end=0 {overrides}", id="equals-zero"),
+        pytest.param(
+            "python train.py training.load_best_model_at_end=false {overrides}", id="hydra-false"
+        ),
+        pytest.param(
+            "python train.py --load_best_model_at_end_strategy true {overrides}",
+            id="longer-flag-name",
+        ),
+        pytest.param(
+            "python train.py --metric_for_best_model=load_best_model_at_end {overrides}",
+            id="name-only-in-value",
+        ),
+    ],
+)
+def test_best_model_warning_ignores_disabled_or_unrelated_trial_command(command):
+    assert experiment_warnings(_best_model_command_experiment(command)) == []
+
+
+def test_best_model_trial_command_does_not_warn_under_envelope():
+    command = "python train.py --load_best_model_at_end {overrides}"
+
+    assert experiment_warnings(_best_model_command_experiment(command, backend="envelope")) == []
+
+
+def test_best_model_warning_names_every_source_in_one_warning():
+    experiment = _best_model_command_experiment(
+        "python train.py --load_best_model_at_end {overrides}",
+        override_format="hydra",
+        trainer_config={"load_best_model_at_end": True},
+    )
+
+    (warning,) = experiment_warnings(experiment)
+
+    assert "load_best_model_at_end=True (set in trainer_config, trial_command)" in warning
 
 
 def test_wandb_query_normalizes_targets_and_collects_exact_keys():
@@ -598,6 +789,41 @@ def test_env_rejects_names_and_values_the_launch_cannot_pass(
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "PHASESWEEP_TRIAL_DIR",
+        "PHASESWEEP_TRIAL_ID",
+        "PHASESWEEP_PHASE",
+        "PHASESWEEP_RUN_NAME",
+        "PHASESWEEP_GENERATION_ID",
+        "PHASESWEEP_ATTEMPT_ID",
+        "PHASESWEEP_OVERRIDES_SHA256",
+        "PHASESWEEP_OBJECTIVE_PATH",
+    ],
+)
+def test_env_rejects_per_attempt_variables(name: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        make_experiment(env={name: "ignored"})
+    message = str(caught.value)
+    assert name in message
+    assert "PhaseSweep sets" in message
+    assert "every attempt" in message
+    assert "Remove" in message
+
+
+def test_env_allows_other_phasesweep_variables() -> None:
+    experiment = make_experiment(env={"PHASESWEEP_LOCK_DIR": "/tmp/locks"})
+    assert experiment.env == {"PHASESWEEP_LOCK_DIR": "/tmp/locks"}
+
+
+def test_env_reports_all_reserved_variables_together() -> None:
+    with pytest.raises(ValidationError) as caught:
+        make_experiment(env={"PHASESWEEP_PHASE": "p", "PHASESWEEP_TRIAL_ID": "123"})
+    assert "PHASESWEEP_PHASE" in str(caught.value)
+    assert "PHASESWEEP_TRIAL_ID" in str(caught.value)
+
+
+@pytest.mark.parametrize(
     ("field", "names", "message"),
     [
         pytest.param("inherit_env", [""], "nonempty and unpadded", id="inherit_empty"),
@@ -815,12 +1041,7 @@ phases:
 
 
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
-    """A parser/scanner error must carry the file path, not PyYAML's stream label.
-
-    Bad indentation is one of the two most common YAML mistakes. PyYAML marks it
-    ``in "<unicode string>"``, so an unwrapped error leaves an operator with a
-    line number and no file - useless for a suite that loads several configs.
-    """
+    """A parser/scanner error must carry the file path, not PyYAML's ``<unicode string>`` label."""
     config_path = tmp_path / "broken.yaml"
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 
@@ -1097,10 +1318,11 @@ def test_observe_names_are_distinct_from_metric_and_constraints() -> None:
     ids=["wandb", "mlflow"],
 )
 def test_observe_refuses_remote_extractors(extractor: JsonObject, tmp_path: Path) -> None:
-    """Remote readers wait for every key, so an observation may only read local files."""
+    """Remote readers require every key, so an observation may only read local files."""
     reason = (
-        r"Observation 'peak' cannot use a \w+ extractor: remote extractors wait for every "
-        r"requested key.*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
+        r"Observation 'peak' cannot use a \w+ extractor: remote extractors require every "
+        r"requested key, so a value the trainer never wrote would fail the trial\. "
+        r".*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
     )
     with pytest.raises(ValidationError, match=reason):
         Observation.model_validate({"name": "peak", "extractor": extractor})

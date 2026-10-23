@@ -9,6 +9,8 @@ represented generations are read permissively from their own files.
 from __future__ import annotations
 
 import logging
+import math
+import statistics
 import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -34,7 +36,7 @@ from phasesweep.engine.optuna import (
     _PhaseTrialStats,
     _published_phase_trial_refs,
     _published_trial_history_available,
-    _trial_state_label,
+    _trial_count_state,
     _TrialRef,
 )
 from phasesweep.engine.paths import (
@@ -45,21 +47,27 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
+    ReduceName,
     RepeatsSummary,
     _repeats_summary,
     _validate_repeats_block,
     group_labels_for,
     repeat_axis,
 )
+from phasesweep.engine.selection import _rank_groups
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
+    TRIAL_OUTCOME_ATTR,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
+    _parsed_trial_outcome,
+    _trial_interrupted,
     _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
@@ -154,9 +162,7 @@ def _phase_status_payloads(
         counts = stats.counts
         payload: dict[str, Any] = {
             "trials": counts,
-            "running": counts.get("RUNNING", 0),
             "n_trials": phase.n_trials,
-            "completed": counts.get("COMPLETE", 0),
             "generation_trials": (
                 stats.generation_counts.get(trial_scope_generation_id, {})
                 if trial_scope_generation_id
@@ -285,9 +291,7 @@ def _represented_winners(
 ) -> list[PhaseWinnerView]:
     """Return the represented generation's winners, in ``phase_names`` order.
 
-    When the represented generation is the validated publication, every winner
-    comes from the bytes that validation read and nothing is reread. Any other
-    generation is read permissively from its files.
+    Where each winner is read from follows the module docstring.
 
     :param Experiment experiment: Experiment whose artifact tree is read.
     :param PublicationPointer publication: This read's single pointer resolution.
@@ -382,9 +386,8 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
     Unlike the last-success pointer, the current pointer is not validated
-    against any artifact: it is progress bookkeeping, always the most recent
-    invocation's own claim, and may legitimately name a failed or
-    in-progress generation.
+    against any artifact: it is progress bookkeeping, naming the most recently
+    claimed generation, and may legitimately name a failed or in-progress one.
 
     :param Experiment experiment: Experiment whose current pointer is read.
     :return str | None: The recorded ``generation_id``, or ``None`` when the
@@ -403,6 +406,7 @@ def read_status(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    trial_generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
 ) -> EngineStatus:
     """Read path-free progress and represented-result status for one experiment.
@@ -410,7 +414,7 @@ def read_status(
     Resolve current and last-success pointers once. Published facts use that capture;
     pinned unpublished generations use their own files. Generation fields mean:
 
-    - ``current_generation_id``: most recent invocation's mutable pointer.
+    - ``current_generation_id``: mutable pointer to the most recently claimed generation.
     - ``published_generation_id``: validated last-success pointer.
     - ``represented_generation_id``: pinned id, or published id by default.
     - ``is_published``: non-null represented id equals the published id.
@@ -422,8 +426,8 @@ def read_status(
     back to current config; ``result_context`` names the source. Semantic fingerprints
     determine ``published_config_matches_current``, or ``None`` if no fingerprint exists.
 
-    ``generation_trials`` counts the pinned generation, or current generation by default;
-    other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
+    ``generation_trials`` counts ``trial_generation_id`` when given, else the pinned
+    generation, else the current generation; other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
     Absent studies have zero counts; unreadable storage sets ``trial_data_available=False``
     and ``running_attempts=None``. ``published_study_unavailable`` marks missing/replaced
     trial identities or incomplete history when readable, otherwise incomplete inspection.
@@ -433,16 +437,20 @@ def read_status(
     :param Experiment experiment: Experiment whose artifacts and trials are inspected.
     :param str | None generation_id: Pin represented artifacts and generation counts,
         leaving pointer identities unchanged.
+    :param str | None trial_generation_id: Generation whose trials ``generation_trials``
+        counts instead of the represented one.
     :param Experiment | None comparison_experiment: Current config for drift comparison
         and fallback semantics; reads still use ``experiment``.
     :raises ArtifactRootConflictError: The root is unreadable or has different ownership.
-    :raises ValueError: ``generation_id`` is not a safe generation name.
+    :raises ValueError: ``generation_id`` or ``trial_generation_id`` is not a safe
+        generation name.
     :return EngineStatus: Identities, integrity, result semantics, progress and artifact
         presence. Path-free ``publication_error`` appears only for failed or denied validation.
     """
     status, _publication = _read_status(
         experiment,
         generation_id=generation_id,
+        trial_generation_id=trial_generation_id,
         comparison_experiment=comparison_experiment,
     )
     return status
@@ -480,6 +488,7 @@ def read_result(
     status, publication = _read_status(
         experiment,
         generation_id=generation_id,
+        trial_generation_id=None,
         comparison_experiment=comparison_experiment,
     )
     winners = _represented_winners(
@@ -495,17 +504,21 @@ def _read_status(
     experiment: Experiment,
     *,
     generation_id: str | None,
+    trial_generation_id: str | None,
     comparison_experiment: Experiment | None,
 ) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional generation to represent.
+    :param str | None trial_generation_id: Optional generation whose trials
+        ``generation_trials`` counts instead of the represented one.
     :param Experiment | None comparison_experiment: Optional current config for
         drift comparison.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
-    :raises ValueError: If ``generation_id`` is not a safe generation name.
+    :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
+        generation name.
     :return tuple[EngineStatus, PublicationPointer]: The status payload and
         the single pointer resolution every fact in it came from.
     """
@@ -521,6 +534,8 @@ def _read_status(
         _validate_safe_name("generation", generation_id)
         represented_generation_id = generation_id
         trial_scope_generation_id = generation_id
+    if trial_generation_id is not None:
+        trial_scope_generation_id = _validate_safe_name("generation", trial_generation_id)
 
     is_published = (
         represented_generation_id is not None
@@ -632,13 +647,40 @@ def _read_status(
 
 
 @dataclass(frozen=True)
+class RepeatGroupView:
+    """Statistics over current completed members of one repeat configuration.
+
+    ``n`` counts finite measured values, including infeasible ones. Missing,
+    failed, interrupted and replaced attempts do not contribute. ``aggregate``
+    is present only when the full group is eligible under the current config;
+    ``sd`` needs at least two measurements. ``winner`` names the publication.
+    """
+
+    group: int
+    params: JsonObject
+    n: int
+    expected: int
+    reduce: ReduceName
+    aggregate: float | None
+    mean: float | None
+    sd: float | None
+    min: float | None
+    max: float | None
+    eligible: bool
+    winner: bool
+    observed: dict[str, float]
+    observed_n: dict[str, int]
+
+
+@dataclass(frozen=True)
 class TrialTable:
     """One phase's trials as table rows, in trial-number order.
 
     ``columns`` lists the keys every row carries, in display order: ``trial``,
     ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
-    repeats phase, one ``observed:<name>`` per report-only value any trial
-    recorded, and ``winner``. ``state`` is the Optuna state, except that a
+    repeats phase, ``rerun_of`` once any trial is a rerun, one ``observed:<name>``
+    per report-only value any trial recorded, an optional ``reason`` when any
+    trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
     ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
     winner stands on and empty elsewhere.
@@ -649,6 +691,7 @@ class TrialTable:
     available: bool
     columns: tuple[str, ...]
     rows: tuple[JsonObject, ...]
+    groups: tuple[RepeatGroupView, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -675,10 +718,23 @@ def _recorded_number(value: object) -> float | None:
     return float(value)
 
 
+def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Read the recorded execution failure or outcome cause for a trial.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose diagnostic is displayed.
+    :return str | None: Recorded cause, or None when no diagnostic was recorded.
+    """
+    failure = trial.user_attrs.get(FAILURE_REASON_ATTR)
+    if isinstance(failure, str) and failure:
+        return failure
+    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return None if outcome is None else outcome.cause
+
+
 #: Columns every trial table starts with, as ``(header, getter)`` pairs.
 _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
     ("trial", lambda trial: trial.number),
-    ("state", _trial_state_label),
+    ("state", _trial_count_state),
     ("value", lambda trial: trial.value),
     ("params", lambda trial: dict(trial.params)),
     ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
@@ -710,6 +766,7 @@ def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
 
 
 def _trial_table(
+    experiment: Experiment,
     phase: Phase,
     trials: Sequence[optuna.trial.FrozenTrial],
     winner: PhaseWinnerView | None,
@@ -718,9 +775,10 @@ def _trial_table(
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
-    A ``rerun_of`` column, naming the interrupted trial each rerun reran, appears
-    once the phase holds a rerun.
+    A ``rerun_of`` column, naming the interrupted trial or failed grid cell each rerun
+    reran, appears once the phase holds a rerun.
 
+    :param Experiment experiment: Current metric and constraint eligibility bounds.
     :param Phase phase: The configured phase the trials belong to.
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
     :param PhaseWinnerView | None winner: The published winner for the phase, if any.
@@ -733,11 +791,14 @@ def _trial_table(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )
     reruns = any(RERUN_OF_ATTR in t.user_attrs for t in trials)
+    reasons = {trial.number: _trial_reason(trial) for trial in trials}
+    has_reason = any(reasons.values())
     columns = (
         *(header for header, _ in _CORE_TRIAL_COLUMNS),
         *([] if axis is None else [_REPEAT_GROUP_COLUMN]),
         *([_RERUN_OF_COLUMN] if reruns else []),
         *observed,
+        *(["reason"] if has_reason else []),
         _WINNER_COLUMN,
     )
     standing = _winning_trials(winner)
@@ -750,13 +811,92 @@ def _trial_table(
             row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
         for name in observed:
             row[name] = _recorded_number(trial.user_attrs.get(name))
+        if has_reason:
+            row["reason"] = reasons[trial.number]
         attempt = standing.get(trial.number)
         marked = trial.number in standing and (
             attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
         )
         row[_WINNER_COLUMN] = "*" if marked else ""
         rows.append(row)
-    return TrialTable(phase=phase.name, available=available, columns=columns, rows=tuple(rows))
+    return TrialTable(
+        phase=phase.name,
+        available=available,
+        columns=columns,
+        rows=tuple(rows),
+        groups=_repeat_group_views(experiment, phase, trials, rows),
+    )
+
+
+def _repeat_group_views(
+    experiment: Experiment,
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    rows: Sequence[JsonObject],
+) -> tuple[RepeatGroupView, ...]:
+    """Summarize every represented configuration using the trial table's group labels.
+
+    :param Experiment experiment: Current selection bounds.
+    :param Phase phase: Configured repeat axis and reducer.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The same capture as the member rows.
+    :param Sequence[JsonObject] rows: Member rows carrying group and published-winner labels.
+    :return tuple[RepeatGroupView, ...]: Groups in ascending label order, empty without repeats.
+    """
+    axis = repeat_axis(phase)
+    if axis is None:
+        return ()
+    labels = group_labels_for(trials, axis)
+    ranking = _rank_groups(trials, experiment, axis)
+    eligible = {labels[group.representative]: group for group in ranking.groups}
+    replaced = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    marked = {row["trial"] for row in rows if row["winner"] == "*"}
+    members: dict[int, list[optuna.trial.FrozenTrial]] = {}
+    params: dict[int, JsonObject] = {}
+    for trial in trials:
+        label = labels.get(trial.number)
+        if label is None:
+            continue
+        members.setdefault(label, [])
+        params[label] = {name: value for name, value in trial.params.items() if name != axis.key}
+        if trial.number not in replaced and not _trial_interrupted(trial):
+            members[label].append(trial)
+    views: list[RepeatGroupView] = []
+    for label, found in sorted(members.items()):
+        values = [
+            float(trial.value)
+            for trial in found
+            if trial.state == optuna.trial.TrialState.COMPLETE
+            and trial.value is not None
+            and math.isfinite(trial.value)
+        ]
+        observations: dict[str, list[float]] = {}
+        for trial in found:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            for name, raw in trial.user_attrs.items():
+                value = _recorded_number(raw)
+                if name.startswith(OBSERVED_PREFIX) and value is not None and math.isfinite(value):
+                    observations.setdefault(name[len(OBSERVED_PREFIX) :], []).append(value)
+        group = eligible.get(label)
+        views.append(
+            RepeatGroupView(
+                group=label,
+                params=params[label],
+                n=len(values),
+                expected=len(axis.values),
+                reduce=axis.reduce,
+                aggregate=None if group is None else group.aggregate,
+                mean=statistics.fmean(values) if values else None,
+                sd=statistics.stdev(values) if len(values) > 1 else None,
+                min=min(values) if values else None,
+                max=max(values) if values else None,
+                eligible=group is not None,
+                winner=bool(found) and all(trial.number in marked for trial in found),
+                observed={name: statistics.fmean(values) for name, values in observations.items()},
+                observed_n={name: len(values) for name, values in observations.items()},
+            )
+        )
+    return tuple(views)
 
 
 def read_trial_tables(experiment: Experiment) -> TrialTables:
@@ -789,10 +929,10 @@ def read_trial_tables(experiment: Experiment) -> TrialTables:
             read = read_phase_trials(ledger, phase)
         except StudyStorageUnavailableError as exc:
             log_storage_read_failure(ledger, phase, exc, logger=log)
-            tables.append(_trial_table(phase, [], None, available=False))
+            tables.append(_trial_table(experiment, phase, [], None, available=False))
             continue
         trials = [] if read is None else read.trials
-        tables.append(_trial_table(phase, trials, winners.get(phase.name)))
+        tables.append(_trial_table(experiment, phase, trials, winners.get(phase.name)))
     return TrialTables(
         experiment=experiment.experiment,
         published_generation_id=published_generation_id,

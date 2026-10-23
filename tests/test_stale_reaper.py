@@ -36,11 +36,12 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -81,12 +82,12 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import _write_config, append_journal_tail
+from tests.ledger_fixtures import append_journal_tail, write_fixture_config
 from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
-    _new_phase_study,
     fabricate_registered_attempt,
     fabricate_stale_trial,
+    new_phase_study,
     stamp_artifact_root,
     write_trial_identity,
 )
@@ -96,15 +97,9 @@ _RECORDED_NAMESPACE = "pid:[4026539001]@100"
 
 
 def test_read_proc_starttime_self():
-    """We should be able to read our own process starttime on Linux."""
-    import os
-
+    """A process can read its own start time."""
     st = read_proc_starttime(os.getpid())
-    # On Linux this should be a positive integer. On non-Linux, None.
-    if Path("/proc/self/stat").exists():
-        assert st is not None and st > 0
-    else:
-        assert st is None
+    assert st is not None and st > 0
 
 
 def test_read_proc_stat_tolerates_non_utf8_comm(tmp_path: Path) -> None:
@@ -249,7 +244,9 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
             exp,
             exp.phases[0],
             inherited_winners={},
-            generation_id="generation-test",
+            generation=InvocationGeneration(
+                exp, generation_id="generation-test", caller_owned_id=True, from_phase=None
+            ),
             ledger=claimed,
         )
     assert reap_called["flag"]
@@ -443,8 +440,10 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         lambda _study: (_ for _ in ()).throw(RuntimeError("schema read failed")),
     )
 
-    with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
+    with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies") as exc_info:
         _preflight_existing_studies(_claimed_over(experiment, studies))
+    # The unexpected error names no remedy, so the aggregate borrows none from the refusal.
+    assert exc_info.value.action is OperatorAction.INSPECT_LOGS
 
 
 def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
@@ -564,9 +563,6 @@ def test_mixed_preflight_error_boundary(
 @pytest.mark.integration
 def test_kill_stale_group_escalates_to_sigkill():
     """A child that ignores SIGTERM must still be killed within the grace window."""
-    if not Path("/proc/self/stat").exists():
-        pytest.skip("Linux-only test (uses /proc starttime)")
-
     # Spawn a child that ignores SIGTERM and only dies on SIGKILL.
     proc = subprocess.Popen(
         [
@@ -579,8 +575,6 @@ def test_kill_stale_group_escalates_to_sigkill():
     try:
         # Give it a moment to install the handler.
         time.sleep(0.3)
-        from phasesweep.runtime.reaper import read_proc_starttime
-
         st = read_proc_starttime(proc.pid)
         assert st is not None
 
@@ -1220,9 +1214,9 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     """
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
-    owner = _write_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
+    owner = write_fixture_config(tmp_path / "b.yaml", ledger_dir=ledger_dir, workdir=tmp_path / "b")
     config_a = tmp_path / "a.yaml"
-    recovering = _write_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
+    recovering = write_fixture_config(config_a, ledger_dir=ledger_dir, workdir=tmp_path / "a")
     study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.journal"
@@ -1258,7 +1252,7 @@ def _fabricate_registered_journal_attempt(
         workdir=tmp_path / "runs",
         storage=f"journal:///{ledger}",
     )
-    study = _new_phase_study(experiment, "p")
+    study = new_phase_study(experiment, "p")
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
@@ -1755,8 +1749,6 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     tmp_path, monkeypatch, wandb_worker_sdk
 ):
     """The existing registry owns the polling worker after the trainer exits."""
-    from phasesweep.runtime.reaper import read_stale_process_identity
-
     old = make_experiment(
         workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}", n_trials=1
     )
@@ -1928,7 +1920,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
-    with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
+    with pytest.raises(
+        PhaseAbortRefusedError, match=r"phases\[p\]\.n_trials above 2 in the config"
+    ):
         run_experiment(_exp(2))
     assert not launched.exists()
 

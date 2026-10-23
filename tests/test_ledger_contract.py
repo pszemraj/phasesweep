@@ -330,8 +330,8 @@ def test_storage_constructors_are_called_only_in_the_ledger_module() -> None:
     )
     chokepoint_references = banned_references(chokepoint)
     assert chokepoint_references, (
-        f"{CHOKEPOINT} no longer constructs any storage; the chokepoint moved and "
-        "CHOKEPOINT here is stale."
+        f"{CHOKEPOINT} constructs no storage; CHOKEPOINT in this module must name the "
+        "module that does."
     )
     sqlite_or_rdb_in_chokepoint = {
         qualified
@@ -341,7 +341,7 @@ def test_storage_constructors_are_called_only_in_the_ledger_module() -> None:
     }
     assert not sqlite_or_rdb_in_chokepoint, (
         f"{CHOKEPOINT} references SQLite/RDB storage: {sqlite_or_rdb_in_chokepoint}. "
-        "The journal is PhaseSweep's only durable backend now, so SQLite/RDB "
+        "The journal is PhaseSweep's only durable backend, so SQLite/RDB "
         "constructors are banned everywhere, including the chokepoint itself."
     )
 

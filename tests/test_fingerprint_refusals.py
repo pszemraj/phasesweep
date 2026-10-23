@@ -26,6 +26,10 @@ from tests.conftest import make_experiment
 from tests.experiments import anchored_phase, project_directory, write_anchored_config
 
 _CWD_SENTENCE = "The trainer working directory follows the directory phasesweep runs from"
+_NEW_STUDY_STEP = (
+    "To run this config, set a new `experiment` name in the config (with `storage: auto` a new "
+    "`workdir` also works); the old study stays readable under the old name."
+)
 
 
 def _stamped_study(experiment: Experiment, *, populated: bool = True) -> optuna.Study:
@@ -100,6 +104,8 @@ def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_di
         f"{_CWD_SENTENCE} when execution.cwd is unset; run from the original directory or set "
         "execution.cwd in the config (relative paths resolve against the config file)."
     ) in message
+    # Running from the original directory keeps the study, so a new name is not offered.
+    assert "new `experiment` name" not in message
     assert caught.value.action is OperatorAction.FIX_CONFIG
 
 
@@ -147,6 +153,17 @@ def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
     assert "env.K10" not in message
 
 
+def test_refusal_gives_the_step_that_runs_the_changed_config() -> None:
+    """A changed input leaves one way forward, so the message names it beside the routing."""
+    study = _stamped_study(make_experiment(provenance={"revision": "toy-v1"}))
+
+    error = _refusal(study, make_experiment(provenance={"revision": "toy-v2"}))
+
+    assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2". ' in str(error)
+    assert str(error).endswith(_NEW_STUDY_STEP)
+    assert error.action is OperatorAction.FRESH_NAMESPACE
+
+
 def test_refusal_for_a_configured_cwd_omits_the_unset_cwd_advice() -> None:
     """A configured ``execution.cwd`` that changed is named, without the unset-cwd advice."""
     study = _stamped_study(make_experiment(execution=ExecutionContext(cwd="/srv/a")))
@@ -171,7 +188,7 @@ def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
     fingerprint = _phase_fingerprint(experiment, experiment.phases[0], {})
     assert message == (
         f"Study {study.study_name!r} was created with a different phase config "
-        f"(fingerprint {'0' * 64} != {fingerprint}). "
+        f"(fingerprint {'0' * 64} != {fingerprint}). {_NEW_STUDY_STEP}"
     )
     assert error.action is OperatorAction.FRESH_NAMESPACE
 

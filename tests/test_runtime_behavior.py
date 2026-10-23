@@ -7,7 +7,6 @@ import json
 import logging
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -26,7 +25,7 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_state_label
+from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_count_state
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -38,7 +37,11 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.run import TerminalReport
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -79,12 +82,13 @@ from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    _bounded_metric,
-    _phase_trials,
+    bounded_metric,
     copy_fake_train,
     make_experiment,
     make_trial_context,
     patch_rejected_trial_user_attr,
+    phase_study,
+    phase_trials,
     requires_nonroot,
     trial_outcome,
     write_constant_trainer,
@@ -158,7 +162,7 @@ def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     )
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
-    (trial,) = _phase_trials(experiment)
+    (trial,) = phase_trials(experiment)
     assert trial.state.name == state
     if state == "COMPLETE":
         assert trial.value == 0.25
@@ -433,7 +437,7 @@ def test_failed_trials_marked_fail_not_complete(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    for trial in _phase_trials(exp, "a"):
+    for trial in phase_trials(exp, "a"):
         # Every trial should be FAIL, not COMPLETE.
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}, expected FAIL"
@@ -542,7 +546,7 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
         run_experiment(expanded)
 
     assert _generation_path(initial).read_bytes() == generation_before
-    assert len(_phase_trials(initial, "local")) == 1
+    assert len(phase_trials(initial, "local")) == 1
 
 
 def test_terminal_callback_reports_success_evidence(
@@ -583,10 +587,16 @@ def test_terminal_callback_reports_success_evidence(
 @pytest.mark.parametrize(
     ("primary_error", "callback_error_type"),
     [
-        pytest.param(NoFeasibleTrialError("phase failed"), RuntimeError, id="failed-exception"),
+        pytest.param(
+            PhaseTrialsFailedError("phase failed"),
+            RuntimeError,
+            id="failed-exception",
+        ),
         # A diagnostic callback raising KeyboardInterrupt cannot mask the primary error.
         pytest.param(
-            NoFeasibleTrialError("phase failed"), KeyboardInterrupt, id="failed-keyboard-interrupt"
+            PhaseTrialsFailedError("phase failed"),
+            KeyboardInterrupt,
+            id="failed-keyboard-interrupt",
         ),
         pytest.param(None, RuntimeError, id="published-success"),
     ],
@@ -602,8 +612,9 @@ def test_terminal_callback_failure_preserves_the_engine_outcome(
     experiment = make_experiment(workdir=tmp_path / "runs")
     captured: list[TerminalReport] = []
 
-    def run_outcome(*_args, **_kwargs):
+    def run_outcome(*_args, generation, **_kwargs):
         if primary_error is not None:
+            generation.claim()
             raise primary_error
         return {}
 
@@ -628,6 +639,44 @@ def test_terminal_callback_failure_preserves_the_engine_outcome(
     assert captured[0].primary_error is primary_error
     assert captured[0].failure_stage == (None if primary_error is None else "execution")
     assert any("terminal callback failed" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("claims", "stage", "studies_reconciled"),
+    [(False, "preflight", False), (True, "execution", True)],
+    ids=["unclaimed", "claimed"],
+)
+def test_failure_stage_and_reconciliation_follow_whether_the_generation_was_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claims: bool,
+    stage: str,
+    studies_reconciled: bool,
+) -> None:
+    """A failure reports ``execution`` and reconciles the studies exactly when it claimed its generation."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    captured: list[TerminalReport] = []
+    preflight_calls = 0
+
+    def preflight(*_args, **_kwargs):
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return {}
+
+    def run_outcome(*_args, generation, **_kwargs):
+        if claims:
+            generation.claim()
+        raise PhaseTrialsFailedError("phase failed")
+
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", run_outcome)
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert [report.failure_stage for report in captured] == [stage]
+    # The second call is the post-failure reconciliation.
+    assert preflight_calls == (2 if studies_reconciled else 1)
 
 
 @pytest.mark.integration
@@ -662,7 +711,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    for trial in _phase_trials(exp, "a"):
+    for trial in phase_trials(exp, "a"):
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}; expected FAIL because "
             "constraint extractor could not find param_bytes."
@@ -777,7 +826,7 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
     from phasesweep.cli import _configure_logging
 
     cases = [
-        ("default_quiet", optuna.logging.INFO, False, optuna.logging.WARNING),
+        ("default_quiet", optuna.logging.INFO, False, optuna.logging.ERROR),
         ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
     ]
 
@@ -795,32 +844,13 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
         root.setLevel(saved_level)
 
 
-def test_runtime_platform_guard_feature_checks_and_dry_run(
+def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real execution needs POSIX process groups and flock; dry-run does not."""
-    import sys
-
+    """Real execution needs Linux; dry-run launches nothing and takes no locks."""
     from phasesweep.runtime import files as runtime_files
 
-    for os_name, has_killpg, has_fcntl in [
-        ("posix", True, True),
-        ("nt", True, True),
-        ("posix", False, True),
-        ("posix", True, False),
-    ]:
-        with monkeypatch.context() as patch:
-            host = SimpleNamespace(name=os_name)
-            if has_killpg:
-                host.killpg = lambda *_args: None
-            patch.setattr(runtime_files, "os", host)
-            if not has_fcntl:
-                patch.setitem(sys.modules, "fcntl", None)
-            if os_name == "posix" and has_killpg and has_fcntl:
-                runtime_files.require_posix_runtime()
-            else:
-                with pytest.raises(RuntimeError, match="requires a POSIX platform"):
-                    runtime_files.require_posix_runtime()
+    runtime_files.require_linux_runtime()
 
     exp = make_experiment(
         experiment="platform_check",
@@ -829,13 +859,11 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
         search_space={"x": IntParam(type="int", low=0, high=1)},
     )
 
-    monkeypatch.delattr(runtime_files.os, "killpg")
-
-    with pytest.raises(RuntimeError, match="requires a POSIX platform"):
-        run_experiment(exp)
-
-    # Dry-run remains available because it launches no subprocesses and takes no locks.
-    winners = run_experiment(exp, dry_run=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_files.sys, "platform", "darwin")
+        with pytest.raises(runtime_files.PlatformCapabilityError, match="only on Linux.*'darwin'"):
+            run_experiment(exp)
+        winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
 
 
@@ -856,7 +884,7 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     # Verify only a small number of trials actually executed before the abort.
     # We can't predict exactly how many because Optuna may have a few in flight,
     # but it should be << 100.
-    n = len(_phase_trials(exp, "a"))
+    n = len(phase_trials(exp, "a"))
     assert n < 30, f"expected early abort, got {n} trials"
 
 
@@ -901,11 +929,9 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
-    )
+    study = phase_study(experiment)
     previous = study.trials
-    assert [_trial_state_label(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
+    assert [_trial_count_state(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
     stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
     assert stopped is not None and "before this trial's trainer launched" in stopped.cause
     for trial in previous:
@@ -981,7 +1007,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
 
     assert injected["n"] == 1
     assert winners["p"].metric == pytest.approx(0.5)
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [trial.state.name for trial in trials] == ["COMPLETE", "COMPLETE"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials] == [1, 2]
     assert all(trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "success" for trial in trials)
@@ -1021,7 +1047,7 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
 
     assert winners["p"].metric == pytest.approx(0.5)
     sequences = sorted(
-        trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in _phase_trials(exp)
+        trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in phase_trials(exp)
     )
     assert first_failed.is_set()
     assert successful_writes[:2] == [1, 0]
@@ -1094,7 +1120,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.RUNNING]
     assert not [
         trial
@@ -1109,7 +1135,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     winners = run_experiment(exp)
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+    study = phase_study(exp)
     trials = study.get_trials(deepcopy=False)
     # Recovery cannot prove what the unrecorded trial measured, so it is
     # interrupted and reruns (trial 1) before the second draw (trial 2).
@@ -1153,7 +1179,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert not [
         trial
         for trial in trials
@@ -1252,6 +1278,23 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         assert CLEANUP_CONFIRMED_ATTR not in unsafe_trial.user_attrs
     assert list(_attempts_dir(_exp(2)).glob("*.json"))
 
+    # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as previewed:
+        run_experiment(_exp(2), dry_run=True)
+    message = str(previewed.value)
+    assert "cleanup could not be confirmed" in message
+    assert "A larger n_trials does not retire this abort" in message
+    assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
+    assert "Then raise phases[p].n_trials above 2 in the config" in message
+    # The closing sentence introduces the recorded results itself, after any remedy.
+    assert "in the config. The recorded trial results stay in the study; " in message
+    # A preview of the larger target refuses the same way, as the live run below does,
+    # and asks only for the cleanup that target still waits on.
+    with pytest.raises(PhaseAbortRefusedError, match="A larger n_trials does not retire") as raised:
+        run_experiment(_exp(3), dry_run=True)
+    assert "phasesweep mcp recover-run" in str(raised.value)
+    assert "Then n_trials=3 retires it." in str(raised.value)
+
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)
     with pytest.raises(ProcessCleanupUncertainError):
@@ -1273,6 +1316,11 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
             cleanup_confirmed=True,
         )
     monkeypatch.setattr("phasesweep.engine.trial.run_supervised", real_run_supervised)
+    # Once the preflight has confirmed cleanup, only the target is left to raise.
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:
+        run_experiment(_exp(2))
+    assert "phases[p].n_trials above 2 in the config" in str(confirmed.value)
+    assert "mcp recover-run" not in str(confirmed.value)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 
@@ -1370,7 +1418,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     assert replayed.consecutive_failures == 0
     assert replayed.abort == record
 
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
 
@@ -1406,8 +1454,14 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         timeout_source=None,
     )
     first_abort: dict[str, Any] | None = None
+    streak: list[int] = []
+    abort_streak: tuple[int, ...] = ()
     for outcome in outcomes:
         trial = study.ask()
+        if outcome in {"failure", "fatal"}:
+            streak.append(trial.number)
+        elif outcome == "success":
+            streak.clear()
         abort = run.abort_decision(trial.number, outcome, cause=None, fatal_policy=None)
         payload = trial_outcome(run.completion_sequence + 1, outcome)
         if abort is not None:
@@ -1417,9 +1471,11 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         if abort is not None:
             run.abort_recorded = True
             first_abort = abort
+            abort_streak = tuple(streak)
         replayed = _load_phase_policy_state(study)
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
+        assert replayed.abort_streak == abort_streak
         assert tripped == (
             outcome == "fatal"
             or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
@@ -1433,6 +1489,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     assert run.completion_sequence == len(outcomes)
     assert run.consecutive_failures == 0
     assert replayed.abort is None
+    assert replayed.abort_streak == ()
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
@@ -1466,7 +1523,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
     with pytest.raises(RuntimeError, match="injected objective implementation bug"):
         run_experiment(exp)
 
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert sorted(trial.state.name for trial in trials) == ["COMPLETE", "FAIL"]
     fatal = next(
         trial.user_attrs[TRIAL_OUTCOME_ATTR]
@@ -1482,7 +1539,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
         "phasesweep.engine.phase.extract_trial_result",
         real_extract,
     )
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
         run_experiment(exp)
     assert not _last_successful_generation_path(exp).exists()
 
@@ -1520,11 +1577,8 @@ def test_gpu_unavailability_preserves_accepted_target_and_old_config(
     assert len(study.trials) == 1
 
 
-# A pairwise-unequal mixed-type choice set. `True` is not equal to 0, 1.5, or
-# "one", so config validation accepts it and Optuna's `choices.index(value)`
-# lookup resolves each sampled value to its own index. That is the property
-# `CategoricalParam` enforces: a choice set containing 1 alongside True would
-# collapse both onto one index the moment Optuna recorded `FrozenTrial.params`.
+# A pairwise-unequal mixed-type choice set: `True` equals none of the others, so
+# config validation accepts it and each sampled value keeps its own index.
 _FIDELITY_CHOICES: list[Any] = [0, 1.5, "one", True]
 
 # Trainer losses keyed by the rendered argparse token for each choice, chosen so
@@ -1631,7 +1685,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     )
 
     # (b) FrozenTrial.params, read back out of persistent storage.
-    trials = _phase_trials(exp, "pick")
+    trials = phase_trials(exp, "pick")
     assert len(trials) == len(_FIDELITY_CHOICES)
     for trial in trials:
         _assert_identical_scalar(
@@ -1726,7 +1780,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
         workdir=tmp_path / "runs",
         storage=storage,
         trainer=trainer,
-        metric=_bounded_metric(min=1.0, max=10.0),
+        metric=bounded_metric(min=1.0, max=10.0),
         n_trials=3,
         max_consecutive_failures=5,
     )
@@ -1734,7 +1788,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
     winners = run_experiment(exp)
 
     assert (winners["p"].trial_number, winners["p"].metric) == (2, 5.0)
-    trials = _phase_trials(exp)
+    trials = phase_trials(exp)
     assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
     assert [t.value for t in trials] == [0.5, 20.0, 5.0]
     assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
@@ -1749,7 +1803,7 @@ def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> Non
         workdir=tmp_path / "aborts-runs",
         storage=f"journal:///{tmp_path / 'aborts.journal'}",
         trainer=write_trainer(tmp_path / "high.py", 'print("x=20.0")'),
-        metric=_bounded_metric(max=10.0),
+        metric=bounded_metric(max=10.0),
         n_trials=6,
         max_consecutive_failures=2,
     )

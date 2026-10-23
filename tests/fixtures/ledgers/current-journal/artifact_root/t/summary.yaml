@@ -1,7 +1,7 @@
-schema_version: 4
+schema_version: 5
 experiment: t
-generation_id: a31422f1dbb5433581e90b00da91911f
-phasesweep_version: 0.3.8
+generation_id: a45df047cf874c15bfa500bdbe745f31
+phasesweep_version: 0.3.9
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
   name: objective
@@ -38,27 +38,55 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: a31422f1dbb5433581e90b00da91911f
-  attempt_id: 0adfa98c3e5b4cc78346e30d83009353
+  generation_id: a45df047cf874c15bfa500bdbe745f31
+  attempt_id: d27116567cda43958e4afb34d46fc8c7
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: a31422f1dbb5433581e90b00da91911f
-    attempt_id: 0adfa98c3e5b4cc78346e30d83009353
+    generation_id: a45df047cf874c15bfa500bdbe745f31
+    attempt_id: d27116567cda43958e4afb34d46fc8c7
   trainer_input:
     schema_version: 1
     format: argparse
     filename: overrides_resolved.json
     size_bytes: 13
     sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
+  confound:
+    schema_version: 2
+    ranked_trials:
+    - 0
+    - 1
+    ranked_groups: null
+    checks:
+      evaluation_point:
+        verdict: n/a
+        reason: log_regex objectives report no evaluation position; json_envelope
+          (report_objective), wandb (evaluation_axis) or mlflow (selected step) would
+          bind one
+      survivorship:
+        verdict: ok
+        detail:
+          ranked: 2
+          infeasible: 0
+          incomplete_group: 0
+          failed: 0
+      tie:
+        verdict: heterogeneous
+        detail:
+          tied_trials:
+          - 1
+          within_noise: null
+  observed: {}
+  repeats: null
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
   sha256: a9a6b2bcccabcfd22ac22298f8905c3525165a294927db7e91581308068b7b88
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 4b01def7f4e221d4c6945cd9edd4dd32315ef69aa6341a3aba373b552e0b4489
+  sha256: 1c9cd079a92aa7c116f4ca80835a3ee17483878d6e6fbe8e53bd779c74eb95d9
 - kind: winner
   phase: p
-  sha256: 8b188b8fa6dd25d39740384777d314a6f3e68f8c473ae18a063fc6338639a956
+  sha256: 5cbbefe5ac01ff6ee993ebf646da94dff80ca0a7a12832c41fd8e28c837d9af6
+trainer_config: {}

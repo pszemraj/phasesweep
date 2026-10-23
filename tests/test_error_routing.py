@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import optuna
@@ -27,8 +27,8 @@ import yaml
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.cli import _operational_error_text
-from phasesweep.config.models import ExecutionContext, Experiment, Phase
-from phasesweep.config.search import IntParam
+from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import fingerprints, guards, study_policy, trial
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
 from phasesweep.engine.artifacts import _load_winner
@@ -46,16 +46,24 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.optuna import _completed_trial_count
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _generation_summary_path,
 )
-from phasesweep.engine.phase import _failure_policy_abort_record
+from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -77,7 +85,7 @@ from phasesweep.errors import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
 )
-from phasesweep.evidence.models import WandbSummaryRequiredGate
+from phasesweep.evidence.models import LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
@@ -90,8 +98,8 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
+from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime.files import (
-    PlatformCapabilityError,
     UnsafeLockPathError,
     UnsafePrivatePathError,
     lock_dir,
@@ -104,7 +112,13 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
 )
 from phasesweep.tracking.mlflow import require_mlflow_sdk
-from tests.conftest import make_experiment, requires_nonroot, trial_outcome
+from tests.conftest import (
+    make_experiment,
+    phase_study,
+    requires_nonroot,
+    trial_outcome,
+    write_trainer,
+)
 from tests.ledger_fixtures import (
     Materialized,
     materialize,
@@ -201,6 +215,17 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     # A cause with no action of its own leaves the class default in place.
     foreign = RunRecoveryError.rewrap(OSError("disk"), "y")
     assert foreign.action is RunRecoveryError.default_action
+
+
+def test_no_feasible_subclasses_rewrap_with_the_donated_action():
+    inbound = PhaseTrialsFailedError("x", action=OperatorAction.FIX_CONFIG)
+
+    rewrapped = ReplayWithoutFeasibleTrialError.rewrap(inbound, "y")
+
+    assert type(rewrapped) is ReplayWithoutFeasibleTrialError
+    assert isinstance(rewrapped, NoFeasibleTrialError)
+    assert rewrapped.action is OperatorAction.FIX_CONFIG
+    assert str(rewrapped) == "y"
 
 
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
@@ -478,12 +503,13 @@ def _regular_file(tmp_path: Path) -> Path:
 
 
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Fail a run, then lose the root before reconciliation can confirm cleanup."""
+    """Fail a run that launched work, then lose the root before reconciliation can confirm cleanup."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
-    def fail_run(*_args: object, **_kwargs: object) -> None:
+    def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         monkeypatch.setattr(guards, "validate_ledger", _raiser(OSError("root is gone")))
-        raise NoFeasibleTrialError("trainer failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
     return run_experiment(experiment)
@@ -492,14 +518,15 @@ def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.Monk
 def _run_fails_then_registry_turns_shared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
-    """Fail a run whose reconciliation then finds the attempt registry shared."""
+    """Fail a run that launched work, whose reconciliation then finds the attempt registry shared."""
     experiment = make_experiment(workdir=tmp_path / "runs")
 
-    def fail_run(*_args: object, **_kwargs: object) -> None:
+    def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
+        generation.claim()
         registry = _attempts_dir(experiment)
         registry.mkdir(parents=True, exist_ok=True)
         registry.chmod(0o755)
-        raise NoFeasibleTrialError("trainer failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
     return run_experiment(experiment)
@@ -614,9 +641,6 @@ def _recover_over_malformed_registry_entry(
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
-_NO_NOFOLLOW = "O_NOFOLLOW is unavailable."
-
-
 def _scan_registry(
     damage: Callable[[Path], None] = lambda _entry: None,
     patch: Callable[[pytest.MonkeyPatch], None] = lambda _monkeypatch: None,
@@ -636,13 +660,6 @@ def _scan_registry(
         return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     return trigger
-
-
-def _lacks_capability(helper: str) -> Callable[[pytest.MonkeyPatch], None]:
-    """Return a patch under which the registry's ``helper`` lacks a platform capability."""
-    return lambda monkeypatch: monkeypatch.setattr(
-        f"phasesweep.engine.attempts.{helper}", _raiser(PlatformCapabilityError(_NO_NOFOLLOW))
-    )
 
 
 def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
@@ -851,14 +868,14 @@ WRAP_CASES = (
         "UnsafePrivatePathError",
     ),
     RoutingCase(
-        id="finalize_snapshot_platform",
+        id="finalize_snapshot_unsafe_path",
         trigger=_finalize_complete_snapshot_while(
-            "write_status_file", PlatformCapabilityError("O_NOFOLLOW is unavailable.")
+            "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
         ),
         raised=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RESTORE_TREE,
         message="failed to finalize terminal result snapshot for wrap-recover: "
-        "PlatformCapabilityError",
+        "UnsafePrivatePathError",
     ),
     RoutingCase(
         # recover-run reads the same entry, so routing it back to recover-run
@@ -902,21 +919,6 @@ WRAP_CASES = (
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Could not inspect study 't::p' for stale RUNNING trials.",
-    ),
-    RoutingCase(
-        # Not a damaged registry: the missing capability keeps its own routing.
-        id="registry_open_platform_capability",
-        trigger=_scan_registry(patch=_lacks_capability("open_directory_fd")),
-        raised=PlatformCapabilityError,
-        action=OperatorAction.FIX_CONFIG,
-        message=_NO_NOFOLLOW,
-    ),
-    RoutingCase(
-        id="registry_entry_platform_capability",
-        trigger=_scan_registry(patch=_lacks_capability("read_private_text_at")),
-        raised=PlatformCapabilityError,
-        action=OperatorAction.FIX_CONFIG,
-        message=_NO_NOFOLLOW,
     ),
     RoutingCase(
         id="preflight_same_type_aggregate",
@@ -1025,6 +1027,39 @@ def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
     monkeypatch.setattr(pwd, "getpwuid", _raiser(KeyError("uid")))
     return lock_dir()
+
+
+def _lock_dir_override_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve an explicit lock directory the OS refuses to open."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(
+        runtime_files, "open_directory_fd", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return lock_dir()
+
+
+def _lock_dir_default_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the default lock directory when the OS refuses to create it."""
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+    monkeypatch.setattr(
+        runtime_files, "ensure_private_dir", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return lock_dir()
+
+
+def _lock_dir_override_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve an explicit lock directory that does not exist."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "typo"))
+    return lock_dir()
+
+
+def _lock_file_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Take a lock file the OS refuses to open."""
+    monkeypatch.setattr(
+        runtime_files, "_open_lock_file", _raiser(PermissionError(13, "Permission denied"))
+    )
+    return runtime_files.try_lock_file(tmp_path / "blocked.lock")
 
 
 def _home_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1232,33 +1267,168 @@ def _append_failure_outcomes(
         )
 
 
-def _fixture_study(experiment: Experiment) -> optuna.Study:
-    """Open the golden fixture's phase study for direct edits."""
-    return optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
-    )
-
-
 def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Re-run a phase whose outcome ledger recorded an abort at its current trial target."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     phase = experiment.phases[0].model_copy(update={"n_trials": 4})
     _append_failure_outcomes(study, 2, abort_for=phase)
     study.set_user_attr(TRIAL_TARGET_ATTR, 4)
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
+def _record_fatal_abort(
+    tmp_path: Path, policy: str, cause: str, attrs: Mapping[str, object]
+) -> tuple[Experiment, Phase]:
+    """Record a fatal abort on the golden fixture's phase, at an accepted target of 4.
+
+    :param Path tmp_path: Where the fixture is materialized.
+    :param str policy: The fatal abort policy to record.
+    :param str cause: The recorded cause.
+    :param Mapping[str, object] attrs: Further user attributes of the fatal trial.
+    :return tuple[Experiment, Phase]: The fixture's experiment, and its phase at that target.
+    """
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = phase_study(experiment)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 4})
+    trials = study.get_trials(deepcopy=False)
+    sequence = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials) + 1
+    outcome = trial_outcome(sequence, "fatal", policy=policy)
+    outcome[TRIAL_OUTCOME_ABORT_KEY] = _abort_record(
+        policy=policy,
+        completion_sequence=sequence,
+        trial_target=phase.n_trials,
+        cause=cause,
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                TRAINER_ENV_DIGEST_ATTR: trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR],
+                TRIAL_OUTCOME_ATTR: outcome,
+                **attrs,
+            },
+        )
+    )
+    study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+    return experiment, phase
+
+
+_UNCONFIRMED_CLEANUP = ("unsafe_process_cleanup", "trial cleanup could not be confirmed")
+
+
+def _preview_unconfirmed_cleanup_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Preview a phase whose unsafe-cleanup abort no cleanup recovery has retired."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
+    )
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}), dry_run=True)
+
+
+def _finish_aborted_phase(experiment: Experiment, phase: Phase) -> object:
+    """Finish a phase the way a live run does once an outcome has recorded an abort.
+
+    A live run raises a fatal error itself before the phase is finished, so a direct call is
+    the one way to reach the abort's headline with a fatal abort on record.
+    """
+    run = SimpleNamespace(
+        experiment=experiment.model_copy(update={"phases": [phase]}),
+        phase=phase,
+        study=phase_study(experiment),
+        optimize_deadline=None,
+        deadline_exhausted=False,
+        aborted=True,
+    )
+    return _finish_phase(run, phase_fingerprint="unused")
+
+
+def _finish_after_fatal_abort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Finish a phase whose recorded abort is an unexpected objective error."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, "unexpected_objective_exception", "RuntimeError: objective defect", {}
+    )
+    return _finish_aborted_phase(experiment, phase)
+
+
+def _finish_after_unconfirmed_cleanup_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Finish a phase whose recorded abort is a cleanup that was never confirmed."""
+    experiment, phase = _record_fatal_abort(
+        tmp_path, *_UNCONFIRMED_CLEANUP, {CLEANUP_CONFIRMED_ATTR: False}
+    )
+    return _finish_aborted_phase(experiment, phase)
+
+
+def _live_abort(
+    tmp_path: Path,
+    *,
+    body: str,
+    cells: int,
+    target: int,
+    bounded: bool = False,
+    persistent: bool = True,
+) -> object:
+    """Run a grid whose first two trials trip a failure limit of 2, and raise its abort.
+
+    :param str body: The trainer's source.
+    :param int cells: Cells in the grid.
+    :param int target: The phase's ``n_trials``.
+    :param bool bounded: Whether the metric rejects the value 5.0 the trainers print.
+    :param bool persistent: Whether the study is kept on a journal.
+    """
+    phase = Phase(
+        name="p",
+        n_trials=target,
+        max_consecutive_failures=2,
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=cells)},
+    )
+    extractor = LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'studies.journal'}" if persistent else None,
+        trainer=write_trainer(tmp_path / "trainer.py", body),
+        phases=[phase],
+        metric=Metric(extractor=extractor, max=1.0) if bounded else None,
+    )
+    return run_experiment(experiment)
+
+
+_FAILS = "raise SystemExit(1)"
+_OUT_OF_BOUNDS = 'print("x=5.0")'
+
+
+def _abort_with_failed_cells(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent two-cell grid whose cells both failed."""
+    return _live_abort(tmp_path, body=_FAILS, cells=2, target=2)
+
+
+def _abort_with_unrun_cells(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent four-cell grid on an infeasible streak, leaving two cells unrun."""
+    return _live_abort(tmp_path, body=_OUT_OF_BOUNDS, cells=4, target=4, bounded=True)
+
+
+def _abort_with_every_cell_measured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a persistent two-cell grid whose cells both measured infeasible."""
+    return _live_abort(tmp_path, body=_OUT_OF_BOUNDS, cells=2, target=2, bounded=True)
+
+
+def _abort_without_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Abort a grid held in memory, which no later run can continue."""
+    return _live_abort(tmp_path, body=_FAILS, cells=2, target=2, persistent=False)
+
+
 def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
 
     The fixture's trials record the pinned environment they were generated under, so the
-    cohort check that allocation needs (routed by ``environment_cohort_changed``) passes
-    only from that environment, whatever shell runs the test.
+    cohort check that allocation runs (``_validate_environment_cohort``) passes only from
+    that environment, whatever shell runs the test.
     """
     pin_fixture_environment(monkeypatch)
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     _append_failure_outcomes(study, 2)
     study.set_user_attr(TRIAL_TARGET_ATTR, 5)
     phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
@@ -1270,7 +1440,7 @@ def _replay_partial_decision_without_opt_in(
 ) -> object:
     """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    study = _fixture_study(experiment)
+    study = phase_study(experiment)
     trials = study.get_trials(deepcopy=False)
     target = len(trials) + 1
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
@@ -1284,9 +1454,7 @@ def _replay_partial_decision_without_opt_in(
                 trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
             ),
             "finished_trials": len(trials),
-            "completed_trials": sum(
-                trial.state is optuna.trial.TrialState.COMPLETE for trial in trials
-            ),
+            "completed_trials": _completed_trial_count(trials),
             "timeout_scope": "phase",
             "recovered_abort_sequence": None,
         },
@@ -1376,6 +1544,34 @@ ORIGIN_CASES = (
         raised=UnsafeLockPathError,
         action=OperatorAction.FIX_CONFIG,
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
+    ),
+    RoutingCase(
+        id="lock_dir_override_access_refused",
+        trigger=_lock_dir_override_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot access lock directory",
+    ),
+    RoutingCase(
+        id="lock_dir_default_access_refused",
+        trigger=_lock_dir_default_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot create or access default lock directory",
+    ),
+    RoutingCase(
+        id="lock_dir_override_missing",
+        trigger=_lock_dir_override_missing,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="does not exist; provision it before setting PHASESWEEP_LOCK_DIR",
+    ),
+    RoutingCase(
+        id="lock_file_access_refused",
+        trigger=_lock_file_refused,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.PROVISION_LOCK_DIR,
+        message="Cannot open lock file",
     ),
     RoutingCase(
         id="phasesweep_home_override_relative",
@@ -1527,14 +1723,66 @@ ORIGIN_CASES = (
     RoutingCase(
         id="prior_phase_abort",
         trigger=_rerun_aborted_phase,
-        raised=NoFeasibleTrialError,
+        raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
-        message="Increase n_trials above 4 to explicitly schedule new recovery attempts",
+        message="phases[p].n_trials above 4 in the config",
+    ),
+    RoutingCase(
+        # Raising the target does not retire an unsafe-cleanup abort; cleanup recovery does.
+        id="prior_phase_abort_awaiting_cleanup_recovery",
+        trigger=_preview_unconfirmed_cleanup_abort,
+        raised=PhaseAbortRefusedError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        message="First confirm the cleanup",
+    ),
+    # A live abort routes like the refusal that repeats it, so `fix:` agrees with its advice.
+    RoutingCase(
+        id="live_abort_with_failed_cells",
+        trigger=_abort_with_failed_cells,
+        raised=PhaseTrialsFailedError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].n_trials from 2 to 4 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_with_unrun_cells",
+        trigger=_abort_with_unrun_cells,
+        raised=PhaseTrialsInfeasibleError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].max_consecutive_failures above 2 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_with_every_cell_measured",
+        trigger=_abort_with_every_cell_measured,
+        raised=PhaseTrialsInfeasibleError,
+        action=OperatorAction.FIX_CONFIG,
+        message="none is feasible, so change the search space or bounds",
+    ),
+    RoutingCase(
+        id="live_abort_fatal",
+        trigger=_finish_after_fatal_abort,
+        raised=PhaseTrialsFailedError,
+        action=OperatorAction.FIX_CONFIG,
+        message="phases[p].n_trials above 4 in the config",
+    ),
+    RoutingCase(
+        id="live_abort_awaiting_cleanup_recovery",
+        trigger=_finish_after_unconfirmed_cleanup_abort,
+        raised=PhaseTrialsFailedError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        message="First confirm the cleanup",
+    ),
+    RoutingCase(
+        # No later run can continue an in-memory study, so only the logs are left.
+        id="live_abort_without_storage",
+        trigger=_abort_without_storage,
+        raised=PhaseTrialsFailedError,
+        action=OperatorAction.INSPECT_LOGS,
+        message="for stderr logs",
     ),
     RoutingCase(
         id="failure_streak_at_limit",
         trigger=_resume_with_streak_at_limit,
-        raised=NoFeasibleTrialError,
+        raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
         message="meets max_consecutive_failures=2, so it launches no more trials",
     ),
@@ -1637,6 +1885,7 @@ _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
         OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
+        OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
         OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
@@ -1692,8 +1941,8 @@ _UNCONFIRMED_CLEANUPS = (
     (_cleanup_refusal(_LEDGER, OSError("ledger unreadable")), None, [_LEDGER]),
     (_cleanup_refusal(None, _LEDGER_LOST), None, []),
     (_cleanup_refusal(None, None), None, []),
-    (NoFeasibleTrialError("trainer failed"), _SHARED_REGISTRY, [_TREE]),
-    (NoFeasibleTrialError("trainer failed"), OSError("root is gone"), []),
+    (PhaseTrialsFailedError("trainer failed"), _SHARED_REGISTRY, [_TREE]),
+    (PhaseTrialsFailedError("trainer failed"), OSError("root is gone"), []),
     (_LEDGER_LOST, None, [_LEDGER]),
     (_LEDGER_LOST, _SHARED_REGISTRY, [_LEDGER, _TREE]),
 )
@@ -1715,8 +1964,11 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         # The durable payload schema is unchanged: the action routes, it is not stored.
         assert "action" not in failure
         _assert_payload_follows(failure, routed)
-    # The last, composed remediation, word for word.
-    assert failure["remediation"] == (
+    # A ledger failure with a shared-registry cleanup error composes both repairs, word for word.
+    composed = mcp_runner._terminal_failure_payload(
+        _LEDGER_LOST, stage="execution", cleanup_confirmed=False, cleanup_error=_SHARED_REGISTRY
+    )
+    assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
         "the files and permissions identified in the error, deleting a file only if certain nothing "
         "is running, then run phasesweep mcp recover-run before another launch. The error in "

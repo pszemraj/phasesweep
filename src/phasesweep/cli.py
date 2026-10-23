@@ -15,26 +15,37 @@ import click
 import optuna
 import yaml
 
-from phasesweep.config.io import ConfigError, describe_validation_error, load_experiment
+from phasesweep.config.common import CONFIG_DIR_CONTEXT
+from phasesweep.config.io import (
+    ConfigError,
+    _load_yaml_mapping_from_text,
+    describe_validation_error,
+    load_experiment,
+)
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
+    ReferenceEntry,
     first_sentence,
     lookup_or_suggest,
+    plain_path,
     reference_notes,
+    rules_for,
     sub_key_count,
     top_level_entries,
 )
+from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
+from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
-from phasesweep.engine.paths import _experiment_dir
+from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
 from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     raise_for_unusable_publication,
 )
-from phasesweep.engine.read import TrialTable, TrialTables, read_trial_tables
+from phasesweep.engine.read import TrialTables, read_trial_tables
 from phasesweep.engine.run import experiment_status, run_experiment
-from phasesweep.errors import OPERATOR_STEPS, PhaseSweepError
+from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -46,7 +57,13 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
-from phasesweep.runtime.json import JsonObject, JsonValue, json_object, strict_json_loads
+from phasesweep.runtime.gpu import GpuPool
+from phasesweep.runtime.json import (
+    JsonObject,
+    JsonValue,
+    json_object,
+    strict_json_loads,
+)
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -70,10 +87,8 @@ _SUMMARY_WIDTH = 72
 def _configure_logging(verbose: bool) -> None:
     """Initialize root logging and tune Optuna's verbosity.
 
-    Args:
-        verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
-            otherwise root is ``INFO`` and Optuna is quieted to ``WARNING``.
-
+    :param bool verbose: If True, set root logger to ``DEBUG`` and Optuna to ``INFO``;
+        otherwise root is ``INFO`` and Optuna is quieted to ``ERROR``.
     """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -81,10 +96,7 @@ def _configure_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname).1s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Optuna's per-trial INFO output is essentially 1:1 with phasesweep's own
-    # runner.info "[phase/trial_N] <cmd>" line and adds nothing. Quiet it down
-    # by default; -v restores INFO for trial-level diagnostics.
-    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
+    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.ERROR)
 
 
 @click.group(
@@ -96,8 +108,18 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
-def _operational_error_text(exc: PhaseSweepError) -> str:
-    """Format an operational diagnosis with its routed operator step."""
+def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) -> str:
+    """Format an operational diagnosis with advice for the requested operation.
+
+    :param PhaseSweepError exc: Operational failure to render.
+    :param bool read_only: Whether the command only inspects existing state.
+    :return str: Diagnostic followed by its operator step.
+    """
+    if read_only and isinstance(exc, (ArtifactRootSchemaMismatchError, StudySchemaMismatchError)):
+        return (
+            f"{exc}\nfix: inspect the raw artifacts, or use the exact checkout that produced "
+            "them for inspection if available; this checkout reads only its current format."
+        )
     return f"{exc}\nfix: {OPERATOR_STEPS[exc.action]}."
 
 
@@ -111,8 +133,9 @@ def main() -> None:
         bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
         Click chose.
     """
+    operation = {"read_only": False}
     try:
-        status = cli.main(standalone_mode=False)
+        status = cli.main(standalone_mode=False, obj=operation)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
         exc.show()
@@ -124,7 +147,10 @@ def main() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
+        click.echo(
+            f"phasesweep: {_operational_error_text(exc, read_only=operation['read_only'])}",
+            err=True,
+        )
         # -v (see _configure_logging) means the operator asked for internals.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
@@ -132,7 +158,7 @@ def main() -> None:
     except OSError as exc:
         click.echo(f"phasesweep: operational error: {exc}", err=True)
         sys.exit(_FAILURE_EXIT)
-    except Exception:  # noqa: BLE001 - the boundary's purpose is to report bugs
+    except Exception:  # the boundary's purpose is to report bugs
         click.echo("phasesweep: internal error — please report this traceback.", err=True)
         traceback.print_exc()
         sys.exit(_INTERNAL_EXIT)
@@ -361,8 +387,8 @@ def report_objective_cmd(
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run every phase in a phasesweep experiment config. Use --from-phase to skip earlier "
-        "phases after their winner.yaml files already exist."
+        "Run configured phases. Use --from-phase to skip earlier phases; only the winners "
+        "inherited by the remaining phases are required."
     ),
     short_help="Run configured phases.",
 )
@@ -372,7 +398,7 @@ def report_objective_cmd(
     metavar="PHASE",
     default=None,
     show_default="first phase",
-    help="Skip earlier phases and load their winners from disk.",
+    help="Skip earlier phases and load winners required by the remaining phases.",
 )
 @click.option(
     "--dry-run",
@@ -384,32 +410,61 @@ def report_objective_cmd(
     ),
 )
 @click.option(
+    "--workdir",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Override the output workdir for this invocation (relative to the current directory).",
+)
+@click.option(
+    "--set",
+    "settings",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Override a config value with a YAML VALUE; repeat as needed. KEY is dot-separated "
+        "names (env.NOTE). Select a list element by zero-based index, as phases.0 or "
+        "phases[0], and a phase by name, as phases[NAME]. Write [KEY] to take a mapping key "
+        "verbatim when it contains dots: phases[NAME].search_space[model.n_layers].choices. "
+        "Inside [...], write \\] and \\\\ for a literal ] and \\. Missing mapping keys are "
+        "created; a validation error at one names the --set that created it."
+    ),
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
     show_default=True,
     help="Show debug logs from phasesweep and INFO logs from Optuna.",
 )
-def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool) -> None:
+def run(
+    config_path: Path,
+    from_phase: str | None,
+    dry_run: bool,
+    workdir: Path | None,
+    settings: tuple[str, ...],
+    verbose: bool,
+) -> None:
     """Run all phases defined in ``config_path``.
 
     :param Path config_path: Path to the experiment YAML file.
     :param str | None from_phase: Optional phase name to start from after loading
-        earlier winners from disk.
+        required earlier winners from disk.
     :param bool dry_run: Preview the trials each phase would launch, refuse most of what a
         run would refuse over the recorded trials, and render example commands, without
         launching subprocesses.
+    :param Path | None workdir: Invocation-relative output directory override.
+    :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
     """
+    click.get_current_context().ensure_object(dict)["read_only"] = dry_run
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
     # codes remain structured throughout startup, including dry-run previews.
     # run_experiment() repeats this idempotently for direct library callers.
     install_signal_handlers()
-    config = _load_cli_config(config_path)
+    config = _run_config(config_path, workdir=workdir, settings=settings)
     if from_phase is not None:
         valid = [p.name for p in config.phases]
         if from_phase not in valid:
@@ -427,6 +482,46 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
         raise
 
 
+def _run_config(path: Path, *, workdir: Path | None, settings: tuple[str, ...]) -> Experiment:
+    """Apply invocation overrides and validate the derived configuration.
+
+    :param Path path: Original config file, which remains unchanged.
+    :param Path | None workdir: Output directory relative to this invocation.
+    :param tuple[str, ...] settings: ``KEY=VALUE`` assignments with YAML values; the key
+        syntax is :data:`phasesweep.config.run_overrides.SET_SYNTAX`.
+    :raises click.BadParameter: An assignment cannot address a config value.
+    :raises ConfigError: The derived config fails normal model validation.
+    :return Experiment: Fully validated config with original path anchoring.
+    """
+    from pydantic import ValidationError
+
+    if workdir is None and not settings:
+        return _load_cli_config(path)
+    try:
+        payload = json_object(_load_yaml_mapping_from_text(path.read_text(encoding="utf-8"), path))
+    except ConfigError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    created: list[CreatedKey] = []
+    for setting in settings:
+        try:
+            new_key = apply_set(payload, setting)
+        except SetPathError as exc:
+            raise click.BadParameter(str(exc), param_hint="--set") from exc
+        if new_key is not None:
+            created.append(new_key)
+    if workdir is not None:
+        payload["workdir"] = str(workdir.expanduser().resolve())
+    try:
+        return Experiment.model_validate(
+            payload, context={CONFIG_DIR_CONTEXT: path.resolve().parent}
+        )
+    except ValidationError as exc:
+        detail = "\n".join([describe_validation_error(exc), *created_key_notes(exc, created)])
+        raise ConfigError(f"{path} (run overrides): {detail}") from exc
+
+
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Validate a phasesweep experiment config without launching any trials.",
@@ -434,11 +529,10 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
-    """Validate static config in ``config_path`` without running anything.
-
-    A non-dry ``run`` checks the ambient execution environment before claiming work.
-    """
+    """Validate config and read-only GPU inventory without launching work."""
     config = _load_cli_config(config_path)
+    for phase in config.phases:
+        GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
     _render_experiment_phases(config)
 
@@ -479,10 +573,12 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
-        "keys; with a KEY such as 'phases[].sampler', print that key and every key below it. "
+        "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
+        "descriptions that govern it, then that key and every key below it. "
         "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
-        "With --notes, print the general notes on file paths, YAML typing and environment "
-        "variables instead."
+        "The broad phases key prints the rules over the phase list and its immediate "
+        "children; narrow it for full details. With --notes, print the general notes on the "
+        "config file, paths, YAML typing and the study fingerprint instead."
     ),
     short_help="Explain config keys.",
 )
@@ -490,10 +586,14 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
 @click.option(
     "--notes",
     is_flag=True,
-    help="Print the general notes on file paths, YAML typing and environment variables.",
+    help="Print the general notes on the config file, paths, YAML typing and the study fingerprint.",
 )
 def explain(key: str | None, notes: bool) -> None:
     """Print the configuration reference for one key, list the top-level keys, or print its notes.
+
+    A key prints the section rules and shared-block descriptions that govern its entries
+    first, then the entries themselves; the broad ``phases`` key prints the rules of its own
+    section and a compact index of its fields.
 
     :param str | None key: Config key in any spelling the reference accepts, or None to list
         the top-level keys.
@@ -519,12 +619,34 @@ def explain(key: str | None, notes: bool) -> None:
         )
         click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
         raise click.exceptions.Exit(_USAGE_EXIT)
+    if plain_path(key) == "phases":
+        # The compact index carries only the rules over the whole phase list.
+        _render_rules(entries[:1])
+        for entry in entries:
+            if plain_path(entry.path).count(".") == 1:
+                click.echo(f"{entry.path}: {entry.signature}")
+                click.echo(f"  {first_sentence(entry, _SUMMARY_WIDTH)}")
+        click.echo("Narrow with a key: phasesweep explain 'phases[].search_space'")
+        return
+    _render_rules(entries)
     for index, entry in enumerate(entries):
         if index:
             click.echo()
         click.echo(f"{entry.path}: {entry.signature}")
         for line in entry.comments:
             click.echo(f"  {line}")
+
+
+def _render_rules(entries: Sequence[ReferenceEntry]) -> None:
+    """Print the section rules and shared-block descriptions that govern some entries.
+
+    :param Sequence[ReferenceEntry] entries: Entries about to be printed, in file order.
+    """
+    for rules in rules_for(entries):
+        click.echo(f"{rules.title}:")
+        for line in rules.lines:
+            click.echo(f"  {line}")
+        click.echo()
 
 
 def _render_reference_index() -> None:
@@ -547,7 +669,7 @@ def _render_reference_index() -> None:
     click.echo()
     click.echo("Narrow with a key, for example: phasesweep explain 'phases[].sampler'")
     click.echo(
-        "General notes on file paths, YAML typing and environment variables: "
+        "General notes on the config file, paths, YAML typing and the study fingerprint: "
         "phasesweep explain --notes"
     )
 
@@ -562,10 +684,11 @@ def _render_reference_index() -> None:
 def show_winners(config_path: Path) -> None:
     """Print winners using their generation's recorded phase plan and validated bytes.
 
-    :param config_path: Config used to locate the publication and label drift as historical.
+    :param Path config_path: Config used to locate the publication and label drift as historical.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     """
+    click.get_current_context().ensure_object(dict)["read_only"] = True
     experiment = _load_cli_config(config_path)
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
@@ -585,12 +708,47 @@ def show_winners(config_path: Path) -> None:
                 f"{validated.generation_id} does not match the current config."
             )
             click.echo("# Rendering the saved phase plan and annotations.")
+        revision = validated.code_revision
+        if revision is None:
+            click.echo("# code revision: unknown (not a git work tree or git unavailable)")
+        else:
+            dirty = " (dirty)" if revision["dirty"] else ""
+            click.echo(f"# code revision: {revision['commit']}{dirty}")
+        if validated.argparse_trainer_config is not None:
+            click.echo("# Producing argparse trainer base, before phase overrides.")
+            click.echo(
+                yaml.safe_dump(
+                    {"trainer_config": validated.argparse_trainer_config}, sort_keys=False
+                )
+            )
 
     for name, comment in phase_plan:
         winner = None if validated is None else validated.winners.get(name)
         if winner is not None:
             click.echo(f"=== {name} ===")
             _render_phase_comment(comment, prefix="# ")
+            if winner.repeats is not None:
+                repeats = winner.repeats
+                click.echo(
+                    f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} "
+                    f"values of repeat key {repeats['key']!r}."
+                )
+                click.echo(
+                    f"# trial_number {winner.source.trial_number} names the group's last member."
+                )
+                click.echo("# Choose a checkpoint explicitly from repeats.members.")
+                for member in repeats["members"]:
+                    trial_dir = _trial_dir_for(
+                        experiment,
+                        name,
+                        member["trial_number"],
+                        generation_id=member["generation_id"],
+                        attempt_id=member["attempt_id"],
+                    )
+                    click.echo(
+                        f"# {repeats['key']}={member['repeat']!r} "
+                        f"trial_number={member['trial_number']} trial_dir={trial_dir}"
+                    )
             click.echo(winner.content.decode("utf-8"))
         else:
             click.echo(f"=== {name} === (no winner yet)")
@@ -628,7 +786,7 @@ def _trial_cell(column: str, value: JsonValue) -> str:
 
 
 #: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner"})
+_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible"})
 
 
 def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
@@ -646,20 +804,21 @@ def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[
     return "  ".join(padded).rstrip()
 
 
-def _trial_table_lines(table: TrialTable) -> list[str]:
-    """Render one phase's trial rows as aligned plain text.
+def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str]:
+    """Render trial or group rows as aligned plain text.
 
-    :param TrialTable table: The phase's rows and columns.
-    :return list[str]: The header line followed by one line per trial, without trailing spaces.
+    :param Sequence[str] columns: Column names in display order.
+    :param Sequence[JsonObject] rows: Rows to display, with every named column present.
+    :return list[str]: The header line followed by one line per row, without trailing spaces.
     """
-    cells = [[_trial_cell(column, row[column]) for column in table.columns] for row in table.rows]
+    cells = [[_trial_cell(column, row[column]) for column in columns] for row in rows]
     widths = [
         max(len(column), *(len(row[index]) for row in cells))
-        for index, column in enumerate(table.columns)
+        for index, column in enumerate(columns)
     ]
     return [
-        _aligned_row(table.columns, table.columns, widths),
-        *(_aligned_row(table.columns, row, widths) for row in cells),
+        _aligned_row(columns, columns, widths),
+        *(_aligned_row(columns, row, widths) for row in cells),
     ]
 
 
@@ -689,7 +848,38 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
             note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
         lines.extend(["", f"=== {table.phase} === ({note})"])
         if table.rows:
-            lines.extend(_trial_table_lines(table))
+            lines.extend(_table_lines(table.columns, table.rows))
+        if table.groups:
+            groups: list[JsonObject] = [
+                {
+                    "group": group.group,
+                    "params": group.params,
+                    "n/expected": f"{group.n}/{group.expected}",
+                    "reduce": group.reduce,
+                    "aggregate": group.aggregate,
+                    "mean": group.mean,
+                    "sd": group.sd,
+                    "min": group.min,
+                    "max": group.max,
+                    "eligible": "yes" if group.eligible else "no",
+                }
+                for group in table.groups
+            ]
+            observed_names = sorted({name for group in table.groups for name in group.observed})
+            for group, row in zip(table.groups, groups, strict=True):
+                for name in observed_names:
+                    row[f"observed:{name}"] = group.observed.get(name)
+                    row[f"observed_n:{name}"] = group.observed_n.get(name, 0)
+                row["winner"] = "*" if group.winner else ""
+            lines.extend(
+                [
+                    "",
+                    "Repeat groups (statistics include infeasible measured members):",
+                    "Group numbers track the highest member trial number so far "
+                    "and can change as members arrive.",
+                ]
+            )
+            lines.extend(_table_lines(tuple(groups[0]), groups))
     return "\n".join(lines)
 
 
@@ -697,7 +887,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Print read-only trial counts and phase state for a phasesweep experiment, as YAML; "
-        "--trials prints one table of trials per phase instead."
+        "--trials prints trial and repeat-group tables per phase instead."
     ),
     short_help="Print read-only run status.",
 )
@@ -708,7 +898,8 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     is_flag=True,
     help=(
         "Print one aligned table of trials per phase (state, value, params, duration, "
-        "repeat group, observed values, winner) instead of the YAML status."
+        "repeat group, observed values, failure reasons, winner) and repeat-group statistics "
+        "instead of YAML."
     ),
 )
 def status(config_path: Path, show_trials: bool) -> None:
@@ -726,6 +917,7 @@ def status(config_path: Path, show_trials: bool) -> None:
         validated as the current user.
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
+    click.get_current_context().ensure_object(dict)["read_only"] = True
     config = _load_cli_config(config_path)
     if show_trials:
         tables = read_trial_tables(config)
@@ -764,7 +956,8 @@ def sync_tracking(config_path: Path, generation_id: str | None) -> None:
 
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
-    :raises ClickException: Target mismatch or incomplete delivery.
+    :raises ClickException: The generation name or a delivery record is malformed.
+    :raises PhaseSweepError: Nothing matching can be synchronized, or uploads remain pending.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
 
@@ -775,7 +968,7 @@ def sync_tracking(config_path: Path, generation_id: str | None) -> None:
         raise click.ClickException(str(exc)) from exc
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
     if counts["pending"]:
-        raise click.ClickException("MLflow uploads remain pending.")
+        raise PhaseSweepError("MLflow uploads remain pending.", action=OperatorAction.RETRY)
 
 
 @cli.group(
@@ -1038,9 +1231,6 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     :param Path output: Catalog destination.
     :param tuple[Path, ...] from_configs: Experiment configs to catalog.
-    :raises FileExistsError: If ten randomized staging names all collide beside
-        ``output``; handled by this function's own ``OSError`` branch, which reports
-        the failure and returns ``False`` rather than propagating.
     :return bool: True when the catalog was written; False after printing why not.
     """
     if output.is_symlink() or output.exists():

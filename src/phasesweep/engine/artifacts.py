@@ -16,8 +16,12 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
-from phasesweep.engine.optuna import _trial_state_label
+from phasesweep.engine.errors import (
+    ResumeWinnerMissingError,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
@@ -132,7 +136,7 @@ def _write_trials_csv(
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": _trial_state_label(t),
+                "state": _trial_count_state(t),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,
@@ -157,31 +161,36 @@ def _save_winner(
     """Persist a phase winner into its immutable generation namespace.
 
     Real winners carry a phase fingerprint for resume validation; dry-run placeholders
-    are never saved. Environment identity excludes ambient values. Confound verdicts,
-    observations, repeats, and evidence provenance remain winner-only fields.
+    are never saved. Environment identity excludes ambient values. Evidence
+    provenance remains a winner-only field.
 
-    Args:
-        experiment: Parsed experiment config; supplies the metric name used
-            in the persisted payload.
-        phase_name: Name of the phase whose winner is being saved.
-        winner: The winning trial.
-        generation_id: Immutable generation namespace to write into.
-
+    :param Experiment experiment: Parsed experiment config; supplies the metric name used in
+        the persisted payload.
+    :param str phase_name: Name of the phase whose winner is being saved.
+    :param Winner winner: The winning trial.
+    :param str generation_id: Immutable generation namespace to write into.
     """
     path = path_ops._generation_winner_path(experiment, generation_id, phase_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    _write_yaml_atomic(path, _winner_payload(experiment, phase_name, winner))
+
+
+def _winner_payload(experiment: Experiment, phase_name: str, winner: Winner) -> dict[str, object]:
+    """Build the mapping a phase's ``winner.yaml`` holds.
+
+    :param Experiment experiment: Parsed experiment config; supplies the metric name and goal.
+    :param str phase_name: Name of the phase the winner belongs to.
+    :param Winner winner: The winning trial.
+    :return dict[str, object]: The winner file's payload.
+    """
+    return {
         "phase": phase_name,
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
         **_winner_common_payload(winner),
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
-        "confound": winner.confound,
-        "observed": winner.observed,
-        "repeats": winner.repeats,
     }
-    _write_yaml_atomic(path, payload)
 
 
 def _winner_common_payload(winner: Winner) -> dict[str, Any]:
@@ -203,6 +212,9 @@ def _winner_common_payload(winner: Winner) -> dict[str, Any]:
         "attempt_id": winner.attempt_id,
         "winner_source": asdict(source),
         "trainer_input": winner.trainer_input,
+        "confound": winner.confound,
+        "observed": winner.observed,
+        "repeats": winner.repeats,
     }
     return payload
 
@@ -258,35 +270,34 @@ def _load_winner(
     Publication validation already checked persisted identities and structure, so
     this function checks only current-config-dependent requirements.
 
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase whose winner is being loaded.
-        inherited_winners: Winners loaded for phases earlier in the chain;
-            contribute to the recomputed fingerprint.
-        publication: The last-success publication the caller resolved with
-            ``raise_on_manifest_error=True``; ``None`` when nothing is
-            published. A caller loading several phases resolves it once.
-
-    Returns:
-        The reconstructed :class:`Winner` for ``phase``.
-
-    Raises:
-        FileNotFoundError: The publication holds no winner for the phase.
-        WinnerIntegrityError: The winner is incomplete, incompatible with
-            the current partial-result policy, or carries a ``repeats`` block
-            that is not the phase's configured repeat axis.
-        StudyFingerprintMismatchError: The stored fingerprint disagrees with
-            the freshly computed one.
-
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase whose winner is being loaded.
+    :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain;
+        contribute to the recomputed fingerprint.
+    :param ValidatedPublication | None publication: The last-success publication the caller
+        resolved with ``raise_on_manifest_error=True``; ``None`` when nothing is published. A
+        caller loading several phases resolves it once.
+    :raises ResumeWinnerMissingError: The publication holds no winner for the phase.
+    :raises WinnerIntegrityError: The winner is incomplete, incompatible with the current
+        partial-result policy, or carries a ``repeats`` block that is not the phase's
+        configured repeat axis.
+    :raises StudyFingerprintMismatchError: The stored fingerprint disagrees with the freshly
+        computed one.
+    :return Winner: The reconstructed winner for ``phase``.
     """
     if publication is None:
-        raise FileNotFoundError(
-            f"Winner file missing for phase {phase.name!r}: no generation has completed."
+        raise ResumeWinnerMissingError(
+            f"Winner file missing for phase {phase.name!r}: no generation has completed, so "
+            "the workdir has no earlier results to resume from. Run without --from-phase so "
+            "the earlier phases run first, or use the workdir that holds their results."
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners.get(phase.name)
     if validated is None:
-        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
+        raise ResumeWinnerMissingError(
+            f"Winner file missing for phase {phase.name!r}: {path}. The last published "
+            "generation holds no winner for it. Run without --from-phase so it runs first."
+        )
     data = validated.payload
 
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)

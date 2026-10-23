@@ -27,20 +27,20 @@ def _preflight_skipped_winners(
     run_deadline: float | None,
     error_mapper: Callable[[str, Exception], Exception] | None = None,
 ) -> dict[str, Winner]:
-    """Validate skipped winners before committing a new generation.
+    """Validate required ancestors and carried published winners before any phase runs.
 
     :param Experiment experiment: Experiment whose resume prefix is checked.
-    :param str | None from_phase: Validated first phase that the new generation will execute.
+    :param str | None from_phase: Validated first phase that this invocation will execute.
     :param float | None run_deadline: Whole-run monotonic deadline, when configured.
     :param Callable[[str, Exception], Exception] | None error_mapper: Optional
         frontend adapter receiving the phase whose winner was being checked
         and its refusal. Publication-resolution failures name the first skipped
         phase. Adapted refusals suppress the internal cause; without an adapter
         every exception is re-raised unchanged.
-    :return dict[str, Winner]: Compatible skipped winners in declaration order.
+    :return dict[str, Winner]: Compatible required or published winners in declaration order.
     :raises TimeoutError: The whole-run wallclock deadline expired before a
         skipped phase could be validated.
-    :raises FileNotFoundError: A skipped phase has no persisted ``winner.yaml``.
+    :raises ResumeWinnerMissingError: A required skipped phase has no persisted ``winner.yaml``.
     :raises WinnerIntegrityError: A skipped phase's persisted winner is invalid
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
@@ -55,12 +55,18 @@ def _preflight_skipped_winners(
     if from_phase is None:
         return {}
 
+    required = {phase.name for _index, phase in experiment.phases_from(from_phase)}
     # One validated immutable generation supplies every skipped winner. The
     # engine holds _experiment_lock; the MCP gate retains the same publication
-    # snapshot while checking the full prefix before spawning its runner.
+    # snapshot while checking skipped winners before spawning its runner.
     phase = experiment.phases[0]
     try:
         publication = _published_for_resume(experiment)
+        if publication is not None:
+            required.update(publication.winners)
+        for candidate in reversed(experiment.phases):
+            if candidate.name in required:
+                required.update(candidate.inherits)
         winners: dict[str, Winner] = {}
         for phase in experiment.phases:
             if run_deadline is not None and time.monotonic() >= run_deadline:
@@ -69,6 +75,8 @@ def _preflight_skipped_winners(
                 )
             if phase.name == from_phase:
                 break
+            if phase.name not in required:
+                continue
             winners[phase.name] = _accept_skipped_winner(experiment, phase, winners, publication)
 
         return winners
@@ -120,7 +128,7 @@ def _accept_skipped_winner(
         phases, which supply ``phase``'s inherited context.
     :param ValidatedPublication | None publication: The publication resolved
         once for the whole resume.
-    :raises FileNotFoundError: The publication holds no winner for the phase.
+    :raises ResumeWinnerMissingError: The publication holds no winner for the phase.
     :raises WinnerIntegrityError: The winner is incompatible with the current
         partial-result policy.
     :raises StudyFingerprintMismatchError: The winner was produced by a
@@ -161,8 +169,8 @@ def _reject_bound_descendant_topups(
         study = existing_studies.get(phase.name)
         if study is None:
             continue
-        terminal = _finished_trial_count(study.get_trials(deepcopy=False))
-        if terminal >= phase.n_trials:
+        finished = _finished_trial_count(study.get_trials(deepcopy=False))
+        if finished >= phase.n_trials:
             continue
         partial_decision = study_policy_ops._load_accepted_partial_decision(study)
         if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
@@ -188,7 +196,7 @@ def _reject_bound_descendant_topups(
         ]
         if bound:
             raise StudyContextConflictError(
-                f"Phase {phase.name!r} has {phase.n_trials - terminal} top-up trial(s) "
+                f"Phase {phase.name!r} has {phase.n_trials - finished} top-up trial(s) "
                 f"remaining, but dependent phase study/studies {bound} are already bound "
                 "to its published winner via inheritance. "
                 "Use a new experiment name to run the larger upstream budget without "
@@ -222,7 +230,7 @@ def _reject_fixed_targets_without_study(
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, completed=0)
+            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, measured=0)
 
 
 def _preflight_reached_fingerprint(
@@ -232,7 +240,7 @@ def _preflight_reached_fingerprint(
     preloaded_winners: dict[str, Winner],
     existing_studies: dict[str, optuna.Study],
 ) -> None:
-    """Verify the first reached study before publishing the new generation.
+    """Verify the first reached study before any phase runs.
 
     :param Experiment experiment: Parsed experiment whose first reached phase
         (``from_phase``, or the first declared phase) is checked.

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
-from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
+from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
 
@@ -113,7 +113,7 @@ def winners_payload(
         winner_generation = (
             "unknown"
             if represented_generation_id is None
-            else "current_generation"
+            else "represented_generation"
             if source.generation_id == represented_generation_id
             else "prior_generation"
         )
@@ -167,7 +167,8 @@ def status_payload(
 ) -> dict[str, Any]:
     """Map ``read_status`` and detached-run state to the ``get_run_status`` payload.
 
-    Omit operator-only free-text publication errors.
+    Omit operator-only free-text publication errors. The this-run counts come from
+    ``generation_trials``, which counts the trials of the run's own generation.
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
@@ -180,34 +181,34 @@ def status_payload(
     """
     phases = []
     for phase in status["phases"]:
+        available = phase["trial_data_available"]
         raw_counts = phase["trials"]
         counts = {state: int(raw_counts.get(state, 0)) for state in TRIAL_STATE_NAMES}
         raw_generation_counts = phase.get("generation_trials") or {}
         generation_counts = {
             state: int(raw_generation_counts.get(state, 0)) for state in TRIAL_STATE_NAMES
         }
-        terminal_trials_total = sum(counts[state] for state in TERMINAL_TRIAL_STATES)
-        terminal_trials_this_run = sum(generation_counts[state] for state in TERMINAL_TRIAL_STATES)
-        terminal_trials_before_run = max(
-            0,
-            terminal_trials_total - terminal_trials_this_run,
-        )
-        target_terminal_trials = int(phase["n_trials"])
+        finished_trials_total = sum(counts[state] for state in FINISHED_TRIAL_STATES)
+        finished_trials_this_run = sum(generation_counts[state] for state in FINISHED_TRIAL_STATES)
+        finished_trials_before_run = max(0, finished_trials_total - finished_trials_this_run)
+        target_finished_trials = int(phase["n_trials"])
         phases.append(
             {
                 "phase": phase["phase"],
-                "trials": counts,
-                "running_trials_total": counts["RUNNING"],
-                "target_terminal_trials": target_terminal_trials,
-                "completed_trials_total": counts["COMPLETE"],
-                "terminal_trials_total": terminal_trials_total,
-                "terminal_trials_before_run": terminal_trials_before_run,
-                "attempts_launched_this_run": sum(generation_counts.values()),
-                "terminal_trials_this_run": terminal_trials_this_run,
-                "remaining_trials": max(0, target_terminal_trials - terminal_trials_total),
-                "target_already_satisfied": (terminal_trials_before_run >= target_terminal_trials),
+                "trials": counts if available else None,
+                "target_finished_trials": target_finished_trials,
+                "finished_trials_total": finished_trials_total if available else None,
+                "finished_trials_before_run": finished_trials_before_run if available else None,
+                "attempts_this_run": sum(generation_counts.values()) if available else None,
+                "finished_trials_this_run": finished_trials_this_run if available else None,
+                "remaining_trials": (
+                    max(0, target_finished_trials - finished_trials_total) if available else None
+                ),
+                "target_already_satisfied": (
+                    finished_trials_before_run >= target_finished_trials if available else None
+                ),
                 "winner_present": phase["winner_present"],
-                "trial_data_available": phase["trial_data_available"],
+                "trial_data_available": available,
                 "published_study_unavailable": phase.get("published_study_unavailable"),
             }
         )
@@ -223,6 +224,12 @@ def status_payload(
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
+        # A run that claims its generation moves the current pointer to its run ID.
+        "run_wrote_generation": (
+            None
+            if result_source == "terminal_snapshot_unavailable"
+            else status["current_generation_id"] == run["run_id"]
+        ),
         "publication_integrity": status["publication_integrity"],
         "result_context": status["result_context"],
         "published_config_matches_current": status["published_config_matches_current"],

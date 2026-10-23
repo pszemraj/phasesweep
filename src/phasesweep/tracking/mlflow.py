@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -456,24 +456,56 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
         time.sleep(min(request["settings"]["poll_seconds"], max(0, stop - time.monotonic())))
 
 
+def _finished_without(
+    data: _SdkRunData, *, metrics: Iterable[str], params: Iterable[str], tags: Iterable[str]
+) -> str | None:
+    """Name the required metrics, params and tags a finished run lacks, and the keys it has.
+
+    :param _SdkRunData data: Logged data of the finished run.
+    :param Iterable[str] metrics: Required metric names.
+    :param Iterable[str] params: Required param names.
+    :param Iterable[str] tags: Required tag names.
+    :return str | None: The failure text, or ``None`` when the run has everything required.
+    """
+    lacking: list[str] = []
+    available: list[str] = []
+    for kind, wanted, present in (
+        ("metric", metrics, data.metrics),
+        ("param", params, data.params),
+        ("tag", tags, data.tags),
+    ):
+        absent = sorted({key for key in wanted if key not in present})
+        if absent:
+            lacking += [f"{kind} {key!r}" for key in absent]
+            available.append(f"{kind} keys: {sorted(present)!r}")
+    if not lacking:
+        return None
+    return f"MLflow run finished without {', '.join(lacking)}; available {'; '.join(available)}."
+
+
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
+
+    A run that reads FINISHED is never polled for evidence it lacks. The trainer
+    process has exited before capture starts, and the MLflow client sends all of
+    that process's logged data, including asynchronous batches, before it marks
+    a run FINISHED, so the run already holds everything the trainer logged.
+    A run that is not yet FINISHED is polled until just before ``timeout_at``.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CaptureRequest request: Trusted target, bound run, and shared query.
     :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
-        or restarted during capture.
-    :raises TimeoutError: The run is unfinished, or its evidence is still missing, when
-        ``timeout_seconds`` runs out; the message names what is missing.
+        restarted during capture, or finished without a required metric, param or tag
+        (the message names it and the keys the run has) or without a metric's history.
+    :raises TimeoutError: The run is still not finished when ``timeout_seconds`` runs out.
     :return MlflowCapture: Frozen shared native evidence.
     """
     from phasesweep.evidence.mlflow import select_observation
     from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 
     binding, query = request["binding"], request["query"]
-    # The parent stops this worker when timeout_seconds runs out (``timeout_at``,
-    # a shared monotonic instant). Ending the wait just before lets the worker
-    # report what is missing; a nearer phase/run deadline still stops it first.
+    # Stop just before timeout_at, a shared monotonic instant, so the worker can report
+    # the run's state; a nearer phase or run deadline still stops it first.
     reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
     stop = request["timeout_at"] - reserve
     while True:
@@ -484,7 +516,6 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
         if run.info.status == "RUNNING" and binding["run_mode"] == "managed":
             client.set_terminated(binding["run_id"], status="FINISHED")
             run = client.get_run(binding["run_id"])
-        missing: list[str] = []
         if run.info.status == "FINISHED":
             selections = {
                 identity: MlflowExtractor.model_validate(specification)
@@ -492,61 +523,53 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
             }
             gates = [MlflowRequiredGate.model_validate(gate) for gate in query["gates"]]
             keys = sorted({spec.metric_key for spec in selections.values()})
-            missing = [f"metric {key!r}" for key in keys if key not in run.data.metrics] + [
-                f"{namespace[:-1]} {key!r}"
-                for gate in gates
-                for namespace, wanted, present in (
-                    ("params", gate.params, run.data.params),
-                    ("tags", gate.tags, run.data.tags),
-                )
-                for key in wanted
-                if key not in present
-            ]
-            if not missing:
-                observations: dict[str, Observation] = {}
-                for key in keys:
-                    history = client.get_metric_history(binding["run_id"], key)
-                    if not history:
-                        missing.append(f"metric {key!r} history")
-                        break
-                    records: list[Mapping[str, object]] = [
-                        {
-                            "value": m.value,
-                            "step": m.step,
-                            "timestamp": m.timestamp,
-                            "model_id": getattr(m, "model_id", None),
-                            "dataset_name": getattr(m, "dataset_name", None),
-                            "dataset_digest": getattr(m, "dataset_digest", None),
-                        }
-                        for m in history
-                    ]
-                    for identity, spec in selections.items():
-                        if spec.metric_key == key:
-                            observations[identity] = select_observation(records, spec)
-                else:
-                    final = client.get_run(binding["run_id"])
-                    verify_remote(final, binding)
-                    if final.info.status != "FINISHED":
-                        raise ValueError("MLflow run restarted during evidence capture.")
-                    return {
-                        "kind": "mlflow",
-                        "binding": binding,
-                        "run_state": "FINISHED",
-                        "query": query,
-                        "observations": observations,
-                        "retrieved_at": utc_now_iso(),
-                        "params": {
-                            key: final.data.params[key] for gate in gates for key in gate.params
-                        },
-                        "tags": {key: final.data.tags[key] for gate in gates for key in gate.tags},
-                    }
-        if time.monotonic() >= stop:
-            state = (
-                f"finished without {', '.join(missing)}"
-                if missing
-                else f"was still {run.info.status}"
+            lacking = _finished_without(
+                run.data,
+                metrics=keys,
+                params=[key for gate in gates for key in gate.params],
+                tags=[key for gate in gates for key in gate.tags],
             )
-            raise TimeoutError(f"MLflow run {state} when timeout_seconds ran out.")
+            if lacking is not None:
+                raise ValueError(lacking)
+            observations: dict[str, Observation] = {}
+            for key in keys:
+                history = client.get_metric_history(binding["run_id"], key)
+                if not history:
+                    raise ValueError(
+                        f"MLflow run finished with metric {key!r} but no history for it."
+                    )
+                records: list[Mapping[str, object]] = [
+                    {
+                        "value": m.value,
+                        "step": m.step,
+                        "timestamp": m.timestamp,
+                        "model_id": getattr(m, "model_id", None),
+                        "dataset_name": getattr(m, "dataset_name", None),
+                        "dataset_digest": getattr(m, "dataset_digest", None),
+                    }
+                    for m in history
+                ]
+                for identity, spec in selections.items():
+                    if spec.metric_key == key:
+                        observations[identity] = select_observation(records, spec)
+            final = client.get_run(binding["run_id"])
+            verify_remote(final, binding)
+            if final.info.status != "FINISHED":
+                raise ValueError("MLflow run restarted during evidence capture.")
+            return {
+                "kind": "mlflow",
+                "binding": binding,
+                "run_state": "FINISHED",
+                "query": query,
+                "observations": observations,
+                "retrieved_at": utc_now_iso(),
+                "params": {key: final.data.params[key] for gate in gates for key in gate.params},
+                "tags": {key: final.data.tags[key] for gate in gates for key in gate.tags},
+            }
+        if time.monotonic() >= stop:
+            raise TimeoutError(
+                f"MLflow run was still {run.info.status} when timeout_seconds ran out."
+            )
         time.sleep(min(request["settings"]["poll_seconds"], max(0, stop - time.monotonic())))
 
 
@@ -726,7 +749,16 @@ def main(argv: list[str] | None = None) -> int:
         # artifact upload carries no secrets; the exception text may.
         code = _error_code(exc)
         cause = _failure_cause(exc)
-        if code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
+        failure: BaseException | None = exc
+        while failure is not None and not isinstance(failure, ConnectionRefusedError):
+            failure = failure.__cause__ or failure.__context__
+        if isinstance(failure, ConnectionRefusedError):
+            cause = _failure_cause(failure)
+            advice = (
+                "the tracking server refused the connection; check tracking_uri "
+                "and that the server is running"
+            )
+        elif code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
             advice = "the experiment or run no longer exists"
         elif code in {"INVALID_PARAMETER_VALUE", 400}:
             advice = (

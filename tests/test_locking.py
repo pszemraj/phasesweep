@@ -31,18 +31,6 @@ from tests.conftest import (
 )
 
 
-def test_missing_nofollow_is_a_platform_capability_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delattr(runtime_files.os, "O_NOFOLLOW")
-
-    with pytest.raises(
-        runtime_files.PlatformCapabilityError,
-        match="without following symlinks",
-    ):
-        runtime_files.nofollow_flag()
-
-
 @pytest.mark.parametrize(
     "variable",
     ["HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "PHASESWEEP_HOME"],
@@ -188,6 +176,56 @@ def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.M
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("override", [False, True], ids=["default", "override"])
+def test_lock_directory_os_failure_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    lock_root = tmp_path / "locks" if override else tmp_path / ".cache/phasesweep/locks"
+    denied = PermissionError(13, "Permission denied", str(lock_root))
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise denied
+
+    if override:
+        monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(lock_root))
+        monkeypatch.setattr(runtime_files, "open_directory_fd", refuse)
+    else:
+        monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
+        monkeypatch.setattr(runtime_files, "ensure_private_dir", refuse)
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.lock_dir()
+
+    assert caught.value.__cause__ is denied
+    assert str(lock_root) in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
+    assert "same writable" in str(caught.value)
+    assert not lock_root.exists()
+
+
+def test_lock_file_os_failure_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "blocked.lock"
+    denied = PermissionError(13, "Permission denied", str(lock_path))
+
+    def refuse(path: Path) -> None:
+        raise denied
+
+    monkeypatch.setattr(runtime_files, "_open_lock_file", refuse)
+
+    with pytest.raises(runtime_files.UnsafeLockPathError) as caught:
+        runtime_files.try_lock_file(lock_path)
+
+    assert caught.value.__cause__ is denied
+    assert str(lock_path) in str(caught.value)
+    assert "PHASESWEEP_LOCK_DIR" in str(caught.value)
+    assert "same writable" in str(caught.value)
+    assert not lock_path.exists()
+
+
 def test_lock_dir_accepts_admin_shared_directory_and_creates_group_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,6 +262,7 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
     with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist"):
         runtime_files.lock_dir()
+    assert not override.exists()
 
     override.mkdir()
     override.chmod(0o750)
@@ -745,9 +784,7 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
 
     with (
         _experiment_lock(exp_a),
-        pytest.raises(  # noqa: SIM117
-            ExperimentLockBusyError, match="Another phasesweep process"
-        ),
+        pytest.raises(ExperimentLockBusyError, match="Another phasesweep process"),
         _experiment_lock(exp_b),
     ):
         pass
@@ -767,7 +804,7 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
         workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'b.journal'}"
     )
 
-    with (  # noqa: SIM117 — testing that the inner enter raises
+    with (  # testing that the inner enter raises
         _experiment_lock(exp_a),
         pytest.raises(RuntimeError, match="output namespace|backend"),
         _experiment_lock(exp_b),
@@ -842,9 +879,7 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
 
     assert set(_run_lock_paths(exp_real)) == set(_run_lock_paths(exp_alias))
 
-    real, alias = exp_real, exp_alias
-    distinct = real.model_copy(update={"experiment": "distinct"})
-    lock = _experiment_lock
+    distinct = exp_real.model_copy(update={"experiment": "distinct"})
     (runs / "distinct").mkdir()
 
     def contender(config):
@@ -871,13 +906,13 @@ except ExperimentLockBusyError:
             timeout=15,
         )
 
-    with lock(real):
+    with _experiment_lock(exp_real):
         lock_inodes = {path: path.stat().st_ino for path in runtime_files.lock_dir().glob("*.lock")}
-        blocked = contender(alias)
+        blocked = contender(exp_alias)
         assert (blocked.returncode, blocked.stdout.strip()) == (2, "busy"), blocked.stderr
         control = contender(distinct)
         assert (control.returncode, control.stdout.strip()) == (0, "acquired"), control.stderr
-    released = contender(alias)
+    released = contender(exp_alias)
     assert (released.returncode, released.stdout.strip()) == (0, "acquired"), released.stderr
     assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 

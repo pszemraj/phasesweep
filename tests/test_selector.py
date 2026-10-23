@@ -187,7 +187,7 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
     assert w.params == {"x": 1}
 
 
-def _add_interrupted(study, params: dict[str, int]) -> None:  # noqa: ANN001
+def _add_interrupted(study, params: dict[str, int]) -> None:
     """Add a FAIL trial that recorded its params before an interruption stopped it."""
     study.add_trial(
         optuna.trial.create_trial(
@@ -274,10 +274,11 @@ def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
     with pytest.raises(NoFeasibleTrialError) as excinfo:
         select_winner(study, _with_bounds(_make_exp(), max=2.0))
     assert str(excinfo.value) == (
-        "No feasible completed trials in phase. The phase's trials.csv records each "
-        "failed trial's reason; trainer output is in its trial_* directory. "
-        "Metric bounds: metric.max=2.0. The best value among COMPLETE trials with a finite "
-        "value is 3.5 (trial 1)."
+        "No completed trials in phase. The phase's trials.csv records why each "
+        "failed or infeasible trial finished that way; trainer output is in its "
+        "trial_* directory. "
+        "Metric bounds: metric.max=2.0. The best value among COMPLETE and INFEASIBLE trials "
+        "with a finite value is 3.5 (trial 1)."
     )
 
     with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=6\.0.*is 7\.0 \(trial 2\)"):
@@ -300,18 +301,18 @@ def test_metric_bounds_note_without_a_completed_value() -> None:
 
 
 def _axis(reduce: str = "mean", *, slot_size: int | None = None) -> RepeatAxis:
-    """Return a ``seed`` repeat axis over three values, slotted for seeded random."""
+    """Return a ``seed`` repeat axis over values 0-2 with the given ``reduce`` and ``slot_size`` (None leaves it unslotted)."""
     assert reduce in ("mean", "median")
     return RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=slot_size)
 
 
-def _add_group(study, x: int, values: list[float], **kwargs) -> None:  # noqa: ANN001
+def _add_group(study, x: int, values: list[float], **kwargs) -> None:
     """Add one configuration's trials, one per seed in order."""
     for seed, value in enumerate(values):
         _add_trial(study, value, params={"x": x, "seed": seed}, **kwargs)
 
 
-def _add_failed(study, x: int, seed: int) -> None:  # noqa: ANN001
+def _add_failed(study, x: int, seed: int) -> None:
     """Add a FAIL trial that recorded its params before failing."""
     study.add_trial(
         optuna.trial.create_trial(
@@ -398,7 +399,7 @@ def test_repeats_without_complete_group_names_incomplete_groups() -> None:
         "No complete repeat group: a configuration ranks only when all 3 trials (one per "
         "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 group(s) were "
         "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
-        "each failed trial's reason. Metric bounds: metric.min=0.01."
+        "why each failed or infeasible trial finished that way. Metric bounds: metric.min=0.01."
     )
 
 

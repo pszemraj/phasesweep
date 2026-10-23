@@ -34,8 +34,9 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
-    _phase_trials,
     make_experiment,
+    phase_study,
+    phase_trials,
     write_constant_trainer,
     write_trainer,
 )
@@ -118,8 +119,6 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     consumers,
 ):
     import sys
-
-    from phasesweep.engine.read import read_result
 
     calls_path = tmp_path / "remote-reads"
     wandb_worker_sdk(f"""
@@ -291,9 +290,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         )
         with pytest.raises(PhaseSweepError, match="optional SDK"):
             run_experiment(increased)
-        study = optuna.load_study(
-            study_name="t::next", storage=_resolve_storage(experiment.resolved_storage)
-        )
+        study = phase_study(experiment, "next")
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
@@ -301,7 +298,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 # The constant objective of ``write_constant_trainer``, but trial 1 exits
 # non-zero until a recovery marker file appears. Used to produce a *genuine*
 # generation that crashed between a trial completing and anything being
-# published (see the carve-out control).
+# published.
 _FLAKY_TRAINER = """
 import argparse, sys
 from pathlib import Path
@@ -432,7 +429,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     experiment = _evidence_experiment(tmp_path, override_format=override_format)
     run_experiment(experiment)
     input_path = _sole_trial_dir(experiment) / filename
-    record = _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
+    record = phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
 
     assert record == {
         "schema_version": 1,
@@ -461,7 +458,7 @@ def test_cli_trainer_input_record_is_the_merged_trainer_config(
     )
     run_experiment(experiment)
     trial_dir = _sole_trial_dir(experiment)
-    (trial,) = _phase_trials(experiment)
+    (trial,) = phase_trials(experiment)
     resolved = trial_dir / "overrides_resolved.json"
 
     if has_base_config:
@@ -553,7 +550,7 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     assert "trial 0" in message
     # Fails before any new trial work: the study still holds only the trial
     # whose evidence was broken, and nothing published over the damaged tree.
-    assert len(_phase_trials(topup)) == 1
+    assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -573,7 +570,7 @@ def test_present_incomplete_objective_provenance_blocks_selection(
     """Partial current provenance records cannot publish."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
-    trial = deepcopy(_phase_trials(experiment)[0])
+    trial = deepcopy(phase_trials(experiment)[0])
     record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
     if damage == "empty":
         record = {}
@@ -605,7 +602,7 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     topup = _evidence_experiment(tmp_path, n_trials=2)
     winners = run_experiment(topup)
 
-    assert len(_phase_trials(topup)) == 2
+    assert len(phase_trials(topup)) == 2
     second_generation = published_generation_id(topup)
     assert second_generation is not None
     assert second_generation != first_generation
@@ -633,7 +630,7 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     ):
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
-    assert len(_phase_trials(experiment)) == 1
+    assert len(phase_trials(experiment)) == 1
     assert _pointer_bytes(experiment) == pointer_before
 
 
@@ -673,7 +670,7 @@ def test_topup_refuses_damaged_generated_trainer_input(
     with pytest.raises(TrialEvidenceMissingError, match="trainer input"):
         run_experiment(topup)
 
-    assert len(_phase_trials(topup)) == 1
+    assert len(phase_trials(topup)) == 1
     assert _pointer_bytes(topup) == pointer_before
 
 
@@ -681,14 +678,18 @@ def test_carried_winner_requires_its_original_generated_input(tmp_path: Path) ->
     """A later generation cannot carry a winner whose trainer input disappeared."""
     experiment = _evidence_experiment(tmp_path, override_format="yaml_file")
     run_experiment(experiment)
-    run_experiment(experiment)
+    source_trial_dir = _sole_trial_dir(experiment)
+    source_generation = published_generation_id(experiment)
+    # The top-up trial ties trial 0, so the generation it publishes carries trial 0's winner.
+    carrying = _evidence_experiment(tmp_path, n_trials=2, override_format="yaml_file")
+    run_experiment(carrying)
     carrying_generation = published_generation_id(experiment)
-    assert carrying_generation is not None
+    assert carrying_generation not in {None, source_generation}
     pointer_before = _pointer_bytes(experiment)
-    (_sole_trial_dir(experiment) / "trainer_config.yaml").unlink()
+    (source_trial_dir / "trainer_config.yaml").unlink()
 
     with pytest.raises(TrialEvidenceMissingError, match="trainer_config.yaml"):
-        run_experiment(experiment)
+        run_experiment(carrying)
 
     assert published_generation_id(experiment) == carrying_generation
     assert _pointer_bytes(experiment) == pointer_before
@@ -745,7 +746,8 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     run_experiment(original)
     source_generation = published_generation_id(original)
     assert source_generation is not None
-    run_experiment(original)
+    # A second trial of q publishes a generation that carries p's winner.
+    run_experiment(_from_phase_evidence_experiment(tmp_path, resumed_trials=2)[0])
     shutil.rmtree(_generations_dir(original) / source_generation)
     marker.unlink()
     source = _sole_trial_dir(original)
@@ -757,11 +759,11 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     else:
         (source / "stdout.log").unlink()
 
-    resumed, _ = _from_phase_evidence_experiment(tmp_path, resumed_trials=2)
+    resumed, _ = _from_phase_evidence_experiment(tmp_path, resumed_trials=3)
     with pytest.raises(TrialEvidenceMissingError, match=expected):
         run_experiment(resumed, from_phase="q")
 
-    assert len(_phase_trials(resumed, "q")) == 1
+    assert len(phase_trials(resumed, "q")) == 2
     assert not marker.exists()
     assert _pointer_bytes(resumed) == pointer_before
 
@@ -797,7 +799,9 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
     winner = run_experiment(original)["p"]
     assert winner.trial_number == 2
     assert winner.generation_id is not None
-    run_experiment(original)
+    # A second trial of q publishes a generation that carries p's winner.
+    carrying = experiment(2)
+    run_experiment(carrying)
     shutil.rmtree(_generations_dir(original) / winner.generation_id)
     marker.unlink()
     first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
@@ -810,18 +814,18 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
         TrialEvidenceMissingError,
         match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
     ):
-        run_experiment(experiment(2), from_phase="q")
-    assert len(_phase_trials(original, "q")) == 1
+        run_experiment(experiment(3), from_phase="q")
+    assert len(phase_trials(original, "q")) == 2
     assert not marker.exists()
     with pytest.raises(
         TrialEvidenceMissingError,
         match=r"Phase 'p' winner group member trial 0 .*bytes behind the published",
     ):
-        run_experiment(original)
+        run_experiment(carrying)
     assert _pointer_bytes(original) == pointer_before
 
     source.write_bytes(original_bytes)
-    assert run_experiment(experiment(2), from_phase="q")["p"].repeats == winner.repeats
+    assert run_experiment(experiment(3), from_phase="q")["p"].repeats == winner.repeats
 
 
 def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
@@ -832,6 +836,8 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     run_experiment(experiment)
     source_generation = published_generation_id(experiment)
     assert source_generation is not None
+    # A second trial of q publishes a generation that carries p's winner.
+    experiment, _marker = _from_phase_evidence_experiment(tmp_path, resumed_trials=2)
     run_experiment(experiment)
     shutil.rmtree(_generations_dir(experiment) / source_generation)
     generation_id = published_generation_id(experiment)
@@ -839,7 +845,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     payload = yaml.safe_load(
         (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
     )
-    assert payload["trainer_input"] == _phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
+    assert payload["trainer_input"] == phase_trials(experiment)[0].user_attrs[TRAINER_INPUT_ATTR]
     optuna.delete_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
         storage=_resolve_storage(experiment.storage),
@@ -859,8 +865,10 @@ def test_carried_result_ignores_older_publication_files(tmp_path: Path, damage: 
     run_experiment(experiment)
     source_generation = published_generation_id(experiment)
     assert source_generation is not None
-    run_experiment(experiment)
-    assert published_generation_id(experiment) != source_generation
+    # Each top-up trial ties trial 0, so the generation it publishes carries trial 0's winner.
+    run_experiment(_evidence_experiment(tmp_path, n_trials=2))
+    carrying_generation = published_generation_id(experiment)
+    assert carrying_generation != source_generation
     expected = read_result(experiment)[1]
     assert expected[0].source is not None
     assert expected[0].source.generation_id == source_generation
@@ -878,9 +886,10 @@ def test_carried_result_ignores_older_publication_files(tmp_path: Path, damage: 
     status, winners = read_result(experiment)
     assert status["publication_integrity"] == "ok"
     assert winners == expected
-    replayed = run_experiment(experiment)["p"]
-    assert replayed.trial_number == expected[0].trial_number
-    assert replayed.generation_id == source_generation
+    republished = run_experiment(_evidence_experiment(tmp_path, n_trials=3))["p"]
+    assert republished.trial_number == expected[0].trial_number
+    assert republished.generation_id == source_generation
+    assert published_generation_id(experiment) not in {source_generation, carrying_generation}
     assert read_status(experiment)["publication_integrity"] == "ok"
 
 
@@ -896,7 +905,7 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
         max_consecutive_failures=1,
         fixed_overrides={"recovered": str(recovery_marker)},
     )
-    with pytest.raises(NoFeasibleTrialError, match="consecutive failures"):
+    with pytest.raises(NoFeasibleTrialError, match="consecutive failed/infeasible trials"):
         run_experiment(crashing)
 
     crashed_generation = yaml.safe_load(_generation_path(crashing).read_text())["generation_id"]

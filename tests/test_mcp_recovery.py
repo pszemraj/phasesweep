@@ -33,8 +33,8 @@ from phasesweep.engine.attempts import (
     _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.guards import _reconcile_existing_studies
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -65,12 +65,11 @@ from phasesweep.tracking.publication import sync_tracking
 from phasesweep.tracking.session import tracking_root
 from tests.conftest import (
     mark_current_format,
+    phase_study,
     reaped_pid,
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
     earlier_boot_id,
     live_runs,
     make_dead_run_handle,
@@ -81,10 +80,13 @@ from tests.mcp_helpers import (
     side_effect_app,
     stage_dead_run,
     write_run_status,
+    write_runner_heartbeat,
+    write_srv_catalog,
+    write_srv_config,
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
-    _new_phase_study,
+    new_phase_study,
     recover_run_cli,
     stamp_artifact_root,
     write_launched_stale_trial,
@@ -95,7 +97,7 @@ from tests.recovery_helpers import (
 
 def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
     """An unsupported MCP store calls for a fresh state directory."""
-    _config, _app, registry, store = side_effect_app(tmp_path)
+    write_srv_config, _app, registry, store = side_effect_app(tmp_path)
     marker = store._format_marker_path
     marker.write_text(json.dumps({"schema_version": MCP_STATE_FORMAT_VERSION + 1}))
     before = marker.read_bytes()
@@ -130,10 +132,7 @@ def _load_first_phase_study(config: Path) -> optuna.Study:
     exp = load_experiment(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
-    return optuna.load_study(
-        study_name=f"{exp.experiment}::{phase.name}",
-        storage=_resolve_storage(exp.resolved_storage),
-    )
+    return phase_study(exp, phase.name)
 
 
 def _load_phase_trial(config: Path, trial_number: int) -> optuna.trial.FrozenTrial:
@@ -164,7 +163,7 @@ def _stage_stale_running_recovery_scaffold(
     trial identities under a different boot ID. Returns ``(app, store, handle,
     attempt_id, recover)``.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     recorded_boot_id = earlier_boot_id() if earlier_boot else None
     trial_number = write_launched_stale_trial(
         config,
@@ -175,7 +174,9 @@ def _stage_stale_running_recovery_scaffold(
     attempt_id = f"stale-attempt-{trial_number}"
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = make_dead_run_handle(
         run_id=run_id,
@@ -226,9 +227,11 @@ def _stage_terminal_uncertain_run(
     cleanup-uncertain terminal trials (generation id == run id, matching the
     detached-runner contract). Returns ``(store, handle, trial_number,
     config, state_dir, recover)``."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     trial_number = write_uncertain_failed_trial(config, generation_id=run_id)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=mark_uncertain)
     write_unsafe_cleanup_status(store, run_id)
@@ -264,11 +267,14 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
     recovered_log = log_path.with_suffix(".log.recovered")
     log_bytes = b"runner failed before persisting its process identity\n"
     log_path.write_bytes(log_bytes)
+    # The runner starts its heartbeat before it persists its process identity.
+    heartbeat_path = write_runner_heartbeat(store, run_id)
     artifacts = (
         registry.state_dir / "runs" / f"{run_id}.json",
         store.config_snapshot_path(run_id),
         store.launch_lease_path(run_id),
         store._logs_dir / f"{run_id}.transition.lock",
+        heartbeat_path,
         log_path,
     )
     original = {path: path.read_bytes() for path in artifacts}
@@ -561,7 +567,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         assert payload["run"]["state"] == "failed"
         assert payload["run"]["recovery_required"] is False
         assert payload["run"]["failure"] == failure
-        assert payload["phases"][0]["running_trials_total"] == 0
+        assert payload["phases"][0]["trials"] is None
         assert payload["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
     assert winners["represented_generation_id"] is None
@@ -696,10 +702,12 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     refuse to clear the run while its process cleanup is uncertain, and only
     finalize after the registered supervisor is confirmed gone.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     run_id = "srv-registry-only-recovery"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
@@ -798,13 +806,13 @@ def _stage_tracking_run(
     :param list[str] | None uncertain_attempt_ids: Attempts the runner's terminal status reported.
     :return _TrackingRun: The staged run, its study, and the operation id.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
-    _, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    _, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     run_id = "srv-tracking-worker-recovery"
     mark_current_format(experiment)
-    study = _new_phase_study(experiment, experiment.phases[0].name)
+    study = new_phase_study(experiment, experiment.phases[0].name)
     stamp_artifact_root(study, experiment)
     handle = stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
     write_unsafe_cleanup_status(
@@ -1014,11 +1022,11 @@ def test_damaged_tracking_receipt_is_not_cleanup_evidence(
 def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str
 ) -> None:
-    """The real sync retires a tracking entry in any generation scope, with its proof kept."""
+    """The real sync retires a tracking entry only in its own generation, and recover-run clears the run either way."""
     pytest.importorskip("mlflow")
-    from tests.tracking_helpers import _remote_example
+    from tests.tracking_helpers import remote_mlflow_example
 
-    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = "journal:///" + str(tmp_path / "study.journal")
     config["phases"] = config["phases"][:1]
     experiment = Experiment.model_validate(config)
@@ -1026,7 +1034,9 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     run_experiment(experiment, generation_id=run_id)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    _, registry, store = make_mcp_app(_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS))
+    _, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS)
+    )
     handle = stage_dead_run(
         store, run_id, config_path, registry.get("srv").id, cleanup_uncertain=True
     )
@@ -1048,7 +1058,7 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     if scope == "own_generation":
         assert sync_tracking(experiment, run_id)["pending"] == 0
     else:
-        with pytest.raises(ValueError, match="No tracking deliveries exist"):
+        with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
             sync_tracking(experiment, "other-generation")
 
     study = _load_first_phase_study(config_path)
@@ -1070,27 +1080,29 @@ def test_sync_tracking_finishes_an_attempt_whose_cleanup_recover_run_confirmed(
     """
     pytest.importorskip("mlflow")
     from tests.tracking_helpers import (
-        _leave_cleanup_uncertain_attempt,
-        _remote_example,
+        leave_cleanup_uncertain_attempt,
+        remote_mlflow_example,
     )
 
-    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = "journal:///" + str(tmp_path / "study.journal")
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
     experiment = Experiment.model_validate(config)
     run_id = "mcp-uncertain-attempt"
-    attempt = _leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=run_id)
+    attempt = leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=run_id)
     if entry == "retired":
         _retire_active_attempt(experiment, attempt)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
-    _, registry, store = make_mcp_app(_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS))
+    _, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS)
+    )
     stage_dead_run(store, run_id, config_path, registry.get("srv").id, cleanup_uncertain=True)
     write_unsafe_cleanup_status(store, run_id)
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
     uploads.clear()
-    with pytest.raises(ValueError, match="No tracking deliveries exist"):
+    with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
         sync_tracking(experiment, run_id)
     assert uploads == []
 
@@ -1130,12 +1142,12 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     changed_storage: bool,
 ) -> None:
     """Cross-generation evidence is causal and survives an interrupted write."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     attempt_config = config
     if changed_storage:
         attempt_config = tmp_path / "srv-later-storage.yaml"
         attempt_config.write_text(
-            config.read_text().replace("/srv.db", "/srv-later.db"),
+            config.read_text().replace("/srv.journal", "/srv-later.journal"),
         )
     earlier_run_id = "srv-earlier-uncertain"
     later_generation_id = "later-cli-generation"
@@ -1168,9 +1180,12 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     if changed_storage:
         recovery_experiment = load_experiment(config)
         assert isinstance(recovery_experiment, Experiment)
+        assert recovery_experiment.resolved_storage != experiment.resolved_storage
         _write_artifact_root_binding(recovery_experiment)
 
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = stage_dead_run(store, earlier_run_id, config, reg.id, cleanup_uncertain=False)
     status_kwargs: dict[str, object] = {}
@@ -1273,6 +1288,60 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
     assert terminal["result_snapshot_error"] == "RuntimeError"
 
 
+@pytest.mark.parametrize("terminal", [False, True], ids=["running", "cleanup-uncertain-terminal"])
+def test_registered_trial_recovery_counts_match_preflight_and_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: bool
+) -> None:
+    """Registry reconciliation contributes the same trial count preflight promised."""
+    config = write_srv_config(tmp_path)
+    run_id = "srv-registered-trial-count"
+    setup = write_uncertain_failed_trial if terminal else write_launched_stale_trial
+    trial_number = setup(config, generation_id=run_id)
+    experiment = load_experiment(config)
+    assert isinstance(experiment, Experiment)
+    phase = experiment.phases[0]
+    attempt_id = f"stale-attempt-{trial_number}"
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase.name,
+        study_name=f"{experiment.experiment}::{phase.name}",
+        trial_number=trial_number,
+        trial_dir=_trial_dir_for(
+            experiment, phase.name, trial_number, generation_id=run_id, attempt_id=attempt_id
+        ),
+        generation_id=run_id,
+    )
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    stage_dead_run(store, run_id, config, "srv", cleanup_uncertain=False)
+    write_unsafe_cleanup_status(store, run_id)
+    record_runner_cleanup(monkeypatch, module="phasesweep.mcp.recovery")
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", Mock(return_value=True)
+    )
+
+    preflight = recover_run_cli(registry.state_dir, run_id)
+
+    assert preflight.exit_code == 0, preflight.output
+    planned = "recover 1 cleanup-uncertain terminal trial" if terminal else "reap 1 stale trial"
+    assert planned in preflight.output
+    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
+
+    assert confirmed.exit_code == 0, confirmed.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["registered_attempts_reconciled"] == 1
+    assert recovery["reaped_running_trials"] == (0 if terminal else 1)
+    assert recovery["cleanup_uncertain_terminal_trials"] == (1 if terminal else 0)
+    actual = "confirmed 1 cleanup-uncertain trial" if terminal else "reaped 1 stale trial"
+    assert actual in confirmed.output
+    trial = _load_phase_trial(config, trial_number)
+    assert trial.state == optuna.trial.TrialState.FAIL
+    study = _load_first_phase_study(config)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
+
+
 @pytest.mark.parametrize(
     (
         "trial_setup_fn",
@@ -1321,11 +1390,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     """Recovery clears cleanup uncertainty from a terminal cleanup-uncertain
     trial and a stale RUNNING trial reaped by recovery.
     """
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     run_id = "srv-cleanup-uncertainty-recover"
     trial_pid = reaped_pid()
     trial_number = trial_setup_fn(config, generation_id=run_id, pid=trial_pid)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     status_kwargs: dict[str, object] = {}
@@ -1335,7 +1406,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         status_kwargs["result_snapshot"] = capture_result_snapshot(exp)
     write_unsafe_cleanup_status(store, run_id, **status_kwargs)
     if expect_running_before_confirm:
-        assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
+        assert app.status(run_id=run_id)["phases"][0]["trials"]["RUNNING"] == 1
 
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
@@ -1396,10 +1467,11 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "WAITING": 0,
             "RUNNING": 0,
             "COMPLETE": 0,
+            "INFEASIBLE": 0,
             "FAIL": 0,
             "INTERRUPTED": 1,
         }
-        assert recovered_status["phases"][0]["running_trials_total"] == 0
+        assert recovered_status["phases"][0]["trials"]["RUNNING"] == 0
 
     final_status = store.status_path(run_id).read_bytes()
     final_recovery = store.cleanup_recovery_path(run_id).read_bytes()
@@ -1496,9 +1568,9 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert phase["generation_trials"]["INTERRUPTED"] == 1
     assert not store.observe(handle).recovery_required
     recovered_status = app.status(run_id=run_id)["phases"][0]
-    # An interrupted trial is not terminal for the budget: it reruns.
-    assert recovered_status["terminal_trials_this_run"] == 0
-    assert recovered_status["terminal_trials_before_run"] == 0
+    # An interrupted trial is not finished, so it spends no budget: it reruns.
+    assert recovered_status["finished_trials_this_run"] == 0
+    assert recovered_status["finished_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
 
     final_status = store.status_path(run_id).read_bytes()
@@ -1581,7 +1653,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     run_id = "srv-runner-reconciled"
     trial_number = write_launched_stale_trial(
         config,
@@ -1614,7 +1686,9 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     assert reconciled_attempt_ids == {attempt_id}
     assert reconciled_attempt_generations == {attempt_id: run_id}
 
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     reg = registry.get("srv")
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_run_status(
@@ -1769,7 +1843,9 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     assert not recovery_record.exists()
     assert store.observe(handle).recovery_required
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    app, _registry, _store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
     assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
@@ -1793,7 +1869,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     recovery record is already on disk. The study ledger supplies the
     evidence."""
     run_id = "srv-terminal-marker-retry"
-    store, handle, _trial, _config, _state_dir, recover = _stage_terminal_uncertain_run(
+    store, handle, _trial, write_srv_config, _state_dir, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True
     )
 

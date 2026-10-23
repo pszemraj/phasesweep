@@ -13,7 +13,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import optuna
 import pytest
 
 from phasesweep.config.io import load_experiment
@@ -22,7 +21,6 @@ from phasesweep.config.reference import reference_notes
 from phasesweep.engine.generation import (
     _write_generation_state,
 )
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_summary_path,
@@ -37,7 +35,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
 from phasesweep.mcp.errors import (
-    ConfigChangedError,
     McpToolError,
     RunPersistentStateUnavailableError,
     RunSnapshotUnavailableError,
@@ -54,15 +51,14 @@ from phasesweep.mcp.server import (
 from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
+    phase_study,
     write_constant_trainer,
+    write_experiment_config,
 )
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
-    _catalog,
-    _config,
-    _drift_experiment,
-    _write_experiment_config,
+    drift_experiment,
     make_mcp_app,
     make_run_handle,
     side_effect_app,
@@ -70,6 +66,8 @@ from tests.mcp_helpers import (
     stage_live_run,
     write_mcp_catalog,
     write_run_status,
+    write_srv_catalog,
+    write_srv_config,
 )
 
 
@@ -81,9 +79,9 @@ def _record_published_run_snapshot(
     """Publish one generation whose id also has a completed MCP run snapshot."""
     trainer = write_constant_trainer(tmp_path)
     config = tmp_path / "srv.yaml"
-    experiment = _drift_experiment(tmp_path, trainer, extractor=extractor)
-    _write_experiment_config(config, experiment)
-    catalog = _catalog(tmp_path, config)
+    experiment = drift_experiment(tmp_path, trainer, extractor=extractor)
+    write_experiment_config(config, experiment)
+    catalog = write_srv_catalog(tmp_path, config)
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
     run_id = "srv-frozen-result"
@@ -105,7 +103,7 @@ def _published_run_terminal(
     tmp_path: Path,
 ) -> tuple[PhaseSweepMCP, Registry, RunStore, RunHandle, TerminalStatus]:
     """Load the completed terminal record of a published run through a restarted app."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, registry, store = make_mcp_app(catalog)
     handle = store.get(run_id)
     assert handle is not None
@@ -121,10 +119,59 @@ def _read_run_tool(app: PhaseSweepMCP, read_tool: str, run_id: str) -> dict[str,
     return getattr(app, read_tool)(run_id=run_id)
 
 
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+@pytest.mark.parametrize("snapshot_unavailable", [False, True], ids=["known-empty", "unavailable"])
+def test_run_status_distinguishes_unknown_trial_counts_from_known_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_tool: str,
+    snapshot_unavailable: bool,
+) -> None:
+    """Unavailable terminal results expose unknown counts; an empty live study exposes zero."""
+    config, app, registry, store = side_effect_app(tmp_path)
+    run_id = "srv-count-availability"
+    if snapshot_unavailable:
+        stage_dead_run(store, run_id, config, "srv", cleanup_uncertain=False)
+        write_run_status(
+            store,
+            run_id,
+            returncode=1,
+            error_class="RuntimeError",
+            result_snapshot_state="failed",
+        )
+    else:
+        stage_live_run(store, run_id, config, "srv")
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = _read_run_tool(app, read_tool, run_id)
+
+    result_type = AwaitRunResult if read_tool == "await_run" else GetRunStatusResult
+    result = result_type.model_validate(payload)
+    phase = result.phases[0]
+    assert phase.target_finished_trials == registry.get("srv").experiment.phases[0].n_trials
+    assert phase.trial_data_available is not snapshot_unavailable
+    counts = (
+        phase.finished_trials_total,
+        phase.finished_trials_before_run,
+        phase.attempts_this_run,
+        phase.finished_trials_this_run,
+    )
+    if snapshot_unavailable:
+        assert phase.trials is None
+        assert counts == (None,) * len(counts)
+        assert phase.remaining_trials is None
+        assert phase.target_already_satisfied is None
+    else:
+        assert phase.trials and set(phase.trials.values()) == {0}
+        assert counts == (0,) * len(counts)
+        assert phase.remaining_trials == phase.target_finished_trials
+        assert phase.target_already_satisfied is False
+
+
 @pytest.mark.integration
 def test_run_results_carry_path_free_confound_verdicts(tmp_path: Path) -> None:
     """Agents get every verdict and its counts; operator evidence stays in winner.yaml."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
 
     payload = app.winners(run_id=run_id)
@@ -152,17 +199,17 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     method_name: str,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    experiment = _drift_experiment(tmp_path, trainer)
+    experiment = drift_experiment(tmp_path, trainer)
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, experiment)
-    catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    write_experiment_config(config, experiment)
+    catalog = write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
     run_id = "srv-launched"
     stage_live_run(store, run_id, config, reg.id)
     if method_name == "winners":
         run_experiment(experiment, generation_id=run_id)
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="edited"))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phase_name="edited"))
 
     restarted_registry = Registry.load(catalog)
     restarted_app = PhaseSweepMCP(restarted_registry, store)
@@ -180,12 +227,12 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     tmp_path: Path,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    old_exp = _drift_experiment(tmp_path, trainer, name="old")
+    old_exp = drift_experiment(tmp_path, trainer, name="old")
     old_config = tmp_path / "old.yaml"
-    _write_experiment_config(old_config, old_exp)
+    write_experiment_config(old_config, old_exp)
     run_id = "old-launched"
     run_experiment(old_exp, generation_id=run_id)
-    other_config = _config(tmp_path, name="other")
+    other_config = write_srv_config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
     )
@@ -200,15 +247,15 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
 @pytest.mark.integration
 def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
-    old_exp = _drift_experiment(tmp_path, trainer, name="old")
+    old_exp = drift_experiment(tmp_path, trainer, name="old")
     old_config = tmp_path / "old.yaml"
-    _write_experiment_config(old_config, old_exp)
+    write_experiment_config(old_config, old_exp)
     run_id = "old-live-published"
     # The published summary carries the launched config's own fingerprint, so
     # only the missing catalog entry can leave the drift unknown.
     run_experiment(old_exp, generation_id=run_id)
 
-    other_config = _config(tmp_path, name="other")
+    other_config = write_srv_config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(write_mcp_catalog(tmp_path, {"other": other_config}))
     stage_live_run(store, run_id, old_config, "old")
 
@@ -249,8 +296,8 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
 
 @pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> None:
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    config = write_srv_config(tmp_path)
+    app, _registry, _store = make_mcp_app(write_srv_catalog(tmp_path, config))
     method = getattr(app, method_name)
 
     with pytest.raises(UnknownRunError, match="unknown run id"):
@@ -274,10 +321,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
     experiment = registry.get("srv").experiment
-    study = optuna.load_study(
-        study_name=f"{experiment.experiment}::p",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    study = phase_study(experiment)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
 
     with pytest.raises(RunPersistentStateUnavailableError) as excinfo:
@@ -347,7 +391,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     integrity: str,
 ) -> None:
     """A live publication failure or access denial cannot expose stale winners."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
     store.status_path(run_id).unlink()
@@ -389,7 +433,7 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
             def run(self, path):
                 return type("Run", (), {"state": "finished", "summary_metrics": {"eval/loss": 0.25}})()
     """)
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(
+    run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(
         tmp_path,
         extractor=WandbExtractor(
             type="wandb", entity="e", project="p", metric_key="eval/loss", timeout_seconds=5
@@ -416,7 +460,10 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
-    """A run snapshot keeps x/minimize after the catalog changes to y/maximize."""
+    """A run snapshot keeps x/minimize after the catalog changes to y/maximize.
+
+    The same server rereads the edited config, so only the drift verdict follows it.
+    """
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     baseline_status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
@@ -424,13 +471,12 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     assert baseline_results.published_config_matches_current is True
     assert baseline_status.published_config_matches_current is True
 
-    _write_experiment_config(
+    write_experiment_config(
         config,
-        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
+        drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
     )
-    restarted, _restarted_registry, _restarted_store = make_mcp_app(catalog)
-    status = GetRunStatusResult.model_validate(restarted.status(run_id=run_id))
-    results = GetRunResultsResult.model_validate(restarted.winners(run_id=run_id))
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
     assert (status.metric.name, status.metric.goal) == (results.metric.name, results.metric.goal)
@@ -465,7 +511,7 @@ def test_run_scoped_snapshot_survives_live_publication_damage(
     damage: Callable[[Experiment, str], None],
 ) -> None:
     """Frozen run reads stay ok after the live winner or publication pointer is damaged."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
     damage(experiment, run_id)
@@ -791,12 +837,12 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     """
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     published_assurance = objective_evidence_assurance(
-        _drift_experiment(tmp_path, trainer).metric.extractor
+        drift_experiment(tmp_path, trainer).metric.extractor
     )
 
-    _write_experiment_config(
+    write_experiment_config(
         config,
-        _drift_experiment(
+        drift_experiment(
             tmp_path,
             trainer,
             extractor=JsonEnvelopeExtractor(
@@ -827,7 +873,7 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
 def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:
     """Renaming a phase must not delete the published result from the payload."""
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="q"))
+    write_experiment_config(config, drift_experiment(tmp_path, trainer, phase_name="q"))
     app, _registry, _store = make_mcp_app(catalog)
 
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
@@ -867,10 +913,10 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     visible: bool,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    experiment = _drift_experiment(tmp_path, trainer)
+    experiment = drift_experiment(tmp_path, trainer)
     config = tmp_path / "srv.yaml"
-    _write_experiment_config(config, experiment)
-    catalog = _catalog(tmp_path, config, visible_params=launch_policy)
+    write_experiment_config(config, experiment)
+    catalog = write_srv_catalog(tmp_path, config, visible_params=launch_policy)
     launch_registry = Registry.load(catalog)
     store = RunStore(launch_registry.state_dir)
     reg = launch_registry.get("srv")
@@ -882,14 +928,14 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     ]
     expected = published.params["lr"] if visible else "<redacted>"
 
-    _catalog(tmp_path, config, visible_params=current_policy)
+    write_srv_catalog(tmp_path, config, visible_params=current_policy)
     restarted = PhaseSweepMCP(Registry.load(catalog), store)
 
     assert restarted.winners(run_id=run_id)["phases"][0]["params"]["lr"] == expected
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
-    configs = {f"srv{i}": _config(tmp_path, name=f"srv{i}") for i in range(3)}
+    configs = {f"srv{i}": write_srv_config(tmp_path, name=f"srv{i}") for i in range(3)}
     registry = Registry.load(write_mcp_catalog(tmp_path, configs))
     store = RunStore(registry.state_dir)
     app = PhaseSweepMCP(registry, store)
@@ -912,7 +958,7 @@ def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
 
 def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
     """A known key returns its subtree, an unknown one the nearest keys, and neither touches the catalog."""
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, _config(tmp_path)))
+    app, _registry, _store = make_mcp_app(write_srv_catalog(tmp_path, write_srv_config(tmp_path)))
 
     sampler = app.explain_config("phases[].sampler")
     assert sampler["found"] is True
@@ -923,8 +969,9 @@ def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
     assert app.explain_config("phases.0.sampler") == {**sampler, "key": "phases.0.sampler"}
     first = sampler["entries"][0]
     assert set(first) == {"path", "signature", "section", "description"}
-    assert first["section"] == "Required experiment fields"
-    assert "\n" in first["description"]
+    assert first["section"] == "Phases"
+    assert "\n" in sampler["entries"][1]["description"]
+    assert [(group["kind"], group["name"]) for group in sampler["rules"]] == [("section", "Phases")]
 
     variants = app.explain_config("metric.extractor.path")
     assert {"metric.extractor[type=json].path", "metric.extractor[type=json_envelope].path"} <= {
@@ -935,6 +982,7 @@ def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
     assert missing == {
         "key": "inherit_env",
         "found": False,
+        "rules": [],
         "entries": [],
         "closest": ["execution.inherit_env"],
         "notes": "",
@@ -963,18 +1011,9 @@ def test_explain_config_without_a_key_lists_top_level_keys_and_needs_no_catalog(
     assert PhaseSweepMCP.explain_config("  ")["notes"] == index["notes"]
 
 
-def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
-    config.write_text(config.read_text() + "\n# changed after server startup\n")
-
-    with pytest.raises(ConfigChangedError, match="restart the MCP server"):
-        app.validate("srv")
-
-
 def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config))
+    config = write_srv_config(tmp_path)
+    app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
 
     assert app.latest_run("srv") == {
         "experiment_id": "srv",

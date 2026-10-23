@@ -40,12 +40,14 @@ from phasesweep.evidence.models import (
 from tests.conftest import (
     make_experiment,
     mark_current_format,
+    phase_trials,
+    tell_feasible,
     trial_outcome,
     write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
-from tests.recovery_helpers import _new_phase_study
+from tests.recovery_helpers import new_phase_study
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -103,7 +105,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
-    study.optimize(lambda trial: 1.0, n_trials=1)
+    tell_feasible(study, study.ask(), 1.0)
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
@@ -179,7 +181,7 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
     else:
         ledger = tmp_path / "study.journal"
         experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
-        _new_phase_study(experiment, "p")
+        new_phase_study(experiment, "p")
         _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     return experiment, ledger, _experiment_dir(experiment)
 
@@ -220,10 +222,13 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     before = tree_snapshot(root)
 
     status = read_status(experiment)
-    for phase in _status_phases(experiment, status):
+    for surface, phase in enumerate(_status_phases(experiment, status)):
         assert phase["trial_data_available"] is False
         assert phase["published_study_unavailable"] is published
-        assert not any(phase["trials"].values())
+        if surface == 2:  # MCP distinguishes unavailable counts from a known empty study.
+            assert phase["trials"] is None
+        else:
+            assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
         engine_ledger.open_existing_study(
@@ -247,14 +252,10 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
 ) -> None:
     """Reads skip a bad final line exactly as Optuna does; a write repairs it and proceeds.
 
-    Optuna's reader skips a final line that lacks its newline or does not
-    decode, so status reports the complete records a live load would see. A
-    write does not refuse on sight: under the PhaseSweep inode lock it
-    backs the damaged bytes up beside the journal, cuts the journal back to
-    its last complete record, and continues. When nothing survives the cut
-    (``keep_prefix=False``) and a generation already published a winner from
-    this study, the truncation still leaves that publication's evidence gone
-    -- a real, later, unrelated refusal the repair cannot paper over.
+    When the repair leaves nothing of the journal (``keep_prefix=False``) and a
+    generation already published a winner from this study, the truncation still
+    leaves that publication's evidence gone -- a real, later, unrelated refusal
+    the repair cannot paper over.
     """
     from phasesweep.engine.errors import PublishedStudyMissingError
 
@@ -316,7 +317,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
-    study.tell(trial, 0.5)
+    tell_feasible(study, trial)
     complete = ledger.read_bytes()
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
     # The handle's format scan also captures the journal. Take it on the whole
@@ -393,7 +394,7 @@ def test_phase_reads_capture_trial_data_once_whatever_the_phase_count(
     ]
     mark_current_format(experiment, *studies)
     for study in studies:
-        study.tell(study.ask(), 0.5)
+        tell_feasible(study, study.ask())
     real_capture = engine_ledger._capture_journal
     captures: list[Path] = []
 
@@ -432,7 +433,7 @@ def test_read_status_captures_trial_data_after_resolving_the_publication_pointer
 
     def finish_then_resolve(target: Experiment):
         # A publication tells its winning trial before it moves the pointer.
-        study.tell(trial, 0.5)
+        tell_feasible(study, trial)
         return real_resolve(target)
 
     monkeypatch.setattr(engine_read, "_resolve_publication_pointer", finish_then_resolve)
@@ -501,9 +502,12 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         phase = payload["phases"][0]
         assert phase["published_study_unavailable"] is True
         assert phase["trial_data_available"] is (damage != "corrupt")
-        assert {state: count for state, count in phase["trials"].items() if count} == (
-            {"COMPLETE": 1} if damage == "stale-ledger" else {}
-        )
+        if payload is mcp_status and damage == "corrupt":
+            assert phase["trials"] is None
+        else:
+            assert {state: count for state, count in phase["trials"].items() if count} == (
+                {"COMPLETE": 1} if damage == "stale-ledger" else {}
+            )
     assert status["phases"][0]["running_attempts"] == (None if damage == "corrupt" else [])
     assert (ledger.read_bytes() if ledger.exists() else None) == ledger_before
     expected_error = (
@@ -578,13 +582,14 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     assert status["phases"][0]["published_study_unavailable"] is True
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
 
-    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+    with pytest.raises(PublishedStudyMissingError) as refused:
         run_experiment(experiment)
+    assert (
+        "has only 1 finished and 1 completed trials, below the published "
+        "completion boundary (3 finished, 3 completed)"
+    ) in str(refused.value)
 
-    study = optuna.load_study(
-        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
-    )
-    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert [trial.number for trial in phase_trials(experiment)] == [0]
     assert _generation_path(experiment).read_bytes() == generation_before
     assert published_generation_id(experiment) == published
     assert {
@@ -604,7 +609,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
-        study.tell(trial, 0.5)
+        tell_feasible(study, trial)
     mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,
@@ -1061,7 +1066,7 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
     assert tables.published_generation_id == published_generation_id(experiment)
     (table,) = tables.phases
     assert table.available
-    assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+    assert table.columns == ("trial", "state", "value", "params", "duration_s", "reason", "winner")
     rows = table.rows
     assert [row["trial"] for row in rows] == [0, 1, 2]
     # Trial 1 completed but breached the metric's max, so it never ranked; trial 2 failed.
@@ -1072,6 +1077,9 @@ def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
         assert isinstance(row["params"], dict) and set(row["params"]) == {"x"}
     duration = rows[0]["duration_s"]
     assert isinstance(duration, float) and duration > 0
+    assert rows[0]["reason"] is None
+    assert "max=1.5" in str(rows[1]["reason"])
+    assert "non-zero exit code 1" in str(rows[2]["reason"])
 
 
 def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
@@ -1102,6 +1110,7 @@ def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> 
         "params",
         "duration_s",
         "observed:mem",
+        "reason",
         "winner",
     )
     assert [row["observed:mem"] for row in table.rows] == [3.0, 4.0, None]

@@ -48,7 +48,11 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -83,14 +87,13 @@ from tests.conftest import (
     mark_current_format,
     requires_nonroot,
     write_constant_trainer,
+    write_experiment_config,
+    write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     SEEDED_RANDOM,
-    _catalog,
-    _config,
-    _write_experiment_config,
     claim_runner_handle,
     live_runs,
     make_dead_run_handle,
@@ -101,13 +104,10 @@ from tests.mcp_helpers import (
     runner_main,
     write_mcp_catalog,
     write_slow_mcp_config,
+    write_srv_catalog,
+    write_srv_config,
 )
 from tests.recovery_helpers import recover_run_cli
-
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="cancel path relies on POSIX process groups + /proc liveness",
-)
 
 
 @pytest.mark.integration
@@ -163,7 +163,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
         search_space={},
     )
     config_path = tmp_path / f"{name}.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     return config_path, hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
@@ -176,7 +176,7 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
                 f"runner exited early ({proc.returncode}); log:\n{log_path.read_text()}"
             )
         status = read_status(experiment)
-        if status["phases"][0]["running"] >= 1:
+        if status["phases"][0]["trials"].get("RUNNING", 0) >= 1:
             phase_dir = _trial_dir_for(experiment, "p", 0).parent
             for trial_dir in phase_dir.glob("trial_00000__*"):
                 if (trial_dir / PROCESS_IDENTITY_FILE).is_file():
@@ -320,7 +320,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         trial_command="echo x=0.5 {overrides}",
     )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     run_experiment(experiment)
     generation_before = _generation_path(experiment).read_bytes()
     (_experiment_dir(experiment) / "study.journal").unlink()
@@ -404,10 +404,10 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             }
         )
     config_path = tmp_path / "experiment.yaml"
-    _write_experiment_config(config_path, experiment)
+    write_experiment_config(config_path, experiment)
     other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
     other_path = tmp_path / "other.yaml"
-    _write_experiment_config(other_path, other)
+    write_experiment_config(other_path, other)
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
@@ -519,7 +519,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         if changed_fact == "generation_claimed":
             unrelated.pop("generation_unavailable_reason")
         elif changed_fact == "unrelated_failure":
-            unrelated["failure"]["cause"]["code"] = "trainer_failed"
+            unrelated["failure"]["cause"]["code"] = "trials_failed"
         else:
             unrelated["failure"]["cause"]["stage"] = "execution"
         store.status_path(run_id).write_text(json.dumps(unrelated))
@@ -553,6 +553,38 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     other_status = asyncio.run(app.await_run(other_relaunch["run_id"], timeout_seconds=30))
     assert other_status["reason"] == "terminal"
     assert other_status["run"]["state"] == "succeeded"
+
+
+@pytest.mark.integration
+def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rerun refused for a recorded abort launches no trainer, so it reports like the other refusals."""
+    monkeypatch.chdir(tmp_path)
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'abort.journal'}",
+        trainer=trainer,
+        n_trials=2,
+        max_consecutive_failures=1,
+        sampler={"type": "random", "seed": 7},
+    )
+    config_path = tmp_path / "experiment.yaml"
+    write_experiment_config(config_path, experiment)
+    store = RunStore(tmp_path / "state")
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_claimed_runner(store, "aborting", config_path, experiment_id="t", cwd=tmp_path)
+    aborting = json.loads(store.status_path("aborting").read_text())["failure"]
+    assert (aborting["code"], aborting["stage"]) == ("trials_failed", "execution")
+
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_claimed_runner(store, "refused", config_path, experiment_id="t", cwd=tmp_path)
+    refused = json.loads(store.status_path("refused").read_text())["failure"]
+    assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")
+    assert (refused["retryable"], refused["actor"]) == (False, "operator")
+    assert "correct the experiment configuration" in refused["remediation"]
 
 
 @pytest.mark.integration
@@ -591,7 +623,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
 
 @pytest.mark.integration
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
@@ -627,8 +659,8 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     changed = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"fixed_overrides": {"k": 2}})]}
     )
-    _write_experiment_config(config, changed)
-    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    write_experiment_config(config, changed)
+    registry = Registry.load(write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     run_id = "srv-preflight-failure"
     snapshot_path = store.config_snapshot_path(run_id)
@@ -655,7 +687,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
         assert payload["failure"]["actor"] == "operator"
     assert status["result_source"] == "frozen_run_snapshot"
     assert status["summary_present"] is False
-    assert status["phases"][0]["attempts_launched_this_run"] == 0
+    assert status["phases"][0]["attempts_this_run"] == 0
     assert awaited["reason"] == "terminal"
     assert winners["winner_count"] == 0
     assert winners["failure"]["code"] == "fingerprint_mismatch"
@@ -665,7 +697,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
 def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     tmp_path: Path,
 ) -> None:
-    config = _config(
+    config = write_srv_config(
         tmp_path,
         phases="""\
   - name: a
@@ -846,8 +878,11 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
             raise cleanup_error
         return {}
 
-    def fail_run(*args: object, **kwargs: object) -> None:
-        raise NoFeasibleTrialError("trainer failed")
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
+        raise PhaseTrialsFailedError("trainer failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
@@ -880,11 +915,14 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
     scan_registry = Mock(return_value=None)
     fail_discovery = Mock(side_effect=cleanup_error)
 
-    def fail_run(*args: object, **kwargs: object) -> None:
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         # Initial discovery and preflight succeeded. Only reconciliation loses
         # access to the root, before it can perform a second registry scan.
         monkeypatch.setattr("phasesweep.engine.guards.validate_ledger", fail_discovery)
-        raise NoFeasibleTrialError("trainer failed")
+        raise PhaseTrialsFailedError("trainer failed")
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_active_attempts", scan_registry)
@@ -937,7 +975,10 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     )
     preflight = Mock(return_value={})
 
-    def cancel_run(*args: object, **kwargs: object) -> None:
+    def cancel_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         raise shutdown
 
     captured: list[TerminalReport] = []
@@ -959,7 +1000,11 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
 @pytest.mark.parametrize(
     ("initial_error", "cleanup_confirmed"),
     [
-        pytest.param(NoFeasibleTrialError("trainer failed"), True, id="ordinary-failure"),
+        pytest.param(
+            PhaseTrialsFailedError("trainer failed"),
+            True,
+            id="ordinary-failure",
+        ),
         pytest.param(
             UnsafeProcessCleanupError("trial cleanup could not be confirmed"),
             False,
@@ -996,7 +1041,10 @@ def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
     )
     preflight = Mock(side_effect=[{}, shutdown])
 
-    def fail_run(*args: object, **kwargs: object) -> None:
+    def fail_run(
+        *args: object, generation: generation_ops.InvocationGeneration, **kwargs: object
+    ) -> None:
+        generation.claim()
         raise initial_error
 
     captured: list[TerminalReport] = []
@@ -1019,7 +1067,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
@@ -1043,11 +1091,11 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
-    primary = NoFeasibleTrialError("trainer failed")
+    primary = PhaseTrialsFailedError("trainer failed")
 
     def fail_with_uncertain_cleanup(
         config_obj: Experiment,
@@ -1093,14 +1141,14 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["failure"]["stage"] == "cleanup"
     assert status["failure"]["retryable"] is False
     assert status["failure"]["actor"] == "operator"
-    assert status["failure"]["cause"]["code"] == "trainer_failed"
+    assert status["failure"]["cause"]["code"] == "trials_failed"
     assert status["failure"]["cause"]["stage"] == "execution"
 
 
 @pytest.mark.integration
 def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
     """A terminal trial missing its attempt id remains attributable to recover-run."""
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "r-terminal-identity"
     status_path = store.status_path(run_id)
@@ -1626,7 +1674,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = write_srv_config(tmp_path)
     store = RunStore(tmp_path / "state")
     run_id = "srv-recover"
     started_at = "2026-06-24T00:00:00Z"
@@ -1665,8 +1713,11 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         experiment: Experiment,
         *,
         generation_id: str,
+        trial_generation_id: str | None = None,
+        generation_claimed: bool = True,
         engine_winners: object = None,
     ) -> dict[str, object]:
+        del trial_generation_id, generation_claimed
         return capture_result_snapshot(
             experiment,
             generation_id=generation_id,
@@ -1690,7 +1741,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert handle.experiment_id == "srv"
     assert handle.config_sha256 == config_sha256
     assert handle.pid == os.getpid()
-    assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
+    assert handle.pgid == os.getpgrp()
     assert handle.pid_starttime == read_proc_starttime(os.getpid())
     assert handle.started_at == started_at
     assert store.observe(handle).state == "succeeded"

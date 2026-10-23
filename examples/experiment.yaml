@@ -57,7 +57,7 @@ phases:
   - name: lr
     comment: |
       With depth locked, find the LR. Log-scale sweep over four orders of
-      magnitude — that's where LRs live. TPE is fine here; the response
+      magnitude - that's where LRs live. TPE is fine here; the response
       surface is smooth in log-LR.
     inherits: [depth]
     n_trials: 12

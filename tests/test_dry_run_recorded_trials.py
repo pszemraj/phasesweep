@@ -21,6 +21,7 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
+    ResumeWinnerMissingError,
     StudyContextConflictError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
@@ -30,8 +31,8 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
-from phasesweep.engine.phase import _placeholder_winner
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.preview import _placeholder_winner
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -45,14 +46,16 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
 from tests.conftest import (
-    _bounded_metric,
+    bounded_metric,
     make_experiment,
+    phase_study,
+    phase_trials,
     requires_nonroot,
     trial_outcome,
     write_flaky_trainer,
 )
 from tests.ledger_fixtures import forbid_file_backed_storage, tree_changes, tree_snapshot
-from tests.recovery_helpers import _new_phase_study, stamp_artifact_root
+from tests.recovery_helpers import new_phase_study, stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
@@ -73,8 +76,8 @@ _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 _RUNNING_WARNING = (
     "DRY RUN warning: phase={name} has 1 RUNNING attempt(s) that a real run recovers before it "
     "checks the phase, as failed where the trial recorded a failure and otherwise as "
-    "interrupted, which reruns; they are counted that way, and its accepted target and abort "
-    "state are not checked"
+    "interrupted, which reruns; they are counted that way, and its accepted target, abort "
+    "state and partial decision are not checked"
 )
 
 
@@ -108,16 +111,8 @@ def _persistent(
     tmp_path: Path, *phases: Phase, trainer: Path | None = None, maximize: bool = False
 ) -> Experiment:
     """Build an experiment whose ledger lives beside its workdir under ``tmp_path``."""
-    metric = _bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
+    metric = bounded_metric().model_copy(update={"goal": "maximize" if maximize else "minimize"})
     return make_experiment(persistent=tmp_path, trainer=trainer, phases=list(phases), metric=metric)
-
-
-def _study(experiment: Experiment, phase: str) -> optuna.Study:
-    """Load one phase's live study from the experiment's ledger."""
-    return optuna.load_study(
-        study_name=f"{experiment.experiment}::{phase}",
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
 
 
 def _stand_ins(experiment: Experiment, phase: Phase) -> dict[str, Winner]:
@@ -149,7 +144,7 @@ def _record(
     as an objective that recorded its outcome just before its orchestrator died. Its
     COMPLETE trials hold no objective evidence, so selecting a winner from them fails.
     """
-    study = _new_phase_study(experiment, phase)
+    study = new_phase_study(experiment, phase)
     stamp_artifact_root(study, experiment)
     study.set_user_attr(TRIAL_TARGET_ATTR, target)
     recorded_phase = next(item for item in experiment.phases if item.name == phase)
@@ -174,8 +169,7 @@ def _record(
 
 def _terminal_trials(experiment: Experiment, phase: str) -> int:
     """Count the terminal trials the ledger holds for one phase."""
-    trials = _study(experiment, phase).get_trials(deepcopy=False)
-    return sum(trial.state.is_finished() for trial in trials)
+    return sum(trial.state.is_finished() for trial in phase_trials(experiment, phase))
 
 
 def _lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -287,7 +281,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(attempt(4))
-    _refusals_match(attempt(4), tmp_path, NoFeasibleTrialError, "aborted")
+    _refusals_match(attempt(4), tmp_path, PhaseAbortRefusedError, "aborted")
     assert len(calls.read_text().splitlines()) == 2
 
     raised = attempt(6)
@@ -309,7 +303,7 @@ def _accept_partial_timeout(tmp_path: Path) -> tuple[Experiment, Winner]:
         winner the first run selected from its two trials.
     """
     winner = run_experiment(_persistent(tmp_path, _phase("a", 2)))["a"]
-    study = _study(_persistent(tmp_path, _phase("a", 2)), "a")
+    study = phase_study(_persistent(tmp_path, _phase("a", 2)), "a")
     study.set_user_attr(TRIAL_TARGET_ATTR, 4)
     study.set_user_attr(
         PHASE_DECISION_ATTR,
@@ -437,7 +431,7 @@ def test_running_attempt_without_a_recorded_failure_previews_as_a_rerun(
     assert _preview(experiment, tmp_path, caplog) == [
         "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
-        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun of an interrupted trial",
+        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
     ]
 
 
@@ -450,7 +444,7 @@ def test_interrupted_trial_previews_as_a_rerun_among_the_launches(
 
     assert _preview(experiment, tmp_path, caplog) == [
         "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
-        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun of an interrupted trial",
+        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
     ]
 
 
@@ -469,13 +463,12 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
         ]
 
     _preview(experiment, tmp_path, caplog)
-    assert totals() == [
-        "DRY RUN total: would launch 6 trials (1 rerun of an interrupted trial) across 3 phases"
-    ]
+    assert totals() == ["DRY RUN total: would launch 6 trials (1 rerun) across 3 phases"]
 
     caplog.clear()
-    run_experiment(experiment, from_phase="b", dry_run=True)
-    assert totals() == ["DRY RUN total: would launch 5 trials across 2 phases"]
+    with pytest.raises(ResumeWinnerMissingError, match="Winner file missing for phase 'a'"):
+        run_experiment(experiment, from_phase="b", dry_run=True)
+    assert totals() == []
 
     caplog.clear()
     lowered = _persistent(tmp_path, _phase("d", 2))
@@ -516,7 +509,7 @@ def test_met_target_without_a_feasible_trial_is_refused_as_a_run_refuses(
     experiment = _persistent(tmp_path, _phase("a", 2))
     _record(experiment, "a", _STATE.FAIL, _STATE.FAIL, target=2)
 
-    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No feasible completed trials")
+    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "No completed trials")
 
 
 @pytest.mark.parametrize(
@@ -531,7 +524,13 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path, case: str) -
     states = () if case == "target-only-empty-study" else (_STATE.COMPLETE, _STATE.FAIL)
     _record(experiment, "a", *states, target=4)
 
-    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
+    _refusals_match(
+        experiment,
+        tmp_path,
+        TrialTargetRefusedError,
+        r"already accepted a target of 4 .* requests 2\. Set phases\[a\]\.n_trials to at least 4 "
+        "in the config",
+    )
 
 
 @pytest.mark.parametrize("target", [4, 2], ids=["failed-mid-target", "target-raised"])
@@ -717,7 +716,9 @@ def test_failure_limit_met_with_work_remaining_is_refused_as_a_run_refuses(tmp_p
     experiment = _persistent(tmp_path, _phase("a", 5, max_consecutive_failures=3))
     _record(experiment, "a", _STATE.FAIL, _STATE.FAIL, _STATE.FAIL, target=5)
 
-    _refusals_match(experiment, tmp_path, NoFeasibleTrialError, "meets max_consecutive_failures=3")
+    _refusals_match(
+        experiment, tmp_path, PhaseAbortRefusedError, "meets max_consecutive_failures=3"
+    )
 
 
 def test_refusal_is_given_before_any_phase_is_previewed(

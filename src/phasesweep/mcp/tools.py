@@ -3,6 +3,7 @@
 Launch and cancellation write audit records and retain process ownership
 through durable handles and the runner handshake. Read tools expose catalog
 metadata and run-specific status or winners under the visibility policy.
+Each catalog tool call first rereads the catalog when it or a listed config changed.
 The FastMCP adapter in :mod:`phasesweep.mcp.server` wraps each method as a tool.
 """
 
@@ -15,9 +16,10 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NoReturn
@@ -30,12 +32,14 @@ from phasesweep.config.reference import (
     first_sentence,
     lookup_or_suggest,
     reference_notes,
+    rules_for,
     top_level_entries,
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublicationAccessError,
     PublicationIntegrityError,
+    ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -44,6 +48,9 @@ from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
+    CatalogError,
+    CatalogReloadRefusal,
+    CatalogReloadRefusedError,
     ConcurrencyLimitError,
     ConfigChangedError,
     ExperimentBusyError,
@@ -59,6 +66,7 @@ from phasesweep.mcp.errors import (
     RunPersistentStateUnavailableError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
+    StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
 )
@@ -218,7 +226,7 @@ def _config_entry_payload(entry: ReferenceEntry, description: str) -> JsonObject
 
 
 def _cursor_offset(cursor: str | None) -> int:
-    """Decode the opaque v1 cursor into a list offset.
+    """Decode a pagination cursor, the decimal offset ``next_cursor`` carries, into a list offset.
 
     :param str | None cursor: Cursor supplied by the agent.
     :return int: Zero-based catalog offset.
@@ -302,6 +310,14 @@ def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -
     )
 
 
+@dataclass(frozen=True)
+class _CatalogReloadRefusal:
+    """The latest refused reread of an edited catalog, kept until a reread succeeds."""
+
+    reason: CatalogReloadRefusal
+    detail: str
+
+
 class PhaseSweepMCP:
     """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
 
@@ -310,14 +326,86 @@ class PhaseSweepMCP:
     ) -> None:
         """Create the SDK-free MCP implementation.
 
+        The run store, audit log and runner state directory stay bound to the
+        initial registry's ``state_dir`` for this object's lifetime.
+
         :param Registry registry: Validated catalog registry.
         :param RunStore runs: Persistent detached-run store.
         :param AuditLogger | None audit: Optional audit sink override; defaults to the
             ``stdio`` log under ``state_dir``.
         """
         self._registry = registry
+        self._state_dir = registry.state_dir
+        # Tool calls run on worker threads; one lock serializes the edit check and swap.
+        self._registry_lock = threading.Lock()
+        self._reload_refusal: _CatalogReloadRefusal | None = None
         self._runs = runs
         self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
+
+    def _refresh_registry(self) -> tuple[Registry, _CatalogReloadRefusal | None]:
+        """Reread the catalog when its file or a listed config changed, and return what to serve.
+
+        The check hashes the catalog file and every config the held registry lists. An
+        unchanged catalog keeps the held registry. A changed one is reloaded through
+        :meth:`Registry.load`, bound to this server's state directory, and swapped in
+        whole. A reload that fails keeps the held registry, which reads keep serving,
+        and returns the refusal that launch reports. A reload writes nothing, and its
+        failure never escapes this method. Each new refusal and each reload is logged
+        once for the operator, with paths.
+
+        :return tuple[Registry, _CatalogReloadRefusal | None]: Registry to serve, and
+            the refusal of the latest reread or ``None`` when the registry is current.
+        """
+        with self._registry_lock:
+            registry = self._registry
+            if registry.unchanged_on_disk():
+                if self._reload_refusal is not None:
+                    log.info(
+                        "catalog %s again matches the loaded catalog; launches are accepted",
+                        registry.catalog_path,
+                    )
+                    self._reload_refusal = None
+                return registry, None
+            try:
+                reloaded = Registry.load(registry.catalog_path, bound_state_dir=self._state_dir)
+            except Exception as exc:
+                refusal = _CatalogReloadRefusal(
+                    "state_dir_changed" if isinstance(exc, StateDirChangedError) else "invalid",
+                    str(exc) if isinstance(exc, CatalogError) else repr(exc),
+                )
+                if refusal != self._reload_refusal:
+                    log.warning(
+                        "catalog reload refused; reads keep the last valid catalog and launches "
+                        "are refused until %s: %s",
+                        "the MCP server restarts"
+                        if refusal.reason == "state_dir_changed"
+                        else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
+                        refusal.detail,
+                        exc_info=None if isinstance(exc, CatalogError) else exc,
+                    )
+                self._reload_refusal = refusal
+                return registry, refusal
+            self._registry = reloaded
+            self._reload_refusal = None
+            log.info(
+                "reloaded catalog %s: %d experiments, max_concurrent_runs=%d",
+                reloaded.catalog_path,
+                len(reloaded),
+                reloaded.max_concurrent_runs,
+            )
+            return reloaded, None
+
+    def _serving_registry(self) -> Registry:
+        """Return the registry read tools serve after the edit check.
+
+        Read helpers that run later in the same call read ``self._registry`` again;
+        any registry swapped in meanwhile passed the same validation and keeps the
+        same state directory, so they see a newer valid catalog, never a partial one.
+
+        :return Registry: Current registry, or the last valid one after a refused reload.
+        """
+        registry, _refusal = self._refresh_registry()
+        return registry
 
     def _audit_success(
         self,
@@ -393,7 +481,7 @@ class PhaseSweepMCP:
         if limit < 1 or limit > MAX_LIST_LIMIT:
             raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
         offset = _cursor_offset(cursor)
-        experiments = self._registry.summaries()
+        experiments = self._serving_registry().summaries()
         total_count = len(experiments)
         page = experiments[offset : offset + limit]
         next_offset = offset + len(page)
@@ -409,12 +497,14 @@ class PhaseSweepMCP:
 
         A blank key returns top-level keys, their first description sentence and general notes.
         A supplied key returns full descriptions for it and its descendants, with one entry per
-        discriminator variant and no general notes.
+        discriminator variant, and the section rules and shared-block descriptions that govern
+        them, with no general notes.
 
         :param str | None key: Config key as the reference spells it, such as ``phases[].sampler``,
             ``phases.sampler`` or ``phases.0.sampler``.
-        :return JsonObject: The echoed key, whether it matched, the entries, the closest
-            documented keys when it did not, and the general notes when no key was given.
+        :return JsonObject: The echoed key, whether it matched, the governing rules, the entries,
+            the closest documented keys when it did not, and the general notes when no key was
+            given.
         """
         entries: list[JsonValue]
         if key is None or not key.strip():
@@ -425,16 +515,22 @@ class PhaseSweepMCP:
             return {
                 "key": key,
                 "found": True,
+                "rules": [],
                 "entries": entries,
                 "closest": [],
                 "notes": "\n".join(reference_notes()),
             }
         matches, near = lookup_or_suggest(key)
+        rules: list[JsonValue] = [
+            {"kind": group.kind, "name": group.name, "description": "\n".join(group.lines)}
+            for group in rules_for(matches)
+        ]
         entries = [_config_entry_payload(entry, "\n".join(entry.comments)) for entry in matches]
         suggestions: list[JsonValue] = list(near)
         return {
             "key": key,
             "found": bool(matches),
+            "rules": rules,
             "entries": entries,
             "closest": suggestions,
             "notes": "",
@@ -445,9 +541,13 @@ class PhaseSweepMCP:
 
         :param str experiment_id: Catalog experiment id to inspect.
         :return dict[str, Any]: Path-free validation payload for the agent.
+        :raises CatalogReloadRefusedError: If this experiment's config was edited
+            but the catalog reread that would load it was refused.
+        :raises ConfigChangedError: If the config changed after this call's reread.
         """
-        reg = self._registry.get(experiment_id)
-        self._current_config_bytes(reg)
+        registry, refusal = self._refresh_registry()
+        reg = registry.get(experiment_id)
+        self._current_config_bytes(reg, refusal)
         exp = reg.experiment
         phases = [
             {
@@ -474,7 +574,7 @@ class PhaseSweepMCP:
         :param str experiment_id: Catalog id whose latest run should be resolved.
         :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
         """
-        reg = self._registry.get(experiment_id)
+        reg = self._serving_registry().get(experiment_id)
         handle = self._runs.latest_run_for(reg.id)
         run = self._run_payload(handle) if handle is not None else None
         return {
@@ -499,7 +599,8 @@ class PhaseSweepMCP:
             reported its terminal snapshot unavailable, so the failure says so too.
         :return JsonObject: Run id, state, launch timestamp, and recovery flag.
             ``runner_observable`` is False for a running run whose runner is in
-            another PID namespace and cannot be proven gone.
+            another PID namespace and cannot be proven gone; ``recovery_required``
+            is then also True once that runner's heartbeat is stale.
         """
         if view is None:
             view = self._runs.runner_view(handle)
@@ -509,7 +610,11 @@ class PhaseSweepMCP:
             "run_id": handle.run_id,
             "state": state,
             "started_at": handle.started_at,
-            "recovery_required": observation.recovery_required,
+            # A stale heartbeat only asks the operator to check from a host shell;
+            # the run stays running until recover-run settles it there.
+            "recovery_required": (
+                observation.recovery_required or observation.runner_heartbeat_stale
+            ),
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
             "failure": self._run_failure_payload(
                 handle,
@@ -584,6 +689,8 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id returned by ``launch`` or ``latest_run``.
         :return dict: Path-free status payload for the agent.
         """
+        # Config drift and visibility below compare against the reread catalog.
+        self._serving_registry()
         target_id, status, run, handle, result_source = self._read_status_target(run_id=run_id)
         return self._status_result(target_id, status, run, handle, result_source)
 
@@ -609,6 +716,7 @@ class PhaseSweepMCP:
             AWAIT_MAX_TIMEOUT_SECONDS, max(AWAIT_MIN_TIMEOUT_SECONDS, int(timeout_seconds))
         )
         deadline = time.monotonic() + timeout
+        await asyncio.to_thread(self._serving_registry)
         baseline: tuple[Any, ...] | None = None
         read_seconds = 0.0
         while True:
@@ -894,6 +1002,8 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
+        # Config drift and visibility below compare against the reread catalog.
+        self._serving_registry()
         target_id, experiment, status, winner_views, handle, view, result_source = (
             self._read_result_target(run_id)
         )
@@ -1041,13 +1151,17 @@ class PhaseSweepMCP:
     def launch(self, experiment_id: str, from_phase: str | None = None) -> JsonObject:
         """Start the sweep as a detached background run; return its run_id.
 
-        Refuses if launch is not permitted, if a ``from_phase`` resume is not
-        ready (an earlier phase has no winner), if this experiment already has a
-        live run, or if the server is at its max_concurrent_runs cap.
+        Refuses while the latest reread of an edited catalog was refused, if launch is
+        not permitted, if a ``from_phase`` resume is not ready (an earlier phase the
+        remaining phases inherit has no compatible published winner), if this experiment
+        already has a live run, or if the server is at its max_concurrent_runs cap.
 
         :param str experiment_id: Catalog experiment id to launch.
-        :param str | None from_phase: Optional phase to resume from after earlier winners exist.
+        :param str | None from_phase: Optional phase to resume from once the earlier phases
+            the remaining phases inherit have winners.
         :return JsonObject: Launch result containing run id, experiment id, and running state.
+        :raises CatalogReloadRefusedError: If the edited catalog or a config it lists
+            fails validation, or it names another state directory than this server's.
         :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
         :raises PermissionDeniedError: If the entry does not allow launching, or
             does not allow ``from_phase`` resumes.
@@ -1058,7 +1172,7 @@ class PhaseSweepMCP:
         :raises LaunchInProgressError: If another launch currently holds the launch lock.
         :raises ExperimentBusyError: If this experiment already has a live run.
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
-        :raises ConfigChangedError: If the cataloged config changed since startup.
+        :raises ConfigChangedError: If the cataloged config changed after this call's reread.
         :raises RuntimeError: If no unused run id could be minted, or the spawned
             runner has no Linux ``/proc`` start time to make cancellation PID-reuse safe.
         """
@@ -1066,7 +1180,10 @@ class PhaseSweepMCP:
         resolved: JsonObject = {}
         state_before: JsonObject | None = None
         try:
-            reg = self._registry.get(experiment_id)
+            registry, refusal = self._refresh_registry()
+            if refusal is not None:
+                raise CatalogReloadRefusedError(refusal.reason)
+            reg = registry.get(experiment_id)
             resolved["experiment_id"] = reg.id
             if not reg.allow_launch:
                 raise PermissionDeniedError("launch", experiment_id)
@@ -1112,22 +1229,40 @@ class PhaseSweepMCP:
                         and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
                     )
                     raise RunCapacityUnknownError(len(unreadable), recoverable)
-                live = [
-                    handle for handle in handles if self._runs.observe(handle).state == "running"
-                ]
+                live: list[RunHandle] = []
+                recovery_required_run_ids: list[str] = []
+                unobservable_run_ids: list[str] = []
+                for inventory_handle in handles:
+                    view = self._runs.runner_view(inventory_handle)
+                    observation = self._runs.observe(inventory_handle, view=view)
+                    if observation.state != "running":
+                        continue
+                    live.append(inventory_handle)
+                    # Refusal advice only: a stale heartbeat never frees the slot.
+                    if observation.recovery_required or observation.runner_heartbeat_stale:
+                        recovery_required_run_ids.append(inventory_handle.run_id)
+                    if view.visibility == "unobservable":
+                        unobservable_run_ids.append(inventory_handle.run_id)
                 state_before = {"live_runs": len(live)}
                 busy = next((h for h in live if h.experiment_id == experiment_id), None)
                 if busy is not None:
-                    raise ExperimentBusyError(experiment_id, busy.run_id)
-                if len(live) >= self._registry.max_concurrent_runs:
+                    raise ExperimentBusyError(
+                        experiment_id,
+                        busy.run_id,
+                        recovery_required=busy.run_id in recovery_required_run_ids,
+                        runner_observable=busy.run_id not in unobservable_run_ids,
+                    )
+                if len(live) >= registry.max_concurrent_runs:
                     blocking_run_ids = [
                         handle.run_id
                         for handle in sorted(live, key=lambda item: (item.started_at, item.run_id))
                     ]
                     raise ConcurrencyLimitError(
                         len(live),
-                        self._registry.max_concurrent_runs,
+                        registry.max_concurrent_runs,
                         blocking_run_ids,
+                        recovery_required_run_ids=recovery_required_run_ids,
+                        unobservable_run_ids=unobservable_run_ids,
                     )
                 config_bytes = self._current_config_bytes(reg)
                 preparation: PreparedRun | None = None
@@ -1207,7 +1342,8 @@ class PhaseSweepMCP:
         :param str run_id: Detached run id to cancel.
         :return JsonObject: Cancellation result containing final state and optional cleanup confirmation.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
-        :raises PermissionDeniedError: If the run's entry did not allow cancel at launch time.
+        :raises PermissionDeniedError: If the run did not allow cancel at launch, or its
+            catalog entry no longer does.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
             process identity, so there is nothing safe to signal.
         :raises RunNamespaceMismatchError: If the runner was recorded in another
@@ -1218,6 +1354,9 @@ class PhaseSweepMCP:
         state_before: JsonObject | None = None
         result: JsonObject
         try:
+            # Permission below follows the reread catalog, or the last valid one after a
+            # refused reread, so a catalog typo cannot leave a live run unstoppable.
+            self._serving_registry()
             handle = self._runs.get(run_id)
             if handle is None:
                 raise UnknownRunError(run_id)
@@ -1363,7 +1502,7 @@ class PhaseSweepMCP:
                     "failed" if isinstance(exc, PublicationIntegrityError) else "permission_denied"
                 )
                 return ResumePublicationUnusableError(reg.id, from_phase, state)
-            if isinstance(exc, FileNotFoundError):
+            if isinstance(exc, ResumeWinnerMissingError):
                 return ResumeNotReadyError(reg.id, from_phase, phase_name)
             if isinstance(
                 exc, (RuntimeError, KeyError, TypeError, ValueError, AttributeError, OSError)
@@ -1387,19 +1526,29 @@ class PhaseSweepMCP:
         )
 
     @staticmethod
-    def _current_config_bytes(reg: RegisteredExperiment) -> bytes:
-        """Read a cataloged config only when it still matches startup validation.
+    def _current_config_bytes(
+        reg: RegisteredExperiment, refusal: _CatalogReloadRefusal | None = None
+    ) -> bytes:
+        """Read a cataloged config only while it still holds the bytes its registry validated.
 
-        :param RegisteredExperiment reg: Frozen catalog entry to verify.
-        :return bytes: Current config bytes when their SHA-256 matches startup.
-        :raises ConfigChangedError: If the file is unreadable or changed.
+        The call's reread makes the bytes match, unless the file changed after it or
+        that reread was refused and the served registry is the last valid one.
+
+        :param RegisteredExperiment reg: Catalog entry to verify.
+        :param _CatalogReloadRefusal | None refusal: Refusal of this call's reread, if any.
+        :return bytes: Current config bytes when their SHA-256 matches the entry.
+        :raises CatalogReloadRefusedError: If the file is unreadable or changed and the
+            reread was refused.
+        :raises ConfigChangedError: If the file is unreadable or changed after the reread.
         """
         try:
-            data = reg.config_path.read_bytes()
+            data: bytes | None = reg.config_path.read_bytes()
         except OSError as exc:
             log.info("cannot read cataloged config for experiment=%s: %s", reg.id, exc)
-            raise ConfigChangedError(reg.id) from None
-        if hashlib.sha256(data).hexdigest() != reg.config_sha256:
+            data = None
+        if data is None or hashlib.sha256(data).hexdigest() != reg.config_sha256:
+            if refusal is not None:
+                raise CatalogReloadRefusedError(refusal.reason)
             raise ConfigChangedError(reg.id)
         return data
 
@@ -1581,7 +1730,7 @@ class PhaseSweepMCP:
                 config_snapshot_path=config_snapshot_path,
                 config_sha256=reg.config_sha256,
                 status_path=status_path,
-                state_dir=self._registry.state_dir,
+                state_dir=self._state_dir,
                 experiment_id=reg.id,
                 started_at=pending.started_at,
                 launch_ready_fd=ready_write,
@@ -1595,7 +1744,7 @@ class PhaseSweepMCP:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
-        spawn_cwd = self._registry.state_dir
+        spawn_cwd = self._state_dir
         ensure_private_dir(spawn_cwd)
         # Once Popen returns, interrupts also require cleanup of the owned child.
         proc: subprocess.Popen[bytes] | None = None
@@ -1605,7 +1754,7 @@ class PhaseSweepMCP:
         runner_acknowledged = False
         try:
             with open_private_text(log_path, "w") as log_file:
-                proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
+                proc = subprocess.Popen(  # argv list, no shell, server-controlled
                     cmd,
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,

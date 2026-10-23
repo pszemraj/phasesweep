@@ -22,14 +22,19 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
 from phasesweep.engine.study_policy import _validate_trial_target
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import invoke_cli_boundary, make_experiment, write_flaky_trainer
+from tests.conftest import invoke_cli_boundary, make_experiment, phase_trials, write_flaky_trainer
 from tests.experiments import write_experiment
 from tests.recovery_helpers import fabricate_stale_trial
 
@@ -70,23 +75,23 @@ def _fixed(
 
 def _states(exp: Experiment) -> list[str]:
     """Return the state name of every trial in the experiment's only phase."""
-    study = optuna.load_study(
-        study_name=f"{exp.experiment}::p", storage=_resolve_storage(exp.resolved_storage)
-    )
-    return [trial.state.name for trial in study.get_trials(deepcopy=False)]
+    return [trial.state.name for trial in phase_trials(exp)]
 
 
 @pytest.mark.parametrize(
-    ("sampler", "max_failures"),
+    ("sampler", "max_failures", "repeat_error"),
     [
-        pytest.param(None, 5, id="default_tpe"),
-        pytest.param(None, 1, id="default_tpe_abort_recorded"),
-        pytest.param(Sampler(type="random", seed=0), 5, id="random"),
-        pytest.param(Sampler(type="grid"), 5, id="grid"),
+        pytest.param(None, 5, NoFeasibleTrialError, id="default_tpe"),
+        pytest.param(None, 1, PhaseAbortRefusedError, id="default_tpe_abort_recorded"),
+        pytest.param(Sampler(type="random", seed=0), 5, NoFeasibleTrialError, id="random"),
+        pytest.param(Sampler(type="grid"), 5, NoFeasibleTrialError, id="grid"),
     ],
 )
 def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
-    tmp_path: Path, sampler: Sampler | None, max_failures: int
+    tmp_path: Path,
+    sampler: Sampler | None,
+    max_failures: int,
+    repeat_error: type[Exception],
 ) -> None:
     """One failed attempt buys one retry under any sampler, and a result is final."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=1)
@@ -100,8 +105,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         run_experiment(attempt(1))
     assert _call_count(calls) == 1
 
-    # The failed attempt used the target up, so repeating it launches nothing.
-    with pytest.raises(NoFeasibleTrialError):
+    # The failed attempt used the target up, so repeating it launches nothing: it replays the
+    # failure, or the recorded abort refuses it.
+    with pytest.raises(repeat_error):
         run_experiment(attempt(1))
     assert _call_count(calls) == 1
 
@@ -121,9 +127,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     with pytest.raises(TrialTargetRefusedError) as repeated:
         run_experiment(attempt(3))
     assert str(repeated.value) == (
-        "Phase 'p' is a fixed configuration that already has a completed trial; n_trials=3 "
-        "would run the same configuration again. Keep n_trials at 2, or use repeats to "
-        "measure seed noise."
+        "Phase 'p' is a fixed configuration that already has a COMPLETE or INFEASIBLE trial; "
+        "n_trials=3 would run the same configuration again. Keep n_trials at 2, or use "
+        "repeats to measure seed noise."
     )
     assert _call_count(calls) == 2
 
@@ -150,21 +156,138 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
     assert _call_count(calls) == 3
 
 
-def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
-    """A COMPLETE trial out of the metric bounds still measured the configuration."""
-    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
-    bounded = Metric(
+def _assert_advises_next_target(message: str, from_target: int) -> None:
+    """Assert the message tells the operator to raise phase ``p``'s target by one in the config."""
+    assert f"phases[p].n_trials from {from_target} to {from_target + 1} in the config" in message
+    assert "retry its failed attempt once more" in message
+    assert "the failure count starts again from zero" in message
+    # The one attempt the target allowed is spent, so a higher limit would schedule nothing.
+    assert "max_consecutive_failures above" not in message
+
+
+def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> None:
+    """Each abort and the rerun refusing it quote the one-more-attempt target."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=2)
+
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
+    _assert_advises_next_target(str(aborted.value), 1)
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
+        run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
+    _assert_advises_next_target(str(refused.value), 1)
+
+    # The retry fails again, so the next abort names the next target.
+    with pytest.raises(NoFeasibleTrialError) as aborted_again:
+        run_experiment(_fixed(tmp_path, trainer, 2, max_consecutive_failures=1))
+    _assert_advises_next_target(str(aborted_again.value), 2)
+    assert _call_count(calls) == 2
+
+    assert (
+        run_experiment(_fixed(tmp_path, trainer, 3, max_consecutive_failures=1))["p"].metric == 1.0
+    )
+    assert _states(_fixed(tmp_path, trainer, 3)) == ["FAIL", "FAIL", "COMPLETE"]
+
+
+def _bounded() -> Metric:
+    """Return a ``x=<value>`` metric whose upper bound a logged 5.0 exceeds."""
+    return Metric(
         extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         max=1.0,
     )
+
+
+def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Path) -> None:
+    """A COMPLETE trial out of the metric bounds still measured the configuration."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    bounded = _bounded()
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1, metric=bounded))
     assert _states(_fixed(tmp_path, trainer, 1)) == ["COMPLETE"]
 
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 2, metric=bounded))
     assert _call_count(calls) == 1
+
+
+def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_path: Path) -> None:
+    """An abort over a completed infeasible attempt offers no setting that retries it."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=_bounded())
+
+    with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible") as aborted:
+        run_experiment(experiment)
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
+        run_experiment(experiment)
+    for message in (str(aborted.value), str(refused.value)):
+        assert "Its configuration was measured and is not feasible" in message
+        assert "phases[p]" not in message
+        assert "workdir" not in message
+    assert _call_count(calls) == 1
+
+
+def _failure_code(error: BaseException) -> object:
+    """Return the failure code the MCP runner records for ``error``."""
+    return mcp_runner._terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)[
+        "code"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failures", "value", "error_type", "code"),
+    [
+        pytest.param(1, 1.0, PhaseTrialsFailedError, "trials_failed", id="trials-failed"),
+        pytest.param(0, 5.0, PhaseTrialsInfeasibleError, "trials_infeasible", id="out-of-bounds"),
+    ],
+)
+def test_no_feasible_failure_code_follows_the_raised_subclass(
+    tmp_path: Path,
+    failures: int,
+    value: float,
+    error_type: type[NoFeasibleTrialError],
+    code: str,
+) -> None:
+    """A failed or out-of-bounds trial and a replay of it each report their own failure code."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
+    experiment = _fixed(tmp_path, trainer, 1, metric=_bounded())
+
+    with pytest.raises(NoFeasibleTrialError) as measured:
+        run_experiment(experiment)
+    with pytest.raises(NoFeasibleTrialError, match="launched no trial") as replayed:
+        run_experiment(experiment)
+
+    assert _call_count(calls) == 1
+    assert (type(measured.value), _failure_code(measured.value)) == (error_type, code)
+    assert (type(replayed.value), _failure_code(replayed.value)) == (
+        ReplayWithoutFeasibleTrialError,
+        "replay_without_feasible_trial",
+    )
+
+
+@pytest.mark.parametrize(
+    ("failures", "value", "error_type", "code"),
+    [
+        pytest.param(1, 1.0, PhaseTrialsFailedError, "trials_failed", id="failed-streak"),
+        pytest.param(
+            0, 5.0, PhaseTrialsInfeasibleError, "trials_infeasible", id="infeasible-streak"
+        ),
+    ],
+)
+def test_streak_abort_failure_code_says_whether_a_trial_failed(
+    tmp_path: Path,
+    failures: int,
+    value: float,
+    error_type: type[NoFeasibleTrialError],
+    code: str,
+) -> None:
+    """An abort over infeasible trials is not reported as a trainer failure."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=failures, value=value)
+    experiment = _fixed(tmp_path, trainer, 1, max_consecutive_failures=1, metric=_bounded())
+
+    with pytest.raises(NoFeasibleTrialError, match="aborted") as aborted:
+        run_experiment(experiment)
+
+    assert (type(aborted.value), _failure_code(aborted.value)) == (error_type, code)
 
 
 def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
@@ -181,7 +304,7 @@ def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
     assert _call_count(calls) == 1
     assert _states(exp) == ["FAIL", "COMPLETE"]
 
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 2))
     assert _call_count(calls) == 1
 
@@ -242,7 +365,7 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
 
     run_experiment(_fixed(tmp_path, trainer, 2))
     run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
         run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
     assert _call_count(calls) == 2
 
@@ -298,7 +421,7 @@ def test_dry_run_logs_the_fixed_configuration_warning(
 
 
 @pytest.mark.parametrize(
-    ("finished", "completed", "n_trials", "refusal"),
+    ("finished", "measured", "n_trials", "refusal"),
     [
         (0, 0, 1, None),
         (0, 0, 2, "would run 2 identical trials"),
@@ -308,17 +431,17 @@ def test_dry_run_logs_the_fixed_configuration_warning(
         (3, 0, 4, None),
         (3, 0, 5, "3 failed attempts and no completed one"),
         (1, 1, 1, None),
-        (1, 1, 2, "already has a completed trial; n_trials=2"),
+        (1, 1, 2, "already has a COMPLETE or INFEASIBLE trial; n_trials=2"),
         (2, 1, 2, None),
         (2, 1, 3, "Keep n_trials at 2"),
     ],
 )
 def test_fixed_configuration_target_rule(
-    finished: int, completed: int, n_trials: int, refusal: str | None
+    finished: int, measured: int, n_trials: int, refusal: str | None
 ) -> None:
-    """The whole rule in one table: F failures allow F + 1, and a completed trial closes it."""
+    """The whole rule in one table: F failures allow F + 1, and a COMPLETE trial closes it."""
     phase = Phase(name="p", n_trials=n_trials, fixed_overrides={"x": 1})
-    message = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    message = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
         assert message is None
     else:

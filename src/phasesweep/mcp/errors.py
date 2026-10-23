@@ -1,19 +1,25 @@
 """MCP errors for agents and operators.
 
 ``McpToolError`` messages exclude paths, commands, environment values and storage URLs.
-Startup ``CatalogError`` messages are operator-facing and may include paths.
+``CatalogError`` messages are operator-facing and may include paths.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, TypeAlias
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 
+CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
+
 
 class CatalogError(Exception):
-    """Catalog could not be loaded or validated. Fatal at startup, operator-facing."""
+    """Catalog could not be loaded or validated. Operator-facing.
+
+    Fatal at startup; a running server that cannot reload an edited catalog keeps
+    serving reads from the last valid one and refuses launches.
+    """
 
     def __init__(self, message: str, *, suggestion: str | None = None) -> None:
         """Create an operator-facing catalog error.
@@ -23,6 +29,10 @@ class CatalogError(Exception):
         """
         super().__init__(message)
         self.suggestion = suggestion
+
+
+class StateDirChangedError(CatalogError):
+    """Raised when a reloaded catalog names another state directory than the server serves."""
 
 
 class McpToolError(Exception):
@@ -82,26 +92,64 @@ class PermissionDeniedError(McpToolError):
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
         """
+        # Launch-time permission caps cancellation, so a later catalog grant cannot reach
+        # a run launched without it.
+        applies = (
+            "which applies on the next call but never to a run launched without it"
+            if action == "cancel"
+            else "which applies on the next call"
+        )
         super().__init__(
             f"action {action!r} is not permitted for experiment {experiment_id!r}; "
             "this is deliberate catalog policy. Report it to the user - only the "
-            f"operator can enable it (allow.{action}: true) and restart the server. "
+            f"operator can enable it (allow.{action}: true in the catalog), {applies}. "
             "Do not retry."
         )
 
 
 class ConfigChangedError(McpToolError):
-    """Raised when a cataloged config no longer matches the startup snapshot."""
+    """Raised when a cataloged config changes between the server's reread and its use."""
 
     def __init__(self, experiment_id: str) -> None:
         """Create a config-changed tool error.
 
-        :param str experiment_id: Catalog id whose config hash no longer matches startup.
+        :param str experiment_id: Catalog id whose config bytes changed during the call.
         """
         super().__init__(
-            f"cataloged config for experiment {experiment_id!r} changed since server startup; "
-            "the operator must restart the MCP server to reload and validate it. Do not retry."
+            f"the config for experiment {experiment_id!r} changed on disk while this call was "
+            "reading it, so the call stopped. The server rereads an edited catalog and its "
+            "configs before each call; retry this call once, and report it to the operator if "
+            "it is refused again."
         )
+
+
+class CatalogReloadRefusedError(McpToolError):
+    """Raised by launch while the server's latest reread of an edited catalog was refused."""
+
+    def __init__(self, reason: CatalogReloadRefusal) -> None:
+        """Create a refused-reload tool error.
+
+        :param CatalogReloadRefusal reason: ``invalid`` when the edited catalog or a config
+            it lists failed validation; ``state_dir_changed`` when it names another state
+            directory than the one this server was started with.
+        """
+        if reason == "state_dir_changed":
+            message = (
+                "the catalog was edited to name a different state_dir than the one this server "
+                "was started with. A running server keeps its run records in one state "
+                "directory, so it refuses launches until the operator restarts it; reads keep "
+                "using the original state directory and the last catalog loaded with it. "
+                "Report this to the operator. Do not retry."
+            )
+        else:
+            message = (
+                "the catalog or an experiment config it lists was edited and no longer "
+                "validates, so this server refuses launches until it is fixed; reads keep "
+                "using the last valid catalog. Ask the operator to fix it; `phasesweep mcp "
+                "check` shows what fails. The server rereads the catalog on the next call. "
+                "Do not retry until the operator reports the fix."
+            )
+        super().__init__(message)
 
 
 class RunSnapshotUnavailableError(McpToolError):
@@ -156,39 +204,107 @@ class RunPersistentStateUnavailableError(McpToolError):
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 
-    def __init__(self, experiment_id: str, run_id: str) -> None:
+    def __init__(
+        self,
+        experiment_id: str,
+        run_id: str,
+        *,
+        recovery_required: bool = False,
+        runner_observable: bool = True,
+    ) -> None:
         """Create an experiment-busy tool error.
 
         :param str experiment_id: Catalog id that already has a live run.
         :param str run_id: Existing live run id blocking a new launch.
+        :param bool recovery_required: Whether the blocker requires operator recovery,
+            including an unobservable runner whose heartbeat is stale.
+        :param bool runner_observable: Whether this server can verify runner liveness.
         """
+        if recovery_required:
+            advice = (
+                "Ask the operator to inspect this run with `phasesweep mcp recover-run` "
+                "and complete its reported recovery before retrying the launch."
+            )
+            if not runner_observable:
+                advice += (
+                    " Its runner is in another PID namespace and has probably stopped or left "
+                    "cleanup uncertain; the operator must check and recover it from a host "
+                    "shell outside the sandbox."
+                )
+        else:
+            advice = (
+                "If you just launched and lost the response, this is likely that run; "
+                f"monitor it with await_run using run_id {run_id!r}. "
+                "Cancel it only if the user wants to stop it."
+            )
+            if not runner_observable:
+                advice += (
+                    " This server cannot verify runner liveness across PID namespaces. "
+                    "Monitor durable progress; if it stops, ask the operator to inspect "
+                    "and recover from a host shell outside the sandbox."
+                )
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
-            f"(run_id {run_id!r}). If you just launched and lost the response, this is "
-            "likely that run; monitor it with await_run using "
-            f"run_id {run_id!r}. Cancel it only if the user wants to stop it."
+            f"(run_id {run_id!r}). {advice}"
         )
 
 
 class ConcurrencyLimitError(McpToolError):
     """Raised when launching would exceed the server's max concurrent runs."""
 
-    def __init__(self, running: int, limit: int, blocking_run_ids: Sequence[str]) -> None:
+    def __init__(
+        self,
+        running: int,
+        limit: int,
+        blocking_run_ids: Sequence[str],
+        *,
+        recovery_required_run_ids: Sequence[str] = (),
+        unobservable_run_ids: Sequence[str] = (),
+    ) -> None:
         """Create a concurrency-limit tool error.
 
         :param int running: Number of currently live runs.
         :param int limit: Configured maximum number of concurrent runs.
         :param Sequence[str] blocking_run_ids: Live run ids the agent can await.
+        :param Sequence[str] recovery_required_run_ids: Blockers requiring operator
+            recovery, including unobservable runners whose heartbeat is stale.
+        :param Sequence[str] unobservable_run_ids: Blockers with unverifiable runner liveness.
         """
-        shown = list(dict.fromkeys(blocking_run_ids))[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
+        recovery_ids = set(recovery_required_run_ids)
+        ordered = sorted(
+            dict.fromkeys(blocking_run_ids), key=lambda run_id: run_id not in recovery_ids
+        )
+        shown = ordered[:_MAX_CAPACITY_BLOCKING_RUN_IDS]
         blockers = ", ".join(repr(run_id) for run_id in shown)
         omitted = max(0, running - len(shown))
         omitted_note = f" ({omitted} more active)" if omitted else ""
+        if recovery_ids:
+            needs_recovery = ", ".join(repr(run_id) for run_id in shown if run_id in recovery_ids)
+            advice = (
+                f"Run_ids requiring operator recovery: {needs_recovery}. Ask the operator to "
+                "inspect these runs with `phasesweep mcp recover-run` and complete the "
+                "reported recovery before retrying the launch."
+            )
+        else:
+            advice = (
+                "Call await_run with one of these run_ids, then retry this launch only "
+                "after that run is terminal. Ask the user before cancelling a blocking run."
+            )
+        unobservable_ids = set(unobservable_run_ids)
+        if unobservable_ids & recovery_ids:
+            advice += (
+                " The operator must recover blockers whose runner is in another PID "
+                "namespace from a host shell outside the sandbox."
+            )
+        if unobservable_ids - recovery_ids:
+            advice += (
+                " This server cannot verify runner liveness for blockers in another PID "
+                "namespace. Monitor durable progress; if it stops, ask the operator to "
+                "inspect and recover from a host shell outside the sandbox."
+            )
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
-            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. Call "
-            "await_run with one of these run_ids, then retry this launch only "
-            "after that run is terminal. Ask the user before cancelling a blocking run."
+            f"sweep(s) are active. Blocking run_ids: {blockers}{omitted_note}. {advice}"
         )
 
 
@@ -281,7 +397,7 @@ class ResumeNotReadyError(McpToolError):
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
             f"earlier phase {missing_phase!r} {reason}. Call get_latest_run({experiment_id!r}) "
             "first; if it finds a run, call get_run_results with its run_id. Resume only after "
-            "every earlier phase has a winner."
+            "every earlier phase the remaining phases inherit has a compatible published winner."
         )
 
 

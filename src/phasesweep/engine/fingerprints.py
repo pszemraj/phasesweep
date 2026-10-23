@@ -146,7 +146,8 @@ def _phase_fingerprint_payload(
     :param Phase phase: Phase whose run-control keys are excluded.
     :param dict[str, Winner] inherited_winners: Parent winners whose effective
         overrides contribute to identity.
-    :return: Configured trial semantics normalized to the JSON representation being hashed.
+    :return JsonObject: Configured trial semantics normalized to the JSON representation being
+        hashed.
     """
     semantic_phase = _semantic_phase_dump(phase)
     payload = {
@@ -187,6 +188,11 @@ _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
     "config (relative paths resolve against the config file)."
+)
+# An explicit storage keeps the same study under a new workdir; only auto storage follows it.
+_NEW_STUDY_STEP = (
+    "To run this config, set a new `experiment` name in the config (with `storage: auto` a new "
+    "`workdir` also works); the old study stays readable under the old name."
 )
 
 
@@ -294,14 +300,14 @@ def _verify_fingerprint(
     phase: Phase,
     inherited_winners: dict[str, Winner],
 ) -> str:
-    """Stamp a fresh study with its fingerprint or fail on mismatch.
+    """Stamp a fresh study, or rebind an empty one, with its fingerprint; refuse a populated mismatch.
 
     :param optuna.Study study: Study being verified or stamped.
     :param Experiment experiment: Current experiment config.
     :param Phase phase: Phase whose fingerprint must match.
     :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
-    :raises StudyFingerprintMismatchError: The populated study has an incompatible
-        persisted fingerprint; the message names the keys that changed.
+    :raises StudyFingerprintMismatchError: The populated study has no persisted
+        fingerprint or an incompatible one; the message names the keys that changed.
     :return str: Verified current fingerprint.
     """
     payload = _phase_fingerprint_payload(experiment, phase, inherited_winners)
@@ -337,7 +343,7 @@ def _verify_fingerprint(
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}"
-            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else ''}",
+            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else _NEW_STUDY_STEP}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
         )

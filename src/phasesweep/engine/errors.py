@@ -29,6 +29,12 @@ class ArtifactRootConflictError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
+class ArtifactRootSchemaMismatchError(ArtifactRootConflictError):
+    """Raised when an artifact root records an unsupported PhaseSweep schema."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
+
+
 class PublicationIntegrityError(PhaseSweepError):
     """Raised when a recorded publication exists but fails validation.
 
@@ -61,6 +67,12 @@ class WinnerIntegrityError(PhaseSweepError):
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
+
+
+class ResumeWinnerMissingError(PhaseSweepError):
+    """Raised when a resume skips a phase whose winner the publication does not hold."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
 class RunRequestError(PhaseSweepError):
@@ -99,10 +111,7 @@ class PublishedStudyMissingError(PhaseSweepError):
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):
-    """Raised when required recovery state cannot persist before launch.
-
-    Launch and GPU acquisition stop when recovery state cannot be persisted.
-    """
+    """Raised when required recovery state cannot persist before launch or GPU acquisition."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
@@ -117,7 +126,8 @@ class TrialTargetRefusedError(PhaseSweepError):
     """Raised when a phase target contradicts its durable study state.
 
     ``n_trials`` cannot fall below the accepted target. A fixed configuration may
-    retry failures only until one attempt completes, feasible or not.
+    retry failures only until one attempt completes, feasible or not. A grid
+    applies that limit per cell when its target exceeds the matrix size.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
@@ -125,5 +135,11 @@ class TrialTargetRefusedError(PhaseSweepError):
 
 class TrackingTargetUnavailableError(PhaseSweepError):
     """Raised before a phase allocates trials when its MLflow target cannot be reached."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+class TrackingSyncRefusedError(PhaseSweepError):
+    """Raised when ``sync-tracking`` has no matching MLflow deliveries it may retry."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

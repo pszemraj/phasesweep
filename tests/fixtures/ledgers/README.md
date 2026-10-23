@@ -8,13 +8,13 @@ current-journal/ledger/study.journal   journal ledger
 current-journal/artifact_root/t/...    the artifact tree that claimed that ledger
 ```
 
-It is consumed by `tests/test_ledger_read_paths.py` through `tests/ledger_fixtures.py`, which copies the fixture into a temporary directory, rebuilds the experiment config from `tests/fixtures/make_ledger_fixtures.py`, and snapshots the bytes before the read.
+It is consumed through `tests/ledger_fixtures.py`: `tests/test_ledger_read_paths.py` runs its read-path matrix over it, and other test modules (publication, error routing, format cutover, CLI, observations, fingerprints, status shape, read views, MLflow delivery) copy it as a ready-made published generation with `golden_publication` or `materialize`. The helper copies the fixture into a temporary directory, rebuilds the experiment config from `tests/fixtures/make_ledger_fixtures.py`, rewrites the copy's artifact-root binding and per-study root records in `tree` mode, and snapshots the bytes before the read.
 
 ## Inventory
 
-| Fixture | Backend | Modes | Binding schema | tree | ledger-only |
+| Fixture | Backend | Modes | Binding schema | tree verdict | ledger-only verdict |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 7 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 9 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, which is the case no binding can answer and the ledger format scan must.
 
@@ -24,11 +24,11 @@ The manifest records the fixture's read verdicts and generating toolchain: Phase
 
 The fixture is regenerated, never hand-edited. From the repository root:
 
-```sh
+```bash
 python -m tests.fixtures.make_ledger_fixtures
 ```
 
-Generation fails if the produced bytes disagree with the expected read verdicts.
+`--out DIR` writes the fixture to another directory, `--notes TEXT` replaces its manifest notes, and `-v` raises log verbosity. Generation fails if the produced bytes disagree with the expected read verdicts, so after a stamp bump set `TARGET_STUDY_SCHEMA_VERSION` and `TARGET_BINDING_SCHEMA_VERSION` in [`make_ledger_fixtures.py`](../make_ledger_fixtures.py) to the new values before regenerating, and update the `Binding schema` column above.
 
 The generator keeps the fixture tracked and independent of the generating host:
 

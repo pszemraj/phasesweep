@@ -325,6 +325,7 @@ def test_empty_trainer_config_leaves_overrides_untouched() -> None:
     assert json.loads(json_input) == {"a": {"x": 1, "y": 3}, "b": 2}
 
 
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
 @pytest.mark.parametrize(
     ("trainer_config", "overrides"),
     [
@@ -334,16 +335,16 @@ def test_empty_trainer_config_leaves_overrides_untouched() -> None:
     ],
 )
 def test_flattened_merge_agrees_with_the_nested_json_composition(
-    trainer_config: dict, overrides: dict
+    override_format: str, trainer_config: dict, overrides: dict
 ) -> None:
     """argparse and hydra see the same values json_file nests, only dotted."""
     json_input = compose_trainer_input(trainer_config, overrides, "json_file")
     assert isinstance(json_input, str)
     nested = json.loads(json_input)
 
-    assert compose_trainer_input(trainer_config, overrides, "argparse") == flatten_trainer_config(
-        nested
-    )
+    assert compose_trainer_input(
+        trainer_config, overrides, override_format
+    ) == flatten_trainer_config(nested)
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,7 @@ from typing import Annotated, Any, Literal, NoReturn, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 if typing.TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
 
 from phasesweep import __version__
@@ -79,8 +80,9 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 )
 DESCRIPTION_EXPLAIN_CONFIG = (
     "Explain the experiment configuration schema: the type, default and rules of one config key "
-    "and every key below it, or the top-level keys and the general notes on paths, YAML typing "
-    "and environment variables when key is omitted. Call only when the user "
+    "and every key below it, with the section rules and shared-block descriptions that govern "
+    "them, or the top-level keys and the general notes on the config file, paths, YAML "
+    "typing and the study fingerprint when key is omitted. Call only when the user "
     "asks for config-authoring help, narrowing with a key such as phases[].sampler; when "
     "found=false, retry with one of closest. Read-only: it describes the schema, not any "
     "catalog experiment, and needs no experiment id."
@@ -88,7 +90,8 @@ DESCRIPTION_EXPLAIN_CONFIG = (
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
     "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
-    "Read-only: launch_run separately rechecks config identity and refuses catalog drift."
+    "Read-only: the server rereads an edited catalog or config before each call, so this "
+    "describes what launch_run would start now."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the most recently launched run for one experiment. Call only to recover a lost "
@@ -98,8 +101,12 @@ DESCRIPTION_GET_LATEST_RUN = (
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
     "inspection and explicit user authorization; monitor with the returned run_id. "
-    "Never retry permission or config-identity refusals; await named blockers before retrying a "
-    "capacity refusal."
+    "Never retry permission refusals. Retry a config-changed refusal once; report an "
+    "invalid-catalog or changed-state_dir refusal to the operator and wait for the fix. For "
+    "capacity refusals, await healthy named blockers; report blockers requiring recovery to the "
+    "operator before retrying. "
+    "When runner liveness is unobservable, monitor durable progress and notify the operator "
+    "if it stops."
 )
 DESCRIPTION_GET_RUN_STATUS = (
     "Read process state and per-phase progress for exactly one run_id. Use as a single status "
@@ -193,7 +200,10 @@ PublishedConfigMatchesCurrent = Annotated[
 MaybePhaseName = Annotated[
     str | None,
     Field(
-        description="Optional phase name to resume from after earlier phases already have winners.",
+        description=(
+            "Optional phase name to resume from once the earlier phases the remaining phases "
+            "inherit have compatible published winners."
+        ),
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
@@ -293,11 +303,30 @@ class ConfigEntryPayload(_ToolPayload):
     )
 
 
+class ConfigRulesPayload(_ToolPayload):
+    """Reference lines that govern a group of keys rather than one key."""
+
+    kind: Literal["section", "block"] = Field(
+        description=(
+            "section for the rules at the head of a reference section; block for the "
+            "description of a shared block whose fields several keys reuse."
+        )
+    )
+    name: str = Field(description="Section title, matching entries' section, or block name.")
+    description: str = Field(description="The rules, one line per paragraph.")
+
+
 class ExplainConfigResult(_ToolPayload):
     """Structured output for explain_config."""
 
     key: str | None = Field(description="The requested key, echoed; null when it was omitted.")
     found: bool = Field(description="Whether the key matches a documented config key.")
+    rules: list[ConfigRulesPayload] = Field(
+        description=(
+            "Section rules and shared-block descriptions that govern the returned entries, "
+            "each once, in order of first use; empty when key is omitted or not found."
+        )
+    )
     entries: list[ConfigEntryPayload] = Field(
         description="The key and every key below it in reference order; empty when not found."
     )
@@ -306,8 +335,8 @@ class ExplainConfigResult(_ToolPayload):
     )
     notes: str = Field(
         description=(
-            "General notes on file paths, YAML typing and environment variables, one line per "
-            "paragraph. Returned only when key is omitted; otherwise empty."
+            "General notes on the config file, paths, YAML typing and the study fingerprint, "
+            "one line per paragraph. Returned only when key is omitted; otherwise empty."
         )
     )
 
@@ -319,7 +348,7 @@ class PhaseValidationPayload(_ToolPayload):
     n_trials: int = Field(
         ge=1,
         description=(
-            "Target number of terminal attempts; COMPLETE and FAIL trials both count. "
+            "Target number of finished attempts; COMPLETE, INFEASIBLE and FAIL trials all count. "
             "INTERRUPTED trials never count: each reruns with its parameters before any new draw."
         ),
     )
@@ -353,16 +382,19 @@ class RunPayload(_ToolPayload):
     started_at: str = Field(description="UTC ISO-8601 launch timestamp.")
     recovery_required: bool = Field(
         description=(
-            "True when the agent must stop monitoring and report an unresolved launch, "
-            "uncertain cleanup, or interrupted snapshot finalization to the operator. "
-            "A launch handoff observed mid-transition can still settle."
+            "True when the agent must stop monitoring and report to the operator an unresolved "
+            "launch, uncertain cleanup, interrupted snapshot finalization, or a runner in "
+            "another PID namespace whose heartbeat stopped. A launch handoff observed "
+            "mid-transition, or a heartbeat paused by a host suspend, can still settle."
         )
     )
     runner_observable: bool = Field(
         description=(
             "False for a running runner in another PID namespace: liveness and cancellation "
             "are unavailable. Monitor durable trial counts, do not call cancel_run, and "
-            "notify the user if counts stop advancing."
+            "notify the user if counts stop advancing. With recovery_required also true, the "
+            "runner has probably stopped or left cleanup uncertain: ask the operator to check "
+            "and recover it from a host shell."
         )
     )
     failure: FailurePayload | None = Field(
@@ -386,35 +418,49 @@ class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
     phase: PhaseName
-    trials: dict[TrialStateName, int] = Field(
+    trials: dict[TrialStateName, int] | None = Field(
         description=(
-            "Dense cumulative study counts; every state key is always present. INTERRUPTED "
+            "Dense cumulative study counts, or null when unavailable. Every state key is "
+            "present when counts are known. COMPLETE counts trials that finished inside every "
+            "metric bound and constraint. INFEASIBLE counts trials that finished outside "
+            "the metric bounds or constraints; they can never win. INTERRUPTED "
             "counts trials a deadline, shutdown or orchestrator death cut short; they are "
-            "not terminal, and WAITING counts their scheduled reruns."
+            "not finished, and WAITING counts their scheduled reruns."
         )
     )
-    running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")
-    target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
-    completed_trials_total: int = Field(ge=0, description="Cumulative COMPLETE study rows.")
-    terminal_trials_total: int = Field(ge=0, description="Cumulative COMPLETE + FAIL study rows.")
-    terminal_trials_before_run: int = Field(
-        ge=0, description="Terminal rows that predate the represented generation."
+    target_finished_trials: int = Field(ge=0, description="Configured finished-trial target.")
+    finished_trials_total: int | None = Field(
+        ge=0,
+        description="Cumulative COMPLETE + INFEASIBLE + FAIL study rows; null when unavailable.",
     )
-    attempts_launched_this_run: int = Field(
-        ge=0, description="All attempts owned by the represented generation."
+    finished_trials_before_run: int | None = Field(
+        ge=0,
+        description="Finished rows not owned by the queried run; null when unavailable.",
     )
-    terminal_trials_this_run: int = Field(
-        ge=0, description="Terminal attempts owned by the represented generation."
-    )
-    remaining_trials: int = Field(
+    attempts_this_run: int | None = Field(
         ge=0,
         description=(
-            "Additional terminal trials needed to reach the configured target, reruns of "
-            "interrupted trials included."
+            "Attempts the queried run's generation started, in any state, including any that "
+            "a deadline, abort or shutdown stopped before their trainer launched; zero for a "
+            "run that started none; null when unavailable."
         ),
     )
-    target_already_satisfied: bool = Field(
-        description="Whether pre-run terminal history already met the configured target."
+    finished_trials_this_run: int | None = Field(
+        ge=0,
+        description="Finished attempts owned by the queried run; null when unavailable.",
+    )
+    remaining_trials: int | None = Field(
+        ge=0,
+        description=(
+            "Additional finished trials needed to reach the configured target, reruns of "
+            "interrupted trials included; null when counts are unavailable."
+        ),
+    )
+    target_already_satisfied: bool | None = Field(
+        description=(
+            "Whether the trials finished before this run already met the configured target; "
+            "null when counts are unavailable."
+        )
     )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
     published_study_unavailable: bool | None = Field(
@@ -429,8 +475,8 @@ class PhaseStatusPayload(_ToolPayload):
         description=(
             "Whether trial counts are known, including confirmed absent or empty studies. "
             "False means inspection failed, a journal snapshot is incomplete, or no "
-            "persistent observation is available; "
-            "zero counts then do not establish that no trials exist."
+            "persistent observation is available; trial counts and derived progress "
+            "fields are then null."
         )
     )
 
@@ -466,14 +512,23 @@ class GetRunStatusResult(_ToolPayload):
     )
     represented_generation_id: str | None = Field(
         description=(
-            "Generation supplying this payload's winners, summary, and this-run counts; "
-            "normally the queried run, or null for an unavailable placeholder."
+            "Generation supplying this payload's winners and summary: the queried run's own "
+            "generation, named by its run ID, or the published generation a run that launched "
+            "nothing replayed. Null for a run refused before it wrote a generation, and for an "
+            "unavailable placeholder."
         )
     )
     is_published: bool = Field(
         description=(
             "True iff the non-null represented_generation_id equals published_generation_id; "
             "a run can still expose its own winners when this is false."
+        )
+    )
+    run_wrote_generation: bool | None = Field(
+        description=(
+            "Whether the queried run has written its own generation, which it does when it "
+            "launches a trial or publishes. False for a run that replayed the published "
+            "winners or was refused before its first trial; null for an unavailable placeholder."
         )
     )
     publication_integrity: PublicationIntegrity
@@ -538,10 +593,11 @@ class WinnerPhasePayload(_ToolPayload):
 
     phase: PhaseName
     winner_source: WinnerSourcePayload
-    winner_generation: Literal["current_generation", "prior_generation", "unknown"] = Field(
+    winner_generation: Literal["represented_generation", "prior_generation", "unknown"] = Field(
         description=(
-            "Whether this winner was selected in the represented generation, carried from an "
-            "earlier generation, or has no recorded generation provenance."
+            "Whether this winner was selected in the represented generation or carried from an "
+            "earlier generation; unknown when no represented generation is available to "
+            "compare against."
         )
     )
     metric: float = Field(
@@ -690,12 +746,12 @@ def _safe_tool(fn: F) -> F:
     if inspect.iscoroutinefunction(fn):
 
         @functools.wraps(fn)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def async_wrapper(*args: object, **kwargs: object) -> object:
             """Invoke an async tool and redact any exception.
 
-            :param Any args: Positional arguments passed through to the wrapped tool.
-            :param Any kwargs: Keyword arguments passed through to the wrapped tool.
-            :return Any: Awaited tool result.
+            :param object args: Positional arguments passed through to the wrapped tool.
+            :param object kwargs: Keyword arguments passed through to the wrapped tool.
+            :return object: Awaited tool result.
             """
             try:
                 return await fn(*args, **kwargs)
@@ -705,12 +761,12 @@ def _safe_tool(fn: F) -> F:
         return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(fn)
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+    def sync_wrapper(*args: object, **kwargs: object) -> object:
         """Invoke a synchronous tool and redact any exception.
 
-        :param Any args: Positional arguments passed through to the wrapped tool.
-        :param Any kwargs: Keyword arguments passed through to the wrapped tool.
-        :return Any: Wrapped tool result.
+        :param object args: Positional arguments passed through to the wrapped tool.
+        :param object kwargs: Keyword arguments passed through to the wrapped tool.
+        :return object: Wrapped tool result.
         """
         try:
             return fn(*args, **kwargs)
@@ -780,45 +836,47 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
             raise RuntimeError(f"MCP tool {tool_name!r} must require run_id")
 
 
-def build_server(app: PhaseSweepMCP) -> Any:
+def build_server(app: PhaseSweepMCP) -> FastMCP:
     """Construct the FastMCP server.
 
     The SDK is imported lazily so non-server code paths do not
     require the ``mcp`` package.
 
     :param PhaseSweepMCP app: SDK-free tool implementation to expose.
-    :return Any: Configured FastMCP server.
+    :return FastMCP: Configured FastMCP server.
     """
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("phasesweep", instructions=agent_prompt_text())
     mcp._mcp_server.version = __version__
 
-    def list_experiments(
+    async def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
         cursor: MaybeCursor = None,
     ) -> ListExperimentsResult:
         """Validate the paginated catalog result.
 
-        :param limit: Maximum catalog entries to return.
-        :param cursor: Optional pagination cursor from a prior result.
-        :return: Structured catalog listing.
+        The call may reread an edited catalog, so it runs off the event-loop thread.
+
+        :param ListLimit limit: Maximum catalog entries to return.
+        :param MaybeCursor cursor: Optional pagination cursor from a prior result.
+        :return ListExperimentsResult: Structured catalog listing.
         """
         return ListExperimentsResult.model_validate(
-            app.list_experiments(limit=limit, cursor=cursor)
+            await asyncio.to_thread(app.list_experiments, limit=limit, cursor=cursor)
         )
 
     def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
         """Validate the configuration-reference result.
 
-        :return: Matching reference entries, or the closest documented keys.
+        :return ExplainConfigResult: Matching reference entries, or the closest documented keys.
         """
         return ExplainConfigResult.model_validate(app.explain_config(key))
 
     async def inspect_experiment(experiment_id: ExperimentId) -> InspectExperimentResult:
         """Validate the experiment inspection result.
 
-        :return: Structured inspection payload.
+        :return InspectExperimentResult: Structured inspection payload.
         """
         return InspectExperimentResult.model_validate(
             await asyncio.to_thread(app.validate, experiment_id)
@@ -827,7 +885,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
         """Validate the latest-run result.
 
-        :return: One computed run handle or ``found=false``.
+        :return GetLatestRunResult: One computed run handle or ``found=false``.
         """
         return GetLatestRunResult.model_validate(
             await asyncio.to_thread(app.latest_run, experiment_id)
@@ -836,7 +894,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_run_status(run_id: RunId) -> GetRunStatusResult:
         """Validate the run-status result.
 
-        :return: Structured status payload.
+        :return GetRunStatusResult: Structured status payload.
         """
         return GetRunStatusResult.model_validate(await asyncio.to_thread(app.status, run_id))
 
@@ -846,9 +904,10 @@ def build_server(app: PhaseSweepMCP) -> Any:
     ) -> AwaitRunResult:
         """Wait for a run update and validate the result.
 
-        :param run_id: Detached run id to wait on.
-        :param timeout_seconds: Seconds to wait before returning current status.
-        :return: Structured status payload plus changed and reason.
+        :param RunId run_id: Detached run id to wait on.
+        :param AwaitTimeoutSeconds timeout_seconds: Seconds to wait before returning current
+            status.
+        :return AwaitRunResult: Structured status payload plus changed and reason.
         """
         result = AwaitRunResult.model_validate(
             await app.await_run(run_id, timeout_seconds=timeout_seconds)
@@ -858,7 +917,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def get_run_results(run_id: RunId) -> GetRunResultsResult:
         """Validate the run-results payload.
 
-        :return: Structured results payload.
+        :return GetRunResultsResult: Structured results payload.
         """
         return GetRunResultsResult.model_validate(await asyncio.to_thread(app.winners, run_id))
 
@@ -868,9 +927,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
     ) -> LaunchRunResult:
         """Launch a detached run and validate the result.
 
-        :param experiment_id: Catalog experiment id to launch.
-        :param from_phase: Optional phase to resume from.
-        :return: Structured launch result.
+        :param ExperimentId experiment_id: Catalog experiment id to launch.
+        :param MaybePhaseName from_phase: Optional phase to resume from.
+        :return LaunchRunResult: Structured launch result.
         """
         return LaunchRunResult.model_validate(
             await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
@@ -879,7 +938,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     async def cancel_run(run_id: RunId) -> CancelRunResult:
         """Cancel a run and validate the result.
 
-        :return: Structured cancellation result.
+        :return CancelRunResult: Structured cancellation result.
         """
         # MCP 1.27 invokes synchronous tool functions on the event-loop
         # thread. Cancellation may spend its 30-second grace period waiting
@@ -955,13 +1014,13 @@ def build_server(app: PhaseSweepMCP) -> Any:
         mime_type="application/json",
     )
     @_safe_tool
-    def catalog_resource() -> str:
+    async def catalog_resource() -> str:
         """Return the first catalog page for clients that attach MCP resources.
 
-        :return: Compact JSON catalog page.
+        :return str: Compact JSON catalog page.
         """
         result = ListExperimentsResult.model_validate(
-            app.list_experiments(limit=DEFAULT_LIST_LIMIT, cursor=None)
+            await asyncio.to_thread(app.list_experiments, limit=DEFAULT_LIST_LIMIT, cursor=None)
         )
         return result.model_dump_json(exclude_none=True)
 
@@ -973,7 +1032,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
     def run_and_monitor_prompt() -> str:
         """Return safe agent instructions for the normal MCP sweep workflow.
 
-        :return: Prompt text.
+        :return str: Prompt text.
         """
         return agent_prompt_text()
 
@@ -1024,6 +1083,9 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
 
 def serve(catalog: Path) -> int:
     """Load the catalog, build the run store, and serve the nine tools over stdio.
+
+    The tools reread the catalog when it or a listed config changes; the run store
+    stays on the ``state_dir`` loaded here.
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or

@@ -61,7 +61,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
         return None
     try:
         length = int(header.decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:
         return None
     if length < 0:
         return None
@@ -70,7 +70,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
         return None
     try:
         payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:
         return None
     if not isinstance(payload, dict):
         return None
@@ -245,7 +245,6 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
         os.execve("/bin/sh", ["/bin/sh", "-c", cmd], env)
     except OSError:
         return 77
-    return 77
 
 
 def _return_child_status(status: int) -> int:
@@ -290,8 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Restore the parent's inherited signal mask before forking the trainer so
     # shutdown signals can reach both processes.
-    if hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_SETMASK, set())
+    signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
     child_pid = os.fork()
     if child_pid == 0:

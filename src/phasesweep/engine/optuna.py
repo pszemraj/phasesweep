@@ -32,9 +32,9 @@ from phasesweep.config.search import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
+    FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
-    TERMINAL_TRIAL_STATES,
     TRIAL_STATE_NAMES,
     RecoveredTrialState,
     TrialStateName,
@@ -53,7 +53,7 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` for an allocation interrupted before its identity
     attributes were written. Published references additionally
-    carry their terminal and complete count boundary, and a RUNNING row the
+    carry their finished and completed count boundary, and a RUNNING row the
     state stale recovery will record for it. Those fields are not part of a
     trial-row identity comparison.
     """
@@ -86,18 +86,24 @@ class _PhaseTrialStats:
 
 
 def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
-    """Return the state a trial is counted under: ``INTERRUPTED``, or its Optuna state.
+    """Return the state a trial is counted and reported under.
 
-    The one classifier behind every state-keyed count, so an interrupted trial
-    (:func:`~phasesweep.engine.state._trial_interrupted`) is never counted as
-    finished anywhere.
+    The one classifier behind every state-keyed count, run log line and trial table, so
+    an interrupted trial (:func:`~phasesweep.engine.state._trial_interrupted`) is never
+    counted as finished anywhere, and a trial that completed out of bounds reads
+    ``INFEASIBLE`` wherever it is shown. A run records the feasibility attr before a
+    trial completes, so a COMPLETE trial without a truthy one never ranks either.
 
     :param optuna.trial.FrozenTrial trial: Trial to classify.
-    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, otherwise
-        the Optuna state name.
+    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, ``INFEASIBLE`` for a
+        COMPLETE trial without a truthy feasibility attr, otherwise the Optuna state name.
     """
     if _trial_interrupted(trial):
         return "INTERRUPTED"
+    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
+        FEASIBLE_ATTR, False
+    ):
+        return "INFEASIBLE"
     name = trial.state.name
     for state in TRIAL_STATE_NAMES:
         if state == name:
@@ -108,41 +114,33 @@ def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     """Return the number of trials that count toward ``n_trials``.
 
-    A trial counts once it is terminal and was not interrupted: an interrupted
-    trial reruns instead, so it never consumes the trial target.
+    A trial counts once it is finished: an interrupted trial reruns instead, so it
+    never consumes the trial target.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials in a state of :data:`~phasesweep.engine.state.TERMINAL_TRIAL_STATES`.
+    :return int: Number of trials in a state of :data:`~phasesweep.engine.state.FINISHED_TRIAL_STATES`.
     """
-    return sum(1 for trial in trials if _trial_count_state(trial) in TERMINAL_TRIAL_STATES)
+    return sum(1 for trial in trials if _trial_count_state(trial) in FINISHED_TRIAL_STATES)
 
 
 def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of COMPLETE trials in ``trials``.
+    """Return the number of trials that finished inside every metric bound and constraint.
+
+    A publication and an accepted partial decision record this count as ``completed_trials``.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :return int: Number of trials :func:`_trial_count_state` counts as ``COMPLETE``.
+    """
+    return sum(1 for trial in trials if _trial_count_state(trial) == "COMPLETE")
+
+
+def _measured_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the Optuna COMPLETE trial count of ``trials``, infeasible ones included.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
     :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
     """
     return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
-
-
-def _trial_state_label(trial: optuna.trial.FrozenTrial) -> str:
-    """Return the state a trial is reported under: its counted state, or ``INFEASIBLE``.
-
-    A COMPLETE trial that violated a constraint or the metric's bounds is never
-    eligible for selection, so run logs and trial tables name it apart from the
-    trials that ranked, and an interrupted trial reads ``INTERRUPTED``, as it
-    is counted.
-
-    :param optuna.trial.FrozenTrial trial: Trial whose state is labeled.
-    :return str: :func:`_trial_count_state`, except ``INFEASIBLE`` for a COMPLETE
-        trial without a truthy feasibility attr.
-    """
-    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
-        FEASIBLE_ATTR, False
-    ):
-        return "INFEASIBLE"
-    return _trial_count_state(trial)
 
 
 def _published_phase_trial_refs(
@@ -152,8 +150,8 @@ def _published_phase_trial_refs(
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
-        their known terminal-count boundary; None when a published phase does
-        not record a complete identity.
+        their known finished and completed count boundary; None when a published
+        phase does not record a complete identity.
     """
     refs: dict[str, _TrialRef | None] = {}
     for item in (summary or {}).get("phases", ()):
@@ -196,8 +194,9 @@ def _meets_published_trial_history_boundary(
 ) -> bool:
     """Return whether a study still holds the history a publication recorded.
 
-    :param int finished: Terminal trials the study holds now.
-    :param int completed: COMPLETE trials the study holds now.
+    :param int finished: Finished trials the study holds now.
+    :param int completed: Completed trials the study holds now, those inside every metric
+        bound and constraint.
     :param _TrialRef expected: Published trial whose recorded counts, when
         present, are the minimum.
     :return bool: ``True`` when both counts meet the recorded boundary.
@@ -218,9 +217,10 @@ def _published_trial_history_available(
     """
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
-    finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES)
-    completed = stats.counts.get("COMPLETE", 0)
-    return _meets_published_trial_history_boundary(finished, completed, published_trial)
+    finished = sum(stats.counts.get(state, 0) for state in FINISHED_TRIAL_STATES)
+    return _meets_published_trial_history_boundary(
+        finished, stats.counts.get("COMPLETE", 0), published_trial
+    )
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
@@ -360,8 +360,8 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
-        :raises RuntimeError: The position lies past the grid, which the trial
-            target's cardinality check rules out.
+        :raises RuntimeError: The position lies past the grid, which target
+            validation and queued failed-cell retries rule out.
         """
         if "grid_id" in trial.system_attrs:
             return
@@ -581,27 +581,20 @@ def _build_sampler(
 ) -> optuna.samplers.BaseSampler:
     """Construct the Optuna sampler for a phase from its YAML ``sampler`` block.
 
-    Args:
-        cfg: Parsed sampler config (type, seed, startup-trials, etc.).
-        search_space: The phase's validated sampler search space
-            (:func:`phasesweep.config.search.sampler_search_space`), used to build the
-            ``GridSampler`` grid; it includes the repeat axis.
-        n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
-            when ``n_jobs > 1``.
-        repeats: The phase's repeats block, which seeded random draws by
-            configuration slot.
-
-    Returns:
-        A configured :class:`optuna.samplers.BaseSampler` subclass instance.
-        A seeded stochastic sampler draws by draw position, so a study resumes
-        and grows without repeating a draw; an unseeded one is Optuna's own,
-        which only in-memory storage allows. A fixed configuration, whose
-        search space is empty, gets a plain random sampler that is never
+    :param Sampler cfg: Parsed sampler config (type, seed, startup-trials, etc.).
+    :param dict[str, SearchParam] search_space: The phase's validated sampler search space
+        (:func:`phasesweep.config.search.sampler_search_space`), used to build the
+        ``GridSampler`` grid; it includes the repeat axis.
+    :param int n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic when
+        ``n_jobs > 1``.
+    :param Repeats | None repeats: The phase's repeats block; the seeded random sampler draws
+        one configuration per slot of ``len(values)`` consecutive positions.
+    :raises ValueError: The validated grid search space cannot be enumerated.
+    :return optuna.samplers.BaseSampler: A configured sampler instance. A seeded stochastic
+        sampler draws by draw position, so a study resumes and grows without repeating a
+        draw; an unseeded one is Optuna's own, which only in-memory storage allows. A fixed
+        configuration, whose search space is empty, gets a plain random sampler that is never
         consulted.
-
-    Raises:
-        ValueError: The validated grid search space cannot be enumerated.
-
     """
     if not search_space:
         return optuna.samplers.RandomSampler(seed=cfg.seed)
@@ -637,14 +630,11 @@ def _build_sampler(
 def _suggest(trial: optuna.Trial, name: str, p: SearchParam) -> Any:
     """Dispatch to the right Optuna ``trial.suggest_*`` based on param type.
 
-    Args:
-        trial: The active Optuna trial.
-        name: Parameter name (used as the Optuna key).
-        p: The concrete search parameter from the phase's ``search_space``.
-
-    Returns:
-        The sampled value. Type matches ``p`` (``float``/``int``/categorical scalar).
-
+    :param optuna.Trial trial: The active Optuna trial.
+    :param str name: Parameter name (used as the Optuna key).
+    :param SearchParam p: The concrete search parameter from the phase's ``search_space``.
+    :return float | int | str | bool | None: The sampled value. Type matches ``p``
+        (``float``/``int``/categorical scalar).
     """
     if isinstance(p, FloatParam):
         return trial.suggest_float(name, p.low, p.high, step=p.step, log=p.log)

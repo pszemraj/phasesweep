@@ -30,7 +30,7 @@ from phasesweep.config.models import (
 )
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
-from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
     RecordedPhase,
@@ -43,7 +43,7 @@ from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
-from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
+from phasesweep.runtime.files import ensure_artifact_dir, require_linux_runtime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
@@ -65,9 +65,9 @@ def _preflight_missing_reached_phase_environments(
     """Validate launch environments for reached phases with no durable study.
 
     A phase absent from an otherwise bound tree has no completed trial to
-    replay, so it must be able to launch before this invocation claims a
-    generation or tops up an earlier phase. Existing studies remain deferred to
-    recovery, which can distinguish new work from an offline-safe no-op.
+    replay, so it must be able to launch before this invocation tops up an
+    earlier phase. Existing studies remain deferred to recovery, which can
+    distinguish new work from an offline-safe no-op.
 
     :param Experiment experiment: Parsed experiment supplying phase environments.
     :param Mapping[str, object] existing_studies: Durable studies found under the lock.
@@ -83,13 +83,15 @@ def _preflight_missing_reached_phase_environments(
 class TerminalReport:
     """One engine invocation's primary outcome and independent cleanup evidence.
 
-    ``winners`` is the engine's own authoritative winner mapping, populated on
-    the success path while the experiment lock is still held: a
-    terminal-result consumer (the MCP runner's snapshot capture) must be able
-    to freeze the published outcome from the exact in-memory state the engine
-    just returned, instead of re-deriving it from mutable storage or optional
-    diagnostic files whose absence would then contradict an engine-defined
-    success. ``None`` on every failure path.
+    ``generation_id`` is the invocation's generation id. A generation namespace
+    exists under it only when the invocation launched a trial or published.
+    ``failure_stage`` is ``"execution"`` for a failure after that claim and
+    ``"preflight"`` for one before it, and ``None`` on success.
+    ``winners`` holds the winners the engine captured under the experiment lock
+    on success, so a terminal-result consumer need not re-read storage. It is
+    ``None`` on every failure path. ``replayed_generation_id`` names the published
+    generation whose winners a successful invocation replayed without writing a
+    generation, and is ``None`` otherwise.
     """
 
     generation_id: str
@@ -101,6 +103,7 @@ class TerminalReport:
     cleanup_error: BaseException | None = None
     failure_stage: str | None = None
     winners: Mapping[str, Winner] | None = None
+    replayed_generation_id: str | None = None
 
 
 class PublicationHook(Protocol):
@@ -143,6 +146,7 @@ def _terminal_report_from_cleanup(
     primary_error: BaseException | None,
     failure_stage: str | None,
     winners: Mapping[str, Winner] | None = None,
+    replayed_generation_id: str | None = None,
 ) -> TerminalReport:
     """Freeze accumulated cleanup evidence into one terminal report.
 
@@ -151,6 +155,8 @@ def _terminal_report_from_cleanup(
     :param BaseException | None primary_error: Invocation's authoritative error.
     :param str | None failure_stage: Stage where the invocation failed.
     :param Mapping[str, Winner] | None winners: Successful published winners.
+    :param str | None replayed_generation_id: Published generation whose winners a successful
+        invocation replayed without writing a generation.
     :return TerminalReport: Immutable terminal outcome snapshot.
     """
     return TerminalReport(
@@ -163,7 +169,17 @@ def _terminal_report_from_cleanup(
         cleanup_error=cleanup.error,
         failure_stage=failure_stage,
         winners=MappingProxyType(dict(winners)) if winners is not None else None,
+        replayed_generation_id=replayed_generation_id,
     )
+
+
+def _failure_stage(generation: generation_ops.InvocationGeneration) -> str:
+    """Name the stage a failed invocation was in, from whether it claimed its generation.
+
+    :param generation_ops.InvocationGeneration generation: The invocation's generation.
+    :return str: ``"execution"`` once the generation is claimed, else ``"preflight"``.
+    """
+    return "execution" if generation.claimed else "preflight"
 
 
 def run_experiment(
@@ -179,18 +195,22 @@ def run_experiment(
 
     Live runs hold the experiment lock across all phases and install shutdown
     handlers. Dry runs inspect recorded state and render commands without writes
-    or subprocesses. Dry-run checks omit recovery-dependent checks, trainer
-    environments, stored fingerprints, and trial evidence.
+    or trainer subprocesses; GPU checks may read local inventory through nvidia-smi.
+    Dry-run checks omit recovery-dependent checks, trainer
+    environments and trial evidence. Fingerprints with placeholder ancestry
+    remain unknown until the parent publishes a winner.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Resume phase; validate and load earlier published winners.
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Resume phase; validate and load earlier published winners.
         None starts at the first phase, reusing recorded trials where applicable.
-    :param dry_run: Preview remaining trial counts and one command per phase.
-    :param terminal_callback: Synchronous diagnostic callback under the experiment lock.
-    :param publication_hook: Required sidecar around publication commit, if supplied.
-    :param generation_id: Invocation identity, generated if omitted. Supplied names
+    :param bool dry_run: Preview remaining trial counts and one command per phase.
+    :param Callable[[TerminalReport], None] | None terminal_callback: Synchronous diagnostic
+        callback under the experiment lock.
+    :param PublicationHook | None publication_hook: Required sidecar around publication
+        commit, if supplied.
+    :param str | None generation_id: Invocation identity, generated if omitted. Supplied names
         may contain only alphanumerics, underscores, and dashes.
-    :return Mapping[str, Winner]: Winners in declaration order. Dry runs return
+    :return dict[str, Winner]: Winners in declaration order. Dry runs return
         replayed winners where available and placeholders elsewhere.
     :raises NoFeasibleTrialError: A phase exhausted its failure limit or has no feasible trial.
     :raises UnsafeProcessCleanupError: A trial's process group may still be alive.
@@ -199,7 +219,8 @@ def run_experiment(
     :raises PhaseSweepError: Preflight, storage, publication, or recovery refused the run.
     :raises RuntimeError: An engine invariant failed.
     :raises ValueError: An unsafe generation id or unknown resume phase was supplied.
-    :raises FileNotFoundError: A skipped phase has no published winner.
+    :raises ResumeWinnerMissingError: A skipped phase has no published winner; a fresh
+        artifact tree is refused before anything is written.
     """
     # Revalidate copied models while preserving mutable defaults and field-set state.
     experiment = Experiment.model_validate(experiment)
@@ -210,11 +231,14 @@ def run_experiment(
             experiment,
             from_phase=from_phase,
             ledger=None,
-            generation_id=None,
+            generation=None,
         )
     # Fresh-tree launch checks precede writes; existing trees defer them until work remains.
     environments_preflighted = not path_ops._artifact_root_binding_path(experiment).exists()
     if environments_preflighted:
+        # A fresh tree holds no publication, so a resume that needs earlier winners cannot
+        # succeed; refuse it before the run creates the tree.
+        resume_ops._preflight_skipped_winners(experiment, from_phase=from_phase, run_deadline=None)
         _preflight_missing_reached_phase_environments(experiment, {}, from_phase=from_phase)
     winners = _run_experiment_outcome(
         experiment,
@@ -242,14 +266,19 @@ def _run_experiment_outcome(
     generation_id: str | None = None,
     environments_preflighted: bool = False,
 ) -> Mapping[str, Winner]:
-    """Run and publish one generation while holding the experiment lock.
+    """Run the phases and publish their winners while holding the experiment lock.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Optional resume point; see :func:`run_experiment`.
-    :param terminal_callback: Optional diagnostic callback.
-    :param publication_hook: Optional required publication sidecar.
-    :param generation_id: Optional caller-owned invocation identity.
-    :param environments_preflighted: Launch environments were checked before any
+    The invocation's generation is created only when a phase launches a trial or the
+    winners differ from the current publication; a refusal or a no-op replay leaves
+    no generation and leaves both generation pointers as they were.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
+    :param Callable[[TerminalReport], None] | None terminal_callback: Optional diagnostic
+        callback.
+    :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :param str | None generation_id: Optional caller-owned invocation identity.
+    :param bool environments_preflighted: Launch environments were checked before any
         writes to a fresh artifact tree.
     :return Mapping[str, Winner]: This invocation's winners, captured under the lock.
     :raises TrialEvidenceMissingError: Candidate evidence failed preflight or winner validation.
@@ -260,7 +289,7 @@ def _run_experiment_outcome(
     :raises BaseException: The run's failure after recording failed state, or a
         control-flow exception that interrupted reconciliation, chained from it.
     """
-    require_posix_runtime()
+    require_linux_runtime()
 
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
@@ -299,23 +328,21 @@ def _run_experiment_outcome(
             )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
-        generation_id = generation_ops._claim_generation(experiment, requested_generation_id)
+        generation = generation_ops.InvocationGeneration(
+            experiment,
+            generation_id=generation_ops._new_generation_id(experiment, requested_generation_id),
+            caller_owned_id=requested_generation_id is not None,
+            from_phase=from_phase,
+        )
+        generation_id = generation.generation_id
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = attempt_ops._PreflightCleanupReport()
-        generation_prepared = False
         try:
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
                 if experiment.timeout_seconds_per_run is not None
                 else None
-            )
-            generation_ops._write_generation_state(
-                experiment,
-                generation_id=generation_id,
-                state="preflighting",
-                from_phase=from_phase,
-                publish_current=True,
             )
             existing_studies = guard_ops._preflight_existing_studies(
                 claimed,
@@ -345,19 +372,11 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 existing_studies=existing_studies,
             )
-            generation_ops._write_generation_state(
-                experiment,
-                generation_id=generation_id,
-                state="running",
-                from_phase=from_phase,
-                publish_current=True,
-            )
-            generation_prepared = True
             result = _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
                 ledger=claimed,
-                generation_id=generation_id,
+                generation=generation,
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
                 publication_hook=publication_hook,
@@ -365,7 +384,8 @@ def _run_experiment_outcome(
         except BaseException as exc:
             terminal_error = exc
             control_error: BaseException | None = None
-            if generation_prepared:
+            if generation.claimed:
+                # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
                 try:
                     guard_ops._reconcile_existing_studies(
@@ -400,20 +420,20 @@ def _run_experiment_outcome(
             )
             if shutdown_cleanup_uncertain:
                 cleanup.mark_uncertain(primary_error)
-            failed_generation_id = generation_id
             failed_error_class = type(primary_error).__name__
-            # Keep a more specific publication_failed record and pointer intact.
-            generation_ops._persist_failed_state_unless_recorded(
-                path_ops._generation_record_path(experiment, failed_generation_id),
-                lambda: generation_ops._write_generation_state(
-                    experiment,
-                    generation_id=failed_generation_id,
-                    state="failed",
-                    from_phase=from_phase,
-                    publish_current=True,
-                    error_class=failed_error_class,
-                ),
-            )
+            if generation.claimed:
+                # Keep a more specific publication_failed record and pointer intact.
+                generation_ops._persist_failed_state_unless_recorded(
+                    path_ops._generation_record_path(experiment, generation_id),
+                    lambda: generation_ops._write_generation_state(
+                        experiment,
+                        generation_id=generation_id,
+                        state="failed",
+                        from_phase=from_phase,
+                        publish_current=True,
+                        error_class=failed_error_class,
+                    ),
+                )
             if experiment.mlflow is not None and cleanup.cleanup_confirmed:
                 from phasesweep.tracking.publication import publish_failed_generation
 
@@ -422,7 +442,7 @@ def _run_experiment_outcome(
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
-                except BaseException as tracking_exc:  # noqa: BLE001 - primary error must survive
+                except BaseException as tracking_exc:  # primary error must survive
                     if (
                         isinstance(tracking_exc, PhaseSweepShutdown)
                         and not tracking_exc.report.cleanup_confirmed
@@ -435,7 +455,7 @@ def _run_experiment_outcome(
                 generation_id,
                 cleanup,
                 primary_error=primary_error,
-                failure_stage="execution" if generation_prepared else "preflight",
+                failure_stage=_failure_stage(generation),
             )
             if (
                 not cleanup.cleanup_confirmed
@@ -464,7 +484,8 @@ def _run_experiment_outcome(
             # Outside the except clause: the pointer has committed, so nothing
             # the MLflow mirror raises may enter the failure handling above.
             try:
-                if experiment.mlflow is not None:
+                # Success without a claim published nothing: the replay matched the publication.
+                if experiment.mlflow is not None and generation.claimed:
                     _mirror_publication(experiment, generation_id, cleanup)
             finally:
                 terminal_report = _terminal_report_from_cleanup(
@@ -473,6 +494,7 @@ def _run_experiment_outcome(
                     primary_error=None,
                     failure_stage=None,
                     winners=result,
+                    replayed_generation_id=generation.replayed_generation_id,
                 )
             return MappingProxyType(dict(result))
         finally:
@@ -483,10 +505,10 @@ def _run_experiment_outcome(
                             generation_id,
                             cleanup,
                             primary_error=terminal_error,
-                            failure_stage=("execution" if generation_prepared else "preflight"),
+                            failure_stage=_failure_stage(generation),
                         )
                     terminal_callback(terminal_report)
-                except BaseException:  # noqa: BLE001
+                except BaseException:
                     # Callback failures cannot replace the committed result or the engine error.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
@@ -541,21 +563,27 @@ def _run_experiment_inner(
     *,
     from_phase: str | None,
     ledger: ledger_ops.ClaimedLedger | None,
-    generation_id: str | None,
+    generation: generation_ops.InvocationGeneration | None,
     preloaded_winners: dict[str, Winner] | None = None,
     run_deadline: float | None = None,
     publication_hook: PublicationHook | None = None,
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
-    :param experiment: Parsed experiment config.
-    :param from_phase: Resume point whose earlier winners are loaded from disk.
-    :param ledger: Claimed ledger, or None for read-only command and trial-count previews.
-    :param generation_id: Invocation identity, or None for a dry run.
-    :param preloaded_winners: Validated skipped-phase winners captured before generation commit.
-    :param run_deadline: Monotonic deadline including preflight and stale cleanup.
-    :param publication_hook: Optional required publication sidecar.
-    :return Mapping[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
+    A live run that launched no trial claims its generation and publishes only when its
+    winners differ from the validated publication, or nothing validates as published.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param str | None from_phase: Resume point whose earlier winners are loaded from disk.
+    :param ledger_ops.ClaimedLedger | None ledger: Claimed ledger, or None for read-only
+        command and trial-count previews.
+    :param generation_ops.InvocationGeneration | None generation: The invocation's
+        unclaimed generation, or None for a dry run.
+    :param dict[str, Winner] | None preloaded_winners: Validated skipped-phase winners captured
+        before generation commit.
+    :param float | None run_deadline: Monotonic deadline including preflight and stale cleanup.
+    :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :return dict[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
     :raises TimeoutError: The run deadline expired before a phase started.
     :raises PublicationAccessError: A recorded dry-run publication is inaccessible.
     :raises PublicationIntegrityError: A recorded dry-run publication fails validation.
@@ -578,14 +606,9 @@ def _run_experiment_inner(
                 else:
                     log.info("DRY RUN %s", line)
         recorded = _preview_ledger(experiment, from_phase=from_phase)
-
-    # Only a dry run resumes without preloaded winners; it resolves the
-    # publication once for every phase it skips.
-    dry_run_publication = (
-        resume_ops._published_for_resume(experiment)
-        if skip_until and preloaded_winners is None and experiment.phases[0].name != from_phase
-        else None
-    )
+        preloaded_winners = resume_ops._preflight_skipped_winners(
+            experiment, from_phase=from_phase, run_deadline=None
+        )
     for phase in experiment.phases:
         using_preloaded_winner = (
             skip_until and phase.name != from_phase and preloaded_winners is not None
@@ -598,34 +621,22 @@ def _run_experiment_inner(
             raise TimeoutError(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start."
             )
+        if (
+            using_preloaded_winner
+            and preloaded_winners is not None
+            and phase.name not in preloaded_winners
+        ):
+            log.info("phase=%s SKIPPED (no published or required winner)", phase.name)
+            continue
         # Resolve current parents before validating skipped winners or running the phase.
         inherited = {p: winners[p] for p in phase.inherits}
 
         if skip_until and phase.name != from_phase:
-            if preloaded_winners is not None:
-                winners[phase.name] = preloaded_winners[phase.name]
-                if not dry_run:
-                    assert generation_id is not None
-                    artifact_io._save_winner(
-                        experiment,
-                        phase.name,
-                        winners[phase.name],
-                        generation_id=generation_id,
-                    )
-                log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
-            else:
-                # Only a dry run gets here: a real run preloads every skipped winner.
-                try:
-                    winners[phase.name] = artifact_io._load_winner(
-                        experiment,
-                        phase,
-                        inherited,
-                        publication=dry_run_publication,
-                    )
-                    log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
-                except FileNotFoundError:
-                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
-                    log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
+            assert preloaded_winners is not None
+            winners[phase.name] = preloaded_winners[phase.name]
+            if generation is not None:
+                generation.save_winner(phase.name, winners[phase.name])
+            log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             continue
         skip_until = False
 
@@ -634,26 +645,21 @@ def _run_experiment_inner(
             previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
             winner = previews[-1].winner
         else:
-            assert generation_id is not None
+            assert generation is not None
             winner = _run_phase(
                 experiment,
                 phase,
                 inherited,
-                generation_id=generation_id,
+                generation=generation,
                 ledger=ledger,
                 run_deadline=run_deadline,
             )
-        if not dry_run:
-            assert generation_id is not None
-            artifact_io._save_winner(
-                experiment,
-                phase.name,
-                winner,
-                generation_id=generation_id,
-            )
+        if generation is not None:
+            generation.save_winner(phase.name, winner)
             group = winner.repeats
+            completion = winner.completion
             log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s%s",
+                "phase=%s WINNER trial=%d metric=%g params=%s%s%s",
                 phase.name,
                 winner.trial_number,
                 winner.metric,
@@ -666,15 +672,32 @@ def _run_experiment_inner(
                     f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
                     f"members {[member['trial_number'] for member in group['members']]})"
                 ),
+                ""
+                if not completion.get("incomplete")
+                else (
+                    f" INCOMPLETE {completion['finished_trials']}/"
+                    f"{completion['requested_trials']} finished "
+                    f"timeout_scope={completion['timeout_scope']}"
+                ),
             )
         winners[phase.name] = winner
 
-    if dry_run:
+    if generation is None:
         log.info("DRY RUN %s", _dry_run_total_line(previews))
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 
-    assert generation_id is not None
+    if not generation.claimed:
+        published_id = generation_ops._publication_holds(experiment, winners)
+        if published_id is not None:
+            log.info(
+                "No trial launched and generation %s already publishes these winners; "
+                "the publication is unchanged and no new generation was written.",
+                published_id,
+            )
+            generation.replayed_generation_id = published_id
+            return winners
+    generation_id = generation.claim()
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     # Freeze artifact hashes and result labels together for generation-consistent reads.
@@ -691,6 +714,8 @@ def _run_experiment_inner(
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
         "artifacts": validation_ops._generation_artifact_manifest(experiment, generation_id),
     }
+    if experiment.override_format == "argparse":
+        summary["trainer_config"] = experiment.trainer_config
     artifact_io._write_yaml_atomic(summary_path, summary)
     generation_ops._publish_generation(
         experiment,
@@ -754,8 +779,8 @@ def _cli_phase_payloads(
         )
         cli_phases.append(
             {
-                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
                 "name": phase["phase"],
+                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
                 "winner": None if winner_path is None else str(winner_path),
             }
         )

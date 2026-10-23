@@ -37,7 +37,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import (
-    PlatformCapabilityError,
     UnsafePrivatePathError,
     canonical_storage_identity,
     open_directory_fd,
@@ -64,6 +63,8 @@ class _PreflightCleanupReport:
     cleanup_confirmed: bool = True
     recovered_attempt_ids: set[str] = field(default_factory=set)
     recovered_attempt_generations: dict[str, str] = field(default_factory=dict)
+    reaped_running_trials: int = 0
+    cleanup_recovered_trials: int = 0
     uncertain_attempt_ids: set[str] = field(default_factory=set)
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
@@ -251,7 +252,6 @@ def _write_tracking_cleanup_receipt(
     :param str operation_id: Tracking operation whose cleanup was confirmed.
     :param str generation_id: Generation that produced the operation.
     :raises OSError: The receipt could not be written.
-    :raises PlatformCapabilityError: The platform lacks the required file primitives.
     :raises UnsafePrivatePathError: The receipt destination is unsafe.
     """
     from phasesweep.tracking.session import tracking_root
@@ -345,12 +345,12 @@ def _register_active_attempt(
             "generation_id": generation_id,
         }
         private_atomic_write_text(entry_path, json.dumps(entry, sort_keys=True) + "\n")
-    except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+    except (OSError, UnsafePrivatePathError) as exc:
         raise ActiveAttemptPersistenceError(
             f"Could not register active attempt {attempt_id} for phase {phase_name!r} "
             f"at {entry_path}: {exc}. No trainer was started and no GPU lease was "
             "consumed. Persistent storage records a phase abort; retry requires "
-            "n_trials above its accepted target."
+            "n_trials above its accepted target in the config."
         ) from exc
 
 
@@ -367,7 +367,7 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     :param str attempt_id: Attempt whose trial reached a terminal state.
     """
     with (
-        contextlib.suppress(OSError, PlatformCapabilityError, ProcessCleanupUncertainError),
+        contextlib.suppress(OSError, ProcessCleanupUncertainError),
         _open_attempt_registry(experiment) as (directory_fd, _entry_paths),
     ):
         if directory_fd is not None:
@@ -609,6 +609,7 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
 def _registry_attempt_fail_stale_trial(
     entry: dict[str, Any],
     entry_path: Path,
+    report: _PreflightCleanupReport,
 ) -> str:
     """Mark the entry's Optuna trial FAIL through its saved storage locator.
 
@@ -616,6 +617,7 @@ def _registry_attempt_fail_stale_trial(
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
+    :param _PreflightCleanupReport report: Counts newly recorded trial cleanup actions.
     :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger or the entry is a tracking operation
@@ -648,7 +650,7 @@ def _registry_attempt_fail_stale_trial(
         trials = study.get_trials(deepcopy=False)
     except StudySchemaMismatchError:
         raise
-    except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
+    except Exception:  # unreachable storage keeps the entry for retry
         log.warning(
             "Attempt registry entry %s references storage that cannot be "
             "read right now; the stale trial will be retried on a later run.",
@@ -683,6 +685,7 @@ def _registry_attempt_fail_stale_trial(
                 )
             if not recovered:
                 _record_cleanup_recovery(study, trial)
+                report.cleanup_recovered_trials += 1
             return "recovered"
         return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
@@ -709,8 +712,9 @@ def _registry_attempt_fail_stale_trial(
             "continue with an inconsistent study."
         ),
     )
-    log.warning(
-        "Reaped stale RUNNING trial %d in study %s via the attempt registry",
+    report.reaped_running_trials += 1
+    log.info(
+        "Confirmed process cleanup for RUNNING trial %d in study %s via the attempt registry",
         trial.number,
         entry["study_name"],
     )
@@ -757,7 +761,7 @@ def _preflight_active_attempts(
                 )
                 if not confirm:
                     continue
-                outcome = _registry_attempt_fail_stale_trial(entry, entry_path)
+                outcome = _registry_attempt_fail_stale_trial(entry, entry_path, report)
             except ProcessCleanupUncertainError as exc:
                 report.uncertain_attempt_ids.add(attempt_id)
                 report.mark_uncertain(exc)
@@ -772,7 +776,7 @@ def _preflight_active_attempts(
                     _write_tracking_cleanup_receipt(
                         experiment, operation_id=attempt_id, generation_id=entry["generation_id"]
                     )
-                except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+                except (OSError, UnsafePrivatePathError) as exc:
                     report.unreceipted_attempt_ids.add(attempt_id)
                     log.warning(
                         "Could not record the cleanup receipt for tracking operation %s: %s. "

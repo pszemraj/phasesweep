@@ -83,13 +83,11 @@ class RunningAttemptSnapshot(_SnapshotModel):
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
-    """One phase's terminal trial counts and winner presence."""
+    """One phase's trial counts by state at capture, and winner presence."""
 
     phase: str
     trials: dict[str, NonNegativeInt]
-    running: NonNegativeInt
     n_trials: NonNegativeInt
-    completed: NonNegativeInt
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
@@ -174,7 +172,7 @@ class EvaluationPointSummary(_SnapshotModel):
 
 
 class SurvivorshipSummary(_SnapshotModel):
-    """How many terminal trials were ranked versus excluded from ranking."""
+    """How many finished trials were ranked versus excluded from ranking."""
 
     verdict: ConfoundVerdict = Field(
         description=(
@@ -367,9 +365,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
                 PhaseStatusSnapshot(
                     phase=phase.name,
                     trials=dict(zero_counts),
-                    running=0,
                     n_trials=phase.n_trials,
-                    completed=0,
                     generation_trials={},
                     winner_present=False,
                     trial_data_available=False,
@@ -386,19 +382,28 @@ def capture_result_snapshot(
     experiment: Experiment,
     *,
     generation_id: str | None = None,
+    trial_generation_id: str | None = None,
+    generation_claimed: bool = True,
     engine_winners: Mapping[str, Winner] | None = None,
 ) -> dict[str, Any]:
     """Capture path-free status and winners for the requested generation.
 
     A pinned generation retains its own partial winners even if unpublished. One tolerant
     status read supplies all counts and RUNNING identities; unreadable phases retain
-    ``trial_data_available: false``. Engine-supplied winners are authoritative; otherwise
-    read the generation's validated winner bytes and recorded phase plan.
+    ``trial_data_available: false``. Engine-supplied winners are authoritative, and each
+    phase's ``winner_present`` says whether they hold its winner; otherwise read the
+    generation's validated winner bytes and recorded phase plan.
 
     An absent post-commit lifecycle record is tolerated; mismatches are logged.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
-    :param str | None generation_id: Engine generation known to own the experiment lock.
+    :param str | None generation_id: Generation to represent: the engine generation that
+        owns the experiment lock, or the published generation a replay matched.
+    :param str | None trial_generation_id: Generation whose trials ``generation_trials``
+        counts when it differs from ``generation_id``; only with ``engine_winners``.
+    :param bool generation_claimed: ``False`` when ``generation_id`` is the id of an
+        invocation that never claimed its generation; that id names no files, so the
+        snapshot represents no generation while still counting its trials.
     :param Mapping[str, Winner] | None engine_winners: The engine's own
         winner mapping from its terminal report, when the run succeeded.
     :return dict[str, Any]: JSON-serializable terminal result snapshot.
@@ -414,13 +419,20 @@ def capture_result_snapshot(
                 generation_id,
             )
     if engine_winners is not None:
-        status = read_status(experiment, generation_id=generation_id)
+        status = read_status(
+            experiment, generation_id=generation_id, trial_generation_id=trial_generation_id
+        )
+        # The engine's winners count even where the generation holds no winner file.
+        for phase in status["phases"]:
+            phase["winner_present"] = phase["phase"] in engine_winners
         winner_snapshots = [
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
     else:
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
+    if not generation_claimed:
+        status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(
         status=StatusSnapshot.model_validate(
             {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
@@ -523,8 +535,8 @@ def finalize_result_snapshot(
         phase.trials["RUNNING"] = running - len(recovered)
         for attempt, _generation_id in recovered:
             phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
-        phase.running = phase.trials["RUNNING"]
-        # Generation counts belong to represented_generation_id.
+        # Generation counts belong to represented_generation_id: a run that launched a
+        # trial, and so can leave one RUNNING, represents its own generation.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt

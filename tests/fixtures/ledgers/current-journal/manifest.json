@@ -1,6 +1,6 @@
 {
   "backend": "journal",
-  "binding_schema_version": 7,
+  "binding_schema_version": 9,
   "derivation": "",
   "derived_from": null,
   "expect": {
@@ -22,7 +22,7 @@
   "produced_by": {
     "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.8-52-gd2b0cea-dirty",
+    "phasesweep_git": "v0.3.9-145-geb489b8-dirty",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }

@@ -129,9 +129,6 @@ def test_run_supervised_preserves_identity_and_records_terminal_lifecycle(
     Retained identity proves cleanup after an orchestrator death between process
     exit and Optuna's terminal commit, including clean trainer exits.
     """
-    if not Path("/proc/self/stat").exists():
-        pytest.skip("Linux-only test")
-
     trial_dir = tmp_path / "trial"
     result = _run_supervised(
         trial_dir,
@@ -438,7 +435,7 @@ def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A missing identity after Popen cannot retain the pre-launch marker."""
+    """With no process identity and unconfirmed cleanup, the ``launching`` marker stays for recovery."""
     import phasesweep.runtime.process as process
 
     real_abort_launch = process._abort_launch
@@ -554,7 +551,7 @@ with open(os.devnull, "w") as output:
             parent.kill()
             parent.wait(timeout=5)
         if supervisor_pid is not None and is_pid_alive(supervisor_pid):
-            with __import__("contextlib").suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(supervisor_pid, signal.SIGKILL)
 
 
@@ -609,7 +606,7 @@ with open(os.devnull, "w") as output:
             parent.kill()
             parent.wait(timeout=5)
         if identity is not None and is_pid_alive(identity.pid):
-            with __import__("contextlib").suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(identity.pgid, signal.SIGKILL)
 
 
@@ -636,7 +633,7 @@ def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
 @pytest.mark.parametrize(
     ("poison_file", "marker_name", "attempt_id"),
     [
-        # Running the supervisor with ``-m phasesweep.runtime.supervisor`` under the FULL trainer environment, including any ``PYTHONPATH`` composed from ``experiment.env``, would execute a shadowed ``phasesweep`` package at import time, before ``process_identity.json`` exists. The supervisor is launched as a stdlib-only script directly under a sanitized ``{"PATH": ...}`` environment instead.
+        # The supervisor runs as a stdlib script under a PATH-only env: ``-m`` under the trainer env would import a shadowed ``phasesweep`` before ``process_identity.json`` exists.
         pytest.param(
             "phasesweep/__init__.py",
             "poison-marker",
@@ -1008,9 +1005,6 @@ def test_unexpected_status_read_failure_preserves_cleanup_evidence(
 
 def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
     """The exec'd trainer receives unblocked shutdown signals despite launch-time deferral."""
-    if not Path("/proc/self/status").exists():
-        pytest.skip("Linux-only test")
-
     trial_dir = tmp_path / "trial"
     status_out = tmp_path / "status.txt"
     cmd = f"cp /proc/self/status {status_out}"
@@ -1064,7 +1058,7 @@ def test_supervised_deadline_uses_remaining_budget(
 
     real_write_identity = _process._write_process_identity
 
-    def slow_write_identity(path, identity):  # noqa: ANN001, ANN202
+    def slow_write_identity(path, identity):
         real_write_identity(path, identity)
         time.sleep(identity_delay)
 
@@ -1476,7 +1470,7 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     """Host-global hidepid failures do not poison an unrelated trainer group."""
     real_iterdir = Path.iterdir
 
-    def fake_iterdir(path: Path):  # noqa: ANN202
+    def fake_iterdir(path: Path):
         if path == Path("/proc"):
             return iter((Path("/proc/11"), Path("/proc/22")))
         return real_iterdir(path)
@@ -1511,7 +1505,7 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
 
     real_open = builtins.open
 
-    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):  # noqa: ANN202
+    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):
         if path == "/proc/11/stat":
             return io.BytesIO(b"11 (trainer) Z 1 1234 0")
         if path == "/proc/22/stat":
@@ -1924,7 +1918,7 @@ def test_uncertain_cleanup_cancels_queued_host_gpu_lease_wait(tmp_path: Path) ->
         os.environ["PHASESWEEP_LOCK_DIR"] = str(lock_dir)
         held_fds = []
         phase_module.GpuPool = SimpleNamespace(
-            create=lambda **kwargs: GpuPool([GpuDevice("0", "GPU-test")])
+            for_phase=lambda phase, **kwargs: GpuPool([GpuDevice("0", "GPU-test")])
         )
 
         def fake_launch_trial(**kwargs):
@@ -1966,6 +1960,7 @@ def test_uncertain_cleanup_cancels_queued_host_gpu_lease_wait(tmp_path: Path) ->
 
     result = subprocess.run(
         [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],  # The script imports the tests package.
         text=True,
         capture_output=True,
         timeout=10,

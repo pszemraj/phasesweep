@@ -34,7 +34,7 @@ def _construct_mapping_strict(
     :param yaml.MappingNode node: Mapping node to construct.
     :param bool deep: Whether to construct nested objects deeply.
     :raises yaml.constructor.ConstructorError: A key is unhashable or duplicated.
-    :return: Constructed mapping.
+    :return dict: Constructed mapping.
     """
     literal_keys: dict[Any, None] = {}
     merge_key_seen = False
@@ -101,6 +101,17 @@ def _construct_str_strict(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str
 _StrictMappingLoader.add_constructor("tag:yaml.org,2002:str", _construct_str_strict)
 
 
+def load_yaml_document(text: str) -> object:
+    """Parse one safe YAML document with unique keys and UTF-8-compatible strings.
+
+    :param str text: YAML document to parse.
+    :raises yaml.YAMLError: Invalid YAML, duplicate keys, or non-UTF-8 strings.
+    :return object: Parsed YAML value.
+    """
+    value: object = yaml.load(text, Loader=_StrictMappingLoader)
+    return value
+
+
 def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any]:
     """Load YAML text as a strict mapping.
 
@@ -110,9 +121,19 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     :return dict[str, Any]: Parsed top-level YAML mapping.
     """
     try:
-        data = yaml.load(text, Loader=_StrictMappingLoader)  # noqa: S506 — strict SafeLoader subclass
+        data = load_yaml_document(text)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{source}: {exc}") from exc
+        if isinstance(exc, yaml.MarkedYAMLError):
+            for mark in (exc.context_mark, exc.problem_mark):
+                if mark is not None:
+                    mark.name = str(source)
+        hint = (
+            " Quote text values containing ': ' with single or double quotes."
+            if isinstance(exc, yaml.MarkedYAMLError)
+            and exc.problem == "mapping values are not allowed here"
+            else ""
+        )
+        raise ConfigError(f"{source}: {exc}{hint}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: top level must be a mapping.")
     return data

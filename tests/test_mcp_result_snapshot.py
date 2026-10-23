@@ -56,11 +56,6 @@ from tests.conftest import (
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import SEEDED_RANDOM, write_slow_mcp_config
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="the detached runner relies on POSIX process groups + /proc liveness",
-)
-
 
 def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
     """Render a validated frozen snapshot through the result boundary."""
@@ -222,11 +217,11 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
 
     captured_phase = captured["status"]["phases"][0]  # type: ignore[index]
     assert captured_phase["n_trials"] == 1
-    assert captured_phase["completed"] == 1
+    assert captured_phase["trials"] == {"COMPLETE": 1}
     assert captured_phase["generation_trials"] == {"COMPLETE": 1}
     current_phase = mcp_runner.capture_result_snapshot(top_up)["status"]["phases"][0]
     assert current_phase["n_trials"] == 2
-    assert current_phase["completed"] == 2
+    assert current_phase["trials"] == {"COMPLETE": 2}
     assert current_phase["generation_trials"] == {"COMPLETE": 1}
 
 
@@ -351,10 +346,11 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     monkeypatch: pytest.MonkeyPatch,
     storage_kind: str,
 ) -> None:
-    """Unavailable trial storage freezes explicit flags without a redundant study read.
+    """A storage-less experiment freezes explicit flags without a redundant study read.
 
     ``running_attempts`` is ``None`` rather than ``[]`` here: nothing was read,
-    so an empty list would claim there are no RUNNING rows.
+    so an empty list would claim there are no RUNNING rows. A corrupt journal
+    raises instead of freezing.
     """
     storage = None
     if storage_kind == "corrupt-journal":
@@ -557,7 +553,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is True
     assert phase["running_attempts"] == []
-    assert phase["completed"] == 1
+    assert phase["trials"] == {"COMPLETE": 1}
     (frozen,) = snapshot["winners"]
     assert frozen["phase"] == "p"
     assert frozen["metric"] == report.winners["p"].metric
@@ -601,9 +597,9 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         TRIAL_OUTCOME_ATTR,
         trial_outcome(1, "failure"),
     )
-    # A RUNNING row written before attempt identity existed: reported with
-    # null identity, never dropped, so the counts and the list agree. It
-    # recorded nothing, so recovery records it as interrupted.
+    # A RUNNING row with no attempt identity: reported with null identity, never
+    # dropped, so the counts and the list agree. It recorded nothing, so recovery
+    # records it as interrupted.
     study.ask()
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -691,7 +687,8 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     )
 
     # No winner file exists anywhere on disk; the frozen winner is exactly
-    # the engine's own in-memory outcome.
+    # the engine's own in-memory outcome, and the status agrees it is present.
+    assert [phase["winner_present"] for phase in snapshot["status"]["phases"]] == [True]
     (frozen,) = snapshot["winners"]
     assert frozen["phase"] == "p"
     assert frozen["trial_number"] == 4
@@ -781,13 +778,10 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     tmp_path: Path,
     from_phase: str | None,
 ) -> None:
-    """A failed preflight advances the current pointer but never the published one.
+    """A refused resume writes no generation and leaves every pointer and projection alone.
 
-    The current-generation pointer legitimately moves to this new (failed)
-    invocation -- a new invocation always overwrites it starting from
-    "preflighting", and every outcome path must drive it to a terminal state
-    -- but the convenience root projections and, critically, the last-success
-    pointer stay exactly as the prior successful publication left them.
+    Its terminal snapshot represents the refused run's own id, which names no
+    generation, and reports the prior publication unchanged.
     """
     phases = [
         Phase(
@@ -802,10 +796,9 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     first_generation = published_generation_id(experiment)
     assert first_generation is not None
 
-    # The convenience root projections must stay untouched by a failed resume;
-    # the current-generation pointer is deliberately excluded here since it
-    # legitimately advances even on a preflight failure (see docstring).
     protected_paths = [
+        _generation_path(experiment),
+        _last_successful_generation_path(experiment),
         _summary_path(experiment),
         *(_winner_path(experiment, phase.name) for phase in phases),
     ]
@@ -839,33 +832,17 @@ def test_failed_fingerprint_preflight_preserves_published_results(
             terminal_callback=capture_failed_resume,
         )
 
-    assert len(callback_generations) == 1
-    assert len(captured) == 1
-    # current_generation_id is always the actual mutable pointer, which this
-    # failed preflight attempt does legitimately claim (a new invocation
-    # overwrites it with "preflighting" before it knows whether preflight
-    # will succeed). published_generation_id is always the actual validated
-    # last-success pointer -- the *first* (successful) run here -- never
-    # forced to equal the pinned generation_id, even though this pinned
-    # capture's own represented_generation_id is that failed generation.
-    assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
-    assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
-    assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]
-    assert captured[0]["status"]["is_published"] is False  # type: ignore[index]
-    assert captured[0]["status"]["summary_present"] is False  # type: ignore[index]
-    assert all(
-        phase["generation_trials"] == {}
-        for phase in captured[0]["status"]["phases"]  # type: ignore[index]
-    )
-    assert captured[0]["winners"] == []
-    # Convenience root projections are untouched, and the published pointer
-    # still resolves to the prior successful generation.
+    [refused_generation] = callback_generations
+    [snapshot] = captured
+    status = snapshot["status"]
+    assert isinstance(status, dict)
+    assert status["current_generation_id"] == first_generation
+    assert status["published_generation_id"] == first_generation
+    assert status["represented_generation_id"] == refused_generation
+    assert status["is_published"] is False
+    assert status["summary_present"] is False
+    assert all(phase["generation_trials"] == {} for phase in status["phases"])
+    assert snapshot["winners"] == []
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert published_generation_id(experiment) == first_generation
-    failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
-    assert len(failed_generations) == 1
-    assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
-    # The current pointer legitimately advanced to this failed attempt.
-    current_pointer = yaml.safe_load(_generation_path(experiment).read_text())
-    assert current_pointer["generation_id"] == callback_generations[0]
-    assert current_pointer["state"] == "failed"
+    assert set(_generations_dir(experiment).iterdir()) == generations_before

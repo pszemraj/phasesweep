@@ -38,6 +38,25 @@ from tests.conftest import (
 
 
 @pytest.mark.integration
+def test_cli_imports_without_sighup_so_the_platform_gate_names_the_host() -> None:
+    """A host without SIGHUP, such as Windows, gets the Linux refusal, not an import error."""
+    code = (
+        "import signal, sys\n"
+        "del signal.SIGHUP\n"
+        "from phasesweep.cli import cli\n"
+        "from phasesweep.runtime.files import require_linux_runtime\n"
+        "sys.platform = 'win32'\n"
+        "require_linux_runtime()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code], text=True, capture_output=True, timeout=60.0, check=False
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "PlatformCapabilityError" in proc.stderr
+    assert "phasesweep runs only on Linux, and this host reports 'win32'" in proc.stderr
+
+
+@pytest.mark.integration
 def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
     tmp_path: Path,
 ) -> None:
@@ -92,9 +111,6 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
     handlers unrestored. The required order is: block, then restore handlers,
     then restore the mask.
     """
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
     received: list[int] = []
 
     def host_handler(signum: int, _frame: object) -> None:
@@ -111,11 +127,9 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
         signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
         assert received == [], "signal fired before scope exit"
 
-    # Scope exit order: block -> restore handlers -> restore mask. The pending
-    # SIGTERM is delivered on the final unblock, by which point the HOST handler
-    # (not phasesweep's) is installed. CPython only invokes the Python-level handler
-    # at the next eval-breaker check, not necessarily synchronously with the
-    # unblocking call, so poll briefly instead of asserting immediately.
+    # CPython only invokes the Python-level handler at the next eval-breaker check,
+    # not necessarily synchronously with the unblocking call, so poll briefly
+    # instead of asserting immediately.
     deadline = time.monotonic() + 2.0
     while not received and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -380,9 +394,6 @@ def test_dry_run_does_not_enter_signal_handler_scope(
 def test_defer_shutdown_signals_blocks_and_restores() -> None:
     """The context manager must add SIGTERM/SIGINT to the thread mask on entry
     and restore the original mask on exit."""
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
     before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     try:
         with defer_shutdown_signals():
@@ -407,9 +418,6 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
             "    os.kill(os.getpid(), signal.SIGTERM)\n",
             "queued",
             id="inherited-shutdown-mask",
-            marks=pytest.mark.skipif(
-                not hasattr(signal, "pthread_sigmask"), reason="pthread_sigmask not available"
-            ),
         ),
         pytest.param(
             "install_signal_handlers()\n"

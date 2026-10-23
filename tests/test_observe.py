@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import optuna
@@ -13,14 +14,18 @@ from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import Observation
+from phasesweep.config.models import Observation, Phase
+from phasesweep.config.search import Repeats, Sampler
+from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import _winner_view, read_result
+from phasesweep.engine.repeats import repeat_axis
+from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import observed_attr
 from phasesweep.evidence.models import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import make_experiment, phase_trials, write_experiment_config, write_trainer
 from tests.ledger_fixtures import golden_publication, reseal_winner
 
 
@@ -111,7 +116,7 @@ def test_validate_and_dry_run_name_each_observation(
         ],
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     expected = [
         "observe heldout_f05: json result.json key heldout_f05 (report-only)",
         "observe mem: log_regex stdout.log pattern 'mem=(?P<value>[0-9.]+)' select last "
@@ -202,3 +207,46 @@ def test_manifest_accepts_a_well_formed_observed_block(tmp_path: Path) -> None:
     _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None
     assert view.observed == {"peak": 7.5, "steps": 3.0}
+
+
+@pytest.mark.parametrize(
+    ("phase_shape", "subject"),
+    [
+        pytest.param({"n_trials": 1}, "Winning trial 0", id="single-trial"),
+        pytest.param(
+            {
+                "phases": [
+                    Phase(
+                        name="p",
+                        n_trials=3,
+                        sampler=Sampler(type="grid"),
+                        repeats=Repeats(key="seed", values=[0, 1, 2]),
+                    )
+                ]
+            },
+            "Trial 0 of the winning repeat group",
+            id="repeat-group-member",
+        ),
+    ],
+)
+def test_malformed_observed_value_names_the_trial_it_came_from(
+    tmp_path: Path, phase_shape: dict[str, object], subject: str
+) -> None:
+    """A repeat member's bad value is not reported as the winning trial's."""
+    trainer = write_trainer(tmp_path / "t.py", 'print("x=0.5")\nprint("mem=3.0")')
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        observe=[_log_observation("mem", r"mem=(?P<value>[0-9.]+)")],
+        **phase_shape,
+    )
+    run_experiment(experiment)
+    trials = [deepcopy(trial) for trial in phase_trials(experiment)]
+    trials[0].user_attrs[observed_attr("mem")] = "3.0"
+    study = optuna.create_study(direction="minimize")
+    study.add_trials(trials)
+
+    with pytest.raises(TrialEvidenceMissingError) as raised:
+        select_winner(study, experiment, phase_name="p", repeats=repeat_axis(experiment.phases[0]))
+
+    assert str(raised.value).startswith(f"{subject} has a malformed 'observed:' value")

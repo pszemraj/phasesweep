@@ -18,12 +18,10 @@ from phasesweep import run_experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
-    _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.read import read_trial_tables
@@ -50,8 +48,9 @@ from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
-    _phase_trials,
     make_experiment,
+    phase_study,
+    phase_trials,
     trial_outcome,
     write_param_echo_trainer,
     write_trainer,
@@ -242,7 +241,6 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
     trials = study.get_trials(deepcopy=False)
 
     assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
-    assert [_trial_state_label(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
     assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
@@ -293,8 +291,8 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     lines = [record.getMessage() for record in caplog.records]
     expected = run_experiment(control)["p"]
 
-    trials = _phase_trials(exp)
-    controls = _phase_trials(control)
+    trials = phase_trials(exp)
+    controls = phase_trials(control)
     assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
     assert _trial_interrupted(trials[0])
     assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
@@ -361,21 +359,21 @@ def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_fa
     expected = (
         (RuntimeError, "stopped after 0/1")
         if serviced
-        else (NoFeasibleTrialError, "aborted after 1 consecutive failures")
+        else (NoFeasibleTrialError, "1 consecutive failed/infeasible trials")
     )
     with pytest.raises(expected[0], match=expected[1]):
         run_experiment(exp)
 
-    (trial,) = _phase_trials(exp)
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+    (trial,) = phase_trials(exp)
+    study = phase_study(exp)
     assert launched.exists()
     if serviced:
-        assert _trial_state_label(trial) == "INTERRUPTED"
+        assert _trial_count_state(trial) == "INTERRUPTED"
         assert _cause(trial) == _SIGINT_CAUSE
         assert _load_phase_policy_state(study).consecutive_failures == 0
         assert _record_reruns(study) == [(0, 1)]
     else:
-        assert _trial_state_label(trial) == "FAIL"
+        assert _trial_count_state(trial) == "FAIL"
         assert _load_phase_policy_state(study).consecutive_failures == 1
         assert _record_reruns(study) == []
 
@@ -406,9 +404,9 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
     with pytest.raises(RuntimeError, match="stopped after 0/1"):
         run_experiment(exp)
 
-    (trial,) = _phase_trials(exp)
+    (trial,) = phase_trials(exp)
     assert not launched.exists()
-    assert _trial_state_label(trial) == "INTERRUPTED"
+    assert _trial_count_state(trial) == "INTERRUPTED"
     assert _cause(trial) == _SIGINT_CAUSE
 
 
@@ -468,8 +466,8 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
         run_experiment(exp)
     sender.join(timeout=5.0)
 
-    trials = _phase_trials(exp)
-    assert [_trial_state_label(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
+    trials = phase_trials(exp)
+    assert [_trial_count_state(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
     assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
     assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)
 

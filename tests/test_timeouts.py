@@ -27,8 +27,10 @@ from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime.process import ProcessResult
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    bounded_metric,
     make_experiment,
     make_trial_context,
+    phase_study,
     write_constant_trainer,
     write_trainer,
     write_trial_zero_trainer,
@@ -82,7 +84,18 @@ def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
     )
 
 
-@pytest.mark.integration
+def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_path: Path) -> None:
+    """A phase timeout of 0 leaves no time to launch, and the refusal does not blame the run."""
+    exp = _sleeping_score_experiment(
+        tmp_path, experiment="phase_zero_timeout", timeout_seconds_per_phase=0.0
+    )
+
+    with pytest.raises(TimeoutError, match="sets timeout_seconds_per_phase to 0") as refused:
+        run_experiment(exp)
+
+    assert "Run wallclock deadline" not in str(refused.value)
+
+
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -90,7 +103,7 @@ def test_runtime_rejects_unexplained_trial_budget_shortfall(
     exp = _sleeping_score_experiment(tmp_path, experiment="budget_shortfall", n_trials=1)
     monkeypatch.setattr(optuna.Study, "optimize", lambda self, objective, **kwargs: None)
 
-    with pytest.raises(RuntimeError, match="stopped after 0/1 terminal trials") as exc_info:
+    with pytest.raises(RuntimeError, match="stopped after 0/1 finished trials") as exc_info:
         run_experiment(exp)
     assert not isinstance(exc_info.value, PhaseSweepError)
 
@@ -206,7 +219,7 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     assert run_experiment(exp)["p"].completion["incomplete"] is True
 
     def load() -> optuna.Study:
-        return optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+        return phase_study(exp)
 
     trials_before = len(load().trials)
     decision_before = load().user_attrs[PHASE_DECISION_ATTR]
@@ -240,7 +253,7 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     )
 
     if not allow_incomplete_on_timeout:
-        with pytest.raises(TimeoutError, match=r"after 1/2 completed evaluations \(1 terminal"):
+        with pytest.raises(TimeoutError, match=r"after 1/2 finished trials \(1 completed\)\."):
             run_experiment(exp)
         return
     completion = run_experiment(exp)["p"].completion
@@ -248,6 +261,26 @@ def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     assert completion["completed_trials"] == 1
     assert completion["finished_trials"] == 1
     assert completion["incomplete"] is True
+
+
+@pytest.mark.integration
+def test_timeout_message_counts_an_out_of_bounds_trial_as_finished_not_completed(
+    tmp_path: Path,
+) -> None:
+    """The finished trial read x=1.0 above metric.max, so `status` lists it INFEASIBLE, not completed."""
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
+    exp = make_experiment(
+        experiment="phase_timeout_infeasible",
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        metric=bounded_metric(max=0.5),
+        n_trials=2,
+        timeout_seconds_per_phase=8.0,
+        sampler=Sampler(type="random", seed=0),
+    )
+
+    with pytest.raises(TimeoutError, match=r"after 1/2 finished trials \(0 completed\)\."):
+        run_experiment(exp)
 
 
 @pytest.mark.integration
@@ -368,7 +401,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     monkeypatch.setattr(phase_mod, "launch_trial", launch_and_burn_the_budget)
 
     if not clock_elapses:
-        with pytest.raises(NoFeasibleTrialError, match="aborted after 1 consecutive failures"):
+        with pytest.raises(NoFeasibleTrialError, match="1 consecutive failed/infeasible trials"):
             run_experiment(exp)
         return
 
@@ -553,10 +586,10 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
-    # The operator's documented remedy is now viable: with a fresh/larger
-    # budget, the remaining attempt can run instead of the stale failure abort
-    # rejecting the invocation during phase startup.
+    # With a fresh, larger budget the remaining attempt runs; no failure abort
+    # is recorded to block it at phase startup.
     offset["seconds"] = 0.0
+    # Overwrites the failing trainer at the same path the experiment already names.
     write_constant_trainer(tmp_path)
     monkeypatch.setattr(phase_mod, "launch_trial", real_launch_trial)
     winners = run_experiment(exp)
@@ -848,7 +881,6 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
         run_experiment(experiment)
 
 
-@pytest.mark.integration
 def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -883,8 +915,8 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     """A quick trainer with slow extraction times out and publishes nothing.
 
     The trainer finishes inside the 0.5s budget but extraction takes 3s. The
-    run must report a timeout rather than publish ``incomplete: false`` more
-    than 2x past both limits.
+    run must report a timeout rather than publish a complete winner, and must
+    return within 20s of starting.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(

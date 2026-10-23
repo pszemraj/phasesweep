@@ -6,17 +6,17 @@ from phasesweep.config.models import Observation, Phase
 from phasesweep.config.search import Repeats, Sampler
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.evidence.models import LogRegexExtractor
-from tests.conftest import _bounded_metric, make_experiment
+from tests.conftest import bounded_metric, make_experiment
 
 
 def test_metric_bounds_are_semantic() -> None:
     """Selection reads the bounds, so moving or adding one changes both fingerprints."""
     variants = {
-        "unbounded": make_experiment(metric=_bounded_metric()),
-        "max": make_experiment(metric=_bounded_metric(max=2.0)),
-        "max_moved": make_experiment(metric=_bounded_metric(max=3.0)),
-        "min": make_experiment(metric=_bounded_metric(min=0.5)),
-        "both": make_experiment(metric=_bounded_metric(min=0.5, max=2.0)),
+        "unbounded": make_experiment(metric=bounded_metric()),
+        "max": make_experiment(metric=bounded_metric(max=2.0)),
+        "max_moved": make_experiment(metric=bounded_metric(max=3.0)),
+        "min": make_experiment(metric=bounded_metric(min=0.5)),
+        "both": make_experiment(metric=bounded_metric(min=0.5, max=2.0)),
     }
 
     phase_fps = {n: _phase_fingerprint(e, e.phases[0], {}) for n, e in variants.items()}

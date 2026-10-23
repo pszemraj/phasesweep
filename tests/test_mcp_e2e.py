@@ -53,13 +53,7 @@ from tests.mcp_helpers import (
 MONITOR_DEADLINE_SECONDS = 300.0
 DISPATCH_DEADLINE_SECONDS = 30.0
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not sys.platform.startswith("linux"),
-        reason="detached runner + cancel rely on POSIX process groups + /proc liveness",
-    ),
-]
+pytestmark = pytest.mark.integration
 
 
 def _chained_config(tmp_path: Path) -> str:
@@ -162,10 +156,10 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         # fixed/effective values stay out of MCP tool output.
         assert set(phases[1]["params"]) == {"lr"}
         for phase_status in awaited["phases"]:
-            target = phase_status["target_terminal_trials"]
-            assert phase_status["attempts_launched_this_run"] == target
-            assert phase_status["terminal_trials_this_run"] == target
-            assert phase_status["terminal_trials_before_run"] == 0
+            target = phase_status["target_finished_trials"]
+            assert phase_status["attempts_this_run"] == target
+            assert phase_status["finished_trials_this_run"] == target
+            assert phase_status["finished_trials_before_run"] == 0
             assert phase_status["target_already_satisfied"] is False
     finally:
         cancel_mcp_run_quietly(app, run_id)
@@ -280,8 +274,6 @@ def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
 
 def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
-    import asyncio
-
     from phasesweep.mcp.server import build_server
 
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
@@ -436,8 +428,6 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
 def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:
     """Only the user authorizes a launch; result payloads do not suggest transitions."""
     pytest.importorskip("mcp")
-    import asyncio
-
     from phasesweep.mcp.server import build_server
 
     catalog = write_mcp_config_catalog(
@@ -476,6 +466,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
         "published_generation_id": None,
         "represented_generation_id": "r1",
         "is_published": False,
+        "run_wrote_generation": True,
         "publication_integrity": "absent",
         "result_context": "current_config",
         "published_config_matches_current": True,
@@ -611,6 +602,7 @@ def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Pa
     assert [entry["path"] for entry in found.structuredContent["entries"]] == [
         "phases[].sampler.type"
     ]
+    assert [group["name"] for group in found.structuredContent["rules"]] == ["Phases"]
     assert str(tmp_path) not in json.dumps(found.structuredContent)
 
     top_level = call_mcp_tool(app, TOOL_EXPLAIN_CONFIG, {})

@@ -206,8 +206,6 @@ def recover_run(
                 terminal_status["result_snapshot_state"] = "pending"
                 try:
                     write_status_file(store.status_path(run_id), terminal_status)
-                # The write is filesystem work an operator can fix; anything
-                # else is a defect and keeps its traceback.
                 except (PhaseSweepError, OSError) as exc:
                     raise RunRecoveryError.rewrap(
                         exc,
@@ -673,6 +671,8 @@ def _recover_trial_evidence(
         registered_attempts = _preflight_active_attempts(
             config, active_report, confirm=confirm, retain_recovery_evidence=True
         )
+        evidence.reaped += active_report.reaped_running_trials
+        evidence.cleanup_recovered += active_report.cleanup_recovered_trials
         if confirm:
             registered_evidence = active_report.recovered_attempt_generations
             # An entry without its receipt stays registered: it is still the
@@ -961,7 +961,7 @@ def _finalize_stored_terminal_result_snapshot(
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
-    except Exception as exc:  # noqa: BLE001 - restore the prior view, then sort below
+    except Exception as exc:
         # Whatever failed, the prior frozen view is put back before it propagates.
         terminal_status["result_snapshot"] = raw_snapshot
         terminal_status["result_snapshot_state"] = prior_state

@@ -34,6 +34,7 @@ from phasesweep.evidence.models import (
     _WandbSummarySource,
 )
 from phasesweep.evidence.wandb import (
+    WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunTerminalError,
     WandbSetupError,
@@ -184,6 +185,8 @@ class TrialContext:
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
+    # Holds at most one failed capture.
+    wandb_capture_failure: list[ExtractorError] = field(default_factory=list, compare=False)
     mlflow_settings: MlflowTarget | None = None
     mlflow_query: MlflowQuery | None = None
     mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
@@ -197,9 +200,9 @@ def _extract_json(
 ) -> float:
     """Read a trial-relative JSON file and extract its numeric value.
 
-    :param TrialContext ctx: Trial output directory.
+    :param TrialContext ctx: Trial identity; the file is read from its ``trial_dir``.
     :param JsonExtractor cfg: Relative file path and dotted numeric key.
-    :param provenance: Optional source-evidence sink.
+    :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The file or key is missing, JSON is invalid, or the value is nonnumeric.
     :return float: Configured numeric value.
     """
@@ -338,9 +341,9 @@ def _extract_log_regex(
     First selection stops matching after its first hit but continues reading for
     the digest. Provenance includes the selected 1-based line and numeric match count.
 
-    :param TrialContext ctx: Trial output directory.
+    :param TrialContext ctx: Trial identity; the log is read from its ``trial_dir``.
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
-    :param provenance: Optional source-evidence sink.
+    :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, unreadable, has no numeric match,
         or a line eligible for matching is invalid UTF-8.
     :return float: Selected match value.
@@ -417,18 +420,21 @@ def _extract_log_regex(
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Obtain and cache one accepted W&B capture for the attempt's consumers.
+    """Share one W&B capture or capture failure between the attempt's consumers.
 
     :param TrialContext ctx: Trial identity and optional shared query/capture.
     :param _WandbSummarySource cfg: Source for a one-off query if needed.
     :param float | None deadline: Absolute monotonic deadline, also bounded by the source timeout.
     :raises DeadlineExceededError: The execution deadline prevents capture.
-    :raises ExtractorError: Polling, authentication, SDK setup, run state, or evidence is invalid.
+    :raises ExtractorError: Polling, authentication, SDK setup, or run state fails, the
+        finished summary lacks required keys, or evidence is invalid.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
-    :return: Finished run identity, numeric values, present keys, and retrieval time.
+    :return dict: Finished run identity, numeric values, present keys, and retrieval time.
     """
     if ctx.wandb_capture:
         return ctx.wandb_capture
+    if ctx.wandb_capture_failure:
+        raise ctx.wandb_capture_failure[0]
     query = ctx.wandb_query or WandbQuery(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
@@ -441,46 +447,58 @@ def _capture_wandb(
         poll_deadline = min(poll_deadline, deadline)
     target = f"{source.base_url}/{source.entity}/{source.project}/{ctx.attempt_id}"
     try:
-        capture = poll_wandb_summary(
-            base_url=source.base_url,
-            entity=source.entity,
-            project=source.project,
-            run_id=ctx.attempt_id,
-            trial_dir=ctx.trial_dir,
-            poll_seconds=source.poll_seconds,
-            timeout_seconds=source.timeout_seconds,
-            required_keys=query.numeric_keys,
-            presence_keys=query.presence_keys,
-            environment=ctx.wandb_environment,
-            deadline=poll_deadline,
-        )
-    except WandbPollTimeout as exc:
-        error = (
-            DeadlineExceededError
-            if capped and time.monotonic() >= poll_deadline
-            else ExtractorError
-        )
-        raise error(
-            f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
-        ) from exc
-    except WandbSetupError as exc:
-        raise ExtractorError(
-            f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
-        ) from exc
-    except WandbRunTerminalError as exc:
-        raise ExtractorError(
-            f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
-        ) from exc
-    except ImportError as exc:
-        raise ExtractorError(
-            "W&B evidence requires the optional SDK; install phasesweep[wandb]."
-        ) from exc
-    except ValueError as exc:
-        raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
-    except UnsafeProcessCleanupError:
+        try:
+            capture = poll_wandb_summary(
+                base_url=source.base_url,
+                entity=source.entity,
+                project=source.project,
+                run_id=ctx.attempt_id,
+                trial_dir=ctx.trial_dir,
+                poll_seconds=source.poll_seconds,
+                timeout_seconds=source.timeout_seconds,
+                required_keys=query.numeric_keys,
+                presence_keys=query.presence_keys,
+                environment=ctx.wandb_environment,
+                deadline=poll_deadline,
+            )
+        except WandbPollTimeout as exc:
+            error = (
+                DeadlineExceededError
+                if capped and time.monotonic() >= poll_deadline
+                else ExtractorError
+            )
+            raise error(
+                f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
+                + (f" Last observation: {exc.last_error}" if exc.last_error else "")
+            ) from exc
+        except WandbSetupError as exc:
+            raise ExtractorError(
+                f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
+            ) from exc
+        except WandbRunTerminalError as exc:
+            raise ExtractorError(
+                f"W&B run {target} ended in {exc.state!r}; only finished runs can provide evidence."
+            ) from exc
+        except WandbMissingKeysError as exc:
+            raise ExtractorError(
+                f"W&B run {target} finished without required summary key(s) {exc.missing!r}; "
+                f"available summary keys: {exc.available!r}."
+            ) from exc
+        except ImportError as exc:
+            raise ExtractorError(
+                "W&B evidence requires the optional SDK; install phasesweep[wandb]."
+            ) from exc
+        except ValueError as exc:
+            raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
+        except (ExtractorError, UnsafeProcessCleanupError):
+            raise
+        except RuntimeError as exc:
+            raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
+    except DeadlineExceededError:
         raise
-    except RuntimeError as exc:
-        raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
+    except ExtractorError as exc:
+        ctx.wandb_capture_failure.append(exc)
+        raise
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
@@ -511,7 +529,7 @@ def _extract_wandb(
 
     :param TrialContext ctx: Attempt whose shared capture supplies the value.
     :param WandbExtractor cfg: Remote target and exact summary key.
-    :param provenance: Optional objective-evidence sink.
+    :param dict | None provenance: Optional objective-evidence sink.
     :param float | None deadline: Absolute monotonic deadline for capture.
     :raises ExtractorError: Capture fails or the selected key is not finite numeric evidence.
     :return float: Selected metric value.
@@ -543,11 +561,12 @@ def locate_objective_position(
     """Add an advisory W&B evaluation position after the objective is accepted.
 
     Failed or expired history reads leave the position unset and retain the
-    accepted objective. Other extractor kinds already record their position.
+    accepted objective. Only W&B needs this lookup: envelope and MLflow objectives
+    record their position at extraction, and json and log_regex record none.
 
     :param TrialContext ctx: Accepted attempt.
     :param ObjectiveExtractor cfg: Objective extractor.
-    :param provenance: Objective evidence updated in place.
+    :param dict provenance: Objective evidence updated in place.
     :param float | None deadline: Remaining absolute monotonic execution deadline.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
@@ -677,7 +696,7 @@ def run_extractor(
     :param TrialContext ctx: Trial identity, outputs, and shared remote captures.
     :param ObjectiveExtractor cfg: Configured extractor.
     :param float | None deadline: Absolute monotonic phase/run deadline.
-    :param provenance: Optional sink for the evidence schema,
+    :param dict | None provenance: Optional sink for the evidence schema,
         extractor kind/fingerprint, file digest or remote capture, and capture timestamp.
     :raises ExtractorError: The kind is unregistered or extraction fails.
     :return float: Extracted numeric value.
@@ -752,7 +771,7 @@ def _json_equals(ctx: TrialContext, gate: JsonEqualsGate) -> GateResult:
     """
     try:
         _, actual = load_json_value(ctx.trial_dir, gate.path, gate.key)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
     if type(actual) is type(gate.value) and actual == gate.value:
         return GateResult(gate.type, True, f"{gate.key} == {gate.value!r}")
@@ -774,7 +793,7 @@ def _json_scalar_bound(ctx: TrialContext, gate: JsonScalarBoundGate) -> GateResu
     try:
         _, raw_value = load_json_value(ctx.trial_dir, gate.path, gate.key)
         value = json_float(raw_value, label=gate.key)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
     if not math.isfinite(value):
         return GateResult(gate.type, False, f"{gate.key} was non-finite: {value!r}")
@@ -839,7 +858,7 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         assert gate.key is not None
         try:
             _, raw_size = load_json_value(ctx.trial_dir, gate.path, gate.key)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return GateResult(gate.type, False, f"{gate.path}:{gate.key} unavailable: {exc}")
         if not isinstance(raw_size, int) or isinstance(raw_size, bool):
             return GateResult(gate.type, False, f"{gate.key} was not an integer byte count")

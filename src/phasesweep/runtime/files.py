@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 import stat
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +20,15 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
-POSIX_RUNTIME_ERROR = (
-    "phasesweep execution currently requires a POSIX platform. It relies on "
-    "fcntl.flock host locks and POSIX process groups for safe subprocess cleanup; "
-    "Windows support needs a separate locking and process-tree implementation."
+LINUX_RUNTIME_ERROR = (
+    "phasesweep runs only on Linux, and this host reports {platform!r}. It relies on /proc "
+    "process identities, fcntl.flock host locks and POSIX process groups."
 )
 _LOCK_DIR_ENV = "PHASESWEEP_LOCK_DIR"
+_LOCK_ACCESS_GUIDANCE = (
+    "Use the same writable PHASESWEEP_LOCK_DIR for every shell, MCP server, and sandbox "
+    "launching work on this host; provision that directory before setting it."
+)
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SHARED_DIR_MODE = 0o3770
@@ -67,7 +71,7 @@ def file_sha256(path: Path) -> str:
 
 
 class UnsafeLockPathError(PhaseSweepError):
-    """Raised when a lock directory or file is not safe to trust."""
+    """Raised when a lock directory or file is inaccessible or unsafe to trust."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
 
@@ -94,19 +98,18 @@ class _LockPolicy:
     file_mode: int
 
 
-def require_posix_runtime() -> None:
-    """Raise a clear error when execution is attempted on an unsupported platform.
+def require_linux_runtime() -> None:
+    """Raise a clear error when execution is attempted on a non-Linux host.
 
-    :raises PlatformCapabilityError: The host is not POSIX or lacks
-        ``os.killpg``/``fcntl``, so process groups and ``flock`` are
-        unavailable.
+    This is the only platform check. Everything below it may use Linux-only
+    primitives (``fcntl``, ``os.killpg``, ``os.O_NOFOLLOW``, ``signal.pthread_sigmask``)
+    without a per-call fallback; ``fcntl`` is imported after the gate so that
+    importing this module still works elsewhere.
+
+    :raises PlatformCapabilityError: The host is not Linux.
     """
-    if os.name != "posix" or not hasattr(os, "killpg"):
-        raise PlatformCapabilityError(POSIX_RUNTIME_ERROR)
-    try:
-        import fcntl  # noqa: F401
-    except ImportError:
-        raise PlatformCapabilityError(POSIX_RUNTIME_ERROR) from None
+    if not sys.platform.startswith("linux"):
+        raise PlatformCapabilityError(LINUX_RUNTIME_ERROR.format(platform=sys.platform))
 
 
 def xdg_home(variable: str, fallback: Path) -> Path:
@@ -156,8 +159,8 @@ def lock_dir() -> Path:
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
         ownership-and-mode check; the OS account has no absolute home; or
-        the default lock directory fails the owner-only checks.
-    :raises PlatformCapabilityError: The host lacks the required POSIX runtime.
+        the default lock directory fails the owner-only checks; or the OS refuses access.
+    :raises PlatformCapabilityError: The host is not Linux.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -167,10 +170,16 @@ def lock_dir() -> Path:
                 f"{_LOCK_DIR_ENV} must be an absolute path: {path}",
                 action=OperatorAction.FIX_CONFIG,
             )
-        _lock_policy(path)
+        try:
+            _lock_policy(path)
+        except OSError as exc:
+            raise UnsafeLockPathError(
+                f"Cannot access lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                action=OperatorAction.PROVISION_LOCK_DIR,
+            ) from exc
         return path
 
-    require_posix_runtime()
+    require_linux_runtime()
     import pwd
 
     # Shells and services for one account must contend even when HOME or XDG
@@ -194,6 +203,11 @@ def lock_dir() -> Path:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
+    except OSError as exc:
+        raise UnsafeLockPathError(
+            f"Cannot create or access default lock directory {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+            action=OperatorAction.PROVISION_LOCK_DIR,
+        ) from exc
     return path
 
 
@@ -216,7 +230,8 @@ def _lock_policy(path: Path) -> _LockPolicy:
         fd = open_directory_fd(path, create=False, private_final=False)
     except FileNotFoundError as exc:
         raise UnsafeLockPathError(
-            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}."
+            f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}.",
+            action=OperatorAction.PROVISION_LOCK_DIR,
         ) from exc
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(f"Lock directory {path} has an unsafe path component.") from exc
@@ -269,15 +284,21 @@ def open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises PlatformCapabilityError: If the platform lacks ``O_NOFOLLOW``.
+    :raises PlatformCapabilityError: The host is not Linux.
     :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
         the leaf name is unsafe, or the file fails the regular-file/ownership/
-        mode checks.
+        mode checks, or the OS refuses access.
     """
     from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     with defer_shutdown_signals():
-        return _open_lock_file(path)
+        try:
+            return _open_lock_file(path)
+        except OSError as exc:
+            raise UnsafeLockPathError(
+                f"Cannot open lock file {path}: {exc}. {_LOCK_ACCESS_GUIDANCE}",
+                action=OperatorAction.PROVISION_LOCK_DIR,
+            ) from exc
 
 
 def _open_lock_file(path: Path) -> IO[str]:
@@ -289,17 +310,12 @@ def _open_lock_file(path: Path) -> IO[str]:
     :param Path path: Lock file path to open or create.
     :return IO[str]: Text-mode (``"r+"``, UTF-8) handle open on the
         validated lock file.
-    :raises PlatformCapabilityError: If the platform lacks ``O_NOFOLLOW``.
+    :raises PlatformCapabilityError: The host is not Linux.
     :raises UnsafeLockPathError: If the parent directory is missing or unsafe,
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks.
     """
-    require_posix_runtime()
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise PlatformCapabilityError(
-            "This platform cannot safely open lock files without following symlinks."
-        )
+    require_linux_runtime()
     try:
         parent_fd = open_directory_fd(path.parent, create=False, private_final=False)
     except (FileNotFoundError, UnsafePrivatePathError) as exc:
@@ -310,7 +326,7 @@ def _open_lock_file(path: Path) -> IO[str]:
             leaf = leaf_name(path)
         except UnsafePrivatePathError as exc:
             raise UnsafeLockPathError(f"Lock path {path} has no safe filename.") from exc
-        flags = os.O_RDWR | os.O_CLOEXEC | nofollow
+        flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         created = False
         try:
             fd = os.open(
@@ -376,7 +392,7 @@ def try_flock(handle: IO[str]) -> bool:
     :param IO[str] handle: File descriptor whose inode all contenders open.
     :return bool: Whether the lock was acquired; the caller owns the handle.
     """
-    require_posix_runtime()
+    require_linux_runtime()
     import fcntl
 
     try:
@@ -417,22 +433,6 @@ def fsync_directory(path: Path) -> None:
         )
     finally:
         os.close(fd)
-
-
-def nofollow_flag() -> int:
-    """Return ``O_NOFOLLOW`` or fail when safe private traversal is unavailable.
-
-    :return int: The platform's ``os.O_NOFOLLOW`` open flag.
-    :raises PlatformCapabilityError: The platform does not define
-        ``O_NOFOLLOW``, so private files cannot be opened without following
-        symlinks.
-    """
-    nofollow: int | None = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise PlatformCapabilityError(
-            "This platform cannot safely access private files without following symlinks."
-        )
-    return nofollow
 
 
 def absolute_path(path: Path) -> Path:
@@ -593,14 +593,12 @@ def _walk_directory_fd(
         was swapped while it was being opened, or the final directory fails the
         owner-only mode/ownership check.
     :raises FileNotFoundError: A component is missing and ``create`` is false.
-    :raises PlatformCapabilityError: The platform does not provide
-        ``O_NOFOLLOW``.
     """
     absolute = absolute_path(path)
     parts = absolute.parts[1:]
     if not parts:
         raise UnsafePrivatePathError("The filesystem root cannot be a private directory.")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow_flag()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for index, component in enumerate(parts):
@@ -736,7 +734,7 @@ def read_private_text_at(parent_fd: int, leaf: str, path: Path) -> str:
     if leaf != leaf_name(Path(leaf)):
         raise UnsafePrivatePathError(f"Private file {path} has an unsafe filename.")
     try:
-        fd = os.open(leaf, os.O_RDONLY | os.O_CLOEXEC | nofollow_flag(), dir_fd=parent_fd)
+        fd = os.open(leaf, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise UnsafePrivatePathError(f"Private file {path} must not be a symlink.") from exc
@@ -793,7 +791,7 @@ def _open_private_text(path: Path, mode: str) -> IO[str]:
     """
     parent_fd = open_directory_fd(path.parent, create=True, private_final=True)
     leaf = leaf_name(path)
-    flags = os.O_WRONLY | os.O_CLOEXEC | nofollow_flag()
+    flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     if mode == "a":
         flags |= os.O_APPEND
     created = False
@@ -855,7 +853,7 @@ def _new_exclusive_temp_fd(
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     leaf = path.name if directory_fd is None else leaf_name(path)
     if directory_fd is not None:
-        flags |= nofollow_flag()
+        flags |= os.O_NOFOLLOW
     for _ in range(10):
         temporary = path.with_name(f".{leaf}.{secrets.token_hex(8)}.tmp")
         try:
@@ -1145,14 +1143,10 @@ def file_url_path(storage: str) -> str:
         journal:////tmp/absolute.journal    -> /tmp/absolute.journal
         journal:///file:/tmp/a%3Fb?uri=true -> /tmp/a?b
 
-    Args:
-        storage: A file-style storage URL whose scheme is already known to be
-            file-based (``journal``).
-
-    Returns:
-        The bare filesystem path, without the scheme or leading slashes that
-        belong to URL grammar.
-
+    :param str storage: A file-style storage URL whose scheme is already known to be file-based
+        (``journal``).
+    :return str: The bare filesystem path, without the scheme or leading slashes that belong
+        to URL grammar.
     """
     scheme, rest = storage.split(":", 1)
 
@@ -1187,8 +1181,8 @@ def file_url_path(storage: str) -> str:
 def journal_file_path(storage: str) -> Path:
     """Resolve a file-backed journal URL to its canonical path.
 
-    Freeze the working directory and resolve symlinks so storage and repair locks
-    address the same journal.
+    Anchor a relative path at the current working directory and resolve symlinks so
+    storage and repair locks address the same journal.
 
     :param str storage: Journal storage URL, including escaped ``file:`` forms.
     :raises ValueError: ``storage`` does not name a journal file.

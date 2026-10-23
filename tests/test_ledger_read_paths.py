@@ -12,9 +12,7 @@ checks to run against, rather than bytes a test invented.
 preflight legitimately needs live ``Study`` objects, so it is not under the
 constructor ban. Its invariant is "validate before open, and leave the bytes
 unchanged", which it satisfies by going through the ledger handle like every
-other read path. Because it reaps through those live studies, it also refuses
-any study bound to another artifact root. That makes its ``ledger-only``
-verdict over the current ledger a refusal where every pure read says ``ok``.
+other read path.
 """
 
 from __future__ import annotations

@@ -229,6 +229,7 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         ("WandbPollTimeout", ("attempt", 1.0)),
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
+        ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"])),
     ],
 )
 def test_wandb_errors_unwind_through_context_managers(name, arguments):
@@ -481,7 +482,7 @@ def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
 
 
 def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
-    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SETTLE_SECONDS", 0.05)
+    monkeypatch.setattr("phasesweep.evidence.wandb._FINISH_SETTLE_SECONDS", 0.05)
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
     start = time.monotonic()
     assert _history_position(monkeypatch, run, timeout_seconds=60) is None
@@ -566,6 +567,88 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     assert provenance["remote_capture"]["run_id"] == ctx.attempt_id
     # The position is read only once the trial is accepted.
     assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": None}}
+
+
+def test_wandb_gates_share_failed_capture(tmp_path, monkeypatch):
+    from phasesweep.evidence.models import WandbQuery
+    from phasesweep.evidence.wandb import WandbRunTerminalError
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    other_gate = gate.model_copy(update={"keys": ["complete"]})
+    ctx = replace(
+        make_trial_context(tmp_path),
+        wandb_query=WandbQuery(gate, (), ("done", "complete")),
+    )
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise WandbRunTerminalError(ctx.attempt_id, "failed")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    results = evaluate_gates(ctx, [gate, other_gate])
+    assert calls == 1
+    assert len(results) == 2
+    assert all(not result.passed and not result.deadline_exhausted for result in results)
+    assert results[0].detail == results[1].detail
+    assert "ended in 'failed'" in results[0].detail
+
+
+@pytest.mark.parametrize("failure_kind", ["deadline", "cleanup"])
+def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_kind):
+    from phasesweep.errors import UnsafeProcessCleanupError
+
+    extractor = WandbExtractor(type="wandb", entity="entity", project="project", metric_key="loss")
+    ctx = make_trial_context(tmp_path)
+    failure = (
+        DeadlineExceededError("capture deadline expired")
+        if failure_kind == "deadline"
+        else UnsafeProcessCleanupError("worker cleanup is uncertain")
+    )
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        return {"values": {"loss": 0.25}, "present_keys": ["loss"]}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    with pytest.raises(type(failure), match=str(failure)):
+        run_extractor(ctx, extractor)
+    assert run_extractor(ctx, extractor) == 0.25
+    assert calls == 2
+
+
+def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypatch):
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    ctx = make_trial_context(tmp_path)
+    clock = [0.0]
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            clock[0] = 1.0
+            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds)
+        return {"values": {}, "present_keys": ["done"]}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    first = evaluate_gates(ctx, [gate], deadline=1.0)[0]
+    assert not first.passed
+    assert first.deadline_exhausted
+    assert evaluate_gates(ctx, [gate], deadline=2.0)[0].passed
+    assert calls == 2
 
 
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
@@ -689,6 +772,200 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
     assert "worker-diagnostic-marker" in diagnostic.read_text()
     assert diagnostic.stat().st_mode & 0o777 == 0o600
     assert "worker-diagnostic-marker" not in str(exc_info.value)
+
+
+def test_wandb_missing_summary_key_reports_available_names_after_polling(
+    wandb_worker_sdk, tmp_path
+):
+    """A settle window longer than the timeout ends as a timeout that names the keys."""
+    calls = tmp_path / "lookup-count"
+    wandb_worker_sdk(f"""
+        from pathlib import Path
+        class Run:
+            state = "finished"
+            summary_metrics = {{"eval/loss": 0.25, "train/runtime": 123456.789}}
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                target = Path({str(calls)!r})
+                target.write_text(str(int(target.read_text()) + 1) if target.exists() else "1")
+                return Run()
+    """)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="eval_loss",
+        poll_seconds=0.02,
+        timeout_seconds=2,
+    )
+
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(make_trial_context(tmp_path), extractor)
+
+    message = str(caught.value)
+    assert "eval_loss" in message
+    assert "available" in message.lower()
+    assert "eval/loss" in message
+    assert "train/runtime" in message
+    assert "123456.789" not in message
+    assert int(calls.read_text()) > 1
+
+
+def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_path):
+    wandb_worker_sdk("""
+        calls = 0
+        class Run:
+            state = "finished"
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                global calls
+                calls += 1
+                run = Run()
+                run.summary_metrics = {"loss": 0.25} if calls >= 3 else {"train/runtime": 1}
+                return run
+    """)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.01,
+        timeout_seconds=2,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
+
+
+# A trainer that logs ``train_runtime`` while the sweep asks for ``train/train_runtime``.
+_RUNTIME_SUMMARY = {"train_runtime": 812.5, "_runtime": 815}
+
+
+def _fake_wandb_clock(monkeypatch):
+    """Advance a fake monotonic clock only by the poller's sleeps."""
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    return clock
+
+
+def _wandb_reads(monkeypatch, state, summary):
+    """Serve the run's ``state(read)`` and ``summary(read)`` on each zero-based read."""
+    public = pytest.importorskip("wandb.apis.public")
+    reads = []
+
+    def lookup(path):
+        reads.append(path)
+        index = len(reads) - 1
+        return SimpleNamespace(state=state(index), summary_metrics=summary(index))
+
+    monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
+    return reads
+
+
+def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypatch):
+    from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbMissingKeysError
+
+    clock = _fake_wandb_clock(monkeypatch)
+    reads = _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
+    with pytest.raises(WandbMissingKeysError) as caught:
+        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
+    assert caught.value.missing == ["train/train_runtime"]
+    assert caught.value.available == ["_runtime", "train_runtime"]
+    # The window opens at the first finished read; the last read is at its end.
+    assert clock[0] == _FINISH_SETTLE_SECONDS < 240
+    assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
+
+
+def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    clock = _fake_wandb_clock(monkeypatch)
+    _wandb_reads(monkeypatch, lambda read: "finished", lambda read: _RUNTIME_SUMMARY)
+
+    def in_process_worker(request, _worker_path, _backend, **_):
+        # The worker's own entry point, so the report crosses its JSON response.
+        directory = tmp_path / "worker"
+        directory.mkdir(mode=0o700)
+        request_path, response_path = directory / "request.json", directory / "response.json"
+        request_path.write_text(json.dumps(dict(request)))
+        assert wandb_evidence.main([str(request_path), str(response_path)]) == 0
+        response = json.loads(response_path.read_text())
+        assert response["status"] == "missing_keys"
+        return SimpleNamespace(timed_out=False, return_code=0), response, None
+
+    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="train/train_runtime",
+        poll_seconds=5,
+        timeout_seconds=240,
+    )
+    ctx = make_trial_context(tmp_path)
+    with pytest.raises(ExtractorError) as caught:
+        run_extractor(ctx, extractor)
+    assert type(caught.value) is ExtractorError
+    assert str(caught.value) == (
+        f"W&B run https://api.wandb.ai/e/p/{ctx.attempt_id} finished without required "
+        "summary key(s) ['train/train_runtime']; available summary keys: "
+        "['_runtime', 'train_runtime']."
+    )
+    assert clock[0] < 240
+
+
+@pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])
+def test_wandb_key_appearing_within_the_settle_window_is_accepted(monkeypatch, appears_at_read):
+    clock = _fake_wandb_clock(monkeypatch)
+    reads = _wandb_reads(
+        monkeypatch,
+        lambda read: "finished",
+        lambda read: (
+            {**_RUNTIME_SUMMARY, "train/train_runtime": 812.5}
+            if read >= appears_at_read
+            else _RUNTIME_SUMMARY
+        ),
+    )
+    capture = _wandb_poll(
+        required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240
+    )
+    assert capture["values"] == {"train/train_runtime": 812.5}
+    assert len(reads) == appears_at_read + 1
+    assert clock[0] == 5 * appears_at_read
+
+
+@pytest.mark.parametrize("finished_from_read", [None, 44], ids=["running", "finished-late"])
+def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
+    monkeypatch, finished_from_read
+):
+    """A running run, or a window the deadline cuts short, keeps polling until the deadline."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    clock = _fake_wandb_clock(monkeypatch)
+    _wandb_reads(
+        monkeypatch,
+        lambda read: (
+            "finished"
+            if finished_from_read is not None and read >= finished_from_read
+            else "running"
+        ),
+        lambda read: _RUNTIME_SUMMARY,
+    )
+    with pytest.raises(WandbPollTimeout) as caught:
+        _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
+    assert clock[0] == 240
+    if finished_from_read is None:
+        assert caught.value.last_error is None
+    else:
+        # The window opened at 220 s, so the deadline arrives first.
+        assert "available summary keys: ['_runtime', 'train_runtime']" in str(
+            caught.value.last_error
+        )
 
 
 @pytest.mark.parametrize("request_kind", ["summary", "position"])

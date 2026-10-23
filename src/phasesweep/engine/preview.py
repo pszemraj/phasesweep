@@ -8,36 +8,33 @@ launching trainers or changing the configured ledger or artifact tree.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 import optuna
 
 import phasesweep.engine.resume as resume_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import sampler_search_space
-from phasesweep.engine.artifact_roots import (
-    _artifact_root_binding_applies,
-    _check_published_phase_studies,
-)
+from phasesweep.config.search import _placeholder_values_for, sampler_search_space
+from phasesweep.engine.artifact_roots import _check_published_phase_studies
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
 from phasesweep.engine.optuna import (
-    _completed_trial_count,
     _finished_trial_count,
+    _measured_trial_count,
     _phase_study_name,
     _suggest,
 )
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.phase import (
     _composed_overrides,
-    _inherited_placeholder_keys,
     _judge_recorded_phase,
     _PhaseResume,
-    _placeholder_winner,
     _replay_met_target,
+    _winner_completion,
+    _winner_overrides,
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
@@ -54,6 +51,7 @@ from phasesweep.engine.study_policy import (
     _validate_trial_target,
 )
 from phasesweep.runtime.commands import render_command
+from phasesweep.runtime.gpu import GpuPool
 
 log = logging.getLogger("phasesweep.engine.preview")
 
@@ -66,12 +64,14 @@ class RecordedPhase:
     #: plus each RUNNING one whose objective recorded a failure, which a launch recovers
     #: as failed first. Any other RUNNING attempt recovers as interrupted and reruns.
     finished: int
-    #: How many of those are COMPLETE.
-    completed: int
+    #: How many of those are COMPLETE, feasible or not.
+    measured: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
     #: Reruns a launch would run before any new draw: interrupted trials without one,
-    #: WAITING reruns, and RUNNING attempts that recover as interrupted.
+    #: failed grid cells a raised target retries, WAITING reruns, and RUNNING attempts that
+    #: recover as interrupted. A phase with a RUNNING attempt counts no grid retries, because
+    #: its recovery changes how many a launch schedules.
     reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
@@ -85,21 +85,19 @@ class PhasePreview:
     winner: Winner
     #: Trials a launch would run, the count the phase's "would launch" line prints.
     launches: int
-    #: How many of those launches rerun interrupted trials.
+    #: How many of those launches rerun an interrupted trial or retry a failed grid cell.
     reruns: int
     #: Whether the phase would replay a recorded result and launch no trials.
     replays: bool
 
 
 def _reruns_phrase(reruns: int) -> str:
-    """Name a count of reruns of interrupted trials in the singular or plural.
+    """Name a count of reruns in the singular or plural.
 
     :param int reruns: Reruns counted.
-    :return str: For example ``"1 rerun of an interrupted trial"``.
+    :return str: For example ``"1 rerun"``.
     """
-    if reruns == 1:
-        return "1 rerun of an interrupted trial"
-    return f"{reruns} reruns of interrupted trials"
+    return "1 rerun" if reruns == 1 else f"{reruns} reruns"
 
 
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
@@ -122,15 +120,16 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     return line
 
 
-def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
+def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     """Count one phase's snapshot study the way a launch counts it.
 
+    :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
-        return RecordedPhase(finished=0, completed=0, running=0, reruns=0, study=None)
+        return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
     running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
     sequence_counts = _outcome_sequence_counts(trials)
@@ -139,9 +138,11 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
     )
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
-        completed=_completed_trial_count(trials),
+        measured=_measured_trial_count(trials),
         running=len(running),
-        reruns=_pending_rerun_count(trials) + len(running) - recovered_as_failed,
+        reruns=_pending_rerun_count(trials, None if running else phase)
+        + len(running)
+        - recovered_as_failed,
         study=study,
     )
 
@@ -167,7 +168,7 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
             exc,
         )
         return {phase.name: None for phase in experiment.phases}
-    return {name: _recorded_phase(study) for name, study in studies.items()}
+    return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
 
 
 def _refuse_as_a_launch_would(
@@ -181,7 +182,7 @@ def _refuse_as_a_launch_would(
     Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
     schema, and fixed-target checks using predicted recovery counts; defer target
     and descendant checks requiring actual recovery. Preview does not verify trainer
-    environment, fingerprints, evidence, or per-study artifact-root claims.
+    environment, evidence, or per-study artifact-root claims.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -199,8 +200,7 @@ def _refuse_as_a_launch_would(
         descendant study already bound to its winner.
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
-    if _artifact_root_binding_applies(experiment):
-        _check_published_phase_studies(experiment, studies, from_phase=from_phase)
+    _check_published_phase_studies(experiment, studies, from_phase=from_phase)
     errors: list[Exception] = []
     reached = from_phase is None
     for phase in experiment.phases:
@@ -215,7 +215,7 @@ def _refuse_as_a_launch_would(
             _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
-                    phase, finished=record.finished, completed=record.completed
+                    phase, finished=record.finished, measured=record.measured
                 )
             elif reached:
                 _validate_trial_target(study, phase)
@@ -281,17 +281,32 @@ def _preview_phase(
     remaining = max(0, phase.n_trials - finished)
     study: optuna.Study | None = None
     resume: _PhaseResume | None = None
+    phase_fingerprint = _phase_fingerprint(experiment, phase, inherited_winners)
+    if (
+        recorded is not None
+        and recorded.study is not None
+        and recorded.study.get_trials(deepcopy=False)
+    ):
+        if not any(winner.placeholder_keys for winner in inherited_winners.values()):
+            phase_fingerprint = _verify_fingerprint(
+                recorded.study, experiment, phase, inherited_winners
+            )
+        else:
+            log.warning(
+                "DRY RUN warning: phase=%s fingerprint comparison awaits the inherited "
+                "winner whose values are placeholders",
+                phase.name,
+            )
     if recorded is not None and not recorded.running and recorded.study is not None:
         study = recorded.study
-        # Snapshots never recover or stamp state; placeholder ancestry also
-        # prevents fingerprint comparison or evidence verification here.
+        # Empty snapshots need no fingerprint stamp or comparison.
         resumed = _judge_recorded_phase(
             experiment,
             phase,
             inherited_winners,
             study,
             policy_state=_load_phase_policy_state(study),
-            phase_fingerprint=_phase_fingerprint(experiment, phase, inherited_winners),
+            phase_fingerprint=phase_fingerprint,
             verify_evidence=False,
         )
         if isinstance(resumed, Winner):
@@ -324,7 +339,7 @@ def _preview_phase(
             "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
             "before it checks the phase, as failed where the trial recorded a failure and "
             "otherwise as interrupted, which reruns; they are counted that way, and its "
-            "accepted target and abort state are not checked",
+            "accepted target, abort state and partial decision are not checked",
             phase.name,
             recorded.running,
         )
@@ -343,6 +358,7 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
+    GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,
         phase,
@@ -352,6 +368,83 @@ def _preview_phase(
         reruns=reruns,
     )
     return PhasePreview(winner=winner, launches=remaining, reruns=reruns, replays=False)
+
+
+def _inherited_placeholder_keys(
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    *,
+    replaced: Collection[str],
+) -> dict[str, list[str]]:
+    """Name the inherited override keys whose values are dry-run stand-ins, by parent.
+
+    A key belongs to the last parent in ``inherits`` order that sets it, as in
+    :func:`_composed_overrides`, and drops out when ``replaced`` sets it afresh.
+
+    :param Phase phase: The phase whose inheritance order decides which parent supplies a key.
+    :param dict[str, Winner] inherited_winners: Parent-phase winners, or stand-ins for them.
+    :param Collection[str] replaced: Keys the phase sets itself, which replace any inherited value.
+    :return dict[str, list[str]]: Sorted stand-in keys per parent, in inheritance order, without
+        the parents that supply none.
+    """
+    supplier: dict[str, str] = {}
+    for parent in phase.inherits:
+        supplier.update(dict.fromkeys(inherited_winners[parent].effective_overrides, parent))
+    by_parent: dict[str, list[str]] = {}
+    for parent in phase.inherits:
+        keys = sorted(
+            key
+            for key in inherited_winners[parent].placeholder_keys
+            if supplier.get(key) == parent and key not in replaced
+        )
+        if keys:
+            by_parent[parent] = keys
+    return by_parent
+
+
+def _placeholder_winner(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    *,
+    sampled_params: dict[str, object] | None = None,
+) -> Winner:
+    """Build a dry-run winner from preview samples or deterministic parameter defaults.
+
+    Carry inherited overrides, omit the repeat key, and mark searched or inherited
+    stand-in keys unless fixed overrides replace them.
+
+    :param Experiment experiment: Experiment defining the phase graph.
+    :param Phase phase: Phase needing a placeholder.
+    :param dict[str, Winner] inherited_winners: Winners from earlier phases.
+    :param dict[str, object] | None sampled_params: Preview samples, or None for low bounds and first choices.
+    :return Winner: Placeholder with trial number -1 and a NaN metric.
+    """
+    placeholder_params = (
+        _placeholder_values_for(phase.search_space)
+        if sampled_params is None
+        else {name: value for name, value in sampled_params.items() if name in phase.search_space}
+    )
+    effective = _winner_overrides(experiment, phase, placeholder_params, inherited_winners)
+    carried = _inherited_placeholder_keys(
+        phase, inherited_winners, replaced=[*phase.fixed_overrides, *placeholder_params]
+    )
+    stand_ins = set(placeholder_params).union(*carried.values())
+    return Winner(
+        trial_number=-1,
+        params=placeholder_params,
+        effective_overrides=effective,
+        placeholder_keys=frozenset(stand_ins & effective.keys()),
+        metric=float("nan"),
+        completion=_winner_completion(
+            requested_trials=phase.n_trials,
+            finished_trials=0,
+            completed_trials=0,
+            incomplete=True,
+            reason="dry_run",
+            timeout_scope=None,
+        ),
+    )
 
 
 def _dry_run_phase(
@@ -368,25 +461,21 @@ def _dry_run_phase(
     The log line names, by parent, the inherited keys whose values are stand-ins
     until that parent publishes a winner.
 
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase being previewed.
-        inherited_winners: Winners loaded for phases earlier in the chain.
-        study: An in-memory Optuna study used to ``ask`` for one sample.
-        remaining: Number of trials that *would* run; logged for the user.
-        reruns: How many of them rerun interrupted trials before any new draw.
-
-    Returns:
-        A :class:`Winner` placeholder built from the previewed sample, or from
-        each parameter's low bound or first choice, so downstream dry-run
-        previews see consistent inherited context.
-
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase being previewed.
+    :param dict[str, Winner] inherited_winners: Winners loaded for phases earlier in the chain.
+    :param optuna.Study study: An in-memory Optuna study used to ``ask`` for one sample.
+    :param int remaining: Number of trials that *would* run; logged for the user.
+    :param int reruns: How many of them rerun an interrupted trial or retry a failed grid cell
+        before any new draw.
+    :return Winner: A placeholder built from the previewed sample, with the repeat key
+        omitted, so downstream dry-run previews see consistent inherited context.
     """
     of_them = ""
     if reruns == 1:
-        of_them = ", 1 of them a rerun of an interrupted trial"
+        of_them = ", 1 of them a rerun"
     elif reruns:
-        of_them = f", {reruns} of them reruns of interrupted trials"
+        of_them = f", {reruns} of them reruns"
     log.info(
         "DRY RUN phase=%s would launch %d %s%s",
         phase.name,

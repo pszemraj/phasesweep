@@ -744,6 +744,7 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
     store.status_path("exp-dangling").symlink_to("missing-status.json")
     store.log_path("exp-directory").mkdir()
     (tmp_path / "state" / "logs" / "exp-transition.transition.lock").write_text("")
+    store.heartbeat_path("exp-heartbeat").write_text("")
 
     handles, unreadable_records = store.launch_inventory()
 
@@ -752,6 +753,7 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
         "run:broken",
         "run:exp-dangling",
         "run:exp-directory",
+        "run:exp-heartbeat",
         "run:exp-orphan",
         "run:exp-transition",
     }
@@ -1368,7 +1370,7 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
     store = RunStore(tmp_path / "state")
     starttime = read_proc_starttime(os.getpid())
     if starttime is None:
-        pytest.skip("/proc starttime unavailable (non-Linux)")
+        pytest.skip("/proc starttime unavailable")
     handle = make_run_handle(
         run_id="exp-1", pid=os.getpid(), starttime=starttime, boot_id=earlier_boot_id()
     )
@@ -1455,7 +1457,7 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
     store = RunStore(tmp_path / "state")
     starttime = read_proc_starttime(os.getpid())
     if starttime is None:
-        pytest.skip("/proc starttime unavailable (non-Linux)")
+        pytest.skip("/proc starttime unavailable")
     handle = make_run_handle(
         run_id="exp-1", pid=os.getpid(), starttime=starttime, boot_id=earlier_boot_id()
     )
@@ -1618,7 +1620,7 @@ def test_state_reserves_recovery_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())
     if live_starttime is None:
-        pytest.skip("/proc starttime unavailable (non-Linux); no PID-reuse guard")
+        pytest.skip("/proc starttime unavailable; no PID-reuse guard")
     # PID is alive (our own) but the saved starttime does not match, so it is a
     # different process than the one we launched. The runner is gone, but its
     # separately-sessioned descendants are not proven gone, so fail closed.
@@ -1631,8 +1633,6 @@ def test_state_reserves_recovery_on_pid_reuse_mismatch(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path) -> None:
-    if not sys.platform.startswith("linux"):
-        pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
     # Kill a child that is paused until signalled. As its unreaping parent, the
     # PID lingers as a zombie that os.kill(pid, 0) still reports as alive.

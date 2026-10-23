@@ -26,6 +26,7 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.tools import PhaseSweepMCP, _runner_protocol_argv
+from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
@@ -199,7 +200,7 @@ def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: floa
         status = app.status(run_id=run_id)
         if status["run"]["state"] in {"succeeded", "failed", "cancelled"}:
             return status["run"]["state"]
-        if status["phases"][0]["running_trials_total"] >= 1:
+        if status["phases"][0]["trials"]["RUNNING"] >= 1:
             return "running"
         time.sleep(0.2)
     return "timeout"
@@ -482,6 +483,21 @@ def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     write_status_file(store.status_path(run_id), full_payload)
 
 
+def write_runner_heartbeat(store: RunStore, run_id: str, *, age_seconds: float = 0.0) -> Path:
+    """Create a run's heartbeat as its runner does, last refreshed ``age_seconds`` ago.
+
+    :param RunStore store: Store owning the run.
+    :param str run_id: Run whose heartbeat is written.
+    :param float age_seconds: How long before now the runner last refreshed it.
+    :return Path: The heartbeat path.
+    """
+    path = store.heartbeat_path(run_id)
+    open_private_text(path, "w").close()
+    refreshed = time.time() - age_seconds
+    os.utime(path, (refreshed, refreshed))
+    return path
+
+
 def _stage_run(
     store: RunStore,
     config: Path,
@@ -653,13 +669,13 @@ def record_runner_cleanup(
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
 
-def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
+def write_srv_config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
     path = tmp_path / f"{name}.yaml"
     path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
     return path
 
 
-def _catalog(
+def write_srv_catalog(
     tmp_path: Path,
     config: Path,
     allow: dict[str, bool] | None = None,
@@ -684,12 +700,14 @@ def side_effect_app(
     :param str | None phases: Phases block for the config, or the default one-phase search.
     :return tuple[Path, PhaseSweepMCP, Registry, RunStore]: Config path, server, registry, and run store.
     """
-    config = _config(tmp_path, phases=phases)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config = write_srv_config(tmp_path, phases=phases)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
     return config, app, registry, store
 
 
-def _drift_experiment(
+def drift_experiment(
     tmp_path: Path,
     trainer: Path,
     *,
@@ -723,8 +741,3 @@ def _drift_experiment(
             )
         ],
     )
-
-
-def _write_experiment_config(config: Path, experiment: Experiment) -> None:
-    """Rewrite a cataloged config file in place, as an operator edit would."""
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))

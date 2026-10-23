@@ -528,6 +528,8 @@ def require_tracking_target(
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.errors import PhaseSweepError
 
+    settings = experiment.mlflow
+    assert settings is not None
     try:
         if (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
             # An earlier phase bound the summary run; the target must still resolve.
@@ -547,8 +549,14 @@ def require_tracking_target(
                 raise
             # The SDK retries a refused connection until the operation times out.
             cause = "it did not answer within timeout_seconds; check that the server is reachable"
+        selector = (
+            f"experiment_id={settings.experiment_id!r}"
+            if settings.experiment_id is not None
+            else f"experiment_name={settings.experiment_name!r}"
+        )
         raise TrackingTargetUnavailableError(
-            f"MLflow tracking target is not ready: {cause}. No trial was started."
+            f"MLflow tracking target {selector} at {settings.tracking_uri!r} is not ready: "
+            f"{cause}. No trial was started."
         ) from exc
 
 

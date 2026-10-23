@@ -24,8 +24,9 @@ from phasesweep.mcp.tools import (
     AWAIT_RECHECK_SECONDS,
     _run_elapsed_seconds,
 )
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, single_trial_confound
+from tests.conftest import mark_current_format, phase_study, single_trial_confound, tell_feasible
 from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
@@ -44,8 +45,7 @@ def _complete_trials(experiment, *, n: int) -> None:
     )
     mark_current_format(experiment, study)
     for i in range(n):
-        trial = study.ask()
-        study.tell(trial, float(i))
+        tell_feasible(study, study.ask(), float(i))
 
 
 def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
@@ -76,8 +76,8 @@ def test_elapsed_seconds_terminal(
     assert _run_elapsed_seconds(store, handle, state) == expected
 
 
-def test_status_floors_inconsistent_historical_terminal_count() -> None:
-    """A partial snapshot cannot expose a negative pre-run trial count."""
+def _status_payload(phase_counts: dict[str, dict[str, int]]) -> JsonObject:
+    """Map a one-phase ``read_status`` payload with the given counts to the MCP status."""
     status = {
         "current_generation_id": "generation-current",
         "published_generation_id": None,
@@ -93,15 +93,13 @@ def test_status_floors_inconsistent_historical_terminal_count() -> None:
             {
                 "phase": "p",
                 "n_trials": 3,
-                "trials": {"COMPLETE": 1},
-                "generation_trials": {"COMPLETE": 2},
+                **phase_counts,
                 "winner_present": False,
                 "trial_data_available": True,
             }
         ],
     }
-
-    payload = status_payload(
+    return status_payload(
         "srv",
         status,
         {"run_id": "run-1"},
@@ -109,7 +107,35 @@ def test_status_floors_inconsistent_historical_terminal_count() -> None:
         elapsed_seconds=None,
     )
 
-    assert payload["phases"][0]["terminal_trials_before_run"] == 0
+
+def test_status_floors_inconsistent_historical_finished_count() -> None:
+    """A partial snapshot cannot expose a negative pre-run trial count."""
+    payload = _status_payload({"trials": {"COMPLETE": 1}, "generation_trials": {"COMPLETE": 2}})
+
+    assert payload["phases"][0]["finished_trials_before_run"] == 0
+
+
+def test_status_counts_infeasible_trials_as_finished_but_not_complete() -> None:
+    """INFEASIBLE is a state of its own: it spends the target, and ``COMPLETE`` leaves it out."""
+    payload = _status_payload(
+        {
+            "trials": {"COMPLETE": 1, "INFEASIBLE": 1, "FAIL": 1},
+            "generation_trials": {"INFEASIBLE": 1},
+        }
+    )
+
+    (phase,) = payload["phases"]
+    assert phase["trials"] == {
+        "WAITING": 0,
+        "RUNNING": 0,
+        "COMPLETE": 1,
+        "INFEASIBLE": 1,
+        "FAIL": 1,
+        "INTERRUPTED": 0,
+    }
+    assert phase["finished_trials_total"] == 3
+    assert phase["finished_trials_this_run"] == 1
+    assert phase["remaining_trials"] == 0
 
 
 def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Path) -> None:
@@ -122,13 +148,14 @@ def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Pat
         "WAITING": 0,
         "RUNNING": 0,
         "COMPLETE": 0,
+        "INFEASIBLE": 0,
         "FAIL": 0,
         "INTERRUPTED": 0,
     }
-    assert phase["terminal_trials_total"] == 0
-    assert phase["terminal_trials_before_run"] == 0
-    assert phase["attempts_launched_this_run"] == 0
-    assert phase["terminal_trials_this_run"] == 0
+    assert phase["finished_trials_total"] == 0
+    assert phase["finished_trials_before_run"] == 0
+    assert phase["attempts_this_run"] == 0
+    assert phase["finished_trials_this_run"] == 0
     assert phase["target_already_satisfied"] is False
     assert phase["remaining_trials"] == phase_target
 
@@ -137,10 +164,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
     _complete_trials(experiment, n=2)
-    study = optuna.load_study(
-        study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=_resolve_storage(experiment.resolved_storage),
-    )
+    study = phase_study(experiment, experiment.phases[0].name)
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
     winner = Winner(
         trial_number=1,
@@ -173,13 +197,14 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         "WAITING": 0,
         "RUNNING": 0,
         "COMPLETE": 2,
+        "INFEASIBLE": 0,
         "FAIL": 1,
         "INTERRUPTED": 0,
     }
-    assert run_status["phases"][0]["terminal_trials_total"] == 3
-    assert run_status["phases"][0]["terminal_trials_before_run"] == 3
-    assert run_status["phases"][0]["attempts_launched_this_run"] == 0
-    assert run_status["phases"][0]["terminal_trials_this_run"] == 0
+    assert run_status["phases"][0]["finished_trials_total"] == 3
+    assert run_status["phases"][0]["finished_trials_before_run"] == 3
+    assert run_status["phases"][0]["attempts_this_run"] == 0
+    assert run_status["phases"][0]["finished_trials_this_run"] == 0
     assert run_status["phases"][0]["target_already_satisfied"] is True
     assert run_status["phases"][0]["remaining_trials"] == 0
     assert run_status["result_source"] == "frozen_run_snapshot"

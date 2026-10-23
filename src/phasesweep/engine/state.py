@@ -21,25 +21,27 @@ WinnerSourceKind = Literal["phase_trial"]
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
 
-TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "FAIL", "INTERRUPTED"]
-"""Name of a trial state as status payloads report it, including ``INTERRUPTED``."""
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "INFEASIBLE", "FAIL", "INTERRUPTED"]
+"""Name of a trial state as status, trial tables and logs report it."""
 
 TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
     "WAITING",
     "RUNNING",
     "COMPLETE",
+    "INFEASIBLE",
     "FAIL",
     "INTERRUPTED",
 )
 """Every counted trial state, in the key order status payloads use.
 
-``INTERRUPTED`` is an Optuna ``FAIL`` trial whose recorded outcome is
-``interrupted``; it is counted apart from ``FAIL`` and reruns. Optuna's
-``PRUNED`` is absent because the study's ``NopPruner`` never prunes and no
+``INFEASIBLE`` is an Optuna ``COMPLETE`` trial that violated a constraint or the
+metric's bounds, so it can never win. ``INTERRUPTED`` is an Optuna ``FAIL`` trial whose
+recorded outcome is ``interrupted``; it is counted apart from ``FAIL`` and reruns.
+Optuna's ``PRUNED`` is absent because the study's ``NopPruner`` never prunes and no
 trainer raises ``TrialPruned``.
 """
 
-TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "FAIL")
+FINISHED_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "INFEASIBLE", "FAIL")
 """The states that count toward ``n_trials``; an interrupted trial is in none of them."""
 
 RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]
@@ -144,12 +146,12 @@ class Winner:
     confound: dict[str, Any] | None = None
     # Report-only values the selected trial recorded, by observation name; for
     # a repeats phase, the mean over the members that recorded each name.
-    # Winner-only: they never enter summary.yaml, a fingerprint, or selection.
+    # They never enter a fingerprint or selection.
     observed: dict[str, float] = field(default_factory=dict)
     # The winning repeat group (:mod:`phasesweep.engine.repeats`): reducer,
     # spread and every member. The scalar fields above then describe the
     # group's highest-numbered member and ``metric`` is the reduced value.
-    # ``None`` for a phase without repeats. Winner-only, like ``observed``.
+    # ``None`` for a phase without repeats.
     repeats: RepeatsRecord | None = None
     # The keys of ``effective_overrides`` whose values are dry-run stand-ins:
     # a placeholder's own searched keys plus those it carries from placeholder
@@ -165,7 +167,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 7
+STUDY_SCHEMA_VERSION = 9
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -180,8 +182,8 @@ TRIAL_OUTCOME_ABORT_KEY = "abort"
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
 # The outcome's ``cause`` says which.
 _TRIAL_OUTCOMES = frozenset({"success", "failure", "interrupted", "fatal"})
-# On a rerun of an interrupted trial: the source's trial number, written in the rerun's
-# creation record. A rerun takes its source's draw position.
+# On an interrupted rerun or failed grid-cell retry: the source's trial number,
+# written in the new attempt's creation record. It takes its source's draw position.
 RERUN_OF_ATTR = "phasesweep_rerun_of"
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
@@ -190,7 +192,7 @@ PHASE_RECOVERY_ATTR = "phasesweep_phase_recovery"
 PHASE_RECOVERY_SCHEMA_VERSION = 1
 # Accepted partial-timeout decision; replay selects without allocating the remaining trials.
 PHASE_DECISION_ATTR = "phasesweep_phase_decision"
-PHASE_DECISION_SCHEMA_VERSION = 1
+PHASE_DECISION_SCHEMA_VERSION = 2
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
 # JSON-encoded frozen objective evidence provenance; written when metric
@@ -478,7 +480,7 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 4
+GENERATION_SUMMARY_SCHEMA_VERSION = 5
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time. The
 # summary keeps only the config *fingerprint*: once the operator edits or loses
@@ -491,7 +493,7 @@ GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # generation whose identity -- and therefore launch authority -- was granted by
 # an external launcher, durably enough to survive the loss of that launcher's
 # own state directory.
-REPRODUCIBILITY_SCHEMA_VERSION = 2
+REPRODUCIBILITY_SCHEMA_VERSION = 3
 
 WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than

@@ -65,7 +65,7 @@ def write_trial_identity(
     )
 
 
-def _new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
+def new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
     """Create one phase's minimizing study."""
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase_name}",
@@ -102,7 +102,7 @@ def fabricate_stale_trial(
     persist_generation_id: bool = True,
 ) -> StaleTrial:
     """Create the phase study, as a crashed engine run leaves it, holding one attribute-complete RUNNING trial."""
-    study = _new_phase_study(experiment, phase_name)
+    study = new_phase_study(experiment, phase_name)
     phase = next(phase for phase in experiment.phases if phase.name == phase_name)
     study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
     stamp_artifact_root(study, experiment)
@@ -167,7 +167,7 @@ def write_launched_stale_trial(
     exp = load_experiment(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
-    study = _new_phase_study(exp, phase.name)
+    study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -201,7 +201,7 @@ def write_uncertain_failed_trial(
     exp = load_experiment(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
-    study = _new_phase_study(exp, phase.name)
+    study = new_phase_study(exp, phase.name)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(

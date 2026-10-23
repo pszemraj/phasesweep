@@ -1,7 +1,7 @@
 """Format override dictionaries into the shape the trial command expects.
 
-All values are unconditionally shell-quoted via shlex.quote to prevent
-injection or misparse from shell metacharacters in paths or categorical values.
+Placeholder values are shell-quoted via shlex.quote, except the integer
+{trial_id} and {overrides}, a sequence of individually shell-quoted tokens.
 """
 
 from __future__ import annotations
@@ -17,13 +17,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
+from pydantic import ConfigDict, TypeAdapter, ValidationError
+from pydantic import JsonValue as PydanticJsonValue
 
 from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
-_FILE_CONFIG_VALUE: TypeAdapter[JsonValue] = TypeAdapter(
-    JsonValue,
+# Validation needs pydantic's own alias: its tagged-union error types and locations are
+# what _validate_file_config_value reads, and the repo's string alias cannot validate.
+_FILE_CONFIG_VALUE: TypeAdapter[PydanticJsonValue] = TypeAdapter(
+    PydanticJsonValue,
     config=ConfigDict(strict=True, allow_inf_nan=False, hide_input_in_errors=True),
 )
 
@@ -127,9 +131,9 @@ def _render_override_value(
 def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideFormat) -> str:
     """Render shell-quoted override tokens for argparse or Hydra.
 
-    :param overrides: Scalar/list values keyed by dotted parameter names.
-    :param fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
-    :return: Space-separated ``key=value`` tokens in insertion order.
+    :param Mapping[str, object] overrides: Scalar/list values keyed by dotted parameter names.
+    :param _CliOverrideFormat fmt: ``argparse`` prefixes keys with ``--``; Hydra uses bare keys.
+    :return str: Space-separated ``key=value`` tokens in insertion order.
     :raises TypeError: A value has no faithful representation in the selected grammar.
     """
     prefix = "--" if fmt == "argparse" else ""
@@ -172,10 +176,10 @@ def _validate_file_config_value(payload: object, *, position: str) -> None:
         raise ValueError(message) from exc
 
 
-def dump_overrides_json(payload: Any) -> str:
+def dump_overrides_json(payload: JsonValue) -> str:
     """Encode only JSON-compatible values using the trainer's strict wire format.
 
-    :param Any payload: JSON-compatible scalar, list, or string-keyed mapping.
+    :param JsonValue payload: JSON-compatible scalar, list, or string-keyed mapping.
     :return str: Deterministic JSON text.
     :raises ValueError: A value is non-finite, recursive, or outside the strict JSON domain.
     """
@@ -211,11 +215,11 @@ def compose_trainer_config(
     :raises ValueError: An override path must descend through a non-mapping value.
     :return dict[str, JsonValue]: Deep-copied complete configuration for one trial.
     """
-    base: dict[str, JsonValue] = (
-        _substitute_trainer_config_placeholders(trainer_config, substitutions)
-        if substitutions
-        else trainer_config
-    )
+    base = trainer_config
+    if substitutions:
+        expanded = _substitute_trainer_config_placeholders(trainer_config, substitutions)
+        assert isinstance(expanded, dict)  # a mapping expands to a mapping
+        base = expanded
     composed = deepcopy(base)
     for key, value in overrides.items():
         current = composed
@@ -238,16 +242,18 @@ def compose_trainer_config(
     return composed
 
 
-def _substitute_trainer_config_placeholders(value: Any, substitutions: dict[str, str]) -> Any:
+def _substitute_trainer_config_placeholders(
+    value: JsonValue, substitutions: dict[str, str]
+) -> JsonValue:
     """Expand PhaseSweep runtime placeholders inside trainer-config strings.
 
     Each source string is scanned once so placeholder-like text inside a real
     replacement value (for example, a workdir containing ``{phase}``) remains
     literal instead of being substituted again.
 
-    :param Any value: Configuration subtree to copy and expand.
+    :param JsonValue value: Configuration subtree to copy and expand.
     :param dict[str, str] substitutions: Literal placeholder-to-value mapping.
-    :return Any: Expanded copy of ``value``.
+    :return JsonValue: Expanded copy of ``value``, a mapping again when ``value`` is one.
     """
     if isinstance(value, str):
         pattern = "|".join(re.escape(placeholder) for placeholder in substitutions)
@@ -387,34 +393,27 @@ def render_command(
     Never write input files. A supplied ``materialized_input_path`` is reused exactly;
     otherwise compose input for preview or validation without filesystem writes.
 
-    Args:
-        template: The user's ``trial_command`` template with ``{...}``
-            placeholders. Supported keys: ``config_path``, ``overrides``, ``overrides_path``,
-            ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
-        overrides: The composed overrides for this trial.
-        fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
-        trial_dir: Per-trial directory used for ``{trial_dir}``.
-        trial_id: Numeric trial number, used for ``{trial_id}``.
-        phase: Phase name, used for ``{phase}``.
-        run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
-            identifier used for ``{run_name}``.
-        trainer_config: Base trainer configuration embedded in the PhaseSweep
-            YAML. Every format composes the overrides into it; strings in it
-            expand the runtime placeholders (``{trial_dir}``, ``{trial_id}``,
-            ``{phase}``, ``{run_name}``).
-        materialized_input_path: Exact generated input already written by the
-            launch path. When supplied for a file mode, command rendering uses
-            this path without serializing or rewriting the input.
-
-    Returns:
-        The fully rendered, shell-ready command string.
-
-    Raises:
-        ValueError: If ``fmt`` is not one of the four supported formats, or a
-            dotted override cannot be composed into ``trainer_config``.
-        TypeError: A configured value cannot be represented by the selected
-            command or generated-file format.
-
+    :param str template: The user's ``trial_command`` template with ``{...}`` placeholders.
+        Supported keys: ``config_path``, ``overrides``, ``overrides_path``, ``trial_dir``,
+        ``trial_id``, ``phase``, ``run_name``.
+    :param dict[str, object] overrides: The composed overrides for this trial.
+    :param str fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
+    :param Path trial_dir: Per-trial directory used for ``{trial_dir}``.
+    :param int trial_id: Numeric trial number, used for ``{trial_id}``.
+    :param str phase: Phase name, used for ``{phase}``.
+    :param str run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>`` identifier
+        used for ``{run_name}``.
+    :param dict[str, object] | None trainer_config: Base trainer configuration embedded in the
+        PhaseSweep YAML. Every format composes the overrides into it; strings in it expand the
+        runtime placeholders (``{trial_dir}``, ``{trial_id}``, ``{phase}``, ``{run_name}``).
+    :param Path | None materialized_input_path: Exact generated input already written by the
+        launch path. When supplied for a file mode, command rendering uses this path without
+        serializing or rewriting the input.
+    :raises ValueError: ``fmt`` is not one of the four supported formats, or a dotted override
+        cannot be composed into ``trainer_config``.
+    :raises TypeError: A configured value cannot be represented by the selected command or
+        generated-file format.
+    :return str: The fully rendered, shell-ready command string.
     """
     config_path = ""
     overrides_path = ""

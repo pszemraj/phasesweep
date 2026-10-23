@@ -19,6 +19,7 @@ from phasesweep.config.models import Experiment, Metric, _metric_semantics_paylo
 from phasesweep.config.search import Repeats
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
+from phasesweep.engine.provenance import CodeRevision, _parse_code_revision
 from phasesweep.engine.repeats import RepeatsRecord, _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
     _GENERATION_FILE_FILENAMES,
@@ -31,7 +32,8 @@ from phasesweep.engine.state import (
     _parse_winner_source,
     _validate_observed_block,
 )
-from phasesweep.runtime.files import file_sha256, nofollow_flag
+from phasesweep.runtime.files import file_sha256
+from phasesweep.runtime.json import JsonObject, json_object
 
 
 class PlannedPhase(NamedTuple):
@@ -41,13 +43,17 @@ class PlannedPhase(NamedTuple):
     comment: str | None
 
 
-class SnapshotPhases(NamedTuple):
-    """What a generation's validated config snapshot says about each of its phases."""
+class GenerationProvenance(NamedTuple):
+    """Phase layout, argparse base and code revision from a generation's provenance files."""
 
     inherits: Mapping[str, tuple[str, ...]]
     """Each phase's parents, in plan order."""
     repeats: Mapping[str, Repeats | None]
     """Each phase's configured ``repeats``, or ``None`` for a phase without them."""
+    argparse_trainer_config: JsonObject | None
+    """Producing argparse base, or ``None`` when the snapshot uses another format."""
+    code_revision: CodeRevision | None
+    """Trainer-cwd git revision from the reproducibility record, or ``None`` when unreadable."""
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,10 @@ class ValidatedPublication:
     """The summary's metric semantics, checked against the config snapshot."""
     winners: Mapping[str, ValidatedWinner]
     """Every manifest-listed winner, keyed by the phase that exposes it."""
+    argparse_trainer_config: JsonObject | None
+    """Producing argparse base captured from the validated snapshot bytes."""
+    code_revision: CodeRevision | None
+    """Trainer-cwd git revision captured from the validated reproducibility bytes, or ``None``."""
 
 
 def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
@@ -126,7 +136,7 @@ def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
         raise OSError(f"artifact {path} is outside {root}") from exc
     if not relative.parts or any(part in {".", ".."} for part in relative.parts):
         raise OSError(f"artifact {path} is not a file below {root}")
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow_flag()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory_fd = os.open(root, directory_flags)
     file_fd = -1
     try:
@@ -136,7 +146,7 @@ def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
             directory_fd = next_fd
         file_fd = os.open(
             relative.parts[-1],
-            os.O_RDONLY | os.O_CLOEXEC | nofollow_flag(),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=directory_fd,
         )
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):
@@ -271,9 +281,9 @@ def _validate_generation_manifest(
             raise _fail("summary artifact entry is malformed")
         name = str(entry["phase"])
         if name in listed:
-            raise _fail(f"duplicate artifact entry for {('winner', name)}")
+            raise _fail(f"duplicate artifact entry for winner {name!r}")
         listed[name] = entry
-    snapshot_phases = _validate_generation_provenance_files(
+    provenance = _validate_generation_provenance_files(
         generation_dir,
         summary,
         listed_files,
@@ -387,9 +397,9 @@ def _validate_generation_manifest(
             repeats = _validate_repeats_block(
                 payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
             )
-            if name not in snapshot_phases.repeats:
+            if name not in provenance.repeats:
                 raise ValueError("the config snapshot plans no such phase")
-            _check_repeats_axis(repeats, snapshot_phases.repeats[name])
+            _check_repeats_axis(repeats, provenance.repeats[name])
         except ValueError as exc:
             raise _fail(f"winner for phase {name!r} has no valid repeats block ({exc})") from exc
         winners[name] = ValidatedWinner(
@@ -414,9 +424,11 @@ def _validate_generation_manifest(
         generation_id=generation_id,
         summary=summary,
         phase_plan=phase_plan,
-        inherits=snapshot_phases.inherits,
+        inherits=provenance.inherits,
         metric=metric,
         winners=winners,
+        argparse_trainer_config=provenance.argparse_trainer_config,
+        code_revision=provenance.code_revision,
     )
 
 
@@ -426,7 +438,7 @@ def _validate_generation_provenance_files(
     listed_files: Mapping[str, Mapping[str, Any]],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
-) -> SnapshotPhases:
+) -> GenerationProvenance:
     """Validate claim-time configuration and reproducibility files against the manifest.
 
     Both files are mandatory and must match their hashes and the summary's identity.
@@ -446,8 +458,9 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return SnapshotPhases: Each snapshot phase's parents, in plan order, and its
-        configured ``repeats``.
+    :return GenerationProvenance: Each snapshot phase's parents, in plan order, its
+        configured ``repeats``, the producing argparse base when applicable, and the
+        reproducibility record's ``code_revision``.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -503,6 +516,10 @@ def _validate_generation_provenance_files(
 
     if summary.get("config_fingerprint") != record.get("config_fingerprint"):
         raise fail("summary config fingerprint disagrees with the reproducibility artifact")
+    try:
+        code_revision = _parse_code_revision(record)
+    except ValueError as exc:
+        raise fail(f"reproducibility artifact has a malformed code_revision ({exc})") from exc
 
     snapshot_phases = snapshot.get("phases")
     if not isinstance(snapshot_phases, list) or any(
@@ -543,7 +560,18 @@ def _validate_generation_provenance_files(
             raise fail(
                 f"config_snapshot artifact has a malformed repeats block for {phase['name']!r}"
             ) from exc
-    return SnapshotPhases(inherits=inherits, repeats=repeats)
+    argparse_trainer_config: JsonObject | None = None
+    if snapshot.get("override_format") == "argparse":
+        try:
+            argparse_trainer_config = json_object(snapshot.get("trainer_config"))
+        except ValueError as exc:
+            raise fail("config_snapshot artifact has a malformed trainer_config") from exc
+    return GenerationProvenance(
+        inherits=inherits,
+        repeats=repeats,
+        argparse_trainer_config=argparse_trainer_config,
+        code_revision=code_revision,
+    )
 
 
 @dataclass(frozen=True)

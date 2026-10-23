@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from phasesweep.config.models import GpuPolicy
+from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
@@ -33,6 +33,10 @@ log = logging.getLogger("phasesweep.runtime.gpu")
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
 _MIG_UUID_INVENTORY = re.compile(r"\(UUID:\s*(MIG-[^)]+)\)", re.IGNORECASE)
+_GPU_HOST_ACCESS_HINT = (
+    "If this shell is sandboxed, rerun GPU validation, dry runs, and training in a "
+    "host shell with GPU access."
+)
 
 
 class GpuLeaseTimeoutError(TimeoutError):
@@ -143,10 +147,10 @@ def _release_host_gpu_lease(lease: IO[str] | None) -> None:
 def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
     """Probe ``nvidia-smi`` once for visible indices and usable device UUIDs.
 
-    Returns:
-        Numeric indices plus the subset mapped to a ``GPU-...`` or ``MIG-...``
-        identity. Both are empty when the probe is unavailable.
-
+    :return tuple[list[int], dict[str, str]]: Numeric indices plus the subset mapped to a
+        ``GPU-...`` or ``MIG-...`` identity, keyed by index. Both are empty when there is no
+        usable ``nvidia-smi``: the binary is missing or not runnable, it exits nonzero, or it
+        times out. Callers turn an empty inventory into their own refusal.
     """
     try:
         out = subprocess.run(
@@ -156,11 +160,9 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
             timeout=5,
             check=False,
         )
-        if out.returncode != 0:
-            return [], {}
-    except FileNotFoundError:
+    except (OSError, subprocess.SubprocessError):
         return [], {}
-    except Exception:  # noqa: BLE001
+    if out.returncode != 0:
         return [], {}
     ids: list[int] = []
     uuid_map: dict[str, str] = {}
@@ -189,9 +191,9 @@ def _detect_mig_uuid_set() -> set[str]:
             timeout=5,
             check=False,
         )
-        if out.returncode != 0:
-            return set()
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if out.returncode != 0:
         return set()
     return {match.group(1) for match in _MIG_UUID_INVENTORY.finditer(out.stdout)}
 
@@ -253,7 +255,8 @@ def _bind_lock_identities(
             ``nvidia-smi`` cannot validate an opaque token, or a configured
             numeric/UUID identity is absent from the readable inventory.
     :return list[GpuDevice]: The same devices, in order, with ``lock_token``
-        populated where a canonical identity could be resolved. No device is dropped.
+        set to its canonical GPU or MIG identity. A token that cannot be resolved
+        raises instead, so no device is dropped.
     """
     _validate_device_token_shapes(devices)
     numeric = [device for device in devices if device.visible_token.isdigit()]
@@ -271,7 +274,7 @@ def _bind_lock_identities(
             "Cannot validate configured MIG token(s) "
             f"{[device.visible_token for device in mig_tokens]} because nvidia-smi -L "
             "reported no usable MIG inventory. Fix nvidia-smi or the configured "
-            "gpu_devices/CUDA_VISIBLE_DEVICES value."
+            f"gpu_devices/CUDA_VISIBLE_DEVICES value. {_GPU_HOST_ACCESS_HINT}"
         )
     if not uuid_map:
         if gpu_tokens:
@@ -279,7 +282,7 @@ def _bind_lock_identities(
                 "Cannot validate configured GPU UUID token(s) "
                 f"{[device.visible_token for device in gpu_tokens]} because nvidia-smi "
                 "reported no usable GPU UUID inventory. Fix nvidia-smi or the configured "
-                "gpu_devices/CUDA_VISIBLE_DEVICES value."
+                f"gpu_devices/CUDA_VISIBLE_DEVICES value. {_GPU_HOST_ACCESS_HINT}"
             )
         if numeric:
             raise GpuConfigurationError(
@@ -287,7 +290,8 @@ def _bind_lock_identities(
                 f"{[device.visible_token for device in numeric]} because nvidia-smi "
                 "reported no usable index-to-UUID inventory. Accepting index-form locks "
                 "would not exclude a concurrent UUID-form lock for the same card. Fix "
-                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value."
+                "nvidia-smi or the configured gpu_ids/gpu_devices/CUDA_VISIBLE_DEVICES value. "
+                f"{_GPU_HOST_ACCESS_HINT}"
             )
 
     resolved: list[GpuDevice] = []
@@ -432,6 +436,24 @@ class GpuPool:
         _live_pools.add(self)
 
     @classmethod
+    def for_phase(cls, phase: Phase, *, cuda_visible_devices: str | None = None) -> GpuPool:
+        """Resolve a phase's GPU inventory without acquiring host leases.
+
+        :param Phase phase: Phase supplying isolation policy and requested devices.
+        :param str | None cuda_visible_devices: Configured visibility, or None for ambient.
+        :return GpuPool: Pool ready for acquisition, after inventory checks and diagnostics.
+        :raises GpuConfigurationError: The phase's isolation policy cannot be honored.
+        """
+        return cls.create(
+            n_jobs=phase.n_jobs,
+            explicit_ids=phase.gpu_ids,
+            explicit_devices=phase.gpu_devices,
+            allow_no_gpu=phase.allow_no_gpu_isolation,
+            policy=phase.gpu_policy,
+            cuda_visible_devices=cuda_visible_devices,
+        )
+
+    @classmethod
     def create(
         cls,
         n_jobs: int,
@@ -548,23 +570,24 @@ class GpuPool:
                     "nvidia-smi could not enumerate GPUs, but "
                     "/proc/driver/nvidia/gpus reports hardware. PhaseSweep cannot "
                     "derive canonical device locks, so launching with unrestricted "
-                    "CUDA visibility could double-book the host. Fix nvidia-smi or "
-                    "set gpu_ids/gpu_devices explicitly"
+                    "CUDA visibility could double-book the host. Fix nvidia-smi. "
+                    f"{_GPU_HOST_ACCESS_HINT}"
                 )
                 if not allow_no_gpu:
                     raise GpuConfigurationError(
-                        f"{message}; set allow_no_gpu_isolation: true only to accept "
-                        "running without GPU host locks."
+                        f"{message} For intentional CPU-only work, set gpu_policy: none "
+                        "and disable CUDA in the trainer environment. Set "
+                        "allow_no_gpu_isolation: true only to accept running without GPU host locks."
                     )
                 if pinned == "":
                     log.warning(
-                        "%s; pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
+                        "%s PhaseSweep is pinning CUDA_VISIBLE_DEVICES='' without GPU host locks because "
                         "allow_no_gpu_isolation: true is set.",
                         message,
                     )
                 else:
                     log.warning(
-                        "%s; running without CUDA isolation because "
+                        "%s PhaseSweep is running without CUDA isolation because "
                         "allow_no_gpu_isolation: true is set.",
                         message,
                     )
@@ -654,10 +677,14 @@ class GpuPool:
         """
         if not self._devices:
             return None
+        waiting_logged = False
         while True:
             with self._condition:
                 while not self._available:
                     wait_seconds = self._remaining_seconds(deadline)
+                    if not waiting_logged:
+                        log.info("Waiting for GPU lease: local GPU slots are in use.")
+                        waiting_logged = True
                     self._condition.wait(timeout=wait_seconds)
                 candidates = list(self._available)
                 self._available.clear()
@@ -683,6 +710,9 @@ class GpuPool:
                     self._condition.notify_all()
             if acquired is not None:
                 return acquired
+            if not waiting_logged:
+                log.info("Waiting for GPU lease: host GPU locks are held.")
+                waiting_logged = True
             self._wait_for_retry(deadline)
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
@@ -694,10 +724,14 @@ class GpuPool:
         """
         if not self._devices:
             return None
+        waiting_logged = False
         while True:
             with self._condition:
                 while self._whole_node_in_use:
                     wait_seconds = self._remaining_seconds(deadline)
+                    if not waiting_logged:
+                        log.info("Waiting for GPU lease: local GPU slots are in use.")
+                        waiting_logged = True
                     self._condition.wait(timeout=wait_seconds)
                 self._whole_node_in_use = True
 
@@ -722,6 +756,9 @@ class GpuPool:
                         self._whole_node_in_use = False
                         self._condition.notify_all()
             if not all_leased:
+                if not waiting_logged:
+                    log.info("Waiting for GPU lease: host GPU locks are held.")
+                    waiting_logged = True
                 self._wait_for_retry(deadline)
                 continue
 
@@ -747,10 +784,8 @@ class GpuPool:
     def _release(self, acquired: _GpuAcquisition | None) -> None:
         """Return a previously-acquired CUDA device token to the pool.
 
-        Args:
-            acquired: Assignment returned by :meth:`_acquire`. ``None`` is a no-op
-                (inactive pool).
-
+        :param _GpuAcquisition | None acquired: Assignment returned by :meth:`_acquire`.
+            ``None`` is a no-op (inactive pool).
         """
         if acquired is None:
             return
@@ -771,8 +806,9 @@ class GpuPool:
         """Block until a GPU is available and yield its visibility plus lease FDs.
 
         :param float | None deadline: Optional monotonic deadline for the wait.
-        :return: Context manager yielding GpuAssignment visibility and guardian-inherited lock FDs.
-            Inactive pools carry a configured disable sentinel or None visibility.
+        :return Generator[GpuAssignment, None, None]: Context manager yielding GpuAssignment
+            visibility and guardian-inherited lock FDs. Inactive pools carry a configured disable
+            sentinel or None visibility.
         :raises GpuLeaseTimeoutError: The deadline expired before acquisition.
         :raises GpuLeaseCancelledError: The owning phase cancelled queued waits.
         """

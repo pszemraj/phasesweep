@@ -114,7 +114,11 @@ def _reap_stale_trials(
                     f"with an inconsistent study. trial_dir={trial_dir}"
                 ),
             )
-            log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
+            log.info(
+                "Confirmed process cleanup for RUNNING trial %d in study %s",
+                trial.number,
+                study.study_name,
+            )
         if recovered_attempts is not None and record is not None:
             recovered_attempts[record.attempt_id] = record
         count += 1

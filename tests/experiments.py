@@ -58,7 +58,7 @@ def anchored_phase(high: int = 3) -> dict[str, object]:
 
 
 def write_anchored_config(path: Path, **fields: object) -> Path:
-    """Write the echo trainer used by anchored-path and fingerprint tests."""
+    """Write an anchored experiment config whose trial echoes ``x=0.5``, with ``fields`` overriding its keys, and return its path."""
     payload = {
         "experiment": "anchored",
         "trial_command": "echo x=0.5 {overrides}",

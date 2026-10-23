@@ -5,8 +5,7 @@ Mutations require the experiment lock. Reads and previews use captured snapshots
 ``validate_ledger`` checks tree ownership before scanning; a bound tree's unreadable
 scan may still serve its frozen publication. ``claim_ledger`` requires a complete
 scan, repairs a partial final record and validates existing studies before writing.
-It then creates the ledger directory, binds the tree and claims empty studies, in
-that order. Execution requires a ClaimedLedger.
+Execution requires a ClaimedLedger.
 
 MCP recovery may open live studies from a ValidatedLedger, checking their artifact
 ownership before reaping. Registry recovery validates its separately recorded ledger.
@@ -36,7 +35,6 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
 from phasesweep.engine.artifact_roots import (
     BindingState,
-    _artifact_root_binding_applies,
     _artifact_root_claim_needed,
     _bind_study_artifact_root,
     _check_artifact_root_binding,
@@ -168,24 +166,45 @@ def _resolve_storage(url: str) -> JournalStorage:
     return JournalStorage(JournalFileBackend(str(path), lock_obj=_JournalLock(path)))
 
 
-def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
-    """Create or load a phase's Optuna study in already-resolved storage.
+def _build_phase_study(
+    experiment: Experiment, phase: Phase, storage: optuna.storages.BaseStorage | None
+) -> optuna.Study:
+    """Load a phase's Optuna study from already-resolved storage, creating it only if absent.
+
+    Journal storage appends a creation record on every ``create_study`` call and
+    only afterwards finds that the name exists, so creating with ``load_if_exists``
+    on each open grows the journal by one record per open. Loading first leaves an
+    existing study's journal untouched; the creating call stays as the fallback for
+    a missing study, and its ``load_if_exists`` still loads the study when another
+    process creates it first.
 
     :param Experiment experiment: Parsed experiment config supplying the metric direction.
     :param Phase phase: Phase whose sampler, search space, and study name are used.
-    :param Any storage: Resolved Optuna storage, or ``None`` for in-memory.
-    :return optuna.Study: Created or loaded Optuna study for the phase.
+    :param optuna.storages.BaseStorage | None storage: Resolved Optuna storage, or
+        ``None`` for a fresh in-memory study.
+    :return optuna.Study: Loaded or newly created Optuna study for the phase.
     """
+    study_name = _phase_study_name(experiment, phase)
+    sampler = _build_sampler(
+        phase.sampler,
+        sampler_search_space(phase),
+        n_jobs=phase.n_jobs,
+        repeats=phase.repeats,
+    )
+    pruner = optuna.pruners.NopPruner()
+    if storage is not None:
+        try:
+            return optuna.load_study(
+                study_name=study_name, storage=storage, sampler=sampler, pruner=pruner
+            )
+        except KeyError:
+            # Optuna signals a study absent from the storage with KeyError.
+            pass
     return optuna.create_study(
-        study_name=_phase_study_name(experiment, phase),
+        study_name=study_name,
         storage=storage,
-        sampler=_build_sampler(
-            phase.sampler,
-            sampler_search_space(phase),
-            n_jobs=phase.n_jobs,
-            repeats=phase.repeats,
-        ),
-        pruner=optuna.pruners.NopPruner(),
+        sampler=sampler,
+        pruner=pruner,
         direction=experiment.metric.goal,
         load_if_exists=True,
     )
@@ -891,7 +910,7 @@ def read_trial_stats(
         snapshot = _journal_snapshot_storage(
             ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
     stats: dict[str, _PhaseTrialStats] = {}
     for phase in phases:
@@ -906,7 +925,7 @@ def read_trial_stats(
             )
         except StudySchemaMismatchError:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
     return stats
 
@@ -1044,10 +1063,11 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     """Validate all phases and claim their ledger under the experiment lock.
 
     Repair a partial final record before opening live storage. Read or ownership
-    failures abort before claims or recovery. Reached published phases require their
-    recorded trial history; skipped phases use saved winners. Recheck the tree binding,
-    create the ledger directory, bind the tree, then claim empty studies. Absent studies
-    are created by :func:`open_phase_study`; existing studies are returned for preflight.
+    failures abort before claims or recovery. An unusable publication is refused for
+    every storage backend. Reached published phases require their recorded trial
+    history; skipped phases use saved winners. Recheck the tree binding, create the
+    ledger directory, bind the tree, then claim empty studies. Absent studies are
+    created by :func:`open_phase_study`; existing studies are returned for preflight.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
@@ -1061,6 +1081,10 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
+    :raises PublicationAccessError: The last publication cannot be read as the
+        current user; nothing was written.
+    :raises PublicationIntegrityError: The last publication no longer
+        validates; nothing was written.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, carries a binding that is not a string, or the
         tree's ownership record changed after validation.
@@ -1083,12 +1107,11 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
             raise unavailable from exc
         if study is not None:
             loaded[phase.name] = study
-    claimable: list[optuna.Study] = []
-    if _artifact_root_binding_applies(experiment):
-        _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
-        claimable = [
-            study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
-        ]
+    _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
+    # An in-memory ledger loads no studies, so only persistent studies are claimed.
+    claimable = [
+        study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
+    ]
     offered = _artifact_root_identity(experiment)
     binding_state = _check_artifact_root_binding(experiment)
     if binding_state != ledger.binding_state or offered != ledger.artifact_root:

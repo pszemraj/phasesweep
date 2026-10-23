@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -143,9 +145,9 @@ class CategoricalParam(_Frozen):
         Optuna persists the first equal choice, so ``1``, ``1.0``, and ``True``
         cannot coexist as choices. Duplicates also alter random sampling weights.
 
-        :param choices: Candidate choices in configured order.
+        :param list choices: Candidate choices in configured order.
         :raises ValueError: A choice is unsupported, non-finite, or equal to an earlier choice.
-        :return: The choices, unchanged.
+        :return list: The choices, unchanged.
         """
         _validate_optuna_choices(choices, label="categorical choices")
         return choices
@@ -320,8 +322,8 @@ def sampler_capability_line(phase: Phase, storage: str | None) -> str:
 def sampler_warnings(phase: Phase) -> list[str]:
     """List advisory sampler and trial-budget warnings without blocking execution.
 
-    Fixed configurations have no sampler warnings; multiple requested trials
-    may represent retries, which only the existing study can establish.
+    A fixed configuration warns when ``n_trials`` exceeds 1, since the extra trials
+    can only retry failed attempts.
 
     :param Phase phase: Phase whose sampler, trial target and failure budget are checked.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
@@ -340,6 +342,12 @@ def sampler_warnings(phase: Phase) -> list[str]:
             "and TPE never fits its model. Use sampler.type: random with a seed (same "
             "coverage), or set sampler.n_startup_trials below n_trials."
         )
+    if sampler.type in ("tpe", "cmaes") and phase_draws(phase) and phase.n_jobs > 1:
+        warnings.append(
+            f"Phase {phase.name!r}: parallel {sampler.type} suggestions depend on trial "
+            "completion order and are not reproducible even with sampler.seed. "
+            "Set sampler.seed and use n_jobs: 1 for reproducible draws given the same trial values."
+        )
     repeats = phase.repeats
     if repeats is not None and phase.max_consecutive_failures <= len(repeats.values):
         count = len(repeats.values)
@@ -352,19 +360,109 @@ def sampler_warnings(phase: Phase) -> list[str]:
     return warnings
 
 
-def fixed_configuration_target_refusal(
-    phase: Phase, *, finished: int, completed: int
-) -> str | None:
+_MAX_REPORTED_CHOICES = 6
+_EXPONENT_LITERAL = re.compile(r"([+-]?\d+)(?:\.(\d*))?e([+-]?)(\d+)")
+_MAX_DECIMAL_SPELLING_CHARS = 24
+
+
+def _is_numeric_string(choice: object) -> bool:
+    """Say whether a categorical choice is a string that Python reads as a finite float.
+
+    :param object choice: One configured categorical choice.
+    :return bool: ``True`` for a string such as ``"1e-4"`` that YAML 1.1 left as text.
+    """
+    if not isinstance(choice, str):
+        return False
+    try:
+        return math.isfinite(float(choice))
+    except ValueError:
+        return False
+
+
+def _numeric_spellings(text: str) -> str:
+    """Spell a numeric string as the YAML 1.1 numbers that mean it.
+
+    :param str text: A string for which :func:`_is_numeric_string` holds.
+    :return str: The decimal-point-and-signed-exponent form and the plain decimal form
+        joined by ``or`` for an exponent, otherwise the number unquoted.
+    """
+    stripped = text.strip()
+    match = _EXPONENT_LITERAL.fullmatch(stripped.lower())
+    if match is None:
+        return f"{stripped} without quotes"
+    whole, fraction, sign, exponent = match.groups()
+    spellings = [f"{whole}.{fraction or '0'}e{sign or '+'}{exponent}"]
+    plain = format(Decimal(stripped), "f")
+    if len(plain) <= _MAX_DECIMAL_SPELLING_CHARS:
+        spellings.append(plain)
+    return " or ".join(spellings)
+
+
+def search_space_warnings(phase: Phase) -> list[str]:
+    """List advisory search-space warnings without blocking execution.
+
+    A categorical choice that is a string reading as a float, such as ``1e-4``, is what
+    PyYAML's YAML 1.1 typing makes of an exponent without a decimal point and sign. The
+    trainer then receives text where it expects a number.
+
+    :param Phase phase: Phase whose categorical choices are checked.
+    :return list[str]: One sentence per categorical key with such choices, empty when
+        nothing is amiss.
+    """
+    warnings: list[str] = []
+    for key, param in phase.search_space.items():
+        if not isinstance(param, CategoricalParam):
+            continue
+        numeric = [choice for choice in param.choices if _is_numeric_string(choice)]
+        if not numeric:
+            continue
+        shown = [repr(choice) for choice in numeric[:_MAX_REPORTED_CHOICES]]
+        if len(numeric) > _MAX_REPORTED_CHOICES:
+            shown.append(f"and {len(numeric) - _MAX_REPORTED_CHOICES} more")
+        warnings.append(
+            f"Phase {phase.name!r}: search_space {key!r} has categorical choices that load as "
+            f"strings, not numbers: {', '.join(shown)}. YAML 1.1 leaves an exponent without a "
+            "decimal point and sign as text (so does a quoted number), and the trainer "
+            f"receives a string. Write {numeric[0].strip()} as {_numeric_spellings(numeric[0])}, "
+            "and the rest likewise, or ignore this if the strings are intended."
+        )
+    return warnings
+
+
+def retry_target_ceiling(phase: Phase, *, finished: int, measured: int) -> int | None:
+    """Return the largest ``n_trials`` a fixed configuration or grid may be raised to.
+
+    A fixed configuration keeps at most one COMPLETE result, feasible or not, so
+    its ceiling is one attempt beyond its failures until one completes and its
+    finished attempts afterwards. A grid applies that rule per cell: one new
+    attempt for each cell without a COMPLETE result. Other sampled phases have
+    no ceiling.
+
+    :param Phase phase: Phase whose ceiling is computed.
+    :param int finished: Finished attempts its study holds, interrupted ones left
+        out, zero when the study does not exist yet.
+    :param int measured: How many of those attempts are COMPLETE, feasible or not.
+    :return int | None: The ceiling, or ``None`` when the phase is unrestricted.
+    """
+    if not phase_draws(phase):
+        return finished if measured >= 1 else finished + 1
+    if phase.sampler.type != "grid":
+        return None
+    return finished + grid_cardinality(phase) - measured
+
+
+def fixed_configuration_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
     """Refuse extra measurements of an already completed fixed configuration.
 
     A fixed configuration keeps at most one COMPLETE result, feasible or not.
-    Without one, the target may allow one attempt beyond its finished failures.
-    Interrupted reruns do not count. Sampled phases are unrestricted here.
+    Without one, the target may allow one attempt beyond its finished failures
+    (:func:`retry_target_ceiling`). Interrupted reruns do not count. Sampled
+    phases are unrestricted here.
 
     :param Phase phase: Phase whose ``n_trials`` is checked.
     :param int finished: Finished attempts its study already holds, interrupted
         ones left out, zero when the study does not exist yet.
-    :param int completed: How many of those attempts are COMPLETE, whether or
+    :param int measured: How many of those attempts are COMPLETE, whether or
         not they are feasible.
     :return str | None: The refusal, which names the fix, or ``None`` when the
         target is allowed.
@@ -372,16 +470,15 @@ def fixed_configuration_target_refusal(
     if phase_draws(phase):
         return None
     name, target = phase.name, phase.n_trials
-    if completed >= 1:
-        if target <= finished:
-            return None
-        return (
-            f"Phase {name!r} is a fixed configuration that already has a completed trial; "
-            f"n_trials={target} would run the same configuration again. Keep n_trials at "
-            f"{finished}, or use repeats to measure seed noise."
-        )
-    if target <= finished + 1:
+    ceiling = retry_target_ceiling(phase, finished=finished, measured=measured)
+    if ceiling is None or target <= ceiling:
         return None
+    if measured >= 1:
+        return (
+            f"Phase {name!r} is a fixed configuration that already has a COMPLETE or "
+            f"INFEASIBLE trial; n_trials={target} would run the same configuration again. "
+            f"Keep n_trials at {finished}, or use repeats to measure seed noise."
+        )
     if finished == 0:
         return (
             f"Phase {name!r}: n_trials={target} with an empty search_space would run {target} "
@@ -396,7 +493,42 @@ def fixed_configuration_target_refusal(
     )
 
 
-def _validate_sampler_search_space(phase: Phase) -> None:
+def grid_cardinality(phase: Phase) -> int:
+    """Return the validated grid size, including its repeat axis.
+
+    :param Phase phase: Phase whose grid can be enumerated.
+    :return int: Number of cells in the grid.
+    """
+    return math.prod(
+        _grid_value_counts(sampler_search_space(phase), phase_name=phase.name).values()
+    )
+
+
+def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
+    """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
+
+    Finished failures remain spent. Raising the target may retry each failed
+    cell once, or visit an unvisited cell; a completed cell is closed even if
+    its metric was infeasible.
+
+    :param Phase phase: Phase whose target is checked.
+    :param int finished: Finished attempts, excluding interruptions.
+    :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
+    :return str | None: Refusal when the target exceeds the available cells.
+    """
+    maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
+    if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
+        return None
+    cardinality = grid_cardinality(phase)
+    return (
+        f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
+        f"attempts: {finished} finished attempts and {measured} COMPLETE or INFEASIBLE cells "
+        f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
+        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated."
+    )
+
+
+def _validate_sampler_search_space(phase: Phase, *, persistent: bool = False) -> None:
     """Validate sampler compatibility and the concrete trial target at config load.
 
     Grid counts include the repeat axis, float rounding, step fidelity, bounds,
@@ -404,13 +536,16 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     instead use :func:`fixed_configuration_target_refusal`.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
+    :param bool persistent: Whether recorded failed cells can justify grid retries.
     :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
         or with ``repeats``, if ``repeats`` is set without grid or seeded random
         or with a trial count that does not cover every repeat, if the CMA-ES
         sampler is paired with categorical params or the ``cmaes`` package is
         not importable, if the grid sampler cannot enumerate a parameter
         (raised by :func:`_grid_value_counts`), or if ``n_trials`` exceeds the
-        grid cardinality or does not equal it without ``allow_partial_grid``.
+        grid cardinality on in-memory storage or is below it without
+        ``allow_partial_grid``. Persistent upper targets are checked against
+        the recorded attempts at launch.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
@@ -423,7 +558,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             "sampler.type: grid."
         )
     if phase.repeats is not None:
-        _validate_repeat_sampling(phase, phase.repeats)
+        _validate_repeat_sampling(phase, phase.repeats, persistent=persistent)
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]
@@ -443,21 +578,19 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             ) from exc
 
     if sampler_type == "grid" and phase_draws(phase):
-        cardinality = math.prod(
-            _grid_value_counts(sampler_search_space(phase), phase_name=phase.name).values()
-        )
+        cardinality = grid_cardinality(phase)
         repeat_note = (
             ""
             if phase.repeats is None
             else f" ({cardinality // len(phase.repeats.values)} configurations x "
             f"{len(phase.repeats.values)} repeats)"
         )
-        if phase.n_trials > cardinality:
+        if phase.n_trials > cardinality and not persistent:
             raise ValueError(
                 f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
                 f"cardinality {cardinality}{repeat_note}."
             )
-        if not phase.allow_partial_grid and phase.n_trials != cardinality:
+        if not phase.allow_partial_grid and phase.n_trials < cardinality:
             remedy = (
                 "increase n_trials or set allow_partial_grid: true."
                 if phase.repeats is None
@@ -471,17 +604,18 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
+def _validate_repeat_sampling(phase: Phase, repeats: Repeats, *, persistent: bool = False) -> None:
     """Require complete repeat groups under grid or seeded random sampling.
 
     Partial grids are refused because they can leave configuration groups incomplete.
 
     :param Phase phase: Phase whose sampler and trial target are checked.
     :param Repeats repeats: The phase's repeats block.
+    :param bool persistent: Whether a raised grid target may retry recorded failed cells.
     :raises ValueError: The sampler is neither grid nor seeded random,
         ``allow_partial_grid`` is set, an empty search space has ``n_trials``
-        other than the repeat count, or seeded random has ``n_trials`` that is
-        not a multiple of it.
+        below the repeat count (or differs from it without persistent grid
+        storage), or seeded random has ``n_trials`` that is not a multiple of it.
     """
     sampler = phase.sampler
     count = len(repeats.values)
@@ -506,7 +640,11 @@ def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
             "complete groups. To run a subset of configurations with all their repeats, use "
             "sampler.type random with a seed."
         )
-    if not phase.search_space and phase.n_trials != count:
+    if (
+        not phase.search_space
+        and phase.n_trials != count
+        and not (persistent and sampler.type == "grid" and phase.n_trials > count)
+    ):
         raise ValueError(
             f"Phase {phase.name!r}: repeats over an empty search_space runs one configuration "
             f"once per repeat value, so n_trials must be {count} (the number of "
@@ -626,7 +764,7 @@ def _placeholder_values_for(search_space: Mapping[str, SearchParam]) -> dict[str
     """Choose deterministic preflight values for every sampler axis.
 
     :param Mapping[str, SearchParam] search_space: Parameters keyed by override name.
-    :return: One valid value per parameter.
+    :return dict: One valid value per parameter.
     """
     return {
         name: param.low if isinstance(param, (FloatParam, IntParam)) else param.choices[0]

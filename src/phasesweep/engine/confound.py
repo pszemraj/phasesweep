@@ -17,7 +17,7 @@ from typing import Any, Literal, get_args
 import optuna
 
 from phasesweep.engine.repeats import RankedGroup, within_noise
-from phasesweep.engine.state import _trial_interrupted
+from phasesweep.engine.state import RERUN_OF_ATTR, _trial_interrupted
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 
@@ -36,7 +36,7 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 CONFOUND_SCHEMA_VERSION = 2
 
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed")
-# Where a terminal trial that selection did not rank is counted. A COMPLETE
+# Where a finished trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set violated a constraint or the metric's bounds,
 # unless it was feasible and only its repeat group was incomplete; a trial
 # that failed an evidence gate or extraction is FAIL.
@@ -149,7 +149,9 @@ def _survivorship(
 
     Failures include evidence-gate and extraction errors. Infeasible trials and
     feasible members of incomplete repeat groups are counted separately and do not
-    flag; interrupted trials are excluded. Counts are recorded for every verdict.
+    flag; interrupted trials are excluded, and so is a failed attempt that a
+    COMPLETE or INFEASIBLE retry replaced (:func:`_replaced_by_measured_retry`), since
+    its cell has a measured trial. Counts are recorded for every verdict.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
@@ -157,16 +159,42 @@ def _survivorship(
     :return dict[str, Any]: The check record.
     """
     ranked_numbers = {trial.number for trial in ranked}
+    replaced = _replaced_by_measured_retry(trials)
     counts = dict.fromkeys(_SURVIVORSHIP_COUNTS, 0)
     counts["ranked"] = len(ranked_numbers)
     for trial in trials:
         bucket = _EXCLUDED_BY_STATE.get(trial.state)
         if bucket is None or trial.number in ranked_numbers or _trial_interrupted(trial):
             continue
+        if bucket == "failed" and trial.number in replaced:
+            continue
         if bucket == "infeasible" and trial.number in incomplete_group:
             bucket = "incomplete_group"
         counts[bucket] += 1
     return _checked("survivorship", counts)
+
+
+def _replaced_by_measured_retry(trials: Sequence[optuna.trial.FrozenTrial]) -> set[int]:
+    """Return the numbers of attempts that a COMPLETE retry replaced, however many retries ago.
+
+    A retry names the attempt it reran under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`
+    and runs that attempt's configuration, repeat value included, so the links trace a
+    cell's attempts. Every attempt on the chain behind a COMPLETE trial is replaced; a chain
+    that ends in a failure replaces none, and the failures in it stay counted.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
+    :return set[int]: Trial numbers of the replaced attempts.
+    """
+    by_number = {trial.number: trial for trial in trials}
+    replaced: set[int] = set()
+    for trial in trials:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        source = trial.user_attrs.get(RERUN_OF_ATTR)
+        while source in by_number and source not in replaced:
+            replaced.add(source)
+            source = by_number[source].user_attrs.get(RERUN_OF_ATTR)
+    return replaced
 
 
 def _tie(
@@ -248,7 +276,7 @@ def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
 
 
 def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
-    """Whether failed trials were at least as numerous as ranked ones.
+    """Whether at least one trial failed and failures are at least as numerous as ranked ones.
 
     :param Mapping[str, int] counts: Survivorship counts.
     :return bool: Whether the failures could have decided what was ranked.
@@ -564,7 +592,11 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"{detail['axis']} values ({_logged_values(groups)}), the lowest more than "
                 f"{_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
                 "search space changes training length (for example epochs or max_steps); "
-                "otherwise the trials were not trained to one budget"
+                "otherwise the trials were not trained to one budget. A training-length phase "
+                "checks cleanly on a relative axis, which still flags a run that stopped early: "
+                'report progress={"schedule_fraction": actual_steps / planned_steps} through '
+                "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
+                "on a json_envelope metric"
             )
         elif name == "survivorship":
             lines.append(

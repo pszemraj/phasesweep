@@ -1,6 +1,6 @@
 """Shutdown-signal handling and the live-child registry it drains.
 
-SIGTERM, SIGINT and available SIGHUP terminate registered process groups and raise
+SIGTERM, SIGINT and SIGHUP terminate registered process groups and raise
 ``PhaseSweepShutdown`` with cleanup evidence. Scopes control handler ownership and
 defer or absorb signals during critical sections.
 """
@@ -31,14 +31,10 @@ _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 # The handler waits until each in-flight launch registers its PGID or fails.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
+# Execution is Linux-only, but the package must import anywhere so that
+# require_linux_runtime(), not an AttributeError, reports a host without SIGHUP.
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
-    sig
-    for sig in (
-        signal.SIGTERM,
-        signal.SIGINT,
-        getattr(signal, "SIGHUP", None),
-    )
-    if sig is not None
+    signal.Signals[name] for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name)
 )
 
 
@@ -61,12 +57,10 @@ class PhaseSweepShutdown(SystemExit):
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
         """Create a POSIX-style signaled exit with structured cleanup evidence.
 
-        Args:
-            signum: Shutdown signal that triggered the exit; the exit code is
-                ``128 + signum`` per the POSIX signaled-exit convention.
-            report: Cleanup evidence captured by the shutdown handler for the
-                child process groups it terminated.
-
+        :param int signum: Shutdown signal that triggered the exit; the exit code is
+            ``128 + signum`` per the POSIX signaled-exit convention.
+        :param ShutdownCleanupReport report: Cleanup evidence captured by the shutdown handler
+            for the child process groups it terminated.
         """
         super().__init__(128 + signum)
         self.signum = signum
@@ -129,16 +123,12 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     A main-thread critical section records the signal for its exit checkpoint;
     a concurrent handler invocation returns without interrupting cleanup.
 
-    Args:
-        signum: Shutdown signal number.
-        _frame: Unused frame required by the signal handler protocol.
-
-    Raises:
-        PhaseSweepShutdown: Exit code ``128 + signum``, unless deferred or cleanup
-            is already running.
-
+    :param int signum: Shutdown signal number.
+    :param FrameType | None _frame: Unused frame required by the signal handler protocol.
+    :raises PhaseSweepShutdown: Exit code ``128 + signum``, unless deferred or cleanup is
+        already running.
     """
-    global _deferred_shutdown_signum, _servicing_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum, _servicing_signum
 
     # A second signal must not re-enter registry locks or replace the first
     # handler's cleanup evidence.
@@ -200,8 +190,6 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
 def _unblock_shutdown_signals() -> None:
     """Ensure shutdown signals can reach the main-thread handler."""
-    if not hasattr(signal, "pthread_sigmask"):
-        return
     if threading.current_thread() is not threading.main_thread():
         return
     signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
@@ -213,17 +201,15 @@ _scope_depth = 0
 
 
 def install_signal_handlers() -> None:
-    """Take process-lifetime ownership of SIGTERM, SIGINT and available SIGHUP.
+    """Take process-lifetime ownership of SIGTERM, SIGINT and SIGHUP.
 
     Main-thread only. Reinstall missing handlers and unblock shutdown signals on
     each call. An open temporary scope hands its installation over and skips
     restoration; later scopes leave process-lifetime ownership intact.
 
-    Raises:
-        SignalOwnershipUnavailableError: Called outside the main thread.
-
+    :raises SignalOwnershipUnavailableError: Called outside the main thread.
     """
-    global _process_lifetime_owner  # noqa: PLW0603
+    global _process_lifetime_owner
     if threading.current_thread() is not threading.main_thread():
         raise SignalOwnershipUnavailableError(
             "install_signal_handlers() must be called from the main thread: "
@@ -234,10 +220,8 @@ def install_signal_handlers() -> None:
     if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
         _process_lifetime_owner = True
         return
-    signal.signal(signal.SIGTERM, _shutdown_handler)
-    signal.signal(signal.SIGINT, _shutdown_handler)
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _shutdown_handler)
+    for sig in _SHUTDOWN_SIGNALS:
+        signal.signal(sig, _shutdown_handler)
     _process_lifetime_owner = True
 
 
@@ -263,7 +247,7 @@ def _reassert_process_lifetime_handlers() -> None:
 
 def _restore_host_signal_state(
     prior_handlers: dict[int, Any],
-    prior_mask: Collection[int] | None,
+    prior_mask: Collection[int],
 ) -> Exception | None:
     """Restore the embedding process's shutdown handlers and signal mask.
 
@@ -273,14 +257,12 @@ def _restore_host_signal_state(
     :param dict[int, Any] prior_handlers: Handlers captured before the scope
         installed its own, keyed by signal number. A ``None`` value means the
         signal had a C-level default that Python cannot reinstall.
-    :param Collection[int] | None prior_mask: Thread signal mask captured
-        before the scope unblocked shutdown signals, or ``None`` on platforms
-        without ``signal.pthread_sigmask``.
+    :param Collection[int] prior_mask: Thread signal mask captured before the
+        scope unblocked shutdown signals.
     :return Exception | None: The first restoration failure, or ``None`` when
         every handler was restored.
     """
-    if hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     restoration_error: Exception | None = None
     for sig, handler in prior_handlers.items():
         if handler is None:
@@ -293,12 +275,11 @@ def _restore_host_signal_state(
             continue
         try:
             signal.signal(sig, handler)
-        except Exception as exc:  # noqa: BLE001 - continue past one bad restore
+        except Exception as exc:  # continue past one bad restore
             log.exception("Failed to restore the prior handler for signal %d after scope exit", sig)
             if restoration_error is None:
                 restoration_error = exc
-    if prior_mask is not None:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+    signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
     return restoration_error
 
 
@@ -310,16 +291,12 @@ def signal_handler_scope() -> Iterator[None]:
     restoration, including when claimed inside the scope. Worker calls require that
     ownership. Restoration reports its first error only when the body did not fail.
 
-    Raises:
-        SignalOwnershipUnavailableError: Called from a non-main thread while
-            no enclosing scope or explicit :func:`install_signal_handlers`
-            call already owns the shutdown signals.
-
-    Yields:
-        ``None`` during the run whose children require shutdown cleanup.
-
+    :raises SignalOwnershipUnavailableError: Called from a non-main thread when no
+        :func:`install_signal_handlers` call owns the shutdown signals for the process
+        lifetime; a scope open on the main thread does not count.
+    :return Iterator[None]: Context for the run whose children require shutdown cleanup.
     """
-    global _scope_depth, _servicing_signum  # noqa: PLW0603
+    global _scope_depth, _servicing_signum
 
     if _scope_depth == 0:
         # A new outermost run starts with no shutdown under way.
@@ -347,10 +324,8 @@ def signal_handler_scope() -> Iterator[None]:
         return
 
     prior_handlers: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
-    prior_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        # Read the mask without changing it.
-        prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    # Read the mask without changing it.
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     _scope_depth = 1
     try:
         for sig in _SHUTDOWN_SIGNALS:
@@ -378,18 +353,13 @@ def defer_shutdown_signals() -> Iterator[None]:
 
     Kernel masking blocks this thread's signals; Python-level main-thread deferral
     also covers signals delivered to other threads. Worker launchers instead make
-    the handler wait on the launch lock. Python deferral remains active on platforms
-    without ``pthread_sigmask``.
+    the handler wait on the launch lock.
 
-    Yields:
-        ``None`` during the critical section.
-
+    :return Iterator[None]: Context for the critical section.
     """
-    global _main_thread_defer_depth  # noqa: PLW0603
+    global _main_thread_defer_depth
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     if is_main:
         _main_thread_defer_depth += 1
     try:
@@ -397,9 +367,8 @@ def defer_shutdown_signals() -> Iterator[None]:
     finally:
         if is_main:
             _main_thread_defer_depth -= 1
-        if old_mask is not None:
-            # Mask restoration delivers queued signals after deferral ends.
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        # Mask restoration delivers queued signals after deferral ends.
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main and _main_thread_defer_depth == 0 and _deferred_shutdown_signum is not None:
             service_pending_shutdown()
 
@@ -409,12 +378,11 @@ def service_pending_shutdown() -> None:
 
     Does nothing when no signal is pending.
 
-    Raises:
-        PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup
-            evidence for the recorded signal.
-
+    :raises PhaseSweepShutdown: Via ``_shutdown_handler``, carrying the cleanup evidence for
+        the recorded signal, unless a main-thread critical section is still open (the signal
+        is recorded again) or another handler is already running (the call returns).
     """
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum
     signum = _deferred_shutdown_signum
     _deferred_shutdown_signum = None
     if signum is not None:
@@ -434,37 +402,30 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
 
     Signals arriving inside the window are reported on the yielded object and
     retained for a later shutdown checkpoint. Signals arriving before entry raise
-    normally. Kernel-queued signals are drained while blocked using ``sigtimedwait``;
-    without it, delivery can occur at window exit, with the terminal record remaining
-    authoritative.
+    normally. Kernel-queued signals are drained while blocked using ``sigtimedwait``.
 
-    Yields:
-        AbsorbedShutdown: ``signum`` is the absorbed shutdown signal, or
-        ``None`` when no shutdown arrived during the window.
-
+    :return Iterator[AbsorbedShutdown]: Window outcome whose ``signum`` is the absorbed
+        shutdown signal, or ``None`` when no shutdown arrived during the window; it is set on
+        window exit.
     """
-    global _main_thread_defer_depth  # noqa: PLW0603
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _main_thread_defer_depth
+    global _deferred_shutdown_signum
     absorbed = AbsorbedShutdown()
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = None
-    if hasattr(signal, "pthread_sigmask"):
-        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
     if is_main:
         _main_thread_defer_depth += 1
     try:
         yield absorbed
     finally:
         drained: int | None = None
-        if old_mask is not None and hasattr(signal, "sigtimedwait"):
-            # Drain while blocked to prevent an exception after commit.
-            while True:
-                info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
-                if info is None:
-                    break
-                drained = info.si_signo
-        if old_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        # Drain while blocked to prevent an exception after commit.
+        while True:
+            info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
+            if info is None:
+                break
+            drained = info.si_signo
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main:
             _main_thread_defer_depth -= 1
             recorded = _deferred_shutdown_signum
@@ -479,14 +440,10 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
 def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
-    Args:
-        proc: Newly launched subprocess.
-        pgid: Explicit child process group guarded by ``proc``. When omitted,
-            register ``proc``'s own process group.
-
-    Returns:
-        Registered process-group ID for removal and signal targeting.
-
+    :param subprocess.Popen[bytes] proc: Newly launched subprocess.
+    :param int | None pgid: Explicit child process group guarded by ``proc``. When omitted,
+        register ``proc``'s own process group.
+    :return int: Registered process-group ID for removal and signal targeting.
     """
     resolved_pgid = os.getpgid(proc.pid) if pgid is None else pgid
     with _lock:
@@ -499,10 +456,8 @@ def _unregister(pgid: int) -> None:
 
     Defer shutdown while holding ``_lock`` to prevent handler re-entry deadlock.
 
-    Args:
-        pgid: The process-group ID returned by :func:`_register`. A pgid not
-            currently registered is silently ignored.
-
+    :param int pgid: The process-group ID returned by :func:`_register`. A pgid not currently
+        registered is silently ignored.
     """
     with defer_shutdown_signals(), _lock:
         _active_children.pop(pgid, None)

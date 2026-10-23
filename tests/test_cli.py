@@ -41,7 +41,7 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     GpuConfigurationError,
@@ -60,6 +60,7 @@ from tests.conftest import (
     make_experiment,
     requires_nonroot,
     write_constant_trainer,
+    write_experiment_config,
     write_param_echo_trainer,
 )
 from tests.experiments import write_experiment
@@ -162,7 +163,7 @@ def test_validate_and_dry_run_explain_scoring_without_sdk(
     else:
         experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, metric=metric)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     assert result.exit_code == 0, result.output
     assert "goal=minimize" in result.output
@@ -192,7 +193,7 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
         ),
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
     monkeypatch.setenv("WANDB_MODE", "offline")
 
     result = CliRunner().invoke(cli_main, ["validate", str(config_path)])
@@ -278,7 +279,7 @@ def test_validate_discloses_environment_contract(
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
     experiment = _environment_contract_experiment(tmp_path, case)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -321,7 +322,7 @@ def test_validate_and_dry_run_disclose_the_trainer_cwd(
     )
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, execution=execution)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     with caplog.at_level(logging.INFO):
@@ -762,7 +763,7 @@ def test_validate_and_dry_run_warn_when_argparse_renders_a_boolean(
     """One warning lists every flag argparse would hand the trainer as ``--key=true``."""
     experiment = _boolean_experiment(tmp_path)
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -776,6 +777,27 @@ def test_validate_and_dry_run_warn_when_argparse_renders_a_boolean(
     assert [(r.levelno, r.getMessage()) for r in warnings] == [
         (logging.WARNING, f"DRY RUN {_ARGPARSE_BOOLEAN_WARNING}")
     ]
+
+
+def test_validate_labels_boolean_repeat_values_as_repeats(tmp_path: Path) -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                repeats=Repeats(key="seed", values=[False, True]),
+                sampler=Sampler(type="grid"),
+                n_trials=2,
+            )
+        ]
+    )
+    config = tmp_path / "experiment.yaml"
+    write_experiment_config(config, experiment)
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "--seed (phase 'p' repeats)" in result.output
+    assert "--seed (phase 'p' search_space)" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -794,7 +816,7 @@ def test_boolean_warning_is_only_for_argparse(
         tmp_path, override_format=override_format, trial_command=trial_command
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
 
@@ -839,7 +861,7 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
         execution=ExecutionContext(inherit_env=inherit_env, passthrough_env=["HF_PASSTHROUGH_KEY"]),
     )
     config = tmp_path / "experiment.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config, experiment)
     expected = [] if named is None else [_CREDENTIAL_WARNING.format(names=named)]
 
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
@@ -923,7 +945,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
             n_trials=1,
             sampler=Sampler(type="random", seed=0),
         )
-        cfg.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(cfg, experiment)
         return cfg
 
     runner = CliRunner()
@@ -1243,7 +1265,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
         n_trials=1,
     )
     p = tmp_path / "exp.yaml"
-    p.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    write_experiment_config(p, experiment)
     run_experiment(load_experiment(p))
 
     result = CliRunner().invoke(cli_main, ["status", str(p)])
@@ -1275,7 +1297,7 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
         n_trials=1,
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
 
     result = subprocess.run(
         [sys.executable, "-m", "phasesweep", "status", str(config_path)],
@@ -1314,7 +1336,7 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
             n_trials=1,
             sampler=Sampler(type="random", seed=0),
         )
-        config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(config_path, experiment)
 
     write_config("original hypothesis", "x")
     run_experiment(load_experiment(config_path))
@@ -1432,7 +1454,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     """A healthy publication and a never-published tree both stay exit 0."""
     fresh_config = tmp_path / "fresh.yaml"
     experiment = make_experiment(workdir=tmp_path / "runs")
-    fresh_config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(fresh_config, experiment)
 
     assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
     fresh = capsys.readouterr()
@@ -1644,7 +1666,8 @@ def test_config_error_appends_explain_hint(
     # The hint is a command the operator can paste.
     explained = CliRunner().invoke(cli_main, shlex.split(hint.removeprefix("see: phasesweep ")))
     assert explained.exit_code == 0
-    assert explained.output.startswith("phases[].sampler.type: ")
+    assert explained.output.startswith("Section Phases:\n")
+    assert "\n\nphases[].sampler.type: " in explained.output
 
 
 def test_config_error_hints_stay_few_and_distinct(
@@ -1700,7 +1723,10 @@ def test_cli_boundary_reports_expected_run_failure(
     """Expected failures gain a traceback only when verbose logging is active."""
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, NoFeasibleTrialError("no feasible trial in phase 'depth'"))
+    _stub_run_command(
+        monkeypatch,
+        PhaseTrialsFailedError("no feasible trial in phase 'depth'"),
+    )
 
     argv = ["run", str(config_path)]
     if verbose:
@@ -1721,6 +1747,11 @@ def test_cli_boundary_reports_expected_run_failure(
         (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (
+            OperatorAction.PROVISION_LOCK_DIR,
+            "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
+            "MCP server, and sandbox on the host, or run on the host",
+        ),
         (OperatorAction.RUN_RECOVER_RUN, "again with the same config for a CLI run"),
         (OperatorAction.FIX_CONFIG, "correct the experiment configuration"),
         (OperatorAction.RETRY, "Wait briefly, then retry the same operation"),
@@ -1784,7 +1815,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
         ),
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    write_experiment_config(config_path, experiment)
     monkeypatch.setenv(env_name, env_value)
 
     exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
@@ -1900,6 +1931,45 @@ def test_cli_boundary_leaves_help_exit_status_unchanged(
     # pin the usage line and body rather than the console-script name.
     assert "[OPTIONS] COMMAND [ARGS]..." in captured.out
     assert "Phase-chained hyperparameter sweeps" in captured.out
+
+
+def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A config with nothing to sync is refused as `phasesweep:` plus a fix line, not Click's `Error:`."""
+    config = write_experiment(tmp_path / "exp.yaml")
+
+    status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
+
+    assert status == 1
+    error = capsys.readouterr().err
+    assert error == (
+        "phasesweep: sync-tracking needs an `mlflow` block, and this config has none. Use the "
+        "config the sweep ran with, or see `phasesweep explain mlflow`.\n"
+        "fix: correct the experiment configuration or the environment it runs in.\n"
+    )
+
+
+def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Counts print first, then the failure is a `phasesweep:` line with a retry step."""
+    monkeypatch.setattr(
+        "phasesweep.tracking.publication.sync_tracking",
+        lambda *_args: {"pending": 2, "delivered": 1},
+    )
+
+    status = invoke_cli_boundary(
+        ["sync-tracking", str(write_experiment(tmp_path / "exp.yaml"))], monkeypatch
+    )
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert captured.out == "pending: 2\ndelivered: 1\n"
+    assert captured.err == (
+        "phasesweep: MLflow uploads remain pending.\n"
+        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+    )
 
 
 def test_expected_operational_failures_share_one_base() -> None:

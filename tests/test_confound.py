@@ -37,6 +37,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
@@ -293,7 +294,11 @@ def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
     assert "2 distinct step values (400, 1000)" in line
     assert line.endswith(
         "Expected when this phase's search space changes training length "
-        "(for example epochs or max_steps); otherwise the trials were not trained to one budget"
+        "(for example epochs or max_steps); otherwise the trials were not trained to one budget. "
+        "A training-length phase checks cleanly on a relative axis, which still flags a run "
+        "that stopped early: report "
+        'progress={"schedule_fraction": actual_steps / planned_steps} through report_objective '
+        "and set metric.extractor.evaluation_axis to schedule_fraction on a json_envelope metric"
     )
 
 
@@ -507,6 +512,38 @@ def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
         "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1},
     }
     assert _validate_confound_block(block, winner_trial=1) == block
+
+
+def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() -> None:
+    """A failed attempt is replaced when a retry of it, or of a retry of it, completed."""
+    study = optuna.create_study()
+    # (state, x, rerun_of): cell 1 fails, its retry fails, and the next retry completes; cell 2
+    # fails and its retry fails; cell 3 fails and nothing retries it.
+    for state, x, rerun_of in [
+        (_FAIL, 1, None),
+        (_FAIL, 2, None),
+        (_FAIL, 3, None),
+        (_FAIL, 1, 0),
+        (_FAIL, 2, 1),
+        (_COMPLETE, 1, 3),
+    ]:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=state,
+                value=None if state == _FAIL else 0.5,
+                params={"x": x},
+                distributions={"x": optuna.distributions.IntDistribution(0, 100)},
+                user_attrs={} if rerun_of is None else {RERUN_OF_ATTR: rerun_of},
+            )
+        )
+    trials = study.get_trials(deepcopy=False)
+    block = _assess(trials, trials[5:])
+
+    assert block["checks"]["survivorship"] == {
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 3},
+    }
+    assert _validate_confound_block(block, winner_trial=5) == block
 
 
 @pytest.mark.parametrize(
@@ -859,6 +896,51 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
     assert "2 failed trials against 2 ranked" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [_json(), log_regex_provenance(), _wandb(None), _envelope()],
+    ids=["json", "log_regex", "wandb-unlocated", "envelope"],
+)
+@pytest.mark.parametrize("count", [1, 2])
+def test_selection_warns_when_multiple_ranked_trials_have_no_evaluation_comparison(
+    caplog: pytest.LogCaptureFixture, record: JsonObject, count: int
+) -> None:
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=count)])
+    study = optuna.create_study(direction="minimize")
+    for number in range(count):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=0.2 + number * 0.1,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 10)},
+                user_attrs=_candidate_attrs(number, record),
+            )
+        )
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        selected = select_winner(study, experiment, phase_name="p")
+
+    assert selected.trial_number == 0
+    check = selected.confound["checks"]["evaluation_point"]
+    warnings = [
+        item.getMessage()
+        for item in caplog.records
+        if item.name == "phasesweep.engine.selection"
+        and item.levelno == logging.WARNING
+        and "evaluation_point" in item.getMessage()
+    ]
+    extractor = record["extractor"]
+    assert isinstance(extractor, dict)
+    if count == 2 and extractor["kind"] != "json_envelope":
+        assert check["verdict"] == "n/a"
+        assert len(warnings) == 1
+        assert "not checked" in warnings[0]
+        assert check["reason"] in warnings[0]
+    else:
+        assert warnings == []
 
 
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:

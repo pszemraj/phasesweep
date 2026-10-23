@@ -15,6 +15,7 @@ import os
 import select
 import subprocess
 import sys
+import time
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -80,18 +81,13 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
     After group termination, perform a bounded wait to reap the direct child.
     This runs outside the signal handler; uncertain cleanup must block new work.
 
-    Args:
-        pgid: Process-group ID of the trial subprocess.
-        proc: The root subprocess's :class:`subprocess.Popen` handle. Reaped
-            via a bounded ``wait`` once the group is confirmed terminated.
-
-    Returns:
-        ``True`` if every process in the group is gone after the SIGTERM →
-        SIGKILL escalation AND the direct child was reaped within
-        ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one
-        group member survived, cleanup status was inconclusive, or the direct
-        child failed to reap in time.
-
+    :param int pgid: Process-group ID of the trial subprocess.
+    :param subprocess.Popen[bytes] proc: The root subprocess's :class:`subprocess.Popen`
+        handle. Reaped via a bounded ``wait`` once the group is terminated.
+    :return bool: ``True`` if every process in the group is gone after the SIGTERM → SIGKILL
+        escalation AND the direct child was reaped within
+        ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one group member
+        survived, cleanup status was inconclusive, or the direct child failed to reap in time.
     """
     cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
     try:
@@ -135,15 +131,12 @@ def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
 def _abort_launch(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
     """Kill and unregister a subprocess after launch or supervision fails.
 
-    Args:
-        proc: The subprocess whose launch or supervision is being aborted.
-        pgid: The process-group ID it was registered under, or ``None`` if
-            registration never completed.
-
-    Returns:
-        Whatever :func:`_kill_group` returns for the resolved target group —
+    :param subprocess.Popen[bytes] proc: The subprocess whose launch or supervision is being
+        aborted.
+    :param int | None pgid: The process-group ID it was registered under, or ``None`` if
+        registration never completed, in which case ``proc.pid`` is the target group.
+    :return bool: Whatever :func:`_kill_group` returns for the resolved target group,
         ``True`` only if the group is confirmed terminated.
-
     """
     target_pgid = pgid if pgid is not None else proc.pid
     cleanup_confirmed = _kill_group(target_pgid, proc)
@@ -230,21 +223,16 @@ def _trial_process_identity(
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
-    Args:
-        attempt_id: Immutable attempt identity already persisted in Optuna;
-            binds this identity record to exactly one attempt so a later
-            reader cannot mistake it for a different trial's process.
-        pid: PID of the just-launched supervisor process.
-        pgid: Process-group ID the supervisor was registered under.
-        pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in,
-            from :func:`read_pid_namespace` before the launch.
-
-    Returns:
-        A :class:`StaleProcessIdentity` combining the given fields with the
-        current schema version, this process's ``/proc`` start time (``None``
-        off-Linux or if unreadable), and the current boot id (``None`` when
-        unavailable).
-
+    :param str attempt_id: Immutable attempt identity already persisted in Optuna; binds this
+        identity record to exactly one attempt so a later reader cannot mistake it for a
+        different trial's process.
+    :param int pid: PID of the just-launched blocked child that becomes the trainer group leader.
+    :param int pgid: Process-group ID that child was registered under.
+    :param str pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in, from
+        :func:`read_pid_namespace` before the launch.
+    :return StaleProcessIdentity: The given fields combined with the current schema version,
+        ``pid``'s ``/proc`` start time (``None`` if unreadable), and the current
+        boot id (``None`` when unavailable).
     """
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -260,10 +248,9 @@ def _trial_process_identity(
 def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     """Atomically persist one complete process identity record.
 
-    Args:
-        path: Destination ``process_identity.json`` path under the trial dir.
-        identity: Complete identity record to serialize as sorted-key JSON.
-
+    :param Path path: Destination ``process_identity.json`` path under the trial dir.
+    :param StaleProcessIdentity identity: Complete identity record to serialize as sorted-key
+        JSON.
     """
     atomic_write_text(
         path,
@@ -300,19 +287,15 @@ def write_attempt_lifecycle(
 ) -> None:
     """Atomically persist the attempt's coarse lifecycle state.
 
-    Args:
-        trial_dir: Per-trial directory (attempt-scoped, so states from
-            different attempts can never collide).
-        attempt_id: Immutable attempt identity binding the record.
-        state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
-        return_code: Root return code; only meaningful for ``"exited"``.
-        cleanup_confirmed: Whether the whole process group was confirmed
-            gone; only meaningful for ``"exited"``.
-
-    Raises:
-        ValueError: ``state`` is not a known lifecycle state.
-        OSError: The record could not be written.
-
+    :param Path trial_dir: Per-trial directory (attempt-scoped, so states from different
+        attempts can never collide).
+    :param str attempt_id: Immutable attempt identity binding the record.
+    :param str state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
+    :param int | None return_code: Root return code; only meaningful for ``"exited"``.
+    :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone;
+        only meaningful for ``"exited"``.
+    :raises ValueError: ``state`` is not a known lifecycle state.
+    :raises OSError: The record could not be written.
     """
     if state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state {state!r}.")
@@ -339,19 +322,13 @@ def read_attempt_lifecycle(
 ) -> AttemptLifecycle | None:
     """Load and validate the attempt lifecycle record, if one exists.
 
-    Args:
-        trial_dir: Trial directory that may contain ``attempt_lifecycle.json``.
-        expected_attempt_id: Attempt identity stored on the Optuna trial.
-
-    Returns:
-        The validated record, or ``None`` when no record exists. Current
-        recovery callers decide whether absence is safe for their state.
-
-    Raises:
-        ValueError: The record is malformed, uses an unknown schema or state,
-            or belongs to another attempt. Callers must treat this as
-            cleanup uncertainty, not as absence.
-
+    :param Path trial_dir: Trial directory that may contain ``attempt_lifecycle.json``.
+    :param str expected_attempt_id: Attempt identity stored on the Optuna trial.
+    :raises ValueError: The record is unreadable, malformed, uses an unknown schema or state,
+        or belongs to another attempt. Callers must treat this as cleanup uncertainty, not as
+        absence.
+    :return AttemptLifecycle | None: The validated record, or ``None`` when no record exists.
+        Current recovery callers decide whether absence is safe for their state.
     """
     path = trial_dir / ATTEMPT_LIFECYCLE_FILE
     try:
@@ -397,11 +374,9 @@ def _record_attempt_exited(
 
     A write failure preserves the primary error; the retained identity permits recovery.
 
-    Args:
-        trial_dir: Per-trial directory holding the lifecycle record.
-        attempt_id: Immutable attempt identity binding the record.
-        return_code: Root process return code observed by the supervisor wait.
-
+    :param Path trial_dir: Per-trial directory holding the lifecycle record.
+    :param str attempt_id: Immutable attempt identity binding the record.
+    :param int | None return_code: Root process return code observed by the supervisor wait.
     """
     try:
         write_attempt_lifecycle(
@@ -458,8 +433,6 @@ def fd_ready(fd: int, *, timeout: float, write: bool = False) -> bool:
     :return bool: Whether ``fd`` became ready within ``timeout``.
     :raises OSError: If ``fd`` is not an open descriptor.
     """
-    import time
-
     deadline = time.monotonic() + timeout
     poller = select.poll()
     poller.register(fd, select.POLLOUT if write else select.POLLIN)
@@ -491,8 +464,6 @@ def _write_all(
         ``deadline``.
     :raises OSError: If the underlying ``os.write`` call fails.
     """
-    import time
-
     view = memoryview(data)
     if deadline is not None:
         os.set_blocking(fd, False)
@@ -524,8 +495,6 @@ def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
     :param float deadline: Absolute ``time.monotonic`` deadline.
     :return bytes | None: Complete frame, or ``None`` on timeout or early EOF.
     """
-    import time
-
     chunks: list[bytes] = []
     remaining = size
     while remaining:
@@ -551,30 +520,23 @@ def _spawn_blocked_supervisor(
     Readiness is bounded by both the supervisor timeout and the launch deadline.
     Failures abort and unregister any spawned group before propagating.
 
-    Args:
-        stdout: Already-open file handle that receives the subprocess stdout.
-        stderr: Already-open file handle that receives the subprocess stderr.
-        deadline: Absolute ``time.monotonic()`` launch deadline, or ``None``.
-        gpu_lease_fds: Host GPU-lock descriptors inherited only by the guardian,
-            keeping leases held after an orchestrator exit until cleanup finishes.
-
-    Returns:
-        ``(proc, pgid, ack_write, status_read)``: guardian process, registered trainer
-        group, launch pipe and status pipe. The caller owns both descriptors; after
-        persisting trainer identity, send the framed payload and close ``ack_write``.
-        ``status_read`` yields ``b"X"`` when the trainer root exits, then ``b"D"`` if
-        descendants were reaped or EOF otherwise. Cleanup after ``b"X"`` is outside
-        the trainer wallclock budget.
-
-    Raises:
-        _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group
-            was aborted and the exception carries cleanup confirmation.
-        RuntimeError: Supervisor readiness timed out or returned an unexpected tag.
-        UnsafeProcessCleanupError: Failed or interrupted launch left cleanup unconfirmed.
-
+    :param IO[str] stdout: Already-open file handle that receives the subprocess stdout.
+    :param IO[str] stderr: Already-open file handle that receives the subprocess stderr.
+    :param float | None deadline: Absolute ``time.monotonic()`` launch deadline, or ``None``.
+    :param Collection[int] gpu_lease_fds: Host GPU-lock descriptors inherited only by the
+        guardian, keeping leases held after an orchestrator exit until cleanup finishes.
+    :raises _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group was
+        aborted and the exception carries cleanup confirmation.
+    :raises RuntimeError: Supervisor readiness timed out or returned an invalid ready frame
+        (unexpected tag or trainer PID).
+    :raises UnsafeProcessCleanupError: Failed or interrupted launch left cleanup unconfirmed.
+    :return tuple[subprocess.Popen[bytes], int, int, int]: ``(proc, pgid, ack_write,
+        status_read)``: guardian process, registered trainer group, launch pipe and status
+        pipe. The caller owns both descriptors; after persisting trainer identity, send the
+        framed payload and close ``ack_write``. ``status_read`` yields ``b"X"`` when the
+        trainer root exits, then ``b"D"`` if descendants were reaped or EOF otherwise.
+        Cleanup after ``b"X"`` is outside the trainer wallclock budget.
     """
-    import time
-
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
     proc: subprocess.Popen[bytes] | None = None
@@ -619,7 +581,7 @@ def _spawn_blocked_supervisor(
             raise RuntimeError("trial supervisor did not become ready before launch")
         try:
             trainer_pid = int(ready_frame[1:].decode("ascii"))
-        except (UnicodeDecodeError, ValueError) as exc:
+        except ValueError as exc:
             raise RuntimeError("trial supervisor reported an invalid trainer PID") from exc
         if trainer_pid <= 0:
             raise RuntimeError("trial supervisor reported an invalid trainer PID")
@@ -673,32 +635,25 @@ def run_supervised(
     outside that budget. Expected post-spawn deadline, identity-write and payload failures
     return a ProcessResult after cleanup.
 
-    Args:
-        cmd: Shell command run with ``/bin/sh``.
-        env: Full trainer environment.
-        stdout: Open stdout destination.
-        stderr: Open stderr destination.
-        timeout: Seconds from call entry, or ``None`` for no relative deadline.
-        trial_dir: Directory for ``process_identity.json`` and lifecycle records.
-        attempt_id: Attempt identity already persisted in Optuna.
-        wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
-        cwd: Trainer working directory; ``None`` retains invocation cwd.
-        gpu_lease_fds: GPU-lock descriptors inherited by the guardian alone.
-
-    Returns:
-        ProcessResult with return code, elapsed time, timeout attribution, failure reason
-        and cleanup confirmation.
-
-    Raises:
-        PhaseSweepError: PID namespace is unreadable; nothing is recorded or launched.
-        ShutdownLaunchRefusedError: Shutdown blocks launch; the attempt is recorded exited.
-        RuntimeError: Supervisor readiness failed before creating a process group.
-        OSError: Spawn/pipe creation failed, or unexpected I/O failed after confirmed cleanup.
-        UnsafeProcessCleanupError: Unexpected post-launch failure with uncertain cleanup.
-
+    :param str cmd: Shell command run with ``/bin/sh``.
+    :param dict[str, str] env: Full trainer environment.
+    :param IO[str] stdout: Open stdout destination.
+    :param IO[str] stderr: Open stderr destination.
+    :param float | None timeout: Seconds from call entry, or ``None`` for no relative deadline.
+    :param Path trial_dir: Directory for ``process_identity.json`` and lifecycle records.
+    :param str attempt_id: Attempt identity already persisted in Optuna.
+    :param float | None wallclock_deadline: Absolute ``time.monotonic()`` phase/run deadline.
+    :param str | None cwd: Trainer working directory; ``None`` retains invocation cwd.
+    :param Collection[int] gpu_lease_fds: GPU-lock descriptors inherited by the guardian alone.
+    :raises PhaseSweepError: PID namespace is unreadable; nothing is recorded or launched.
+    :raises ShutdownLaunchRefusedError: Shutdown blocks launch; the attempt is recorded exited.
+    :raises RuntimeError: Supervisor readiness failed before creating a process group.
+    :raises OSError: Spawn/pipe creation failed, or unexpected I/O failed after confirmed
+        cleanup.
+    :raises UnsafeProcessCleanupError: Unexpected post-launch failure with uncertain cleanup.
+    :return ProcessResult: Return code, elapsed time, timeout attribution, failure reason and
+        cleanup confirmation.
     """
-    import time
-
     started = time.monotonic()
     deadline, timeout_capped_by_wallclock = _choose_process_deadline(
         started=started,
@@ -782,8 +737,8 @@ def run_supervised(
         pid = exc.pid
         return_code = -9
         if proc is not None:
-            # Raised at the pre-payload recheck: the supervisor is still
-            # blocked on its ack pipe; kill and reap it here.
+            # Raised at the pre-payload recheck or while the payload is written:
+            # the supervisor is still blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
             pid = pgid if pgid is not None else proc.pid
             if proc.returncode is not None:

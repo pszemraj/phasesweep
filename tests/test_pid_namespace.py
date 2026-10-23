@@ -1,4 +1,4 @@
-"""PID-namespace binding of process identities: reading, the absence proof, and stale cleanup."""
+"""PID-namespace binding of process identities: reading, the absence proof, the runner heartbeat, and stale cleanup."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -51,10 +53,13 @@ from tests.mcp_helpers import (
     claim_runner_handle,
     live_runs,
     patch_popen_capture,
+    runner_argv,
+    runner_main,
     side_effect_app,
     stage_dead_run,
     stage_live_run,
     write_run_status,
+    write_runner_heartbeat,
 )
 from tests.recovery_helpers import write_trial_identity
 
@@ -110,9 +115,14 @@ def _hide_namespace(proc: Path, pid: int) -> None:
 def _fake_proc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reader: str | None = INITIAL_READER
 ) -> Path:
-    """Replace ``/proc`` with one holding only the host's init, and the reader's namespace with ``reader``."""
+    """Replace ``/proc`` with one holding only the host's init and its current boot id, and the reader's namespace with ``reader``."""
     proc = tmp_path / "proc"
     _write_process(proc, 1, nspid=[1], namespace=INITIAL_READER)
+    boot_id = reaper.read_boot_id()
+    if boot_id is not None:
+        boot_id_file = proc / "sys" / "kernel" / "random" / "boot_id"
+        boot_id_file.parent.mkdir(parents=True)
+        boot_id_file.write_text(f"{boot_id}\n")
     monkeypatch.setattr(reaper, "_PROC", proc)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reader)
     return proc
@@ -142,6 +152,21 @@ def test_read_pid_namespace_names_this_process_namespace() -> None:
 
     assert namespace == f"{os.readlink('/proc/self/ns/pid')}@{read_proc_starttime(1)}"
     assert reaper.is_pid_namespace(namespace)
+
+
+def test_read_boot_id_reads_the_module_procfs_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boot id comes from ``_PROC``, so a fake procfs answers for it and a missing file reads as unknown."""
+    proc = _fake_proc(tmp_path, monkeypatch)
+    boot_id_file = proc / "sys" / "kernel" / "random" / "boot_id"
+    boot_id_file.parent.mkdir(parents=True, exist_ok=True)
+    boot_id_file.write_text("fake-boot\n")
+
+    assert reaper.read_boot_id() == "fake-boot"
+
+    boot_id_file.unlink()
+    assert reaper.read_boot_id() is None
 
 
 def test_read_pid_namespace_refuses_procfs_of_another_namespace(
@@ -596,8 +621,13 @@ def _stage_foreign_run(
     allow_cancel: bool = False,
     cleanup_uncertain: bool = False,
     reader: str = NESTED_READER,
+    heartbeat_age: float | None = 0.0,
 ) -> tuple[PhaseSweepMCP, Registry, RunStore, RunHandle]:
-    """Serve the standard experiment from ``reader``'s PID namespace with one run recorded in another."""
+    """Serve the standard experiment from ``reader``'s PID namespace with one run recorded in another.
+
+    The run's heartbeat was refreshed ``heartbeat_age`` seconds ago, as a live runner's
+    is by default; ``None`` leaves it missing.
+    """
     config, app, registry, store = side_effect_app(tmp_path)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reader)
     handle = stage_dead_run(
@@ -609,6 +639,8 @@ def _stage_foreign_run(
         allow_cancel=allow_cancel,
         pid_namespace=RECORDED,
     )
+    if heartbeat_age is not None:
+        write_runner_heartbeat(store, handle.run_id, age_seconds=heartbeat_age)
     return app, registry, store, handle
 
 
@@ -829,10 +861,195 @@ def test_finished_foreign_run_reports_runner_observable(
     assert run["runner_observable"] is True
 
 
-def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
+@pytest.mark.parametrize(
+    ("heartbeat_age", "stale"),
+    [
+        pytest.param(5.0, False, id="fresh"),
+        pytest.param(mcp_runs.RUNNER_HEARTBEAT_STALE_SECONDS + 30.0, True, id="stale"),
+        pytest.param(None, True, id="missing"),
+    ],
+)
+def test_a_stale_heartbeat_asks_for_recovery_without_settling_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heartbeat_age: float | None, stale: bool
+) -> None:
+    """A stopped heartbeat is reported to the agent as recovery; it frees, writes and signals nothing."""
+    app, registry, store, handle = _stage_foreign_run(
+        tmp_path, monkeypatch, heartbeat_age=heartbeat_age
+    )
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    _forbid_reaping(monkeypatch)
+    _forbid_run_signals(monkeypatch, mcp_recovery, mcp_tools, reaper)
+    before = tree_snapshot(registry.state_dir)
+
+    observation = store.observe(handle)
+    run = app.status(run_id=handle.run_id)["run"]
+    awaited = asyncio.run(app.await_run(handle.run_id, timeout_seconds=0))
+    latest = app.latest_run("srv")["run"]
+    results = app.winners(run_id=handle.run_id)
+
+    assert observation.runner_heartbeat_stale is stale
+    # Durable evidence alone decides state and recovery; only agent reports carry the guess.
+    assert (observation.state, observation.recovery_required) == ("running", False)
+    for reported in (run, awaited["run"], latest):
+        assert (reported["state"], reported["recovery_required"]) == ("running", stale)
+        assert reported["runner_observable"] is False
+    assert awaited["reason"] == ("recovery_required" if stale else "timeout")
+    assert results["result_source"] == "current_shared_study"
+    assert results["failure"] is None
+    assert live_runs(store) == [handle]
+    assert tree_snapshot(registry.state_dir) == before
+
+
+@pytest.mark.parametrize("dead", [False, True], ids=["live", "dead"])
+def test_an_observable_runner_is_judged_by_its_process_not_its_heartbeat(
+    tmp_path: Path, dead: bool
+) -> None:
+    """A stale heartbeat cannot fail a live runner, nor a fresh one revive a dead runner."""
+    config, app, registry, store = side_effect_app(tmp_path)
+    if dead:
+        handle = stage_dead_run(
+            store, "srv-here", config, registry.get("srv").id, cleanup_uncertain=False
+        )
+        write_runner_heartbeat(store, handle.run_id)
+    else:
+        handle = stage_live_run(store, "srv-here", config, registry.get("srv").id)
+        write_runner_heartbeat(
+            store, handle.run_id, age_seconds=mcp_runs.RUNNER_HEARTBEAT_STALE_SECONDS + 30.0
+        )
+
+    observation = store.observe(handle)
+    run = app.status(run_id=handle.run_id)["run"]
+
+    assert not observation.runner_heartbeat_stale
+    assert (run["state"], run["recovery_required"], run["runner_observable"]) == (
+        "running",
+        dead,
+        True,
+    )
+
+
+@pytest.mark.parametrize("finalized", [True, False], ids=["terminal", "finalizing"])
+def test_only_a_runner_still_owing_its_final_status_is_judged_by_its_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finalized: bool
+) -> None:
+    """A final status needs no runner; a pending snapshot still waits on one."""
+    app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, heartbeat_age=None)
+    if finalized:
+        _write_finished_status(store, handle.run_id)
+    else:
+        write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
+
+    observation = store.observe(handle)
+    run = app.status(run_id=handle.run_id)["run"]
+
+    assert observation.runner_heartbeat_stale is not finalized
+    assert not observation.recovery_required
+    assert (run["state"], run["recovery_required"]) == (
+        ("succeeded", False) if finalized else ("running", True)
+    )
+
+
+def test_runner_heartbeat_starts_before_launch_ready_and_refreshes_until_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, allow_cancel=True)
+    """A reader in another PID namespace never finds a reported runner without a heartbeat.
+
+    The heartbeat exists before the identity write and the launch-ready byte, keeps
+    refreshing while the runner works, and stops when the runner exits, staying
+    with the run's records.
+    """
+    store = RunStore(tmp_path / "state")
+    run_id = "r-heartbeat"
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="a" * 64,
+        config_dir=tmp_path,
+        started_at=started_at,
+        experiment_id="cancel_me",
+    )
+    heartbeat = store.heartbeat_path(run_id)
+    interval = 0.01
+    monkeypatch.setattr(mcp_runner, "RUNNER_HEARTBEAT_INTERVAL_SECONDS", interval)
+    observed: dict[str, bool] = {}
+    real_handshake = mcp_runner._complete_launch_handshake
+
+    def persist_identity(**_kwargs: object) -> RunHandle:
+        # The real write needs this process's /proc identity, which a sandbox can hide.
+        observed["at_identity"] = heartbeat.is_file()
+        pending = store.get(run_id)
+        assert pending is not None
+        return pending
+
+    def report_ready(ready_fd: int, ack_fd: int, lease_fd: int) -> None:
+        observed["at_ready"] = heartbeat.is_file()
+        real_handshake(ready_fd, ack_fd, lease_fd)
+
+    def await_refresh(*_args: object, **_kwargs: object) -> None:
+        aged = int(time.time()) - 3600
+        os.utime(heartbeat, (aged, aged))
+        deadline = time.monotonic() + 10
+        while heartbeat.stat().st_mtime < aged + 60:
+            assert time.monotonic() < deadline, "the runner never refreshed its heartbeat"
+            time.sleep(interval)
+        raise ValueError("stop once the heartbeat has refreshed")
+
+    monkeypatch.setattr(mcp_runner, "_persist_spawned_handle", persist_identity)
+    monkeypatch.setattr(mcp_runner, "_complete_launch_handshake", report_ready)
+    monkeypatch.setattr(mcp_runner, "load_experiment_snapshot", await_refresh)
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    assert os.write(ack_write, b"A") == 1
+    os.close(ack_write)
+    lease_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        with pytest.raises(RuntimeError, match="stop once the heartbeat has refreshed"):
+            runner_main(
+                [
+                    *runner_argv(
+                        store,
+                        run_id=run_id,
+                        config=tmp_path / "unread.yaml",
+                        config_sha256="a" * 64,
+                        experiment_id="cancel_me",
+                        started_at=started_at,
+                    ),
+                    "--launch-ready-fd",
+                    str(ready_write),
+                    "--launch-ack-fd",
+                    str(ack_read),
+                    "--launch-lease-fd",
+                    str(lease_fd),
+                ],
+                cwd=tmp_path,
+            )
+        os.set_blocking(ready_read, False)
+        assert os.read(ready_read, 1) == b"R"
+    finally:
+        os.close(ready_read)
+        if "at_ready" not in observed:
+            # The handshake closes its own descriptors only once it runs.
+            for fd in (ready_write, ack_read, lease_fd):
+                os.close(fd)
+
+    assert observed == {"at_identity": True, "at_ready": True}
+    assert store.status_path(run_id).is_file()
+    assert stat.S_IMODE(heartbeat.stat().st_mode) == 0o600
+    assert "phasesweep-runner-heartbeat" not in {thread.name for thread in threading.enumerate()}
+    stopped = int(time.time()) - 3600
+    os.utime(heartbeat, (stopped, stopped))
+    time.sleep(interval * 10)
+    assert heartbeat.stat().st_mtime == stopped
+
+
+@pytest.mark.parametrize("heartbeat_age", [0.0, None], ids=["fresh", "missing"])
+def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heartbeat_age: float | None
+) -> None:
+    app, registry, store, handle = _stage_foreign_run(
+        tmp_path, monkeypatch, allow_cancel=True, heartbeat_age=heartbeat_age
+    )
     audit_path = registry.state_dir / "audit.jsonl"
     app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
     _forbid_run_signals(monkeypatch, mcp_tools)
@@ -867,12 +1084,13 @@ def test_cancel_of_an_absent_runner_signals_nothing(
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
+@pytest.mark.parametrize("heartbeat_age", [0.0, None], ids=["fresh", "missing"])
 @pytest.mark.parametrize("reader", [NESTED_READER, INITIAL_READER])
 def test_recover_run_refuses_a_runner_it_cannot_prove_gone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str, heartbeat_age: float | None
 ) -> None:
     _app, registry, _store, handle = _stage_foreign_run(
-        tmp_path, monkeypatch, cleanup_uncertain=True, reader=reader
+        tmp_path, monkeypatch, cleanup_uncertain=True, reader=reader, heartbeat_age=heartbeat_age
     )
     if reader == INITIAL_READER:
         _add_runner_blocker(_fake_proc(tmp_path / "fake", monkeypatch), handle)
@@ -939,19 +1157,6 @@ def test_spawn_refuses_unreadable_pid_namespace_before_popen(
         app.launch("srv")
 
     assert [h for h in store.list_handles() if h.launch_state == "spawned"] == []
-
-
-def test_launch_records_the_servers_pid_namespace_in_the_spawned_handle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _config, app, _registry, store = side_effect_app(tmp_path)
-    patch_popen_capture(monkeypatch)
-
-    run_id = app.launch("srv")["run_id"]
-
-    handle = store.get(run_id)
-    assert handle is not None
-    assert handle.pid_namespace == read_pid_namespace()
 
 
 def test_runner_receipt_from_another_namespace_is_refused(

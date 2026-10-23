@@ -22,13 +22,12 @@ from pathlib import Path
 
 import optuna
 import pytest
-import yaml
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, Repeats, Sampler
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_state_label
+from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
 from phasesweep.engine.read import read_result
 from phasesweep.engine.state import (
     RERUN_OF_ATTR,
@@ -40,9 +39,10 @@ from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, kill_stale_group
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
-    _phase_trials,
     copy_fake_train,
     make_experiment,
+    phase_trials,
+    write_experiment_config,
     write_trainer,
 )
 
@@ -108,7 +108,7 @@ class _Harness:
         assert experiment.workdir is not None
         path = Path(experiment.workdir).parent / "experiment.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+        write_experiment_config(path, experiment)
         return path
 
     def _spawn(self, config: Path) -> subprocess.Popen[bytes]:
@@ -225,7 +225,7 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
     :param Experiment control: The uninterrupted control.
     :return list[int]: The interrupted trial numbers.
     """
-    trials, controls = _phase_trials(experiment), _phase_trials(control)
+    trials, controls = phase_trials(experiment), phase_trials(control)
     assert _finished_draws(trials) == _finished_draws(controls)
     interrupted = [t.number for t in trials if _trial_interrupted(t)]
     sources = [t.user_attrs[RERUN_OF_ATTR] for t in trials if RERUN_OF_ATTR in t.user_attrs]
@@ -234,7 +234,7 @@ def _assert_matches_control(experiment: Experiment, control: Experiment) -> list
         if trial.number in interrupted:
             parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
             assert parsed is not None and parsed.outcome == "interrupted"
-            assert _trial_state_label(trial) == "INTERRUPTED"
+            assert _trial_count_state(trial) == "INTERRUPTED"
     assert "WAITING" not in {t.state.name for t in trials}
     phase = experiment.phases[0]
     assert _finished_trial_count(trials) == phase.n_trials
@@ -261,7 +261,7 @@ def _sources(experiment: Experiment) -> dict[int, int]:
     """
     return {
         t.number: t.user_attrs[RERUN_OF_ATTR]
-        for t in _phase_trials(experiment)
+        for t in phase_trials(experiment)
         if RERUN_OF_ATTR in t.user_attrs
     }
 
@@ -290,12 +290,12 @@ def test_grid_reruns_points_interrupted_by_sigint_and_sigkill(
 
     harness.interrupt(config, 1, signal.SIGINT)
     # The second run's first trial is the rerun of trial 1, so this interrupts a rerun.
-    harness.interrupt(config, len(_phase_trials(experiment)), signal.SIGKILL)
+    harness.interrupt(config, len(phase_trials(experiment)), signal.SIGKILL)
     harness.complete(config)
 
     assert len(_assert_matches_control(experiment, control)) >= 2
     grid_ids = [
-        t.system_attrs["grid_id"] for t in _phase_trials(experiment) if t.state.name == "COMPLETE"
+        t.system_attrs["grid_id"] for t in phase_trials(experiment) if t.state.name == "COMPLETE"
     ]
     assert sorted(grid_ids) == list(range(6))
 
@@ -404,7 +404,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
 
     refused = harness.experiment("refused", phase)
     (harness.gate / "hold-1").touch()
-    with pytest.raises(TimeoutError, match=r"after 1/3 completed evaluations"):
+    with pytest.raises(TimeoutError, match=r"after 1/3 finished trials \(1 completed\)"):
         run_experiment(refused)
     harness.release()
     longer = phase.model_copy(update={"timeout_seconds_per_phase": 600.0})
@@ -418,7 +418,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
     harness.release()
     # The same target replays the accepted partial and schedules nothing.
     run_experiment(accepted)
-    assert [_trial_state_label(t) for t in _phase_trials(accepted)] == [
+    assert [_trial_count_state(t) for t in phase_trials(accepted)] == [
         "COMPLETE",
         "INTERRUPTED",
     ]
@@ -427,7 +427,7 @@ def test_phase_deadline_interrupts_a_trial_that_reruns_once_the_phase_continues(
     )
     run_experiment(raised)
     assert _sources(raised) == {2: 1}
-    assert _finished_trial_count(_phase_trials(raised)) == 4
+    assert _finished_trial_count(phase_trials(raised)) == 4
 
 
 @pytest.mark.parametrize(

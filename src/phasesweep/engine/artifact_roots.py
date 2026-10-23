@@ -13,6 +13,7 @@ import optuna
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    ArtifactRootSchemaMismatchError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
@@ -59,7 +60,7 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 7
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 9
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
@@ -179,7 +180,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
-        raise ArtifactRootConflictError(
+        raise ArtifactRootSchemaMismatchError(
             f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
             f"format {raw.get('schema_version')!r}. Nothing was written.",
         )
@@ -297,7 +298,11 @@ def _check_published_phase_studies(
     *,
     from_phase: str | None = None,
 ) -> None:
-    """Require published trial identity and history for phases that would execute.
+    """Refuse an unusable publication, then require published history for phases that would execute.
+
+    The refusal applies to every storage backend, so a launch never publishes past
+    a publication that needs operator attention. Only persistent storage carries
+    published trials to require; an in-memory ledger starts empty on every launch.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
@@ -312,6 +317,8 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
+    if not _artifact_root_binding_applies(experiment):
+        return
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary
     )
@@ -333,15 +340,18 @@ def _check_published_phase_studies(
                     completed = _completed_trial_count(trials)
                     if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
-                    missing = (
-                        f"has only {finished} terminal and {completed} complete trials, below "
-                        "the published completion boundary"
+                    boundary = ", ".join(
+                        f"{count} {label}"
+                        for count, label in (
+                            (expected.finished_trials, "finished"),
+                            (expected.completed_trials, "completed"),
+                        )
+                        if count is not None
                     )
-                    if expected.finished_trials is not None:
-                        missing += f" ({expected.finished_trials} terminal"
-                        if expected.completed_trials is not None:
-                            missing += f", {expected.completed_trials} complete"
-                        missing += ")"
+                    missing = (
+                        f"has only {finished} finished and {completed} completed trials, "
+                        f"below the published completion boundary ({boundary})"
+                    )
             except Exception as exc:
                 raise StudyStorageUnavailableError.rewrap(
                     exc,

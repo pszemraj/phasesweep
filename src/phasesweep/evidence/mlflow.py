@@ -114,6 +114,12 @@ def select_observation(
     candidates = list(points.values())
     if spec.select == "step":
         candidates = [p for p in candidates if p["step"] == spec.step]
+        if not candidates:
+            available = sorted({point["step"] for point in points.values()})
+            raise ValueError(
+                f"MLflow metric {spec.metric_key!r} has no observation at requested step "
+                f"{spec.step}; available steps: {available}."
+            )
     if not candidates:
         raise ValueError(f"MLflow metric {spec.metric_key!r} has no requested observation.")
     if spec.select in {"last", "step"}:

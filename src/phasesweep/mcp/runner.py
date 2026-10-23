@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -29,7 +30,12 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.run import PublicationHook, TerminalReport, run_experiment
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import (
+    PhaseAbortRefusedError,
+    PhaseTrialsFailedError,
+    PhaseTrialsInfeasibleError,
+    ReplayWithoutFeasibleTrialError,
+)
 from phasesweep.engine.state import Winner
 from phasesweep.errors import (
     OPERATOR_STEPS,
@@ -40,6 +46,7 @@ from phasesweep.errors import (
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
+    RUNNER_HEARTBEAT_INTERVAL_SECONDS,
     RunHandle,
     RunStore,
     load_experiment_snapshot,
@@ -51,6 +58,7 @@ from phasesweep.mcp.snapshots import (
     finalize_result_snapshot,
     mark_result_snapshot_published,
 )
+from phasesweep.runtime.files import UnsafeLockPathError, open_private_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -69,7 +77,9 @@ FailureCode: TypeAlias = Literal[
     "published_study_missing",
     "trial_target_refused",
     "experiment_busy",
-    "trainer_failed",
+    "trials_failed",
+    "trials_infeasible",
+    "replay_without_feasible_trial",
     "timeout",
     "cleanup_uncertain",
     "cancelled",
@@ -167,16 +177,15 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (StudySchemaMismatchError, "study_schema_mismatch"),
     (PublishedStudyMissingError, "published_study_missing"),
     (StudyStorageUnavailableError, "storage_unavailable"),
+    (UnsafeLockPathError, "storage_unavailable"),
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (TrialTargetRefusedError, "trial_target_refused"),
-    (NoFeasibleTrialError, "trainer_failed"),
+    (PhaseAbortRefusedError, "trial_target_refused"),
+    (PhaseTrialsFailedError, "trials_failed"),
+    (PhaseTrialsInfeasibleError, "trials_infeasible"),
+    (ReplayWithoutFeasibleTrialError, "replay_without_feasible_trial"),
 )
-# Categories that only occur at one stage, whatever stage the caller reports.
-_FIXED_STAGES: dict[FailureCode, FailureStage] = {
-    "experiment_busy": "preflight",
-    "published_study_missing": "preflight",
-}
 
 
 def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, object]:
@@ -218,18 +227,14 @@ def _base_failure_payload(
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure.
 
-    The error's type selects ``code`` and ``stage``. For a
-    :class:`PhaseSweepError`, ``retryable``, ``actor``, and ``remediation``
-    come only from the action its raise routes; an exception without a routed
-    action keeps its type's fixed text.
+    The error's type selects ``code``. For a :class:`PhaseSweepError`, ``retryable``,
+    ``actor``, and ``remediation`` come only from the action its raise routes; an
+    exception without a routed action keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
-    :param str | None stage: Failure stage to report for most error types;
-        clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
-        falling back to ``"execution"`` for any other value. Three error types
-        override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError` and :class:`PublishedStudyMissingError`
-        always report ``"preflight"`` and
+    :param str | None stage: Failure stage to report; clamped to one of
+        ``"preflight"``, ``"execution"``, or ``"cleanup"``, falling back to
+        ``"execution"`` for any other value.
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
         ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
@@ -246,11 +251,7 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    return {
-        "code": code,
-        "stage": _FIXED_STAGES.get(code, failure_stage),
-        **_routed_next_steps(error.action),
-    }
+    return {"code": code, "stage": failure_stage, **_routed_next_steps(error.action)}
 
 
 def _cleanup_steps(
@@ -293,9 +294,11 @@ def _cleanup_failure_payload(
         when classifying it as the nested cause.
     :param BaseException | None cleanup_error: The engine's recorded cleanup
         failure, whose repairs the payload keeps.
-    :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
-        ``primary`` nested under ``"cause"``. For an existing cleanup error,
-        retain its explicit storage failure when that prevents inspection.
+    :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload with
+        ``primary`` nested under ``"cause"``; a ``ProcessCleanupUncertainError``
+        primary nests only its ``StudyStorageUnavailableError`` cause, when it has one.
+        For an existing cleanup error, retain its explicit storage failure when that
+        prevents inspection.
     """
     payload = _cleanup_uncertain_payload(_cleanup_steps(primary, cleanup_error))
     # Preserve the primary cause's policy beneath the authoritative cleanup refusal.
@@ -313,19 +316,15 @@ def _terminal_error(
 ) -> tuple[BaseException, str | None]:
     """Return the engine's primary error and stage, or the caller's fallback.
 
-    A storage failure wrapped before any terminal report comes from the
-    ownership check that precedes generation allocation.
+    The engine delivers a report only from the block that can claim its generation,
+    so a failure with no report came before any claim and is a preflight failure.
 
     :param TerminalReport | None report: Engine terminal report, when one was delivered.
     :param BaseException fallback: Exception caught by the runner.
     :return tuple[BaseException, str | None]: Authoritative error and failure stage.
     """
     if report is None:
-        if isinstance(fallback, ProcessCleanupUncertainError) and isinstance(
-            fallback.__cause__, StudyStorageUnavailableError
-        ):
-            return fallback, "preflight"
-        return fallback, "execution"
+        return fallback, "preflight"
     return report.primary_error or fallback, report.failure_stage
 
 
@@ -542,14 +541,14 @@ def _write_status(
                 "outcome is unaffected but this run has no terminal MCP evidence"
             )
             return False
-        except Exception as exc:  # noqa: BLE001 - terminal evidence must not mask the run's exit
+        except Exception as exc:  # terminal evidence must not mask the run's exit
             log.exception("failed to write status.json with the captured result snapshot")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
             try:
                 _write_status_file_with_retry(status_path, terminal)
-            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+            except Exception:  # no further persistence fallback is available
                 log.exception("failed to write status.json without the result snapshot")
                 return False
             return True
@@ -560,7 +559,7 @@ def _write_status(
             terminal["result_snapshot"] = finalize_result_snapshot(
                 result_snapshot,
             )
-        except Exception as exc:  # noqa: BLE001 - minimal terminal evidence is already durable
+        except Exception as exc:  # minimal terminal evidence is already durable
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = result_snapshot_error or type(exc).__name__
@@ -577,16 +576,64 @@ def _write_status(
                 "recoverable with `phasesweep mcp recover-run`"
             )
             return True
-        except Exception as exc:  # noqa: BLE001 - preserve a serializable failed state
+        except Exception as exc:  # preserve a serializable failed state
             log.exception("failed to finalize result snapshot state in status.json")
             terminal.pop("result_snapshot", None)
             terminal["result_snapshot_state"] = "failed"
             terminal["result_snapshot_error"] = type(exc).__name__
             try:
                 _write_status_file_with_retry(status_path, terminal)
-            except Exception:  # noqa: BLE001 - no further persistence fallback is available
+            except Exception:  # no further persistence fallback is available
                 log.exception("failed to persist result snapshot finalization failure")
         return True
+
+
+class _RunnerHeartbeat:
+    """Refresh one run's heartbeat file from a daemon thread until stopped.
+
+    A reader that cannot observe this runner's PID namespace takes a stale heartbeat
+    as a sign that the runner has probably stopped. A refresh only advances the file's
+    modification time: it writes no data and syncs nothing.
+    """
+
+    def __init__(self, path: Path, interval_seconds: float) -> None:
+        """Create the private heartbeat file and start refreshing it.
+
+        :param Path path: The run's heartbeat path in the MCP state directory.
+        :param float interval_seconds: Seconds between refreshes.
+        :raises OSError: If the heartbeat file cannot be created.
+        :raises UnsafePrivatePathError: If the heartbeat path or its directory is unsafe.
+        """
+        self._handle = open_private_text(path, "w")
+        self._interval_seconds = interval_seconds
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._refresh, name="phasesweep-runner-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def _refresh(self) -> None:
+        """Advance the heartbeat's modification time once per interval until stopped."""
+        failing = False
+        while not self._stopped.wait(self._interval_seconds):
+            try:
+                os.utime(self._handle.fileno())
+            except OSError:
+                if not failing:
+                    logging.getLogger("phasesweep.mcp.runner").warning(
+                        "could not refresh the runner heartbeat; a reader in another PID "
+                        "namespace may report that this runner has probably stopped",
+                        exc_info=True,
+                    )
+                failing = True
+            else:
+                failing = False
+
+    def stop(self) -> None:
+        """Stop refreshing and close the heartbeat file, which stays with the run's records."""
+        self._stopped.set()
+        self._thread.join()
+        self._handle.close()
 
 
 def _persist_spawned_handle(
@@ -613,7 +660,7 @@ def _persist_spawned_handle(
     """
     store = RunStore(state_dir)
     pid = os.getpid()
-    pgid = os.getpgrp() if hasattr(os, "getpgrp") else pid
+    pgid = os.getpgrp()
     pid_starttime = read_proc_starttime(pid)
     if pid_starttime is None:
         raise RuntimeError(
@@ -744,7 +791,13 @@ def main(argv: list[str] | None = None) -> int:
     config: Experiment | None = None
     status_persisted = False
     publication_hook = _RunnerPublicationHook(status_path, status)
+    heartbeat: _RunnerHeartbeat | None = None
     try:
+        # The heartbeat starts before the identity is durable, so no reader finds a
+        # spawned runner without one, and stops only once terminal status is durable.
+        heartbeat = _RunnerHeartbeat(
+            RunStore(state_dir).heartbeat_path(args.run_id), RUNNER_HEARTBEAT_INTERVAL_SECONDS
+        )
         # Persist identity even if the spawning server has exited.
         handle = _persist_spawned_handle(
             state_dir=state_dir,
@@ -807,12 +860,16 @@ def main(argv: list[str] | None = None) -> int:
                     result_snapshot = dict(publication_hook.snapshot)
                 else:
                     try:
+                        # A replay that wrote no generation represents the one it matched;
+                        # a failure before the claim represents none.
                         result_snapshot = capture_result_snapshot(
                             config,
-                            generation_id=report.generation_id,
+                            generation_id=report.replayed_generation_id or report.generation_id,
+                            trial_generation_id=report.generation_id,
+                            generation_claimed=report.failure_stage != "preflight",
                             engine_winners=report.winners,
                         )
-                    except Exception as exc:  # noqa: BLE001 - preserve engine terminal cause
+                    except Exception as exc:  # preserve engine terminal cause
                         result_snapshot_error = type(exc).__name__
                         logging.getLogger("phasesweep.mcp.runner").exception(
                             "failed to capture terminal result snapshot under the experiment lock"
@@ -852,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
                 cleanup_error=_recorded_cleanup_error(terminal_report),
             )
         raise
-    except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
+    except BaseException as exc:  # record every terminal cause, then re-raise
         status["returncode"] = 1
         primary, failure_stage = _terminal_error(terminal_report, exc)
         cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError)
@@ -871,26 +928,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise
     finally:
-        if publication_hook.snapshot is not None and result_snapshot is None:
-            result_snapshot = dict(publication_hook.snapshot)
-        if publication_hook.state == "prepared" and status["returncode"] != 0:
-            # Reported non-commit clears the marker; a hard exit leaves it for recovery.
-            publication_hook.clear_uncommitted_marker()
-        if result_snapshot is None and terminal_report is None and config is not None:
-            try:
-                result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
-                    mode="json"
-                )
-            except Exception as exc:  # noqa: BLE001 - preserve the terminal engine failure
-                result_snapshot_error = type(exc).__name__
-            else:
-                status["generation_unavailable_reason"] = "engine_generation_not_claimed"
-        status_persisted = _write_status(
-            status_path,
-            status,
-            result_snapshot=result_snapshot,
-            result_snapshot_error=result_snapshot_error,
-        )
+        try:
+            if publication_hook.snapshot is not None and result_snapshot is None:
+                result_snapshot = dict(publication_hook.snapshot)
+            if publication_hook.state == "prepared" and status["returncode"] != 0:
+                # Reported non-commit clears the marker; a hard exit leaves it for recovery.
+                publication_hook.clear_uncommitted_marker()
+            if result_snapshot is None and terminal_report is None and config is not None:
+                try:
+                    result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
+                        mode="json"
+                    )
+                except Exception as exc:  # preserve the terminal engine failure
+                    result_snapshot_error = type(exc).__name__
+                else:
+                    status["generation_unavailable_reason"] = "engine_generation_not_claimed"
+            status_persisted = _write_status(
+                status_path,
+                status,
+                result_snapshot=result_snapshot,
+                result_snapshot_error=result_snapshot_error,
+            )
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop()
     # Missing terminal evidence makes an otherwise successful run exit nonzero.
     return 0 if status_persisted else 1
 

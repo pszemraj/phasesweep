@@ -144,6 +144,14 @@ def json_text_map(value: object) -> dict[str, str] | None:
     return narrowed
 
 
+def json_text_list(value: object) -> list[str] | None:
+    """Copy a list of strings, or return None for other shapes."""
+    if not isinstance(value, list):
+        return None
+    items = [item for item in value if isinstance(item, str)]
+    return items if len(items) == len(value) else None
+
+
 def json_number_map(value: object) -> dict[str, float] | None:
     """Copy a string-to-number object unchanged, or return None for other shapes.
 

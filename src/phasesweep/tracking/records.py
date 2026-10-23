@@ -220,7 +220,7 @@ def _parse_identity(value: object) -> tuple[RunIdentity, Mapping[str, object]]:
 
 
 def validate_identity(identity: object) -> RunIdentity:
-    """Require an attempt identity that names no native run yet.
+    """Narrow a decoded attempt identity; extra keys such as ``run_id`` are dropped, not refused.
 
     :param object identity: Decoded identity a run will be bound to.
     :raises ValueError: A required identity is absent or invalid.

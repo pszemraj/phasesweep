@@ -8,7 +8,7 @@ cd phasesweep
 pip install -e ".[dev,wandb,mlflow]"
 ```
 
-The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks, pytest-xdist for local parallel tests, and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The MLflow server tests in `tests/test_mlflow_integration.py` (marked `integration`) start a local tracking server and need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally); they skip without it. Run Python-dependent commands in the environment where you installed the project. `python -m phasesweep` runs the same command line when the console script is not on `PATH`.
 
 To install unreleased `main` without an editable checkout:
 
@@ -26,6 +26,7 @@ pytest --collect-only
 ruff check .
 ruff format --check .
 mypy src
+bash scripts/check_module_size.sh
 ```
 
 > [!IMPORTANT]
@@ -41,19 +42,20 @@ pre-commit install
 
 | Hook | Stage | Runs on |
 | --- | --- | --- |
-| `ruff check --fix`, `ruff format` | commit | changed Python files |
-| `pathlint` | commit | changed `src/` and `tests/` Python files |
-| module size | commit | changed `src/` and `tests/` Python files |
-| typing escapes | commit | lines the commit adds to `src/` and `tests/` Python files |
-| contract tests | commit | every commit |
-| whole-suite collection | commit | every commit, collecting the whole suite |
-| `mypy src` | push | the whole package |
+| `ruff check --fix`, `ruff format` | pre-commit | changed Python files |
+| `pathlint` | pre-commit | changed `src/` and `tests/` Python files |
+| module size | pre-commit | changed `src/` and `tests/` Python files |
+| typing escapes | pre-commit | lines the commit adds to `src/` and `tests/` Python files |
+| review-provenance tags | pre-commit | changed `src/` and `tests/` Python files |
+| contract tests | pre-commit | every commit |
+| whole-suite collection | pre-commit | every commit, collecting the whole suite |
+| `mypy src` | pre-push | the whole package |
 
 Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
 
-The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change.
+The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 
-`pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
+`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone. The hooks are a fast subset, and plain `pytest` is the full gate.
 
 ### Source prose review
 
@@ -81,7 +83,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Together these lanes cover the same cases as plain `pytest`. The serial lane retains integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation. CI and mandatory hooks retain their existing serial collection and contract-test scope.
+Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
 
 To inspect the cost of a qualification run:
 
@@ -92,7 +94,7 @@ pytest --durations=25 --durations-min=1
 > [!NOTE]
 > A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why both commands above spell out `not live`.
 
-`@pytest.mark.live` tests use real host hardware or a live external service, so every run leaves them out unless `-m live` selects them. The W&B round trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a pure-Python trainer. It checks the attempt-keyed remote captures, publication, inherited parameters, and a replay that reads no W&B state. It needs a project the current W&B credentials may write to, and skips without one:
+`@pytest.mark.live` tests use real host hardware or a live external service, so every run leaves them out unless `-m live` selects them. The W&B round trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a pure-Python trainer. It checks the attempt-keyed remote captures, publication, inherited parameters, and a replay that reads no W&B state. It needs the W&B SDK installed and credentials that may write to the project you name, and skips when `PHASESWEEP_WANDB_ENTITY` or `PHASESWEEP_WANDB_PROJECT` is unset; `PHASESWEEP_WANDB_BASE_URL` selects another W&B server:
 
 ```bash
 PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
@@ -105,7 +107,7 @@ Mark tests explicitly according to the rules above, including tests that call sh
 
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, whole-suite collection, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
+GitHub Actions runs one Linux job on pull requests: Ruff linting, Ruff format checking, mypy, the module-size check, whole-suite collection, and the contract tests, with the tests importing from `src/` and no package build. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests are opt-in.
 
 The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
@@ -113,13 +115,15 @@ The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decodi
 
 ### Shared test setup
 
-Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests.
+Use `tests/conftest.py` for isolation fixtures, model builders and trial records; `tests/experiments.py` for dictionary-based YAML configuration; `tests/ledger_fixtures.py` for golden publications and journal mutations; `tests/mcp_helpers.py` and `tests/recovery_helpers.py` for MCP and recovery setup; and `tests/tracking_helpers.py` for shared tracking fakes and experiment setup. Import shared setup from these support modules rather than another test module. Keep assertions and scenario-specific malformed input or trainer programs with their tests. Helpers that other modules import have public names.
+
+The golden ledger fixture under `tests/fixtures/ledgers` is committed output of a real run. Regenerate it when a persisted format changes; the [fixture guide](../tests/fixtures/ledgers/README.md) gives the command and what churns.
 
 ## PyPI releases
 
 Versions come from Git tags through setuptools-scm. The [`publish.yml` workflow](../.github/workflows/publish.yml) builds one wheel and one source distribution from the commit recorded by a published GitHub Release. The build restricts setuptools-scm's Git tag selection to that release's tag, so other tags on the same commit cannot determine the package version. It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`, then checks that both distributions contain the tag's normalized version and the project name `phasesweep`. GitHub prereleases are skipped, and prerelease version tags are rejected even for normal GitHub Releases.
 
-Before the first upload, configure the pending publisher in [PyPI account publishing](https://pypi.org/manage/account/publishing/):
+PyPI trusts this publisher for the `phasesweep` project, configured in [PyPI account publishing](https://pypi.org/manage/account/publishing/):
 
 | Field | Value |
 | --- | --- |
@@ -137,11 +141,11 @@ For each release:
 2. Publish a normal GitHub Release with a new stable version tag, pointing to a commit that includes the publishing workflow. Keep release notes in GitHub Releases. Publishing starts the workflow; draft creation and tag pushes do not.
 3. Check the workflow result and the [PyPI project](https://pypi.org/p/phasesweep): version, wheel, source distribution, README rendering, and attestations.
 
-The first successful upload converts the pending publisher into the project's trusted publisher. Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail visibly.
+Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail visibly.
 
 ## Package map
 
-- `phasesweep.config`: Pydantic Experiment models and strict YAML loading.
+- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and the `run --set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
@@ -149,14 +153,27 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
+- `phasesweep.errors`: the shared operator-facing error taxonomy and the operator steps behind the `fix:` lines.
+- `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train` that the templates and examples run.
+- Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (served to MCP clients).
 
-Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are defined in `phasesweep.config.models` and `phasesweep.config.search`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
+The configuration reference is written by hand. `tests/test_config_reference.py` expands its shared blocks and compares every key path, variant, type and default with the schema; it does not check the prose, so bounds, units and interactions are only as current as their last review against the code.
 
-Within `phasesweep.engine`, module ownership is intentionally direct:
+Its first header block is the title, and the second is the general notes that `phasesweep explain --notes` prints and `explain_config` returns without a key, so keep that block to what someone writing a config acts on. A `# ---------- Title ----------` banner, at any indent, starts a section, and the comment block right after it, ending at a blank line, is the section's rules, which `explain` prints before the section's keys. A column-0 `TitleCase:` line below the Shared blocks banner defines a shared block, described by the comment lines directly above it. A signature that names blocks, such as `JsonExtractor | WandbExtractor (required)`, expands each block's fields below that key, tagged by the block's `type` field, and `<<: Name` merges a block's fields at its indent. The parser rejects an unknown or unused block and a comment block it cannot attach to a key, a section head or a block.
+
+Common package-root calls are `load_experiment`, `run_experiment`, `experiment_status` and `report_objective`. Schema types are defined in `phasesweep.config.models` and `phasesweep.config.search`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
+
+Within `phasesweep.engine`, responsibilities map to modules as follows:
 
 | Responsibility | Modules |
 | --- | --- |
 | Experiment and phase orchestration | `run`, `phase` |
+| Trial launch, objective extraction and worker threads | `trial`, `workers` |
+| Samplers and trial identity | `optuna` |
+| Winner selection and repeat groups | `selection`, `repeats` |
+| Dry-run planning and run.log progress lines | `preview`, `progress` |
+| Artifact serialization and generation provenance | `artifacts`, `provenance` |
+| Typed engine failures | `errors` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
 | Ledger storage: the only module that constructs Optuna storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
@@ -174,35 +191,66 @@ The ordinary control flow is:
 ```mermaid
 flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
-    run --> preflight["take experiment lock, check and bind artifact root and ledger, claim generation, preflight attempts"]
+    run --> preflight["take experiment lock, check and bind artifact root and ledger, preflight attempts"]
     preflight --> phase["phase._run_phase"]
-    phase --> optimize["Optuna optimize"]
+    phase --> work{"trials to launch?"}
+    work -->|yes| claim["claim the generation once"]
+    work -->|no| select
+    claim --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
     launch --> evidence["read configured scalar and gates"]
     evidence --> select["select feasible winner"]
     select --> next{"more phases?"}
     next -->|yes| phase
-    next -->|no| generation["write immutable generation"]
+    next -->|no| changed{"claimed, or winners differ from the publication?"}
+    changed -->|yes| generation["write immutable generation"]
+    changed -->|no| unchanged["leave both pointers as they were"]
     generation --> pointer["commit last-successful pointer"]
     pointer --> snapshot["freeze MCP terminal result when applicable"]
 ```
 
 ## Test map
 
+The principal test groups and what each covers:
+
 - `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
 - `tests/test_config.py`, `tests/test_param_validation.py`, and `tests/test_overrides.py`: Experiment validation, composition, parameter domains, and retained input boundaries.
+- `tests/test_run_overrides.py`: `run --set` key syntax, created-key notes, and the derived config's validation.
+- `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
+- `tests/test_generation_claim.py`: no generation for a refused run or a replay of the published winners, from the CLI, the engine and a detached MCP run.
 - `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
+- `tests/test_grid_failure_retry.py` and `tests/test_fixed_configuration_retry.py`: raised-target retries of failed grid cells and fixed configurations, raised-limit recovery of a streak abort, the abort advice, and the grid winner advisories.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
 - `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
-- `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and result rendering.
+- `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
 ## Tracked TODOs
 
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK exposes a tested public closed-input-schema API; keep behavior-level request validation as the safety net until then.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
+
+## Declined requests
+
+These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
+
+- **Reading or migrating trees and ledgers written in an older format.** PhaseSweep keeps no compatibility layer. Each persisted-format change bumps the study and artifact-root stamps, so older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
+- **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
+- **An `await_run` limit above 600 seconds, or a streaming watch tool.** MCP tool calls are request and response, and clients bound how long one may block. An agent repeats `await_run` with the same `run_id`; [MCP](mcp.md) gives the loop.
+- **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials answered a different question. Derive the new configuration with `run --set` under a new `experiment` name and run it.
+- **An audit-only mode for seed or repeat phases that publishes no winner.** `repeats` already publishes each group's spread with the winner, and a phase that publishes nothing would be a second phase kind for the same need.
+- **A launch queue that chains sweeps.** A scheduler is outside a single-node sweep tool. An agent waits on the blocking run with `await_run` and launches the next one.
+- **Per-item paired bootstrap or a cost tiebreak for near ties.** Both need per-example evaluation data that PhaseSweep never collects. The tie warning reports the gap, the combined SE and each group's params.
+- **A nonzero exit for an accepted incomplete winner or pending MLflow uploads.** Both are configured successes: an incomplete winner is published only under `allow_incomplete_on_timeout`, and its `WINNER` line says `INCOMPLETE`; pending uploads end with a closing line that points to `sync-tracking`.
+- **Shorter trial directory names.** `trials.csv` and `status --trials` are the interfaces for scripts; the directory name carries the generation and attempt IDs that keep attempts apart.
+- **Reporting a name missing from `mlflow_required` as a gate failure rather than an objective read error.** The gate and the objective read one shared capture, and a finished run that lacks a required name fails that capture at once, so the trial fails either way; the error names the missing key and lists the run's keys of that kind.
+- **Restricting `record_env` to `true` and `false`.** It is a plain boolean, and every boolean key accepts the same YAML forms.
+- **Treating a key that overrides a `<<:` merge as a duplicate key.** Keys written in a mapping win over merged ones under standard YAML merge semantics. A key written twice in one mapping, or a second `<<`, is still rejected.
+- **Dropping the experiment-level `trainer_config` check because each phase's composition check repeats it.** The experiment-level check names the `trainer_config` key the override format cannot carry; the phase check only reports that composition failed for that phase.
+- **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and the fast lane leaves it out.
+- **One shared failure boundary for the `json_equals`, `json_scalar_bound` and JSON `artifact_size` gates.** Each handler's read-and-report block is four lines and converts a different value. A shared boundary needs a new exception type or a union return, which adds more indirection than the three copies cost.

@@ -64,10 +64,10 @@ FIXTURE_ENVIRONMENT: dict[str, str | None] = {
 #: PhaseSweep study schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal so this
 #: module names no PhaseSweep import before ``_isolate_environment`` runs.
-TARGET_STUDY_SCHEMA_VERSION = 7
+TARGET_STUDY_SCHEMA_VERSION = 9
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
-TARGET_BINDING_SCHEMA_VERSION = 7
+TARGET_BINDING_SCHEMA_VERSION = 9
 #: Study user attribute holding the PhaseSweep study schema version.
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 #: Optuna journal op code for ``SET_STUDY_USER_ATTR``.
@@ -295,9 +295,9 @@ def _computed_expectations(paths: FixturePaths) -> dict[str, str]:
     """Derive the verdict each mode owes this fixture, from the produced bytes.
 
     The artifact-root binding is validated before the ledger is scanned, so a
-    missing or mismatched binding decides the ``tree`` verdict on its own; the
-    ledger decides ``ledger-only`` and any ``tree`` read whose binding is
-    current.
+    mismatched binding decides the ``tree`` verdict on its own, and so does a
+    missing one beside a durable tree. Otherwise the ledger decides both
+    ``tree`` and ``ledger-only``.
 
     :param FixturePaths paths: Produced fixture.
     :return dict[str, str]: Verdict per mode.
@@ -486,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         produced_by = _produced_by(source_root)
         try:
             generate(out_dir, scratch=sandbox, produced_by=produced_by, notes=args.notes)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
     print(f"generated {FIXTURE_NAME} under {out_dir}")

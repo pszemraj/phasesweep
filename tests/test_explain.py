@@ -2,11 +2,88 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
 from click.testing import CliRunner
 
+import phasesweep.config.reference as reference
 from phasesweep.cli import cli as cli_main
-from phasesweep.config.reference import reference_entries, reference_notes, top_level_entries
+from phasesweep.config.reference import (
+    reference_entries,
+    reference_notes,
+    rules_for,
+    top_level_entries,
+)
+from phasesweep.mcp.tools import PhaseSweepMCP
+
+_SAMPLE = """\
+# sample reference
+
+# note one
+
+# ---------- Objective ----------
+# A bad read fails the trial.
+
+# Scalar source.
+extractor: JsonX | WandbX (required)
+
+# ---------- Gates ----------
+
+# Hard checks.
+gates: list[wb] = []
+  # W&B gate.
+  - type: "wb" (required)
+    <<: Target
+    # Keys that must be present.
+    keys: list[string] (required)
+
+# ---------- Shared blocks ----------
+
+# Read one number from a JSON file.
+JsonX:
+  # Selects the JSON reader.
+  type: "json" (required)
+  # JSON file.
+  path: string (required)
+
+# Read a W&B summary.
+WandbX:
+  # Selects the W&B reader.
+  type: "wandb" (required)
+  <<: Target
+
+# The W&B run every consumer in a phase reads.
+Target:
+  # Seconds to wait.
+  timeout_seconds: float = 120.0
+"""
+
+
+@pytest.fixture
+def sample_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Serve a small reference with section rules and shared blocks in place of the packaged one.
+
+    :param Path tmp_path: Directory for the sample file.
+    :param pytest.MonkeyPatch monkeypatch: Replaces the packaged resource lookup.
+    :return Iterator[None]: Yields while the sample is served, then restores the packaged one.
+    """
+    path = tmp_path / "config_reference.yaml"
+    path.write_text(_SAMPLE, encoding="utf-8")
+    caches = (
+        reference._packaged,
+        reference.reference_notes,
+        reference._display_by_segments,
+        reference._variant_tags,
+    )
+    monkeypatch.setattr(reference, "_reference_resource", lambda: path)
+    for cache in caches:
+        cache.cache_clear()
+    yield
+    monkeypatch.undo()
+    for cache in caches:
+        cache.cache_clear()
 
 
 def _explain(*args: str) -> tuple[int, str, str]:
@@ -44,7 +121,7 @@ def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:
     assert "config_reference.yaml" not in out
 
 
-def test_explain_notes_prints_the_general_notes_and_no_maintainer_lines() -> None:
+def test_explain_notes_prints_the_general_notes_and_not_the_title() -> None:
     """``--notes`` prints the header block that applies to every key, one line per note."""
     code, out, err = _explain("--notes")
     assert code == 0
@@ -52,9 +129,9 @@ def test_explain_notes_prints_the_general_notes_and_no_maintainer_lines() -> Non
     assert out.splitlines() == list(reference_notes())
     assert "Paths: a relative workdir" in out
     assert "YAML scalars follow PyYAML" in out
-    assert "PHASESWEEP_LOCK_DIR" in out
-    for maintainer_line in ("does not load as YAML", "maintained by hand", "parsed by", "tests/"):
-        assert maintainer_line not in out
+    assert "docs/runtime.md#environment-variables" in out
+    for title_line in ("does not load", "signature form", "parsed by", "tests/"):
+        assert title_line not in out
 
 
 def test_explain_notes_refuses_a_key() -> None:
@@ -79,6 +156,13 @@ def test_explain_a_subtree_prints_each_entry_with_indented_comments() -> None:
     assert err == ""
     blocks = out.rstrip("\n").split("\n\n")
     expected = [entry for entry in reference_entries() if entry.path.startswith("phases[].sampler")]
+    heads = [
+        "\n".join([f"{rules.title}:", *(f"  {line}" for line in rules.lines)])
+        for rules in rules_for(expected)
+    ]
+    assert heads and heads[0].startswith("Section Phases:\n")
+    assert blocks[: len(heads)] == heads
+    blocks = blocks[len(heads) :]
     assert len(blocks) == len(expected) >= 2
     first = blocks[0].splitlines()
     assert first[0] == f"phases[].sampler: {expected[0].signature}"
@@ -109,11 +193,35 @@ def test_explain_accepts_bracket_dotted_and_indexed_spellings(spelling: str) -> 
 
 
 def test_explain_a_leaf_prints_only_that_entry() -> None:
-    """A key without children prints one block."""
+    """A key without children prints its section rules and then one entry block."""
     code, out, _ = _explain("execution.inherit_env")
     assert code == 0
-    assert out.startswith("execution.inherit_env: ")
-    assert "\n\n" not in out
+    blocks = out.rstrip("\n").split("\n\n")
+    assert blocks[0].startswith("Section Execution environment:\n")
+    assert [block for block in blocks if not block.startswith("Section ")] == [blocks[-1]]
+    assert blocks[-1].startswith("execution.inherit_env: ")
+
+
+def test_explain_resolves_a_dotted_search_parameter_name() -> None:
+    """A dotted trainer key resolves to its search-parameter reference."""
+    code, out, err = _explain("phases[].search_space.optimizer.lr")
+
+    assert code == 0
+    assert not err
+    assert "choices:" in out
+    assert "low:" in out
+
+
+def test_explain_phases_is_a_compact_index_to_its_children() -> None:
+    """The broad phases query stays usable and points to detailed child queries."""
+    code, out, err = _explain("phases")
+
+    assert code == 0
+    assert not err
+    assert "phases[].n_trials" in out
+    assert "phases[].search_space" in out
+    assert "phasesweep explain" in out
+    assert len(out) < 8000
 
 
 def test_explain_unknown_key_exits_two_with_closest_matches() -> None:
@@ -142,3 +250,63 @@ def test_explain_unknown_key_without_neighbours_points_at_the_listing(key: str) 
     assert out == ""
     assert "no config key matches" in err
     assert "Run `phasesweep explain` to list the top-level keys." in err
+
+
+@pytest.mark.usefixtures("sample_reference")
+def test_explain_prints_section_rules_and_block_descriptions_before_the_entries() -> None:
+    """A key's section rules and the blocks its entries came from head the output, once each."""
+    code, out, err = _explain("extractor.timeout_seconds")
+    assert code == 0
+    assert err == ""
+    assert out == (
+        "Section Objective:\n  A bad read fails the trial.\n\n"
+        "Shared block WandbX:\n  Read a W&B summary.\n\n"
+        "Shared block Target:\n  The W&B run every consumer in a phase reads.\n\n"
+        "extractor[type=wandb].timeout_seconds: float = 120.0\n  Seconds to wait.\n"
+    )
+    code, out, _ = _explain("gates[].timeout_seconds")
+    assert code == 0
+    assert out.startswith("Shared block Target:\n")
+    assert "Section" not in out
+    assert PhaseSweepMCP.explain_config("extractor.timeout_seconds")["rules"] == [
+        {"kind": "section", "name": "Objective", "description": "A bad read fails the trial."},
+        {"kind": "block", "name": "WandbX", "description": "Read a W&B summary."},
+        {
+            "kind": "block",
+            "name": "Target",
+            "description": "The W&B run every consumer in a phase reads.",
+        },
+    ]
+    assert PhaseSweepMCP.explain_config(None)["rules"] == []
+
+
+@pytest.mark.usefixtures("sample_reference")
+def test_typo_suggestions_and_validation_hints_reach_shared_block_fields() -> None:
+    """Expanded block fields are ordinary keys for suggestions and error locations."""
+    assert set(reference.closest("timeout_secnds")) == {
+        "extractor.timeout_seconds",
+        "gates[].timeout_seconds",
+    }
+    assert reference.loc_to_path(("extractor", "wandb", "timeout_seconds")) == (
+        "extractor.timeout_seconds"
+    )
+    assert reference.loc_to_path(("gates", 0, "wb", "timeout_seconds")) == "gates[].timeout_seconds"
+
+
+def test_explain_prints_the_packaged_section_rules_and_shared_block_descriptions() -> None:
+    """A field merged from a shared block shows its use site's section and the block's description."""
+    code, out, err = _explain("constraints[].extractor.timeout_seconds")
+    assert code == 0
+    assert err == ""
+    blocks = out.rstrip("\n").split("\n\n")
+    assert blocks[0].startswith("Section Constraints:\n")
+    assert blocks[1].startswith("Shared block WandbTarget:\n")
+    assert blocks[2].startswith(
+        "constraints[].extractor[type=wandb].timeout_seconds: float = 120.0\n"
+    )
+    assert len(blocks) == 3
+    rules = PhaseSweepMCP.explain_config("phases[].gates[].entity")["rules"]
+    assert [(group["kind"], group["name"]) for group in rules] == [
+        ("section", "Phase gates"),
+        ("block", "WandbTarget"),
+    ]
