@@ -400,6 +400,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
         "Refusing to reinterpret those finished attempts as a successful phase."
         + ("" if advice is None else f" {advice}"),
         action=_recovery_action(study, abort_record),
+        remediation=advice,
     )
 
 
@@ -423,6 +424,7 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         f"trials at its accepted n_trials={abort_record['trial_target']}."
         + ("" if advice is None else f" {advice}"),
         action=OperatorAction.FIX_CONFIG,
+        remediation=advice,
     )
 
 
@@ -1348,6 +1350,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}"
             + ("" if advice is None else f" {advice}"),
             action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
+            remediation=advice,
         )
     if (
         finished_after < phase.n_trials

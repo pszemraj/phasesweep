@@ -804,7 +804,9 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
     remedies = _recovery_remedies(phase, study, abort)
-    return None if remedies is None else f"{remedies} {_FRESH_START}"
+    if remedies is None:
+        return None
+    return f"{remedies} Raising n_trials does not change the study fingerprint. {_FRESH_START}"
 
 
 def _recovery_remedies(

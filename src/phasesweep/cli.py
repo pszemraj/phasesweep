@@ -143,7 +143,8 @@ def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) ->
             f"{exc}\nfix: inspect the raw artifacts, or use the exact checkout that produced "
             "them for inspection if available; this checkout reads only its current format."
         )
-    return f"{exc}\nfix: {OPERATOR_STEPS[exc.action]}."
+    step = exc.remediation or f"{OPERATOR_STEPS[exc.action]}."
+    return f"{exc}\nfix: {step}"
 
 
 def main() -> None:

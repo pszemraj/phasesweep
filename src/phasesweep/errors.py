@@ -40,15 +40,22 @@ class PhaseSweepError(RuntimeError):
     # Concrete subclasses must declare their own default action.
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
-    def __init__(self, *args: object, action: OperatorAction | None = None) -> None:
+    def __init__(
+        self,
+        *args: object,
+        action: OperatorAction | None = None,
+        remediation: str | None = None,
+    ) -> None:
         """Create an operational failure carrying the remediation it calls for.
 
         :param object args: Standard exception arguments; the first is the message.
         :param OperatorAction | None action: Remediation for this one raise,
             overriding the class's :attr:`default_action`.
+        :param str | None remediation: Concrete operator step when the raise knows it.
         """
         super().__init__(*args)
         self.action: OperatorAction = action if action is not None else type(self).default_action
+        self.remediation = remediation
 
     @classmethod
     def rewrap(
@@ -56,6 +63,7 @@ class PhaseSweepError(RuntimeError):
         cause: BaseException,
         *args: object,
         action: OperatorAction | None = None,
+        remediation: str | None = None,
     ) -> Self:
         """Construct a translated error while retaining its cause's remediation.
 
@@ -66,11 +74,14 @@ class PhaseSweepError(RuntimeError):
         :param BaseException cause: Failure being rewrapped.
         :param object args: Arguments for the new error; the first is the message.
         :param OperatorAction | None action: Remediation for this one raise.
+        :param str | None remediation: Concrete operator step, inherited from the cause by default.
         :return Self: The new error, for the caller to raise ``from cause``.
         """
         if action is None and isinstance(cause, PhaseSweepError):
             action = cause.action
-        return cls(*args, action=action)
+        if remediation is None and isinstance(cause, PhaseSweepError):
+            remediation = cause.remediation
+        return cls(*args, action=action, remediation=remediation)
 
 
 #: Recovery guidance for both CLI and MCP entry points.

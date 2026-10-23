@@ -1826,6 +1826,10 @@ def test_raise_sites_route_their_declared_action(
     if case.cause is not None:
         assert type(error.__cause__) is case.cause
     assert case.message in str(error)
+    if error.remediation is not None:
+        rendered = _operational_error_text(error)
+        assert rendered.split("\nfix: ", 1)[1] == error.remediation
+        assert "correct the experiment configuration" not in rendered
     if case.action is OperatorAction.RETRY:
         rendered = _operational_error_text(error)
         assert "retry the same operation once the reported blocker is resolved" in rendered

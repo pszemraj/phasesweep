@@ -1292,8 +1292,8 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert "A larger n_trials does not retire this abort" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
     assert "Then raise phases[p].n_trials above 2 in the config" in message
-    # The closing sentence introduces the recorded results itself, after any remedy.
-    assert "in the config. The recorded trial results stay in the study; " in message
+    assert "Raising n_trials does not change the study fingerprint." in message
+    assert "The recorded trial results stay in the study; " in message
     # A preview of the larger target refuses the same way, as the live run below does,
     # and asks only for the cleanup that target still waits on.
     with pytest.raises(PhaseAbortRefusedError, match="A larger n_trials does not retire") as raised:
