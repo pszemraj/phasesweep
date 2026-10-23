@@ -33,36 +33,36 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
     file_sha256,
-    require_linux_runtime,
+    require_supported_runtime,
 )
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
 
-def require_linux_mcp_host() -> None:
-    """Require Linux process identity semantics for autonomous MCP control.
+def require_supported_mcp_host() -> None:
+    """Require Linux or macOS process identity for autonomous MCP control.
 
-    :raises CatalogError: If the host is not Linux, or cannot provide the
-        ``/proc`` process start times and this process's own PID namespace
+    :raises CatalogError: If the host is unsupported, or cannot provide the
+        kernel process start times and this process's own PID namespace
         used to prevent PID-reuse mistakes during cancellation and crash
         recovery.
     """
     try:
-        require_linux_runtime()
+        require_supported_runtime()
     except PlatformCapabilityError as exc:
-        raise CatalogError(str(exc), suggestion="run the MCP server on a Linux host") from exc
+        raise CatalogError(str(exc), suggestion="run the MCP server on Linux or macOS") from exc
     if read_proc_starttime(os.getpid()) is None:
         raise CatalogError(
-            "the phasesweep MCP server cannot read this process's Linux /proc start time, "
+            "the phasesweep MCP server cannot read this process's start time, "
             "which is required for PID-reuse-safe cancellation and crash recovery",
-            suggestion="mount /proc with process stat access for the MCP server process",
+            suggestion="allow native process identity reads for the MCP server process",
         )
     if read_pid_namespace() is None:
         raise CatalogError(
             "the phasesweep MCP server cannot read its own PID namespace, which is required "
             "to tell its runners' process ids from those of another namespace",
-            suggestion="run the MCP server where /proc is the procfs of its own PID namespace",
+            suggestion="run the MCP server where its own host PID namespace can be read",
         )
 
 
@@ -481,7 +481,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     :param Path catalog_path: Path to the operator-authored catalog YAML.
     :return CatalogCheckReport: One verdict per catalog entry, in catalog order.
     """
-    require_linux_mcp_host()
+    require_supported_mcp_host()
     catalog, base, _catalog_sha256 = _parse_catalog(catalog_path)
     _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
     report = CatalogCheckReport(entries=verdicts)
@@ -538,12 +538,12 @@ class Registry:
         :return Registry: Immutable registry of validated catalog entries.
         :raises StateDirChangedError: If ``bound_state_dir`` is given and the catalog
             resolves ``state_dir`` to another directory.
-        :raises CatalogError: If the host is not a supported Linux MCP host, the
+        :raises CatalogError: If the host is not a supported Linux or macOS MCP host, the
             catalog cannot be parsed, an id is duplicated, an entry fails
             validation, two entries claim one engine namespace, or the state
             directory cannot be prepared.
         """
-        require_linux_mcp_host()
+        require_supported_mcp_host()
         catalog, base, catalog_sha256 = _parse_catalog(catalog_path)
         if bound_state_dir is not None:
             state_dir = _resolve_catalog_relative_path(base, catalog.state_dir)

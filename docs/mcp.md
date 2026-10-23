@@ -2,7 +2,7 @@
 
 The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio and is supported on Linux. It has the trial launcher's [`/proc` requirements](runtime.md) and also reads `/proc` process start times to distinguish process reuse during cancellation and recovery.
+The server runs over local stdio on Linux and macOS. Cancellation and recovery require the trial launcher's [native process identity reads](runtime.md): exact process start time, boot identity and host PID namespace. An unreadable or mismatched identity refuses signalling.
 
 ## The catalog
 

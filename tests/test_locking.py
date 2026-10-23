@@ -725,6 +725,9 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
 
 
 @pytest.mark.signals_own_pid
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="counts descriptors through Linux /proc/self/fd"
+)
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

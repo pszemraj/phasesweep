@@ -23,6 +23,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
@@ -54,7 +55,7 @@ dev = [
     "types-PyYAML>=6.0",
     "mcp>=1.27,<1.28",
     "pre-commit>=3.2",
-    "pathlint>=0.2",
+    "pathlint>=0.3.1",
 ]
 
 [project.scripts]

@@ -34,6 +34,7 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
 def test_gpu_enumeration_refusal_explains_cpu_only_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Unreadable mocked CUDA hardware explains the deliberate CPU opt-out on any host."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)

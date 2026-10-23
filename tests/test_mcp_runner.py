@@ -1756,7 +1756,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
 @pytest.mark.parametrize(
     ("reader", "match"),
     [
-        pytest.param("read_proc_starttime", "/proc start time is unavailable", id="proc_starttime"),
+        pytest.param("read_proc_starttime", "start time is unavailable", id="proc_starttime"),
         pytest.param("read_boot_id", "boot id", id="boot_id"),
     ],
 )
@@ -1766,7 +1766,7 @@ def test_runner_does_not_persist_a_receipt_without_process_identity(
     reader: str,
     match: str,
 ) -> None:
-    """A runner that cannot read its Linux process identity leaves its claimed handle launching."""
+    """A runner that cannot read its process identity leaves its claimed handle launching."""
     store = RunStore(tmp_path / "state")
     run_id = "srv-no-identity"
     started_at = "2026-06-24T00:00:00Z"

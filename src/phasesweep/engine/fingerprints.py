@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +129,13 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
     if phase.gpu_policy == "whole_node":
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
-        dump["whole_node_device_count"] = len(tokens or [])
+        # Only macOS permits a discovered whole-node pool: one MPS device on
+        # Apple silicon and no device on Intel. CUDA configurations declare the count.
+        dump["whole_node_device_count"] = (
+            len(tokens)
+            if tokens is not None
+            else int(platform.machine().lower() in {"arm64", "aarch64"})
+        )
     return dump
 
 

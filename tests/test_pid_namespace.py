@@ -8,9 +8,11 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +26,7 @@ from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSwe
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import CatalogError, ExperimentBusyError, RunNamespaceMismatchError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
-from phasesweep.mcp.registry import Registry, require_linux_mcp_host
+from phasesweep.mcp.registry import Registry, require_supported_mcp_host
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN
 from phasesweep.mcp.tools import PhaseSweepMCP
@@ -123,6 +125,7 @@ def _fake_proc(
         boot_id_file = proc / "sys" / "kernel" / "random" / "boot_id"
         boot_id_file.parent.mkdir(parents=True)
         boot_id_file.write_text(f"{boot_id}\n")
+    monkeypatch.setattr(reaper, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(reaper, "_PROC", proc)
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reader)
     return proc
@@ -145,6 +148,7 @@ def _identity(
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="reads the real Linux procfs namespace links")
 def test_read_pid_namespace_names_this_process_namespace() -> None:
     namespace = read_pid_namespace()
     if namespace is None:
@@ -176,6 +180,7 @@ def test_read_pid_namespace_refuses_procfs_of_another_namespace(
     proc = tmp_path / "proc"
     _write_process(proc, 1, nspid=None, namespace=None, starttime=100)
     _write_process(proc, os.getpid(), nspid=None, namespace=RECORDED)
+    monkeypatch.setattr(reaper, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(reaper, "_PROC", proc)
 
     (proc / "self").symlink_to(str(os.getpid() + 1))
@@ -192,6 +197,7 @@ def test_read_pid_namespace_needs_its_pid_1_start_time(
     """Without its PID 1, a namespace's inode could be one an ended namespace used."""
     proc = tmp_path / "proc"
     _write_process(proc, os.getpid(), nspid=None, namespace=RECORDED)
+    monkeypatch.setattr(reaper, "sys", SimpleNamespace(platform="linux"))
     (proc / "self").symlink_to(str(os.getpid()))
     monkeypatch.setattr(reaper, "_PROC", proc)
 
@@ -204,6 +210,7 @@ def test_read_pid_namespace_rejects_a_malformed_link(
     proc = tmp_path / "proc"
     _write_process(proc, 1, nspid=None, namespace=None)
     _write_process(proc, os.getpid(), nspid=None, namespace="net:[4026539001]")
+    monkeypatch.setattr(reaper, "sys", SimpleNamespace(platform="linux"))
     (proc / "self").symlink_to(str(os.getpid()))
     monkeypatch.setattr(reaper, "_PROC", proc)
 
@@ -578,6 +585,7 @@ def _start_namespace_holder() -> tuple[subprocess.Popen[str], str, int]:
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux PID namespaces and procfs")
 def test_absence_proof_tracks_a_real_child_pid_namespace() -> None:
     """A live recorded process blocks the proof; once its namespace is gone, nothing does."""
     current = read_pid_namespace()
@@ -1210,4 +1218,4 @@ def test_server_startup_requires_a_readable_pid_namespace(
     monkeypatch.setattr(mcp_registry, "read_pid_namespace", lambda: None)
 
     with pytest.raises(CatalogError, match="PID namespace"):
-        require_linux_mcp_host()
+        require_supported_mcp_host()

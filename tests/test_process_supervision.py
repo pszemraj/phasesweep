@@ -1003,6 +1003,9 @@ def test_unexpected_status_read_failure_preserves_cleanup_evidence(
         assert lifecycle.cleanup_confirmed is True
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="reads Linux procfs SigBlk for the exec'd trainer"
+)
 def test_trainer_starts_with_unblocked_shutdown_signals(tmp_path: Path) -> None:
     """The exec'd trainer receives unblocked shutdown signals despite launch-time deferral."""
     trial_dir = tmp_path / "trial"
@@ -1468,6 +1471,7 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     expected: tuple[tuple[int, ...], bool, bool],
 ) -> None:
     """Host-global hidepid failures do not poison an unrelated trainer group."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
     real_iterdir = Path.iterdir
 
     def fake_iterdir(path: Path):
@@ -1502,6 +1506,7 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     expected_alive: bool,
 ) -> None:
     """The stdlib guardian applies the same target-scoped completeness rule."""
+    monkeypatch.setattr(supervisor, "sys", SimpleNamespace(platform="linux"))
 
     real_open = builtins.open
 

@@ -1,4 +1,4 @@
-"""Lease CUDA devices and prevent double-booking through host lock files.
+"""Lease CUDA or MPS devices and prevent double-booking through host lock files.
 
 Numeric indices and GPU UUID spellings bind to one canonical GPU UUID.
 Single-job CPU work needs no pool; parallel CPU work requires an explicit opt-in.
@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -49,9 +51,10 @@ class GpuLeaseCancelledError(RuntimeError):
 
 @dataclass(frozen=True)
 class GpuDevice:
-    """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem.
+    """A CUDA visibility token or discovered MPS device with a safe lock stem.
 
-    ``visible_token`` is what the trainer sees in ``CUDA_VISIBLE_DEVICES``.
+    ``visible_token`` is what a CUDA trainer sees in ``CUDA_VISIBLE_DEVICES``;
+    the discovered ``mps`` token leases the device without changing visibility.
     GPU/MIG prefixes are replaced with the inventory's canonical spelling;
     numeric indices keep the operator's ordinal.
     ``lock_token`` is the canonical physical-device identity the host lock keys
@@ -76,7 +79,7 @@ class GpuDevice:
         numeric index and the GPU UUID naming the same card share one lock file.
         """
         identity = self.lock_identity
-        if identity.isdigit():
+        if identity.isdigit() or identity == "mps":
             return identity
         normalized = _SAFE_LOCK_TOKEN.sub("_", identity).strip("_") or "device"
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -97,13 +100,13 @@ class _GpuAcquisition:
 
     devices: list[GpuDevice]
     leases: list[IO[str]]
-    visible_devices: str
+    visible_devices: str | None
 
 
 def _gpu_lock_path(device: GpuDevice) -> Path:
-    """Return the host-wide lock file for a CUDA device token.
+    """Return the host-wide lock file for a CUDA or MPS device token.
 
-    :param GpuDevice device: Canonical CUDA device identity.
+    :param GpuDevice device: Canonical CUDA or MPS device identity.
     :return Path: Host-wide lock file path for ``device``.
     """
     return lock_dir() / f"gpu_{device.lock_name}.lock"
@@ -402,7 +405,7 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
 
 
 class GpuPool:
-    """Lease CUDA device assignments and host locks across threads.
+    """Lease CUDA or MPS device assignments and host locks across threads.
 
     :meth:`acquire` yields a :class:`GpuAssignment` with visibility and lease FDs,
     including an inactive assignment when no device is leased.
@@ -415,7 +418,7 @@ class GpuPool:
         whole_node: bool = False,
         pinned_visible_devices: str | None = None,
     ) -> None:
-        """Build a pool from a fixed list of CUDA device tokens.
+        """Build a pool from a fixed list of CUDA or MPS device tokens.
 
         :param list[GpuDevice] devices: Tokens to manage; empty means no GPU leases.
             Prefer :meth:`create` for discovery and policy handling.
@@ -468,7 +471,8 @@ class GpuPool:
         :param int n_jobs: Number of parallel trials.
         :param list[int] | None explicit_ids: GPU indices, or None for autodetection,
             including single-job runs. Mutually exclusive with ``explicit_devices``.
-        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens.
+        :param list[str] | None explicit_devices: Numeric, GPU UUID, or MIG instance tokens
+            on Linux. macOS discovers its pool and refuses explicit device lists.
         :param bool allow_no_gpu: Allow unresolved inventory or auto-detected parallel
             CPU-only work. An explicit CUDA-disable value needs no opt-in.
         :param GpuPolicy policy: ``single_per_trial`` leases one token; ``whole_node``
@@ -483,6 +487,26 @@ class GpuPool:
         if policy == "none":
             log.info("GPU isolation disabled by gpu_policy='none'.")
             return cls(devices=[])
+
+        if sys.platform == "darwin":
+            if explicit_ids is not None or explicit_devices is not None:
+                raise GpuConfigurationError(
+                    "gpu_ids and gpu_devices are unavailable on macOS: the device pool "
+                    "is discovered automatically (one MPS device on Apple silicon). "
+                    "Omit CUDA device lists; the trainer selects its own device."
+                )
+            if platform.machine().lower() in {"arm64", "aarch64"}:
+                devices = [GpuDevice("mps")]
+                _log_pool_size(n_jobs, ["mps"], "discovered")
+                return cls(devices=devices, whole_node=policy == "whole_node")
+            if n_jobs <= 1 or allow_no_gpu:
+                log.info("No GPUs detected on this Intel Mac; phase will run without GPU leases.")
+                return cls(devices=[])
+            raise GpuConfigurationError(
+                f"n_jobs={n_jobs} but no GPUs detected on this Intel Mac. The device pool "
+                "is discovered automatically on macOS; set allow_no_gpu_isolation: true "
+                "if this is an intentional CPU-only parallel sweep."
+            )
 
         # Explicit configuration always wins, even at n_jobs==1.
         explicit = explicit_ids if explicit_ids is not None else explicit_devices
@@ -699,7 +723,9 @@ class GpuPool:
                         acquired = _GpuAcquisition(
                             devices=[device],
                             leases=[lease],
-                            visible_devices=device.visible_token,
+                            visible_devices=(
+                                None if device.visible_token == "mps" else device.visible_token
+                            ),
                         )
                         break
             finally:
@@ -762,7 +788,11 @@ class GpuPool:
                 self._wait_for_retry(deadline)
                 continue
 
-            visible_devices = ",".join(device.visible_token for device in self._devices)
+            visible_devices = (
+                None
+                if self._devices[0].visible_token == "mps"
+                else ",".join(device.visible_token for device in self._devices)
+            )
             log.debug("Whole-node GPU host leases acquired: %s", visible_devices)
             return _GpuAcquisition(
                 devices=list(self._devices),

@@ -438,7 +438,7 @@ def test_recover_run_surfaces_host_error_suggestion(
 ) -> None:
     """An unusable host must report the remediation, not only the diagnosis.
 
-    ``require_linux_mcp_host`` carries its fix in ``CatalogError.suggestion``;
+    ``require_supported_mcp_host`` carries its fix in ``CatalogError.suggestion``;
     rendering only the message would leave the operator with a run stuck in
     ``recovery_required`` and nothing to act on.
     """
@@ -450,7 +450,7 @@ def test_recover_run_surfaces_host_error_suggestion(
             suggestion="mount /proc with process stat access",
         )
 
-    monkeypatch.setattr("phasesweep.cli.require_linux_mcp_host", refuse_host)
+    monkeypatch.setattr("phasesweep.cli.require_supported_mcp_host", refuse_host)
 
     result = recover_run_cli(tmp_path / "state", "missing")
 

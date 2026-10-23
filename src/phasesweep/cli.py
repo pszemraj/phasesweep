@@ -52,7 +52,7 @@ from phasesweep.mcp.registry import (
     CatalogCheckReport,
     Registry,
     check_catalog,
-    require_linux_mcp_host,
+    require_supported_mcp_host,
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
@@ -1035,7 +1035,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     """
     state_dir = state_dir.expanduser().resolve()
     try:
-        require_linux_mcp_host()
+        require_supported_mcp_host()
     except CatalogError as exc:
         raise click.ClickException(_catalog_error_text(exc)) from None
     try:

@@ -31,8 +31,8 @@ _active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 # The handler waits until each in-flight launch registers its PGID or fails.
 _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
-# Execution is Linux-only, but the package must import anywhere so that
-# require_linux_runtime(), not an AttributeError, reports a host without SIGHUP.
+# The package must import anywhere so that
+# require_supported_runtime(), not an AttributeError, reports a host without SIGHUP.
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
     signal.Signals[name] for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name)
 )
@@ -402,7 +402,8 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
 
     Signals arriving inside the window are reported on the yielded object and
     retained for a later shutdown checkpoint. Signals arriving before entry raise
-    normally. Kernel-queued signals are drained while blocked using ``sigtimedwait``.
+    normally. Kernel-queued signals are drained while blocked where timed waits
+    exist, or delivered into main-thread deferral before restoring the original mask.
 
     :return Iterator[AbsorbedShutdown]: Window outcome whose ``signum`` is the absorbed
         shutdown signal, or ``None`` when no shutdown arrived during the window; it is set on
@@ -419,12 +420,22 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
         yield absorbed
     finally:
         drained: int | None = None
-        # Drain while blocked to prevent an exception after commit.
-        while True:
-            info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
-            if info is None:
-                break
-            drained = info.si_signo
+        if hasattr(signal, "sigtimedwait"):
+            # A timed wait cannot block if another thread receives the signal first.
+            while True:
+                info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
+                if info is None:
+                    break
+                drained = info.si_signo
+        elif is_main:
+            # Deliver even an outer scope's masked signals into Python deferral,
+            # which stays active until after the original mask is restored.
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
+        else:
+            # Workers cannot dispatch Python handlers. Observe without consuming
+            # so restoration still delivers shutdown to the owning main thread.
+            pending = signal.sigpending()
+            drained = next((sig for sig in _SHUTDOWN_SIGNALS if sig in pending), None)
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main:
             _main_thread_defer_depth -= 1

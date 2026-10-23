@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -39,21 +40,21 @@ from tests.conftest import (
 
 @pytest.mark.integration
 def test_cli_imports_without_sighup_so_the_platform_gate_names_the_host() -> None:
-    """A host without SIGHUP, such as Windows, gets the Linux refusal, not an import error."""
+    """A host without SIGHUP, such as Windows, gets the platform refusal, not an import error."""
     code = (
         "import signal, sys\n"
         "del signal.SIGHUP\n"
         "from phasesweep.cli import cli\n"
-        "from phasesweep.runtime.files import require_linux_runtime\n"
+        "from phasesweep.runtime.files import require_supported_runtime\n"
         "sys.platform = 'win32'\n"
-        "require_linux_runtime()\n"
+        "require_supported_runtime()\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code], text=True, capture_output=True, timeout=60.0, check=False
     )
     assert proc.returncode == 1, proc.stderr
     assert "PlatformCapabilityError" in proc.stderr
-    assert "phasesweep runs only on Linux, and this host reports 'win32'" in proc.stderr
+    assert "Linux" in proc.stderr and "macOS" in proc.stderr and "'win32'" in proc.stderr
 
 
 @pytest.mark.integration
@@ -324,6 +325,65 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
 def test_service_pending_shutdown_is_noop_without_absorbed_signal() -> None:
     """The explicit checkpoint does nothing when no shutdown was absorbed."""
     assert runtime_shutdown.service_pending_shutdown() is None
+
+
+@pytest.mark.signals_own_pid
+@pytest.mark.parametrize("already_blocked", [False, True])
+def test_absorption_without_timed_wait_preserves_nested_mask_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch, already_blocked: bool
+) -> None:
+    """A queued shutdown is absorbed and retained even inside an already-masked scope."""
+    monkeypatch.delattr(signal, "sigtimedwait", raising=False)
+    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        install_signal_handlers()
+        if already_blocked:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        expected_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        with runtime_shutdown.absorb_shutdown_signals() as absorbed:
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+
+        assert absorbed.signum == signal.SIGTERM
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == expected_mask
+        assert signal.SIGTERM not in signal.sigpending()
+        with pytest.raises(PhaseSweepShutdown) as exc_info:
+            runtime_shutdown.service_pending_shutdown()
+        assert exc_info.value.signum == signal.SIGTERM
+    finally:
+        runtime_shutdown._deferred_shutdown_signum = None
+        signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
+
+
+def test_worker_absorption_without_timed_wait_leaves_signal_for_main_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker reports a pending signal without consuming it or waiting for another signal."""
+    monkeypatch.delattr(signal, "sigtimedwait", raising=False)
+    monkeypatch.setattr(signal, "sigpending", lambda: {signal.SIGTERM})
+    masks: list[tuple[int, set[int]]] = []
+
+    def mask(how: int, signals: Collection[int]) -> set[int]:
+        masks.append((how, set(signals)))
+        return {signal.SIGINT}
+
+    monkeypatch.setattr(signal, "pthread_sigmask", mask)
+    monkeypatch.setattr(signal, "sigwait", lambda *_args: pytest.fail("must never wait"))
+
+    def absorb() -> int | None:
+        with runtime_shutdown.absorb_shutdown_signals() as absorbed:
+            pass
+        return absorbed.signum
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(absorb).result(timeout=2) == signal.SIGTERM
+
+    assert masks == [
+        (signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS)),
+        (signal.SIG_SETMASK, {signal.SIGINT}),
+    ]
+    assert signal.sigpending() == {signal.SIGTERM}
+    assert runtime_shutdown._deferred_shutdown_signum is None
 
 
 def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:

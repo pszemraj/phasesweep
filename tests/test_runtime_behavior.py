@@ -844,13 +844,17 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
         root.setLevel(saved_level)
 
 
-def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
+def test_runtime_platform_gate_refuses_an_unsupported_host_but_not_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real execution needs Linux; dry-run launches nothing and takes no locks."""
+    """Real execution needs a supported host; dry-run launches nothing and takes no locks."""
     from phasesweep.runtime import files as runtime_files
 
-    runtime_files.require_linux_runtime()
+    runtime_files.require_supported_runtime()
+    for platform in ("linux", "darwin"):
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_files.sys, "platform", platform)
+            runtime_files.require_supported_runtime()
 
     exp = make_experiment(
         experiment="platform_check",
@@ -860,8 +864,8 @@ def test_runtime_platform_gate_refuses_a_non_linux_host_but_not_dry_run(
     )
 
     with monkeypatch.context() as patch:
-        patch.setattr(runtime_files.sys, "platform", "darwin")
-        with pytest.raises(runtime_files.PlatformCapabilityError, match="only on Linux.*'darwin'"):
+        patch.setattr(runtime_files.sys, "platform", "win32")
+        with pytest.raises(runtime_files.PlatformCapabilityError, match="Linux.*macOS.*'win32'"):
             run_experiment(exp)
         winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}

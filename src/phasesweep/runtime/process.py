@@ -231,7 +231,7 @@ def _trial_process_identity(
     :param str pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in, from
         :func:`read_pid_namespace` before the launch.
     :return StaleProcessIdentity: The given fields combined with the current schema version,
-        ``pid``'s ``/proc`` start time (``None`` if unreadable), and the current
+        ``pid``'s kernel start time (``None`` if unreadable), and the current
         boot id (``None`` when unavailable).
     """
     return StaleProcessIdentity(
@@ -678,8 +678,7 @@ def run_supervised(
     pid_namespace = read_pid_namespace()
     if pid_namespace is None:
         raise PhaseSweepError(
-            "cannot read this process's PID namespace: /proc must be the procfs of its own "
-            "PID namespace, with that namespace's PID 1 readable. Refused to launch a trial "
+            "cannot read this process's host PID namespace. Refused to launch a trial "
             "whose process identity could not be tied to it.",
             action=OperatorAction.FIX_CONFIG,
         )

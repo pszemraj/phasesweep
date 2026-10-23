@@ -47,7 +47,7 @@ The packaged fake trainer uses [`report_objective(...)`](https://github.com/psze
 
 ## Install and try it
 
-Requirements: Python 3.11+ and a Linux host for real runs. GPUs are optional.
+Requirements: Python 3.11+ and a Linux or macOS host for real runs. GPUs are optional. Apple silicon Macs discover one MPS device for same-host leasing; the trainer selects its own compute device.
 
 PhaseSweep runs on one host. It drives Optuna's grid, random, TPE and CMA-ES samplers, keeps an [Optuna journal](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna) as its ledger, and can run trials in parallel on that host's GPUs. It does not spread trials across machines or prune them early.
 

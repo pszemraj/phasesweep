@@ -43,7 +43,7 @@ from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
-from phasesweep.runtime.files import ensure_artifact_dir, require_linux_runtime
+from phasesweep.runtime.files import ensure_artifact_dir, require_supported_runtime
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
@@ -289,7 +289,7 @@ def _run_experiment_outcome(
     :raises BaseException: The run's failure after recording failed state, or a
         control-flow exception that interrupted reconciliation, chained from it.
     """
-    require_linux_runtime()
+    require_supported_runtime()
 
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)

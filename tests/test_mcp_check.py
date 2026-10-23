@@ -188,27 +188,27 @@ def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
 
 
 def _platform_gate_refuses() -> None:
-    raise PlatformCapabilityError("phasesweep runs only on Linux, and this host reports 'test'.")
+    raise PlatformCapabilityError("phasesweep supports Linux and macOS; this host reports 'test'.")
 
 
 @pytest.mark.parametrize(
     ("patch_target", "value", "match"),
     [
         pytest.param(
-            "phasesweep.mcp.registry.require_linux_runtime",
+            "phasesweep.mcp.registry.require_supported_runtime",
             _platform_gate_refuses,
-            "runs only on Linux",
+            "supports Linux and macOS",
             id="platform_gate_refuses",
         ),
         pytest.param(
             "phasesweep.mcp.registry.read_proc_starttime",
             lambda _pid: None,
-            "cannot read this process's Linux /proc start time",
+            "cannot read this process's.*start time",
             id="proc_identity_unavailable",
         ),
     ],
 )
-def test_mcp_catalog_rejected_without_linux_process_identity_before_state_creation(
+def test_mcp_catalog_rejected_without_process_identity_before_state_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patch_target: str,

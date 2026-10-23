@@ -24,7 +24,7 @@ repos:
         require_serial: true
       - id: pathlint
         name: pathlint
-        entry: pathlint
+        entry: pathlint check
         language: system
         files: ^(src|tests)/.*\.py$
       - id: module-size

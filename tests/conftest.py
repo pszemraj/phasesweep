@@ -13,6 +13,7 @@ import sys
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, NoReturn, ParamSpec, TypeVar
 
 import optuna
@@ -45,6 +46,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
+from phasesweep.runtime.darwin import read_process_info
 from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.reaper import _read_proc_stat
@@ -140,7 +142,11 @@ def temporary_umask(mask: int) -> Iterator[None]:
 
 def is_pid_zombie(pid: int) -> bool:
     """Return whether a test subprocess has exited but awaits parent reaping."""
-    stat = _read_proc_stat(Path("/proc") / str(pid))
+    stat = (
+        read_process_info(pid)
+        if sys.platform == "darwin"
+        else _read_proc_stat(Path("/proc") / str(pid))
+    )
     return stat is not None and stat.state == "Z"
 
 
@@ -308,7 +314,7 @@ def isolate_host_gpu_detection(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> None:
-    """Keep ordinary tests independent of the host's NVIDIA driver state.
+    """Keep ordinary tests independent of the host's CUDA and MPS device state.
 
     Live-marked tests opt out and may explicitly exercise the real host.
     GPU behavior tests replace these defaults with the inventory and driver
@@ -320,6 +326,8 @@ def isolate_host_gpu_detection(
     # this process's monkeypatches cannot. Individual GPU tests replace or
     # delete it when exercising ambient visibility and auto-detection.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr("phasesweep.runtime.gpu.sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr("phasesweep.runtime.gpu.platform.machine", lambda: "x86_64")
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
 

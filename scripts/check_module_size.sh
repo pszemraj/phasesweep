@@ -10,7 +10,10 @@ limit=2000
 if [ "$#" -eq 0 ]; then
   repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
   cd -- "$repo_root"
-  mapfile -t modules < <(git ls-files -- 'src/*.py' 'tests/*.py')
+  modules=()
+  while IFS= read -r module; do
+    modules+=("$module")
+  done < <(git ls-files -- 'src/*.py' 'tests/*.py')
   set -- "${modules[@]}"
 fi
 

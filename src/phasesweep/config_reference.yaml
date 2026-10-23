@@ -188,10 +188,11 @@ phases: list[object] (required)
     allow_partial_grid: bool = false
 
     # ---------- Phase GPU placement ----------
-    # whole_node needs n_jobs 1 and exactly one of gpu_ids and gpu_devices, naming distinct devices.
+    # whole_node needs n_jobs 1; Linux requires exactly one explicit device list, while macOS discovers its pool.
     # none forbids gpu_ids and gpu_devices, and with n_jobs above 1 it needs allow_no_gpu_isolation true.
-    # Without gpu_ids or gpu_devices the pool is discovered from env.CUDA_VISIBLE_DEVICES, else the controller's ambient CUDA_VISIBLE_DEVICES, else nvidia-smi.
-    # validate, the dry run and the launch check listed devices and env.CUDA_VISIBLE_DEVICES tokens against nvidia-smi, so an unknown one fails there.
+    # On Apple silicon macOS the discovered pool is one MPS device; Intel Macs discover no GPU. macOS refuses gpu_ids and gpu_devices.
+    # On Linux, without gpu_ids or gpu_devices the pool is discovered from env.CUDA_VISIBLE_DEVICES, else the controller's ambient CUDA_VISIBLE_DEVICES, else nvidia-smi.
+    # On Linux, validate, the dry run and the launch check listed devices and env.CUDA_VISIBLE_DEVICES tokens against nvidia-smi, so an unknown one fails there.
     # See: docs/runtime.md#gpu-isolation
 
     # Number of trials run at the same time, an integer >= 1. Under single_per_trial each takes its own device lease, so extra trials queue for a smaller pool.
@@ -199,8 +200,9 @@ phases: list[object] (required)
     # Warning: with tpe or cmaes in a phase that draws, more than 1 makes seeded draws depend on completion order. validate and run --dry-run warn.
     n_jobs: int = 1
 
-    # CUDA visibility policy. single_per_trial leases one device per attempt, with a same-host lock held until the trainer's process group exits.
-    # whole_node gives the one running attempt every listed device, comma-joined, so the device count is the trainer's world size and is fingerprinted.
+    # Device lease policy. single_per_trial leases one device per attempt, with a same-host lock held until the trainer's process group exits.
+    # MPS leases use gpu_mps.lock without assigning CUDA_VISIBLE_DEVICES; the trainer selects its device.
+    # whole_node gives the one running attempt every listed CUDA device, comma-joined, or the discovered MPS device; its device count is fingerprinted.
     # none binds no device and takes no lock. Set CUDA_VISIBLE_DEVICES in env, or name it in execution.inherit_env, when the trainer needs a restriction.
     # Warning: the trainer sees a leased GPU as its local cuda:0, so index devices locally.
     gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"

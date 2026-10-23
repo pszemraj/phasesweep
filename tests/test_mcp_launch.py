@@ -946,7 +946,7 @@ def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
     ("cleanup_confirmed", "expected_state"),
     [(True, "failed"), (False, "running")],
 )
-def test_launch_refuses_runner_without_linux_process_identity(
+def test_launch_refuses_runner_without_process_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cleanup_confirmed: bool,
@@ -957,7 +957,7 @@ def test_launch_refuses_runner_without_linux_process_identity(
     cleanup_calls = record_runner_cleanup(monkeypatch, confirmed=cleanup_confirmed)
     monkeypatch.setattr("phasesweep.mcp.tools.read_proc_starttime", lambda _pid: None)
 
-    with pytest.raises(RuntimeError, match="has no Linux /proc start time"):
+    with pytest.raises(RuntimeError, match="has no.*start time"):
         app.launch("srv")
 
     handles = store.list_handles()
