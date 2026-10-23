@@ -154,6 +154,8 @@ def lock_dir() -> Path:
     account home, independent of environment-based state/cache placement.
     ``PHASESWEEP_LOCK_DIR`` selects an existing operator-provisioned directory
     and is never created or chmodded by phasesweep.
+    macOS's root-owned ``/var`` and ``/tmp`` aliases resolve before the
+    no-symlink walk; operator-controlled path components still cannot be links.
 
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
@@ -171,6 +173,10 @@ def lock_dir() -> Path:
                 action=OperatorAction.FIX_CONFIG,
             )
         try:
+            if sys.platform == "darwin" and len(path.parts) > 1 and path.parts[1] in {"var", "tmp"}:
+                system_root = Path(path.anchor, path.parts[1])
+                if system_root.is_symlink() and system_root.lstat().st_uid == 0:
+                    path = system_root.resolve(strict=True).joinpath(*path.parts[2:])
             _lock_policy(path)
         except OSError as exc:
             raise UnsafeLockPathError(
