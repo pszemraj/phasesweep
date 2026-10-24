@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import open_registry_study
 from phasesweep.engine.paths import _attempts_dir
+from phasesweep.engine.progress import _warn_deferred_extraction
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -64,7 +65,7 @@ from phasesweep.runtime.reaper import (
     read_stale_process_identity,
     stale_trial_process_decision,
 )
-from phasesweep.runtime.shutdown import servicing_shutdown_signal
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
 
 log = logging.getLogger(__name__)
 
@@ -1040,6 +1041,7 @@ def _recover_completed_trial(
     ):
         return False
     if servicing_shutdown_signal() is not None:
+        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
         return None
     experiment = _load_generation_experiment(artifact_root, record.generation_id)
     phase = experiment.phase(record.phase_name)
@@ -1080,12 +1082,17 @@ def _recover_completed_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} trainer exit evidence could not be recorded; its trial remains RUNNING."
         ) from exc
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
-        gates=phase.gates,
-    )
+    try:
+        result = extract_trial_result(
+            experiment=experiment,
+            executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
+            gates=phase.gates,
+        )
+    except PhaseSweepShutdown:
+        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        raise
     if servicing_shutdown_signal() is not None:
+        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
         return None
     if result.failure_reason is not None:
         log.warning(

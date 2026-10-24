@@ -41,7 +41,12 @@ from phasesweep.engine.optuna import (
     _suggest,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
-from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
+from phasesweep.engine.progress import (
+    _log_finished_trial,
+    _log_phase_header,
+    _log_reruns,
+    _warn_deferred_extraction,
+)
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -1213,6 +1218,8 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     "interrupted",
                     cause=f"orchestrator interrupted by signal {exc.signum}",
                 )
+            elif isinstance(attempt_id, str):
+                _warn_deferred_extraction(attempt_id, run.phase.name, trial.number)
             raise
         except BaseException as exc:
             run.record_fatal(exc)

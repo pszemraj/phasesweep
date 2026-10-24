@@ -36,6 +36,23 @@ def _warn_once(logger: logging.Logger, key: Hashable, message: str, *args: objec
         logger.warning(message, *args)
 
 
+def _warn_deferred_extraction(attempt_id: str, phase_name: str, trial_number: int) -> None:
+    """Explain retained training once across shutdown and reconciliation.
+
+    :param str attempt_id: Attempt whose completed training awaits extraction.
+    :param str phase_name: Owning phase.
+    :param int trial_number: Trial number within that phase.
+    """
+    _warn_once(
+        log,
+        ("deferred-extraction", attempt_id),
+        "Trial %d in phase %s finished training; its result is retained. "
+        "The next phasesweep run with the same config will extract the result without retraining.",
+        trial_number,
+        phase_name,
+    )
+
+
 def _log_phase_header(
     phase: Phase,
     study_name: str,

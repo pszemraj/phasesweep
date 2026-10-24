@@ -702,6 +702,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         (0, True, "interrupt-intent"),
         (0, True, "interrupt-termination"),
         (0, True, "interrupt-extraction"),
+        (0, True, "interrupt-extraction-signal"),
         (0, True, "missing-snapshot"),
         (0, True, "corrupt-snapshot"),
         (0, True, "mcp-missing-snapshot"),
@@ -789,38 +790,71 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
     if sdk_worker:
         release.touch()
     runner_code = """
-import sys, time
+import logging, sys
+from dataclasses import replace
 from pathlib import Path
 from phasesweep.config.io import load_experiment
 from phasesweep import run_experiment
 from phasesweep.engine import trial
 from phasesweep.engine.attempts import _PreflightCleanupReport
 from phasesweep.engine.guards import _reconcile_existing_studies
-from phasesweep.runtime.remote_worker import run_worker
-from phasesweep.evidence.evaluation import ExtractorError
-from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.evidence.evaluation import _capture_mlflow
+from phasesweep.evidence.mlflow import compile_query
+from phasesweep.evidence.models import MlflowExtractor
+from phasesweep.tracking import mlflow, session
+from phasesweep.tracking.models import MlflowSettings
 
+logging.basicConfig(level=logging.WARNING)
 original_extract = trial.run_extractor
+original_worker = mlflow.run_worker
+
+def fake_sdk_worker(request, worker_path, backend, **kwargs):
+    \"\"\"Replace the SDK process while retaining its real supervisor and controller.\"\"\"
+    return original_worker(request, Path(sys.argv[3]), backend, **kwargs)
 
 def extract_with_worker(ctx, cfg, **kwargs):
-    \"\"\"Run worker-backed extraction through the production failed-result boundary.\"\"\"
-    try:
-        process, _, _ = run_worker({}, Path(sys.argv[3]), "fake-sdk", statuses=frozenset({"ok"}), run_id=ctx.attempt_id, trial_dir=ctx.trial_dir, environment={}, deadline=time.monotonic() + 60)
-    except (OSError, ValueError, RuntimeError) as exc:
-        if isinstance(exc, UnsafeProcessCleanupError):
-            raise
-        raise ExtractorError(str(exc)) from exc
-    if process.return_code != 0:
-        raise ExtractorError(f"fake-sdk worker exited {process.return_code}")
+    \"\"\"Exercise the production MLflow capture and extractor-error conversion.\"\"\"
+    settings = MlflowSettings(tracking_uri="http://localhost:5000", experiment_id="1")
+    binding = {
+        "schema_version": 1,
+        "tracking_uri": settings.tracking_uri,
+        "experiment_id": "1",
+        "run_id": "native-id",
+        "run_mode": settings.run_mode,
+        "experiment": ctx.experiment,
+        "phase": ctx.phase,
+        "generation_id": ctx.generation_id,
+        "attempt_id": ctx.attempt_id,
+        "overrides_sha256": ctx.overrides_sha256,
+    }
+    session.write_record(ctx.trial_dir / "mlflow-binding.json", binding)
+    session.write_record(
+        ctx.trial_dir / "mlflow-expected.json",
+        {k: v for k, v in binding.items() if k != "run_id"},
+    )
+    remote = experiment.model_copy(update={
+        "mlflow": settings,
+        "metric": experiment.metric.model_copy(update={
+            "extractor": MlflowExtractor(type="mlflow", metric_key="x", select="last"),
+        }),
+    })
+    _capture_mlflow(
+        replace(ctx, mlflow_settings=settings.target(), mlflow_query=compile_query(remote, [])),
+        deadline=kwargs.get("deadline"),
+    )
     return original_extract(ctx, cfg, **kwargs)
 
-if sys.argv[2] in {"1", "recovery"}:
+if sys.argv[2] in {"1", "recovery", "recovery-signal"}:
     trial.run_extractor = extract_with_worker
+    mlflow.run_worker = fake_sdk_worker
 experiment = load_experiment(sys.argv[1])
-if sys.argv[2].startswith("recovery"):
+if sys.argv[2] == "recovery":
     _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
 else:
-    run_experiment(experiment, generation_id="orphan-generation")
+    run_experiment(
+        experiment,
+        generation_id=None if sys.argv[2] == "recovery-signal" else "orphan-generation",
+    )
 """
     orphan_identity = None
     recovery_runner: subprocess.Popen[bytes] | None = None
@@ -967,16 +1001,19 @@ else:
                 assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
                 assert launches.read_text() == "launch\n"
                 snapshot.write_bytes(snapshot_bytes)
-            if recovery_stage == "interrupt-extraction":
+            if recovery_stage in {"interrupt-extraction", "interrupt-extraction-signal"}:
                 recovery_runner = subprocess.Popen(
                     [
                         sys.executable,
                         "-c",
                         runner_code,
                         str(config),
-                        "recovery",
+                        (
+                            "recovery-signal"
+                            if recovery_stage == "interrupt-extraction-signal"
+                            else "recovery"
+                        ),
                         str(worker),
-                        str(release),
                     ],
                     stdout=output,
                     stderr=output,
@@ -989,14 +1026,35 @@ else:
                 pending = phase_trials(experiment)[0]
                 assert pending.user_attrs[RETURN_CODE_ATTR] == 0
                 assert pending.user_attrs[DURATION_ATTR] == lifecycle.duration_seconds
-                recovery_runner.kill()
+                if recovery_stage == "interrupt-extraction-signal":
+                    recovery_runner.send_signal(signal.SIGINT)
+                else:
+                    recovery_runner.kill()
                 recovery_runner.wait(timeout=5)
+                if recovery_stage == "interrupt-extraction-signal":
+                    assert recovery_runner.returncode == 128 + signal.SIGINT
+                    pending = phase_trials(experiment)[0]
+                    assert pending.state.name == "RUNNING"
+                    assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
+                    assert (_attempts_dir(experiment) / f"{attempt}.json").is_file()
                 orphan_identity = reaper.read_stale_process_identity(
                     directory, expected_attempt_id=attempt
                 )
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                assert lifecycle is not None and lifecycle.state == "launching"
+                assert lifecycle is not None and lifecycle.state == (
+                    "exited" if recovery_stage == "interrupt-extraction-signal" else "launching"
+                )
                 trial = pending
+            if shutdown_sdk or recovery_stage == "interrupt-extraction-signal":
+                log_text = (tmp_path / "runner.log").read_text()
+                assert (
+                    log_text.count("Trial 0 in phase p finished training; its result is retained.")
+                    == 1
+                )
+                assert (
+                    "The next phasesweep run with the same config will extract the result without retraining."
+                    in log_text
+                )
             if return_code == 0 and not terminated:
                 assert (
                     _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
