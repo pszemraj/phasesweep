@@ -50,6 +50,7 @@ from phasesweep.engine.study_policy import (
     _validate_study_schema,
     _validate_trial_target,
 )
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuPool
 
@@ -133,6 +134,15 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     trials = study.get_trials(deepcopy=False)
     running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
     sequence_counts = _outcome_sequence_counts(trials)
+    if any(
+        _recovered_trial_state(trial, sequence_counts) == "EVIDENCE_PENDING" for trial in running
+    ):
+        raise PhaseSweepError(
+            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
+            "the trial and rerun counts depend on its extraction. Run a normal resume "
+            "to recover that evidence before requesting a dry-run plan.",
+            action=OperatorAction.FIX_CONFIG,
+        )
     recovered_as_failed = sum(
         1 for trial in running if _recovered_trial_state(trial, sequence_counts) == "FAIL"
     )

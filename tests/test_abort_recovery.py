@@ -10,6 +10,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
@@ -316,7 +317,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(initial)
     assert [trial.state.name for trial in phase_study(initial).trials] == ["FAIL", "FAIL"]
-    message = str(aborted.value)
+    message = _operational_error_text(aborted.value)
     assert "phases[p].max_consecutive_failures above 2 in the config" in message
     assert "run the 2 trials still left at n_trials=4" in message
     assert "phases[p].n_trials above 4 in the config" in message
@@ -355,11 +356,11 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(initial)
 
-    refusals = [str(aborted.value)]
+    refusals = [_operational_error_text(aborted.value)]
     for dry_run in (True, False):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(_with_limit(initial, 5), dry_run=dry_run)
-        refusals.append(str(refused.value))
+        refusals.append(_operational_error_text(refused.value))
     for message in refusals:
         assert "phases[p].n_trials above 2 in the config" in message
         assert "max_consecutive_failures above" not in message
@@ -430,7 +431,7 @@ def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
     with pytest.raises(NoFeasibleTrialError) as aborted:
         phase_module._finish_phase(run, phase_fingerprint="unused")
 
-    message = str(aborted.value)
+    message = _operational_error_text(aborted.value)
     assert "Phase 'p' aborted: RuntimeError: simulated objective defect" in message
     assert "consecutive" not in message
     assert "phases[p].n_trials above 3 in the config" in message
@@ -453,7 +454,7 @@ def test_fatal_abort_of_a_grid_advises_the_retry_target_without_a_failure_count(
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
 
-    message = str(refused.value)
+    message = _operational_error_text(refused.value)
     assert "phases[p].n_trials from 3 to 4 in the config" in message
     assert "retry its 1 failed cell and run its 2 remaining cells" in message
     assert "failure count" not in message
@@ -472,7 +473,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
     for dry_run in (True, False):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(roomy, dry_run=dry_run)
-        refusals.append(str(refused.value))
+        refusals.append(_operational_error_text(refused.value))
     for message in refusals:
         assert "simulated objective defect" in message
         assert "phases[p].n_trials above 3 in the config" in message

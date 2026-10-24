@@ -112,6 +112,15 @@ OPERATOR_STEPS: dict[OperatorAction, str] = {
 }
 
 
+def operator_step(error: PhaseSweepError) -> str:
+    """Render the concrete detail of an error's routed operator action.
+
+    :param PhaseSweepError error: Operational failure whose action must be reported.
+    :return str: Its concrete instruction, or the shared action's default instruction.
+    """
+    return error.remediation or f"{OPERATOR_STEPS[error.action]}."
+
+
 class ProcessCleanupUncertainError(PhaseSweepError):
     """Base class for failures where a subprocess group may still be alive."""
 

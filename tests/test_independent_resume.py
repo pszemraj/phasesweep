@@ -93,8 +93,9 @@ def test_from_phase_into_a_workdir_without_results_refuses_before_creating_it(
 
     message = str(refused.value)
     assert "Winner file missing for phase 'parent'" in message
-    assert "no earlier results" in message
-    assert "Run without --from-phase" in message
+    assert "no generation has been published" in message
+    assert "--from-phase requires published predecessors" in message
+    assert "Resume without --from-phase to reuse completed trials" in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
     assert not workdir.exists()
 
@@ -149,8 +150,9 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     error = capsys.readouterr().err
     assert error.startswith("phasesweep: Winner file missing for phase 'parent'")
     assert "operational error" not in error
-    assert "no earlier results" in error
-    assert "Run without --from-phase" in error
+    assert "no generation has been published" in error
+    assert "--from-phase requires published predecessors" in error
+    assert "Resume without --from-phase to reuse completed trials" in error
     assert error.rstrip().endswith(
         "fix: correct the experiment configuration or the environment it runs in."
     )

@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import math
+import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -279,7 +280,12 @@ def select_winner(
     )
     flagged = _describe_flagged(confound)
     if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
-        flagged.append(_evaluation_point_remedy(experiment.metric.extractor.type))
+        flagged.append(
+            _evaluation_point_remedy(
+                experiment.metric.extractor.type,
+                axis=confound["checks"]["evaluation_point"]["detail"]["axis"],
+            )
+        )
     if winning is not None and ranking is not None:
         for group in ranking.groups:
             if dict(group.params) != dict(winning.params) and within_noise(winning, group):
@@ -295,14 +301,16 @@ def select_winner(
             "winner's confound block): %s.",
             phase_name or study.study_name,
             len(survivors),
-            "; ".join(flagged),
+            "; ".join(fragment.rstrip(".") for fragment in flagged),
         )
     phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     if phase is not None and emit_advisories:
         _warn_grid_edges(phase, best.params)
         _warn_unsuccessful_grid_cells(phase, trials)
         if winning is not None and ranking is not None and phase.cost_key is not None:
-            _warn_cheaper_within_error(phase, winning, ranking.groups)
+            advisory = _cost_advisory(phase, winning, ranking.groups, goal=experiment.metric.goal)
+            if advisory is not None:
+                log.warning("[%s] %s", phase.name, advisory)
 
     record = (
         None
@@ -336,22 +344,26 @@ def select_winner(
     )
 
 
-def _warn_cheaper_within_error(
-    phase: Phase, winner: RankedGroup, groups: Sequence[RankedGroup]
-) -> None:
-    """Advise a cheaper mean-repeat configuration within one combined standard error.
+def _cost_advisory(
+    phase: Phase,
+    winner: RankedGroup,
+    groups: Sequence[RankedGroup],
+    *,
+    goal: typing.Literal["minimize", "maximize"],
+) -> str | None:
+    """Describe a cheaper configuration within one standard error of the winner's mean.
 
     :param Phase phase: Phase declaring a numeric sampled cost key and mean repeats.
     :param RankedGroup winner: Configuration selected by the objective.
     :param Sequence[RankedGroup] groups: Complete feasible configuration groups.
+    :param typing.Literal["minimize", "maximize"] goal: Objective direction for breaking cost ties.
+    :return str | None: Advisory text, or ``None`` without a cheaper eligible group or cost key.
     """
     key = phase.cost_key
-    assert key is not None
-    eligible = [
-        group
-        for group in groups
-        if abs(group.aggregate - winner.aggregate) <= combined_standard_error(winner, group)
-    ]
+    if key is None:
+        return None
+    winner_se = winner.spread["sd"] / math.sqrt(winner.spread["n"])
+    eligible = [group for group in groups if abs(group.aggregate - winner.aggregate) <= winner_se]
 
     def cost(group: RankedGroup) -> float:
         """Read the numeric parameter guaranteed by the phase's cost-key validator.
@@ -364,20 +376,16 @@ def _warn_cheaper_within_error(
             raise ValueError(f"cost_key {key!r} is not numeric in group {group.representative}.")
         return float(value)
 
-    cheapest = min(eligible, key=lambda group: (cost(group), group.numbers))
+    sign = 1.0 if goal == "minimize" else -1.0
+    cheapest = min(eligible, key=lambda group: (cost(group), sign * group.aggregate, group.numbers))
     if cost(cheapest) < cost(winner):
-        log.warning(
-            "[%s] one-standard-error cost advisory: params=%s has %s=%s versus winner %s=%s, "
-            "gap=%g <= combined_se=%g. The selected winner is unchanged.",
-            phase.name,
-            dict(cheapest.params),
-            key,
-            cost(cheapest),
-            key,
-            cost(winner),
-            abs(cheapest.aggregate - winner.aggregate),
-            combined_standard_error(winner, cheapest),
+        return (
+            f"one-standard-error cost advisory: params={dict(cheapest.params)} has "
+            f"{key}={cost(cheapest):g} versus winner {key}={cost(winner):g}, "
+            f"gap={abs(cheapest.aggregate - winner.aggregate):g} <= winner_se={winner_se:g}. "
+            "The selected winner is unchanged."
         )
+    return None
 
 
 def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:

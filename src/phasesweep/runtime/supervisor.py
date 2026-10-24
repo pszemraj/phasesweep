@@ -12,7 +12,9 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 # Wire frame constants shared with phasesweep.runtime.process.
 _HEADER_LEN = 10
@@ -23,6 +25,51 @@ _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
 _GROUP_MAX_POLL_SECONDS = 0.5
 _GROUP_TERM_GRACE_SECONDS = 10.0
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 2
+
+
+def write_lifecycle_record(
+    path: Path,
+    *,
+    attempt_id: str,
+    state: str,
+    return_code: int | None,
+    cleanup_confirmed: bool | None,
+    duration_seconds: float | None,
+) -> None:
+    """Atomically persist lifecycle evidence from either supervisor or orchestrator.
+
+    :param Path path: Existing attempt directory's lifecycle file.
+    :param str attempt_id: Immutable attempt identity.
+    :param str state: Allocated, launching, or exited lifecycle state.
+    :param int | None return_code: Trainer exit code, when known.
+    :param bool | None cleanup_confirmed: Whether the whole group has exited.
+    :param float | None duration_seconds: Supervised elapsed time, when known.
+    :raises OSError: The record could not be durably replaced.
+    """
+    payload = {
+        "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "state": state,
+        "return_code": return_code,
+        "cleanup_confirmed": cleanup_confirmed,
+        "duration_seconds": duration_seconds,
+    }
+    fd, stage = tempfile.mkstemp(prefix=".attempt-lifecycle-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(stage, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(stage)
 
 
 def _read_exact(fd: int, size: int) -> bytes | None:
@@ -271,9 +318,9 @@ def _return_child_status(status: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Fork a blocked trainer and guard its whole process group.
 
-    :param list[str] | None argv: Optional ``[ready_fd, ack_fd]`` argument
+    :param list[str] | None argv: Optional ``[ready_fd, ack_fd, trial_dir, attempt_id, started]`` argument
         vector; defaults to ``sys.argv[1:]`` when omitted.
-    :return int: ``64`` if ``argv`` does not have exactly two elements; ``75``
+    :return int: ``64`` if ``argv`` has neither two nor five elements; ``75``
         if the acknowledgement pipe does not deliver a well-formed
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
@@ -282,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         gone, and returns the trainer root's exit status or terminating signal.
     """
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 2:
+    if len(args) not in {2, 5}:
         return 64
     ready_fd = int(args[0])
     ack_fd = int(args[1])
@@ -303,11 +350,26 @@ def main(argv: list[str] | None = None) -> int:
         _, status = os.waitpid(child_pid, 0)
         with contextlib.suppress(OSError):
             os.write(ready_fd, _TRAINER_ROOT_EXITED)
-        if _reap_remaining_group(child_pid):
+        descendants_reaped = _reap_remaining_group(child_pid)
+        if descendants_reaped:
             with contextlib.suppress(OSError):
                 os.write(ready_fd, _DESCENDANTS_REAPED)
             # A closed pipe is expected after an orchestrator hard exit: there
             # is no parent left to consume the diagnostic, but cleanup continues.
+        if len(args) == 5:
+            return_code = os.waitstatus_to_exitcode(status)
+            # Descendant cleanup is a failed trial even when its root returned zero.
+            if descendants_reaped and return_code == 0:
+                return_code = 1
+            with contextlib.suppress(OSError):
+                write_lifecycle_record(
+                    Path(args[2]) / "attempt_lifecycle.json",
+                    attempt_id=args[3],
+                    state="exited",
+                    return_code=return_code,
+                    cleanup_confirmed=True,
+                    duration_seconds=time.monotonic() - float(args[4]),
+                )
         return _return_child_status(status)
     finally:
         os.close(ready_fd)

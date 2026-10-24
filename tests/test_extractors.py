@@ -987,6 +987,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         )
     assert result.cleanup_confirmed
     original_abort = process._abort_launch
+    aborted_groups: list[int] = []
 
     def fail_identity(path, identity):
         assert not path.exists()
@@ -994,6 +995,8 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
 
     def uncertain_abort(proc, pgid):
         assert original_abort(proc, pgid)
+        assert isinstance(pgid, int)
+        aborted_groups.append(pgid)
         return False
 
     monkeypatch.setattr(process, "_write_process_identity", fail_identity)
@@ -1013,8 +1016,12 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         else:
             locate_wandb_position(**target, metric_key="loss", axis="_step", value=0.25)
     lifecycle = process.read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
-    assert lifecycle.state == "launching"
-    assert lifecycle.cleanup_confirmed is None
+    assert lifecycle is not None and lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
+    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert aborted_groups
+    assert all(not process._process_group_alive(pgid) for pgid in aborted_groups)
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])

@@ -13,19 +13,19 @@ import math
 import statistics
 import typing
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import optuna
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
+from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     _confound_summary,
-    _evaluation_point_remedy,
     _validate_confound_block,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -45,7 +45,9 @@ from phasesweep.engine.optuna import (
     _TrialRef,
 )
 from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
     _experiment_dir,
+    _generation_config_snapshot_path,
     _generation_dir,
     _generation_path,
     _generation_summary_path,
@@ -55,13 +57,14 @@ from phasesweep.engine.publication import PublicationPointer, _resolve_publicati
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
     ReduceName,
+    RepeatsRecord,
     RepeatsSummary,
     _repeats_summary,
     _validate_repeats_block,
     group_labels_for,
     repeat_axis,
 )
-from phasesweep.engine.selection import _rank_groups
+from phasesweep.engine.selection import _cost_advisory, _rank_groups
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
@@ -77,6 +80,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
     _validate_observed_block,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
@@ -113,12 +117,11 @@ class EngineStatus(typing.TypedDict):
 
 @dataclass(frozen=True)
 class PhaseWinnerView:
-    """A phase winner reduced to the fields a caller may safely see.
+    """Trusted phase winner facts for CLI and MCP projection.
 
-    Notably absent: any filesystem path, the trial command, the environment,
-    and the storage URL. ``effective_overrides`` is included for trusted engine
-    and CLI readers that need the composed hyperparameter set; MCP filters it
-    out before returning agent-visible payloads.
+    ``effective_overrides`` and ``repeats_detail`` support local composition and
+    member checkpoint paths. MCP returns only the public summary fields through
+    its visibility policy.
     """
 
     phase: str
@@ -138,6 +141,11 @@ class PhaseWinnerView:
     # and member trial numbers, never the repeat key or values
     # (:func:`phasesweep.engine.repeats._repeats_summary`).
     repeats: RepeatsSummary | None = None
+    repeats_detail: RepeatsRecord | None = None
+    generation_id: str | None = None
+    is_published: bool = False
+    config_matches_current: bool | None = None
+    cost_advisory: str | None = None
 
 
 def _phase_status_payloads(
@@ -253,12 +261,14 @@ def _winner_view(
             metric = validated.metric
             repeats = validated.repeats
             observed = dict(validated.observed)
-        confound = _confound_summary(confound_block, winner_trial=trial_number)
         provenance = data.get("objective_provenance")
         extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
         kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
-        if isinstance(kind, str) and confound["evaluation_point"]["verdict"] == "heterogeneous":
-            confound["evaluation_point"]["remedy"] = _evaluation_point_remedy(kind)
+        confound = _confound_summary(
+            confound_block,
+            winner_trial=trial_number,
+            extractor_kind=kind if isinstance(kind, str) else "unknown",
+        )
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=trial_number,
@@ -271,6 +281,7 @@ def _winner_view(
             confound=confound,
             observed=observed,
             repeats=None if repeats is None else _repeats_summary(repeats),
+            repeats_detail=repeats,
         )
     except (KeyError, ValueError, TypeError):
         return None
@@ -300,6 +311,8 @@ def _represented_winners(
     publication: PublicationPointer,
     represented_generation_id: str | None,
     phase_names: Sequence[str],
+    *,
+    fallback_published: bool = False,
 ) -> list[PhaseWinnerView]:
     """Return the represented generation's winners, in ``phase_names`` order.
 
@@ -310,6 +323,7 @@ def _represented_winners(
     :param str | None represented_generation_id: Generation whose winners are
         represented, or ``None`` when there is none.
     :param Sequence[str] phase_names: Safe phase names to enumerate.
+    :param bool fallback_published: Fill missing latest phase winners from the publication.
     :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
     """
     if represented_generation_id is None:
@@ -318,9 +332,8 @@ def _represented_winners(
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
-            _winner_view(validated.winners[name], name)
+            _winner_view(validated.winners[name], name) if name in validated.winners else None
             for name in phase_names
-            if name in validated.winners
         ]
     else:
         views = [
@@ -329,7 +342,116 @@ def _represented_winners(
             )
             for name in phase_names
         ]
-    return [view for view in views if view is not None]
+    chosen: list[PhaseWinnerView] = []
+    for name, view in zip(phase_names, views, strict=True):
+        view_generation = represented_generation_id
+        if (
+            view is None
+            and fallback_published
+            and validated is not None
+            and name in validated.winners
+        ):
+            view = _winner_view(validated.winners[name], name)
+            view_generation = validated.generation_id
+        if view is not None:
+            is_published = validated is not None and view_generation == validated.generation_id
+            if is_published and validated is not None:
+                stored_fingerprint = validated.summary.get("config_fingerprint")
+                prefix = experiment.model_copy(
+                    update={"phases": experiment.phases[: len(validated.phase_plan)]}
+                )
+                config_matches = (
+                    stored_fingerprint == _experiment_semantic_fingerprint(prefix)
+                    if isinstance(stored_fingerprint, str)
+                    else None
+                )
+            else:
+                config_matches = _generation_config_matches(experiment, view_generation)
+            chosen.append(
+                replace(
+                    view,
+                    generation_id=view_generation,
+                    is_published=is_published,
+                    config_matches_current=config_matches,
+                    cost_advisory=(
+                        winner_cost_advisory(experiment, view) if config_matches is True else None
+                    ),
+                )
+            )
+    return chosen
+
+
+def require_study(experiment: Experiment) -> None:
+    """Require evidence of a started study at the configured artifact root.
+
+    :param Experiment experiment: Config locating the study.
+    :raises StudyStorageUnavailableError: No study has initialized this root.
+    """
+    ledger_path = resolved_ledger_path(experiment)
+    if not _experiment_dir(experiment).is_dir() or not any(
+        path.is_file()
+        for path in (
+            _artifact_root_binding_path(experiment),
+            _generation_path(experiment),
+            *((ledger_path,) if ledger_path is not None else ()),
+        )
+    ):
+        raise StudyStorageUnavailableError(
+            f"No study directory at {_experiment_dir(experiment)} contains a started study. "
+            "Use the same config and --set overrides as run.",
+            action=OperatorAction.FIX_CONFIG,
+        )
+
+
+def _generation_config_matches(experiment: Experiment, generation_id: str | None) -> bool | None:
+    """Compare recorded semantics with the matching prefix of the current phase plan.
+
+    :param Experiment experiment: Current config to compare.
+    :param str | None generation_id: Producing generation, when known.
+    :return bool | None: Semantic match, or unknown when its snapshot is absent.
+    """
+    if generation_id is None:
+        return None
+    path = _generation_config_snapshot_path(experiment, generation_id)
+    if not path.is_file():
+        return None
+    producing = load_experiment(path)
+    prefix = experiment.model_copy(update={"phases": experiment.phases[: len(producing.phases)]})
+    return _experiment_semantic_fingerprint(producing) == _experiment_semantic_fingerprint(prefix)
+
+
+def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
+    """Recompute cost advice from retained repeat groups under the current display config.
+
+    :param Experiment experiment: Current selection semantics and optional cost key.
+    :param PhaseWinnerView winner: Winner whose repeat group anchors the window.
+    :return str | None: Advisory text when a cheaper eligible group is in the window.
+    """
+    phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
+    if phase is None or phase.cost_key is None or winner.repeats is None:
+        return None
+    axis = repeat_axis(phase)
+    if axis is None:
+        return None
+    try:
+        read = read_phase_trials(validate_ledger(experiment), phase)
+    except StudyStorageUnavailableError:
+        return None
+    if read is None:
+        return None
+    ranking = _rank_groups(read.trials, experiment, axis)
+    numbers = tuple(winner.repeats["member_trials"])
+    group = next((group for group in ranking.groups if group.numbers == numbers), None)
+    return (
+        None
+        if group is None
+        else _cost_advisory(
+            phase,
+            group,
+            ranking.groups,
+            goal=experiment.metric.goal,
+        )
+    )
 
 
 def _published_generation_id(publication: PublicationPointer) -> str | None:
@@ -662,6 +784,23 @@ def _read_status(
 
     publication_state: PublicationState = publication.state
 
+    latest_winners = (
+        {
+            view.phase: view
+            for view in _represented_winners(
+                experiment,
+                publication,
+                represented_generation_id,
+                result_phase_plan,
+                fallback_published=True,
+            )
+        }
+        if latest and generation_id is None and publication.state in {"ok", "absent"}
+        else None
+    )
+    if latest_winners is not None:
+        winners_present = set(latest_winners)
+
     status: EngineStatus = {
         "experiment": experiment.experiment,
         "current_generation_id": current_generation_id,
@@ -684,6 +823,14 @@ def _read_status(
     }
     if publication.state in {"failed", "permission_denied"}:
         status["publication_error"] = publication.error
+    if latest_winners is not None:
+        for phase_payload in status["phases"]:
+            view = latest_winners.get(str(phase_payload["phase"]))
+            phase_payload["winner_generation_id"] = None if view is None else view.generation_id
+            phase_payload["winner_is_published"] = False if view is None else view.is_published
+            phase_payload["winner_config_matches_current"] = (
+                None if view is None else view.config_matches_current
+            )
     return status, publication
 
 
@@ -694,7 +841,7 @@ class RepeatGroupView:
     ``n`` counts finite measured values, including infeasible ones. Missing,
     failed, interrupted and replaced attempts do not contribute. ``aggregate``
     is present only when the full group is eligible under the current config;
-    ``sd`` needs at least two measurements. ``winner`` names the publication.
+    ``sd`` needs at least two measurements. ``winner`` names the represented phase winner.
     """
 
     group: int
@@ -723,7 +870,7 @@ class TrialTable:
     per report-only value any trial recorded, an optional ``reason`` when any
     trial has a recorded cause, and ``winner``. ``state`` is the Optuna state, except that a
     COMPLETE trial that violated a constraint or a metric bound reads
-    ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
+    ``INFEASIBLE``. ``winner`` is ``*`` on the trials the represented phase's
     winner stands on and empty elsewhere.
     """
 
@@ -737,28 +884,31 @@ class TrialTable:
 
 @dataclass(frozen=True)
 class TrialTables:
-    """Every configured phase's trial table, from one publication resolution."""
+    """Every configured phase's trial table, from one generation-pointer capture."""
 
     experiment: str
-    #: The generation whose winners are marked, or ``None`` when nothing validates as published.
+    #: Last validated publication, independent of each displayed winner's generation.
     published_generation_id: str | None
     publication_integrity: PublicationState
     #: Validation diagnostic beside a ``failed`` or ``permission_denied`` integrity.
     publication_error: str | None
     phases: tuple[TrialTable, ...]
     represented_generation_id: str | None = None
+    winner_generations: dict[str, tuple[str, bool]] = field(default_factory=dict)
 
 
 def _cli_phase_payloads(
     experiment: Experiment,
     phases: Sequence[JsonObject],
     represented_generation_id: str | None,
+    published_generation_id: str | None,
 ) -> list[JsonObject]:
     """Add winner paths to the captured phase status for CLI inspection.
 
     :param Experiment experiment: Experiment supplying artifact paths.
     :param Sequence[JsonObject] phases: Path-free phase payloads from the shared read.
     :param str | None represented_generation_id: Generation whose winner paths appear.
+    :param str | None published_generation_id: Validated publication for per-phase labels.
     :return list[JsonObject]: CLI phase payloads with name and winner path fields.
     """
     cli_phases: list[JsonObject] = []
@@ -766,9 +916,10 @@ def _cli_phase_payloads(
         name = phase["phase"]
         if not isinstance(name, str):
             raise TypeError("Phase status name must be a string.")
+        winner_generation = phase.get("winner_generation_id", represented_generation_id)
         winner_path = (
-            _generation_winner_path(experiment, represented_generation_id, name)
-            if phase["winner_present"] and represented_generation_id is not None
+            _generation_winner_path(experiment, winner_generation, name)
+            if phase["winner_present"] and isinstance(winner_generation, str)
             else None
         )
         cli_phases.append(
@@ -780,18 +931,31 @@ def _cli_phase_payloads(
                     if key not in {"phase", "winner_present", "running_attempts"}
                 },
                 "winner": None if winner_path is None else str(winner_path),
+                "winner_generation_id": winner_generation if winner_path is not None else None,
+                "winner_is_published": winner_path is not None
+                and winner_generation == published_generation_id,
+                "winner_config_matches_current": phase.get("winner_config_matches_current"),
             }
         )
     return cli_phases
 
 
 def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:
-    """Collect CLI status and winner paths from one read-only generation capture.
+    """Inspect study progress and phase winners without creating or modifying state.
+
+    By default each phase uses its latest usable winner, falling back to the validated
+    publication. Per-phase generation, publication and config-match labels identify
+    that choice. An explicit generation pin reads only that generation. Corrupt
+    publications expose diagnostics and counts without winner paths.
 
     :param Experiment experiment: Parsed experiment config to inspect.
-    :param str | None generation_id: Generation pin, defaulting to the latest existing namespace.
-    :return JsonObject: Experiment paths, publication identity and phase counts.
+    :param str | None generation_id: Optional generation pin, disabling published fallback.
+    :raises StudyStorageUnavailableError: No study has started at the configured root.
+    :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
+    :raises StudySchemaMismatchError: The stored study format is unsupported.
+    :return JsonObject: Paths, pointer identities, integrity, phase counts and labeled winners.
     """
+    require_study(experiment)
     status, _ = _read_status(
         experiment,
         generation_id=generation_id,
@@ -820,6 +984,7 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
             experiment,
             status["phases"],
             status["represented_generation_id"] if integrity in {"ok", "absent"} else None,
+            status["published_generation_id"],
         ),
     }
     if experiment.mlflow is not None:
@@ -1051,6 +1216,7 @@ def read_trial_tables(
             publication,
             represented_generation_id,
             [phase.name for phase in experiment.phases],
+            fallback_published=latest and generation_id is None,
         )
     }
     tables: list[TrialTable] = []
@@ -1070,4 +1236,9 @@ def read_trial_tables(
         publication_error=publication.error,
         phases=tuple(tables),
         represented_generation_id=represented_generation_id,
+        winner_generations={
+            name: (view.generation_id, view.is_published)
+            for name, view in winners.items()
+            if view.generation_id is not None
+        },
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -389,8 +389,8 @@ def _numeric_spellings(text: str) -> str:
     """Spell a numeric string as the YAML 1.1 numbers that mean it.
 
     :param str text: A string for which :func:`_is_numeric_string` holds.
-    :return str: The decimal-point-and-signed-exponent form and the plain decimal form
-        joined by ``or`` for an exponent, otherwise the number unquoted.
+    :return str: The decimal-point-and-signed-exponent form with a short plain decimal
+        alternative when representable, otherwise the number unquoted.
     """
     stripped = text.strip()
     match = _EXPONENT_LITERAL.fullmatch(stripped.lower())
@@ -398,9 +398,14 @@ def _numeric_spellings(text: str) -> str:
         return f"{stripped} without quotes"
     whole, fraction, sign, exponent = match.groups()
     spellings = [f"{whole}.{fraction or '0'}e{sign or '+'}{exponent}"]
-    plain = format(Decimal(stripped), "f")
-    if len(plain) <= _MAX_DECIMAL_SPELLING_CHARS:
-        spellings.append(plain)
+    try:
+        number = Decimal(stripped)
+    except InvalidOperation:
+        return spellings[0]
+    if abs(number.adjusted()) <= _MAX_DECIMAL_SPELLING_CHARS:
+        plain = format(number, "f")
+        if len(plain) <= _MAX_DECIMAL_SPELLING_CHARS:
+            spellings.append(plain)
     return " or ".join(spellings)
 
 
@@ -641,9 +646,8 @@ def _validate_repeat_sampling(phase: Phase, repeats: Repeats, *, persistent: boo
     if phase.allow_partial_grid:
         raise ValueError(
             f"Phase {phase.name!r}: allow_partial_grid cannot be combined with repeats. A grid "
-            "visits the configuration x repeat matrix in a shuffled order, so a partial grid "
-            "leaves most configurations without all their repeats, and selection ranks only "
-            "complete groups. To run a subset of configurations with all their repeats, use "
+            "with repeats requires a target covering the full configuration x repeat matrix. "
+            "To run a subset of configurations with all their repeats, use "
             "sampler.type random with a seed."
         )
     if (

@@ -60,6 +60,9 @@ payload carries no empty error field.
 """
 
 PHASE_STATUS_KEYS = {
+    "winner_generation_id",
+    "winner_is_published",
+    "winner_config_matches_current",
     "trials",
     "n_trials",
     "generation_trials",
@@ -284,7 +287,9 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
 
 def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
     """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
-    payload = experiment_status(make_experiment(workdir=tmp_path / "runs"))
+    experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
+    run_experiment(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert payload["ledger_path"] is None

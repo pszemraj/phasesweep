@@ -6,6 +6,7 @@ import math
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
     from phasesweep.engine.repeats import RepeatsRecord
+    from phasesweep.runtime.process import AttemptLifecycle
 
 WinnerSourceKind = Literal["phase_trial"]
 
@@ -44,8 +46,8 @@ trainer raises ``TrialPruned``.
 FINISHED_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "INFEASIBLE", "FAIL")
 """The states that count toward ``n_trials``; an interrupted trial is in none of them."""
 
-RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]
-"""The counted state stale recovery leaves a RUNNING trial in."""
+RecoveredTrialState = Literal["FAIL", "INTERRUPTED", "EVIDENCE_PENDING"]
+"""Predicted recovery state; pending successful evidence requires extraction before counting."""
 
 
 @dataclass(frozen=True)
@@ -167,7 +169,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # it so a refusal can name which keys changed instead of two opaque hashes.
 PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 9
+STUDY_SCHEMA_VERSION = 10
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
@@ -449,6 +451,49 @@ def _unduplicated_outcome(
     return parsed
 
 
+def _completed_trainer_duration(trial: FrozenTrial, lifecycle: AttemptLifecycle) -> float | None:
+    """Return completed trainer time without confusing SDK worker exits with trainer exits.
+
+    Evidence workers reuse the process slot after trainer exit. The ledger records
+    trainer metadata before extraction; the guardian record covers an earlier runner death.
+
+    :param FrozenTrial trial: Trial carrying trainer exit attributes, when committed.
+    :param AttemptLifecycle lifecycle: Current process-slot lifecycle evidence.
+    :return float | None: Successful trainer duration, or None when exit evidence is incomplete.
+    """
+    if FAILURE_REASON_ATTR in trial.user_attrs:
+        return None
+    return_code = trial.user_attrs.get(RETURN_CODE_ATTR, lifecycle.return_code)
+    duration = trial.user_attrs.get(DURATION_ATTR, lifecycle.duration_seconds)
+    if (
+        type(return_code) is not int
+        or return_code != 0
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        return None
+    return float(duration)
+
+
+def _recorded_infeasible_result(trial: FrozenTrial, outcome: _ParsedTrialOutcome | None) -> bool:
+    """Recognize extracted bound violations that still commit as measured COMPLETE trials.
+
+    :param FrozenTrial trial: Trial carrying canonical extracted result attributes.
+    :param _ParsedTrialOutcome | None outcome: Parsed terminal outcome, when recorded.
+    :return bool: Whether a failed outcome represents measured infeasibility.
+    """
+    return (
+        outcome is not None
+        and outcome.outcome == "failure"
+        and trial.user_attrs.get(FEASIBLE_ATTR) is False
+        and trial.user_attrs.get(RETURN_CODE_ATTR) == 0
+        and isinstance(trial.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR), str)
+        and FAILURE_REASON_ATTR not in trial.user_attrs
+    )
+
+
 def _recovered_trial_state(
     trial: FrozenTrial, sequence_counts: Counter[int]
 ) -> RecoveredTrialState:
@@ -458,10 +503,29 @@ def _recovered_trial_state(
     :param Counter[int] sequence_counts: The study's
         :func:`_outcome_sequence_counts`, so a duplicated record is discarded
         as recovery discards it.
-    :return RecoveredTrialState: ``FAIL`` when recovery keeps a recorded failure
-        or fatal error, otherwise ``INTERRUPTED``.
+    :return RecoveredTrialState: ``EVIDENCE_PENDING`` for successful trainer evidence awaiting extraction, ``FAIL`` for recorded failure or fatal error, otherwise ``INTERRUPTED``.
     """
-    outcome = _stale_recovery_outcome(_unduplicated_outcome(trial, sequence_counts))
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    parsed = _unduplicated_outcome(trial, sequence_counts)
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+    if (
+        (
+            parsed is None
+            or parsed.outcome == "success"
+            or _recorded_infeasible_result(trial, parsed)
+        )
+        and isinstance(directory, str)
+        and isinstance(attempt_id, str)
+    ):
+        try:
+            lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt_id)
+        except ValueError:
+            lifecycle = None
+        if lifecycle is not None and _completed_trainer_duration(trial, lifecycle) is not None:
+            return "EVIDENCE_PENDING"
+    outcome = _stale_recovery_outcome(parsed)
     return "INTERRUPTED" if outcome == "interrupted" else "FAIL"
 
 

@@ -1925,10 +1925,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
-    with pytest.raises(
-        PhaseAbortRefusedError, match=r"phases\[p\]\.n_trials above 2 in the config"
-    ):
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(_exp(2))
+    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(refused.value)
     assert not launched.exists()
 
     winners = run_experiment(_exp(3))

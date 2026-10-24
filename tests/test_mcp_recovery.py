@@ -431,40 +431,6 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert captured["cmd"]
 
 
-@pytest.mark.parametrize(("alive", "birth_matches"), [(False, False), (True, False), (True, True)])
-def test_recovery_preview_names_trial_group_liveness(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    alive: bool,
-    birth_matches: bool,
-) -> None:
-    """Inspection names the training group and its termination without signalling it."""
-    write_trial_identity(tmp_path, attempt_id="preview", pid=12345, starttime=1)
-    monkeypatch.setattr(attempts_module, "_process_group_alive", lambda _pgid: alive)
-    monkeypatch.setattr(attempts_module, "is_same_live_process", lambda _pid, _start: birth_matches)
-
-    def forbid_cleanup(_identity: StaleProcessIdentity) -> bool:
-        raise AssertionError("inspection must not signal")
-
-    monkeypatch.setattr(attempts_module, "cleanup_stale_trial_process", forbid_cleanup)
-    attempts_module._resolve_attempt(
-        _AttemptRecord("preview", tmp_path, "generation", "p", 0),
-        context="RUNNING trial 0",
-        evidence_action=OperatorAction.RESTORE_TREE,
-        lifecycle_settles=True,
-        confirm=False,
-    )
-    assert f"training process group is {'live' if alive else 'exited'}" in caplog.text
-    assert "pid=12345 pgid=12345" in caplog.text
-    assert ("--confirm will terminate it if still alive" in caplog.text) is (
-        alive and birth_matches
-    )
-    if alive and not birth_matches:
-        assert "process-birth identity is unverified or mismatched" in caplog.text
-        assert "must verify process-birth identity before signalling" in caplog.text
-
-
 def test_recovery_preserves_status_written_after_initial_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

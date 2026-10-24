@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import optuna
+import yaml
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.models import Experiment
@@ -26,11 +27,16 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_ID_ATTR,
+    OVERRIDES_ATTR,
+    TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    _completed_trainer_duration,
     _outcome_sequence_counts,
     _parsed_trial_outcome,
+    _recorded_infeasible_result,
     _stale_recovery_outcome,
     _trial_outcome_payload,
     _unduplicated_outcome,
@@ -45,16 +51,17 @@ from phasesweep.runtime.files import (
     read_private_text_at,
     storage_recovery_locator,
 )
-from phasesweep.runtime.json import JsonObject, strict_json_loads
-from phasesweep.runtime.process import AttemptLifecycle, read_attempt_lifecycle
+from phasesweep.runtime.json import JsonObject, json_text, strict_json_loads
+from phasesweep.runtime.process import (
+    AttemptLifecycle,
+    _record_attempt_exited,
+    read_attempt_lifecycle,
+)
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
-    _process_group_alive,
     cleanup_stale_trial_process,
-    is_same_live_process,
-    read_boot_id,
     read_stale_process_identity,
-    same_pid_namespace,
+    stale_trial_process_decision,
 )
 
 log = logging.getLogger(__name__)
@@ -451,8 +458,8 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
                 isinstance(payload[k], str) and payload[k] for k in required - {"schema_version"}
             )
             # Both ids become path components of the operation's cleanup receipt.
-            and SAFE_NAME_PATTERN.fullmatch(payload["attempt_id"])
-            and SAFE_NAME_PATTERN.fullmatch(payload["generation_id"])
+            and SAFE_NAME_PATTERN.fullmatch(json_text(payload, "attempt_id"))
+            and SAFE_NAME_PATTERN.fullmatch(json_text(payload, "generation_id"))
         ):
             return payload
         raise ProcessCleanupUncertainError(
@@ -461,7 +468,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     locator_identity: str | None = None
     if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):
         try:
-            locator_identity = canonical_storage_identity(payload["storage_locator"])
+            locator_identity = canonical_storage_identity(json_text(payload, "storage_locator"))
         except ValueError as exc:
             raise ProcessCleanupUncertainError(
                 f"Attempt registry entry {entry_path} has an unsupported or partial schema.",
@@ -563,22 +570,29 @@ def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
     return trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False or unsafe_outcome
 
 
-def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Record a recovered outcome before marking a stale trial FAIL.
+def _record_stale_trial_outcome(
+    study: optuna.Study, trial: optuna.trial.FrozenTrial, *, completed_feasible: bool | None = None
+) -> None:
+    """Record an extracted result or interruption before retiring a stale RUNNING trial.
 
-    Keep recorded failures, fatal errors, interruptions, and their aborts. An uncommitted
+    Keep recorded failures, fatal errors, interruptions, and their aborts. An unproven
     success or missing outcome becomes interrupted and reruns. Recovery adds no abort.
     Malformed or duplicate outcomes receive a fresh sequence.
 
     :param optuna.Study study: Study providing outcome sequences.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial.
+    :param bool | None completed_feasible: Recovered result feasibility, or None for interruption.
     :raises StudyStorageUnavailableError: Outcome persistence failed; leave the trial RUNNING.
     """
     trials = study.get_trials(deepcopy=False)
     sequence_counts = _outcome_sequence_counts(trials)
     current = next((candidate for candidate in trials if candidate.number == trial.number), trial)
     existing = _unduplicated_outcome(current, sequence_counts)
-    outcome = _stale_recovery_outcome(existing)
+    outcome = (
+        ("success" if completed_feasible else "failure")
+        if completed_feasible is not None
+        else _stale_recovery_outcome(existing)
+    )
     policy: str | None = None
     abort: JsonObject | None = None
     if existing is None:
@@ -593,6 +607,12 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
         sequence = existing.sequence
         cause = "orchestrator stopped before Optuna committed the terminal trial state"
 
+    if completed_feasible is not None:
+        cause = (
+            None
+            if completed_feasible
+            else "recovered evidence violates metric or constraint bounds"
+        )
     payload = _trial_outcome_payload(sequence, outcome, cause=cause, policy=policy, abort=abort)
     try:
         active_trial = optuna.Trial(study, trial._trial_id)
@@ -611,14 +631,14 @@ def _registry_attempt_fail_stale_trial(
     entry_path: Path,
     report: _PreflightCleanupReport,
 ) -> str:
-    """Mark the entry's Optuna trial FAIL through its saved storage locator.
+    """Settle the entry's Optuna trial through its saved storage locator.
 
     Recovery remains independent of current storage and phase configuration.
 
     :param dict[str, Any] entry: Validated registry entry payload.
     :param Path entry_path: Entry file, used only for diagnostics.
     :param _PreflightCleanupReport report: Counts newly recorded trial cleanup actions.
-    :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
+    :return str: ``"reaped"`` when the stale RUNNING trial became terminal,
         ``"recovered"`` when an interrupted pass already recorded that
         transition in the study ledger or the entry is a tracking operation
         (which owns no trial, so its resolved process is the recovery
@@ -705,6 +725,8 @@ def _registry_attempt_fail_stale_trial(
     _fail_stale_running_trial(
         study,
         trial,
+        record=_registry_attempt_record(entry, entry_path),
+        artifact_root=entry_path.parent.parent,
         failure_message=(
             f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
             f"but its stale RUNNING trial {trial.number} in study "
@@ -877,26 +899,16 @@ def _resolve_attempt(
             action=evidence_action,
         ) from exc
     if not confirm:
-        action = "--confirm must verify process-birth identity before signalling."
-        if (
-            identity.boot_id is not None
-            and identity.boot_id == read_boot_id()
-            and same_pid_namespace(identity.pid_namespace)
-        ):
-            state = "live" if _process_group_alive(identity.pgid) else "exited"
-            if state == "live":
-                if identity.proc_starttime is not None and is_same_live_process(
-                    identity.pid, identity.proc_starttime
-                ):
-                    action = "--confirm will terminate it if still alive before reconciling this attempt."
-                else:
-                    state = "live, but its process-birth identity is unverified or mismatched"
-        else:
-            state = "not observable from this boot/PID namespace"
+        decision = stale_trial_process_decision(identity)
+        action = {
+            "terminate": "--confirm will terminate it if still alive before reconciling this attempt",
+            "gone": "--confirm will reconcile this attempt without signalling",
+            "refuse": "--confirm will refuse cleanup and leave this attempt unresolved",
+        }[decision.action]
         log.warning(
-            "%s: training process group is %s (pid=%s pgid=%s); %s",
+            "%s: training process group: %s (pid=%s pgid=%s); %s.",
             context,
-            state,
+            decision.reason,
             identity.pid,
             identity.pgid,
             action,
@@ -908,9 +920,124 @@ def _resolve_attempt(
             f"pid={identity.pid} pgid={identity.pgid}. "
             "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery."
         )
+    _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
     log.warning(
         "%s: confirmed process cleanup (pid=%s pgid=%s).", context, identity.pid, identity.pgid
     )
+
+
+def _recover_completed_trial(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+    *,
+    record: _AttemptRecord,
+    artifact_root: Path,
+) -> bool:
+    """Accept a finished orphan through the producing configuration's extraction path.
+
+    Confirmed group cleanup and successful trainer exit evidence permit acceptance.
+    Trainer ledger attributes precede SDK workers and take priority over the reused
+    process slot; the guardian covers a runner death before those attributes commit.
+    Recorded process failures and interruptions remain authoritative; a measured
+    bound violation may still commit as COMPLETE and infeasible.
+
+    :param optuna.Study study: Owning study whose trial is still RUNNING.
+    :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
+    :param _AttemptRecord record: Attempt identity and original trial directory.
+    :param Path artifact_root: Owning artifact root containing generation snapshots.
+    :return bool: Whether the trial was recovered as COMPLETE.
+    :raises StudyStorageUnavailableError: Valid completed evidence could not be committed.
+    """
+    from phasesweep.engine.trial import (
+        ExecutedTrial,
+        _environment_identity,
+        extract_trial_result,
+        record_trial_result,
+        trial_run_name,
+    )
+    from phasesweep.evidence.evaluation import TrialContext
+    from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
+    from phasesweep.runtime.process import ProcessResult
+
+    lifecycle = read_attempt_lifecycle(record.trial_dir, expected_attempt_id=record.attempt_id)
+    outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    measured_infeasible = _recorded_infeasible_result(trial, outcome)
+    trainer_duration = None if lifecycle is None else _completed_trainer_duration(trial, lifecycle)
+    if (
+        lifecycle is None
+        or lifecycle.state != "exited"
+        or not lifecycle.cleanup_confirmed
+        or trainer_duration is None
+        or record.generation_id is None
+        or (outcome is not None and outcome.outcome != "success" and not measured_infeasible)
+    ):
+        return False
+    snapshot = (
+        artifact_root / "generations" / record.generation_id / GENERATION_CONFIG_SNAPSHOT_FILENAME
+    )
+    experiment = Experiment.model_validate(
+        yaml.safe_load(read_private_text(snapshot, require_private_dir=False))
+    )
+    phase = experiment.phase(record.phase_name)
+    environment = _environment_identity(
+        experiment, record.phase_name, require_wandb_online=False
+    ).values
+    trainer_input = trial.user_attrs.get(TRAINER_INPUT_ATTR)
+    overrides_json = trial.user_attrs.get(OVERRIDES_ATTR)
+    if (
+        not isinstance(trainer_input, dict)
+        or not isinstance(trainer_input.get("sha256"), str)
+        or not isinstance(overrides_json, str)
+    ):
+        raise StudyStorageUnavailableError(
+            f"Completed attempt {record.attempt_id} lacks its recorded trainer input or overrides; its trial remains RUNNING."
+        )
+    ctx = TrialContext(
+        experiment=experiment.experiment,
+        phase=record.phase_name,
+        trial_id=trial.number,
+        generation_id=record.generation_id,
+        attempt_id=record.attempt_id,
+        overrides_sha256=trainer_input["sha256"],
+        trial_dir=record.trial_dir,
+        run_name=trial_run_name(experiment, record.phase_name, trial.number, record.attempt_id),
+        return_code=0,
+        duration_seconds=trainer_duration,
+        mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
+        mlflow_query=compile_mlflow_query(experiment, phase.gates),
+        wandb_environment=environment,
+        mlflow_environment=environment,
+    )
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=ExecutedTrial(ctx, ProcessResult(0, False, -1, trainer_duration)),
+        gates=phase.gates,
+    )
+    if result.failure_reason is not None:
+        log.warning(
+            "Completed orphan attempt %s evidence could not be accepted: %s",
+            record.attempt_id,
+            result.failure_reason,
+        )
+        return False
+    assert result.metric is not None
+    try:
+        record_trial_result(
+            optuna.Trial(study, trial._trial_id), result, overrides_json=overrides_json
+        )
+        _record_stale_trial_outcome(study, trial, completed_feasible=result.feasible)
+        _record_cleanup_recovery(study, trial)
+        study.tell(trial.number, result.metric)
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
+        ) from exc
+    log.info(
+        "Recovered completed trainer evidence for trial %d in study %s",
+        trial.number,
+        study.study_name,
+    )
+    return True
 
 
 def _fail_stale_running_trial(
@@ -918,21 +1045,32 @@ def _fail_stale_running_trial(
     trial: optuna.trial.FrozenTrial,
     *,
     failure_message: str,
+    record: _AttemptRecord | None = None,
+    artifact_root: Path | None = None,
 ) -> None:
-    """Commit a stale RUNNING trial as ``FAIL`` once its attempt is resolved.
+    """Settle a resolved RUNNING trial using completed evidence when available.
 
-    The recovered outcome and then the cleanup-recovery ledger are written
-    before Optuna's terminal state retires the trial's RUNNING authority.
+    Re-extract a confirmed successful trainer through its producing configuration.
+    Otherwise preserve failures or record an interruption. The outcome and cleanup
+    ledger precede Optuna's terminal transition.
 
     :param optuna.Study study: Study containing ``trial``.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial whose attempt
         can no longer leak a process.
+    :param _AttemptRecord | None record: Attempt record for recovering completed evidence.
+    :param Path | None artifact_root: Artifact root containing the producing config snapshot.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
     :raises StudyStorageUnavailableError: The outcome, the recovery ledger, or
         the terminal state could not be recorded; the trial is left RUNNING
         rather than committed without its outcome.
     """
+    if (
+        record is not None
+        and artifact_root is not None
+        and _recover_completed_trial(study, trial, record=record, artifact_root=artifact_root)
+    ):
+        return
     _record_stale_trial_outcome(study, trial)
     _record_cleanup_recovery(study, trial)
     try:

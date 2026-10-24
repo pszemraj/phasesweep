@@ -634,6 +634,10 @@ class WinnerPhasePayload(_ToolPayload):
         description="True/false when gates were declared; null when the phase has no gates."
     )
     incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
+    cost_advisory: str | None = Field(
+        default=None,
+        description="Cheaper configuration within the winner's standard error; parameters follow visible_params policy.",
+    )
     confound: ConfoundSummary = Field(
         description=(
             "Advisory verdicts on the population this winner was selected from. Report every "

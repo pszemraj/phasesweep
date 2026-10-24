@@ -6,27 +6,40 @@ import csv
 import logging
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import optuna
 import pytest
 from optuna.distributions import IntDistribution
 
+import phasesweep.engine.attempts as attempts_module
+import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
 from phasesweep.engine import phase as phase_module
-from phasesweep.engine.attempts import _record_stale_trial_outcome
+from phasesweep.engine.attempts import (
+    _AttemptRecord,
+    _PreflightCleanupReport,
+    _record_stale_trial_outcome,
+)
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
 )
 from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
-from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    FEASIBLE_ATTR,
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
@@ -44,18 +57,21 @@ from phasesweep.engine.study_policy import (
     _rerun_sources,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
-from phasesweep.runtime.json import JsonObject
-from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
+from phasesweep.runtime.reaper import read_boot_id
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
     phase_study,
     phase_trials,
     trial_outcome,
+    write_experiment_config,
     write_param_echo_trainer,
     write_trainer,
 )
-from tests.recovery_helpers import fabricate_stale_trial
+from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
 _UNCOMMITTED_CAUSE = "orchestrator stopped before Optuna committed the terminal trial state"
@@ -533,3 +549,246 @@ def test_the_shutdown_wait_gives_up_on_a_running_trial_no_worker_finishes(
     started = time.monotonic()
     _await_worker_trials(_WorkerTrials(), study)
     assert 0.2 <= time.monotonic() - started < 2.0
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(("return_code", "feasible"), [(0, True), (0, False), (7, True)])
+@pytest.mark.parametrize("sdk_worker", [False, True])
+def test_completed_orphan_evidence_survives_runner_sigkill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    return_code: int,
+    feasible: bool,
+    sdk_worker: bool,
+) -> None:
+    """A surviving guardian saves trainer exit evidence; only zero exits survive resume as COMPLETE."""
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, time
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        args, _ = parser.parse_known_args()
+        with Path({str(launches)!r}).open("a") as handle:
+            handle.write("launch\\n")
+        Path({str(started)!r}).touch()
+        while not Path({str(release)!r}).exists():
+            time.sleep(0.02)
+        Path(args.out).write_text(json.dumps({{"x": 1.0}}))
+        print("x=1.0")
+        raise SystemExit({return_code})
+    """,
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    if not feasible:
+        experiment = experiment.model_copy(
+            update={"metric": experiment.metric.model_copy(update={"max": 0.5})}
+        )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    worker_started = tmp_path / "worker-started"
+    worker = write_trainer(
+        tmp_path / "worker.py",
+        f"""
+        import time
+        from pathlib import Path
+        Path({str(worker_started)!r}).touch()
+        time.sleep(60)
+    """,
+    )
+    if sdk_worker:
+        release.touch()
+    runner_code = """
+import sys, time
+from pathlib import Path
+from phasesweep.config.io import load_experiment
+from phasesweep import run_experiment
+from phasesweep.engine import phase
+from phasesweep.runtime.remote_worker import run_worker
+
+original_extract = phase.extract_trial_result
+
+def extract_with_worker(**kwargs):
+    \"\"\"Keep an SDK worker active until recovery terminates its process slot.\"\"\"
+    ctx = kwargs["executed"].ctx
+    run_worker({}, Path(sys.argv[3]), "fake-sdk", statuses=frozenset({"ok"}), run_id=ctx.attempt_id, trial_dir=ctx.trial_dir, environment={}, deadline=time.monotonic() + 60)
+    return original_extract(**kwargs)
+
+if sys.argv[2] == "1":
+    phase.extract_trial_result = extract_with_worker
+run_experiment(load_experiment(sys.argv[1]))
+"""
+    orphan_identity = None
+    with (tmp_path / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                runner_code,
+                str(config),
+                "1" if sdk_worker else "0",
+                str(worker),
+            ],
+            stdout=output,
+            stderr=output,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            reached = worker_started if sdk_worker else started
+            while not reached.exists() and time.monotonic() < deadline:
+                assert runner.poll() is None, (tmp_path / "runner.log").read_text()
+                time.sleep(0.02)
+            assert reached.exists()
+            runner.kill()
+            runner.wait(timeout=5)
+            release.touch()
+            (trial,) = phase_trials(experiment)
+            directory = Path(trial.user_attrs["phasesweep_trial_dir"])
+            attempt = trial.user_attrs["phasesweep_attempt_id"]
+            orphan_identity = reaper.read_stale_process_identity(
+                directory, expected_attempt_id=attempt
+            )
+            if sdk_worker:
+                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                assert lifecycle is not None and lifecycle.state == "launching"
+                assert reaper._process_group_alive(orphan_identity.pgid)
+            else:
+                while time.monotonic() < deadline:
+                    lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                    if lifecycle is not None and lifecycle.state == "exited":
+                        break
+                    time.sleep(0.02)
+                assert lifecycle is not None and lifecycle.state == "exited"
+                assert lifecycle.return_code == return_code
+                assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
+            assert (directory / "r.json").exists()
+            if return_code == 0:
+                assert (
+                    _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
+                    == "EVIDENCE_PENDING"
+                )
+                with pytest.raises(
+                    PhaseSweepError, match="completed trainer evidence awaiting recovery"
+                ):
+                    _preview_ledger(experiment, from_phase=None)
+
+                def lose_terminal_commit(*_args: object, **_kwargs: object) -> None:
+                    raise RuntimeError("interrupted terminal commit")
+
+                with monkeypatch.context() as interrupted:
+                    interrupted.setattr(optuna.Study, "tell", lose_terminal_commit)
+                    with pytest.raises(StudyStorageUnavailableError, match="retained evidence"):
+                        _reconcile_existing_studies(
+                            experiment, cleanup_report=_PreflightCleanupReport()
+                        )
+                assert phase_trials(experiment)[0].state.name == "RUNNING"
+                if not feasible:
+                    interrupted_study = phase_study(experiment)
+                    pending = interrupted_study.get_trials()[0]
+                    parsed_pending = _parsed_trial_outcome(pending.user_attrs[TRIAL_OUTCOME_ATTR])
+                    assert parsed_pending is not None
+                    saved_outcome = json_object(pending.user_attrs[TRIAL_OUTCOME_ATTR])
+                    saved_abort = _abort(parsed_pending.sequence)
+                    saved_abort["trial_target"] = 1
+                    saved_outcome[TRIAL_OUTCOME_ABORT_KEY] = saved_abort
+                    optuna.Trial(interrupted_study, pending._trial_id).set_user_attr(
+                        TRIAL_OUTCOME_ATTR, saved_outcome
+                    )
+            _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
+            (recovered,) = phase_trials(experiment)
+            assert recovered.state.name == ("COMPLETE" if return_code == 0 else "FAIL")
+            if return_code == 0:
+                assert recovered.value == 1.0
+                assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
+                if feasible:
+                    assert _cause(recovered) is None
+                    assert run_experiment(experiment)["p"].metric == 1.0
+                    assert run_experiment(experiment)["p"].metric == 1.0
+                else:
+                    assert (
+                        _cause(recovered)
+                        == "recovered evidence violates metric or constraint bounds"
+                    )
+                    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+                        run_experiment(experiment)
+                assert len(phase_trials(experiment)) == 1
+            else:
+                assert _trial_interrupted(recovered)
+            assert launches.read_text() == "launch\n"
+            assert not reaper._process_group_alive(orphan_identity.pgid)
+        finally:
+            release.touch()
+            if runner.poll() is None:
+                runner.kill()
+            runner.wait(timeout=5)
+            if orphan_identity is not None:
+                reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["live", "leader_exited", "group_exited", "prior_boot", "foreign_absent", "reused_group"],
+)
+def test_recovery_preview_names_trial_group_liveness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    """Inspection and confirmation share every signal-target and absence decision."""
+    write_trial_identity(tmp_path, attempt_id="preview", pid=12345, starttime=1)
+    monkeypatch.setattr(
+        reaper, "read_boot_id", lambda: "old" if case == "prior_boot" else read_boot_id()
+    )
+    monkeypatch.setattr(reaper, "same_pid_namespace", lambda _: case != "foreign_absent")
+    monkeypatch.setattr(reaper, "recorded_process_blocker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: case == "live")
+    monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 1)
+    monkeypatch.setattr(reaper.os, "getpgid", lambda _: 12345)
+    monkeypatch.setattr(reaper, "_process_group_exists", lambda _: case != "group_exited")
+    monkeypatch.setattr(reaper, "_process_group_alive", lambda _: case != "group_exited")
+    monkeypatch.setattr(
+        reaper,
+        "_read_proc_stat",
+        lambda _: SimpleNamespace(pgrp=12345, starttime=2) if case == "reused_group" else None,
+    )
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        reaper, "_terminate_process_group", lambda pgid, **_: signalled.append(pgid) or True
+    )
+    record = _AttemptRecord("preview", tmp_path, "generation", "p", 0)
+    attempts_module._resolve_attempt(
+        record,
+        context="RUNNING trial 0",
+        evidence_action=OperatorAction.RESTORE_TREE,
+        lifecycle_settles=True,
+        confirm=False,
+    )
+    assert not signalled
+    should_signal = case in {"live", "leader_exited"}
+    assert ("--confirm will terminate it if still alive" in caplog.text) is should_signal
+    assert "pid=12345 pgid=12345" in caplog.text
+    if case == "leader_exited":
+        assert "stored PGID fallback" in caplog.text
+    if case == "reused_group":
+        assert "unrelated group will be spared" in caplog.text
+        with pytest.raises(attempts_module.ProcessCleanupUncertainError):
+            attempts_module._resolve_attempt(
+                record,
+                context="RUNNING trial 0",
+                evidence_action=OperatorAction.RESTORE_TREE,
+                lifecycle_settles=True,
+                confirm=True,
+            )
+    else:
+        attempts_module._resolve_attempt(
+            record,
+            context="RUNNING trial 0",
+            evidence_action=OperatorAction.RESTORE_TREE,
+            lifecycle_settles=True,
+            confirm=True,
+        )
+    assert signalled == ([12345] if should_signal else [])

@@ -19,6 +19,7 @@ import optuna
 from optuna.exceptions import ExperimentalWarning
 from optuna.samplers._lazy_random_state import LazyRandomState
 
+from phasesweep.config.common import StrictJsonScalar
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     CategoricalParam,
@@ -351,12 +352,36 @@ class _PositionRandomSampler(optuna.samplers.RandomSampler):
 class _PositionGridSampler(optuna.samplers.GridSampler):
     """Grid sampler that gives each trial the grid point at its draw position and never stops a study."""
 
+    def __init__(
+        self,
+        search_space: Mapping[str, Sequence[StrictJsonScalar]],
+        *,
+        seed: int | None,
+        repeats: Repeats | None = None,
+    ) -> None:
+        """Keep configurations shuffled and their repeat values consecutive.
+
+        :param Mapping[str, Sequence[StrictJsonScalar]] search_space: Enumerated grid axes.
+        :param int | None seed: Seed for the configuration shuffle; None uses zero.
+        :param Repeats | None repeats: Repeat axis to group in its configured value order.
+        """
+        super().__init__(search_space, seed=seed)
+        self._grid_ids = list(range(len(self._all_grids)))
+        if repeats is not None:
+            repeat_index = self._param_names.index(repeats.key)
+            groups: dict[tuple[object, ...], dict[object, int]] = {}
+            for grid_id, point in enumerate(self._all_grids):
+                configuration = point[:repeat_index] + point[repeat_index + 1 :]
+                groups.setdefault(configuration, {})[point[repeat_index]] = grid_id
+            self._grid_ids = [group[value] for group in groups.values() for value in repeats.values]
+
     def before_trial(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         """Assign the grid point at the trial's draw position, unless the trial already has one.
 
         A rerun copies its source's ``grid_id``. New draws take positions
-        ``0..M-1`` in the grid's seeded shuffle, so no two trials that are not
-        reruns share a point under any ``n_jobs``.
+        ``0..M-1`` in the grid's seeded configuration shuffle, with repeat values
+        consecutive, so no two trials that are not reruns share a point under
+        any ``n_jobs``.
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
@@ -365,12 +390,13 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
         """
         if "grid_id" in trial.system_attrs:
             return
-        grid_id = _draw_position(study, trial)
-        if grid_id >= len(self._all_grids):
+        position = _draw_position(study, trial)
+        if position >= len(self._grid_ids):
             raise RuntimeError(
                 f"Trial {trial.number} of study {study.study_name!r} has draw position "
-                f"{grid_id}, past the {len(self._all_grids)}-point grid."
+                f"{position}, past the {len(self._all_grids)}-point grid."
             )
+        grid_id = self._grid_ids[position]
         study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
         study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
 
@@ -584,7 +610,7 @@ def _build_sampler(
         ``GridSampler`` grid; it includes the repeat axis.
     :param int n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic when
         ``n_jobs > 1``.
-    :param Repeats | None repeats: The phase's repeats block; the seeded random sampler draws
+    :param Repeats | None repeats: The phase's repeats block; grid and seeded random run
         one configuration per slot of ``len(values)`` consecutive positions.
     :raises ValueError: The validated grid search space cannot be enumerated.
     :return optuna.samplers.BaseSampler: A configured sampler instance. A seeded stochastic
@@ -616,7 +642,7 @@ def _build_sampler(
             return optuna.samplers.RandomSampler()
         return _PositionRandomSampler(seed=cfg.seed, repeats=repeats)
     if cfg.type == "grid":
-        return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed)
+        return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed, repeats=repeats)
     if cfg.type == "cmaes":
         if cfg.seed is None:
             return optuna.samplers.CmaEsSampler()

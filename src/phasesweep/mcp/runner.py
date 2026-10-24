@@ -42,6 +42,7 @@ from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
     ProcessCleanupUncertainError,
+    operator_step,
 )
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
@@ -137,17 +138,22 @@ def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") 
     return remediation
 
 
-def _routed_next_steps(action: OperatorAction) -> dict[str, object]:
+def _routed_next_steps(error: PhaseSweepError) -> dict[str, object]:
     """Return the retryability, actor, and remediation a raise's routed action calls for.
 
-    :param OperatorAction action: Action the raise routes.
+    :param PhaseSweepError error: Failure carrying the routed action and its concrete detail.
     :return dict[str, object]: ``retryable``, ``actor``, and ``remediation``
         payload fields: the agent's retry when the action is ``RETRY``, and
         otherwise the operator's step.
     """
-    if action is OperatorAction.RETRY:
-        return {"retryable": True, "actor": "agent", "remediation": f"{OPERATOR_STEPS[action]}."}
-    return {"retryable": False, "actor": "operator", "remediation": _operator_remediation([action])}
+    if error.action is OperatorAction.RETRY:
+        return {"retryable": True, "actor": "agent", "remediation": operator_step(error)}
+    remediation = (
+        f"Ask the operator: {operator_step(error)}"
+        if error.remediation is not None
+        else _operator_remediation([error.action])
+    )
+    return {"retryable": False, "actor": "operator", "remediation": remediation}
 
 
 def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, object]:
@@ -228,7 +234,7 @@ def _base_failure_payload(
     """Map an operator-facing exception to one stable, path-free agent failure.
 
     The error's type selects ``code``. For a :class:`PhaseSweepError`, ``retryable``,
-    ``actor``, and ``remediation`` come only from the action its raise routes; an
+    ``actor``, and ``remediation`` come from the action and concrete detail its raise routes; an
     exception without a routed action keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
@@ -251,7 +257,7 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    return {"code": code, "stage": failure_stage, **_routed_next_steps(error.action)}
+    return {"code": code, "stage": failure_stage, **_routed_next_steps(error)}
 
 
 def _cleanup_steps(

@@ -15,7 +15,6 @@ from phasesweep.engine.confound import (
     ConfoundCheck,
     ConfoundVerdict,
     _confound_summary,
-    _evaluation_point_remedy,
     _validate_confound_block,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
@@ -27,16 +26,19 @@ from phasesweep.engine.read import (
     ResultContext,
     read_result,
     read_status,
+    winner_cost_advisory,
 )
 from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
     RecoveredTrialState,
+    TrialStateName,
     Winner,
     WinnerSourceKind,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
+from phasesweep.runtime.json import JsonObject, dump_json
 
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
@@ -80,7 +82,7 @@ class RunningAttemptSnapshot(_SnapshotModel):
     generation_id: str | None = None
     attempt_id: str | None = None
     recovers_as: RecoveredTrialState
-    """The state stale recovery records for this row, read from its outcome record at capture."""
+    """Captured recovery prediction; successful trainer evidence stays pending until extraction."""
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
@@ -206,7 +208,7 @@ class TieSummary(_SnapshotModel):
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
     remedy: str | None = Field(
-        description="Explains a missing noise estimate and phases[].repeats; null with repeat groups."
+        description="Configuration-first noise guidance; null for unchecked comparisons or repeat groups."
     )
     tied_trials: NonNegativeInt | None = Field(
         description=(
@@ -272,16 +274,20 @@ class WinnerSnapshot(_SnapshotModel):
     confound: ConfoundSummary
     observed: dict[str, float]
     repeats: RepeatsSpread | None
+    cost_advisory: str | None = None
 
 
 def _winner_snapshot(
     phase: str,
     winner: PhaseWinnerView | Winner,
+    *,
+    experiment: Experiment | None = None,
 ) -> WinnerSnapshot:
     """Freeze either engine winner representation into one validated snapshot.
 
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
+    :param Experiment | None experiment: Producing config for recomputed repeat-cost advice.
     :raises RuntimeError: A ``PhaseWinnerView`` carries no confound verdicts, or either
         representation carries no source provenance.
     :raises ValueError: A stored ``Winner``'s confound block fails validation.
@@ -292,16 +298,32 @@ def _winner_snapshot(
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
         )
         incomplete = bool(winner.completion.get("incomplete", False))
-        confound = _confound_summary(
-            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
-            winner_trial=winner.trial_number,
-        )
         provenance = winner.objective_provenance
         extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
         kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
-        if isinstance(kind, str) and confound["evaluation_point"]["verdict"] == "heterogeneous":
-            confound["evaluation_point"]["remedy"] = _evaluation_point_remedy(kind)
+        confound = _confound_summary(
+            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
+            winner_trial=winner.trial_number,
+            extractor_kind=kind if isinstance(kind, str) else "unknown",
+        )
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
+        cost_advisory = (
+            winner_cost_advisory(
+                experiment,
+                PhaseWinnerView(
+                    phase=phase,
+                    trial_number=winner.trial_number,
+                    metric=winner.metric,
+                    params=dict(winner.params),
+                    effective_overrides={},
+                    gates_passed=gates_passed,
+                    incomplete=incomplete,
+                    repeats=repeats,
+                ),
+            )
+            if experiment is not None
+            else None
+        )
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
@@ -309,6 +331,7 @@ def _winner_snapshot(
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
         repeats = winner.repeats
+        cost_advisory = winner.cost_advisory
     source = winner.source
     if source is None:
         raise RuntimeError("Current-format winner is missing source provenance.")
@@ -325,6 +348,7 @@ def _winner_snapshot(
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
+        cost_advisory=cost_advisory,
     )
 
 
@@ -441,7 +465,8 @@ def capture_result_snapshot(
         for phase in status["phases"]:
             phase["winner_present"] = phase["phase"] in engine_winners
         winner_snapshots = [
-            _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
+            _winner_snapshot(phase_name, winner, experiment=experiment)
+            for phase_name, winner in engine_winners.items()
         ]
     else:
         status, winner_views = read_result(experiment, generation_id=generation_id)
@@ -505,11 +530,12 @@ def finalize_result_snapshot(
     *,
     confirmed_attempt_ids: Collection[str] = (),
     confirmed_attempt_locations: Mapping[str, tuple[str, int, str]] | None = None,
-) -> dict[str, Any]:
+    confirmed_attempt_states: Mapping[str, TrialStateName] | None = None,
+) -> JsonObject:
     """Reconcile captured RUNNING identities without rereading shared state.
 
-    Recovered attempts become their captured ``INTERRUPTED`` or ``FAIL`` state. Phases
-    with unavailable trial data and no RUNNING identities remain unchanged.
+    Use the exact recovered terminal state for completed evidence awaiting extraction,
+    and the captured prediction for other attempts. Preserve all unrelated frozen counts.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled by recovery.
@@ -517,7 +543,8 @@ def finalize_result_snapshot(
         Reconciled attempt ids mapped to phase, trial number, and generation;
         used when the frozen row was captured before its Optuna identity attrs
         were set.
-    :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
+    :param Mapping[str, TrialStateName] | None confirmed_attempt_states: Actual terminal states of reconciled attempts, required for captured pending evidence.
+    :return JsonObject: Validated terminal snapshot with truthful trial states.
     :raises RuntimeError: If the cleanup report names more recovered attempts
         than the snapshot counts as RUNNING, for a phase or for the represented
         generation.
@@ -535,27 +562,44 @@ def finalize_result_snapshot(
     for phase in parsed.status.phases:
         if phase.running_attempts is None:
             continue
-        recovered: list[tuple[RunningAttemptSnapshot, str | None]] = []
+        recovered: list[tuple[RunningAttemptSnapshot, str | None, TrialStateName]] = []
         for attempt in phase.running_attempts:
             location = confirmed_by_location.get((phase.phase, attempt.trial_number))
-            if attempt.attempt_id is not None and attempt.attempt_id in confirmed:
-                recovered.append((attempt, None if location is None else location[1]))
-            elif attempt.attempt_id is None and location is not None:
-                recovered.append((attempt, location[1]))
+            attempt_id = attempt.attempt_id
+            if attempt_id is None and location is not None:
+                attempt_id = location[0]
+            if attempt_id is None or attempt_id not in confirmed:
+                continue
+            state: TrialStateName
+            if attempt.recovers_as == "EVIDENCE_PENDING":
+                actual = (confirmed_attempt_states or {}).get(attempt_id)
+                if actual is None or actual not in {
+                    "COMPLETE",
+                    "INFEASIBLE",
+                    "FAIL",
+                    "INTERRUPTED",
+                }:
+                    raise RuntimeError(
+                        f"cleanup report lacks the terminal state of pending attempt {attempt_id}"
+                    )
+                state = actual
+            else:
+                state = attempt.recovers_as
+            recovered.append((attempt, None if location is None else location[1], state))
         if not recovered:
             continue
         running = phase.trials.get("RUNNING", 0)
         if len(recovered) > running:
             raise RuntimeError("cleanup report identifies more attempts than the snapshot records")
         phase.trials["RUNNING"] = running - len(recovered)
-        for attempt, _generation_id in recovered:
-            phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
+        for _attempt, _generation_id, state in recovered:
+            phase.trials[state] = phase.trials.get(state, 0) + 1
         # Generation counts belong to represented_generation_id: a run that launched a
         # trial, and so can leave one RUNNING, represents its own generation.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
-            attempt
-            for attempt, recovered_generation_id in recovered
+            (attempt, state)
+            for attempt, recovered_generation_id, state in recovered
             if generation_id is not None
             and (
                 attempt.generation_id == generation_id
@@ -569,17 +613,17 @@ def finalize_result_snapshot(
                     "cleanup report identifies more generation attempts than the snapshot records"
                 )
             phase.generation_trials["RUNNING"] = generation_running - len(generation_recovered)
-            for attempt in generation_recovered:
-                phase.generation_trials[attempt.recovers_as] = (
-                    phase.generation_trials.get(attempt.recovers_as, 0) + 1
-                )
-        recovered_trial_numbers = {attempt.trial_number for attempt, _generation_id in recovered}
+            for _attempt, state in generation_recovered:
+                phase.generation_trials[state] = phase.generation_trials.get(state, 0) + 1
+        recovered_trial_numbers = {
+            attempt.trial_number for attempt, _generation_id, _state in recovered
+        }
         phase.running_attempts = [
             attempt
             for attempt in phase.running_attempts
             if attempt.trial_number not in recovered_trial_numbers
         ]
-    return parsed.model_dump(mode="json")
+    return dump_json(parsed)
 
 
 def parse_result_snapshot(status: Mapping[str, object]) -> RunResultSnapshot | None:

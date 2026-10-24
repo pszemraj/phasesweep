@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_summary_path,
@@ -133,9 +134,11 @@ def test_new_artifact_dir_does_not_modify_repository_ignore(tmp_path: Path) -> N
 
 
 def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
+    """Dry runs and refused inspection leave missing artifact directories absent."""
     exp = make_experiment(workdir=str(tmp_path / "runs"))
     run_experiment(exp, dry_run=True)
-    experiment_status(exp)
+    with pytest.raises(StudyStorageUnavailableError, match="contains a started study"):
+        experiment_status(exp)
     assert not Path(exp.workdir).exists()
 
 

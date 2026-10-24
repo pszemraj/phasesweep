@@ -1,9 +1,9 @@
-# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/v0.3.11/examples/example.yaml.
+# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
 # Installed reference links and explain's See links target the installed release tag or source revision.
-# The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mcp.md#the-catalog.
-# Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#run-time-overrides). No environment variable sets a key.
+# The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
+# Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
 # Paths: a relative workdir, journal path or execution.cwd resolves against the config file's directory, after symlinks. A leading ~ expands from HOME.
 # Trial paths (extractor path and file, gate path) are relative to the attempt directory, nonempty, without NUL or .. segments, and name a file below it.
@@ -14,7 +14,7 @@
 # Every key is in the study fingerprint, which a study with trials refuses to change, except storage, workdir, observe and timeout_seconds_per_run.
 # Also outside it: execution.record_env, mlflow.poll_seconds, mlflow.timeout_seconds and the run-control keys listed under Phases.
 # Notation: a `| null = null` key may be omitted, which turns its feature off unless an Unset: line says otherwise. TitleCase types are shared blocks.
-# Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mcp.md#the-catalog.
+# Environment variables PhaseSweep reads: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#environment-variables. The MCP catalog is a separate file: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 
 # ---------- Experiment ----------
 
@@ -37,7 +37,7 @@ trial_command: string (required)
 
 # Primary objective: the scalar each trial reports and how trials rank. PhaseSweep does no pruning, evaluation scheduling or checkpoint selection.
 # Selection records advisory confound verdicts on the winner, which never block selection or publication.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#confound-verdicts
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#confound-verdicts
 metric: object (required)
   # Nonempty name the objective is published under, for example validation_loss. The name goal is reserved.
   # Requires: distinct from every constraints[].name and observe[].name, which are distinct from each other too.
@@ -68,7 +68,7 @@ metric: object (required)
 # With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
 # On persistent storage, launch and dry run refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
 # Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#phase-composition
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition
 
 # Ordered list of phase objects, at least one.
 phases: list[object] (required)
@@ -80,14 +80,14 @@ phases: list[object] (required)
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
     # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Use a new experiment name then.
-    # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
     # Free-text note on the phase. validate prints the current note, and show-winners the one stored with the represented generation.
     comment: string | null = null
 
     # Numeric sampled parameter whose smaller values cost less, for example model.depth.
-    # With mean repeats, advise the cheapest configuration within one combined standard error of the winner; the selected winner never changes.
+    # With mean repeats, advise the cheapest configuration within the winner's standard error; the selected winner never changes.
     # Requires: repeats.reduce mean and a numeric search_space parameter of this phase; numeric categorical choices may not include booleans.
     cost_key: string | null = null
 
@@ -156,7 +156,7 @@ phases: list[object] (required)
     # Warning: R repeat values multiply the phase's cost by R. For a continuous hyperparameter, more distinct values with one trial each cover the same ground.
     # Recommended: keep repeats for a few discrete finalists whose gap is near the noise, a one-off seed audit, or a final configuration's spread.
     # Requires: sampler.type grid, or random with sampler.seed on any storage, and allow_partial_grid false.
-    # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#repeats and https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#repeat-groups
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats and https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#repeat-groups
     repeats: object | null = null
       # Dotted override key, under the fixed_overrides key rules, that receives the repeat value on every trial and is recorded as a param, for example seed.
       # The winner exports neither this key nor an inherited value it replaced, so a phase that inherits this one runs its own value or none.
@@ -170,12 +170,12 @@ phases: list[object] (required)
 
     # Sampling strategy and its parameters. Omit the block for the defaults.
     sampler: object = {}
-      # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid visits a shuffled matrix, and cmaes runs CMA-ES.
-      # grid uses sampler.seed for its shuffle, not the order of choices. Identify trials by their sampled parameters, not by trial number.
+      # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid shuffles configurations, and cmaes runs CMA-ES.
+      # grid uses sampler.seed to spread partial searches across configurations and keeps each configuration's repeat values consecutive in their listed order.
       # Requires: cmaes only with float and int parameters, and the cmaes package, which the config load error names when it is missing.
       # Requires: grid only with no log parameter, a step on every float, and at most 4096 combinations, repeat values included, even with allow_partial_grid.
       # Warning: random draws are independent and with replacement, seeded or not, so a value can repeat or never be drawn. Use grid to cover every value.
-      # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#interrupted-trials-rerun for draw positions and reproducibility.
+      # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#interrupted-trials-rerun for draw positions and reproducibility.
       type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 
       # Sampler seed, an integer from 0 to 4294967295, independent of any trainer seed.
@@ -200,7 +200,7 @@ phases: list[object] (required)
     # On Apple silicon macOS the discovered pool is one MPS device; Intel Macs discover no GPU. macOS refuses gpu_ids and gpu_devices.
     # On Linux, without gpu_ids or gpu_devices the pool is discovered from env.CUDA_VISIBLE_DEVICES, else the controller's ambient CUDA_VISIBLE_DEVICES, else nvidia-smi.
     # On Linux, validate, the dry run and the launch check listed devices and env.CUDA_VISIBLE_DEVICES tokens against nvidia-smi, so an unknown one fails there.
-    # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#gpu-isolation
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#gpu-isolation
 
     # Number of trials run at the same time, an integer >= 1. Under single_per_trial each takes its own device lease, so extra trials queue for a smaller pool.
     # validate, the dry run and the launch warn when it exceeds the device pool. With tpe, more than 1 turns on Optuna's constant_liar.
@@ -239,7 +239,7 @@ phases: list[object] (required)
     # The earliest of the per-trial, phase and run deadlines ends the work it covers. Cleanup and publication can run past a deadline.
     # A failure a deadline causes, such as an evidence read cut short, records the attempt as interrupted, which counts toward neither n_trials nor the streak.
     # When a deadline and a failure-streak abort stop the same phase short of n_trials, the deadline decides the outcome and the abort is retired.
-    # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#timeouts-cleanup-and-continuation
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 
     # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
     # A feasible success resets the count, and an interrupted attempt leaves it unchanged.
@@ -422,7 +422,7 @@ constraints: list[object] = []
 # ---------- Observations ----------
 # An observation is read after the trial is accepted and its objective located, so it never spends the budget acceptance needed.
 # A read that fails, or a value that is not a finite number, logs a warning and records nothing for that name, never failing the trial or changing selection.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#report-only-observations for where recorded values appear.
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#report-only-observations for where recorded values appear.
 
 # Report-only scalars recorded from each accepted trial. Each item is one observation.
 observe: list[object] = []
@@ -441,7 +441,7 @@ observe: list[object] = []
 # Requires: metric.extractor of type mlflow, and no W&B reader or gate anywhere. Local constraints and gates stay allowed.
 # Requires: the phasesweep[mlflow] extra, and credentials with write access in both the controller and the trainer environment.
 # Warning: validate and run --dry-run check neither the credentials nor the experiment. Each phase with trials left checks both before its first trial.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mlflow.md for run ownership, result delivery and sync-tracking.
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md for run ownership, result delivery and sync-tracking.
 mlflow: object | null = null
   # MLflow tracking server: an http or https URL, databricks, or databricks://profile. Local file and sqlite URIs are rejected.
   # An http URL is checked and normalized as WandbTarget.base_url is. A databricks profile with whitespace or a path is rejected.
@@ -460,7 +460,7 @@ mlflow: object | null = null
   # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(run_id) inside it.
   # Warning: a trainer that starts a different run instead of attaching to the managed ID logs evidence PhaseSweep does not read.
   # Recommended: managed when the trainer can honor MLFLOW_RUN_ID, and trainer for code that must own start_run(). Disable autologging and nested runs either way.
-  # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mlflow.md#choose-run-ownership
+  # See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md#choose-run-ownership
   run_mode: "managed" | "trainer" = "managed"
 
   # Seconds between polls while waiting for the attempt's run to finish, or for a run whose creation was not confirmed to appear. Greater than 0.
@@ -476,10 +476,10 @@ mlflow: object | null = null
 # ---------- Execution environment ----------
 # Trainer environment, lowest to highest precedence: what execution.inherit_env selects, execution.passthrough_env, env, then per-attempt variables.
 # Before a phase with work left runs, its tracked environment must match the one its study's trials recorded, or the run is refused naming each difference.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#trainer-contract
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract
 
 # Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
-# The per-attempt PHASESWEEP_* names, listed in https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#trainer-contract, fail config load.
+# The per-attempt PHASESWEEP_* names, listed in https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract, fail config load.
 # See: the MLflow section rules and WandbTarget for the tracking variables it may set.
 # Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
 # Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
@@ -517,7 +517,7 @@ execution: object = {}
 # Wallclock budget for one phasesweep run invocation, in seconds, >= 0. Its clock starts once the ledger is claimed and restarts at every invocation.
 # It also caps W&B evidence reads and MLflow resolution, run creation and capture, but not MLflow result uploads.
 # 0 fails the first phase before it starts, even a replay of finished work.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/runtime.md#timeouts-cleanup-and-continuation
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 timeout_seconds_per_run: float | null = null
 
 # ---------- Shared blocks ----------
@@ -536,7 +536,7 @@ JsonEnvelopeExtractor:
   # Variant json_envelope: read an attempt-bound result envelope, as phasesweep.report_objective() writes it.
   # It must report schema_version 1, status complete, and the generation ID, attempt ID and overrides_sha256 PhaseSweep gave the attempt, or the read fails.
   # It also reports a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite objective.value. Extra top-level keys are allowed.
-  # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#reporting-an-objective
+  # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#reporting-an-objective
   type: "json_envelope" (required)
 
   # Envelope file. report_objective() writes the metric.extractor path, exported as PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric.extractor.
@@ -562,7 +562,7 @@ JsonEnvelopeExtractor:
   # Any other name is read from evaluation.progress, and a missing position, or one that is not a finite number >= 0, fails the read.
   # Only used when: this is metric.extractor. A constraint or observation reader must leave it at its default, or config load fails.
   # Recommended: the axis the comparison holds fixed, such as tokens for a fixed-token sweep.
-  # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#training-length-comparison
+  # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#training-length-comparison
   evaluation_axis: string = "step"
 
 LogRegexExtractor:
@@ -584,7 +584,7 @@ LogRegexExtractor:
 
 # Requires: the top-level mlflow block.
 # Seed ranking: phases[].repeats.
-# See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/mlflow.md#select-metrics-and-require-evidence
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md#select-metrics-and-require-evidence
 MlflowExtractor:
   # Variant mlflow: read the native unscoped metric history of the attempt's MLflow run once it has finished. A model- or dataset-scoped point fails the read.
   # A FAILED or KILLED run fails the read at once. Under run_mode managed, PhaseSweep finishes a run still running after the trainer exits and reads it.
@@ -606,7 +606,7 @@ WandbExtractor:
   # Variant wandb: read one finite number from the finished summary of the W&B run PhaseSweep manages for this attempt, <entity>/<project>/<attempt ID>.
   # The trainer must log to that run under the managed WANDB_RUN_ID and finish it.
   # Seed ranking: phases[].repeats.
-  # See: https://github.com/pszemraj/phasesweep/blob/v0.3.11/docs/config.md#wb-evidence
+  # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence
   type: "wandb" (required)
   <<: WandbTarget
 

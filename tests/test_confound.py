@@ -325,10 +325,25 @@ def test_evaluation_point_remedy_uses_the_current_reader(kind: str) -> None:
     elif kind == "mlflow":
         assert "integer step" in remedy
         assert "int(10000 *" in remedy
+        assert "separate metric key" in remedy
+        assert "metric.extractor.metric_key" in remedy
+        assert "select: last" in remedy
+        assert "native-step history under its original key" in remedy
         assert "evaluation_axis" not in remedy
     else:
         assert "report_objective" in remedy
         assert "evaluation_axis" in remedy
+
+
+@pytest.mark.parametrize("kind", ["json_envelope", "wandb"])
+def test_evaluation_point_remedy_keeps_an_existing_relative_axis(kind: str) -> None:
+    """A relative-completion disagreement calls for inspecting the schedules and early stops."""
+    remedy = _evaluation_point_remedy(kind, axis="schedule_fraction")
+
+    assert "already measures actual_steps / planned_steps" in remedy
+    assert "inspect trials that stopped early" in remedy
+    assert "retain their lower fractions" in remedy
+    assert "set metric.extractor.evaluation_axis" not in remedy
 
 
 @pytest.mark.parametrize(
@@ -377,13 +392,22 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
     assert "trial(s) 1 matched" in _describe_flagged(block)[0]
 
 
-def test_tie_between_repeats_of_one_config_is_ok() -> None:
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 1))
+@pytest.mark.parametrize("values", [(0.5, 0.5), (0.5, 0.6, 0.7)])
+def test_tie_between_repeats_of_one_config_is_unchecked(values: tuple[float, ...]) -> None:
+    """Multiple trials of one configuration carry no configuration gap or noise advice."""
+    trials = _trials(*[(_COMPLETE, value, 1) for value in values])
     block = _assess(trials, trials)
 
     assert block["checks"]["tie"] == {
-        "verdict": "ok",
-        "detail": {"tied_trials": [], "within_noise": None},
+        "verdict": "n/a",
+        "reason": "only one configuration was ranked",
+    }
+    assert _validate_confound_block(block, winner_trial=0) == block
+    assert _confound_summary(block, winner_trial=0, extractor_kind="json_envelope")["tie"] == {
+        "verdict": "n/a",
+        "remedy": None,
+        "tied_trials": None,
+        "within_noise": None,
     }
 
 
@@ -436,7 +460,7 @@ def test_repeats_tie_flags_groups_within_noise() -> None:
     assert _validate_confound_block(block, winner_trial=1) == block
     (line,) = _describe_flagged(block)
     assert "repeat group(s) ending at trial(s) 3 are within two standard errors" in line
-    assert _confound_summary(block, winner_trial=1)["tie"] == {
+    assert _confound_summary(block, winner_trial=1, extractor_kind="json_envelope")["tie"] == {
         "verdict": "heterogeneous",
         "remedy": None,
         "tied_trials": 0,
@@ -497,7 +521,7 @@ def test_repeats_single_group_leaves_tie_unchecked() -> None:
         "reason": "only one repeat group was ranked",
     }
     assert _validate_confound_block(block, winner_trial=1) == block
-    assert _confound_summary(block, winner_trial=1)["tie"] == {
+    assert _confound_summary(block, winner_trial=1, extractor_kind="json_envelope")["tie"] == {
         "verdict": "n/a",
         "remedy": None,
         "tied_trials": None,
@@ -565,6 +589,12 @@ def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() 
         pytest.param(("ranked_groups",), [[0, 1], [2, 3]], "cover each ranked", id="lost-group"),
         pytest.param(("ranked_groups",), [[0], [1]], "at least two", id="singleton-groups"),
         pytest.param(("ranked_groups",), [], "neither null", id="empty-groups"),
+        pytest.param(
+            ("checks", "tie"),
+            {"verdict": "n/a", "reason": "only one configuration was ranked"},
+            "several repeat groups",
+            id="multiple-groups-unchecked",
+        ),
         pytest.param(
             ("checks", "tie"),
             {"verdict": "ok", "detail": {"tied_trials": [], "within_noise": None}},
@@ -769,7 +799,7 @@ def test_validator_anchors_the_block_to_its_own_winner() -> None:
 
 
 def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
-    """The agent-visible projection drops every reported or configured string."""
+    """The agent-visible projection retains the evaluation axis and excludes checkpoint paths."""
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
     block = _assess(
         trials,
@@ -780,17 +810,14 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
         },
     )
 
-    summary = _confound_summary(block, winner_trial=0)
+    summary = _confound_summary(block, winner_trial=0, extractor_kind="json_envelope")
 
     assert summary == {
         "flagged": ["evaluation_point", "tie"],
         "evaluation_point": {
             "verdict": "heterogeneous",
             "axis": "tokens",
-            "remedy": (
-                "For training-length comparisons, report schedule_fraction=actual_steps / "
-                "planned_steps as the evaluation axis; retain lower fractions for early stops."
-            ),
+            "remedy": _evaluation_point_remedy("json_envelope", axis="tokens"),
             "distinct_values": 2,
             "winner_value": 2000,
         },
@@ -811,11 +838,16 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
     rendered = json.dumps(summary)
     assert "/abs/ckpt.pt" not in rendered
     assert summary["evaluation_point"]["axis"] == "tokens"
+    assert _noise_remedy().index("First compare more distinct values") < _noise_remedy().index(
+        "phases[].repeats"
+    )
 
 
 def test_summary_reports_unchecked_counts_as_null() -> None:
     trials = _trials((_COMPLETE, 0.5, 1))
-    summary = _confound_summary(_assess(trials, trials), winner_trial=0)
+    summary = _confound_summary(
+        _assess(trials, trials), winner_trial=0, extractor_kind="json_envelope"
+    )
 
     assert summary["evaluation_point"] == {
         "verdict": "n/a",
@@ -826,7 +858,7 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
     }
     assert summary["tie"] == {
         "verdict": "n/a",
-        "remedy": _noise_remedy(),
+        "remedy": None,
         "tied_trials": None,
         "within_noise": None,
     }
@@ -924,6 +956,8 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
     assert "2 failed trials against 2 ranked" in warnings[0]
+    assert warnings[0].endswith("json_envelope metric.")
+    assert "metric.." not in warnings[0]
 
 
 @pytest.mark.parametrize(

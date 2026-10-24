@@ -1,10 +1,10 @@
-2026-10-23 13:31:18 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
-2026-10-23 13:31:18 I phasesweep.engine.phase phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1
-2026-10-23 13:31:18 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
-2026-10-23 13:31:18 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
-2026-10-23 13:31:18 I phasesweep.engine.phase phase=p TRIAL trial=0 state=COMPLETE value=0.5 duration=0.4s params={'a': 1} (1/2 finished)
-2026-10-23 13:31:18 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
-2026-10-23 13:31:19 I phasesweep.engine.phase phase=p TRIAL trial=1 state=COMPLETE value=0.5 duration=0.4s params={'a': 10} (2/2 finished)
-2026-10-23 13:31:19 W phasesweep.engine.selection [p] potential confounds in the 2 ranked trials (advisory; verdicts recorded in the winner's confound block): tie: trial(s) 1 matched the winner's value exactly with different params, and the lower draw position won.
-2026-10-23 13:31:19 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
-2026-10-23 13:31:19 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/f1d0d350a5df4cffb90a23fa8f7edbc0/summary.yaml
+2026-10-23 23:03:31 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
+2026-10-23 23:03:31 I phasesweep.engine.phase phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1
+2026-10-23 23:03:31 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-10-23 23:03:31 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
+2026-10-23 23:03:31 I phasesweep.engine.phase phase=p TRIAL trial=0 state=COMPLETE value=0.5 duration=0.4s params={'a': 1} (1/2 finished)
+2026-10-23 23:03:31 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
+2026-10-23 23:03:32 I phasesweep.engine.phase phase=p TRIAL trial=1 state=COMPLETE value=0.5 duration=0.4s params={'a': 10} (2/2 finished)
+2026-10-23 23:03:32 W phasesweep.engine.selection [p] potential confounds in the 2 ranked trials (advisory; verdicts recorded in the winner's confound block): tie: trial(s) 1 matched the winner's value exactly with different params, and the lower draw position won.
+2026-10-23 23:03:32 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
+2026-10-23 23:03:32 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/f31a2f5ef6a945a39d51ec8f0c2acf02/summary.yaml

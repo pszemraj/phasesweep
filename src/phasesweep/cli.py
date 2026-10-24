@@ -43,6 +43,7 @@ from phasesweep.engine.paths import (
     _generation_config_snapshot_path,
     _generation_dir,
     _generation_winner_path,
+    _trial_dir_for,
 )
 from phasesweep.engine.publication import (
     raise_for_unusable_publication,
@@ -53,9 +54,10 @@ from phasesweep.engine.read import (
     _represented_winners,
     experiment_status,
     read_trial_tables,
+    require_study,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -143,7 +145,7 @@ def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) ->
             f"{exc}\nfix: inspect the raw artifacts, or use the exact checkout that produced "
             "them for inspection if available; this checkout reads only its current format."
         )
-    step = exc.remediation or f"{OPERATOR_STEPS[exc.action]}."
+    step = operator_step(exc)
     return f"{exc}\nfix: {step}"
 
 
@@ -162,6 +164,11 @@ def main() -> None:
         status = cli.main(standalone_mode=False, obj=operation)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
+        if isinstance(exc, click.NoSuchOption) and exc.option_name == "--workdir":
+            exc = click.UsageError(
+                f"{exc.message} Use --set workdir=PATH; relative paths resolve against the config file's directory.",
+                ctx=exc.ctx,
+            )
         exc.show()
         sys.exit(exc.exit_code)
     except (click.Abort, KeyboardInterrupt):
@@ -523,19 +530,6 @@ def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:
         raise ConfigError(f"{path} (overrides): {detail}") from exc
 
 
-def _require_study(experiment: Experiment) -> None:
-    """Refuse an inspection of a study directory that does not exist.
-
-    :param Experiment experiment: Config whose workdir and name locate the study.
-    :raises click.ClickException: The study directory does not exist.
-    """
-    path = _experiment_dir(experiment)
-    if not path.is_dir():
-        raise click.ClickException(
-            f"No study directory at {path}. Use the same config and --set overrides as run."
-        )
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Validate a phasesweep experiment config without launching any trials.",
@@ -712,7 +706,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
     experiment = _command_config(config_path, settings=settings)
-    _require_study(experiment)
+    require_study(experiment)
     validate_ledger(experiment)
     _, generation_id, publication = _read_generation_selection(experiment, latest=True)
     raise_for_unusable_publication(
@@ -730,12 +724,25 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
         if validated is not None
         else [phase.name for phase in producing.phases]
     )
-    views = _represented_winners(experiment, publication, generation_id, phase_names)
+    views = _represented_winners(
+        experiment,
+        publication,
+        generation_id,
+        phase_names,
+        fallback_published=True,
+    )
     winners = {view.phase: view for view in views}
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in producing.phases]
     if generation_id is not None:
         label = "" if is_published else " (unpublished)"
         click.echo(f"# generation: {_generation_dir(experiment, generation_id)}{label}")
+    if not is_published and any(
+        not view.is_published and view.config_matches_current is False for view in views
+    ):
+        click.echo(
+            f"# Historical experiment result: unpublished generation {generation_id} "
+            "does not match the current config."
+        )
     if validated is not None:
         phase_plan = [(phase.name, phase.comment) for phase in validated.phase_plan]
         stored_fingerprint = validated.summary.get("config_fingerprint")
@@ -763,21 +770,43 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
         else:
             dirty = " (dirty)" if revision["dirty"] else ""
             click.echo(f"# code revision: {revision['commit']}{dirty}")
-    trainer_base = (
-        validated.argparse_trainer_config
-        if validated is not None
-        else producing.trainer_config
-        if generation_id is not None and producing.override_format == "argparse"
-        else None
-    )
-    if trainer_base is not None:
-        click.echo("# Producing argparse trainer base, before phase overrides.")
+    trainer_bases: dict[str | None, JsonObject] = {}
+    for view in views:
+        winner_publication = publication.validated if view.is_published else None
+        trainer_base = (
+            winner_publication.argparse_trainer_config
+            if winner_publication is not None
+            else producing.trainer_config
+            if generation_id is not None and producing.override_format == "argparse"
+            else None
+        )
+        if trainer_base is not None:
+            trainer_bases[view.generation_id] = trainer_base
+    multiple_sources = len({view.generation_id for view in views}) > 1
+    for source_id, trainer_base in trainer_bases.items():
+        source_label = f" for generation {source_id}" if multiple_sources else ""
+        click.echo(f"# Producing argparse trainer base{source_label}, before phase overrides.")
         click.echo(yaml.safe_dump({"trainer_config": trainer_base}, sort_keys=False))
 
     for name, comment in phase_plan:
         winner = winners.get(name)
         if winner is not None:
+            winner_publication = publication.validated if winner.is_published else None
+            metric_name = producing.metric.name
+            if winner_publication is not None:
+                metric_name = str(winner_publication.metric["name"])
+                comment = next(
+                    phase.comment for phase in winner_publication.phase_plan if phase.name == name
+                )
             click.echo(f"=== {name} ===")
+            click.echo(
+                f"# winner generation: {winner.generation_id} "
+                f"({'published' if winner.is_published else 'unpublished'})"
+            )
+            if winner.is_published and not is_published and winner.config_matches_current is False:
+                click.echo(
+                    "# Historical published phase result: does not match the current config."
+                )
             _render_phase_comment(comment, prefix="# ")
             if winner.repeats is not None:
                 repeats = winner.repeats
@@ -786,17 +815,13 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 click.echo(
                     "# Choose a checkpoint explicitly from repeats.members in the full record."
                 )
-            if generation_id is not None:
+            if winner.generation_id is not None:
                 click.echo(
-                    f"# full record: {_generation_winner_path(experiment, generation_id, name)}"
+                    f"# full record: {_generation_winner_path(experiment, winner.generation_id, name)}"
                 )
             payload: JsonObject = {
                 "trial_number": winner.trial_number,
-                "metric": {
-                    str(validated.metric["name"])
-                    if validated is not None
-                    else producing.metric.name: winner.metric
-                },
+                "metric": {metric_name: winner.metric},
                 "params": json_object(winner.params),
                 "effective_overrides": json_object(winner.effective_overrides),
                 "gates_passed": winner.gates_passed,
@@ -804,7 +829,28 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 "observed": dict(winner.observed),
                 "confound": None if winner.confound is None else json_object(winner.confound),
                 "repeats": None if winner.repeats is None else json_object(dict(winner.repeats)),
+                "cost_advisory": winner.cost_advisory,
             }
+            if winner.repeats_detail is not None:
+                detail = winner.repeats_detail
+                if isinstance(payload["repeats"], dict):
+                    payload["repeats"]["key"] = detail["key"]
+                    payload["repeats"]["members"] = [
+                        {
+                            "trial_number": member["trial_number"],
+                            "repeat": member["repeat"],
+                            "trial_dir": str(
+                                _trial_dir_for(
+                                    experiment,
+                                    name,
+                                    member["trial_number"],
+                                    generation_id=member["generation_id"],
+                                    attempt_id=member["attempt_id"],
+                                )
+                            ),
+                        }
+                        for member in detail["members"]
+                    ]
             click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
         else:
             click.echo(f"=== {name} === (no winner yet)")
@@ -886,7 +932,13 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     :return str: The header line, then each phase's heading and table.
     """
     represented = tables.represented_generation_id or tables.published_generation_id
-    if represented is None:
+    sources = set(tables.winner_generations.values())
+    if len(sources) == 1:
+        represented, published = next(iter(sources))
+        marks = f"winner (*) marks {'published' if published else 'unpublished'} generation {represented}"
+    elif len(sources) > 1:
+        marks = "winner (*) marks the phase generations listed below"
+    elif represented is None:
         marks = "no generation is published, so no winner is marked"
     elif represented != tables.published_generation_id:
         marks = f"winner (*) marks unpublished generation {represented}"
@@ -903,6 +955,12 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
         else:
             note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
         lines.extend(["", f"=== {table.phase} === ({note})"])
+        source = tables.winner_generations.get(table.phase)
+        if source is not None:
+            source_id, published = source
+            lines.append(
+                f"winner generation: {source_id} ({'published' if published else 'unpublished'})"
+            )
         if table.rows:
             lines.extend(_table_lines(table.columns, table.rows))
         if table.groups:
@@ -977,7 +1035,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
     config = _command_config(config_path, settings=settings)
-    _require_study(config)
+    require_study(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
@@ -1023,7 +1081,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     from phasesweep.tracking.publication import sync_tracking as sync
 
     config = _command_config(config_path, settings=settings)
-    _require_study(config)
+    require_study(config)
     try:
         counts = sync(config, generation_id)
     except ValueError as exc:

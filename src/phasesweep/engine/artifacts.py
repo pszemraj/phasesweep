@@ -287,9 +287,10 @@ def _load_winner(
     """
     if publication is None:
         raise ResumeWinnerMissingError(
-            f"Winner file missing for phase {phase.name!r}: no generation has completed, so "
-            "the workdir has no earlier results to resume from. Run without --from-phase so "
-            "the earlier phases run first, or use the workdir that holds their results."
+            f"Winner file missing for phase {phase.name!r}: no generation has been published. "
+            "Unpublished phase winners can be inspected, but --from-phase requires published "
+            "predecessors. Resume without --from-phase to reuse completed trials, or use the "
+            "workdir that holds the publication."
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners.get(phase.name)

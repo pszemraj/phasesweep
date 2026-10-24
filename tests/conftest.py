@@ -39,6 +39,7 @@ from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
+from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.state import (
@@ -737,7 +738,7 @@ def log_regex_provenance() -> JsonObject:
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
     """Return the confound block selection records for a one-trial population."""
     return {
-        "schema_version": 2,
+        "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": [trial_number],
         "ranked_groups": None,
         "checks": {

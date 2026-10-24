@@ -585,7 +585,10 @@ def test_prior_abort_refusal_is_a_refused_target_not_a_trainer_failure(
     refused = json.loads(store.status_path("refused").read_text())["failure"]
     assert (refused["code"], refused["stage"]) == ("trial_target_refused", "preflight")
     assert (refused["retryable"], refused["actor"]) == (False, "operator")
-    assert "correct the experiment configuration" in refused["remediation"]
+    for failure in (aborting, refused):
+        assert "phases[p].n_trials above 2 in the config" in failure["remediation"]
+        assert "phases[p].max_consecutive_failures above 1 in the config" in failure["remediation"]
+        assert "run the 1 trial still left at n_trials=2" in failure["remediation"]
 
 
 @pytest.mark.integration

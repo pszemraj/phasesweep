@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import TYPE_CHECKING, Any, NoReturn, TypeAlias
+from typing import TYPE_CHECKING, NoReturn, TypeAlias
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -36,14 +36,14 @@ def _reject_constant(value: str) -> NoReturn:
     raise ValueError(f"non-standard JSON constant {value!r}")
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+def _unique_object(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
     """Build an object with unique member names.
 
-    :param pairs: Decoded JSON members in source order.
+    :param list[tuple[str, JsonValue]] pairs: Decoded JSON members in source order.
     :raises ValueError: A member name occurs more than once.
-    :return: A mapping of the supplied member names to their values.
+    :return JsonObject: A mapping of the supplied member names to their values.
     """
-    result: dict[str, Any] = {}
+    result: JsonObject = {}
     for key, value in pairs:
         if key in result:
             raise ValueError(f"duplicate JSON key {key!r}")
@@ -51,27 +51,28 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def strict_json_loads(text: str) -> Any:
+def strict_json_loads(text: str) -> JsonValue:
     """Parse JSON with unique keys, rejecting Infinity, -Infinity and NaN.
 
     :param str text: JSON document to decode.
     :raises json.JSONDecodeError: The document has invalid JSON syntax.
     :raises ValueError: An object has duplicate keys or a nonstandard numeric constant occurs.
-    :return: The decoded JSON value.
+    :return JsonValue: The decoded JSON value.
     """
-    return json.loads(
+    decoded: object = json.loads(
         text,
         object_pairs_hook=_unique_object,
         parse_constant=_reject_constant,
     )
+    return json_value(decoded)
 
 
-def progress_position(value: Any) -> int | float | None:
+def progress_position(value: object) -> int | float | None:
     """Return a finite, nonnegative JSON number or None, excluding booleans.
 
     Keep integers exact for evaluation-axis grouping.
 
-    :param value: Candidate evaluation position.
+    :param object value: Candidate evaluation position.
     :return int | float | None: The valid position unchanged, or None for an unsupported value.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):

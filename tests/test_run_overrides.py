@@ -7,16 +7,25 @@ import yaml
 from click.testing import CliRunner
 
 import phasesweep.cli as cli_module
+from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.paths import (
     _generation_dir,
     _generation_path,
     _last_successful_generation_path,
 )
+from phasesweep.engine.read import experiment_status
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from tests.conftest import invoke_cli_boundary
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.experiments import phase_payload, write_experiment
 from tests.ledger_fixtures import materialize, published_generation_id
 
@@ -115,14 +124,143 @@ def test_derived_run_writes_its_overrides_to_the_config_snapshot(tmp_path: Path)
         assert "smoke" in inspected.output or "trial_number: 0" in inspected.output
 
 
+@pytest.mark.parametrize("empty_directory", [False, True])
 @pytest.mark.parametrize("command", ["status", "show-winners", "sync-tracking"])
-def test_study_reads_name_the_missing_directory(tmp_path: Path, command: str) -> None:
+def test_study_reads_name_the_missing_directory(
+    tmp_path: Path,
+    command: str,
+    empty_directory: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Study reads refuse a missing output tree instead of inventing empty results."""
     path = write_experiment(tmp_path / "sweep.yaml", workdir="absent")
-    result = CliRunner().invoke(cli, [command, str(path)])
-    assert result.exit_code == 1
-    assert "No study directory at" in result.output
-    assert str(tmp_path / "absent" / "t") in result.output
+    if empty_directory:
+        (tmp_path / "absent" / "t").mkdir(parents=True)
+    assert invoke_cli_boundary([command, str(path)], monkeypatch) == 1
+    message = capsys.readouterr().err
+    assert "phasesweep: No study directory at" in message
+    assert "fix:" in message
+    assert str(tmp_path / "absent" / "t") in message
+    with pytest.raises(StudyStorageUnavailableError, match="No study directory at"):
+        experiment_status(cli_module._load_cli_config(path))
+
+
+def test_removed_workdir_option_points_to_config_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stale option identifies the supported spelling and its path anchor."""
+    path = write_experiment(tmp_path / "sweep.yaml")
+    assert invoke_cli_boundary(["run", str(path), "--workdir", "runs"], monkeypatch) == 2
+    message = capsys.readouterr().err
+    assert "--set workdir=PATH" in message
+    assert "config file's directory" in message
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("continuation", ["topup", "append", "prepend_drift"])
+def test_published_winner_survives_a_failed_later_generation(
+    tmp_path: Path,
+    continuation: str,
+) -> None:
+    """Failed continuations retain each winner's producing metric, annotations and trainer base."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os, sys
+        if os.environ['PHASESWEEP_TRIAL_ID'] != '0' or '--fail=1' in sys.argv or '--fail' in sys.argv:
+            sys.exit(1)
+        print('x=0.5')
+    """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=1,
+        trainer_config={"caption": "original-base"},
+        comment="original annotation",
+    )
+    run_experiment(experiment)
+    published_id = published_generation_id(experiment)
+    assert published_id is not None
+    if continuation == "append":
+        phases = [
+            *experiment.phases,
+            Phase(
+                name="next",
+                n_trials=1,
+                gpu_policy="none",
+                max_consecutive_failures=1,
+                fixed_overrides={"fail": 1},
+            ),
+        ]
+    elif continuation == "prepend_drift":
+        phases = [
+            Phase(name="lead", n_trials=1, gpu_policy="none"),
+            experiment.phases[0].model_copy(update={"comment": "changed annotation"}),
+        ]
+    else:
+        phases = [
+            experiment.phases[0].model_copy(
+                update={
+                    "n_trials": 2,
+                    "max_consecutive_failures": 1,
+                }
+            )
+        ]
+    changed = experiment.model_copy(update={"phases": phases})
+    if continuation == "prepend_drift":
+        changed = changed.model_copy(
+            update={
+                "metric": experiment.metric.model_copy(update={"name": "changed_metric"}),
+                "trainer_config": {"caption": "changed-base"},
+            }
+        )
+        with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+            run_experiment(changed)
+    else:
+        with pytest.raises(NoFeasibleTrialError, match="aborted"):
+            run_experiment(changed)
+    path = tmp_path / "sweep.yaml"
+    write_experiment_config(path, changed)
+    winners = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert winners.exit_code == 0, winners.exception
+    assert "trial_number: 0" in winners.output
+    status = experiment_status(changed)
+    expected_generation = (
+        status["current_generation_id"] if continuation == "append" else published_id
+    )
+    expected_label = "unpublished" if continuation == "append" else "published"
+    assert f"# winner generation: {expected_generation} ({expected_label})" in winners.output
+    phases_payload = status["phases"]
+    assert isinstance(phases_payload, list) and isinstance(phases_payload[0], dict)
+    phase_payload = next(phase for phase in phases_payload if phase["name"] == "p")
+    assert phase_payload["winner_generation_id"] == expected_generation
+    assert phase_payload["winner_is_published"] is (continuation != "append")
+    assert str(expected_generation) in str(phase_payload["winner"])
+    if continuation == "prepend_drift":
+        lead, published = winners.output.split("=== lead ===", 1)[1].split("=== p ===", 1)
+        assert "changed_metric: 0.5" in lead
+        assert "objective: 0.5" in published and "changed_metric:" not in published
+        assert "# original annotation" in published and "changed annotation" not in published
+        assert (
+            "# Historical published phase result: does not match the current config." in published
+        )
+        assert "# Historical experiment result: unpublished generation" not in winners.output
+        for generation, base in (
+            (published_id, "original-base"),
+            (status["current_generation_id"], "changed-base"),
+        ):
+            assert (
+                f"# Producing argparse trainer base for generation {generation}, before phase overrides.\n"
+                f"trainer_config:\n  caption: {base}"
+            ) in winners.output
+            assert winners.output.count(f"caption: {base}") == 1
+    table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
+    assert table.exit_code == 0, table.exception
+    assert f"winner generation: {expected_generation} ({expected_label})" in table.output
 
 
 def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:

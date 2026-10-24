@@ -289,6 +289,10 @@ def experiment_disclosures(
         None,
         [
             *((False, line) for line in experiment_contract_lines(experiment)),
+            (
+                False,
+                f"artifact root: {Path(experiment.workdir).expanduser().resolve() / experiment.experiment}",
+            ),
             *((True, line) for line in experiment_warnings(experiment)),
         ],
     )
@@ -597,8 +601,9 @@ class Phase(_Frozen):
         default=None,
         description=(
             "Numeric sampled parameter whose smaller values cost less. With mean repeats, "
-            "advise the cheapest configuration within one combined standard error of the "
-            "winner without changing the winner. Excluded from study fingerprints."
+            "advise the cheapest configuration within one standard error of the winner's "
+            "mean, preferring better objectives for cost ties. Selection and result reads "
+            "report this without changing the winner. Excluded from study fingerprints."
         ),
     )
     n_trials: ConfigInt = Field(ge=1)

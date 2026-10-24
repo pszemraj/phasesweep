@@ -518,16 +518,17 @@ def test_cleanup_stale_trial_process_signals_only_within_the_same_namespace(
 ) -> None:
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: RECORDED)
-    signalled: list[tuple[int | None, int | None]] = []
-
-    def record(pid: int | None, starttime: int | None, **_kwargs: object) -> bool:
-        signalled.append((pid, starttime))
-        return True
-
-    monkeypatch.setattr(reaper, "kill_stale_group", record)
+    signalled: list[int] = []
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: True)
+    monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 111)
+    monkeypatch.setattr(reaper.os, "getpgid", lambda _: 4242)
+    monkeypatch.setattr(reaper, "_process_group_alive", lambda _: True)
+    monkeypatch.setattr(
+        reaper, "_terminate_process_group", lambda pgid, **_: signalled.append(pgid) or True
+    )
 
     assert cleanup_stale_trial_process(_identity(pid_namespace=RECORDED)) is True
-    assert signalled == [(4242, 111)]
+    assert signalled == [4242]
 
 
 def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_its_birth(

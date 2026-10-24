@@ -17,6 +17,7 @@ import pytest
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
@@ -177,15 +178,15 @@ def test_aborted_fixed_configuration_names_the_next_target(tmp_path: Path) -> No
 
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
-    _assert_advises_next_target(str(aborted.value), 1)
+    _assert_advises_next_target(_operational_error_text(aborted.value), 1)
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(_fixed(tmp_path, trainer, 1, max_consecutive_failures=1))
-    _assert_advises_next_target(str(refused.value), 1)
+    _assert_advises_next_target(_operational_error_text(refused.value), 1)
 
     # The retry fails again, so the next abort names the next target.
     with pytest.raises(NoFeasibleTrialError) as aborted_again:
         run_experiment(_fixed(tmp_path, trainer, 2, max_consecutive_failures=1))
-    _assert_advises_next_target(str(aborted_again.value), 2)
+    _assert_advises_next_target(_operational_error_text(aborted_again.value), 2)
     assert _call_count(calls) == 2
 
     assert (
@@ -225,7 +226,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
         run_experiment(experiment)
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
-    for message in (str(aborted.value), str(refused.value)):
+    for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
         assert "workdir" not in message

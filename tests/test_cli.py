@@ -930,7 +930,11 @@ def test_dry_run_warns_when_one_configuration_can_exhaust_the_failure_budget(
     ]
 
 
-def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
+def test_show_winners_renders_comment_before_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """``show-winners`` prints phase comments before results and for phases without a winner."""
 
     def make_cfg(workdir: Path) -> Path:
@@ -960,9 +964,11 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
 
     # A missing study directory is a path error.
-    result_without = runner.invoke(cli_main, ["show-winners", str(make_cfg(tmp_path / "empty_wd"))])
-    assert result_without.exit_code == 1
-    assert "No study directory at" in result_without.output
+    assert (
+        invoke_cli_boundary(["show-winners", str(make_cfg(tmp_path / "empty_wd"))], monkeypatch)
+        == 1
+    )
+    assert "No study directory at" in capsys.readouterr().err
 
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
@@ -1464,7 +1470,8 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
     lines = capsys.readouterr().out.splitlines()
     assert generation_id in lines[0] and "winner (*)" in lines[0]
-    assert lines[lines.index(heading) + 1].split() == [
+    assert lines[lines.index(heading) + 1] == f"winner generation: {generation_id} (published)"
+    assert lines[lines.index(heading) + 2].split() == [
         "trial",
         "state",
         "value",
@@ -1472,7 +1479,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
         "duration_s",
         "winner",
     ]
-    rows = lines[lines.index(heading) + 2 :]
+    rows = lines[lines.index(heading) + 3 :]
     assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
     assert rows[0].endswith("*") and not rows[1].endswith("*")
@@ -1915,8 +1922,7 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A config with nothing to sync is refused as `phasesweep:` plus a fix line, not Click's `Error:`."""
-    config = write_experiment(tmp_path / "exp.yaml")
-    _experiment_dir(load_experiment(config)).mkdir(parents=True)
+    config = materialize("current-journal", tmp_path, mode="tree").config_path
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 
@@ -1937,8 +1943,7 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
         "phasesweep.tracking.publication.sync_tracking",
         lambda *_args: {"pending": 2, "delivered": 1},
     )
-    config = write_experiment(tmp_path / "exp.yaml")
-    _experiment_dir(load_experiment(config)).mkdir(parents=True)
+    config = materialize("current-journal", tmp_path, mode="tree").config_path
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 

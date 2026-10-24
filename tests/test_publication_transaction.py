@@ -62,6 +62,7 @@ from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
@@ -388,6 +389,7 @@ def test_postcommit_write_failure_leaves_run_successful(
 def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A directory-fsync failure after the pointer rename cannot fail the publication.
 
@@ -397,16 +399,41 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     ``publication_failed``.
     """
     experiment = _stored_experiment(tmp_path)
+    pointer = _last_successful_generation_path(experiment)
+    original_fsync_directory = runtime_files.fsync_directory
+    committed_pointers: list[bytes] = []
 
-    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
+    def fail_pointer_directory_fsync(path: Path) -> None:
+        """Fail the directory flush only after the publication pointer has committed."""
+        if path == pointer.parent and pointer.is_file() and not committed_pointers:
+            committed_pointers.append(pointer.read_bytes())
+            with monkeypatch.context() as fault:
+                patch_directory_fsync_failure(fault, "simulated directory fsync failure")
+                original_fsync_directory(path)
+        else:
+            original_fsync_directory(path)
 
-    winners = run_experiment(experiment)
+    with monkeypatch.context() as publication_patch:
+        publication_patch.setattr(runtime_files, "fsync_directory", fail_pointer_directory_fsync)
+        winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
+    assert committed_pointers == [pointer.read_bytes()]
+    assert any(
+        record.name == "phasesweep.runtime.files"
+        and "Directory fsync failed after an atomic write" in record.message
+        for record in caplog.records
+    )
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     assert _record_state(experiment, generation_id) == "published"
     assert _current_pointer_state(experiment) == "published"
+    assert run_experiment(experiment)["p"].metric == winners["p"].metric
+    assert published_generation_id(experiment) == generation_id
+    status, (published,) = read_result(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert published is not None and published.metric == winners["p"].metric
+    assert committed_pointers == [pointer.read_bytes()]
 
 
 @pytest.mark.integration

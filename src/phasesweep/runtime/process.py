@@ -259,7 +259,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
 
 
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
-ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 1
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = _supervisor.ATTEMPT_LIFECYCLE_SCHEMA_VERSION
 _ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
 
 
@@ -275,6 +275,7 @@ class AttemptLifecycle:
     state: str
     return_code: int | None
     cleanup_confirmed: bool | None
+    duration_seconds: float | None
 
 
 def write_attempt_lifecycle(
@@ -284,6 +285,7 @@ def write_attempt_lifecycle(
     state: str,
     return_code: int | None = None,
     cleanup_confirmed: bool | None = None,
+    duration_seconds: float | None = None,
 ) -> None:
     """Atomically persist the attempt's coarse lifecycle state.
 
@@ -294,24 +296,19 @@ def write_attempt_lifecycle(
     :param int | None return_code: Root return code; only meaningful for ``"exited"``.
     :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone;
         only meaningful for ``"exited"``.
+    :param float | None duration_seconds: Supervised elapsed time when the group exited.
     :raises ValueError: ``state`` is not a known lifecycle state.
     :raises OSError: The record could not be written.
     """
     if state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state {state!r}.")
-    atomic_write_text(
+    _supervisor.write_lifecycle_record(
         trial_dir / ATTEMPT_LIFECYCLE_FILE,
-        json.dumps(
-            {
-                "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
-                "attempt_id": attempt_id,
-                "state": state,
-                "return_code": return_code,
-                "cleanup_confirmed": cleanup_confirmed,
-            },
-            sort_keys=True,
-        )
-        + "\n",
+        attempt_id=attempt_id,
+        state=state,
+        return_code=return_code,
+        cleanup_confirmed=cleanup_confirmed,
+        duration_seconds=duration_seconds,
     )
 
 
@@ -349,7 +346,7 @@ def read_attempt_lifecycle(
     if payload.get("attempt_id") != expected_attempt_id:
         raise ValueError(f"Attempt lifecycle record at {path} belongs to another attempt.")
     state = payload.get("state")
-    if state not in _ATTEMPT_LIFECYCLE_STATES:
+    if not isinstance(state, str) or state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state at {path}: {state!r}.")
     return_code = payload.get("return_code")
     if return_code is not None and (isinstance(return_code, bool) or type(return_code) is not int):
@@ -357,10 +354,19 @@ def read_attempt_lifecycle(
     cleanup_confirmed = payload.get("cleanup_confirmed")
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
+    duration = payload.get("duration_seconds")
+    if duration is not None and (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
     return AttemptLifecycle(
         state=state,
         return_code=return_code,
         cleanup_confirmed=cleanup_confirmed,
+        duration_seconds=duration,
     )
 
 
@@ -379,14 +385,23 @@ def _record_attempt_exited(
     :param int | None return_code: Root process return code observed by the supervisor wait.
     """
     try:
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+        if (
+            lifecycle is not None
+            and lifecycle.state == "exited"
+            and lifecycle.cleanup_confirmed
+            and lifecycle.duration_seconds is not None
+        ):
+            return
         write_attempt_lifecycle(
             trial_dir,
             attempt_id=attempt_id,
             state="exited",
             return_code=return_code,
             cleanup_confirmed=True,
+            duration_seconds=None if lifecycle is None else lifecycle.duration_seconds,
         )
-    except OSError:
+    except (OSError, ValueError):
         log.warning(
             "Could not persist the 'exited' lifecycle transition for attempt %s; "
             "recovery will fall back to verifying the retained process identity.",
@@ -514,6 +529,7 @@ def _spawn_blocked_supervisor(
     stderr: IO[str],
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
+    lifecycle_args: tuple[str, str, str] | tuple[()] = (),
 ) -> tuple[subprocess.Popen[bytes], int, int, int]:
     """Spawn and register a supervisor whose trainer waits for a launch payload.
 
@@ -525,6 +541,7 @@ def _spawn_blocked_supervisor(
     :param float | None deadline: Absolute ``time.monotonic()`` launch deadline, or ``None``.
     :param Collection[int] gpu_lease_fds: Host GPU-lock descriptors inherited only by the
         guardian, keeping leases held after an orchestrator exit until cleanup finishes.
+    :param tuple[str, str, str] | tuple[()] lifecycle_args: Optional attempt directory, identity, and monotonic start.
     :raises _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group was
         aborted and the exception carries cleanup confirmation.
     :raises RuntimeError: Supervisor readiness timed out or returned an invalid ready frame
@@ -550,6 +567,7 @@ def _spawn_blocked_supervisor(
                 _SUPERVISOR_SCRIPT_PATH,
                 str(ready_write),
                 str(ack_read),
+                *lifecycle_args,
             ],
             env=_sanitized_supervisor_env(),
             stdout=stdout,
@@ -703,6 +721,7 @@ def run_supervised(
                 stderr=stderr,
                 deadline=deadline,
                 gpu_lease_fds=gpu_lease_fds,
+                lifecycle_args=(str(trial_dir), attempt_id, str(started)),
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,

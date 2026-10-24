@@ -55,10 +55,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
-    GATES_ATTR,
     GENERATION_ID_ATTR,
-    OBJECTIVE_PROVENANCE_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -72,8 +69,6 @@ from phasesweep.engine.state import (
     WinnerSource,
     _parsed_trial_outcome,
     _trial_outcome_payload,
-    constraint_attr,
-    observed_attr,
 )
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
@@ -105,6 +100,7 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
+    record_trial_result,
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
@@ -394,11 +390,12 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
+    if advice is not None:
+        log.error("phase=%s fix: %s", phase.name, advice)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
-        "Refusing to reinterpret those finished attempts as a successful phase."
-        + ("" if advice is None else f" {advice}"),
+        "Refusing to reinterpret those finished attempts as a successful phase.",
         action=_recovery_action(study, abort_record),
         remediation=advice,
     )
@@ -417,12 +414,13 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
+    if advice is not None:
+        log.error("phase=%s fix: %s", phase.name, advice)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
         f"max_consecutive_failures={phase.max_consecutive_failures}, so it launches no more "
-        f"trials at its accepted n_trials={abort_record['trial_target']}."
-        + ("" if advice is None else f" {advice}"),
+        f"trials at its accepted n_trials={abort_record['trial_target']}.",
         action=OperatorAction.FIX_CONFIG,
         remediation=advice,
     )
@@ -980,6 +978,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(GENERATION_ID_ATTR, run.generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
     # GPU lease covers only subprocess lifetime, not extraction.
     try:
         _refuse_launch_after_deadline(run)
@@ -1073,6 +1072,12 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _refuse_launch_during_shutdown()
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
+    # SDK readers reuse the process slot; preserve the trainer's result before extraction.
+    if executed.process.failure_reason is not None:
+        trial.set_user_attr(FAILURE_REASON_ATTR, executed.process.failure_reason)
+    trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
+    trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
+
     # Extraction releases the GPU but still consumes the phase/run budget.
     result = extract_trial_result(
         experiment=experiment,
@@ -1084,30 +1089,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
 
-    trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
-    trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
-    trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
-    trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
-    if result.objective_provenance is not None:
-        trial.set_user_attr(
-            OBJECTIVE_PROVENANCE_ATTR,
-            json.dumps(result.objective_provenance, sort_keys=True),
-        )
-    if result.gate_results is not None:
-        trial.set_user_attr(
-            GATES_ATTR,
-            json.dumps(
-                [
-                    {
-                        "type": gate.gate_type,
-                        "passed": gate.passed,
-                        "detail": gate.detail,
-                    }
-                    for gate in result.gate_results
-                ],
-                sort_keys=True,
-            ),
-        )
+    record_trial_result(
+        trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
+    )
 
     # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
     if result.failure_reason:
@@ -1116,11 +1100,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _DeadlineTrialExecutionError if result.deadline_exhausted else TrialExecutionError
         )
         raise error_type(result.failure_reason)
-
-    for cname, cval in result.constraints.items():
-        trial.set_user_attr(constraint_attr(cname), cval)
-    for oname, oval in result.observed.items():
-        trial.set_user_attr(observed_attr(oname), oval)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
     violations: list[str] = []
@@ -1339,6 +1318,8 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Without storage there is no study to continue, so only the logs are left to read.
         persistent = experiment.storage is not None
         advice = _recovery_advice(phase, study, abort) if persistent else None
+        if advice is not None:
+            log.error("phase=%s fix: %s", phase.name, advice)
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."
@@ -1347,8 +1328,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         )
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(
-            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}"
-            + ("" if advice is None else f" {advice}"),
+            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}",
             action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
             remediation=advice,
         )

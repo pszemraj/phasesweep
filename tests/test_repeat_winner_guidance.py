@@ -75,11 +75,21 @@ def _assert_repeat_summary(saved: bytes, output: str) -> None:
     assert compact["metric"] == {"objective": full["metric"]["objective"]}
     assert compact["params"] == full["params"]
     assert compact["effective_overrides"] == full["effective_overrides"]
-    assert compact["repeats"] == {
+    assert {
+        key: value for key, value in compact["repeats"].items() if key not in {"key", "members"}
+    } == {
         "reduce": repeats["reduce"],
         **repeats["spread"],
         "member_trials": [member["trial_number"] for member in repeats["members"]],
     }
+    assert compact["repeats"]["key"] == repeats["key"]
+    for expected, member in zip(repeats["members"], compact["repeats"]["members"], strict=True):
+        assert member["trial_number"] == expected["trial_number"]
+        assert member["repeat"] == expected["repeat"]
+        directory = Path(member["trial_dir"])
+        assert directory.is_dir()
+        assert expected["generation_id"] in directory.name
+        assert expected["attempt_id"] in directory.name
     assert (
         f"# metric is the {repeats['reduce']} over {repeats['spread']['n']} repeats."
     ) in output.splitlines()
