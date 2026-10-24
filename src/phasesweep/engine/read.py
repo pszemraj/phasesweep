@@ -286,7 +286,7 @@ def _winner_view(
             repeats=None if repeats is None else _repeats_summary(repeats),
             repeats_detail=repeats,
         )
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return None
 
 
@@ -990,14 +990,17 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
 
 
 def _recorded_number(value: object) -> float | None:
-    """Return a recorded user-attr number, or ``None`` when it is not one.
+    """Return a recorded user-attr number when it is representable as a float.
 
     :param object value: A trial user-attr value.
-    :return float | None: The value as a float, or ``None`` for anything but a real number.
+    :return float | None: The value as a float, or ``None`` for nonnumbers or conversion overflow.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError:
+        return None
 
 
 def _trial_reason(trial: optuna.trial.FrozenTrial) -> str | None:

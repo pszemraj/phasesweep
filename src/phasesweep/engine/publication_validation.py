@@ -340,7 +340,11 @@ def _validate_generation_manifest(
         if not isinstance(metric_block, Mapping) or metric_block.get("goal") != metric["goal"]:
             raise _fail(f"winner for phase {name!r} has a mismatched metric goal")
         value = metric_block.get(metric["name"])
-        if not isinstance(value, (int, float)) or float(value) != item.get("metric"):
+        try:
+            metric_value = float(value) if isinstance(value, (int, float)) else None
+        except OverflowError:
+            metric_value = None
+        if metric_value is None or metric_value != item.get("metric"):
             raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
         for field in (
             "params",
@@ -395,7 +399,7 @@ def _validate_generation_manifest(
             raise _fail(f"winner for phase {name!r} has no valid observed block ({exc})") from exc
         try:
             repeats = _validate_repeats_block(
-                payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
+                payload, metric_value=metric_value, ranked_groups=confound["ranked_groups"]
             )
             if name not in provenance.repeats:
                 raise ValueError("the config snapshot plans no such phase")
@@ -405,7 +409,7 @@ def _validate_generation_manifest(
         winners[name] = ValidatedWinner(
             content=content,
             payload=payload,
-            metric=float(value),
+            metric=metric_value,
             source=parsed_source,
             confound=confound,
             observed=observed,

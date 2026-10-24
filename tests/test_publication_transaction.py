@@ -40,6 +40,7 @@ from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
+    WinnerIntegrityError,
 )
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -890,16 +891,35 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     assert read_result(experiment, phase_names=["p"])[1] == []
 
 
-def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
-    """Strict resume rejects a linked winner from a current-format publication."""
+@pytest.mark.parametrize(
+    ("damage", "error", "reason"),
+    [
+        ("link", PublicationIntegrityError, "missing or unreadable"),
+        ("constraint-overflow", WinnerIntegrityError, "invalid or incomplete for skipped phase"),
+    ],
+)
+def test_load_winner_rejects_unusable_winner_with_current_summary(
+    tmp_path: Path, damage: str, error: type[Exception], reason: str
+) -> None:
+    """Strict resume reports linked or numerically unusable winners through domain errors."""
     experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
-    preserved_winner_path = winner_path.with_name("winner.original.yaml")
-    winner_path.rename(preserved_winner_path)
-    winner_path.symlink_to(preserved_winner_path.name)
+    if damage == "link":
+        preserved_winner_path = winner_path.with_name("winner.original.yaml")
+        winner_path.rename(preserved_winner_path)
+        winner_path.symlink_to(preserved_winner_path.name)
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["constraints"] = {"size": 10**400}
+        reseal_winner(experiment, generation_id, winner)
+        summary_path = _generation_summary_path(experiment, generation_id)
+        summary = yaml.safe_load(summary_path.read_text())
+        summary["phases"][0]["constraints"] = winner["constraints"]
+        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+        reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
-    with pytest.raises(PublicationIntegrityError, match="missing or unreadable"):
+    with pytest.raises(error, match=reason):
         artifact_io._load_winner(
             experiment,
             experiment.phases[0],
@@ -1207,21 +1227,36 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     assert "permission denied" in verdict.error
 
 
-def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [
+        ("hash", "does not match its recorded hash"),
+        ("metric-overflow", "disagrees with the summary metric value"),
+    ],
+)
+def test_corrupt_publication_is_reported_as_failed_not_absent(
+    tmp_path: Path, damage: str, reason: str
+) -> None:
+    """Unusable publications retain their failed verdict through reads and continuation."""
     experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+    if damage == "hash":
+        winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["metric"][experiment.metric.name] = 10**400
+        reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
     assert pointer.generation_id == generation_id
     assert pointer.error is not None
-    assert "does not match its recorded hash" in pointer.error
+    assert reason in pointer.error
 
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
-    assert "does not match its recorded hash" in status["publication_error"]
+    assert reason in status["publication_error"]
     assert status["published_generation_id"] is None
     assert status["represented_generation_id"] is None
     assert status["is_published"] is False
@@ -1232,7 +1267,7 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     pointer_path = _last_successful_generation_path(experiment)
     pointer_bytes = pointer_path.read_bytes()
     generations_before = set(_generations_dir(_experiment_dir(experiment)).iterdir())
-    with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
+    with pytest.raises(PublicationIntegrityError, match=reason):
         run_experiment(experiment)
     assert pointer_path.read_bytes() == pointer_bytes
     assert set(_generations_dir(_experiment_dir(experiment)).iterdir()) == generations_before

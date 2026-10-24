@@ -266,6 +266,7 @@ def _members(winner: JsonObject) -> list[JsonObject]:
     ("tamper", "reason"),
     [
         pytest.param("member-metric", "mean of the member metrics differs", id="value"),
+        pytest.param("member-overflow", "member metric is not a finite number", id="overflow"),
         pytest.param("member-order", "ascending and distinct", id="order"),
         pytest.param("representative", "disagrees with the winner's attempt_id", id="identity"),
         pytest.param("spread", "spread differs", id="spread"),
@@ -275,11 +276,14 @@ def _members(winner: JsonObject) -> list[JsonObject]:
 def test_group_winner_repeats_block_is_manifest_validated(
     tmp_path: Path, tamper: str, reason: str
 ) -> None:
+    """Manifest validation rejects malformed repeat identities, members and statistics."""
     experiment, generation_id = _repeats_publication(tmp_path)
     winner = winner_payload(experiment, generation_id)
     members = _members(winner)
     if tamper == "member-metric":
         members[0]["metric"] = -1.0
+    elif tamper == "member-overflow":
+        members[0]["metric"] = 10**400
     elif tamper == "member-order":
         repeats = winner["repeats"]
         assert isinstance(repeats, dict)

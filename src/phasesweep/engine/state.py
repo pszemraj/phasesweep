@@ -278,7 +278,11 @@ def _validate_observed_block(value: object) -> dict[str, float]:
             raise ValueError(f"observed name {name!r} must be a nonempty string")
         if isinstance(number, bool) or not isinstance(number, int | float):
             raise ValueError(f"observed value for {name!r} must be a number")
-        if not math.isfinite(number):
+        try:
+            finite = math.isfinite(number)
+        except OverflowError:
+            finite = False
+        if not finite:
             raise ValueError(f"observed value for {name!r} must be finite")
         observed[name] = float(number)
     return observed
@@ -461,7 +465,7 @@ def _completed_trainer_duration(
 
     :param FrozenTrial | Trial trial: Trial carrying trainer exit attributes, when committed.
     :param AttemptLifecycle | None lifecycle: Current process-slot evidence, or None to require trainer ledger attributes.
-    :return float | None: Successful trainer duration, or None when exit evidence is incomplete.
+    :return float | None: Successful trainer duration, or None when exit evidence is incomplete or invalid.
     """
     if FAILURE_REASON_ATTR in trial.user_attrs:
         return None
@@ -476,11 +480,13 @@ def _completed_trainer_duration(
         or return_code != 0
         or isinstance(duration, bool)
         or not isinstance(duration, (int, float))
-        or not math.isfinite(duration)
         or duration < 0
     ):
         return None
-    return float(duration)
+    try:
+        return float(duration) if math.isfinite(duration) else None
+    except OverflowError:
+        return None
 
 
 def _recorded_infeasible_result(trial: FrozenTrial, outcome: _ParsedTrialOutcome | None) -> bool:

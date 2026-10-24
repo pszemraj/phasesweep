@@ -43,6 +43,7 @@ def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> Non
         ({"duration_seconds": True}, "field 'duration_seconds' is invalid"),
         ({"duration_seconds": "1"}, "field 'duration_seconds' is invalid"),
         ({"duration_seconds": -1}, "field 'duration_seconds' is invalid"),
+        ({"duration_seconds": 10**400}, "field 'duration_seconds' is invalid"),
     ],
 )
 def test_read_attempt_lifecycle_rejects_every_malformed_shape(

@@ -360,11 +360,14 @@ def read_attempt_lifecycle(
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
     duration = payload.get("duration_seconds")
     if duration is not None and (
-        isinstance(duration, bool)
-        or not isinstance(duration, (int, float))
-        or not math.isfinite(duration)
-        or duration < 0
+        isinstance(duration, bool) or not isinstance(duration, (int, float))
     ):
+        raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
+    try:
+        valid_duration = duration is None or (math.isfinite(duration) and duration >= 0)
+    except OverflowError:
+        valid_duration = False
+    if not valid_duration:
         raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
     return AttemptLifecycle(
         state=state,

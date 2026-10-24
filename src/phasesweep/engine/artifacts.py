@@ -354,7 +354,7 @@ def _load_winner(
             observed=dict(validated.observed),
             repeats=validated.repeats,
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc

@@ -602,7 +602,7 @@ def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
             return False
         try:
             value = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
         if not check_bounds(value, min_value=constraint.min, max_value=constraint.max):
             return False

@@ -166,6 +166,7 @@ def test_winner_without_observations_publishes_an_empty_map(tmp_path: Path) -> N
         pytest.param({"peak": "7"}, "must be a number", id="not-a-number"),
         pytest.param({"peak": True}, "must be a number", id="boolean"),
         pytest.param({"peak": float("nan")}, "must be finite", id="not-finite"),
+        pytest.param({"peak": 10**400}, "must be finite", id="overflow"),
     ],
 )
 def test_manifest_rejects_a_malformed_observed_block(
@@ -201,8 +202,9 @@ def test_winner_view_projects_observed_values(tmp_path: Path) -> None:
     assert reported is not None
     assert reported.observed == {"peak": 7.5}
 
-    winner["observed"] = {"peak": float("inf")}
-    assert _winner_view(winner, "p") is None
+    for invalid in (float("inf"), 10**400):
+        winner["observed"] = {"peak": invalid}
+        assert _winner_view(winner, "p") is None
     del winner["observed"]
     assert _winner_view(winner, "p") is None
 
