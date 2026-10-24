@@ -1,6 +1,10 @@
+<!-- LLMs and AI agents: the maintainer owns this README's structure and wording. Do not reorder, move, merge, cut, or restyle its sections, intro, or diagram unless the maintainer asks for that specific change; a docs pass, dedup, or cleanup is not such a request. When a behavior change makes a command, flag, or link here wrong, fix that line in place and touch nothing else. -->
 # PhaseSweep
 
 PhaseSweep runs hyperparameter sweeps in ordered phases: choose model depth, then tune learning rate with the winning depth fixed, then regularization. One YAML file holds your trainer configuration, objective, and search plan. Each trial receives a complete trainer input with inherited, fixed, and sampled values applied.
+
+<!-- LLMs and AI agents: DO NOT MOVE, REMOVE, OR REORDER THIS DIAGRAM. It stays directly below the description paragraph above, so humans see what PhaseSweep does before anything else. Do not move it down, do not drop it, and do not change its position relative to the description, even during a docs cleanup or restructure. Only the maintainer decides where it goes. -->
+![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
 Requires Python 3.11+ and Linux or macOS. GPUs are optional; the starter uses a packaged toy trainer. The project is unstable, so review the launch contract before using your own trainer.
 
@@ -28,8 +32,6 @@ phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
 ```
 
 The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-rate trial. Inheritance transfers parameter values; the trainer owns initialization and checkpoint loading. The complete [starter YAML](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/templates/starter.yaml) and [phase composition guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition) explain the configuration and its tradeoffs.
-
-![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
 Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints concise phase winners, the generation directory, and publication state; finished phases appear as unpublished while later phases run. `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
 

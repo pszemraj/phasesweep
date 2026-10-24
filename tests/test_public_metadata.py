@@ -83,6 +83,18 @@ def test_readme_links_do_not_depend_on_a_checkout_path() -> None:
         assert target.startswith("#") or urlsplit(target).scheme, target
 
 
+def test_readme_shows_the_phase_diagram_directly_below_the_description() -> None:
+    """The phase diagram is the first block after the title and description paragraph."""
+    readme = PYPROJECT_PATH.parent / _pyproject()["project"]["readme"]
+    text = re.sub(r"<!--.*?-->\n?", "", readme.read_text(encoding="utf-8"), flags=re.DOTALL)
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    assert blocks[0] == "# PhaseSweep"
+    assert not blocks[1].startswith(("#", "!", "<", "`"))
+    assert re.fullmatch(
+        r"!\[PhaseSweep phase DAG\]\([^)]+/docs/images/diagramA_dag\.png\)", blocks[2]
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
     ("release_tag", "expected_version"),
