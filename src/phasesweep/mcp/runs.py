@@ -6,7 +6,6 @@ Run state is derived from process visibility and recorded evidence; reads write 
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -23,8 +22,6 @@ from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.config.io import load_experiment_bytes
-from phasesweep.config.models import Experiment
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -287,27 +284,6 @@ class PreparedRun:
     def close(self) -> None:
         """Release this server process's copy of the launch lease."""
         self.lease.close()
-
-
-def load_experiment_snapshot(
-    path: Path, expected_sha256: str, *, source: str, config_dir: Path
-) -> Experiment:
-    """Read, verify, and parse one immutable experiment snapshot.
-
-    :param Path path: Snapshot file to read.
-    :param str expected_sha256: Digest recorded with the run handle.
-    :param str source: Human-readable parser source label.
-    :param Path config_dir: Absolute directory of the cataloged config file,
-        recorded with the run handle; relative config paths resolve against it.
-    :raises OSError: If the snapshot cannot be read.
-    :raises ValueError: If its digest or syntax is invalid, or ``config_dir``
-        is not absolute.
-    :return Experiment: Verified experiment configuration.
-    """
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != expected_sha256:
-        raise ValueError("run snapshot hash mismatch")
-    return load_experiment_bytes(data, source=source, config_dir=config_dir)
 
 
 class RunStore:

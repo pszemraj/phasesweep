@@ -1,5 +1,6 @@
 """Derive a run from one config without editing or copying that config."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
+from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -337,7 +339,19 @@ def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> N
     assert winner.config_matches_current is False
 
 
-@pytest.mark.parametrize("damage", ["missing", "yaml", "model"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "yaml",
+        "model",
+        "digest",
+        "missing-record",
+        "invalid-record",
+        "missing-digest",
+        "path",
+    ],
+)
 @pytest.mark.parametrize("command", ["status", "show-winners"])
 def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
     tmp_path: Path,
@@ -346,7 +360,7 @@ def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
     command: str,
     damage: str,
 ) -> None:
-    """Missing or invalid producing snapshots yield one routed restore-tree refusal."""
+    """Damaged producing snapshots or their digest anchors yield one restore-tree refusal."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
@@ -354,12 +368,31 @@ def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
     snapshot = _generation_config_snapshot_path(
         _experiment_dir(materialized.experiment), generation_id
     )
+    reproducibility = snapshot.with_name("reproducibility.json")
     if damage == "missing":
         snapshot.unlink()
-    else:
+    elif damage in {"yaml", "model"}:
         snapshot.write_text(
             "broken: [" if damage == "yaml" else "experiment: invalid\n", encoding="utf-8"
         )
+        record = json.loads(reproducibility.read_text())
+        record["config_snapshot"]["sha256"] = file_sha256(snapshot)
+        reproducibility.write_text(json.dumps(record))
+    elif damage == "digest":
+        config = yaml.safe_load(snapshot.read_text())
+        config["metric"]["name"] = "altered metric"
+        snapshot.write_text(yaml.safe_dump(config))
+    elif damage == "missing-record":
+        reproducibility.unlink()
+    elif damage == "invalid-record":
+        reproducibility.write_text("[invalid")
+    else:
+        record = json.loads(reproducibility.read_text())
+        if damage == "missing-digest":
+            del record["config_snapshot"]["sha256"]
+        else:
+            record["config_snapshot"]["path"] = "other.yaml"
+        reproducibility.write_text(json.dumps(record))
 
     assert invoke_cli_boundary([command, str(materialized.config_path)], monkeypatch) == 1
     message = capsys.readouterr().err
@@ -368,6 +401,14 @@ def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
     assert message.count("fix:") == 1
     assert "restore the files and permissions identified in the error" in message
     assert "Traceback" not in message
+    if damage == "digest":
+        assert "snapshot hash mismatch" in message
+    elif damage in {"yaml", "model"}:
+        assert "hash mismatch" not in message
+    elif damage == "missing-digest":
+        assert "sha256" in message
+    elif damage == "path":
+        assert "does not anchor" in message
 
 
 @pytest.mark.parametrize(

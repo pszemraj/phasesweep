@@ -16,6 +16,7 @@ from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict
 
+from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
@@ -50,7 +51,6 @@ from phasesweep.mcp.runs import (
     RUNNER_HEARTBEAT_INTERVAL_SECONDS,
     RunHandle,
     RunStore,
-    load_experiment_snapshot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (

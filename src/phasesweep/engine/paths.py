@@ -181,14 +181,11 @@ def _generation_config_snapshot_path(artifact_root: Path, generation_id: str) ->
     return _generation_dir(artifact_root, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
 
 
-def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
+def _generation_reproducibility_path(artifact_root: Path, generation_id: str) -> Path:
     """Return one generation's shareable reproducibility record path.
 
-    :param Experiment experiment: Configuration naming the experiment directory.
+    :param Path artifact_root: Experiment artifact directory.
     :param str generation_id: Generation whose reproducibility record is addressed.
     :return Path: Reproducibility record inside the generation namespace.
     """
-    return (
-        _generation_dir(_experiment_dir(experiment), generation_id)
-        / GENERATION_REPRODUCIBILITY_FILENAME
-    )
+    return _generation_dir(artifact_root, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME

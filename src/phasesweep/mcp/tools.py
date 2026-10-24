@@ -26,6 +26,7 @@ from typing import Any, Literal, NoReturn
 
 from pydantic import ValidationError
 
+from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
 from phasesweep.config.reference import (
     ReferenceEntry,
@@ -88,7 +89,6 @@ from phasesweep.mcp.runs import (
     RunObservation,
     RunState,
     RunStore,
-    load_experiment_snapshot,
     write_status_file_if_absent,
 )
 from phasesweep.mcp.snapshots import (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 from pathlib import Path
 from typing import Any
@@ -212,3 +213,22 @@ def load_experiment(path: str | Path) -> Experiment:
     return load_experiment_bytes(
         path_obj.read_bytes(), source=path_obj, config_dir=path_obj.resolve().parent
     )
+
+
+def load_experiment_snapshot(
+    path: Path, expected_sha256: str, *, source: str, config_dir: Path
+) -> Experiment:
+    """Read, verify, and parse one immutable experiment snapshot.
+
+    :param Path path: Snapshot file to read.
+    :param str expected_sha256: Digest recorded when the configuration was frozen.
+    :param str source: Human-readable parser source label.
+    :param Path config_dir: Absolute source directory for resolving relative config paths.
+    :raises OSError: The snapshot cannot be read.
+    :raises ValueError: Its digest or syntax is invalid, or ``config_dir`` is not absolute.
+    :return Experiment: Verified experiment configuration from the hashed bytes.
+    """
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("run snapshot hash mismatch")
+    return load_experiment_bytes(data, source=source, config_dir=config_dir)

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import optuna
 import pytest
+import yaml
 from optuna.distributions import IntDistribution
 
 import phasesweep.engine.attempts as attempts_module
@@ -730,8 +731,10 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         (0, True, "interrupt-extraction-signal"),
         (0, True, "missing-snapshot"),
         (0, True, "corrupt-snapshot"),
+        (0, True, "altered-snapshot"),
         (0, True, "mcp-missing-snapshot"),
         (0, True, "mcp-corrupt-snapshot"),
+        (0, True, "mcp-altered-snapshot"),
     ],
 )
 def test_completed_orphan_evidence_survives_runner_sigkill(
@@ -987,6 +990,10 @@ else:
                 snapshot_bytes = snapshot.read_bytes()
                 if recovery_stage.endswith("missing-snapshot"):
                     snapshot.unlink()
+                elif recovery_stage.endswith("altered-snapshot"):
+                    saved_config = yaml.safe_load(snapshot_bytes)
+                    saved_config["metric"]["max"] = 0.5
+                    snapshot.write_text(yaml.safe_dump(saved_config))
                 else:
                     snapshot.write_text("invalid: [unterminated\n")
                 with pytest.raises(PhaseSweepError, match="configuration snapshot") as refusal:
@@ -994,6 +1001,8 @@ else:
                         experiment, cleanup_report=_PreflightCleanupReport()
                     )
                 assert refusal.value.action is OperatorAction.RESTORE_TREE
+                if recovery_stage.endswith("altered-snapshot"):
+                    assert "snapshot hash mismatch" in str(refusal.value)
                 argv = ["run", str(config)]
                 if recovery_stage.startswith("mcp-"):
                     from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog

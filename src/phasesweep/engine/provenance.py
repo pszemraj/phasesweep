@@ -15,7 +15,7 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep._metadata import __version__
-from phasesweep.config.io import load_experiment
+from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.state import (
@@ -25,7 +25,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.runtime.files import atomic_text_writer, file_sha256, private_atomic_write_text
-from phasesweep.runtime.json import json_object, json_text
+from phasesweep.runtime.json import json_object, json_text, strict_json_loads
 
 _GIT_COMMAND_TIMEOUT_SECONDS = 10
 # SHA-1 repositories name commits with 40 hex digits and SHA-256 repositories with 64.
@@ -165,17 +165,27 @@ def _phase_config_fingerprint(phase: Phase) -> str:
 
 
 def _load_generation_experiment(artifact_root: Path, generation_id: str) -> Experiment:
-    """Load the producing configuration or route an unavailable snapshot as artifact damage.
+    """Verify the producing configuration against its frozen reproducibility anchor.
 
     :param Path artifact_root: Experiment artifact directory containing the generation.
     :param str generation_id: Generation whose frozen launch configuration is required.
-    :raises WinnerIntegrityError: The snapshot is absent, unreadable, or invalid.
+    :raises WinnerIntegrityError: Snapshot evidence is absent, unreadable, invalid, or mismatched.
     :return Experiment: Validated producing configuration.
     """
     path = path_ops._generation_config_snapshot_path(artifact_root, generation_id)
+    record_path = path_ops._generation_reproducibility_path(artifact_root, generation_id)
     try:
-        return load_experiment(path)
-    except (OSError, ValueError) as exc:
+        record = json_object(strict_json_loads(record_path.read_text(encoding="utf-8")))
+        snapshot = json_object(record.get("config_snapshot"))
+        if json_text(snapshot, "path") != GENERATION_CONFIG_SNAPSHOT_FILENAME:
+            raise ValueError("reproducibility record does not anchor the configuration snapshot")
+        return load_experiment_snapshot(
+            path,
+            json_text(snapshot, "sha256"),
+            source=str(path),
+            config_dir=path.resolve().parent,
+        )
+    except (KeyError, OSError, ValueError) as exc:
         raise WinnerIntegrityError(
             f"Cannot read configuration snapshot for generation {generation_id!r} at {path}: {exc}"
         ) from exc
@@ -212,9 +222,8 @@ def _write_generation_provenance(
         occupies the snapshot path and is not a private, unshared regular file.
     :raises yaml.YAMLError: The canonicalized config could not be serialized.
     """
-    snapshot_path = path_ops._generation_config_snapshot_path(
-        path_ops._experiment_dir(experiment), generation_id
-    )
+    artifact_root = path_ops._experiment_dir(experiment)
+    snapshot_path = path_ops._generation_config_snapshot_path(artifact_root, generation_id)
     snapshot = experiment.model_dump(mode="json")
     trainer_cwd = fingerprint_ops._execution_identity(experiment)["cwd"]
     snapshot["execution"]["cwd"] = trainer_cwd
@@ -223,7 +232,7 @@ def _write_generation_provenance(
         yaml.safe_dump(snapshot, sort_keys=False),
         require_private_dir=False,
     )
-    reproducibility_path = path_ops._generation_reproducibility_path(experiment, generation_id)
+    reproducibility_path = path_ops._generation_reproducibility_path(artifact_root, generation_id)
     payload = {
         "schema_version": REPRODUCIBILITY_SCHEMA_VERSION,
         "experiment": experiment.experiment,

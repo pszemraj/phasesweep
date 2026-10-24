@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 
 import optuna
 
+from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
 from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
@@ -52,7 +53,6 @@ from phasesweep.mcp.runs import (
     RunnerView,
     RunStore,
     UnsupportedStateFormatError,
-    load_experiment_snapshot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
