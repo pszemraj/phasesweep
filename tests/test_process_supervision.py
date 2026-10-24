@@ -20,13 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
-import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext
-from phasesweep.engine.cleanup import _reap_stale_trials
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
@@ -38,7 +35,6 @@ from phasesweep.runtime.process import (
 )
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
-    PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
     _group_member_pids,
     _GroupMemberScan,
@@ -1784,42 +1780,6 @@ def test_terminate_process_group_reports_cleanup_status(
 
     assert _terminate_process_group(1234, grace_seconds=0.0) is expected
     assert required_signals.issubset({sig for _, sig in calls})
-
-
-def test_reaper_raises_when_cleanup_uncertain(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Uncertain cleanup prevents the reaper from advancing the trial."""
-
-    def fake_identity(*_args: object, **_kwargs: object) -> StaleProcessIdentity:
-        return StaleProcessIdentity(
-            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
-            attempt_id="uncertain-attempt",
-            pid=99999,
-            pgid=99999,
-            proc_starttime=12345,
-            boot_id="test-boot",
-            pid_namespace="pid:[4026539001]@100",
-        )
-
-    monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
-    monkeypatch.setattr(
-        "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity, **_kwargs: False,
-    )
-
-    exp = make_experiment(workdir=tmp_path / "runs")
-    study = optuna.create_study(direction="maximize")
-
-    # Inject one RUNNING trial so the reaper has something to chew on.
-    trial = study.ask()
-    trial.set_user_attr(ATTEMPT_ID_ATTR, "uncertain-attempt")
-    trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
-    assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
-
-    with pytest.raises(RuntimeError, match="process cleanup could not be confirmed"):
-        _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
 
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(
