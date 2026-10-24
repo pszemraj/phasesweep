@@ -28,6 +28,7 @@ from phasesweep.tracking.mlflow import (
 from phasesweep.tracking.models import MlflowSettings
 from tests.tracking_helpers import (
     FakeWorkerProcess,
+    ManualClock,
     attempt_identity,
     mlflow_binder,
     mlflow_binding,
@@ -966,27 +967,16 @@ def test_trainer_run_is_never_finished_by_controller():
         )
 
 
-class _Clock:
-    """A fake monotonic clock that a sleep advances instantly and records."""
-
-    def __init__(self):
-        self.now = 0.0
-        self.sleeps = []
-
-    def monotonic(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.sleeps.append(seconds)
-        self.now += seconds
-
-
 @pytest.fixture
-def clock(monkeypatch):
-    """Replace the capture worker's clock, so polling to a long deadline takes no real time."""
+def clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
+    """Replace the capture worker's clock without waiting for polling deadlines.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the worker's clock.
+    :return ManualClock: Fake time and recorded poll sleeps.
+    """
     from phasesweep.tracking import mlflow as worker
 
-    fake = _Clock()
+    fake = ManualClock()
     monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=fake.monotonic, sleep=fake.sleep))
     return fake
 
