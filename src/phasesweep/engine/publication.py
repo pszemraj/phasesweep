@@ -169,7 +169,7 @@ def _resolve_publication_pointer(
                 f"name experiment {experiment.experiment!r} and this generation."
             ),
         )
-    generation_dir = path_ops._generation_dir(experiment, generation_id)
+    generation_dir = path_ops._generation_dir(path_ops._experiment_dir(experiment), generation_id)
     if raise_on_manifest_error:
         validated = validation_ops._validate_generation_manifest(
             generation_dir, generation_id, summary

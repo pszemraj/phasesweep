@@ -10,17 +10,16 @@ from phasesweep.engine.state import (
     GENERATION_REPRODUCIBILITY_FILENAME,
     WINNER_FILENAME,
 )
+from phasesweep.runtime.files import artifact_root_path
 
 
-def _experiment_dir(experiment: Experiment | Path) -> Path:
+def _experiment_dir(experiment: Experiment) -> Path:
     """Resolve the workdir, leaving the experiment leaf unresolved.
 
-    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param Experiment experiment: Configuration naming the experiment directory.
     :return Path: Absolute experiment directory with any leaf symlink still unresolved.
     """
-    if isinstance(experiment, Path):
-        return experiment
-    return Path(experiment.workdir).expanduser().resolve() / experiment.experiment
+    return artifact_root_path(experiment.workdir, experiment.experiment)
 
 
 def _artifact_root_identity(experiment: Experiment) -> str:
@@ -105,23 +104,23 @@ def _generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "generation.yaml"
 
 
-def _generations_dir(experiment: Experiment | Path) -> Path:
+def _generations_dir(artifact_root: Path) -> Path:
     """Return the root of the experiment's generation namespaces.
 
-    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param Path artifact_root: Experiment artifact directory.
     :return Path: Parent directory of all generation artifact namespaces.
     """
-    return _experiment_dir(experiment) / "generations"
+    return artifact_root / "generations"
 
 
-def _generation_dir(experiment: Experiment | Path, generation_id: str) -> Path:
+def _generation_dir(artifact_root: Path, generation_id: str) -> Path:
     """Return one generation's artifact namespace.
 
-    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param Path artifact_root: Experiment artifact directory.
     :param str generation_id: Generation whose artifacts are addressed.
     :return Path: Artifact directory for that generation.
     """
-    return _generations_dir(experiment) / generation_id
+    return _generations_dir(artifact_root) / generation_id
 
 
 def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
@@ -131,7 +130,7 @@ def _generation_record_path(experiment: Experiment, generation_id: str) -> Path:
     :param str generation_id: Generation whose lifecycle record is addressed.
     :return Path: Lifecycle record inside the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / "generation.yaml"
+    return _generation_dir(_experiment_dir(experiment), generation_id) / "generation.yaml"
 
 
 GENERATION_SUMMARY_FILENAME = "summary.yaml"
@@ -144,7 +143,7 @@ def _generation_summary_path(experiment: Experiment, generation_id: str) -> Path
     :param str generation_id: Generation whose result summary is addressed.
     :return Path: Summary record inside the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / GENERATION_SUMMARY_FILENAME
+    return _generation_dir(_experiment_dir(experiment), generation_id) / GENERATION_SUMMARY_FILENAME
 
 
 def _generation_winner_path(experiment: Experiment, generation_id: str, phase_name: str) -> Path:
@@ -155,7 +154,12 @@ def _generation_winner_path(experiment: Experiment, generation_id: str, phase_na
     :param str phase_name: Phase whose winner record is addressed.
     :return Path: Phase winner record inside the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / "phases" / phase_name / WINNER_FILENAME
+    return (
+        _generation_dir(_experiment_dir(experiment), generation_id)
+        / "phases"
+        / phase_name
+        / WINNER_FILENAME
+    )
 
 
 def _last_successful_generation_path(experiment: Experiment) -> Path:
@@ -167,14 +171,14 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
 
-def _generation_config_snapshot_path(experiment: Experiment | Path, generation_id: str) -> Path:
-    """Return one generation's canonical config snapshot path.
+def _generation_config_snapshot_path(artifact_root: Path, generation_id: str) -> Path:
+    """Return one generation's saved configuration path.
 
-    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param Path artifact_root: Experiment artifact directory.
     :param str generation_id: Generation whose launch configuration is addressed.
     :return Path: Configuration snapshot inside the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
+    return _generation_dir(artifact_root, generation_id) / GENERATION_CONFIG_SNAPSHOT_FILENAME
 
 
 def _generation_reproducibility_path(experiment: Experiment, generation_id: str) -> Path:
@@ -184,4 +188,7 @@ def _generation_reproducibility_path(experiment: Experiment, generation_id: str)
     :param str generation_id: Generation whose reproducibility record is addressed.
     :return Path: Reproducibility record inside the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / GENERATION_REPRODUCIBILITY_FILENAME
+    return (
+        _generation_dir(_experiment_dir(experiment), generation_id)
+        / GENERATION_REPRODUCIBILITY_FILENAME
+    )

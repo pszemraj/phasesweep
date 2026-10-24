@@ -480,9 +480,7 @@ def capture_result_snapshot(
         winners=winner_snapshots,
         represented_config_fingerprint=(
             _experiment_semantic_fingerprint(
-                experiment.model_copy(
-                    update={"phases": experiment.phases[: len(status["result_phase_plan"])]}
-                )
+                experiment, phase_count=len(status["result_phase_plan"])
             )
             if status["published_config_matches_current"] is True
             else None

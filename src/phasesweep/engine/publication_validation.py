@@ -173,7 +173,7 @@ def _generation_artifact_manifest(
         namespace-root provenance file, then one ``{"kind", "phase",
         "sha256"}`` entry per winner artifact ordered by phase.
     """
-    generation_dir = path_ops._generation_dir(experiment, generation_id)
+    generation_dir = path_ops._generation_dir(path_ops._experiment_dir(experiment), generation_id)
     items: list[dict[str, str]] = []
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         artifact = generation_dir / filename

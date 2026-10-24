@@ -18,7 +18,12 @@ from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.paths import _generation_dir, _generation_path, _generation_winner_path
+from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_dir,
+    _generation_path,
+    _generation_winner_path,
+)
 from phasesweep.engine.read import read_status, read_trial_tables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonValue
@@ -115,7 +120,7 @@ def test_inspection_uses_one_current_pointer_capture(
     generation = published_generation_id(experiment)
     assert generation is not None
     pointer = _generation_path(experiment)
-    _generation_dir(experiment, "next-generation").mkdir()
+    _generation_dir(_experiment_dir(experiment), "next-generation").mkdir()
     original_read = engine_read.read_yaml_or_none
     reads: list[None] = []
 

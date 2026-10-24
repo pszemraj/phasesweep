@@ -368,7 +368,9 @@ def _represented_winners(
                     phase_count=len(validated.phase_plan),
                 )
             else:
-                producing = _load_generation_experiment(experiment, view_generation)
+                producing = _load_generation_experiment(
+                    _experiment_dir(experiment), view_generation
+                )
                 config_matches = _recorded_config_matches(
                     comparison,
                     _experiment_semantic_fingerprint(producing),
@@ -548,7 +550,7 @@ def _read_generation_selection(
         latest
         and publication.state in {"ok", "absent"}
         and current_id is not None
-        and _generation_dir(experiment, current_id).is_dir()
+        and _generation_dir(_experiment_dir(experiment), current_id).is_dir()
     ):
         generation_id = current_id
     else:

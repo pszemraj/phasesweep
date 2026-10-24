@@ -19,6 +19,7 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
     _generation_path,
     _generation_record_path,
@@ -46,7 +47,7 @@ def _tree(experiment: Experiment) -> tuple[list[str], bytes | None, bytes | None
     :return tuple[list[str], bytes | None, bytes | None]: Sorted generation ids, then the
         current pointer and the last-success pointer, each ``None`` when absent.
     """
-    root = _generations_dir(experiment)
+    root = _generations_dir(_experiment_dir(experiment))
     names = sorted(path.name for path in root.iterdir()) if root.is_dir() else []
     current, published = (
         path.read_bytes() if path.exists() else None
@@ -101,7 +102,7 @@ def test_a_replay_of_the_published_winners_writes_no_generation(tmp_path: Path) 
         assert reports[-1].primary_error is None
         assert reports[-1].winners == winners
         assert reports[-1].replayed_generation_id == published
-        assert not _generation_dir(experiment, reports[-1].generation_id).exists()
+        assert not _generation_dir(_experiment_dir(experiment), reports[-1].generation_id).exists()
         assert _tree(experiment) == before
 
     assert generation_ops._publication_holds(experiment, winners) == published
@@ -167,7 +168,7 @@ def test_a_refused_run_leaves_no_generation_and_both_pointers_as_they_were(
         run_experiment(refused, terminal_callback=reports.append)
 
     assert reports[0].primary_error is not None
-    assert not _generation_dir(experiment, reports[0].generation_id).exists()
+    assert not _generation_dir(_experiment_dir(experiment), reports[0].generation_id).exists()
     assert _tree(experiment) == before
 
 

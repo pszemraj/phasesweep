@@ -40,7 +40,7 @@ def _new_generation_id(experiment: Experiment, requested_id: str | None) -> str:
     """
     if requested_id is None:
         return uuid4().hex
-    if path_ops._generation_dir(experiment, requested_id).exists():
+    if path_ops._generation_dir(path_ops._experiment_dir(experiment), requested_id).exists():
         raise RunRequestError(
             f"Generation id {requested_id!r} already exists; refusing to overwrite history."
         )
@@ -60,8 +60,9 @@ def _claim_generation(experiment: Experiment, generation_id: str, *, caller_owne
     :raises OSError: The generation namespace already exists, or it or its
         provenance files could not be created.
     """
-    path_ops._generations_dir(experiment).mkdir(parents=True, exist_ok=True)
-    path_ops._generation_dir(experiment, generation_id).mkdir()
+    artifact_root = path_ops._experiment_dir(experiment)
+    path_ops._generations_dir(artifact_root).mkdir(parents=True, exist_ok=True)
+    path_ops._generation_dir(artifact_root, generation_id).mkdir()
     provenance_ops._write_generation_provenance(
         experiment, generation_id, caller_owned_id=caller_owned_id
     )
@@ -317,7 +318,7 @@ def _validate_generation_publishable(
         generation_id=generation_id,
     )
     publication = validation_ops._validate_generation_manifest(
-        path_ops._generation_dir(experiment, generation_id),
+        path_ops._generation_dir(path_ops._experiment_dir(experiment), generation_id),
         generation_id,
         summary,
     )

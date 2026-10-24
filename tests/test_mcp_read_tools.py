@@ -329,7 +329,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
     else:
         _last_successful_generation_path(experiment).unlink()
-        snapshot = _generation_config_snapshot_path(experiment, run_id)
+        snapshot = _generation_config_snapshot_path(_experiment_dir(experiment), run_id)
         if damage == "snapshot-missing":
             snapshot.unlink()
         else:

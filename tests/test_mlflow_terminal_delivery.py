@@ -745,7 +745,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
-    assert not _generation_dir(experiment, reports[0].generation_id).exists()
+    assert not _generation_dir(_experiment_dir(experiment), reports[0].generation_id).exists()
     assert yaml.safe_load(pointer_path.read_text())["generation_id"] == first
     assert not _generation_record_path(experiment, first).exists()
     assert publication._published(experiment, first)

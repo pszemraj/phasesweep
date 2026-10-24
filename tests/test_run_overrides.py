@@ -13,6 +13,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_config_snapshot_path,
     _generation_dir,
     _generation_path,
@@ -350,7 +351,9 @@ def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
     _last_successful_generation_path(materialized.experiment).unlink()
-    snapshot = _generation_config_snapshot_path(materialized.experiment, generation_id)
+    snapshot = _generation_config_snapshot_path(
+        _experiment_dir(materialized.experiment), generation_id
+    )
     if damage == "missing":
         snapshot.unlink()
     else:
@@ -398,7 +401,7 @@ def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
     experiment, config_path = materialized.experiment, materialized.config_path
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    generation_path = _generation_dir(experiment, generation_id)
+    generation_path = _generation_dir(_experiment_dir(experiment), generation_id)
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
     published = CliRunner().invoke(cli, ["show-winners", str(config_path)])

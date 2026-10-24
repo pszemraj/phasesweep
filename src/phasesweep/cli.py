@@ -725,7 +725,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     is_published = publication.validated is not None and generation_id == publication.generation_id
     validated = publication.validated if is_published else None
     producing = (
-        _load_generation_experiment(experiment, generation_id)
+        _load_generation_experiment(_experiment_dir(experiment), generation_id)
         if generation_id is not None and not is_published
         else experiment
     )
@@ -745,7 +745,8 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in producing.phases]
     if generation_id is not None:
         label = "" if is_published else " (unpublished)"
-        click.echo(f"# generation: {_generation_dir(experiment, generation_id)}{label}")
+        generation_path = _generation_dir(_experiment_dir(experiment), generation_id)
+        click.echo(f"# generation: {generation_path}{label}")
     if not is_published and any(
         not view.is_published and view.config_matches_current is False for view in views
     ):

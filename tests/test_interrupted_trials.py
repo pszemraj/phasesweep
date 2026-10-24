@@ -37,7 +37,11 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _trial_count_state,
 )
-from phasesweep.engine.paths import _generation_config_snapshot_path, _phase_dir
+from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_config_snapshot_path,
+    _phase_dir,
+)
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
@@ -909,7 +913,9 @@ else:
                     reaper, "_terminate_process_group", terminate_and_wait_for_guardian
                 )
             if recovery_stage.endswith("snapshot"):
-                snapshot = _generation_config_snapshot_path(experiment, "orphan-generation")
+                snapshot = _generation_config_snapshot_path(
+                    _experiment_dir(experiment), "orphan-generation"
+                )
                 snapshot_bytes = snapshot.read_bytes()
                 if recovery_stage.endswith("missing-snapshot"):
                     snapshot.unlink()

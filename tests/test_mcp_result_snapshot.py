@@ -787,7 +787,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         *(_generation_winner_path(experiment, first_generation, phase.name) for phase in phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
-    generations_before = set(_generations_dir(experiment).iterdir())
+    generations_before = set(_generations_dir(_experiment_dir(experiment)).iterdir())
     changed = experiment.model_copy(
         update={
             "phases": [
@@ -829,7 +829,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     assert snapshot["winners"] == []
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert published_generation_id(experiment) == first_generation
-    assert set(_generations_dir(experiment).iterdir()) == generations_before
+    assert set(_generations_dir(_experiment_dir(experiment)).iterdir()) == generations_before
 
 
 @pytest.mark.parametrize("terminal_state", ["COMPLETE", "INFEASIBLE", "FAIL", "INTERRUPTED"])

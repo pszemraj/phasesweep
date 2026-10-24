@@ -811,7 +811,9 @@ def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None
 
 @pytest.mark.parametrize("change", ["append", "prepend", "phase"])
 def test_config_agreement_uses_the_producing_phase_prefix(tmp_path: Path, change: str) -> None:
-    """Appending phases preserves agreement; changing the producing phase plan does not."""
+    """Live and frozen results preserve agreement only for an unchanged producing prefix."""
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
     published = _published(tmp_path)
     extra = Phase(name="next", n_trials=1, gpu_policy="none")
     if change == "append":
@@ -826,6 +828,12 @@ def test_config_agreement_uses_the_producing_phase_prefix(tmp_path: Path, change
 
     assert status["published_config_matches_current"] is (change == "append")
     assert winner.config_matches_current is (change == "append")
+    original_snapshot = capture_result_snapshot(published)
+    assert isinstance(original_snapshot["represented_config_fingerprint"], str)
+    comparison_snapshot = capture_result_snapshot(comparison)
+    assert comparison_snapshot["represented_config_fingerprint"] == (
+        original_snapshot["represented_config_fingerprint"] if change == "append" else None
+    )
 
 
 def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:

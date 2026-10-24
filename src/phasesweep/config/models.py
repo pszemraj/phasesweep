@@ -71,6 +71,7 @@ from phasesweep.runtime.commands import (
     render_command,
 )
 from phasesweep.runtime.files import (
+    artifact_root_path,
     canonical_storage_identity,
     file_url_path,
     local_storage_url,
@@ -285,15 +286,13 @@ def experiment_disclosures(
     :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
         ordered warning/content pairs; ``None`` identifies the experiment block.
     """
-    from phasesweep.engine.paths import _experiment_dir
-
     yield (
         None,
         [
             *((False, line) for line in experiment_contract_lines(experiment)),
             (
                 False,
-                f"artifact root: {_experiment_dir(experiment)}",
+                f"artifact root: {artifact_root_path(experiment.workdir, experiment.experiment)}",
             ),
             *((True, line) for line in experiment_warnings(experiment)),
         ],
@@ -1194,9 +1193,9 @@ class Experiment(_Frozen):
         """
         if self.storage != "auto":
             return self.storage
-        from phasesweep.engine.paths import _experiment_dir
-
-        return local_storage_url(_experiment_dir(self) / "study.journal")
+        return local_storage_url(
+            artifact_root_path(self.workdir, self.experiment) / "study.journal"
+        )
 
     def phase(self, name: str) -> Phase:
         """Look up a configured phase by its unique name.

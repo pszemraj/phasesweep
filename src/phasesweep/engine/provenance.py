@@ -164,15 +164,15 @@ def _phase_config_fingerprint(phase: Phase) -> str:
     return fingerprint_ops._semantic_payload_digest(payload)
 
 
-def _load_generation_experiment(experiment: Experiment | Path, generation_id: str) -> Experiment:
+def _load_generation_experiment(artifact_root: Path, generation_id: str) -> Experiment:
     """Load the producing configuration or route an unavailable snapshot as artifact damage.
 
-    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param Path artifact_root: Experiment artifact directory containing the generation.
     :param str generation_id: Generation whose frozen launch configuration is required.
     :raises WinnerIntegrityError: The snapshot is absent, unreadable, or invalid.
     :return Experiment: Validated producing configuration.
     """
-    path = path_ops._generation_config_snapshot_path(experiment, generation_id)
+    path = path_ops._generation_config_snapshot_path(artifact_root, generation_id)
     try:
         return load_experiment(path)
     except (OSError, ValueError) as exc:
@@ -212,7 +212,9 @@ def _write_generation_provenance(
         occupies the snapshot path and is not a private, unshared regular file.
     :raises yaml.YAMLError: The canonicalized config could not be serialized.
     """
-    snapshot_path = path_ops._generation_config_snapshot_path(experiment, generation_id)
+    snapshot_path = path_ops._generation_config_snapshot_path(
+        path_ops._experiment_dir(experiment), generation_id
+    )
     snapshot = experiment.model_dump(mode="json")
     trainer_cwd = fingerprint_ops._execution_identity(experiment)["cwd"]
     snapshot["execution"]["cwd"] = trainer_cwd

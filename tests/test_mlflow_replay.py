@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.config.models import Experiment
-from phasesweep.engine.paths import _generation_dir
+from phasesweep.engine.paths import _experiment_dir, _generation_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.runtime.json import JsonObject
@@ -39,7 +39,7 @@ def test_no_work_mlflow_replay_creates_no_empty_tracking_generation(
         name: winner.metric for name, winner in winners.items()
     }
     assert reports[1].generation_id != reports[0].generation_id
-    assert not _generation_dir(experiment, reports[1].generation_id).exists()
+    assert not _generation_dir(_experiment_dir(experiment), reports[1].generation_id).exists()
     assert read_status(experiment)["published_generation_id"] == reports[0].generation_id
     assert {path.relative_to(root) for path in root.rglob("*") if path.is_dir()} == directories
     assert all(any((root / directory).iterdir()) for directory in directories)

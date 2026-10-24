@@ -131,7 +131,7 @@ def _topped_up(experiment: Experiment) -> Experiment:
 
 def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:
     """Return one generation's ``(config.snapshot.yaml, reproducibility.json)`` paths."""
-    generation_dir = _generation_dir(experiment, generation_id)
+    generation_dir = _generation_dir(_experiment_dir(experiment), generation_id)
     return (
         generation_dir / _CONFIG_SNAPSHOT_NAME,
         generation_dir / _REPRODUCIBILITY_NAME,
@@ -1231,11 +1231,11 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
 
     pointer_path = _last_successful_generation_path(experiment)
     pointer_bytes = pointer_path.read_bytes()
-    generations_before = set(_generation_dir(experiment, generation_id).parent.iterdir())
+    generations_before = set(_generations_dir(_experiment_dir(experiment)).iterdir())
     with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
         run_experiment(experiment)
     assert pointer_path.read_bytes() == pointer_bytes
-    assert set(_generation_dir(experiment, generation_id).parent.iterdir()) == generations_before
+    assert set(_generations_dir(_experiment_dir(experiment)).iterdir()) == generations_before
 
 
 @pytest.mark.parametrize("delete_current_pointer", [False, True])
@@ -1267,10 +1267,10 @@ def test_generation_loss_with_a_surviving_pointer_reports_failed(
     """Losing published generation artifacts cannot authorize convenience-winner fallback."""
     experiment, generation_id = golden_publication(tmp_path)
     if damage == "deleted-target":
-        shutil.rmtree(_generation_dir(experiment, generation_id))
+        shutil.rmtree(_generation_dir(_experiment_dir(experiment), generation_id))
     else:
         _generation_path(experiment).unlink()
-        generations = _generations_dir(experiment)
+        generations = _generations_dir(_experiment_dir(experiment))
         generations.rename(generations.with_name(f"saved-{generations.name}"))
 
     pointer = _resolve_publication_pointer(experiment)
@@ -1512,7 +1512,7 @@ def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Pat
     assert read_result(experiment, phase_names=["p"])[1] != []
     _last_successful_generation_path(experiment).unlink()
     _generation_path(experiment).unlink()
-    generations = _generations_dir(experiment)
+    generations = _generations_dir(_experiment_dir(experiment))
     generations.rename(generations.with_name("saved-generations"))
     generations.symlink_to("missing-generations", target_is_directory=True)
     assert generations.is_symlink() and not generations.exists()
@@ -1677,7 +1677,10 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     run_experiment(experiment, generation_id="launcher-granted-1")
 
     record = json.loads(
-        (_generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME).read_text()
+        (
+            _generation_dir(_experiment_dir(experiment), "launcher-granted-1")
+            / _REPRODUCIBILITY_NAME
+        ).read_text()
     )
     assert record["generation_id_source"] == "caller"
 
@@ -1717,7 +1720,7 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     """
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     original = target.read_bytes()
 
     target.write_bytes(original + b"\n# tampered\n")
@@ -1750,7 +1753,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     """A provenance file this user may not read reports ``permission_denied`` and names the publishing user."""
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     original_mode = stat.S_IMODE(target.stat().st_mode)
     target.chmod(0o000)
     try:
@@ -1895,7 +1898,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     """
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     if filename == _REPRODUCIBILITY_NAME:
         target.write_text(json.dumps(mutate(json.loads(target.read_text()))))
     else:

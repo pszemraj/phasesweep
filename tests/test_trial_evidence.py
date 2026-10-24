@@ -20,6 +20,7 @@ from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_path,
     _generations_dir,
     _last_successful_generation_path,
@@ -742,7 +743,7 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     assert source_generation is not None
     # A second trial of q publishes a generation that carries p's winner.
     run_experiment(_from_phase_evidence_experiment(tmp_path, resumed_trials=2)[0])
-    shutil.rmtree(_generations_dir(original) / source_generation)
+    shutil.rmtree(_generations_dir(_experiment_dir(original)) / source_generation)
     marker.unlink()
     source = _sole_trial_dir(original)
     pointer_before = _pointer_bytes(original)
@@ -796,7 +797,7 @@ def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
     # A second trial of q publishes a generation that carries p's winner.
     carrying = experiment(2)
     run_experiment(carrying)
-    shutil.rmtree(_generations_dir(original) / winner.generation_id)
+    shutil.rmtree(_generations_dir(_experiment_dir(original)) / winner.generation_id)
     marker.unlink()
     first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
     source = first_member / "stdout.log"
@@ -833,7 +834,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     # A second trial of q publishes a generation that carries p's winner.
     experiment, _marker = _from_phase_evidence_experiment(tmp_path, resumed_trials=2)
     run_experiment(experiment)
-    shutil.rmtree(_generations_dir(experiment) / source_generation)
+    shutil.rmtree(_generations_dir(_experiment_dir(experiment)) / source_generation)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     payload = winner_payload(experiment, generation_id)
@@ -864,7 +865,7 @@ def test_carried_result_ignores_older_publication_files(tmp_path: Path, damage: 
     expected = read_result(experiment)[1]
     assert expected[0].source is not None
     assert expected[0].source.generation_id == source_generation
-    source_dir = _generations_dir(experiment) / source_generation
+    source_dir = _generations_dir(_experiment_dir(experiment)) / source_generation
     source_winner = source_dir / "phases" / "p" / "winner.yaml"
     if damage == "deleted_generation":
         shutil.rmtree(source_dir)
@@ -901,7 +902,7 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
         run_experiment(crashing)
 
     crashed_generation = yaml.safe_load(_generation_path(crashing).read_text())["generation_id"]
-    crashed_dir = _generations_dir(crashing) / crashed_generation
+    crashed_dir = _generations_dir(_experiment_dir(crashing)) / crashed_generation
     assert crashed_dir.is_dir()
     assert not (crashed_dir / "summary.yaml").exists()
     assert not (crashed_dir / "phases").exists()

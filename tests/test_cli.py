@@ -1372,7 +1372,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     config_path = materialized.config_path
     generation_id = published_generation_id(materialized.experiment)
     assert generation_id is not None
-    tampered = _generation_dir(materialized.experiment, generation_id) / artifact
+    tampered = _generation_dir(_experiment_dir(materialized.experiment), generation_id) / artifact
     tampered.write_bytes(tampered.read_bytes() + appended)
 
     exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
@@ -1419,7 +1419,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
+    snapshot = _generation_dir(_experiment_dir(experiment), generation_id) / "config.snapshot.yaml"
     original_mode = stat.S_IMODE(snapshot.stat().st_mode)
     snapshot.chmod(0o000)
     try:
@@ -1496,7 +1496,10 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
 
-    tampered = _generation_dir(materialized.experiment, generation_id) / "phases/p/winner.yaml"
+    tampered = (
+        _generation_dir(_experiment_dir(materialized.experiment), generation_id)
+        / "phases/p/winner.yaml"
+    )
     tampered.write_bytes(tampered.read_bytes() + b"\n# edited after publication\n")
 
     exit_code = invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch)

@@ -92,22 +92,25 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
     }
 
 
-def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
+def _experiment_semantic_fingerprint(
+    experiment: Experiment, *, phase_count: int | None = None
+) -> str:
     """Hash the experiment semantics recorded with each published result.
 
     Include metric/extractor, constraints, command, environment, provenance, and
     ordered phase semantics. Exclude run-control targets, throughput, and comments.
 
     :param Experiment experiment: Parsed experiment config to fingerprint.
-    :return str: SHA-256 hex digest (64 characters) of the canonicalised
-        semantic payload.
+    :param int | None phase_count: Producing phase-prefix length, or None for the full plan.
+    :return str: SHA-256 hex digest of the canonicalised semantic payload.
     """
     payload = {
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         **_semantic_core(experiment),
         "phases": [
-            {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
+            {"name": phase.name, **_semantic_phase_dump(phase)}
+            for phase in experiment.phases[:phase_count]
         ],
     }
     return _semantic_payload_digest(payload)
@@ -125,8 +128,9 @@ def _recorded_config_matches(
     """
     if not isinstance(stored_fingerprint, str) or not stored_fingerprint:
         return None
-    prefix = experiment.model_copy(update={"phases": experiment.phases[:phase_count]})
-    return stored_fingerprint == _experiment_semantic_fingerprint(prefix)
+    return stored_fingerprint == _experiment_semantic_fingerprint(
+        experiment, phase_count=phase_count
+    )
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:

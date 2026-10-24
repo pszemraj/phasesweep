@@ -27,6 +27,7 @@ from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
     _generation_summary_path,
     _phase_dir,
@@ -510,7 +511,7 @@ def test_carried_repeat_winner_reads_without_older_publication(tmp_path: Path) -
     assert published_generation_id(experiment) != source_generation
     assert carried.repeats is not None
     expected = read_result(experiment)
-    shutil.rmtree(_generation_dir(experiment, source_generation))
+    shutil.rmtree(_generation_dir(_experiment_dir(experiment), source_generation))
 
     assert read_result(experiment) == expected
     assert run_experiment(experiment)["p"].repeats == carried.repeats
