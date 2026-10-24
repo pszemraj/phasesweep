@@ -1,4 +1,4 @@
-"""engine.read: permissive status/winner reads that never raise on a partial file."""
+"""Read status and winners under their recorded semantics, including partial results."""
 
 from __future__ import annotations
 
@@ -788,6 +788,8 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
         drifted, phase_names=[phase.name for phase in drifted.phases]
     )
     assert len(winners) == 1
+    assert winners[0].config_matches_current is False
+    assert result_status["published_config_matches_current"] is False
     assert winners[0].effective_overrides == {"a": 1}
     assert (result_status["metric"]["name"], result_status["metric"]["goal"]) == (
         "objective",
@@ -805,6 +807,25 @@ def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None
     status = read_status(topped_up)
     assert status["published_config_matches_current"] is True
     assert status["metric"]["name"] == "objective"
+
+
+@pytest.mark.parametrize("change", ["append", "prepend", "phase"])
+def test_config_agreement_uses_the_producing_phase_prefix(tmp_path: Path, change: str) -> None:
+    """Appending phases preserves agreement; changing the producing phase plan does not."""
+    published = _published(tmp_path)
+    extra = Phase(name="next", n_trials=1, gpu_policy="none")
+    if change == "append":
+        phases = [*published.phases, extra]
+    elif change == "prepend":
+        phases = [extra, *published.phases]
+    else:
+        phases = [published.phases[0].model_copy(update={"fixed_overrides": {"changed": True}})]
+    comparison = published.model_copy(update={"phases": phases})
+
+    status, (winner,) = read_result(published, comparison_experiment=comparison)
+
+    assert status["published_config_matches_current"] is (change == "append")
+    assert winner.config_matches_current is (change == "append")
 
 
 def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:

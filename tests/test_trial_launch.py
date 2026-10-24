@@ -46,7 +46,18 @@ from tests.tracking_helpers import attempt_identity, mlflow_binding
 #: process identity exists, so anything else it loaded could start code that
 #: cleanup can never find.
 SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
-    {"__future__", "contextlib", "json", "os", "pathlib", "signal", "sys", "tempfile", "time"}
+    {
+        "__future__",
+        "contextlib",
+        "json",
+        "os",
+        "pathlib",
+        "signal",
+        "sys",
+        "tempfile",
+        "time",
+        "types",
+    }
 )
 
 

@@ -31,7 +31,7 @@ from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
     _process_group_alive,
-    _terminate_process_group,
+    _terminate_process_groups,
     read_boot_id,
     read_pid_namespace,
     read_proc_starttime,
@@ -76,20 +76,23 @@ _SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 
 
 def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
-    """Terminate the trial process group and confirm cleanup.
+    """Request guardian cancellation and confirm the trial group is gone.
 
-    After group termination, perform a bounded wait to reap the direct child.
-    This runs outside the signal handler; uncertain cleanup must block new work.
+    A known trainer group is terminated by its guardian after durable cancellation intent.
+    Before trainer readiness, only the guardian's own group is terminated directly.
+    A bounded wait then reaps the guardian; uncertain cleanup blocks new work.
 
     :param int pgid: Process-group ID of the trial subprocess.
-    :param subprocess.Popen[bytes] proc: The root subprocess's :class:`subprocess.Popen`
-        handle. Reaped via a bounded ``wait`` once the group is terminated.
-    :return bool: ``True`` if every process in the group is gone after the SIGTERM → SIGKILL
-        escalation AND the direct child was reaped within
+    :param subprocess.Popen[bytes] proc: Guardian subprocess, reaped with a bounded wait.
+    :return bool: ``True`` if every process in the group is gone and the guardian was reaped within
         ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one group member
         survived, cleanup status was inconclusive, or the direct child failed to reap in time.
     """
-    cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
+    cleanup_confirmed = _terminate_process_groups(
+        (pgid,),
+        grace_seconds=_KILL_GRACE_SECONDS,
+        guardians=None if pgid == proc.pid else {pgid: proc.pid},
+    )[pgid]
     try:
         proc.wait(timeout=_DIRECT_CHILD_REAP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -260,7 +263,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
 
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = _supervisor.ATTEMPT_LIFECYCLE_SCHEMA_VERSION
-_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
+_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "terminating", "exited"})
 
 
 @dataclass(frozen=True)
@@ -269,7 +272,8 @@ class AttemptLifecycle:
 
     ``allocated`` identifies a durable RUNNING trial before launch, possibly queued
     for a GPU. ``launching`` is recorded before spawning, so a missing identity
-    then requires recovery. ``exited`` confirms group cleanup before Optuna completion.
+    then requires recovery. ``terminating`` preserves cancellation before the guardian
+    signals the trainer. ``exited`` confirms group cleanup before Optuna completion.
     """
 
     state: str
@@ -292,10 +296,9 @@ def write_attempt_lifecycle(
     :param Path trial_dir: Per-trial directory (attempt-scoped, so states from different
         attempts can never collide).
     :param str attempt_id: Immutable attempt identity binding the record.
-    :param str state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
-    :param int | None return_code: Root return code; only meaningful for ``"exited"``.
-    :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone;
-        only meaningful for ``"exited"``.
+    :param str state: Allocated, launching, terminating, or exited lifecycle state.
+    :param int | None return_code: Root return code or a guardian's nonzero cancellation code.
+    :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone; false while cancellation is in progress.
     :param float | None duration_seconds: Supervised elapsed time when the group exited.
     :raises ValueError: ``state`` is not a known lifecycle state.
     :raises OSError: The record could not be written.
@@ -378,6 +381,7 @@ def _record_attempt_exited(
 ) -> None:
     """Best-effort persistence of confirmed process cleanup.
 
+    Recorded exit or cancellation status survives repeated cleanup confirmations.
     A write failure preserves the primary error; the retained identity permits recovery.
 
     :param Path trial_dir: Per-trial directory holding the lifecycle record.
@@ -397,7 +401,13 @@ def _record_attempt_exited(
             trial_dir,
             attempt_id=attempt_id,
             state="exited",
-            return_code=return_code,
+            return_code=(
+                lifecycle.return_code
+                if lifecycle is not None
+                and lifecycle.state in {"terminating", "exited"}
+                and lifecycle.return_code is not None
+                else return_code
+            ),
             cleanup_confirmed=True,
             duration_seconds=None if lifecycle is None else lifecycle.duration_seconds,
         )

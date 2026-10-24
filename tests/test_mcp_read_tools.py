@@ -16,13 +16,14 @@ from typing import Any
 import pytest
 
 from phasesweep.config.io import load_experiment
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.reference import reference_notes
 from phasesweep.engine.generation import (
     _write_generation_state,
 )
 from phasesweep.engine.paths import (
     _experiment_dir,
+    _generation_config_snapshot_path,
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
@@ -308,21 +309,31 @@ def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> 
 
 
 @pytest.mark.parametrize("read_method", ["status", "winners"])
+@pytest.mark.parametrize("damage", ["ledger", "snapshot-missing", "snapshot-corrupt"])
 @pytest.mark.integration
 def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     read_method: str,
+    damage: str,
 ) -> None:
-    """Live status and result reads never expose a downgraded ledger's details."""
+    """Live reads route unreadable persistent state without exposing artifact paths."""
     app, registry, store, handle, complete = _published_run_terminal(tmp_path)
     run_id = handle.run_id
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
     experiment = registry.get("srv").experiment
-    study = phase_study(experiment)
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
+    if damage == "ledger":
+        study = phase_study(experiment)
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
+    else:
+        _last_successful_generation_path(experiment).unlink()
+        snapshot = _generation_config_snapshot_path(experiment, run_id)
+        if damage == "snapshot-missing":
+            snapshot.unlink()
+        else:
+            snapshot.write_text("broken: [", encoding="utf-8")
 
     with pytest.raises(RunPersistentStateUnavailableError) as excinfo:
         getattr(app, read_method)(run_id)
@@ -457,24 +468,48 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("edit", ["metric", "append", "prepend", "phase"])
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
+    edit: str,
 ) -> None:
-    """A run snapshot keeps x/minimize after the catalog changes to y/maximize.
-
-    The same server rereads the edited config, so only the drift verdict follows it.
-    """
+    """Frozen results keep their metric and compare the current producing phase prefix."""
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, _store = make_mcp_app(catalog)
+    app, _registry, store = make_mcp_app(catalog)
     baseline_status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     baseline_results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
     assert baseline_results.published_config_matches_current is True
     assert baseline_status.published_config_matches_current is True
 
-    write_experiment_config(
-        config,
-        drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
-    )
+    comparison = drift_experiment(tmp_path, trainer)
+    extra = Phase(name="next", n_trials=1, gpu_policy="none")
+    if edit == "metric":
+        comparison = drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize")
+    elif edit == "append":
+        comparison = comparison.model_copy(update={"phases": [*comparison.phases, extra]})
+    elif edit == "prepend":
+        comparison = comparison.model_copy(update={"phases": [extra, *comparison.phases]})
+    else:
+        comparison = comparison.model_copy(
+            update={
+                "phases": [
+                    comparison.phases[0].model_copy(update={"fixed_overrides": {"changed": True}})
+                ]
+            }
+        )
+    write_experiment_config(config, comparison)
+    if edit == "append":
+        handle = store.get(run_id)
+        assert handle is not None
+        complete = store.recorded_terminal_status(handle)
+        assert complete is not None
+        write_run_status(
+            store,
+            **{
+                **complete,
+                "result_snapshot": capture_result_snapshot(comparison, generation_id=run_id),
+            },
+        )
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
@@ -483,8 +518,8 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     assert results.result_context == "represented_generation"
     assert results.result_source == "frozen_run_snapshot"
     assert status.result_source == "frozen_run_snapshot"
-    assert results.published_config_matches_current is False
-    assert status.published_config_matches_current is False
+    assert results.published_config_matches_current is (edit == "append")
+    assert status.published_config_matches_current is (edit == "append")
     assert results.winner_count == 1
 
 

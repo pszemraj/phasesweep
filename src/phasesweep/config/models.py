@@ -285,13 +285,15 @@ def experiment_disclosures(
     :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
         ordered warning/content pairs; ``None`` identifies the experiment block.
     """
+    from phasesweep.engine.paths import _experiment_dir
+
     yield (
         None,
         [
             *((False, line) for line in experiment_contract_lines(experiment)),
             (
                 False,
-                f"artifact root: {Path(experiment.workdir).expanduser().resolve() / experiment.experiment}",
+                f"artifact root: {_experiment_dir(experiment)}",
             ),
             *((True, line) for line in experiment_warnings(experiment)),
         ],
@@ -1192,8 +1194,9 @@ class Experiment(_Frozen):
         """
         if self.storage != "auto":
             return self.storage
-        root = Path(self.workdir).expanduser().resolve() / self.experiment
-        return local_storage_url(root / "study.journal")
+        from phasesweep.engine.paths import _experiment_dir
+
+        return local_storage_url(_experiment_dir(self) / "study.journal")
 
     def phase(self, name: str) -> Phase:
         """Look up a configured phase by its unique name.

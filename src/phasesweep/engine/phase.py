@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NamedTuple
 from uuid import uuid4
 
@@ -67,6 +68,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     Winner,
     WinnerSource,
+    _completed_trainer_duration,
     _parsed_trial_outcome,
     _trial_outcome_payload,
 )
@@ -107,9 +109,10 @@ from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
-from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
     servicing_shutdown_signal,
 )
@@ -390,8 +393,6 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
-    if advice is not None:
-        log.error("phase=%s fix: %s", phase.name, advice)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
@@ -414,8 +415,6 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         normally.
     """
     advice = _recovery_advice(phase, study, abort_record)
-    if advice is not None:
-        log.error("phase=%s fix: %s", phase.name, advice)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
@@ -926,6 +925,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         phase hard-aborts before another trial can acquire the just-released GPU lease.
     :raises TrialExecutionError: The subprocess returned non-zero or produced no metric.
         Caught by ``study.optimize(catch=...)``.
+    :raises PhaseSweepShutdown: Shutdown interrupted the trial or left completed training pending extraction.
     :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
         persisted; nothing was launched and no GPU lease was consumed.
     :raises _TrialOutcomeUnrecordedAbort: A successful trial's terminal outcome could not be
@@ -1078,13 +1078,27 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
     trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
 
+    def preserve_trainer_on_shutdown() -> None:
+        """Leave extraction pending when shutdown has already cleaned this process slot.
+
+        :raises PhaseSweepShutdown: Shutdown is being serviced after trainer cleanup.
+        """
+        signum = servicing_shutdown_signal()
+        if signum is not None and _completed_trainer_duration(trial, None) is not None:
+            raise PhaseSweepShutdown(signum, ShutdownCleanupReport(signum, True, ()))
+
     # Extraction releases the GPU but still consumes the phase/run budget.
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=executed,
-        gates=phase.gates,
-        deadline=run.optimize_deadline,
-    )
+    preserve_trainer_on_shutdown()
+    try:
+        result = extract_trial_result(
+            experiment=experiment,
+            executed=executed,
+            gates=phase.gates,
+            deadline=run.optimize_deadline,
+        )
+    except ShutdownLaunchRefusedError as exc:
+        raise PhaseSweepShutdown(exc.signum, ShutdownCleanupReport(exc.signum, True, ())) from exc
+    preserve_trainer_on_shutdown()
     if result.deadline_exhausted:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
@@ -1131,7 +1145,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
 
 def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
-    """Record each objective outcome before returning or re-raising its exception.
+    """Record objective outcomes, preserving completed training when shutdown interrupts extraction.
 
     :param _PhaseExecution run: Phase execution receiving the outcome and any fatal error.
     :param optuna.Trial trial: Active Optuna trial.
@@ -1182,13 +1196,23 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             )
             raise
         except PhaseSweepShutdown as exc:
-            # Preserve shutdown as an interruption for stale recovery and failure-streak replay.
-            _record_outcome(
-                run,
-                trial,
-                "interrupted",
-                cause=f"orchestrator interrupted by signal {exc.signum}",
-            )
+            lifecycle = None
+            directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(directory, str) and isinstance(attempt_id, str):
+                try:
+                    lifecycle = read_attempt_lifecycle(
+                        Path(directory), expected_attempt_id=attempt_id
+                    )
+                except ValueError as lifecycle_error:
+                    raise exc from lifecycle_error
+            if _completed_trainer_duration(trial, lifecycle) is None:
+                _record_outcome(
+                    run,
+                    trial,
+                    "interrupted",
+                    cause=f"orchestrator interrupted by signal {exc.signum}",
+                )
             raise
         except BaseException as exc:
             run.record_fatal(exc)
@@ -1318,8 +1342,6 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Without storage there is no study to continue, so only the logs are left to read.
         persistent = experiment.storage is not None
         advice = _recovery_advice(phase, study, abort) if persistent else None
-        if advice is not None:
-            log.error("phase=%s fix: %s", phase.name, advice)
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."

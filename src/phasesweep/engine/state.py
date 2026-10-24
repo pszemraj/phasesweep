@@ -13,7 +13,7 @@ from phasesweep.config.common import _validate_safe_name
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
-    from optuna.trial import FrozenTrial
+    from optuna.trial import FrozenTrial, Trial
 
     from phasesweep.engine.repeats import RepeatsRecord
     from phasesweep.runtime.process import AttemptLifecycle
@@ -451,20 +451,26 @@ def _unduplicated_outcome(
     return parsed
 
 
-def _completed_trainer_duration(trial: FrozenTrial, lifecycle: AttemptLifecycle) -> float | None:
+def _completed_trainer_duration(
+    trial: FrozenTrial | Trial, lifecycle: AttemptLifecycle | None
+) -> float | None:
     """Return completed trainer time without confusing SDK worker exits with trainer exits.
 
     Evidence workers reuse the process slot after trainer exit. The ledger records
     trainer metadata before extraction; the guardian record covers an earlier runner death.
 
-    :param FrozenTrial trial: Trial carrying trainer exit attributes, when committed.
-    :param AttemptLifecycle lifecycle: Current process-slot lifecycle evidence.
+    :param FrozenTrial | Trial trial: Trial carrying trainer exit attributes, when committed.
+    :param AttemptLifecycle | None lifecycle: Current process-slot evidence, or None to require trainer ledger attributes.
     :return float | None: Successful trainer duration, or None when exit evidence is incomplete.
     """
     if FAILURE_REASON_ATTR in trial.user_attrs:
         return None
-    return_code = trial.user_attrs.get(RETURN_CODE_ATTR, lifecycle.return_code)
-    duration = trial.user_attrs.get(DURATION_ATTR, lifecycle.duration_seconds)
+    return_code = trial.user_attrs.get(
+        RETURN_CODE_ATTR, None if lifecycle is None else lifecycle.return_code
+    )
+    duration = trial.user_attrs.get(
+        DURATION_ATTR, None if lifecycle is None else lifecycle.duration_seconds
+    )
     if (
         type(return_code) is not int
         or return_code != 0

@@ -21,7 +21,6 @@ from typing import Any, Literal, TypeAlias
 import optuna
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
-from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.artifacts import read_yaml_or_none
@@ -30,7 +29,10 @@ from phasesweep.engine.confound import (
     _validate_confound_block,
 )
 from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.fingerprints import (
+    _experiment_semantic_fingerprint,
+    _recorded_config_matches,
+)
 from phasesweep.engine.ledger import (
     log_storage_read_failure,
     read_phase_trials,
@@ -48,12 +50,12 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _experiment_dir,
-    _generation_config_snapshot_path,
     _generation_dir,
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
 )
+from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
@@ -314,6 +316,7 @@ def _represented_winners(
     phase_names: Sequence[str],
     *,
     fallback_published: bool = False,
+    comparison_experiment: Experiment | None = None,
 ) -> list[PhaseWinnerView]:
     """Return the represented generation's winners, in ``phase_names`` order.
 
@@ -325,11 +328,13 @@ def _represented_winners(
         represented, or ``None`` when there is none.
     :param Sequence[str] phase_names: Safe phase names to enumerate.
     :param bool fallback_published: Fill missing latest phase winners from the publication.
+    :param Experiment | None comparison_experiment: Current config for drift comparisons.
     :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
     """
     if represented_generation_id is None:
         return []
     validated = publication.validated
+    comparison = comparison_experiment or experiment
     views: list[PhaseWinnerView | None]
     if validated is not None and validated.generation_id == represented_generation_id:
         views = [
@@ -357,17 +362,18 @@ def _represented_winners(
         if view is not None:
             is_published = validated is not None and view_generation == validated.generation_id
             if is_published and validated is not None:
-                stored_fingerprint = validated.summary.get("config_fingerprint")
-                prefix = experiment.model_copy(
-                    update={"phases": experiment.phases[: len(validated.phase_plan)]}
-                )
-                config_matches = (
-                    stored_fingerprint == _experiment_semantic_fingerprint(prefix)
-                    if isinstance(stored_fingerprint, str)
-                    else None
+                config_matches = _recorded_config_matches(
+                    comparison,
+                    validated.summary.get("config_fingerprint"),
+                    phase_count=len(validated.phase_plan),
                 )
             else:
-                config_matches = _generation_config_matches(experiment, view_generation)
+                producing = _load_generation_experiment(experiment, view_generation)
+                config_matches = _recorded_config_matches(
+                    comparison,
+                    _experiment_semantic_fingerprint(producing),
+                    phase_count=len(producing.phases),
+                )
             chosen.append(
                 replace(
                     view,
@@ -402,23 +408,6 @@ def require_study(experiment: Experiment) -> None:
             "Use the same config and --set overrides as run.",
             action=OperatorAction.FIX_CONFIG,
         )
-
-
-def _generation_config_matches(experiment: Experiment, generation_id: str | None) -> bool | None:
-    """Compare recorded semantics with the matching prefix of the current phase plan.
-
-    :param Experiment experiment: Current config to compare.
-    :param str | None generation_id: Producing generation, when known.
-    :return bool | None: Semantic match, or unknown when its snapshot is absent.
-    """
-    if generation_id is None:
-        return None
-    path = _generation_config_snapshot_path(experiment, generation_id)
-    if not path.is_file():
-        return None
-    producing = load_experiment(path)
-    prefix = experiment.model_copy(update={"phases": experiment.phases[: len(producing.phases)]})
-    return _experiment_semantic_fingerprint(producing) == _experiment_semantic_fingerprint(prefix)
 
 
 def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
@@ -589,7 +578,8 @@ def read_status(
     Progress ``phases`` use current config. Metric labels, ``result_phase_plan``, winner
     and summary presence use the represented generation. Missing result semantics fall
     back to current config; ``result_context`` names the source. Semantic fingerprints
-    determine ``published_config_matches_current``, or ``None`` if no fingerprint exists.
+    determine ``published_config_matches_current`` against the producing phase prefix,
+    or ``None`` if no fingerprint exists. Appended phases do not change that agreement.
 
     ``generation_trials`` counts ``trial_generation_id`` when given, else the pinned
     generation, else the current generation; other counts are cumulative. Counts and ``running_attempts`` share one storage capture.
@@ -641,6 +631,7 @@ def read_result(
         an empty sequence selects none.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
     :raises ValueError: If ``generation_id`` or an explicit phase name is not safe.
     :return tuple[EngineStatus, list[PhaseWinnerView]]: Status and usable winners
         in the selected phase order.
@@ -661,6 +652,7 @@ def read_result(
         publication,
         status["represented_generation_id"],
         status["result_phase_plan"] if names is None else names,
+        comparison_experiment=comparison_experiment,
     )
     return status, winners
 
@@ -774,14 +766,12 @@ def _read_status(
                     "objective_evidence": stored_evidence,
                 }
                 result_context = "represented_generation"
-    published_config_matches_current: bool | None = None
     stored_fingerprint = (
         None if summary_payload is None else summary_payload.get("config_fingerprint")
     )
-    if isinstance(stored_fingerprint, str) and stored_fingerprint:
-        published_config_matches_current = stored_fingerprint == _experiment_semantic_fingerprint(
-            comparison
-        )
+    published_config_matches_current = _recorded_config_matches(
+        comparison, stored_fingerprint, phase_count=len(result_phase_plan)
+    )
 
     publication_state: PublicationState = publication.state
 
@@ -794,6 +784,7 @@ def _read_status(
                 represented_generation_id,
                 result_phase_plan,
                 fallback_published=True,
+                comparison_experiment=comparison_experiment,
             )
         }
         if latest and generation_id is None and publication.state in {"ok", "absent"}
@@ -954,6 +945,7 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
     :raises StudyStorageUnavailableError: No study has started at the configured root.
     :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
     :raises StudySchemaMismatchError: The stored study format is unsupported.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
     :return JsonObject: Paths, pointer identities, integrity, phase counts and labeled winners.
     """
     require_study(experiment)

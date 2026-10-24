@@ -1829,7 +1829,7 @@ def test_raise_sites_route_their_declared_action(
         assert "correct the experiment configuration" not in rendered
         assert rendered.count(error.remediation) == 1
         assert error.remediation not in str(error)
-        assert caplog.text.count(error.remediation) == 1
+        assert error.remediation not in caplog.text
         failure = mcp_runner._terminal_failure_payload(
             error, stage="execution", cleanup_confirmed=True
         )

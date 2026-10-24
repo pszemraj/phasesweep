@@ -113,6 +113,22 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
     return _semantic_payload_digest(payload)
 
 
+def _recorded_config_matches(
+    experiment: Experiment, stored_fingerprint: object, *, phase_count: int
+) -> bool | None:
+    """Compare recorded semantics with the current plan's producing phase prefix.
+
+    :param Experiment experiment: Current configuration to compare.
+    :param object stored_fingerprint: Represented generation's semantic fingerprint.
+    :param int phase_count: Number of phases in the represented generation's plan.
+    :return bool | None: Semantic agreement, or unknown without a recorded fingerprint.
+    """
+    if not isinstance(stored_fingerprint, str) or not stored_fingerprint:
+        return None
+    prefix = experiment.model_copy(update={"phases": experiment.phases[:phase_count]})
+    return stored_fingerprint == _experiment_semantic_fingerprint(prefix)
+
+
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     """Return phase execution and output semantics, excluding run control.
 

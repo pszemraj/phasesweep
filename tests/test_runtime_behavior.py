@@ -1345,7 +1345,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     monkeypatch.setattr(optuna.Trial, "set_user_attr", maybe_refuse_cleanup_attr)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: cleanup_safe["value"],
+        lambda _identity, **_kwargs: cleanup_safe["value"],
     )
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))

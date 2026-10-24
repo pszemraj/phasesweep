@@ -399,7 +399,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
-    assert "Whether this winner was selected in the represented generation" in json.dumps(
+    assert "winner's source trial belongs to the represented generation" in json.dumps(
         output_schemas[TOOL_GET_RUN_RESULTS]
     )
     # Both result surfaces disclose which config labeled the result they show.

@@ -15,7 +15,9 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep._metadata import __version__
+from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_SUMMARY_SCHEMA_VERSION,
@@ -160,6 +162,23 @@ def _phase_config_fingerprint(phase: Phase) -> str:
         **fingerprint_ops._semantic_phase_dump(phase),
     }
     return fingerprint_ops._semantic_payload_digest(payload)
+
+
+def _load_generation_experiment(experiment: Experiment | Path, generation_id: str) -> Experiment:
+    """Load the producing configuration or route an unavailable snapshot as artifact damage.
+
+    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
+    :param str generation_id: Generation whose frozen launch configuration is required.
+    :raises WinnerIntegrityError: The snapshot is absent, unreadable, or invalid.
+    :return Experiment: Validated producing configuration.
+    """
+    path = path_ops._generation_config_snapshot_path(experiment, generation_id)
+    try:
+        return load_experiment(path)
+    except (OSError, ValueError) as exc:
+        raise WinnerIntegrityError(
+            f"Cannot read configuration snapshot for generation {generation_id!r} at {path}: {exc}"
+        ) from exc
 
 
 def _write_generation_provenance(

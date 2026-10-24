@@ -414,7 +414,7 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     )
     write_unsafe_cleanup_status(store, run_id)
     monkeypatch.setattr(
-        "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _identity: True
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _identity, **_kwargs: True
     )
 
     read_running = threading.Event()

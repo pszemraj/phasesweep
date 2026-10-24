@@ -1221,7 +1221,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
+        lambda _identity, **_kwargs: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
@@ -1421,7 +1421,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
 
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
-    def fake_trial_cleanup(identity: StaleProcessIdentity) -> bool:
+    def fake_trial_cleanup(identity: StaleProcessIdentity, **_kwargs: object) -> bool:
+        """Record the durable identity selected for trial cleanup.
+
+        :param StaleProcessIdentity identity: Trial group selected for cleanup.
+        :param object _kwargs: Optional cleanup callbacks supplied by recovery.
+        :return bool: Confirmed cleanup for the staged identity.
+        """
         trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
@@ -1678,7 +1684,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     reconciled_attempts: dict[str, _AttemptRecord] = {}
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
+        lambda _identity, **_kwargs: True,
     )
     assert (
         _reap_stale_trials(
@@ -1745,7 +1751,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
         mark_cleanup_uncertain=True,
         snapshot_bound_to_generation=False,
         kill_stale_group_stub=lambda *args, **kwargs: True,
-        cleanup_trial_stub=lambda _identity: True,
+        cleanup_trial_stub=lambda _identity, **_kwargs: True,
         monkeypatch=monkeypatch,
     )
 

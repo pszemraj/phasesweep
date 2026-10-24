@@ -189,11 +189,10 @@ PublishedConfigMatchesCurrent = Annotated[
     bool | None,
     Field(
         description=(
-            "Whether the config that produced this result still matches the one a further "
-            "run would execute. False means the config was edited after publication: the "
-            "labels here are historical, and the current phases may not correspond to the "
-            "published ones. Null when undeterminable - nothing published, or a "
-            "publication that recorded no config fingerprint. Never treat null as 'no drift'."
+            "Whether the producing configuration matches the corresponding prefix of the "
+            "current phase plan. Appended phases do not invalidate that agreement. False "
+            "means the producing semantics differ and these result labels are historical. "
+            "Null when no producing fingerprint is available. Never treat null as 'no drift'."
         )
     ),
 ]

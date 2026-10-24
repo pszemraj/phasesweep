@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import fcntl
+import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -34,14 +37,16 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _trial_count_state,
 )
-from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.paths import _generation_config_snapshot_path, _phase_dir
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    DURATION_ATTR,
     FEASIBLE_ATTR,
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
+    RETURN_CODE_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -57,12 +62,13 @@ from phasesweep.engine.study_policy import (
     _rerun_sources,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     phase_study,
     phase_trials,
@@ -428,8 +434,12 @@ def test_no_trainer_starts_while_a_shutdown_is_serviced(
 
 @pytest.mark.integration
 @pytest.mark.signals_own_pid
+@pytest.mark.parametrize("trainer_return_code", [0, 1])
 def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    trainer_return_code: int,
 ) -> None:
     """A signal during Optuna's final join lets each worker record its interruption before reconciliation reaps."""
     reached = tmp_path / "reached"
@@ -437,8 +447,10 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
     trainer = write_trainer(
         tmp_path / "trainer.py",
         f"""
-        import os, time
+        import os, signal, sys, time
         from pathlib import Path
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit({trainer_return_code}))
+        print("x=0.25", flush=True)
         Path({str(reached)!r}, os.environ["PHASESWEEP_TRIAL_ID"]).touch()
         time.sleep(60)
         """,
@@ -452,6 +464,7 @@ def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
         allow_no_gpu_isolation=True,
         timeout_seconds_per_trial=60.0,
     )
+    exp = exp.model_copy(update={"trial_command": "exec " + exp.trial_command})
     record_outcome = phase_module._record_outcome
 
     def slow_interruption(
@@ -552,29 +565,189 @@ def test_the_shutdown_wait_gives_up_on_a_running_trial_no_worker_finishes(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(("return_code", "feasible"), [(0, True), (0, False), (7, True)])
-@pytest.mark.parametrize("sdk_worker", [False, True])
-def test_completed_orphan_evidence_survives_runner_sigkill(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    return_code: int,
-    feasible: bool,
-    sdk_worker: bool,
+@pytest.mark.parametrize(
+    "trainer_completed", [False, True], ids=["intent-write-fails", "completed-before-cancellation"]
+)
+def test_guardian_cancellation_preserves_evidence_and_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trainer_completed: bool
 ) -> None:
-    """A surviving guardian saves trainer exit evidence; only zero exits survive resume as COMPLETE."""
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    launches = tmp_path / "launches"
+    """Cancellation waits for completed evidence and keeps live training leased when intent cannot persist."""
+    from phasesweep.runtime import process
+
+    started, release, failed, signalled = (
+        tmp_path / name for name in ("started", "release", "failed", "signalled")
+    )
+    publish = tmp_path / "publish"
+    publication_timer: threading.Timer | None = None
     trainer = write_trainer(
         tmp_path / "trainer.py",
         f"""
-        import argparse, json, time
+        import signal, time
+        from pathlib import Path
+        signal.signal(signal.SIGTERM, lambda *_: Path({str(signalled)!r}).touch())
+        Path({str(started)!r}).touch()
+        while not Path({str(release)!r}).exists():
+            time.sleep(0.01)
+        """,
+    )
+    guardian_script = write_trainer(
+        tmp_path / "guardian.py",
+        f"""
+        import runpy, time
+        from pathlib import Path
+        namespace = runpy.run_path({process._SUPERVISOR_SCRIPT_PATH!r})
+        original = namespace["write_lifecycle_record"]
+        def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
+            if state == "terminating" and not {trainer_completed!r}:
+                Path({str(failed)!r}).touch()
+                raise OSError("intent write unavailable")
+            if state == "exited" and {trainer_completed!r}:
+                Path({str(failed)!r}).touch()
+                while not Path({str(publish)!r}).exists():
+                    time.sleep(0.01)
+            original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
+        namespace["main"].__globals__["write_lifecycle_record"] = fail_intent
+        raise SystemExit(namespace["main"]())
+        """,
+    )
+    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(guardian_script))
+    process.write_attempt_lifecycle(tmp_path, attempt_id="held-lease", state="launching")
+    lease = tmp_path / "gpu.lock"
+    with lease.open("w") as held, (tmp_path / "guardian.log").open("w") as output:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        guardian, pgid, ack_write, status_read = process._spawn_blocked_supervisor(
+            stdout=output,
+            stderr=output,
+            gpu_lease_fds=(held.fileno(),),
+            lifecycle_args=(str(tmp_path), "held-lease", str(time.monotonic())),
+        )
+    try:
+        process._write_all(
+            ack_write,
+            process._encode_launch_payload(
+                "exec " + shlex.join([sys.executable, str(trainer)]), os.environ.copy(), None
+            ),
+        )
+        os.close(ack_write)
+        ack_write = -1
+        deadline = time.monotonic() + 5
+        while not started.exists() and time.monotonic() < deadline:
+            assert guardian.poll() is None
+            time.sleep(0.01)
+        assert started.exists()
+        if trainer_completed:
+            release.touch()
+        else:
+            guardian.send_signal(signal.SIGTERM)
+        while not failed.exists() and time.monotonic() < deadline:
+            assert guardian.poll() is None
+            time.sleep(0.01)
+        assert failed.exists()
+        assert guardian.poll() is None
+        assert reaper._process_group_alive(pgid) is not trainer_completed
+        with lease.open("w") as contender, pytest.raises(BlockingIOError):
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if trainer_completed:
+            publication_timer = threading.Timer(0.2, publish.touch)
+            publication_timer.start()
+            assert reaper._terminate_process_groups(
+                (pgid,), grace_seconds=1.0, guardians={pgid: guardian.pid}
+            ) == {pgid: True}
+            lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
+            assert lifecycle is not None and lifecycle.state == "exited"
+            assert lifecycle.return_code == 0
+        else:
+            release.touch()
+        assert guardian.wait(timeout=5) == 0
+        assert not signalled.exists()
+        with lease.open("w") as contender:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
+        assert lifecycle is not None and lifecycle.state == "exited"
+        assert lifecycle.return_code == 0 and lifecycle.cleanup_confirmed
+    finally:
+        release.touch()
+        publish.touch()
+        if publication_timer is not None:
+            publication_timer.cancel()
+            publication_timer.join()
+        if ack_write >= 0:
+            os.close(ack_write)
+        os.close(status_read)
+        reaper._terminate_process_group(pgid, grace_seconds=0.1)
+        guardian.wait(timeout=5)
+        process._unregister(pgid)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("return_code", "feasible", "recovery_stage"),
+    [
+        (0, True, "finished"),
+        (0, False, "finished"),
+        (7, True, "finished"),
+        (0, True, "sdk"),
+        (0, False, "sdk"),
+        (7, True, "sdk"),
+        (0, True, "sdk-interrupt"),
+        (0, True, "sdk-interrupt-parallel"),
+        (0, True, "shutdown-trainer"),
+        (0, True, "timeout-trainer"),
+        (0, True, "terminate"),
+        (0, True, "mcp-terminate"),
+        (0, True, "interrupt-intent"),
+        (0, True, "interrupt-termination"),
+        (0, True, "interrupt-extraction"),
+        (0, True, "missing-snapshot"),
+        (0, True, "corrupt-snapshot"),
+        (0, True, "mcp-missing-snapshot"),
+        (0, True, "mcp-corrupt-snapshot"),
+    ],
+)
+def test_completed_orphan_evidence_survives_runner_sigkill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    return_code: int,
+    feasible: bool,
+    recovery_stage: str,
+) -> None:
+    """Recovery preserves completed training across crashes and rejects a trainer it terminates."""
+    sdk_worker = recovery_stage in {"sdk", "sdk-interrupt", "sdk-interrupt-parallel"}
+    shutdown_sdk = recovery_stage.startswith("sdk-interrupt")
+    guardian_cancel = recovery_stage in {"shutdown-trainer", "timeout-trainer"}
+    terminated = recovery_stage in {
+        "terminate",
+        "mcp-terminate",
+        "interrupt-intent",
+        "interrupt-termination",
+        "shutdown-trainer",
+        "timeout-trainer",
+    }
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    launches = tmp_path / "launches"
+    runner_pid = tmp_path / "runner-pid"
+    termination_intent = tmp_path / "termination-intent"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, os, signal, sys, time
         from pathlib import Path
         parser = argparse.ArgumentParser()
         parser.add_argument("--out", required=True)
         args, _ = parser.parse_known_args()
+        def terminate(*_):
+            if {guardian_cancel!r}:
+                lifecycle = Path(args.out).parent / "attempt_lifecycle.json"
+                Path({str(termination_intent)!r}).write_text(lifecycle.read_text())
+                os.kill(int(Path({str(runner_pid)!r}).read_text()), signal.SIGKILL)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, terminate)
         with Path({str(launches)!r}).open("a") as handle:
             handle.write("launch\\n")
+        Path(args.out).write_text(json.dumps({{"x": 0.25}}))
+        print("x=0.25", flush=True)
         Path({str(started)!r}).touch()
         while not Path({str(release)!r}).exists():
             time.sleep(0.02)
@@ -583,7 +756,17 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         raise SystemExit({return_code})
     """,
     )
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=1,
+        n_jobs=2 if recovery_stage == "sdk-interrupt-parallel" else 1,
+        timeout_seconds_per_trial=1.0 if recovery_stage == "timeout-trainer" else 30.0,
+    )
+    if terminated:
+        experiment = experiment.model_copy(
+            update={"trial_command": "exec " + experiment.trial_command}
+        )
     if not feasible:
         experiment = experiment.model_copy(
             update={"metric": experiment.metric.model_copy(update={"max": 0.5})}
@@ -603,25 +786,38 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         release.touch()
     runner_code = """
 import sys, time
+from dataclasses import replace
 from pathlib import Path
 from phasesweep.config.io import load_experiment
 from phasesweep import run_experiment
-from phasesweep.engine import phase
+from phasesweep.engine import phase, trial
+from phasesweep.engine.attempts import _PreflightCleanupReport
+from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.runtime.remote_worker import run_worker
 
-original_extract = phase.extract_trial_result
+owner = trial if sys.argv[2] == "recovery" else phase
+original_extract = owner.extract_trial_result
 
 def extract_with_worker(**kwargs):
     \"\"\"Keep an SDK worker active until recovery terminates its process slot.\"\"\"
     ctx = kwargs["executed"].ctx
-    run_worker({}, Path(sys.argv[3]), "fake-sdk", statuses=frozenset({"ok"}), run_id=ctx.attempt_id, trial_dir=ctx.trial_dir, environment={}, deadline=time.monotonic() + 60)
-    return original_extract(**kwargs)
+    process, _, _ = run_worker({}, Path(sys.argv[3]), "fake-sdk", statuses=frozenset({"ok"}), run_id=ctx.attempt_id, trial_dir=ctx.trial_dir, environment={}, deadline=time.monotonic() + 60)
+    result = original_extract(**kwargs)
+    if process.return_code != 0:
+        return replace(result, failure_reason=f"fake-sdk worker exited {process.return_code}")
+    return result
 
-if sys.argv[2] == "1":
-    phase.extract_trial_result = extract_with_worker
-run_experiment(load_experiment(sys.argv[1]))
+if sys.argv[2] in {"1", "recovery"}:
+    owner.extract_trial_result = extract_with_worker
+    trial.extract_trial_result = extract_with_worker
+experiment = load_experiment(sys.argv[1])
+if sys.argv[2] == "recovery":
+    _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
+else:
+    run_experiment(experiment, generation_id="orphan-generation")
 """
     orphan_identity = None
+    recovery_runner: subprocess.Popen[bytes] | None = None
     with (tmp_path / "runner.log").open("w") as output:
         runner = subprocess.Popen(
             [
@@ -635,6 +831,7 @@ run_experiment(load_experiment(sys.argv[1]))
             stdout=output,
             stderr=output,
         )
+        runner_pid.write_text(str(runner.pid))
         try:
             deadline = time.monotonic() + 15
             reached = worker_started if sdk_worker else started
@@ -642,16 +839,29 @@ run_experiment(load_experiment(sys.argv[1]))
                 assert runner.poll() is None, (tmp_path / "runner.log").read_text()
                 time.sleep(0.02)
             assert reached.exists()
-            runner.kill()
-            runner.wait(timeout=5)
-            release.touch()
             (trial,) = phase_trials(experiment)
             directory = Path(trial.user_attrs["phasesweep_trial_dir"])
             attempt = trial.user_attrs["phasesweep_attempt_id"]
             orphan_identity = reaper.read_stale_process_identity(
                 directory, expected_attempt_id=attempt
             )
-            if sdk_worker:
+            if shutdown_sdk or recovery_stage == "shutdown-trainer":
+                runner.send_signal(signal.SIGINT)
+            elif recovery_stage != "timeout-trainer":
+                runner.kill()
+            runner.wait(timeout=5)
+            if shutdown_sdk:
+                assert runner.returncode == 128 + signal.SIGINT
+            elif guardian_cancel:
+                assert runner.returncode == -signal.SIGKILL
+                intent = json_object(json.loads(termination_intent.read_text()))
+                assert intent["state"] == "terminating"
+                assert intent["return_code"] == -signal.SIGTERM
+                assert intent["cleanup_confirmed"] is False
+            if not terminated:
+                release.touch()
+            (trial,) = phase_trials(experiment)
+            if (sdk_worker and not shutdown_sdk) or (terminated and not guardian_cancel):
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == "launching"
                 assert reaper._process_group_alive(orphan_identity.pgid)
@@ -662,10 +872,109 @@ run_experiment(load_experiment(sys.argv[1]))
                         break
                     time.sleep(0.02)
                 assert lifecycle is not None and lifecycle.state == "exited"
-                assert lifecycle.return_code == return_code
-                assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
+                if shutdown_sdk:
+                    assert trial.user_attrs[RETURN_CODE_ATTR] == 0
+                    assert trial.user_attrs[DURATION_ATTR] > 0
+                else:
+                    assert lifecycle.return_code == (
+                        -signal.SIGTERM if guardian_cancel else return_code
+                    )
+                    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds > 0
             assert (directory / "r.json").exists()
-            if return_code == 0:
+            if terminated and not guardian_cancel:
+                terminate_group = reaper._terminate_process_group
+
+                def terminate_and_wait_for_guardian(pgid: int, *, grace_seconds: float) -> bool:
+                    """Expose a handled SIGTERM's real zero exit before recovery reads evidence.
+
+                    :param int pgid: Trainer group selected for termination.
+                    :param float grace_seconds: SIGTERM grace before escalation.
+                    :return bool: Confirmed cleanup after the guardian records the trainer exit.
+                    """
+                    assert terminate_group(pgid, grace_seconds=grace_seconds)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        exited = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                        if exited is not None and exited.state == "exited":
+                            break
+                        time.sleep(0.02)
+                    assert exited is not None and exited.state == "exited"
+                    assert exited.return_code == 0
+                    assert exited.cleanup_confirmed
+                    assert exited.duration_seconds is not None and exited.duration_seconds > 0
+                    assert (directory / "r.json").read_text() == '{"x": 0.25}'
+                    return True
+
+                monkeypatch.setattr(
+                    reaper, "_terminate_process_group", terminate_and_wait_for_guardian
+                )
+            if recovery_stage.endswith("snapshot"):
+                snapshot = _generation_config_snapshot_path(experiment, "orphan-generation")
+                snapshot_bytes = snapshot.read_bytes()
+                if recovery_stage.endswith("missing-snapshot"):
+                    snapshot.unlink()
+                else:
+                    snapshot.write_text("invalid: [unterminated\n")
+                with pytest.raises(PhaseSweepError, match="configuration snapshot") as refusal:
+                    _reconcile_existing_studies(
+                        experiment, cleanup_report=_PreflightCleanupReport()
+                    )
+                assert refusal.value.action is OperatorAction.RESTORE_TREE
+                argv = ["run", str(config)]
+                if recovery_stage.startswith("mcp-"):
+                    from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog
+
+                    _app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+                    stage_dead_run(
+                        store,
+                        "orphan-generation",
+                        config,
+                        "srv",
+                        cleanup_uncertain=False,
+                    )
+                    argv = [
+                        "mcp",
+                        "recover-run",
+                        "--state-dir",
+                        str(registry.state_dir),
+                        "--run-id",
+                        "orphan-generation",
+                        "--confirm",
+                    ]
+                with monkeypatch.context() as boundary:
+                    assert invoke_cli_boundary(argv, boundary) == 1
+                failure_text = capsys.readouterr().err
+                assert "configuration snapshot" in failure_text
+                assert "fix: " + OPERATOR_STEPS[OperatorAction.RESTORE_TREE] in failure_text
+                assert "internal error" not in failure_text
+                pending = phase_trials(experiment)[0]
+                assert pending.state.name == "RUNNING"
+                assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
+                assert launches.read_text() == "launch\n"
+                snapshot.write_bytes(snapshot_bytes)
+            if recovery_stage == "interrupt-extraction":
+                recovery_runner = subprocess.Popen(
+                    [sys.executable, "-c", runner_code, str(config), "recovery", str(worker)],
+                    stdout=output,
+                    stderr=output,
+                )
+                deadline = time.monotonic() + 15
+                while not worker_started.exists() and time.monotonic() < deadline:
+                    assert recovery_runner.poll() is None, (tmp_path / "runner.log").read_text()
+                    time.sleep(0.02)
+                assert worker_started.exists()
+                pending = phase_trials(experiment)[0]
+                assert pending.user_attrs[RETURN_CODE_ATTR] == 0
+                assert pending.user_attrs[DURATION_ATTR] == lifecycle.duration_seconds
+                recovery_runner.kill()
+                recovery_runner.wait(timeout=5)
+                orphan_identity = reaper.read_stale_process_identity(
+                    directory, expected_attempt_id=attempt
+                )
+                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                assert lifecycle is not None and lifecycle.state == "launching"
+                trial = pending
+            if return_code == 0 and not terminated:
                 assert (
                     _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
                     == "EVIDENCE_PENDING"
@@ -697,10 +1006,80 @@ run_experiment(load_experiment(sys.argv[1]))
                     optuna.Trial(interrupted_study, pending._trial_id).set_user_attr(
                         TRIAL_OUTCOME_ATTR, saved_outcome
                     )
-            _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
+            if recovery_stage in {"interrupt-intent", "interrupt-termination"}:
+                if recovery_stage == "interrupt-intent":
+                    original_intent = attempts_module._record_recovery_interruption
+
+                    def interrupt_intent(
+                        study: optuna.Study, stale: optuna.trial.FrozenTrial
+                    ) -> None:
+                        """Stop recovery after its interruption intent commits, before any signal.
+
+                        :param optuna.Study study: Owning phase study.
+                        :param optuna.trial.FrozenTrial stale: Interrupted trainer trial.
+                        :raises KeyboardInterrupt: After the durable interruption commits.
+                        """
+                        original_intent(study, stale)
+                        raise KeyboardInterrupt
+
+                    target = attempts_module
+                    name = "_record_recovery_interruption"
+                    replacement = interrupt_intent
+                else:
+                    original_terminate = reaper._terminate_process_group
+
+                    def interrupt_termination(pgid: int, *, grace_seconds: float) -> bool:
+                        """Stop recovery after SIGTERM cleanup and before trial settlement.
+
+                        :param int pgid: Trainer group selected for termination.
+                        :param float grace_seconds: SIGTERM grace before escalation.
+                        :raises KeyboardInterrupt: After real group cleanup completes.
+                        :return bool: Never returns because recovery is interrupted.
+                        """
+                        assert original_terminate(pgid, grace_seconds=grace_seconds)
+                        raise KeyboardInterrupt
+
+                    target = reaper
+                    name = "_terminate_process_group"
+                    replacement = interrupt_termination
+                with monkeypatch.context() as interrupted:
+                    interrupted.setattr(target, name, replacement)
+                    with pytest.raises(KeyboardInterrupt):
+                        _reconcile_existing_studies(
+                            experiment, cleanup_report=_PreflightCleanupReport()
+                        )
+                pending = phase_trials(experiment)[0]
+                assert pending.state.name == "RUNNING"
+                assert _recovered_trial_state(pending, _outcome_sequence_counts([pending])) == (
+                    "INTERRUPTED"
+                )
+                assert _cause(pending) == _STALE_CAUSE
+                assert reaper._process_group_alive(orphan_identity.pgid) is (
+                    recovery_stage == "interrupt-intent"
+                )
+            if recovery_stage == "mcp-terminate":
+                from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog
+                from tests.recovery_helpers import recover_run_cli
+
+                _app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+                stage_dead_run(
+                    store,
+                    "orphan-generation",
+                    config,
+                    "srv",
+                    cleanup_uncertain=False,
+                )
+                recovered_run = recover_run_cli(
+                    registry.state_dir, "orphan-generation", confirm=True
+                )
+                assert recovered_run.exit_code == 0, recovered_run.output
+            else:
+                _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
             (recovered,) = phase_trials(experiment)
-            assert recovered.state.name == ("COMPLETE" if return_code == 0 else "FAIL")
-            if return_code == 0:
+            assert recovered.state.name == (
+                "COMPLETE" if return_code == 0 and not terminated else "FAIL"
+            )
+            if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
                 assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
                 if feasible:
@@ -719,12 +1098,31 @@ run_experiment(load_experiment(sys.argv[1]))
                 assert _trial_interrupted(recovered)
             assert launches.read_text() == "launch\n"
             assert not reaper._process_group_alive(orphan_identity.pgid)
+            if terminated:
+                lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
+                assert lifecycle is not None and lifecycle.return_code == (
+                    -signal.SIGTERM if guardian_cancel else 0
+                )
+                assert recovered.value is None
+                release.touch()
+                assert run_experiment(experiment)["p"].metric == 1.0
+                rerun = phase_trials(experiment)[1]
+                assert rerun.user_attrs[RERUN_OF_ATTR] == 0
+                assert launches.read_text() == "launch\nlaunch\n"
         finally:
             release.touch()
             if runner.poll() is None:
                 runner.kill()
             runner.wait(timeout=5)
+            if recovery_runner is not None:
+                if recovery_runner.poll() is None:
+                    recovery_runner.kill()
+                recovery_runner.wait(timeout=5)
             if orphan_identity is not None:
+                if (directory / reaper.PROCESS_IDENTITY_FILE).exists():
+                    orphan_identity = reaper.read_stale_process_identity(
+                        directory, expected_attempt_id=attempt
+                    )
                 reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
 
 

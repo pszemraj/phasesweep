@@ -42,8 +42,9 @@ from phasesweep.engine.errors import (
     ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    WinnerIntegrityError,
 )
-from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
@@ -961,6 +962,7 @@ class PhaseSweepMCP:
             ArtifactRootConflictError,
             StudySchemaMismatchError,
             StudyStorageUnavailableError,
+            WinnerIntegrityError,
         ) as exc:
             self._raise_persistent_read_error(handle, exc)
         if comparison is None:
@@ -970,13 +972,15 @@ class PhaseSweepMCP:
     @staticmethod
     def _raise_persistent_read_error(
         handle: RunHandle,
-        exc: ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError,
+        exc: ArtifactRootConflictError
+        | StudySchemaMismatchError
+        | StudyStorageUnavailableError
+        | WinnerIntegrityError,
     ) -> NoReturn:
         """Replace a path-bearing live-study read failure with a safe tool error.
 
         :param RunHandle handle: Run whose immutable config selected the failed state.
-        :param ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError exc:
-            Explicit persistent-state failure to redact.
+        :param ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError | WinnerIntegrityError exc: Explicit persistent-state failure to redact.
         :raises RunPersistentStateUnavailableError: Always, without storage details.
         """
         log.info("persistent state read failed for run=%s: %s", handle.run_id, exc)
@@ -1001,12 +1005,13 @@ class PhaseSweepMCP:
         """
         status = snapshot.status_payload()
         comparison = self._catalog_comparison_experiment(experiment_id)
-        represented_fingerprint = snapshot.represented_config_fingerprint
         status["published_config_matches_current"] = (
-            represented_fingerprint == _experiment_semantic_fingerprint(comparison)
-            if comparison is not None
-            and represented_fingerprint is not None
-            and result_source != "terminal_snapshot_unavailable"
+            _recorded_config_matches(
+                comparison,
+                snapshot.represented_config_fingerprint,
+                phase_count=len(snapshot.status.result_phase_plan),
+            )
+            if comparison is not None and result_source != "terminal_snapshot_unavailable"
             else None
         )
         return status

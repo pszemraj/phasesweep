@@ -14,7 +14,7 @@ import re
 import signal
 import sys
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeGuard
@@ -500,30 +500,42 @@ def cleanup_stale_trial_process(
     identity: StaleProcessIdentity,
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
+    before_terminate: Callable[[], None] | None = None,
 ) -> bool:
     """Apply the same boot, namespace and group decision used by recovery inspection.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_terminate: Commit recovery intent before signalling a live group; a raised exception prevents termination.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
     :return bool: Whether cleanup is confirmed; unsafe identities remain untouched.
     """
     return _apply_stale_process_decision(
-        stale_trial_process_decision(identity), grace_seconds=grace_seconds
+        stale_trial_process_decision(identity),
+        grace_seconds=grace_seconds,
+        before_terminate=before_terminate,
     )
 
 
-def _apply_stale_process_decision(decision: StaleProcessDecision, *, grace_seconds: float) -> bool:
+def _apply_stale_process_decision(
+    decision: StaleProcessDecision,
+    *,
+    grace_seconds: float,
+    before_terminate: Callable[[], None] | None = None,
+) -> bool:
     """Apply a freshly probed cleanup decision.
 
     :param StaleProcessDecision decision: Current process evidence and signal target.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_terminate: Persist recovery intent before sending a signal.
     :return bool: Whether the group is confirmed gone.
     """
     log.warning("Stale process cleanup: %s.", decision.reason)
     if decision.action != "terminate":
         return decision.action == "gone"
     assert decision.pgid is not None
+    if before_terminate is not None:
+        before_terminate()
     return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
@@ -539,29 +551,38 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     return _terminate_process_groups((pgid,), grace_seconds=grace_seconds)[pgid]
 
 
-def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
-    """Escalate SIGTERM to SIGKILL with shared wait windows across all groups.
+def _terminate_process_groups(
+    pgids: tuple[int, ...],
+    *,
+    grace_seconds: float,
+    guardians: Mapping[int, int] | None = None,
+) -> dict[int, bool]:
+    """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
-    Per-group verdicts match :func:`_terminate_process_group`; all groups share one
-    SIGTERM grace and one post-SIGKILL confirmation window.
+    All groups share one grace period and one final confirmation window. Unguarded
+    groups receive direct SIGKILL after the grace period; guardians own escalation
+    for their groups and must finish lifecycle publication before cleanup is confirmed.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
-    :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL,
-        shared across all groups.
+    :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
+    :param Mapping[int, int] | None guardians: Group-to-guardian PIDs whose cancellation protocol owns durable intent and all trainer signals; the caller only requests cancellation and observes cleanup.
     :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
-        group is confirmed dead.
+        group and any assigned guardian are confirmed dead, so lifecycle publication has finished.
     """
     confirmed: dict[int, bool] = {}
     members: dict[int, set[int]] = {}
     pending: list[int] = []
     for pgid in pgids:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            if guardians is None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(guardians[pgid], signal.SIGTERM)
         except ProcessLookupError:
-            confirmed[pgid] = True
+            confirmed[pgid] = not _process_group_alive(pgid)
             continue
         except OSError as exc:
-            log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
+            log.error("Failed to request termination for process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
         members[pgid] = set(_group_member_pids(pgid).pids)
@@ -575,7 +596,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
                 # An owned zombie keeps killpg(0) positive until its parent reaps it.
                 # Other parents' children remain untouched; their groups stay uncertain.
                 reap_child(pgid)
-            if _process_group_alive_with_members(pgid, members[pgid]):
+            if _process_group_alive_with_members(pgid, members[pgid]) or (
+                guardians is not None and _process_group_alive(guardians[pgid])
+            ):
                 still_alive.append(pgid)
             else:
                 confirmed[pgid] = True
@@ -585,6 +608,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
 
     survivors: list[int] = []
     for pgid in pending:
+        if guardians is not None:
+            survivors.append(pgid)
+            continue
         if sys.platform == "darwin":
             reap_child(pgid)
             if not _process_group_exists(pgid):
@@ -610,7 +636,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
         for pgid in survivors:
             if sys.platform == "darwin":
                 reap_child(pgid)
-            if _process_group_alive_with_members(pgid, members[pgid]):
+            if _process_group_alive_with_members(pgid, members[pgid]) or (
+                guardians is not None and _process_group_alive(guardians[pgid])
+            ):
                 still_alive.append(pgid)
             else:
                 confirmed[pgid] = True
@@ -619,7 +647,11 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
             time.sleep(0.1)
 
     for pgid in survivors:
-        log.error("Process group %d still appears alive after SIGKILL", pgid)
+        log.error(
+            "Process group %d still appears alive after %s",
+            pgid,
+            "guardian cancellation" if guardians is not None else "SIGKILL",
+        )
         confirmed[pgid] = False
     return confirmed
 

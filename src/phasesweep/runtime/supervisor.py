@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import FrameType
 
 # Wire frame constants shared with phasesweep.runtime.process.
 _HEADER_LEN = 10
@@ -25,7 +26,7 @@ _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
 _GROUP_MAX_POLL_SECONDS = 0.5
 _GROUP_TERM_GRACE_SECONDS = 10.0
-ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 2
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
 
 
 def write_lifecycle_record(
@@ -41,7 +42,7 @@ def write_lifecycle_record(
 
     :param Path path: Existing attempt directory's lifecycle file.
     :param str attempt_id: Immutable attempt identity.
-    :param str state: Allocated, launching, or exited lifecycle state.
+    :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param int | None return_code: Supervised process exit code, when known.
     :param bool | None cleanup_confirmed: Whether the whole group has exited.
     :param float | None duration_seconds: Supervised elapsed time, when known.
@@ -213,10 +214,10 @@ def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
 
 
 def _reap_remaining_group(pgid: int) -> bool:
-    """Terminate post-root descendants while retaining inherited leases.
+    """Terminate a trainer group while retaining inherited leases.
 
-    :param int pgid: Trainer process group whose root was already reaped.
-    :return bool: Whether at least one descendant remained after root exit.
+    :param int pgid: Trainer process group being cancelled or surviving its root.
+    :return bool: Whether at least one group member needed termination.
     """
     if not _trainer_group_alive(pgid):
         return False
@@ -327,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         be entered. On success, the supervisor remains outside the trainer's
         process group, holds inherited GPU leases until every group member is
         gone, and returns the trainer root's exit status or terminating signal.
+        Guardian cancellation preserves SIGTERM as the result even if the trainer handles it by exiting zero.
     """
     args = sys.argv[1:] if argv is None else argv
     if len(args) not in {2, 5}:
@@ -334,20 +336,56 @@ def main(argv: list[str] | None = None) -> int:
     ready_fd = int(args[0])
     ack_fd = int(args[1])
 
-    # Restore the parent's inherited signal mask before forking the trainer so
-    # shutdown signals can reach both processes.
-    signal.pthread_sigmask(signal.SIG_SETMASK, set())
+    # A cancellation request must wait until the guardian can preserve its intent.
+    signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM})
 
     child_pid = os.fork()
     if child_pid == 0:
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
         os._exit(_run_trainer(ready_fd, ack_fd))
+
+    def cancel(signum: int, _frame: FrameType | None) -> None:
+        """Interrupt supervision only while the trainer group still needs cleanup.
+
+        :param int signum: Cancellation request delivered to the guardian.
+        :param FrameType | None _frame: Unused signal frame.
+        :raises SystemExit: A live group needs durably recorded cancellation.
+        """
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if _trainer_group_alive(child_pid):
+            raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, cancel)
 
     # The guardian is outside the trainer's new session and
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)
     try:
-        _, status = os.waitpid(child_pid, 0)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+            _, status = os.waitpid(child_pid, 0)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except SystemExit:
+            try:
+                if len(args) == 5:
+                    write_lifecycle_record(
+                        Path(args[2]) / "attempt_lifecycle.json",
+                        attempt_id=args[3],
+                        state="terminating",
+                        return_code=-signal.SIGTERM,
+                        cleanup_confirmed=False,
+                        duration_seconds=None,
+                    )
+            except OSError:
+                # Without durable intent, retain the lease and let the trainer finish.
+                _wait_for_group_exit(child_pid, None)
+                _, status = os.waitpid(child_pid, 0)
+            else:
+                _reap_remaining_group(child_pid)
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(child_pid, 0)
+                status = signal.SIGTERM
         with contextlib.suppress(OSError):
             os.write(ready_fd, _TRAINER_ROOT_EXITED)
         descendants_reaped = _reap_remaining_group(child_pid)

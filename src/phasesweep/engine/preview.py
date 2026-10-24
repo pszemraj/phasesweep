@@ -139,9 +139,12 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     ):
         raise PhaseSweepError(
             f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
-            "the trial and rerun counts depend on its extraction. Run a normal resume "
-            "to recover that evidence before requesting a dry-run plan.",
-            action=OperatorAction.FIX_CONFIG,
+            "the trial and rerun counts depend on its extraction.",
+            action=OperatorAction.RUN_RECOVER_RUN,
+            remediation=(
+                "Run phasesweep run with the same config, without --dry-run, to recover "
+                "completed trainer evidence before requesting a dry-run plan."
+            ),
         )
     recovered_as_failed = sum(
         1 for trial in running if _recovered_trial_state(trial, sequence_counts) == "FAIL"

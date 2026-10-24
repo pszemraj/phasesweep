@@ -13,6 +13,7 @@ from phasesweep.engine.attempts import (
     _cleanup_recovered_trial_numbers,
     _fail_stale_running_trial,
     _record_cleanup_recovery,
+    _record_recovery_interruption,
     _require_trial_attempt,
     _resolve_attempt,
     _trial_attempt_record,
@@ -90,6 +91,7 @@ def _reap_stale_trials(
                     evidence_action=OperatorAction.INSPECT_LOGS,
                     lifecycle_settles=True,
                     confirm=confirm,
+                    before_terminate=partial(_record_recovery_interruption, study, trial),
                 )
             else:
                 # The launch path records the directory before any process can

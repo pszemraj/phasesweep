@@ -12,12 +12,14 @@ from phasesweep.engine.state import (
 )
 
 
-def _experiment_dir(experiment: Experiment) -> Path:
+def _experiment_dir(experiment: Experiment | Path) -> Path:
     """Resolve the workdir, leaving the experiment leaf unresolved.
 
-    :param Experiment experiment: Configuration naming the workdir and experiment leaf.
+    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
     :return Path: Absolute experiment directory with any leaf symlink still unresolved.
     """
+    if isinstance(experiment, Path):
+        return experiment
     return Path(experiment.workdir).expanduser().resolve() / experiment.experiment
 
 
@@ -103,19 +105,19 @@ def _generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "generation.yaml"
 
 
-def _generations_dir(experiment: Experiment) -> Path:
+def _generations_dir(experiment: Experiment | Path) -> Path:
     """Return the root of the experiment's generation namespaces.
 
-    :param Experiment experiment: Configuration naming the experiment directory.
+    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
     :return Path: Parent directory of all generation artifact namespaces.
     """
     return _experiment_dir(experiment) / "generations"
 
 
-def _generation_dir(experiment: Experiment, generation_id: str) -> Path:
+def _generation_dir(experiment: Experiment | Path, generation_id: str) -> Path:
     """Return one generation's artifact namespace.
 
-    :param Experiment experiment: Configuration naming the experiment directory.
+    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
     :param str generation_id: Generation whose artifacts are addressed.
     :return Path: Artifact directory for that generation.
     """
@@ -165,10 +167,10 @@ def _last_successful_generation_path(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "last_successful_generation.yaml"
 
 
-def _generation_config_snapshot_path(experiment: Experiment, generation_id: str) -> Path:
+def _generation_config_snapshot_path(experiment: Experiment | Path, generation_id: str) -> Path:
     """Return one generation's canonical config snapshot path.
 
-    :param Experiment experiment: Configuration naming the experiment directory.
+    :param Experiment | Path experiment: Configuration or an already-resolved artifact root.
     :param str generation_id: Generation whose launch configuration is addressed.
     :return Path: Configuration snapshot inside the generation namespace.
     """

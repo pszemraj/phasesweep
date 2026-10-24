@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Mapping
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,14 +65,16 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
     """Patch group termination to clean up the group but report uncertainty."""
     import phasesweep.runtime.reaper as _reaper
 
-    real_terminate = _reaper._terminate_process_group
+    real_terminate = _reaper._terminate_process_groups
 
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
+    def terminate_then_report_uncertain(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int] | None = None
+    ) -> dict[int, bool]:
+        real_terminate(pgids, grace_seconds=0.05, guardians=guardians)
+        return dict.fromkeys(pgids, False)
 
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_groups",
         terminate_then_report_uncertain,
     )
 
@@ -322,7 +325,19 @@ def test_spawn_interrupt_after_popen_preserves_cleanup_evidence(
         expected_attempt_id="interrupted-supervisor-spawn",
     )
     assert lifecycle is not None
-    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+    if cleanup_confirmed:
+        assert lifecycle.state == "exited"
+        assert lifecycle.cleanup_confirmed is True
+    else:
+        # The guardian may finish independently of the caller's uncertain verdict.
+        assert lifecycle.state in {"launching", "terminating", "exited"}
+        if lifecycle.state == "exited":
+            assert lifecycle.cleanup_confirmed is True
+            assert lifecycle.return_code != 0
+            assert lifecycle.duration_seconds is not None
+        elif lifecycle.state == "terminating":
+            assert lifecycle.return_code == -signal.SIGTERM
+            assert lifecycle.cleanup_confirmed is False
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
@@ -424,14 +439,36 @@ def test_identity_write_failure_marks_launch_before_popen(
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
+@pytest.mark.parametrize("cleanup_return_code", [None, 0, -signal.SIGTERM])
+def test_cleanup_retains_cancellation_after_guardian_dies_before_final_publication(
+    tmp_path: Path, cleanup_return_code: int | None
+) -> None:
+    """Cleanup after guardian death retains cancellation through repeated durable confirmations."""
+    from phasesweep.runtime.process import _record_attempt_exited, write_attempt_lifecycle
+
+    write_attempt_lifecycle(
+        tmp_path,
+        attempt_id="cancelled",
+        state="terminating",
+        return_code=-signal.SIGTERM,
+        cleanup_confirmed=False,
+    )
+    for _ in range(2):
+        _record_attempt_exited(tmp_path, attempt_id="cancelled", return_code=cleanup_return_code)
+        lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="cancelled")
+        assert lifecycle is not None and lifecycle.state == "exited"
+        assert lifecycle.return_code == -signal.SIGTERM
+        assert lifecycle.cleanup_confirmed and lifecycle.duration_seconds is None
+
+
 def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A direct child that never reaps within the bounded wait must report cleanup
     as unconfirmed, not silently ``True``."""
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: True,
+        "phasesweep.runtime.process._terminate_process_groups",
+        lambda pgids, *, grace_seconds, guardians: dict.fromkeys(pgids, True),
     )
 
     proc = Mock(pid=424243, returncode=None)
@@ -1520,11 +1557,14 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     report.
     """
     terminated: list[int] = []
-    active: dict[int, object] = {1234: object()}
+    active = {1234: SimpleNamespace(pid=4321)}
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
-    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+    def fake_terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+    ) -> dict[int, bool]:
+        assert guardians == {1234: 4321}
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1542,10 +1582,12 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
 def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", {1234: object()})
+    monkeypatch.setattr(
+        "phasesweep.runtime.shutdown._active_children", {1234: SimpleNamespace(pid=4321)}
+    )
     monkeypatch.setattr(
         "phasesweep.runtime.shutdown._terminate_process_groups",
-        lambda pgids, *, grace_seconds: dict.fromkeys(pgids, False),
+        lambda pgids, *, grace_seconds, guardians: dict.fromkeys(pgids, False),
     )
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
@@ -1560,13 +1602,16 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first shutdown signal owns cleanup evidence until its pass completes."""
-    active: dict[int, object] = {1234: object(), 5678: object()}
+    active = {1234: SimpleNamespace(pid=4321), 5678: SimpleNamespace(pid=8765)}
     terminated: list[int] = []
     reentered = False
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
-    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+    def fake_terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+    ) -> dict[int, bool]:
+        assert guardians == {1234: 4321, 5678: 8765}
         nonlocal reentered
         terminated.extend(pgids)
         if not reentered:
@@ -1728,7 +1773,7 @@ def test_reaper_raises_when_cleanup_uncertain(
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: False,
+        lambda _identity, **_kwargs: False,
     )
 
     exp = make_experiment(workdir=tmp_path / "runs")
@@ -1748,7 +1793,7 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``_terminate_process_group`` returns ``False`` (cleanup uncertain),
+    """When group termination reports uncertain cleanup,
     ``run_supervised`` must surface that in ``ProcessResult.cleanup_confirmed``
     so the orchestrator can abort instead of launching more trials."""
     # Pattern: actually kill the group with the real implementation, then

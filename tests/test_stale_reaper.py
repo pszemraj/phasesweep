@@ -9,10 +9,11 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from typing import NoReturn
 
 import optuna
 import pytest
@@ -1041,7 +1042,13 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     ("failure_site", "match"),
     [
         pytest.param("outcome", "durable interrupted outcome could not be recorded", id="outcome"),
+        pytest.param(
+            "outcome-read", "durable recovered outcome could not be recorded", id="outcome-read"
+        ),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
+        pytest.param(
+            "ledger-read", "cleanup recovery ledger could not be updated", id="ledger-read"
+        ),
         pytest.param("tell", "Optuna state could not be updated", id="tell"),
     ],
 )
@@ -1051,7 +1058,7 @@ def test_reaper_reports_storage_failures_after_cleanup(
     failure_site: str,
     match: str,
 ) -> None:
-    """Every failed durable recovery write is an operator-facing storage outage."""
+    """Every failed durable recovery read or write is an operator-facing storage outage."""
     exp = make_experiment(workdir=tmp_path / "runs")
     study = optuna.create_study(direction="maximize")
     trial = study.ask()
@@ -1070,9 +1077,35 @@ def test_reaper_reports_storage_failures_after_cleanup(
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
-    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: True)
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _, **_kwargs: True
+    )
 
-    if failure_site == "outcome":
+    if failure_site == "outcome-read":
+        original_get_trials = study.get_trials
+        reads = 0
+
+        def read_trials(
+            *,
+            deepcopy: bool = True,
+            states: Container[optuna.trial.TrialState] | None = None,
+        ) -> list[optuna.trial.FrozenTrial]:
+            """Fail the outcome-state read after the initial stale-trial capture."""
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise OSError("storage read failed")
+            return original_get_trials(deepcopy=deepcopy, states=states)
+
+        monkeypatch.setattr(study, "get_trials", read_trials)
+    elif failure_site == "ledger-read":
+
+        def read_ledger(_study_id: int) -> NoReturn:
+            """Refuse the study-level cleanup ledger read."""
+            raise OSError("storage read failed")
+
+        monkeypatch.setattr(study._storage, "get_study_user_attrs", read_ledger)
+    elif failure_site == "outcome":
         patch_rejected_trial_user_attr(
             monkeypatch,
             TRIAL_OUTCOME_ATTR,
@@ -1109,7 +1142,9 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
     write_trial_identity(
         stale.trial_dir, attempt_id="uncertain-attempt", pid=99999, pgid=99998, starttime=12345
     )
-    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: False)
+    monkeypatch.setattr(
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _, **_kwargs: False
+    )
     uncertain: set[str] = set()
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
