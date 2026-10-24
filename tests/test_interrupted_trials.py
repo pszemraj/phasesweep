@@ -571,14 +571,22 @@ def test_the_shutdown_wait_gives_up_on_a_running_trial_no_worker_finishes(
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "trainer_completed", [False, True], ids=["intent-write-fails", "completed-before-cancellation"]
+    "cancellation",
+    ["intent-write-fails", "completed-before-cancellation", "handles-term", "ignores-term"],
 )
+@pytest.mark.parametrize("procfs_available", [True, False], ids=["procfs", "no-procfs"])
 def test_guardian_cancellation_preserves_evidence_and_lease(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trainer_completed: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancellation: str,
+    procfs_available: bool,
 ) -> None:
-    """Cancellation waits for completed evidence and keeps live training leased when intent cannot persist."""
+    """Guardians reap cancelled children without procfs and retain leases when intent cannot persist."""
     from phasesweep.runtime import process
 
+    trainer_completed = cancellation == "completed-before-cancellation"
+    intent_write_fails = cancellation == "intent-write-fails"
+    cancelled = cancellation in {"handles-term", "ignores-term"}
     started, release, failed, signalled = (
         tmp_path / name for name in ("started", "release", "failed", "signalled")
     )
@@ -589,7 +597,11 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         f"""
         import signal, time
         from pathlib import Path
-        signal.signal(signal.SIGTERM, lambda *_: Path({str(signalled)!r}).touch())
+        def terminate(*_):
+            Path({str(signalled)!r}).touch()
+            if {cancelled!r}:
+                raise SystemExit(0)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN if {cancellation == "ignores-term"!r} else terminate)
         Path({str(started)!r}).touch()
         while not Path({str(release)!r}).exists():
             time.sleep(0.01)
@@ -603,7 +615,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         namespace = runpy.run_path({process._SUPERVISOR_SCRIPT_PATH!r})
         original = namespace["write_lifecycle_record"]
         def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
-            if state == "terminating" and not {trainer_completed!r}:
+            if state == "terminating" and {intent_write_fails!r}:
                 Path({str(failed)!r}).touch()
                 raise OSError("intent write unavailable")
             if state == "exited" and {trainer_completed!r}:
@@ -612,6 +624,11 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
                     time.sleep(0.01)
             original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
         namespace["main"].__globals__["write_lifecycle_record"] = fail_intent
+        namespace["main"].__globals__["_GROUP_TERM_GRACE_SECONDS"] = 0.2
+        if not {procfs_available!r}:
+            def no_procfs(path):
+                raise FileNotFoundError(path)
+            namespace["os"].scandir = no_procfs
         raise SystemExit(namespace["main"]())
         """,
     )
@@ -644,32 +661,38 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             release.touch()
         else:
             guardian.send_signal(signal.SIGTERM)
-        while not failed.exists() and time.monotonic() < deadline:
-            assert guardian.poll() is None
-            time.sleep(0.01)
-        assert failed.exists()
-        assert guardian.poll() is None
-        assert reaper._process_group_alive(pgid) is not trainer_completed
-        with lease.open("w") as contender, pytest.raises(BlockingIOError):
-            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if trainer_completed:
-            publication_timer = threading.Timer(0.2, publish.touch)
-            publication_timer.start()
-            assert reaper._terminate_process_groups(
-                (pgid,), grace_seconds=1.0, guardians={pgid: guardian}
-            ) == {pgid: True}
-            lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
-            assert lifecycle is not None and lifecycle.state == "exited"
-            assert lifecycle.return_code == 0
+        if cancelled:
+            assert guardian.wait(timeout=5) == -signal.SIGTERM
+            assert signalled.exists() is (cancellation == "handles-term")
         else:
-            release.touch()
-        assert guardian.wait(timeout=5) == 0
-        assert not signalled.exists()
+            while not failed.exists() and time.monotonic() < deadline:
+                assert guardian.poll() is None
+                time.sleep(0.01)
+            assert failed.exists()
+            assert guardian.poll() is None
+            assert reaper._process_group_alive(pgid) is not trainer_completed
+            with lease.open("w") as contender, pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if trainer_completed:
+                publication_timer = threading.Timer(0.2, publish.touch)
+                publication_timer.start()
+                assert reaper._terminate_process_groups(
+                    (pgid,), grace_seconds=1.0, guardians={pgid: guardian}
+                ) == {pgid: True}
+                lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
+                assert lifecycle is not None and lifecycle.state == "exited"
+                assert lifecycle.return_code == 0
+            else:
+                release.touch()
+            assert guardian.wait(timeout=5) == 0
+            assert not signalled.exists()
         with lease.open("w") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="held-lease")
         assert lifecycle is not None and lifecycle.state == "exited"
-        assert lifecycle.return_code == 0 and lifecycle.cleanup_confirmed
+        assert lifecycle.return_code == (-signal.SIGTERM if cancelled else 0)
+        assert lifecycle.cleanup_confirmed
+        assert not reaper._process_group_alive(pgid)
     finally:
         release.touch()
         publish.touch()
@@ -680,6 +703,8 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             os.close(ack_write)
         os.close(status_read)
         reaper._terminate_process_group(pgid, grace_seconds=0.1)
+        if guardian.poll() is None:
+            guardian.kill()
         guardian.wait(timeout=5)
         process._unregister(pgid)
 

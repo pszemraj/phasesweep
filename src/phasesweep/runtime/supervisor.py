@@ -197,20 +197,24 @@ def _trainer_group_alive(pgid: int) -> bool:
 
 
 def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
-    """Wait until ``pgid`` is gone, bounded only when ``timeout`` is set.
+    """Reap the trainer root while waiting for its whole group to disappear.
 
-    :param int pgid: Process group whose exit is awaited.
+    :param int pgid: Group led by the guardian's child, which may already be reaped.
     :param float | None timeout: Maximum seconds to wait, or ``None`` for no deadline.
     :return bool: ``True`` once the group is gone, or ``False`` when the deadline expires.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     poll_seconds = _GROUP_POLL_SECONDS
-    while _trainer_group_alive(pgid):
+    while True:
+        # Without procfs, killpg still sees our exited child until it is reaped.
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pgid, os.WNOHANG)
+        if not _trainer_group_alive(pgid):
+            return True
         if deadline is not None and time.monotonic() >= deadline:
             return False
         time.sleep(poll_seconds)
         poll_seconds = min(poll_seconds * 2, _GROUP_MAX_POLL_SECONDS)
-    return True
 
 
 def _reap_remaining_group(pgid: int) -> bool:
@@ -379,8 +383,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
             except OSError:
                 # Without durable intent, retain the lease and let the trainer finish.
-                _wait_for_group_exit(child_pid, None)
                 _, status = os.waitpid(child_pid, 0)
+                _wait_for_group_exit(child_pid, None)
             else:
                 _reap_remaining_group(child_pid)
                 with contextlib.suppress(ChildProcessError):
