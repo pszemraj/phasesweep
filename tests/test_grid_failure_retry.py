@@ -19,7 +19,6 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -38,7 +37,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.experiments import write_experiment
-from tests.ledger_fixtures import winner_payload
+from tests.ledger_fixtures import published_generation_id, winner_payload
 
 
 def _grid(
@@ -636,9 +635,9 @@ def test_grid_winner_with_a_successful_trial_in_every_cell_stays_quiet(
 
 def _published_survivorship(experiment: Experiment) -> dict[str, object]:
     """Read the survivorship check that phase ``p``'s published winner.yaml records."""
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.generation_id is not None
-    confound = winner_payload(experiment, pointer.generation_id)["confound"]
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    confound = winner_payload(experiment, generation_id)["confound"]
     assert isinstance(confound, dict)
     checks = confound["checks"]
     assert isinstance(checks, dict)

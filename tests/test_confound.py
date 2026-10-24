@@ -47,7 +47,7 @@ from phasesweep.engine.state import (
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import log_regex_provenance, make_experiment, write_constant_trainer
-from tests.ledger_fixtures import winner_payload
+from tests.ledger_fixtures import published_generation_id, winner_payload
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
 _FAIL = optuna.trial.TrialState.FAIL
@@ -1031,11 +1031,10 @@ def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
 
 def _published_winner(experiment: Experiment) -> tuple[Path, JsonObject]:
     """Return the published winner path and payload for phase ``p``."""
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "ok"
-    assert pointer.generation_id is not None
-    path = _generation_winner_path(experiment, pointer.generation_id, "p")
-    return path, winner_payload(experiment, pointer.generation_id)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    path = _generation_winner_path(experiment, generation_id, "p")
+    return path, winner_payload(experiment, generation_id)
 
 
 @pytest.mark.integration
