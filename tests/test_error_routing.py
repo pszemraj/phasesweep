@@ -48,7 +48,6 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _completed_trial_count
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -68,8 +67,6 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_DECISION_ATTR,
-    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -116,6 +113,7 @@ from tests.conftest import (
     make_experiment,
     patch_published_trial_read_failure,
     phase_study,
+    record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
     write_trainer,
@@ -1435,24 +1433,8 @@ def _replay_partial_decision_without_opt_in(
     """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     study = phase_study(experiment)
-    trials = study.get_trials(deepcopy=False)
-    target = len(trials) + 1
-    study.set_user_attr(TRIAL_TARGET_ATTR, target)
-    study.set_user_attr(
-        PHASE_DECISION_ATTR,
-        {
-            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
-            "decision": "accepted_partial_timeout",
-            "trial_target": target,
-            "outcome_sequence": max(
-                trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
-            ),
-            "finished_trials": len(trials),
-            "completed_trials": _completed_trial_count(trials),
-            "timeout_scope": "phase",
-            "recovered_abort_sequence": None,
-        },
-    )
+    target = len(study.get_trials(deepcopy=False)) + 1
+    record_accepted_partial_timeout(study, target)
     phase = experiment.phases[0].model_copy(update={"n_trials": target})
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 

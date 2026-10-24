@@ -34,8 +34,6 @@ from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir
 from phasesweep.engine.preview import _placeholder_winner
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
-    PHASE_DECISION_ATTR,
-    PHASE_DECISION_SCHEMA_VERSION,
     PHASE_FINGERPRINT_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -43,13 +41,13 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
     Winner,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import _environment_identity
 from tests.conftest import (
     bounded_metric,
     make_experiment,
     phase_study,
     phase_trials,
+    record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
     write_flaky_trainer,
@@ -304,20 +302,7 @@ def _accept_partial_timeout(tmp_path: Path) -> tuple[Experiment, Winner]:
     """
     winner = run_experiment(_persistent(tmp_path, _phase("a", 2)))["a"]
     study = phase_study(_persistent(tmp_path, _phase("a", 2)), "a")
-    study.set_user_attr(TRIAL_TARGET_ATTR, 4)
-    study.set_user_attr(
-        PHASE_DECISION_ATTR,
-        {
-            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
-            "decision": "accepted_partial_timeout",
-            "trial_target": 4,
-            "outcome_sequence": _load_phase_policy_state(study).max_sequence,
-            "finished_trials": 2,
-            "completed_trials": 2,
-            "timeout_scope": "phase",
-            "recovered_abort_sequence": None,
-        },
-    )
+    record_accepted_partial_timeout(study, 4)
     return _persistent(tmp_path, _phase("a", 4, allow_incomplete_on_timeout=True)), winner
 
 

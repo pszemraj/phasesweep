@@ -41,14 +41,19 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FEASIBLE_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_SCHEMA_VERSION,
+    TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.darwin import read_process_info
@@ -364,6 +369,29 @@ def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.t
     :return list[optuna.trial.FrozenTrial]: Its trials in number order.
     """
     return phase_study(experiment, phase_name).get_trials(deepcopy=False)
+
+
+def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
+    """Record a phase timeout decision at the study's current outcome boundary.
+
+    :param optuna.Study study: Study containing the completed partial run.
+    :param int target: Requested trial target accepted by the timeout decision.
+    """
+    trials = study.get_trials(deepcopy=False)
+    study.set_user_attr(TRIAL_TARGET_ATTR, target)
+    study.set_user_attr(
+        PHASE_DECISION_ATTR,
+        {
+            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+            "decision": "accepted_partial_timeout",
+            "trial_target": target,
+            "outcome_sequence": _load_phase_policy_state(study).max_sequence,
+            "finished_trials": _finished_trial_count(trials),
+            "completed_trials": _completed_trial_count(trials),
+            "timeout_scope": "phase",
+            "recovered_abort_sequence": None,
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
