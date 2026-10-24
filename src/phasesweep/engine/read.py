@@ -1,9 +1,10 @@
 """Read-only status, winners, and trial tables for engine and MCP callers.
 
-Missing and partial results are reported permissively; conflicting artifact-root
-ownership is refused. Resume fingerprint checks belong to ``artifacts._load_winner``.
-Published facts come from the bytes publication validation read. Unpublished
-represented generations are read permissively from their own files.
+The CLI and ``experiment_status`` require a started study. Partial generation
+results are read permissively; latest reads fill missing phase winners from the
+validated publication. Published facts come from the bytes publication validation
+read. Conflicting artifact-root ownership is refused, and resume fingerprint
+checks belong to ``artifacts._load_winner``.
 """
 
 from __future__ import annotations

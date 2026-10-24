@@ -59,9 +59,7 @@ def _reap_stale_trials(
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
         cleanup could not be proven safe.
-    :raises StudyStorageUnavailableError: Cleanup succeeded but Optuna could
-        not be updated to ``FAIL``; refusing to continue with an inconsistent
-        study.
+    :raises StudyStorageUnavailableError: Cleanup succeeded but the terminal result or durable recovery state could not be committed.
     """
     count = 0
     try:

@@ -1,7 +1,7 @@
 # config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
-# Installed reference links and explain's See links target the installed release tag or source revision.
+# explain and MCP explain_config pin links to the installed release tag or source revision at read time; this file links to development docs.
 # The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 # Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
@@ -83,12 +83,13 @@ phases: list[object] (required)
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
-    # Free-text note on the phase. validate prints the current note, and show-winners the one stored with the represented generation.
+    # Free-text note on the phase. validate prints the current note, and show-winners the one stored with each winner's producing generation.
     comment: string | null = null
 
     # Numeric sampled parameter whose smaller values cost less, for example model.depth.
     # With mean repeats, advise the cheapest configuration within the winner's standard error; the selected winner never changes.
     # Requires: repeats.reduce mean and a numeric search_space parameter of this phase; numeric categorical choices may not include booleans.
+    # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats for selection, result reads and replay.
     cost_key: string | null = null
 
     # Earlier phases whose winners' effective overrides, their inherited, fixed and sampled keys, become fixed inputs here. Nothing is inherited unless listed.

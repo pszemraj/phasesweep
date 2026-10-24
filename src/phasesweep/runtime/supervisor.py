@@ -42,7 +42,7 @@ def write_lifecycle_record(
     :param Path path: Existing attempt directory's lifecycle file.
     :param str attempt_id: Immutable attempt identity.
     :param str state: Allocated, launching, or exited lifecycle state.
-    :param int | None return_code: Trainer exit code, when known.
+    :param int | None return_code: Supervised process exit code, when known.
     :param bool | None cleanup_confirmed: Whether the whole group has exited.
     :param float | None duration_seconds: Supervised elapsed time, when known.
     :raises OSError: The record could not be durably replaced.

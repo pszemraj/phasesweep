@@ -939,7 +939,7 @@ class PhaseSweepMCP:
         experiment: Experiment,
         handle: RunHandle,
     ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
-        """Read one publication's live status and winners using the saved run config.
+        """Read run-pinned generation status and winners using the saved run config.
 
         After decataloging, that config still locates artifacts but cannot establish current
         catalog drift; leave the drift verdict unknown.

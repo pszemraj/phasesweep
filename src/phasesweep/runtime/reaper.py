@@ -794,9 +794,7 @@ def kill_stale_group(
     :param int | None pgid: Process-group ID from the same durable identity.
     :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL;
         passed through to :func:`_terminate_process_group`.
-    :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (cleanup confirmed or
-        nothing to clean). ``False`` when cleanup is uncertain and callers must NOT advance
-        state.
+    :return bool: ``True`` when cleanup is confirmed or nothing needs cleaning, permitting the trial to be settled; ``False`` when cleanup is uncertain and callers must not advance state.
     """
     return _apply_stale_process_decision(
         _stale_group_decision(pid, saved_starttime, pgid=pgid), grace_seconds=grace_seconds

@@ -651,9 +651,7 @@ def _registry_attempt_fail_stale_trial(
         holds unsupported PhaseSweep study state.
     :raises ProcessCleanupUncertainError: A terminal trial lacks the identity
         needed to attribute confirmed cleanup to the registry's attempt.
-    :raises StudyStorageUnavailableError: The stale RUNNING trial could not be
-        marked FAIL, or its durable recovery state could not be recorded; the
-        study is left inconsistent rather than silently dropping the failure.
+    :raises StudyStorageUnavailableError: The trial's terminal result or durable recovery state could not be recorded; the attempt remains available for retry.
     """
     if entry["kind"] == "tracking":
         return "recovered"

@@ -150,7 +150,7 @@ Inside `[...]`, write `\]` for a literal `]` and `\\` for a literal `\`. On a li
 
 A mapping key that the config does not have is created, so an absent optional block can be filled in and `trainer_config` takes any new key. If validation then fails at or below a key an assignment created, which is what a misspelled schema key produces, the error adds a note naming that `--set` argument's key and the key it created. A block written as `null` is not absent: replace it whole, as in `--set 'phases[NAME].repeats={key: seed, values: [0, 1]}'`.
 
-Paths inside `--set` retain the YAML file's directory as their base, including `--set workdir=...`. Pass the same assignments to `validate`, `run`, `status`, `show-winners` and `sync-tracking`. A read that finds no study directory fails and names the path it searched. Changing `workdir` alone does not redirect an explicit journal in `storage`; use `--set storage=auto` or a fresh journal path for a derived run. Semantic edits cannot reuse a populated study; choose a fresh experiment/output namespace. Apply `--dry-run` to the same overrides before launching.
+Paths inside `--set` retain the YAML file's directory as their base, including `--set workdir=...`. Pass the same assignments to `validate`, `run`, `status`, `show-winners` and `sync-tracking`; `validate` and the dry run print the resolved `artifact root:`. A read that finds a missing or empty study directory fails and names the path it searched. Changing `workdir` alone does not redirect an explicit journal in `storage`; use `--set storage=auto` or a fresh journal path for a derived run. Semantic edits cannot reuse a populated study; choose a fresh experiment/output namespace. Apply `--dry-run` to the same overrides before launching.
 
 ## Search spaces and samplers
 
@@ -370,7 +370,9 @@ report_objective(
 
 `planned_steps` is the positive optimizer-step target resolved for that trial before training; `actual_steps` is the number of training steps it completed, including when early stopping cuts training short. Trials finishing 100/100 and 200/200 both report `1.0`, so this check stays `ok`; a trial ending at 160/200 reports `0.8` and is flagged against a finished trial. This axis compares relative completion; the trials can still use different data or compute budgets. A heterogeneous verdict appears in MCP's `confound.flagged` list.
 
-With the `wandb` reader, keep that reader and set `metric.extractor.evaluation_axis: schedule_fraction`. Log `schedule_fraction: actual_steps / planned_steps` in the same `wandb.log()` call as the objective so the reader can bind both to the same history row. With `mlflow`, the evaluation axis is the selected metric observation's integer `step`; log a common scaled relative-completion step, for example `int(10000 * actual_steps / planned_steps)`, alongside that objective. Retain lower positions for early stops. MCP results include the axis and a remedy for the reader in use.
+With the `wandb` reader, keep that reader and set `metric.extractor.evaluation_axis: schedule_fraction`. Log `schedule_fraction: actual_steps / planned_steps` in the same `wandb.log()` call as the objective so the reader can bind both to the same history row.
+
+With `mlflow`, the evaluation axis is the selected metric observation's integer `step`. Log the objective under a separate metric key, such as `objective_schedule_fraction`, at `step=int(10000 * actual_steps / planned_steps)`, and set `metric.extractor` to `{type: mlflow, metric_key: objective_schedule_fraction, select: last}`. Keep native-step history under its original metric key so a native step above 10000 cannot displace the relative-completion observation. Retain lower positions for early stops. MCP results include the axis and a remedy for the reader in use.
 
 ### W&B evidence
 

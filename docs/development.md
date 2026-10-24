@@ -83,7 +83,7 @@ Run the complementary lane serially, after the workers have exited:
 pytest -m "not live and (integration or signals_own_pid)"
 ```
 
-Both lanes run on Linux and macOS. Tests whose subject requires real Linux procfs or PID namespaces skip on macOS; synthetic procfs tests retain their Linux provider explicitly, and macOS native identity and MPS lease tests cover the host paths. Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier.
+Both lanes run on Linux and macOS. Tests that require real Linux procfs or PID namespaces skip on macOS; native macOS identity tests require a macOS host. Synthetic providers exercise parsing and routing across hosts, while native identity and MPS lease tests cover macOS host paths. Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier.
 
 To inspect the cost of a qualification run:
 
@@ -218,6 +218,7 @@ The principal test groups and what each covers:
 - `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
+- `tests/test_attempt_lifecycle.py` and `tests/test_process_supervision.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup, and guardian completion evidence.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
