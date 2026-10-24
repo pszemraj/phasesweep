@@ -241,9 +241,7 @@ def _reassert_process_lifetime_handlers() -> None:
         "took process-lifetime ownership; reinstalling them for child cleanup.",
         stale,
     )
-    for sig in stale:
-        signal.signal(sig, _shutdown_handler)
-    _unblock_shutdown_signals()
+    install_signal_handlers()
 
 
 def _restore_host_signal_state(
