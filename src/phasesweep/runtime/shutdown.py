@@ -206,8 +206,8 @@ _scope_depth = 0
 def install_signal_handlers() -> None:
     """Take process-lifetime ownership of SIGTERM, SIGINT and SIGHUP.
 
-    Main-thread only. Reinstall missing handlers and unblock shutdown signals on
-    each call. An open temporary scope hands its installation over and skips
+    Main-thread only. Reinstall missing handlers before unblocking shutdown signals
+    on each call. An open temporary scope hands its installation over and skips
     restoration; later scopes leave process-lifetime ownership intact.
 
     :raises SignalOwnershipUnavailableError: Called outside the main thread.
@@ -219,13 +219,11 @@ def install_signal_handlers() -> None:
             "signal.signal and process-lifetime shutdown-signal ownership are "
             "main-thread-only."
         )
-    _unblock_shutdown_signals()
-    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
-        _process_lifetime_owner = True
-        return
-    for sig in _SHUTDOWN_SIGNALS:
-        signal.signal(sig, _shutdown_handler)
+    if not all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
+        for sig in _SHUTDOWN_SIGNALS:
+            signal.signal(sig, _shutdown_handler)
     _process_lifetime_owner = True
+    _unblock_shutdown_signals()
 
 
 def _reassert_process_lifetime_handlers() -> None:

@@ -471,6 +471,15 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
     ("body", "marker"),
     [
         pytest.param(
+            "signal.signal(signal.SIGTERM, lambda *_: print('host-handler', flush=True))\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
+            "print('queued', flush=True)\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "install_signal_handlers()\n",
+            "queued",
+            id="pending-before-installation",
+        ),
+        pytest.param(
             "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
             "install_signal_handlers()\n"
             "with defer_shutdown_signals():\n"
@@ -499,7 +508,7 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
     ],
 )
 def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> None:
-    """Queued shutdown exits after restoring inherited masks or leaving held critical locks."""
+    """Queued shutdown uses installed handlers before unblocking or leaving critical locks."""
     code = (
         "import os, signal\n"
         "from phasesweep.runtime.shutdown import (install_signal_handlers, "
@@ -515,6 +524,7 @@ def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> N
         check=False,
     )
     assert marker in proc.stdout
+    assert "host-handler" not in proc.stdout
     assert proc.returncode == 128 + signal.SIGTERM
 
 
