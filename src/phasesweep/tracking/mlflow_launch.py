@@ -29,10 +29,15 @@ def main(argv: list[str] | None = None) -> int:
     if not run_id:
         parser.error("MLFLOW_RUN_ID is missing; this launcher requires mlflow.run_mode: managed")
 
-    import mlflow
+    try:
+        import mlflow
+    except ModuleNotFoundError as error:
+        if error.name != "mlflow":
+            raise
+        parser.error('Install the MLflow SDK: pip install "phasesweep[mlflow]"')
 
     sys.argv = [str(args.script), *args.args]
-    sys.path.insert(0, str(args.script.resolve().parent))
+    sys.path[0] = str(args.script.resolve().parent)
     with mlflow.start_run(run_id=run_id):
         try:
             runpy.run_path(str(args.script), run_name="__main__")
