@@ -37,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('Install the MLflow SDK: pip install "phasesweep[mlflow]"')
 
     sys.argv = [str(args.script), *args.args]
-    sys.path[0] = str(args.script.resolve().parent)
+    if not sys.flags.safe_path:
+        del sys.path[0]
+    sys.path.insert(0, str(args.script.resolve().parent))
     with mlflow.start_run(run_id=run_id):
         try:
             runpy.run_path(str(args.script), run_name="__main__")

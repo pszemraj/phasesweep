@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -105,3 +107,63 @@ def test_launcher_missing_sdk_names_install_extra(
         main([str(tmp_path / "trainer.py")])
     assert raised.value.code == 2
     assert 'pip install "phasesweep[mlflow]"' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("safe_path", ["normal", "flag", "environment"])
+def test_launcher_keeps_pythonpath_and_excludes_cwd_shadow(tmp_path: Path, safe_path: str) -> None:
+    """Normal and safe-path launches preserve package paths and script sibling imports."""
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    packages = tmp_path / "packages"
+    packages.mkdir()
+    (tmp_path / "launcher_evaluate.py").write_text(
+        "raise RuntimeError('cwd shadow imported')\n", encoding="utf-8"
+    )
+    (packages / "launcher_evaluate.py").write_text("VALUE = 'package'\n", encoding="utf-8")
+    (packages / "mlflow.py").write_text(
+        "from contextlib import nullcontext\n"
+        "def start_run(*, run_id: str) -> nullcontext[None]:\n"
+        "    assert run_id == 'managed-run'\n"
+        "    return nullcontext()\n",
+        encoding="utf-8",
+    )
+    (script_dir / "launcher_sibling.py").write_text("VALUE = 'sibling'\n", encoding="utf-8")
+    script = script_dir / "trainer.py"
+    script.write_text(
+        "import sys\n"
+        "import launcher_evaluate, launcher_sibling\n"
+        "assert launcher_evaluate.VALUE == 'package'\n"
+        "assert launcher_sibling.VALUE == 'sibling'\n"
+        "assert sys.argv[1:] == ['--learning_rate', '0.1']\n"
+        "print('trainer completed')\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "MLFLOW_RUN_ID": "managed-run",
+        "PYTHONPATH": str(packages),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    env.pop("PYTHONSAFEPATH", None)
+    if safe_path == "environment":
+        env["PYTHONSAFEPATH"] = "1"
+    flags = ["-P"] if safe_path == "flag" else []
+    result = subprocess.run(
+        [
+            sys.executable,
+            *flags,
+            "-m",
+            "phasesweep.tracking.mlflow_launch",
+            str(script),
+            "--learning_rate",
+            "0.1",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "trainer completed\n"
