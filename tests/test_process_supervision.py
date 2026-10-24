@@ -68,7 +68,10 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
     real_terminate = _reaper._terminate_process_groups
 
     def terminate_then_report_uncertain(
-        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int] | None = None
+        pgids: tuple[int, ...],
+        *,
+        grace_seconds: float,
+        guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
     ) -> dict[int, bool]:
         real_terminate(pgids, grace_seconds=0.05, guardians=guardians)
         return dict.fromkeys(pgids, False)
@@ -1529,20 +1532,44 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
     assert elapsed < 2 * grace, f"escalation took {elapsed:.2f}s; grace not shared"
 
 
-def test_terminate_process_groups_reports_per_group_verdicts() -> None:
-    """An already-gone group confirms instantly; a live group still gets killed."""
+@pytest.mark.parametrize("guardian_state", [None, "dead", "dying"])
+def test_terminate_process_groups_reports_per_group_verdicts(
+    guardian_state: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live group gets cleaned after its guardian exits before or during cancellation."""
     dead = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
     dead.wait()
     live = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
+    guardian = (
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+        )
+        if guardian_state == "dying"
+        else dead
+    )
+    real_kill = os.kill
+
+    def kill(pid: int, signum: int) -> None:
+        assert pid != dead.pid or signum == 0
+        real_kill(pid, signum)
+
+    monkeypatch.setattr(os, "kill", kill)
     try:
-        verdicts = _terminate_process_groups((dead.pid, live.pid), grace_seconds=5.0)
+        verdicts = _terminate_process_groups(
+            (dead.pid, live.pid),
+            grace_seconds=5.0,
+            guardians=None if guardian_state is None else {live.pid: guardian},
+        )
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(live.pid, signal.SIGKILL)
         with contextlib.suppress(Exception):
             live.wait(timeout=5)
+        if guardian.poll() is None:
+            guardian.kill()
+        guardian.wait(timeout=5)
 
     assert verdicts == {dead.pid: True, live.pid: True}
 
@@ -1562,9 +1589,12 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
     def fake_terminate(
-        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+        pgids: tuple[int, ...],
+        *,
+        grace_seconds: float,
+        guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == {1234: 4321}
+        assert guardians == active
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1609,9 +1639,12 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
     def fake_terminate(
-        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+        pgids: tuple[int, ...],
+        *,
+        grace_seconds: float,
+        guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == {1234: 4321, 5678: 8765}
+        assert guardians == active
         nonlocal reentered
         terminated.extend(pgids)
         if not reentered:

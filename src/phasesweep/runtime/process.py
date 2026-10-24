@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -78,8 +79,8 @@ _SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
     """Request guardian cancellation and confirm the trial group is gone.
 
-    A known trainer group is terminated by its guardian after durable cancellation intent.
-    Before trainer readiness, only the guardian's own group is terminated directly.
+    A live guardian owns its trainer's durable cancellation and termination. A dead
+    guardian or a launch before trainer readiness requires direct group termination.
     A bounded wait then reaps the guardian; uncertain cleanup blocks new work.
 
     :param int pgid: Process-group ID of the trial subprocess.
@@ -91,7 +92,7 @@ def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
     cleanup_confirmed = _terminate_process_groups(
         (pgid,),
         grace_seconds=_KILL_GRACE_SECONDS,
-        guardians=None if pgid == proc.pid else {pgid: proc.pid},
+        guardians=None if pgid == proc.pid or proc.poll() is not None else {pgid: proc},
     )[pgid]
     try:
         proc.wait(timeout=_DIRECT_CHILD_REAP_TIMEOUT_SECONDS)
@@ -115,7 +116,7 @@ def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
     An uncertain group cleanup leaves the guardian holding its leases; a wait
     that expires must preserve that uncertainty.
 
-    :param subprocess.Popen[bytes] proc: Guardian process whose trainer root already exited.
+    :param subprocess.Popen[bytes] proc: Guardian process whose trainer-status pipe became ready or closed.
     :return bool: Whether the guardian exited inside its cleanup allowance.
     """
     try:
@@ -386,7 +387,7 @@ def _record_attempt_exited(
 
     :param Path trial_dir: Per-trial directory holding the lifecycle record.
     :param str attempt_id: Immutable attempt identity binding the record.
-    :param int | None return_code: Root process return code observed by the supervisor wait.
+    :param int | None return_code: Guardian exit status, mirroring trainer status during normal supervision.
     """
     try:
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
@@ -902,28 +903,33 @@ def run_supervised(
                 )
             if guardian_status == _supervisor._DESCENDANTS_REAPED:
                 failure_reason = (
-                    f"root process exited with code {proc.returncode}, "
-                    f"but process group {pgid} still had live descendants"
+                    f"trainer root exited, but process group {pgid} still had live descendants"
                 )
                 log.warning(
-                    "Process PID %d exited with code %s but process group %d "
+                    "Trainer root PID %d exited but process group %d "
                     "still had live descendants; the lease guardian terminated them",
                     pgid,
-                    proc.returncode,
                     pgid,
                 )
             # Root exit is insufficient: surviving descendants still require group cleanup.
             if failure_reason is None and _process_group_alive(pgid):
                 failure_reason = (
-                    f"root process exited with code {proc.returncode}, "
-                    f"but process group {pgid} still had live descendants"
+                    f"lease guardian {proc.pid} exited with code {proc.returncode}, "
+                    f"but trainer process group {pgid} remained alive"
                 )
                 log.warning(
-                    "Process PID %d exited with code %s but process group %d "
-                    "still has live descendants — terminating group",
-                    pgid,
+                    "Lease guardian PID %d exited with code %s but trainer process group %d "
+                    "remained alive — terminating group",
+                    proc.pid,
                     proc.returncode,
                     pgid,
+                )
+                write_attempt_lifecycle(
+                    trial_dir,
+                    attempt_id=attempt_id,
+                    state="terminating",
+                    return_code=-signal.SIGTERM,
+                    cleanup_confirmed=False,
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
 

@@ -92,6 +92,7 @@ def _reap_stale_trials(
                     lifecycle_settles=True,
                     confirm=confirm,
                     before_terminate=partial(_record_recovery_interruption, study, trial),
+                    recovery_trial=(study, trial),
                 )
             else:
                 # The launch path records the directory before any process can
@@ -105,7 +106,7 @@ def _reap_stale_trials(
             raise
 
         if confirm:
-            _fail_stale_running_trial(
+            settled = _fail_stale_running_trial(
                 study,
                 trial,
                 record=record,
@@ -116,6 +117,8 @@ def _reap_stale_trials(
                     f"with an inconsistent study. trial_dir={trial_dir}"
                 ),
             )
+            if not settled:
+                continue
             log.info(
                 "Confirmed process cleanup for RUNNING trial %d in study %s",
                 trial.number,

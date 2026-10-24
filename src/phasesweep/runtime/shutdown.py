@@ -151,7 +151,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
-            guardians = {pgid: proc.pid for pgid, proc in _active_children.items()}
+            guardians = dict(_active_children)
             pgids = tuple(guardians)
 
         log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
