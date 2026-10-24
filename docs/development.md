@@ -18,7 +18,7 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 
 ## Quality gates
 
-During iteration, run the mandatory checks and tests for the changed subsystem. Use the parallel fast lane below for broader coverage; reserve the complete suite for qualification. Run the repository checks sequentially:
+During iteration, run the mandatory checks and tests for the changed subsystem. Complete qualification uses [both non-live lanes](#test-tiers). Run the repository checks sequentially:
 
 ```bash
 pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
@@ -30,7 +30,7 @@ bash scripts/check_module_size.sh
 ```
 
 > [!IMPORTANT]
-> Run `pytest` by itself, with no concurrent lint or type check: process-supervision and timeout tests are timing-sensitive.
+> Within this checkout, run one test lane at a time and keep `pytest` separate from lint and type checks: process-supervision and timeout tests are timing-sensitive. Bounded test overlap with other projects is allowed.
 
 ### Git hooks
 
@@ -68,28 +68,24 @@ The audit scans every source docstring (including attribute documentation) and c
 
 ### Test tiers
 
-Plain `pytest` runs the complete non-live qualification suite. For broader checks while iterating, use two process workers for the fast lane:
+Complete non-live qualification runs the parallel lane, including integration tests, followed by the serial self-signalling lane. Use a bounded worker count, for example:
 
 ```bash
-pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid" \
+pytest -n 2 --dist worksteal -m "not live and not signals_own_pid" \
   --durations=25 --durations-min=1
 ```
 
-`loadfile` keeps each test module in one worker. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks.
+`worksteal` balances tests across workers. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks. For fast iteration, add `and not integration` to the parallel marker expression.
 
-Run the complementary lane serially, after the workers have exited:
-
-```bash
-pytest -m "not live and (integration or signals_own_pid)"
-```
-
-Both lanes run on Linux and macOS. Tests that require real Linux procfs or PID namespaces skip on macOS; native macOS identity tests require a macOS host. Synthetic providers exercise parsing and routing across hosts, while native identity and MPS lease tests cover macOS host paths. Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier.
-
-To inspect the cost of a qualification run:
+Run only the complementary self-signalling lane serially, after this checkout's parallel lane exits:
 
 ```bash
-pytest --durations=25 --durations-min=1
+pytest -m "not live and signals_own_pid"
 ```
+
+Both lanes run on Linux and macOS. Tests that require real Linux procfs or PID namespaces skip on macOS; native macOS identity tests require a macOS host. Synthetic providers exercise parsing and routing across hosts, while native identity and MPS lease tests cover macOS host paths. Together these lanes cover the same cases as plain `pytest`, so qualification needs no duplicate full serial pass. Only tests that signal their own runner require the serial lane within this checkout.
+
+If tests fail under contention, wait for an idle machine and rerun only the failing node IDs serially. Do not rerun the whole suite. Add the duration-report options shown above to either lane to inspect its runtime.
 
 > [!NOTE]
 > A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why both commands above spell out `not live`.
@@ -242,6 +238,7 @@ These have been requested and declined. Check this list before proposing one aga
 - **An audit-only mode for seed or repeat phases that publishes no winner.** `repeats` already publishes each group's spread with the winner, and a phase that publishes nothing would be a second phase kind for the same need.
 - **A launch queue that chains sweeps.** A scheduler is outside a single-node sweep tool. An agent waits on the blocking run with `await_run` and launches the next one.
 - **Per-item paired bootstrap.** This needs per-example evaluation data that PhaseSweep never collects. The tie warning reports the gap, the combined SE and each group's params; a phase's `cost_key` can advise a cheaper configuration within one standard error from repeat-level objectives without changing selection.
+- **Cost tiebreak for near ties.** Selection ranks the configured objective and keeps its draw-position tiebreak. `cost_key` advises a cheaper configuration within the winning mean's standard error; it does not select a different winner or alter inherited parameters.
 - **Visiting grid configurations in listed order.** A seeded configuration shuffle gives a partial or deadline-truncated search a spread across the space instead of one corner. Each configuration's repeat values stay consecutive in their listed order, so the shuffle does not scatter repeat groups.
 - **A nonzero exit for an accepted incomplete winner or pending MLflow uploads.** Both are configured successes: an incomplete winner is published only under `allow_incomplete_on_timeout`, and its `WINNER` line says `INCOMPLETE`; pending uploads end with a closing line that points to `sync-tracking`.
 - **Shorter trial directory names.** `trials.csv` and `status --trials` are the interfaces for scripts; the directory name carries the generation and attempt IDs that keep attempts apart.
@@ -249,5 +246,5 @@ These have been requested and declined. Check this list before proposing one aga
 - **Restricting `record_env` to `true` and `false`.** It is a plain boolean, and every boolean key accepts the same YAML forms.
 - **Treating a key that overrides a `<<:` merge as a duplicate key.** Keys written in a mapping win over merged ones under standard YAML merge semantics. A key written twice in one mapping, or a second `<<`, is still rejected.
 - **Dropping the experiment-level `trainer_config` check because each phase's composition check repeats it.** The experiment-level check names the `trainer_config` key the override format cannot carry; the phase check only reports that composition failed for that phase.
-- **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and the fast lane leaves it out.
+- **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and fast focused runs leave it out.
 - **One shared failure boundary for the `json_equals`, `json_scalar_bound` and JSON `artifact_size` gates.** Each handler's read-and-report block is four lines and converts a different value. A shared boundary needs a new exception type or a union return, which adds more indirection than the three copies cost.
