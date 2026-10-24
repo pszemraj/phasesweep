@@ -913,7 +913,7 @@ def test_kill_stale_group_pid_pgid_decision_matrix(
         monkeypatch.setattr("os.getpgid", lambda _pid, value=case.derived_pgid: value)
     monkeypatch.setattr(
         "phasesweep.runtime.reaper._terminate_process_group",
-        lambda pgid, *, grace_seconds, on_no_signal=None: calls.append(pgid) or True,
+        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
     confirmed = kill_stale_group(

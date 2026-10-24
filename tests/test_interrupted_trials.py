@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +21,6 @@ import pytest
 from optuna.distributions import IntDistribution
 
 import phasesweep.engine.attempts as attempts_module
-import phasesweep.engine.cleanup as cleanup_module
 import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
 from phasesweep.engine import phase as phase_module
@@ -704,9 +702,6 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         (0, True, "interrupt-intent"),
         (0, True, "interrupt-termination"),
         (0, True, "interrupt-extraction"),
-        (0, True, "finish-before-signal"),
-        (0, True, "finish-before-signal-restart"),
-        (0, True, "finish-before-signal-prior"),
         (0, True, "missing-snapshot"),
         (0, True, "corrupt-snapshot"),
         (0, True, "mcp-missing-snapshot"),
@@ -725,8 +720,6 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
     sdk_worker = recovery_stage in {"sdk", "sdk-interrupt", "sdk-interrupt-parallel"}
     shutdown_sdk = recovery_stage.startswith("sdk-interrupt")
     guardian_cancel = recovery_stage in {"shutdown-trainer", "timeout-trainer"}
-    finishes_in_recovery = recovery_stage.startswith("finish-before-signal")
-    retains_interruption = recovery_stage == "finish-before-signal-prior"
     terminated = recovery_stage in {
         "terminate",
         "mcp-terminate",
@@ -774,7 +767,7 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
         n_jobs=2 if recovery_stage == "sdk-interrupt-parallel" else 1,
         timeout_seconds_per_trial=1.0 if recovery_stage == "timeout-trainer" else 30.0,
     )
-    if terminated or finishes_in_recovery:
+    if terminated:
         experiment = experiment.model_copy(
             update={"trial_command": "exec " + experiment.trial_command}
         )
@@ -801,13 +794,11 @@ from pathlib import Path
 from phasesweep.config.io import load_experiment
 from phasesweep import run_experiment
 from phasesweep.engine import trial
-from phasesweep.engine import attempts, cleanup
 from phasesweep.engine.attempts import _PreflightCleanupReport
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.runtime.remote_worker import run_worker
 from phasesweep.evidence.evaluation import ExtractorError
 from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.runtime.process import read_attempt_lifecycle
 
 original_extract = trial.run_extractor
 
@@ -823,23 +814,8 @@ def extract_with_worker(ctx, cfg, **kwargs):
         raise ExtractorError(f"fake-sdk worker exited {process.return_code}")
     return original_extract(ctx, cfg, **kwargs)
 
-if sys.argv[2] in {"1", "recovery", "recovery-race"}:
+if sys.argv[2] in {"1", "recovery"}:
     trial.run_extractor = extract_with_worker
-if sys.argv[2] == "recovery-race":
-    original_intent = attempts._record_recovery_interruption
-    def finish_after_intent(study, stale):
-        original_intent(study, stale)
-        assert study.get_trials()[0].user_attrs["phasesweep_trial_outcome"]["outcome"] == "interrupted"
-        Path(sys.argv[4]).touch()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            lifecycle = read_attempt_lifecycle(Path(stale.user_attrs["phasesweep_trial_dir"]), expected_attempt_id=stale.user_attrs["phasesweep_attempt_id"])
-            if lifecycle is not None and lifecycle.state == "exited":
-                break
-            time.sleep(0.02)
-        assert lifecycle is not None and lifecycle.return_code == 0 and lifecycle.cleanup_confirmed
-    attempts._record_recovery_interruption = finish_after_intent
-    cleanup._record_recovery_interruption = finish_after_intent
 experiment = load_experiment(sys.argv[1])
 if sys.argv[2].startswith("recovery"):
     _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
@@ -888,14 +864,10 @@ else:
                 assert intent["state"] == "terminating"
                 assert intent["return_code"] == -signal.SIGTERM
                 assert intent["cleanup_confirmed"] is False
-            if not terminated and not finishes_in_recovery:
+            if not terminated:
                 release.touch()
             (trial,) = phase_trials(experiment)
-            if (
-                (sdk_worker and not shutdown_sdk)
-                or (terminated and not guardian_cancel)
-                or finishes_in_recovery
-            ):
+            if (sdk_worker and not shutdown_sdk) or (terminated and not guardian_cancel):
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == "launching"
                 assert reaper._process_group_alive(orphan_identity.pgid)
@@ -925,18 +897,14 @@ else:
                     pgid: int,
                     *,
                     grace_seconds: float,
-                    on_no_signal: Callable[[], None] | None = None,
                 ) -> bool:
                     """Expose a handled SIGTERM's real zero exit before recovery reads evidence.
 
                     :param int pgid: Trainer group selected for termination.
                     :param float grace_seconds: SIGTERM grace before escalation.
-                    :param Callable[[], None] | None on_no_signal: Receive an initial request that delivered no signal.
                     :return bool: Confirmed cleanup after the guardian records the trainer exit.
                     """
-                    assert terminate_group(
-                        pgid, grace_seconds=grace_seconds, on_no_signal=on_no_signal
-                    )
+                    assert terminate_group(pgid, grace_seconds=grace_seconds)
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         exited = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
@@ -999,14 +967,14 @@ else:
                 assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
                 assert launches.read_text() == "launch\n"
                 snapshot.write_bytes(snapshot_bytes)
-            if recovery_stage in {"interrupt-extraction", "finish-before-signal-restart"}:
+            if recovery_stage == "interrupt-extraction":
                 recovery_runner = subprocess.Popen(
                     [
                         sys.executable,
                         "-c",
                         runner_code,
                         str(config),
-                        "recovery-race" if finishes_in_recovery else "recovery",
+                        "recovery",
                         str(worker),
                         str(release),
                     ],
@@ -1020,11 +988,7 @@ else:
                 assert worker_started.exists()
                 pending = phase_trials(experiment)[0]
                 assert pending.user_attrs[RETURN_CODE_ATTR] == 0
-                if finishes_in_recovery:
-                    assert pending.user_attrs.get(TRIAL_OUTCOME_ATTR) is None
-                    assert pending.user_attrs[DURATION_ATTR] > 0
-                else:
-                    assert pending.user_attrs[DURATION_ATTR] == lifecycle.duration_seconds
+                assert pending.user_attrs[DURATION_ATTR] == lifecycle.duration_seconds
                 recovery_runner.kill()
                 recovery_runner.wait(timeout=5)
                 orphan_identity = reaper.read_stale_process_identity(
@@ -1033,41 +997,7 @@ else:
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.state == "launching"
                 trial = pending
-            if recovery_stage in {"finish-before-signal", "finish-before-signal-prior"}:
-                original_intent = attempts_module._record_recovery_interruption
-                if retains_interruption:
-                    _record_stale_trial_outcome(phase_study(experiment), trial)
-                    prior_outcome = phase_trials(experiment)[0].user_attrs[TRIAL_OUTCOME_ATTR]
-
-                def finish_after_intent(
-                    study: optuna.Study, stale: optuna.trial.FrozenTrial
-                ) -> None:
-                    """Finish the trainer after durable intent and before the first signal.
-
-                    :param optuna.Study study: Owning phase study.
-                    :param optuna.trial.FrozenTrial stale: Running trainer trial.
-                    """
-                    original_intent(study, stale)
-                    assert study.get_trials()[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == (
-                        "interrupted"
-                    )
-                    release.touch()
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        finished = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
-                        if finished is not None and finished.state == "exited":
-                            break
-                        time.sleep(0.02)
-                    assert finished is not None and finished.return_code == 0
-                    assert finished.cleanup_confirmed
-
-                monkeypatch.setattr(
-                    attempts_module, "_record_recovery_interruption", finish_after_intent
-                )
-                monkeypatch.setattr(
-                    cleanup_module, "_record_recovery_interruption", finish_after_intent
-                )
-            if return_code == 0 and not terminated and not finishes_in_recovery:
+            if return_code == 0 and not terminated:
                 assert (
                     _recovered_trial_state(trial, _outcome_sequence_counts([trial]))
                     == "EVIDENCE_PENDING"
@@ -1125,19 +1055,15 @@ else:
                         pgid: int,
                         *,
                         grace_seconds: float,
-                        on_no_signal: Callable[[], None] | None = None,
                     ) -> bool:
                         """Stop recovery after SIGTERM cleanup and before trial settlement.
 
                         :param int pgid: Trainer group selected for termination.
                         :param float grace_seconds: SIGTERM grace before escalation.
-                        :param Callable[[], None] | None on_no_signal: Receive an initial request that delivered no signal.
                         :raises KeyboardInterrupt: After real group cleanup completes.
                         :return bool: Never returns because recovery is interrupted.
                         """
-                        assert original_terminate(
-                            pgid, grace_seconds=grace_seconds, on_no_signal=on_no_signal
-                        )
+                        assert original_terminate(pgid, grace_seconds=grace_seconds)
                         raise KeyboardInterrupt
 
                     target = reaper
@@ -1178,11 +1104,9 @@ else:
                 _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
             (recovered,) = phase_trials(experiment)
             assert recovered.state.name == (
-                "COMPLETE"
-                if return_code == 0 and not terminated and not retains_interruption
-                else "FAIL"
+                "COMPLETE" if return_code == 0 and not terminated else "FAIL"
             )
-            if return_code == 0 and not terminated and not retains_interruption:
+            if return_code == 0 and not terminated:
                 assert recovered.value == 1.0
                 assert recovered.user_attrs[FEASIBLE_ATTR] is feasible
                 if feasible:
@@ -1201,14 +1125,12 @@ else:
                 assert _trial_interrupted(recovered)
             assert launches.read_text() == "launch\n"
             assert not reaper._process_group_alive(orphan_identity.pgid)
-            if terminated or retains_interruption:
+            if terminated:
                 lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=attempt)
                 assert lifecycle is not None and lifecycle.return_code == (
                     -signal.SIGTERM if guardian_cancel else 0
                 )
                 assert recovered.value is None
-                if retains_interruption:
-                    assert recovered.user_attrs[TRIAL_OUTCOME_ATTR] == prior_outcome
                 release.touch()
                 assert run_experiment(experiment)["p"].metric == 1.0
                 rerun = phase_trials(experiment)[1]

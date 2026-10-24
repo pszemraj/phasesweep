@@ -52,7 +52,7 @@ from phasesweep.runtime.files import (
     read_private_text_at,
     storage_recovery_locator,
 )
-from phasesweep.runtime.json import JsonObject, json_object, json_text, strict_json_loads
+from phasesweep.runtime.json import JsonObject, json_text, strict_json_loads
 from phasesweep.runtime.process import (
     AttemptLifecycle,
     _record_attempt_exited,
@@ -705,13 +705,6 @@ def _registry_attempt_fail_stale_trial(
             lifecycle_settles=True,
             confirm=True,
             before_terminate=before_terminate,
-            recovery_trial=(
-                (study, trial)
-                if study is not None
-                and trial is not None
-                and trial.state == optuna.trial.TrialState.RUNNING
-                else None
-            ),
         )
 
     if entry["kind"] == "tracking":
@@ -913,7 +906,6 @@ def _resolve_attempt(
     lifecycle_settles: bool,
     confirm: bool,
     before_terminate: Callable[[], None] | None = None,
-    recovery_trial: tuple[optuna.Study, optuna.trial.FrozenTrial] | None = None,
 ) -> None:
     """Inspect or clean one attempt using its durable lifecycle and process identity.
 
@@ -927,10 +919,9 @@ def _resolve_attempt(
     :param bool lifecycle_settles: Whether lifecycle evidence can prove cleanup.
     :param bool confirm: Clean the process group; False validates evidence without signalling.
     :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before terminating a live group.
-    :param tuple[optuna.Study, optuna.trial.FrozenTrial] | None recovery_trial: RUNNING owner whose newly recorded interruption can be retired after proven signal-free completion.
     :raises ProcessCleanupUncertainError: Invalid or mismatched lifecycle/identity,
         or unconfirmed process cleanup.
-    :raises StudyStorageUnavailableError: Recovery intent could not be read or retired durably.
+    :raises StudyStorageUnavailableError: Recovery intent could not be recorded durably before signalling.
     """
     context = (
         f"{context}: attempt={record.attempt_id} phase={record.phase_name!r} "
@@ -986,78 +977,9 @@ def _resolve_attempt(
             action,
         )
         return
-    previous_outcome: JsonObject | None = None
-    introduced_interruption: JsonObject | None = None
-
-    def preserve_interruption() -> None:
-        """Capture this pass's interruption without changing a prior failure's authority."""
-        nonlocal previous_outcome, introduced_interruption
-        eligible = False
-        if recovery_trial is not None:
-            try:
-                study, stale = recovery_trial
-                raw: object = study._storage.get_trial(stale._trial_id).user_attrs.get(
-                    TRIAL_OUTCOME_ATTR
-                )
-                parsed = _parsed_trial_outcome(raw)
-                eligible = raw is None or (parsed is not None and parsed.outcome == "success")
-                if eligible:
-                    previous_outcome = None if raw is None else json_object(raw)
-            except Exception as exc:
-                raise StudyStorageUnavailableError(
-                    f"{context}: interruption state could not be read before signalling; the trial remains RUNNING."
-                ) from exc
-        if before_terminate is not None:
-            before_terminate()
-        if eligible and recovery_trial is not None:
-            try:
-                study, stale = recovery_trial
-                current: object = study._storage.get_trial(stale._trial_id).user_attrs.get(
-                    TRIAL_OUTCOME_ATTR
-                )
-                parsed = _parsed_trial_outcome(current)
-                if parsed is not None and parsed.outcome == "interrupted":
-                    introduced_interruption = json_object(current)
-            except Exception as exc:
-                raise StudyStorageUnavailableError(
-                    f"{context}: interruption state could not be confirmed before signalling; the trial remains RUNNING."
-                ) from exc
-
-    def retire_unsignalled_interruption() -> None:
-        """Keep naturally completed training when this pass delivered no termination signal."""
-        if recovery_trial is None or introduced_interruption is None:
-            return
-        try:
-            completed = read_attempt_lifecycle(
-                record.trial_dir, expected_attempt_id=record.attempt_id
-            )
-        except (OSError, ValueError) as exc:
-            raise ProcessCleanupUncertainError(
-                f"{context}: signal-free cleanup lacks readable completion evidence; the trial remains RUNNING.",
-                action=evidence_action,
-            ) from exc
-        try:
-            study, stale = recovery_trial
-            current = study._storage.get_trial(stale._trial_id)
-            if (
-                completed is not None
-                and completed.state == "exited"
-                and completed.cleanup_confirmed
-                and _completed_trainer_duration(current, completed) is not None
-                and current.user_attrs.get(TRIAL_OUTCOME_ATTR) == introduced_interruption
-            ):
-                optuna.Trial(study, stale._trial_id).set_user_attr(
-                    TRIAL_OUTCOME_ATTR, previous_outcome
-                )
-        except Exception as exc:
-            raise StudyStorageUnavailableError(
-                f"{context}: signal-free completion could not retire this recovery pass's interruption; the trial remains RUNNING."
-            ) from exc
-
     if not cleanup_stale_trial_process(
         identity,
-        before_terminate=preserve_interruption,
-        on_no_signal=(retire_unsignalled_interruption if recovery_trial is not None else None),
+        before_terminate=before_terminate,
     ):
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed. "

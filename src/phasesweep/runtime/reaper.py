@@ -502,14 +502,12 @@ def cleanup_stale_trial_process(
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
     before_terminate: Callable[[], None] | None = None,
-    on_no_signal: Callable[[], None] | None = None,
 ) -> bool:
     """Apply the same boot, namespace and group decision used by recovery inspection.
 
     :param StaleProcessIdentity identity: Attempt-bound durable process identity.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
     :param Callable[[], None] | None before_terminate: Commit recovery intent before signalling a live group; a raised exception prevents termination.
-    :param Callable[[], None] | None on_no_signal: Record proof that the first termination request found the group gone without delivering a signal.
     :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
     :return bool: Whether cleanup is confirmed; unsafe identities remain untouched.
     """
@@ -517,7 +515,6 @@ def cleanup_stale_trial_process(
         stale_trial_process_decision(identity),
         grace_seconds=grace_seconds,
         before_terminate=before_terminate,
-        on_no_signal=on_no_signal,
     )
 
 
@@ -526,14 +523,12 @@ def _apply_stale_process_decision(
     *,
     grace_seconds: float,
     before_terminate: Callable[[], None] | None = None,
-    on_no_signal: Callable[[], None] | None = None,
 ) -> bool:
     """Apply a freshly probed cleanup decision.
 
     :param StaleProcessDecision decision: Current process evidence and signal target.
     :param float grace_seconds: SIGTERM grace before SIGKILL.
     :param Callable[[], None] | None before_terminate: Persist recovery intent before sending a signal.
-    :param Callable[[], None] | None on_no_signal: Settle intent when the initial termination request delivered no signal.
     :return bool: Whether the group is confirmed gone.
     """
     log.warning("Stale process cleanup: %s.", decision.reason)
@@ -542,37 +537,19 @@ def _apply_stale_process_decision(
     assert decision.pgid is not None
     if before_terminate is not None:
         before_terminate()
-    return _terminate_process_group(
-        decision.pgid, grace_seconds=grace_seconds, on_no_signal=on_no_signal
-    )
+    return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
-def _terminate_process_group(
-    pgid: int, *, grace_seconds: float, on_no_signal: Callable[[], None] | None = None
-) -> bool:
+def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     """Send SIGTERM, wait, then SIGKILL, confirming the group is gone.
 
     :param int pgid: Target process-group ID.
     :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL.
-    :param Callable[[], None] | None on_no_signal: Settle newly recorded intent only when no initial termination signal was delivered.
     :return bool: ``True`` if the group is confirmed dead (already gone, or died within the
         SIGTERM grace, or died within 2s after SIGKILL). ``False`` if signal delivery failed
         for non-``ProcessLookupError`` reasons, or the group is still alive 2s after SIGKILL.
     """
-
-    def record_no_signal(_pgid: int) -> None:
-        """Forward this group's signal-free cleanup receipt.
-
-        :param int _pgid: Sole target group selected by the shared reaper.
-        """
-        if on_no_signal is not None:
-            on_no_signal()
-
-    return _terminate_process_groups(
-        (pgid,),
-        grace_seconds=grace_seconds,
-        on_no_signal=record_no_signal if on_no_signal is not None else None,
-    )[pgid]
+    return _terminate_process_groups((pgid,), grace_seconds=grace_seconds)[pgid]
 
 
 def _terminate_process_groups(
@@ -580,7 +557,6 @@ def _terminate_process_groups(
     *,
     grace_seconds: float,
     guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
-    on_no_signal: Callable[[int], None] | None = None,
 ) -> dict[int, bool]:
     """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
@@ -591,7 +567,6 @@ def _terminate_process_groups(
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
     :param Mapping[int, subprocess.Popen[bytes]] | None guardians: Group-to-guardian processes whose cancellation protocol owns durable intent and trainer signals while they remain alive.
-    :param Callable[[int], None] | None on_no_signal: Receive an unguarded group ID only when its first termination request delivered no signal and the group is confirmed gone.
     :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
         group and any assigned guardian are confirmed dead, so lifecycle publication has finished.
     """
@@ -611,18 +586,12 @@ def _terminate_process_groups(
             guardian is not None and guardian.poll() is None and _process_group_alive(guardian.pid)
         )
 
-    def request_termination(pgid: int, *, initial: bool = False) -> bool:
+    def request_termination(pgid: int) -> bool:
         """Delegate to a live guardian or terminate the unguarded trainer group.
 
         :param int pgid: Trainer process group requiring cancellation.
-        :param bool initial: Whether this is the first request, before any cancellation signal.
         :return bool: Whether signal delivery succeeded and cleanup still needs observation.
         """
-        unguarded = pgid not in active_guardians
-        if initial and unguarded and on_no_signal is not None and not _process_group_alive(pgid):
-            confirmed[pgid] = True
-            on_no_signal(pgid)
-            return False
         try:
             guardian = active_guardians.get(pgid)
             if guardian is not None and guardian_alive(pgid):
@@ -633,8 +602,6 @@ def _terminate_process_groups(
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             confirmed[pgid] = not _process_group_alive(pgid)
-            if initial and unguarded and confirmed[pgid] and on_no_signal is not None:
-                on_no_signal(pgid)
             return False
         except OSError as exc:
             log.error("Failed to request termination for process group %d: %s", pgid, exc)
@@ -662,7 +629,7 @@ def _terminate_process_groups(
         return True
 
     for pgid in pgids:
-        if request_termination(pgid, initial=True):
+        if request_termination(pgid):
             members[pgid] = set(_group_member_pids(pgid).pids)
             pending.append(pgid)
 

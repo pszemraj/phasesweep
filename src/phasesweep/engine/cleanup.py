@@ -92,7 +92,6 @@ def _reap_stale_trials(
                     lifecycle_settles=True,
                     confirm=confirm,
                     before_terminate=partial(_record_recovery_interruption, study, trial),
-                    recovery_trial=(study, trial),
                 )
             else:
                 # The launch path records the directory before any process can
