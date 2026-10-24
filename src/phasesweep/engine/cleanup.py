@@ -13,13 +13,14 @@ from phasesweep.engine.attempts import (
     _cleanup_recovered_trial_numbers,
     _fail_stale_running_trial,
     _record_cleanup_recovery,
+    _record_recovery_interruption,
     _require_trial_attempt,
     _resolve_attempt,
     _trial_attempt_record,
     _trial_dir_from_attr,
     _trial_requires_cleanup_recovery,
 )
-from phasesweep.engine.paths import _trial_dir_for
+from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -40,7 +41,7 @@ def _reap_stale_trials(
     recovered_attempts: dict[str, _AttemptRecord] | None = None,
     uncertain_attempt_ids: set[str] | None = None,
 ) -> int:
-    """Resolve stale RUNNING attempts, then mark their trials FAIL.
+    """Resolve stale RUNNING attempts and recover completed evidence or interruptions.
 
     Inspection validates evidence without signalling or writing. Confirmed recovery
     must still find the same RUNNING trials before recording cleanup evidence.
@@ -49,19 +50,17 @@ def _reap_stale_trials(
     :param Experiment experiment: Experiment used to locate trial directories.
     :param str phase_name: Name of the phase containing the stale trials.
     :param bool confirm: Clean orphaned process groups and mark each stale
-        trial FAIL when true; otherwise only validate and count.
+        trial terminal when true; otherwise only validate and count.
     :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
-        mapping from each attempt id whose trial was marked FAIL (or, when
+        mapping from each attempt id whose trial became terminal (or, when
         inspecting, would be) to its record.
     :param set[str] | None uncertain_attempt_ids: Optional collector for exact
         attempt identities whose cleanup could not be proven.
-    :return int: Number of stale RUNNING trials marked FAIL, or found when inspecting.
+    :return int: Number of stale RUNNING trials settled, or found when inspecting.
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
         cleanup could not be proven safe.
-    :raises StudyStorageUnavailableError: Cleanup succeeded but Optuna could
-        not be updated to ``FAIL``; refusing to continue with an inconsistent
-        study.
+    :raises StudyStorageUnavailableError: Cleanup succeeded but the terminal result or durable recovery state could not be committed.
     """
     count = 0
     try:
@@ -92,6 +91,7 @@ def _reap_stale_trials(
                     evidence_action=OperatorAction.INSPECT_LOGS,
                     lifecycle_settles=True,
                     confirm=confirm,
+                    before_terminate=partial(_record_recovery_interruption, study, trial),
                 )
             else:
                 # The launch path records the directory before any process can
@@ -105,15 +105,19 @@ def _reap_stale_trials(
             raise
 
         if confirm:
-            _fail_stale_running_trial(
+            settled = _fail_stale_running_trial(
                 study,
                 trial,
+                record=record,
+                artifact_root=_experiment_dir(experiment),
                 failure_message=(
                     f"Stale process cleanup completed for RUNNING trial {trial.number}, "
                     f"but Optuna state could not be updated to FAIL. Refusing to continue "
                     f"with an inconsistent study. trial_dir={trial_dir}"
                 ),
             )
+            if not settled:
+                continue
             log.info(
                 "Confirmed process cleanup for RUNNING trial %d in study %s",
                 trial.number,

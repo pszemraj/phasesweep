@@ -23,15 +23,10 @@ def test_hf_argparse_recipe_reads_results_below_the_rendered_output_dir(tmp_path
         recipe.encode(), source="documented HF recipe", config_dir=tmp_path
     )
     phase = experiment.phases[0]
-    assert phase.repeats is not None
-    assert phase.repeats.key == "seed"
-    assert phase.n_trials == 4
-    assert len(phase.repeats.values) == 2
-
     trial_dir = tmp_path / "trial"
     command = render_command(
         experiment.trial_command,
-        {"learning_rate": 0.00002, "seed": phase.repeats.values[0]},
+        {**phase.fixed_overrides, "learning_rate": 0.00002},
         experiment.override_format,
         trial_dir=trial_dir,
         trial_id=0,

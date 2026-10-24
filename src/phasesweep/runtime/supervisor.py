@@ -12,7 +12,10 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
+from pathlib import Path
+from types import FrameType
 
 # Wire frame constants shared with phasesweep.runtime.process.
 _HEADER_LEN = 10
@@ -23,6 +26,51 @@ _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
 _GROUP_MAX_POLL_SECONDS = 0.5
 _GROUP_TERM_GRACE_SECONDS = 10.0
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
+
+
+def write_lifecycle_record(
+    path: Path,
+    *,
+    attempt_id: str,
+    state: str,
+    return_code: int | None,
+    cleanup_confirmed: bool | None,
+    duration_seconds: float | None,
+) -> None:
+    """Atomically persist lifecycle evidence from either supervisor or orchestrator.
+
+    :param Path path: Existing attempt directory's lifecycle file.
+    :param str attempt_id: Immutable attempt identity.
+    :param str state: Allocated, launching, terminating, or exited lifecycle state.
+    :param int | None return_code: Supervised process exit code, when known.
+    :param bool | None cleanup_confirmed: Whether the whole group has exited.
+    :param float | None duration_seconds: Supervised elapsed time, when known.
+    :raises OSError: The record could not be durably replaced.
+    """
+    payload = {
+        "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "state": state,
+        "return_code": return_code,
+        "cleanup_confirmed": cleanup_confirmed,
+        "duration_seconds": duration_seconds,
+    }
+    fd, stage = tempfile.mkstemp(prefix=".attempt-lifecycle-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(stage, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(stage)
 
 
 def _read_exact(fd: int, size: int) -> bytes | None:
@@ -149,27 +197,31 @@ def _trainer_group_alive(pgid: int) -> bool:
 
 
 def _wait_for_group_exit(pgid: int, timeout: float | None) -> bool:
-    """Wait until ``pgid`` is gone, bounded only when ``timeout`` is set.
+    """Reap the trainer root while waiting for its whole group to disappear.
 
-    :param int pgid: Process group whose exit is awaited.
+    :param int pgid: Group led by the guardian's child, which may already be reaped.
     :param float | None timeout: Maximum seconds to wait, or ``None`` for no deadline.
     :return bool: ``True`` once the group is gone, or ``False`` when the deadline expires.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     poll_seconds = _GROUP_POLL_SECONDS
-    while _trainer_group_alive(pgid):
+    while True:
+        # Without procfs, killpg still sees our exited child until it is reaped.
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pgid, os.WNOHANG)
+        if not _trainer_group_alive(pgid):
+            return True
         if deadline is not None and time.monotonic() >= deadline:
             return False
         time.sleep(poll_seconds)
         poll_seconds = min(poll_seconds * 2, _GROUP_MAX_POLL_SECONDS)
-    return True
 
 
 def _reap_remaining_group(pgid: int) -> bool:
-    """Terminate post-root descendants while retaining inherited leases.
+    """Terminate a trainer group while retaining inherited leases.
 
-    :param int pgid: Trainer process group whose root was already reaped.
-    :return bool: Whether at least one descendant remained after root exit.
+    :param int pgid: Trainer process group being cancelled or surviving its root.
+    :return bool: Whether at least one group member needed termination.
     """
     if not _trainer_group_alive(pgid):
         return False
@@ -271,43 +323,95 @@ def _return_child_status(status: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Fork a blocked trainer and guard its whole process group.
 
-    :param list[str] | None argv: Optional ``[ready_fd, ack_fd]`` argument
+    :param list[str] | None argv: Optional ``[ready_fd, ack_fd, trial_dir, attempt_id, started]`` argument
         vector; defaults to ``sys.argv[1:]`` when omitted.
-    :return int: ``64`` if ``argv`` does not have exactly two elements; ``75``
+    :return int: ``64`` if ``argv`` has neither two nor five elements; ``75``
         if the acknowledgement pipe does not deliver a well-formed
         ``{"cmd": str, "env": {str: str}}`` payload before EOF or a shape
         violation; ``76`` if the payload's optional working directory cannot
         be entered. On success, the supervisor remains outside the trainer's
         process group, holds inherited GPU leases until every group member is
         gone, and returns the trainer root's exit status or terminating signal.
+        Guardian cancellation preserves SIGTERM as the result even if the trainer handles it by exiting zero.
     """
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 2:
+    if len(args) not in {2, 5}:
         return 64
     ready_fd = int(args[0])
     ack_fd = int(args[1])
 
-    # Restore the parent's inherited signal mask before forking the trainer so
-    # shutdown signals can reach both processes.
-    signal.pthread_sigmask(signal.SIG_SETMASK, set())
+    # A cancellation request must wait until the guardian can preserve its intent.
+    signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGTERM})
 
     child_pid = os.fork()
     if child_pid == 0:
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
         os._exit(_run_trainer(ready_fd, ack_fd))
+
+    def cancel(signum: int, _frame: FrameType | None) -> None:
+        """Interrupt supervision only while the trainer group still needs cleanup.
+
+        :param int signum: Cancellation request delivered to the guardian.
+        :param FrameType | None _frame: Unused signal frame.
+        :raises SystemExit: A live group needs durably recorded cancellation.
+        """
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if _trainer_group_alive(child_pid):
+            raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, cancel)
 
     # The guardian is outside the trainer's new session and
     # process group. Group-directed SIGKILL can therefore never release its
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)
     try:
-        _, status = os.waitpid(child_pid, 0)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+            _, status = os.waitpid(child_pid, 0)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except SystemExit:
+            try:
+                if len(args) == 5:
+                    write_lifecycle_record(
+                        Path(args[2]) / "attempt_lifecycle.json",
+                        attempt_id=args[3],
+                        state="terminating",
+                        return_code=-signal.SIGTERM,
+                        cleanup_confirmed=False,
+                        duration_seconds=None,
+                    )
+            except OSError:
+                # Without durable intent, retain the lease and let the trainer finish.
+                _, status = os.waitpid(child_pid, 0)
+                _wait_for_group_exit(child_pid, None)
+            else:
+                _reap_remaining_group(child_pid)
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(child_pid, 0)
+                status = signal.SIGTERM
         with contextlib.suppress(OSError):
             os.write(ready_fd, _TRAINER_ROOT_EXITED)
-        if _reap_remaining_group(child_pid):
+        descendants_reaped = _reap_remaining_group(child_pid)
+        if descendants_reaped:
             with contextlib.suppress(OSError):
                 os.write(ready_fd, _DESCENDANTS_REAPED)
             # A closed pipe is expected after an orchestrator hard exit: there
             # is no parent left to consume the diagnostic, but cleanup continues.
+        if len(args) == 5:
+            return_code = os.waitstatus_to_exitcode(status)
+            # Descendant cleanup is a failed trial even when its root returned zero.
+            if descendants_reaped and return_code == 0:
+                return_code = 1
+            with contextlib.suppress(OSError):
+                write_lifecycle_record(
+                    Path(args[2]) / "attempt_lifecycle.json",
+                    attempt_id=args[3],
+                    state="exited",
+                    return_code=return_code,
+                    cleanup_confirmed=True,
+                    duration_seconds=time.monotonic() - float(args[4]),
+                )
         return _return_child_status(status)
     finally:
         os.close(ready_fd)

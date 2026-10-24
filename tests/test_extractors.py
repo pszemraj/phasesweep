@@ -32,6 +32,7 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
 )
 from tests.conftest import make_trial_context
+from tests.tracking_helpers import ManualClock
 
 
 def _wandb_poll(**kwargs):
@@ -492,12 +493,7 @@ def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch
 
 def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypatch):
     """Only waiting for history to catch up is bounded by the settle window."""
-    clock = [0.0]
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        "phasesweep.evidence.wandb.time.sleep",
-        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-    )
+    clock = _fake_wandb_clock(monkeypatch)
 
     class FlakyRun(_HistoryRun):
         failures = 1
@@ -505,7 +501,7 @@ def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypa
         def history(self, keys, samples=500, pandas=True):
             if self.failures:
                 self.failures -= 1
-                clock[0] += 40.0  # a long read, then a dropped connection
+                clock.now += 40.0  # a long read, then a dropped connection
                 raise ConnectionError("connection reset by peer")
             return super().history(keys, samples, pandas)
 
@@ -518,15 +514,15 @@ def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
     monkeypatch, timeout, expected
 ):
     """A history read may outlast the settle window, bounded by the deadline."""
-    clock = [0.0]
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    clock = ManualClock()
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)
 
     class SlowScanRun(_HistoryRun):
         def scan_history(self, keys, page_size=1000, use_cache=True):
             # Four evaluation rows, 20 s apart: the scan ends 80 s in.
             for row in super().scan_history(keys, page_size, use_cache):
-                clock[0] += 20.0
+                clock.now += 20.0
                 yield row
 
     run = SlowScanRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
@@ -625,24 +621,25 @@ def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_
 
 
 def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypatch):
+    """A deadline-limited capture can be retried with a later deadline."""
     from phasesweep.evidence.wandb import WandbPollTimeout
 
     gate = WandbSummaryRequiredGate(
         type="wandb_summary_required", entity="entity", project="project", keys=["done"]
     )
     ctx = make_trial_context(tmp_path)
-    clock = [0.0]
+    clock = ManualClock()
     calls = 0
 
     def capture(**kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            clock[0] = 1.0
+            clock.now = 1.0
             raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds)
         return {"values": {}, "present_keys": ["done"]}
 
-    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
     first = evaluate_gates(ctx, [gate], deadline=1.0)[0]
     assert not first.passed
@@ -681,19 +678,20 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
 def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
+    """SDK success after the deadline remains a timeout."""
     public = pytest.importorskip("wandb.apis.public")
     from phasesweep.evidence.wandb import WandbPollTimeout
 
-    clock = [0.0]
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    clock = ManualClock()
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
 
     class Api:
         def __init__(self, **kwargs):
             if stage == "constructor":
-                clock[0] = 2.0
+                clock.now = 2.0
 
         def run(self, path):
-            clock[0] = 2.0
+            clock.now = 2.0
             return SimpleNamespace(state="finished", summary_metrics={"loss": 0.2})
 
     monkeypatch.setattr(public, "Api", Api)
@@ -842,14 +840,15 @@ def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_pa
 _RUNTIME_SUMMARY = {"train_runtime": 812.5, "_runtime": 815}
 
 
-def _fake_wandb_clock(monkeypatch):
-    """Advance a fake monotonic clock only by the poller's sleeps."""
-    clock = [0.0]
-    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        "phasesweep.evidence.wandb.time.sleep",
-        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-    )
+def _fake_wandb_clock(monkeypatch: pytest.MonkeyPatch) -> ManualClock:
+    """Advance fake monotonic time by the poller's sleeps.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture that replaces the poller's clock functions.
+    :return ManualClock: The clock shared by the poller and test assertions.
+    """
+    clock = ManualClock()
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.sleep", clock.sleep)
     return clock
 
 
@@ -868,6 +867,7 @@ def _wandb_reads(monkeypatch, state, summary):
 
 
 def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypatch):
+    """A finished run exposes missing keys after its full settle window."""
     from phasesweep.evidence.wandb import _FINISH_SETTLE_SECONDS, WandbMissingKeysError
 
     clock = _fake_wandb_clock(monkeypatch)
@@ -877,11 +877,12 @@ def test_wandb_finished_run_missing_a_key_fails_after_the_settle_window(monkeypa
     assert caught.value.missing == ["train/train_runtime"]
     assert caught.value.available == ["_runtime", "train_runtime"]
     # The window opens at the first finished read; the last read is at its end.
-    assert clock[0] == _FINISH_SETTLE_SECONDS < 240
+    assert clock.now == _FINISH_SETTLE_SECONDS < 240
     assert len(reads) == _FINISH_SETTLE_SECONDS / 5 + 1
 
 
 def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_path, monkeypatch):
+    """Worker failures retain missing-key details and the run URL."""
     from phasesweep.evidence import wandb as wandb_evidence
 
     clock = _fake_wandb_clock(monkeypatch)
@@ -916,11 +917,12 @@ def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_p
         "summary key(s) ['train/train_runtime']; available summary keys: "
         "['_runtime', 'train_runtime']."
     )
-    assert clock[0] < 240
+    assert clock.now < 240
 
 
 @pytest.mark.parametrize("appears_at_read", [3, 6], ids=["mid-window", "window-end"])
 def test_wandb_key_appearing_within_the_settle_window_is_accepted(monkeypatch, appears_at_read):
+    """A key arriving by the settle boundary is accepted without another wait."""
     clock = _fake_wandb_clock(monkeypatch)
     reads = _wandb_reads(
         monkeypatch,
@@ -936,7 +938,7 @@ def test_wandb_key_appearing_within_the_settle_window_is_accepted(monkeypatch, a
     )
     assert capture["values"] == {"train/train_runtime": 812.5}
     assert len(reads) == appears_at_read + 1
-    assert clock[0] == 5 * appears_at_read
+    assert clock.now == 5 * appears_at_read
 
 
 @pytest.mark.parametrize("finished_from_read", [None, 44], ids=["running", "finished-late"])
@@ -958,7 +960,7 @@ def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
     )
     with pytest.raises(WandbPollTimeout) as caught:
         _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
-    assert clock[0] == 240
+    assert clock.now == 240
     if finished_from_read is None:
         assert caught.value.last_error is None
     else:
@@ -987,6 +989,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         )
     assert result.cleanup_confirmed
     original_abort = process._abort_launch
+    aborted_groups: list[int] = []
 
     def fail_identity(path, identity):
         assert not path.exists()
@@ -994,6 +997,8 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
 
     def uncertain_abort(proc, pgid):
         assert original_abort(proc, pgid)
+        assert isinstance(pgid, int)
+        aborted_groups.append(pgid)
         return False
 
     monkeypatch.setattr(process, "_write_process_identity", fail_identity)
@@ -1013,8 +1018,12 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch,
         else:
             locate_wandb_position(**target, metric_key="loss", axis="_step", value=0.25)
     lifecycle = process.read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
-    assert lifecycle.state == "launching"
-    assert lifecycle.cleanup_confirmed is None
+    assert lifecycle is not None and lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
+    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert aborted_groups
+    assert all(not process._process_group_alive(pgid) for pgid in aborted_groups)
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])

@@ -43,17 +43,28 @@ def cache_dir() -> Path:
     return xdg_home("XDG_CACHE_HOME", Path.home() / ".cache") / "phasesweep"
 
 
+def artifact_root_path(workdir: str, experiment: str) -> Path:
+    """Resolve the workdir before appending the experiment namespace.
+
+    :param str workdir: Configured parent directory of experiment artifacts.
+    :param str experiment: Validated experiment directory name.
+    :return Path: Absolute artifact root with any experiment leaf symlink unresolved.
+    """
+    return Path(workdir).expanduser().resolve() / experiment
+
+
 def ensure_artifact_dir(path: Path) -> None:
-    """Create a self-ignoring artifact namespace without replacing its ignore file.
+    """Keep artifacts out of Git while allowing ripgrep to search their contents.
 
     :param Path path: Managed experiment directory, not its shared workdir.
     """
     path.mkdir(parents=True, exist_ok=True)
-    try:
-        with (path / ".gitignore").open("x", encoding="utf-8") as handle:
-            handle.write("*\n")
-    except FileExistsError:
-        pass
+    for name, rule in ((".gitignore", "*\n"), (".ignore", "!**\n")):
+        try:
+            with (path / name).open("x", encoding="utf-8") as handle:
+                handle.write(rule)
+        except FileExistsError:
+            pass
 
 
 def file_sha256(path: Path) -> str:

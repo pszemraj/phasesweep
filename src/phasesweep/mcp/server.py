@@ -189,11 +189,10 @@ PublishedConfigMatchesCurrent = Annotated[
     bool | None,
     Field(
         description=(
-            "Whether the config that produced this result still matches the one a further "
-            "run would execute. False means the config was edited after publication: the "
-            "labels here are historical, and the current phases may not correspond to the "
-            "published ones. Null when undeterminable - nothing published, or a "
-            "publication that recorded no config fingerprint. Never treat null as 'no drift'."
+            "Whether the producing configuration matches the corresponding prefix of the "
+            "current phase plan. Appended phases do not invalidate that agreement. False "
+            "means the producing semantics differ and these result labels are historical. "
+            "Null when no producing fingerprint is available. Never treat null as 'no drift'."
         )
     ),
 ]
@@ -271,10 +270,19 @@ class ExperimentSummaryPayload(_ToolPayload):
     capabilities: CapabilitiesPayload
 
 
+class CatalogStatusPayload(_ToolPayload):
+    """Freshness of the catalog used to answer a read."""
+
+    stale: bool
+    reload_refusal: Literal["invalid", "state_dir_changed"] | None
+    remediation: str | None
+
+
 class ListExperimentsResult(_ToolPayload):
     """Structured output for list_experiments."""
 
     experiments: list[ExperimentSummaryPayload]
+    catalog_status: CatalogStatusPayload
     total_count: int = Field(ge=0, description="Total catalog entries exposed by this server.")
     next_cursor: str | None = Field(
         default=None,
@@ -369,6 +377,7 @@ class InspectExperimentResult(_ToolPayload):
     """Structured output for inspect_experiment."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     metric: MetricSnapshot
     capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
@@ -410,6 +419,7 @@ class GetLatestRunResult(_ToolPayload):
     """Newest durable run handle for one experiment."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     found: bool = Field(description="Whether any MCP run is recorded for this experiment.")
     run: RunPayload | None
 
@@ -492,6 +502,7 @@ class GetRunStatusResult(_ToolPayload):
     """Structured output for get_run_status."""
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     result_source: ResultSource = Field(
         description=(
             "Result source: mutable shared study, immutable terminal snapshot, or unavailable "
@@ -595,9 +606,9 @@ class WinnerPhasePayload(_ToolPayload):
     winner_source: WinnerSourcePayload
     winner_generation: Literal["represented_generation", "prior_generation", "unknown"] = Field(
         description=(
-            "Whether this winner was selected in the represented generation or carried from an "
-            "earlier generation; unknown when no represented generation is available to "
-            "compare against."
+            "Whether the winner's source trial belongs to the represented generation or an "
+            "earlier generation; unknown when no represented generation is available for "
+            "comparison. Reselecting an earlier trial does not change its source generation."
         )
     )
     metric: float = Field(
@@ -622,6 +633,10 @@ class WinnerPhasePayload(_ToolPayload):
         description="True/false when gates were declared; null when the phase has no gates."
     )
     incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
+    cost_advisory: str | None = Field(
+        default=None,
+        description="Cheaper configuration within the winner's standard error; parameters follow visible_params policy.",
+    )
     confound: ConfoundSummary = Field(
         description=(
             "Advisory verdicts on the population this winner was selected from. Report every "
@@ -657,6 +672,7 @@ class GetRunResultsResult(_ToolPayload):
     """
 
     experiment_id: ExperimentId
+    catalog_status: CatalogStatusPayload
     run_id: RunId
     result_source: ResultSource = Field(
         description=(

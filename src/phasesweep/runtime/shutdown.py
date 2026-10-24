@@ -118,7 +118,8 @@ def register_shutdown_waker(waker: Callable[[], None]) -> None:
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Terminate all tracked process groups, then exit.
 
-    One PGID snapshot under the launch lock drives both termination stages.
+    One guardian snapshot under the launch lock requests cancellation; each guardian
+    records its intent and owns trainer termination while this handler confirms cleanup.
     Never call ``proc.wait()`` here: its interrupted waitpid lock is non-reentrant.
     A main-thread critical section records the signal for its exit checkpoint;
     a concurrent handler invocation returns without interrupting cleanup.
@@ -150,7 +151,8 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
-            pgids = tuple(_active_children)
+            guardians = dict(_active_children)
+            pgids = tuple(guardians)
 
         log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
@@ -159,6 +161,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             confirmed_by_pgid = _terminate_process_groups(
                 pgids,
                 grace_seconds=_KILL_GRACE_SECONDS,
+                guardians=guardians,
             )
         except Exception:
             log.exception("Failed while cleaning child process groups after signal %d", signum)
@@ -203,8 +206,8 @@ _scope_depth = 0
 def install_signal_handlers() -> None:
     """Take process-lifetime ownership of SIGTERM, SIGINT and SIGHUP.
 
-    Main-thread only. Reinstall missing handlers and unblock shutdown signals on
-    each call. An open temporary scope hands its installation over and skips
+    Main-thread only. Reinstall missing handlers before unblocking shutdown signals
+    on each call. An open temporary scope hands its installation over and skips
     restoration; later scopes leave process-lifetime ownership intact.
 
     :raises SignalOwnershipUnavailableError: Called outside the main thread.
@@ -216,13 +219,11 @@ def install_signal_handlers() -> None:
             "signal.signal and process-lifetime shutdown-signal ownership are "
             "main-thread-only."
         )
-    _unblock_shutdown_signals()
-    if all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
-        _process_lifetime_owner = True
-        return
-    for sig in _SHUTDOWN_SIGNALS:
-        signal.signal(sig, _shutdown_handler)
+    if not all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
+        for sig in _SHUTDOWN_SIGNALS:
+            signal.signal(sig, _shutdown_handler)
     _process_lifetime_owner = True
+    _unblock_shutdown_signals()
 
 
 def _reassert_process_lifetime_handlers() -> None:
@@ -240,9 +241,7 @@ def _reassert_process_lifetime_handlers() -> None:
         "took process-lifetime ownership; reinstalling them for child cleanup.",
         stale,
     )
-    for sig in stale:
-        signal.signal(sig, _shutdown_handler)
-    _unblock_shutdown_signals()
+    install_signal_handlers()
 
 
 def _restore_host_signal_state(

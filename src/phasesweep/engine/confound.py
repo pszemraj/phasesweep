@@ -33,7 +33,7 @@ ConfoundCheck = Literal["evaluation_point", "survivorship", "tie"]
 
 CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
-CONFOUND_SCHEMA_VERSION = 2
+CONFOUND_SCHEMA_VERSION = 3
 
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed")
 # Where a finished trial that selection did not rank is counted. A COMPLETE
@@ -214,6 +214,8 @@ def _tie(
     """
     if len(ranked) < 2:
         return _not_checked("only one trial was ranked")
+    if all(trial.params == winner.params for trial in ranked):
+        return _not_checked("only one configuration was ranked")
     tied = [
         trial.number
         for trial in ranked
@@ -423,7 +425,7 @@ def _validate_against_units(
     :param Mapping[str, object] survivorship: The validated survivorship record.
     :param list[int] ranked: The block's ranked trial numbers.
     :param list[list[int]] | None groups: The block's ranked repeat groups, if any.
-    :raises ValueError: A single ranked unit was compared, several were not,
+    :raises ValueError: A single ranked unit was compared, several configurations were not,
         ``incomplete_group`` or ``within_noise`` is recorded without groups,
         ``within_noise`` is absent with them, or a listed trial does not name
         another ranked group.
@@ -432,7 +434,8 @@ def _validate_against_units(
     unit_name = "trials" if groups is None else "repeat groups"
     if units < 2 and tie["verdict"] != "n/a":
         raise ValueError(f"confound compared {unit_name} though only one was ranked")
-    if units >= 2 and tie["verdict"] == "n/a":
+    one_configuration = groups is None and tie.get("reason") == "only one configuration was ranked"
+    if units >= 2 and tie["verdict"] == "n/a" and not one_configuration:
         raise ValueError(f"confound tie is n/a though several {unit_name} were ranked")
     counts = survivorship["detail"]
     if groups is None and isinstance(counts, Mapping) and counts["incomplete_group"]:
@@ -593,10 +596,8 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"{_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
                 "search space changes training length (for example epochs or max_steps); "
                 "otherwise the trials were not trained to one budget. A training-length phase "
-                "checks cleanly on a relative axis, which still flags a run that stopped early: "
-                'report progress={"schedule_fraction": actual_steps / planned_steps} through '
-                "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
-                "on a json_envelope metric"
+                "checks relative completion on a schedule_fraction axis, which still flags "
+                "a run that stopped early"
             )
         elif name == "survivorship":
             lines.append(
@@ -611,6 +612,52 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
     return lines
+
+
+def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
+    """Describe relative completion using the objective reader in use.
+
+    :param str kind: Objective extractor kind.
+    :param str axis: Recorded evaluation axis, defaults to ``step``.
+    :return str: Trainer reporting and evaluation-axis instructions.
+    """
+    if axis == "schedule_fraction":
+        return (
+            "schedule_fraction already measures actual_steps / planned_steps. Compare "
+            "objectives at the same relative completion and inspect trials that stopped "
+            "early; retain their lower fractions."
+        )
+    if kind == "wandb":
+        return (
+            "Log schedule_fraction=actual_steps / planned_steps alongside the objective in "
+            "the same wandb.log() call and set metric.extractor.evaluation_axis to schedule_fraction."
+        )
+    if kind == "mlflow":
+        return (
+            "MLflow compares the selected metric's integer step. For a training-length "
+            "comparison, log the objective under a separate metric key (for example "
+            "objective_schedule_fraction) at step=int(10000 * actual_steps / planned_steps). "
+            "Set metric.extractor.metric_key to that key and select: last, keeping "
+            "native-step history under its original key and lower steps for early stops."
+        )
+    return (
+        'Report progress={"schedule_fraction": actual_steps / planned_steps} through '
+        "report_objective and set metric.extractor.evaluation_axis to schedule_fraction "
+        "on the json_envelope metric."
+    )
+
+
+def _noise_remedy() -> str:
+    """Return guidance when the selected configurations carry no repeat noise estimate.
+
+    :return str: Configuration-comparison guidance shared by winner output and MCP results.
+    """
+    return (
+        "No noise estimate: one trial per configuration leaves the size of the gap uncertain. "
+        "First compare more distinct values and inspect trends across neighboring "
+        "configurations. Use phases[].repeats for a few discrete finalists or an explicit "
+        "noise check."
+    )
 
 
 def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
@@ -630,34 +677,47 @@ def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
     untied = [number for number in noisy if number not in tied]
     if untied:
         lines.append(
-            f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
+            ("tie: " if not lines else "")
+            + f"the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
             "within two standard errors of the winning group's aggregate, so their order "
             "may be seed noise (an advisory heuristic, not a significance test)"
         )
     return lines
 
 
-def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[str, Any]:
+def _confound_summary(
+    block: Mapping[str, object], *, winner_trial: int, extractor_kind: str
+) -> dict[str, object]:
     """Project a validated block onto the enums and numbers agents may see.
 
-    Evidence holds operator- and trainer-authored strings -- the axis is a
-    config key, like the metric keys MCP never returns -- so the projection
-    keeps only verdicts, check names, counts, and the winner's position. The
-    full evidence stays in ``winner.yaml`` for operators.
+    Include the declared evaluation axis and actionable guidance alongside counts.
+    The full trial evidence stays in ``winner.yaml`` for operators.
 
-    :param Mapping[str, Any] block: A validated confound block.
+    :param Mapping[str, object] block: A validated confound block.
     :param int winner_trial: Trial number of the winner the block belongs to.
-    :return dict[str, Any]: The string-free summary, one entry per check plus
-        the ``flagged`` check names.
+    :param str extractor_kind: Objective reader that recorded the winner's provenance.
+    :raises TypeError: The block's checks are not a mapping.
+    :return dict[str, object]: The summary, one entry per check plus the ``flagged`` check names.
     """
     checks = block["checks"]
+    if not isinstance(checks, Mapping):
+        raise TypeError("confound checks are not a mapping")
     evaluation = checks["evaluation_point"]
     groups = evaluation["detail"]["values"] if "detail" in evaluation else None
+    axis = evaluation["detail"]["axis"] if "detail" in evaluation else None
     tie = checks["tie"]
     return {
         "flagged": list(_flagged_checks(block)),
         "evaluation_point": {
             "verdict": evaluation["verdict"],
+            "axis": axis,
+            "remedy": (
+                _evaluation_point_remedy(
+                    extractor_kind, axis=axis if isinstance(axis, str) else "step"
+                )
+                if evaluation["verdict"] == "heterogeneous"
+                else None
+            ),
             "distinct_values": len(groups) if groups is not None else None,
             "winner_value": (
                 next(
@@ -674,6 +734,9 @@ def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[st
         },
         "tie": {
             "verdict": tie["verdict"],
+            "remedy": (
+                _noise_remedy() if block["ranked_groups"] is None and "detail" in tie else None
+            ),
             "tied_trials": len(tie["detail"]["tied_trials"]) if "detail" in tie else None,
             "within_noise": (
                 len(tie["detail"]["within_noise"])

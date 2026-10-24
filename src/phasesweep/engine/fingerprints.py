@@ -21,12 +21,7 @@ log = logging.getLogger(__name__)
 
 _RUN_CONTROL_KEYS = frozenset(
     {
-        # Fields excluded from the fingerprint because they don't change trial
-        # meaning. Top-up workflow (re-run with a higher n_trials) must work;
-        # throughput knobs (n_jobs / gpu_ids) and circuit breakers
-        # (max_consecutive_failures) likewise must not invalidate a study.
-        # `comment` is operator-facing documentation — editing it is never a
-        # semantic change to the experiment.
+        # Run-control settings do not change trial semantics and stay outside fingerprints.
         "n_trials",
         "n_jobs",
         "gpu_ids",
@@ -34,6 +29,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_no_gpu_isolation",
         "max_consecutive_failures",
         "comment",
+        "cost_key",
         "allow_unbounded_trials",
         "timeout_seconds_per_phase",
         "allow_incomplete_on_timeout",
@@ -96,25 +92,45 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
     }
 
 
-def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
+def _experiment_semantic_fingerprint(
+    experiment: Experiment, *, phase_count: int | None = None
+) -> str:
     """Hash the experiment semantics recorded with each published result.
 
     Include metric/extractor, constraints, command, environment, provenance, and
     ordered phase semantics. Exclude run-control targets, throughput, and comments.
 
     :param Experiment experiment: Parsed experiment config to fingerprint.
-    :return str: SHA-256 hex digest (64 characters) of the canonicalised
-        semantic payload.
+    :param int | None phase_count: Producing phase-prefix length, or None for the full plan.
+    :return str: SHA-256 hex digest of the canonicalised semantic payload.
     """
     payload = {
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
         **_semantic_core(experiment),
         "phases": [
-            {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
+            {"name": phase.name, **_semantic_phase_dump(phase)}
+            for phase in experiment.phases[:phase_count]
         ],
     }
     return _semantic_payload_digest(payload)
+
+
+def _recorded_config_matches(
+    experiment: Experiment, stored_fingerprint: object, *, phase_count: int
+) -> bool | None:
+    """Compare recorded semantics with the current plan's producing phase prefix.
+
+    :param Experiment experiment: Current configuration to compare.
+    :param object stored_fingerprint: Represented generation's semantic fingerprint.
+    :param int phase_count: Number of phases in the represented generation's plan.
+    :return bool | None: Semantic agreement, or unknown without a recorded fingerprint.
+    """
+    if not isinstance(stored_fingerprint, str) or not stored_fingerprint:
+        return None
+    return stored_fingerprint == _experiment_semantic_fingerprint(
+        experiment, phase_count=phase_count
+    )
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:

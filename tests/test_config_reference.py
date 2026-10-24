@@ -201,24 +201,6 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
         load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
 
 
-def test_config_guide_index_lists_every_top_level_key() -> None:
-    """The guide's reference index names each top-level key under the section it sits in."""
-    guide = (REPO / "docs/config.md").read_text()
-    rows = re.findall(
-        r"^\| ([^|`]+?) \| ((?:`[^`]+`(?:, )?)+) \| `phasesweep explain ([^`]+)` \|$",
-        guide,
-        re.MULTILINE,
-    )
-    documented = {section: re.findall(r"`([^`]+)`", keys) for section, keys, _ in rows}
-    assert len(documented) == len(rows), "Duplicate index section"
-    expected: dict[str, list[str]] = {}
-    for entry in top_level_entries():
-        expected.setdefault(entry.section, []).append(entry.path)
-    assert documented == expected
-    for section, _, command_key in rows:
-        assert command_key in documented[section], (section, command_key)
-
-
 def test_top_level_entries_are_the_undotted_paths_in_file_order() -> None:
     """Top-level keys are exactly the entries whose path has no dot."""
     paths = [entry.path for entry in top_level_entries()]
@@ -609,10 +591,16 @@ def test_describe_validation_error_adds_distinct_quoted_hints() -> None:
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
     assert len(caught.value.errors()) == 3
-    assert describe_validation_error(caught.value) == (
-        f"{caught.value}\nsee: phasesweep explain 'phases[].sampler.type'"
+    text = describe_validation_error(caught.value)
+    assert text == (
+        "phases.0.sampler.type: Input should be 'tpe', 'random', 'grid' or 'cmaes'"
+        "\nenv.A: Input should be a valid string"
+        "\nenv.B: Input should be a valid string"
+        "\nsee: phasesweep explain 'phases[].sampler.type'"
         "\nsee: phasesweep explain env"
     )
+    assert "errors.pydantic.dev" not in text
+    assert "input_value" not in text
 
 
 def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
@@ -622,7 +610,9 @@ def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
     with pytest.raises(ValidationError) as caught:
         Experiment.model_validate(data)
     assert [error["loc"] for error in caught.value.errors()] == [()]
-    assert describe_validation_error(caught.value) == str(caught.value)
+    assert describe_validation_error(caught.value) == (
+        "Phase 'baseline' inherits from 'baseline', which is not a prior phase."
+    )
 
 
 def test_loc_to_path_has_no_key_for_unknown_or_model_level_locations() -> None:

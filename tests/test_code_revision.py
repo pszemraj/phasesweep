@@ -13,7 +13,7 @@ from click.testing import CliRunner
 from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import ExecutionContext, Experiment
-from phasesweep.engine.paths import _generation_reproducibility_path
+from phasesweep.engine.paths import _experiment_dir, _generation_reproducibility_path
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_experiment_config, write_param_echo_trainer
@@ -89,7 +89,7 @@ def _published_record(experiment: Experiment) -> dict[str, object]:
     """
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    path = _generation_reproducibility_path(experiment, generation_id)
+    path = _generation_reproducibility_path(_experiment_dir(experiment), generation_id)
     return json.loads(path.read_text())
 
 

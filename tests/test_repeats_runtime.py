@@ -27,9 +27,9 @@ from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
     _generation_summary_path,
-    _generation_winner_path,
     _phase_dir,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
@@ -38,7 +38,7 @@ from phasesweep.engine.repeats import ReduceName, _validate_repeats_block, reduc
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_trainer
-from tests.ledger_fixtures import published_generation_id, reseal_winner
+from tests.ledger_fixtures import published_generation_id, reseal_winner, winner_payload
 
 
 def _seed_trainer(tmp_path: Path) -> Path:
@@ -145,7 +145,7 @@ def test_repeats_phase_runs_children_without_the_repeat_key(tmp_path: Path) -> N
 
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    published = _winner_payload(experiment, generation_id)
+    published = winner_payload(experiment, generation_id)
     assert published["trial_number"] == numbers[-1]
     assert published["confound"]["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
     with (_phase_dir(experiment, "p") / "trials.csv").open() as handle:
@@ -253,13 +253,6 @@ def readonly_repeats_publication(
         return _repeats_publication(root)
 
 
-def _winner_payload(experiment: Experiment, generation_id: str) -> JsonObject:
-    """Return phase ``p``'s winner as one generation published it."""
-    loaded = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
-    assert isinstance(loaded, dict)
-    return loaded
-
-
 def _members(winner: JsonObject) -> list[JsonObject]:
     """Return the ``repeats.members`` records of a winner payload."""
     repeats = winner["repeats"]
@@ -273,6 +266,7 @@ def _members(winner: JsonObject) -> list[JsonObject]:
     ("tamper", "reason"),
     [
         pytest.param("member-metric", "mean of the member metrics differs", id="value"),
+        pytest.param("member-overflow", "member metric is not a finite number", id="overflow"),
         pytest.param("member-order", "ascending and distinct", id="order"),
         pytest.param("representative", "disagrees with the winner's attempt_id", id="identity"),
         pytest.param("spread", "spread differs", id="spread"),
@@ -282,11 +276,14 @@ def _members(winner: JsonObject) -> list[JsonObject]:
 def test_group_winner_repeats_block_is_manifest_validated(
     tmp_path: Path, tamper: str, reason: str
 ) -> None:
+    """Manifest validation rejects malformed repeat identities, members and statistics."""
     experiment, generation_id = _repeats_publication(tmp_path)
-    winner = _winner_payload(experiment, generation_id)
+    winner = winner_payload(experiment, generation_id)
     members = _members(winner)
     if tamper == "member-metric":
         members[0]["metric"] = -1.0
+    elif tamper == "member-overflow":
+        members[0]["metric"] = 10**400
     elif tamper == "member-order":
         repeats = winner["repeats"]
         assert isinstance(repeats, dict)
@@ -403,7 +400,7 @@ def test_manifest_binds_the_repeats_block_to_the_snapshot_axis(
     summary are rewritten to agree with it and only the axis comparison can refuse the block.
     """
     experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
-    winner = _winner_payload(experiment, generation_id)
+    winner = winner_payload(experiment, generation_id)
     aggregate = _forge_axis_mismatch(winner, tamper)
     _publish_forgery(experiment, generation_id, winner, aggregate)
 
@@ -422,7 +419,7 @@ def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
 ) -> None:
     """The winner a skipped phase loads must carry the repeat axis the current config declares."""
     experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
-    winner = _winner_payload(experiment, generation_id)
+    winner = winner_payload(experiment, generation_id)
     aggregate = _forge_axis_mismatch(winner, tamper)
     published = _published_for_resume(experiment)
     confound = _validate_confound_block(
@@ -451,7 +448,7 @@ def test_winner_view_projects_the_repeats_summary(
 ) -> None:
     """Reads expose the reducer and spread, and a malformed block hides the winner."""
     experiment, generation_id = readonly_repeats_publication
-    winner = _winner_payload(experiment, generation_id)
+    winner = winner_payload(experiment, generation_id)
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
 
@@ -518,7 +515,7 @@ def test_carried_repeat_winner_reads_without_older_publication(tmp_path: Path) -
     assert published_generation_id(experiment) != source_generation
     assert carried.repeats is not None
     expected = read_result(experiment)
-    shutil.rmtree(_generation_dir(experiment, source_generation))
+    shutil.rmtree(_generation_dir(_experiment_dir(experiment), source_generation))
 
     assert read_result(experiment) == expected
     assert run_experiment(experiment)["p"].repeats == carried.repeats

@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import ResumeWinnerMissingError
+from phasesweep.engine.read import _read_generation_selection, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import LogRegexExtractor
@@ -91,10 +93,11 @@ def test_from_phase_into_a_workdir_without_results_refuses_before_creating_it(
     with pytest.raises(ResumeWinnerMissingError) as refused:
         run_experiment(_chained_experiment(workdir), from_phase="child")
 
-    message = str(refused.value)
+    message = _operational_error_text(refused.value)
     assert "Winner file missing for phase 'parent'" in message
-    assert "no earlier results" in message
-    assert "Run without --from-phase" in message
+    assert "no generation has been published" in message
+    assert "--from-phase requires published predecessors" in message
+    assert "Resume without --from-phase to reuse completed trials" in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
     assert not workdir.exists()
 
@@ -110,10 +113,11 @@ def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path)
     with pytest.raises(ResumeWinnerMissingError) as refused:
         run_experiment(_chained_experiment(workdir), from_phase="child")
 
-    message = str(refused.value)
+    message = _operational_error_text(refused.value)
     assert "Winner file missing for phase 'parent'" in message
     assert "holds no winner for it" in message
-    assert "Run without --from-phase" in message
+    assert "--from-phase requires published predecessors" in message
+    assert "Resume without --from-phase to reuse completed trials" in message
     assert refused.value.action is OperatorAction.FIX_CONFIG
 
 
@@ -141,7 +145,7 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     )
 
     status = invoke_cli_boundary(
-        ["run", "--workdir", str(tmp_path / "alt"), "--from-phase", "child", str(config)],
+        ["run", "--set", f"workdir={tmp_path / 'alt'}", "--from-phase", "child", str(config)],
         monkeypatch,
     )
 
@@ -149,9 +153,47 @@ def test_cli_from_phase_into_a_workdir_without_results_names_the_fix(
     error = capsys.readouterr().err
     assert error.startswith("phasesweep: Winner file missing for phase 'parent'")
     assert "operational error" not in error
-    assert "no earlier results" in error
-    assert "Run without --from-phase" in error
+    assert "no generation has been published" in error
+    assert "--from-phase requires published predecessors" in error
+    assert "Resume without --from-phase to reuse completed trials" in error
     assert error.rstrip().endswith(
-        "fix: correct the experiment configuration or the environment it runs in."
+        "fix: Resume without --from-phase to reuse completed trials, or use the workdir "
+        "that holds the publication."
     )
     assert not (tmp_path / "alt").exists()
+
+
+@pytest.mark.parametrize("has_publication", [False, True])
+def test_from_phase_refusal_explains_an_inspectable_unpublished_predecessor(
+    tmp_path: Path, has_publication: bool
+) -> None:
+    """An unpublished predecessor stays inspectable while resume requires its publication."""
+    experiment = _chained_experiment(tmp_path / "runs").model_copy(
+        update={"trial_command": "test {phase} != child && echo x=0.5 {overrides}"}
+    )
+    if has_publication:
+        other = Phase(name="other", n_trials=1, gpu_policy="none")
+        run_experiment(experiment.model_copy(update={"phases": [other]}))
+        experiment = experiment.model_copy(update={"phases": [other, *experiment.phases]})
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    _, generation_id, _ = _read_generation_selection(experiment, latest=True)
+    assert generation_id is not None
+    _, winners = read_result(experiment, generation_id=generation_id)
+    parent = next(winner for winner in winners if winner.phase == "parent")
+    assert parent.metric == 0.5
+    assert not parent.is_published
+    with pytest.raises(ResumeWinnerMissingError) as refused:
+        run_experiment(experiment, from_phase="child")
+
+    error = refused.value
+    message = _operational_error_text(error)
+    assert "Winner file missing for phase 'parent'" in message
+    assert "--from-phase requires published predecessors" in message
+    assert "Resume without --from-phase to reuse completed trials" in message
+    assert "so it runs first" not in message
+    assert "winner.yaml" not in message
+    assert error.action is OperatorAction.FIX_CONFIG
+    assert error.remediation is not None
+    assert message.count(error.remediation) == 1

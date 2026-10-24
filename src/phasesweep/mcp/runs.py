@@ -6,7 +6,6 @@ Run state is derived from process visibility and recorded evidence; reads write 
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -23,8 +22,6 @@ from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.config.io import load_experiment_bytes
-from phasesweep.config.models import Experiment
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -90,7 +87,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".transition.lock",
     ".heartbeat",
 )
-MCP_STATE_FORMAT_VERSION = 5
+MCP_STATE_FORMAT_VERSION = 7
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
@@ -248,7 +245,7 @@ class RunHandle:
     config_dir: str
     pid: int | None
     pgid: int | None
-    # PID-reuse-safe /proc start time; None only before spawn.
+    # Native process start time; None only before spawn.
     pid_starttime: int | None
     started_at: str  # ISO-8601 UTC
     visible_params_at_launch: Literal["none", "all"] | list[str]
@@ -256,7 +253,7 @@ class RunHandle:
     allow_cancel: bool = False
     # Boot that numbered the PID; None only before spawn.
     boot_id: str | None = None
-    # Namespace inode and PID 1 start time; None only before spawn.
+    # Platform PID-space identity; None only before spawn.
     pid_namespace: str | None = None
 
     @property
@@ -287,27 +284,6 @@ class PreparedRun:
     def close(self) -> None:
         """Release this server process's copy of the launch lease."""
         self.lease.close()
-
-
-def load_experiment_snapshot(
-    path: Path, expected_sha256: str, *, source: str, config_dir: Path
-) -> Experiment:
-    """Read, verify, and parse one immutable experiment snapshot.
-
-    :param Path path: Snapshot file to read.
-    :param str expected_sha256: Digest recorded with the run handle.
-    :param str source: Human-readable parser source label.
-    :param Path config_dir: Absolute directory of the cataloged config file,
-        recorded with the run handle; relative config paths resolve against it.
-    :raises OSError: If the snapshot cannot be read.
-    :raises ValueError: If its digest or syntax is invalid, or ``config_dir``
-        is not absolute.
-    :return Experiment: Verified experiment configuration.
-    """
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != expected_sha256:
-        raise ValueError("run snapshot hash mismatch")
-    return load_experiment_bytes(data, source=source, config_dir=config_dir)
 
 
 class RunStore:
@@ -581,31 +557,59 @@ class RunStore:
         return f"{experiment_id}-{uuid4().hex}"
 
     def log_path(self, run_id: str) -> Path:
-        """Return the operator-only captured stdout/stderr log path."""
+        """Return the operator-only captured stdout/stderr log path.
+
+        :param str run_id: Run whose log is located.
+        :return Path: Captured output path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.log"
 
     def status_path(self, run_id: str) -> Path:
-        """Return the operator-only runner terminal-status path."""
+        """Return the operator-only runner terminal-status path.
+
+        :param str run_id: Run whose terminal status is located.
+        :return Path: Terminal-status JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.status.json"
 
     def config_snapshot_path(self, run_id: str) -> Path:
-        """Return the operator-only immutable runner config path."""
+        """Return the operator-only immutable runner config path.
+
+        :param str run_id: Run whose immutable config is located.
+        :return Path: Config snapshot YAML path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.config.yaml"
 
     def cleanup_uncertain_path(self, run_id: str) -> Path:
-        """Return the operator-only unconfirmed-cleanup marker path."""
+        """Return the operator-only unconfirmed-cleanup marker path.
+
+        :param str run_id: Run whose cleanup marker is located.
+        :return Path: Unconfirmed-cleanup JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.cleanup_uncertain.json"
 
     def cleanup_recovery_path(self, run_id: str) -> Path:
-        """Return the operator-only cleanup recovery evidence path."""
+        """Return the operator-only cleanup recovery evidence path.
+
+        :param str run_id: Run whose cleanup recovery evidence is located.
+        :return Path: Cleanup recovery JSON path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.cleanup_recovery.json"
 
     def launch_lease_path(self, run_id: str) -> Path:
-        """Return the private kernel-backed launch lease path."""
+        """Return the private kernel-backed launch lease path.
+
+        :param str run_id: Run whose launch lease is located.
+        :return Path: Launch lock path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.launch.lock"
 
     def heartbeat_path(self, run_id: str) -> Path:
-        """Return the private heartbeat path whose mtime the live runner refreshes."""
+        """Return the private heartbeat path whose mtime the live runner refreshes.
+
+        :param str run_id: Run whose heartbeat is located.
+        :return Path: Heartbeat file path in the store's log directory.
+        """
         return self._logs_dir / f"{run_id}.heartbeat"
 
     def prepare_launch(self, handle: RunHandle, config_bytes: bytes) -> PreparedRun:
@@ -1413,17 +1417,29 @@ def _valid_cleanup_recovery(
 
 
 def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
-    """Accept None or a positive integer, excluding booleans."""
+    """Accept None or a positive integer, excluding booleans.
+
+    :param object value: Candidate optional integer.
+    :return TypeGuard[int | None]: Whether the value is None or a positive built-in integer.
+    """
     return value is None or (type(value) is int and value > 0)
 
 
 def _valid_config_dir(value: object) -> TypeGuard[str]:
-    """Accept absolute path strings without NUL."""
+    """Accept absolute path strings without NUL.
+
+    :param object value: Candidate configuration-directory path.
+    :return TypeGuard[str]: Whether the value is a built-in string naming an absolute path without NUL.
+    """
     return type(value) is str and "\0" not in value and Path(value).is_absolute()
 
 
 def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:
-    """Accept None or canonical lowercase Linux boot UUID text."""
+    """Accept None or canonical lowercase boot UUID text.
+
+    :param object value: Candidate optional boot identifier.
+    :return TypeGuard[str | None]: Whether the value is None or canonical UUID text.
+    """
     if value is None:
         return True
     if type(value) is not str:

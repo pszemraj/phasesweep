@@ -91,6 +91,8 @@ def _classify_message(message: str) -> str:
     """
     if _STUDY_OWNED_ELSEWHERE_PHRASE in message:
         return "study-owned-elsewhere"
+    if "No study directory at" in message:
+        return "study-absent"
     return f"unclassified: {message}"
 
 
@@ -176,6 +178,12 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     """A read over a golden ledger reaches the right verdict without writing."""
     fixture = fixture_by_name(fixture_name)
     expected = fixture.expected(mode)
+    if mode == "ledger-only" and read_path in {
+        "cli-status",
+        "cli-status-trials",
+        "cli-show-winners",
+    }:
+        expected = "study-absent"
     materialized = materialize(fixture_name, tmp_path, mode=mode)
     state_changes: dict[str, str] = {}
 

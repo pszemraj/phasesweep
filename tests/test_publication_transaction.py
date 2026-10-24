@@ -40,6 +40,7 @@ from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
+    WinnerIntegrityError,
 )
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -62,9 +63,12 @@ from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
+    fail_pointer_commit,
+    lose_record_writes,
     make_experiment,
     patch_directory_fsync_failure,
     patch_path_method_failure,
@@ -128,7 +132,7 @@ def _topped_up(experiment: Experiment) -> Experiment:
 
 def _provenance_paths(experiment, generation_id: str) -> tuple[Path, Path]:
     """Return one generation's ``(config.snapshot.yaml, reproducibility.json)`` paths."""
-    generation_dir = _generation_dir(experiment, generation_id)
+    generation_dir = _generation_dir(_experiment_dir(experiment), generation_id)
     return (
         generation_dir / _CONFIG_SNAPSHOT_NAME,
         generation_dir / _REPRODUCIBILITY_NAME,
@@ -191,19 +195,6 @@ def _fail_precommit_validation(monkeypatch: pytest.MonkeyPatch, experiment: Expe
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
 
-def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
-    """Make writing the last-success pointer raise ``OSError``."""
-    pointer_path = _last_successful_generation_path(experiment)
-    original_write = artifact_io._write_yaml_atomic
-
-    def flaky_write(path: Path, payload: object) -> None:
-        if path == pointer_path:
-            raise OSError("simulated pointer commit failure")
-        return original_write(path, payload)
-
-    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize(
     ("inject_failure", "error_type", "error_match"),
@@ -216,7 +207,7 @@ def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment
         ),
         # A failure writing the last-success pointer itself is the same failure shape as validation.
         pytest.param(
-            _fail_pointer_commit,
+            fail_pointer_commit,
             OSError,
             "simulated pointer commit failure",
             id="pointer-commit",
@@ -356,7 +347,7 @@ def test_postcommit_write_failure_leaves_run_successful(
     record_write = fault == "atomic_create_text"
 
     if record_write:
-        _lose_record_writes(monkeypatch)
+        lose_record_writes(monkeypatch)
     else:
         original = generation_ops._write_generation_state
 
@@ -399,6 +390,7 @@ def test_postcommit_write_failure_leaves_run_successful(
 def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A directory-fsync failure after the pointer rename cannot fail the publication.
 
@@ -408,16 +400,41 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     ``publication_failed``.
     """
     experiment = _stored_experiment(tmp_path)
+    pointer = _last_successful_generation_path(experiment)
+    original_fsync_directory = runtime_files.fsync_directory
+    committed_pointers: list[bytes] = []
 
-    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
+    def fail_pointer_directory_fsync(path: Path) -> None:
+        """Fail the directory flush only after the publication pointer has committed."""
+        if path == pointer.parent and pointer.is_file() and not committed_pointers:
+            committed_pointers.append(pointer.read_bytes())
+            with monkeypatch.context() as fault:
+                patch_directory_fsync_failure(fault, "simulated directory fsync failure")
+                original_fsync_directory(path)
+        else:
+            original_fsync_directory(path)
 
-    winners = run_experiment(experiment)
+    with monkeypatch.context() as publication_patch:
+        publication_patch.setattr(runtime_files, "fsync_directory", fail_pointer_directory_fsync)
+        winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
+    assert committed_pointers == [pointer.read_bytes()]
+    assert any(
+        record.name == "phasesweep.runtime.files"
+        and "Directory fsync failed after an atomic write" in record.message
+        for record in caplog.records
+    )
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     assert _record_state(experiment, generation_id) == "published"
     assert _current_pointer_state(experiment) == "published"
+    assert run_experiment(experiment)["p"].metric == winners["p"].metric
+    assert published_generation_id(experiment) == generation_id
+    status, (published,) = read_result(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert published is not None and published.metric == winners["p"].metric
+    assert committed_pointers == [pointer.read_bytes()]
 
 
 @pytest.mark.integration
@@ -433,14 +450,7 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     """
     experiment = _stored_experiment(tmp_path)
 
-    original = generation_ops.atomic_create_text
-
-    def interrupt_record_write(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml":
-            raise KeyboardInterrupt
-        return original(path, text)
-
-    monkeypatch.setattr(generation_ops, "atomic_create_text", interrupt_record_write)
+    lose_record_writes(monkeypatch, KeyboardInterrupt())
 
     winners = run_experiment(experiment)
 
@@ -613,18 +623,6 @@ def test_successful_publication_never_logs_a_record_refusal(
 # --------------------------------------------------------------------------
 
 
-def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
-    """Make writing an immutable record raise ``OSError``, for one record path or every one."""
-    original = generation_ops.atomic_create_text
-
-    def flaky(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml" and (only is None or path == only):
-            raise OSError("simulated record write failure")
-        return original(path, text)
-
-    monkeypatch.setattr(generation_ops, "atomic_create_text", flaky)
-
-
 def _publish_without_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Experiment, str]:
@@ -636,7 +634,7 @@ def _publish_without_record(
     """
     experiment = _stored_experiment(tmp_path)
     with monkeypatch.context() as crash:
-        _lose_record_writes(crash)
+        lose_record_writes(crash)
         run_experiment(experiment)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
@@ -699,7 +697,7 @@ def test_replacing_the_pointer_never_rewrites_an_existing_record(
     "inject_failure",
     [
         pytest.param(_fail_precommit_validation, id="precommit-validation"),
-        pytest.param(_fail_pointer_commit, id="pointer-commit"),
+        pytest.param(fail_pointer_commit, id="pointer-commit"),
     ],
 )
 def test_failed_publication_is_never_recorded_as_published(
@@ -740,7 +738,7 @@ def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer
     topped_up = _topped_up(experiment)
 
     with monkeypatch.context() as failing:
-        _lose_record_writes(failing, only=first_record)
+        lose_record_writes(failing, only=first_record)
         with pytest.raises(OSError, match="simulated record write failure"):
             run_experiment(topped_up, terminal_callback=lambda r: captured.append(r.generation_id))
 
@@ -893,16 +891,35 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     assert read_result(experiment, phase_names=["p"])[1] == []
 
 
-def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
-    """Strict resume rejects a linked winner from a current-format publication."""
+@pytest.mark.parametrize(
+    ("damage", "error", "reason"),
+    [
+        ("link", PublicationIntegrityError, "missing or unreadable"),
+        ("constraint-overflow", WinnerIntegrityError, "invalid or incomplete for skipped phase"),
+    ],
+)
+def test_load_winner_rejects_unusable_winner_with_current_summary(
+    tmp_path: Path, damage: str, error: type[Exception], reason: str
+) -> None:
+    """Strict resume reports linked or numerically unusable winners through domain errors."""
     experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
-    preserved_winner_path = winner_path.with_name("winner.original.yaml")
-    winner_path.rename(preserved_winner_path)
-    winner_path.symlink_to(preserved_winner_path.name)
+    if damage == "link":
+        preserved_winner_path = winner_path.with_name("winner.original.yaml")
+        winner_path.rename(preserved_winner_path)
+        winner_path.symlink_to(preserved_winner_path.name)
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["constraints"] = {"size": 10**400}
+        reseal_winner(experiment, generation_id, winner)
+        summary_path = _generation_summary_path(experiment, generation_id)
+        summary = yaml.safe_load(summary_path.read_text())
+        summary["phases"][0]["constraints"] = winner["constraints"]
+        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+        reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
-    with pytest.raises(PublicationIntegrityError, match="missing or unreadable"):
+    with pytest.raises(error, match=reason):
         artifact_io._load_winner(
             experiment,
             experiment.phases[0],
@@ -994,7 +1011,8 @@ def test_published_reads_consume_the_bytes_validation_read(
     write_experiment_config(config_path, experiment)
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
-    assert validated_bytes.decode("utf-8") in result.output
+    rendered = yaml.safe_load(result.output.split("=== p ===\n", 1)[1])
+    assert rendered["metric"][experiment.metric.name] == validated_metric
 
 
 # --------------------------------------------------------------------------
@@ -1209,21 +1227,36 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     assert "permission denied" in verdict.error
 
 
-def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [
+        ("hash", "does not match its recorded hash"),
+        ("metric-overflow", "disagrees with the summary metric value"),
+    ],
+)
+def test_corrupt_publication_is_reported_as_failed_not_absent(
+    tmp_path: Path, damage: str, reason: str
+) -> None:
+    """Unusable publications retain their failed verdict through reads and continuation."""
     experiment, generation_id = golden_publication(tmp_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+    if damage == "hash":
+        winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["metric"][experiment.metric.name] = 10**400
+        reseal_winner(experiment, generation_id, winner)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
     assert pointer.generation_id == generation_id
     assert pointer.error is not None
-    assert "does not match its recorded hash" in pointer.error
+    assert reason in pointer.error
 
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
-    assert "does not match its recorded hash" in status["publication_error"]
+    assert reason in status["publication_error"]
     assert status["published_generation_id"] is None
     assert status["represented_generation_id"] is None
     assert status["is_published"] is False
@@ -1233,11 +1266,11 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
 
     pointer_path = _last_successful_generation_path(experiment)
     pointer_bytes = pointer_path.read_bytes()
-    generations_before = set(_generation_dir(experiment, generation_id).parent.iterdir())
-    with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
+    generations_before = set(_generations_dir(_experiment_dir(experiment)).iterdir())
+    with pytest.raises(PublicationIntegrityError, match=reason):
         run_experiment(experiment)
     assert pointer_path.read_bytes() == pointer_bytes
-    assert set(_generation_dir(experiment, generation_id).parent.iterdir()) == generations_before
+    assert set(_generations_dir(_experiment_dir(experiment)).iterdir()) == generations_before
 
 
 @pytest.mark.parametrize("delete_current_pointer", [False, True])
@@ -1269,10 +1302,10 @@ def test_generation_loss_with_a_surviving_pointer_reports_failed(
     """Losing published generation artifacts cannot authorize convenience-winner fallback."""
     experiment, generation_id = golden_publication(tmp_path)
     if damage == "deleted-target":
-        shutil.rmtree(_generation_dir(experiment, generation_id))
+        shutil.rmtree(_generation_dir(_experiment_dir(experiment), generation_id))
     else:
         _generation_path(experiment).unlink()
-        generations = _generations_dir(experiment)
+        generations = _generations_dir(_experiment_dir(experiment))
         generations.rename(generations.with_name(f"saved-{generations.name}"))
 
     pointer = _resolve_publication_pointer(experiment)
@@ -1514,7 +1547,7 @@ def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Pat
     assert read_result(experiment, phase_names=["p"])[1] != []
     _last_successful_generation_path(experiment).unlink()
     _generation_path(experiment).unlink()
-    generations = _generations_dir(experiment)
+    generations = _generations_dir(_experiment_dir(experiment))
     generations.rename(generations.with_name("saved-generations"))
     generations.symlink_to("missing-generations", target_is_directory=True)
     assert generations.is_symlink() and not generations.exists()
@@ -1679,7 +1712,10 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     run_experiment(experiment, generation_id="launcher-granted-1")
 
     record = json.loads(
-        (_generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME).read_text()
+        (
+            _generation_dir(_experiment_dir(experiment), "launcher-granted-1")
+            / _REPRODUCIBILITY_NAME
+        ).read_text()
     )
     assert record["generation_id_source"] == "caller"
 
@@ -1719,7 +1755,7 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     """
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     original = target.read_bytes()
 
     target.write_bytes(original + b"\n# tampered\n")
@@ -1752,7 +1788,7 @@ def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     """A provenance file this user may not read reports ``permission_denied`` and names the publishing user."""
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     original_mode = stat.S_IMODE(target.stat().st_mode)
     target.chmod(0o000)
     try:
@@ -1897,7 +1933,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     """
     experiment, generation_id = golden_publication(tmp_path)
 
-    target = _generation_dir(experiment, generation_id) / filename
+    target = _generation_dir(_experiment_dir(experiment), generation_id) / filename
     if filename == _REPRODUCIBILITY_NAME:
         target.write_text(json.dumps(mutate(json.loads(target.read_text()))))
     else:

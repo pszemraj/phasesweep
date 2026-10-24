@@ -48,7 +48,6 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.generation import InvocationGeneration
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _completed_trial_count
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -68,8 +67,6 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_DECISION_ATTR,
-    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -114,7 +111,9 @@ from phasesweep.runtime.reaper import (
 from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import (
     make_experiment,
+    patch_published_trial_read_failure,
     phase_study,
+    record_accepted_partial_timeout,
     requires_nonroot,
     trial_outcome,
     write_trainer,
@@ -394,14 +393,7 @@ def _claim_while_published_trials_fail(inbound: Callable[[], Exception]) -> Trig
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         materialized = materialize("current-journal", tmp_path, mode="tree")
-        real_check = engine_ledger._check_published_phase_studies
-
-        def check_while_reads_fail(*args: Any, **kwargs: Any) -> None:
-            with monkeypatch.context() as reads:
-                reads.setattr(optuna.Study, "get_trials", _raiser(inbound()))
-                real_check(*args, **kwargs)
-
-        monkeypatch.setattr(engine_ledger, "_check_published_phase_studies", check_while_reads_fail)
+        patch_published_trial_read_failure(monkeypatch, inbound())
         return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
     return trigger
@@ -1441,24 +1433,8 @@ def _replay_partial_decision_without_opt_in(
     """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     study = phase_study(experiment)
-    trials = study.get_trials(deepcopy=False)
-    target = len(trials) + 1
-    study.set_user_attr(TRIAL_TARGET_ATTR, target)
-    study.set_user_attr(
-        PHASE_DECISION_ATTR,
-        {
-            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
-            "decision": "accepted_partial_timeout",
-            "trial_target": target,
-            "outcome_sequence": max(
-                trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
-            ),
-            "finished_trials": len(trials),
-            "completed_trials": _completed_trial_count(trials),
-            "timeout_scope": "phase",
-            "recovered_abort_sequence": None,
-        },
-    )
+    target = len(study.get_trials(deepcopy=False)) + 1
+    record_accepted_partial_timeout(study, target)
     phase = experiment.phases[0].model_copy(update={"n_trials": target})
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
@@ -1815,7 +1791,10 @@ CASES = (*WRAP_CASES, *ORIGIN_CASES)
 
 @pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in CASES])
 def test_raise_sites_route_their_declared_action(
-    case: RoutingCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    case: RoutingCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     with pytest.raises(case.raised) as excinfo:
         case.trigger(tmp_path, monkeypatch)
@@ -1825,7 +1804,21 @@ def test_raise_sites_route_their_declared_action(
     assert error.action is case.action
     if case.cause is not None:
         assert type(error.__cause__) is case.cause
-    assert case.message in str(error)
+    assert case.message in _operational_error_text(error)
+    if error.remediation is not None:
+        rendered = _operational_error_text(error)
+        assert rendered.split("\nfix: ", 1)[1] == error.remediation
+        assert "correct the experiment configuration" not in rendered
+        assert rendered.count(error.remediation) == 1
+        assert error.remediation not in str(error)
+        assert error.remediation not in caplog.text
+        failure = mcp_runner._terminal_failure_payload(
+            error, stage="execution", cleanup_confirmed=True
+        )
+        assert failure["remediation"] == f"Ask the operator: {error.remediation}"
+        if case.id.startswith("live_abort_with_"):
+            run_log = tmp_path / "runs" / "t" / "run.log"
+            assert run_log.read_text(encoding="utf-8").count(error.remediation) == 1
     if case.action is OperatorAction.RETRY:
         rendered = _operational_error_text(error)
         assert "retry the same operation once the reported blocker is resolved" in rendered

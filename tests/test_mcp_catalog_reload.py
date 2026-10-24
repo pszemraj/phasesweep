@@ -150,13 +150,23 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     _break_catalog(tmp_path, catalog, config, damage)
 
     assert _listed_ids(app) == ["srv"]
+    catalog_status = app.list_experiments()["catalog_status"]
+    assert catalog_status["stale"] is True
+    assert catalog_status["reload_refusal"] == "invalid"
+    assert "phasesweep mcp check" in catalog_status["remediation"]
     latest = app.latest_run("srv")
     assert latest["run"] is not None and latest["run"]["run_id"] == "srv-live"
-    assert app.status(run_id="srv-live")["run"]["state"] == "running"
+    assert latest["catalog_status"] == catalog_status
+    status = app.status(run_id="srv-live")
+    assert status["run"]["state"] == "running"
+    assert status["catalog_status"] == catalog_status
     if damage == "invalid_config":
         # The served entry no longer describes the file, so inspection refuses too.
         with pytest.raises(CatalogReloadRefusedError, match="no longer validates"):
             app.validate("srv")
+        refused_inspection = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
+        assert refused_inspection.isError
+        assert "inspection of changed configs" in str(refused_inspection.content)
     else:
         assert app.validate("srv")["experiment_id"] == "srv"
     with pytest.raises(CatalogReloadRefusedError, match="no longer validates") as excinfo:
@@ -175,6 +185,7 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     config.write_bytes(original_config)
     with pytest.raises(ExperimentBusyError):
         app.launch("srv")
+    assert app.list_experiments()["catalog_status"]["stale"] is False
     assert len(_messages(caplog, "again matches the loaded catalog")) == 1
 
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import textwrap
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, FloatParam, IntParam, Sampler
 from phasesweep.engine import phase as phase_module
@@ -46,8 +49,10 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    DURATION_ATTR,
     FEASIBLE_ATTR,
     RERUN_OF_ATTR,
+    RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
@@ -68,6 +73,7 @@ from phasesweep.engine.trial import (
     EnvironmentIdentity,
     ExecutedTrial,
     TrialExecutionError,
+    TrialResult,
     _environment_identity,
     extract_trial_result,
 )
@@ -77,9 +83,19 @@ from phasesweep.errors import (
     UnsafeProcessCleanupError,
 )
 from phasesweep.evidence.evaluation import DeadlineExceededError, ExtractorError
-from phasesweep.evidence.models import JsonExtractor, LogRegexExtractor, WandbSummaryRequiredGate
-from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
+from phasesweep.evidence.models import (
+    Gate,
+    JsonExtractor,
+    LogRegexExtractor,
+    WandbSummaryRequiredGate,
+)
+from phasesweep.runtime.process import (
+    ProcessResult,
+    read_attempt_lifecycle,
+    write_attempt_lifecycle,
+)
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
+from phasesweep.runtime.remote_worker import run_worker
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
     bounded_metric,
@@ -1061,9 +1077,9 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
 
 
 @pytest.mark.parametrize(
-    ("trainer_body", "constraints"),
+    ("trainer_body", "constraints", "recovered_complete"),
     [
-        pytest.param('print("x=0.5")', None, id="successful_trial"),
+        pytest.param('print("x=0.5")', None, True, id="successful_trial"),
         pytest.param(
             """
             import os, sys
@@ -1072,6 +1088,7 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
             print("x=0.5")
             """,
             None,
+            False,
             id="trainer_failure_trial",
         ),
         pytest.param(
@@ -1090,16 +1107,20 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
                     max=1000,
                 )
             ],
+            True,
             id="infeasible_trial",
         ),
     ],
 )
+@pytest.mark.parametrize("worker_return_code", [0, 7])
 @pytest.mark.integration
 def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trainer_body: str,
     constraints: list[Constraint] | None,
+    recovered_complete: bool,
+    worker_return_code: int,
 ) -> None:
     """An unwritable outcome ledger must never produce a terminal row without one.
 
@@ -1112,12 +1133,63 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     outage. The next run recovers it through the ordinary stale-attempt
     protocol, which writes the outcome *before* the terminal transition.
     """
+    launches = tmp_path / "launches"
+    trainer_body = (
+        "import os\nfrom pathlib import Path\n"
+        f"with Path({str(launches)!r}).open('a') as handle:\n"
+        "    handle.write(os.environ['PHASESWEEP_TRIAL_ID'] + '\\n')\n"
+        + textwrap.dedent(trainer_body)
+    )
     exp = _outcome_write_experiment(
         tmp_path,
         trainer_body=trainer_body,
         constraints=constraints,
     )
 
+    trainer_durations: list[float] = []
+    worker = write_trainer(
+        tmp_path / "sdk_worker.py",
+        f"""
+        import sys
+        from pathlib import Path
+        Path(sys.argv[2]).write_text('{{"status": "ok"}}')
+        raise SystemExit({worker_return_code})
+    """,
+    )
+    original_extract = phase_module.extract_trial_result
+
+    def extract_after_sdk_worker(
+        *,
+        experiment: Experiment,
+        executed: ExecutedTrial,
+        gates: list[Gate] | None = None,
+        deadline: float | None = None,
+    ) -> TrialResult:
+        """Reuse the cleanup slot while preserving trainer evidence recorded before extraction."""
+        ctx = executed.ctx
+        if ctx.trial_id == 0 and recovered_complete:
+            recorded = phase_trials(experiment)[0]
+            assert recorded.user_attrs[DURATION_ATTR] == executed.process.duration_seconds
+            assert recorded.user_attrs[RETURN_CODE_ATTR] == 0
+            trainer_durations.append(executed.process.duration_seconds)
+            result, _response, _diagnostic = run_worker(
+                {},
+                worker,
+                "fake-sdk",
+                statuses=frozenset({"ok"}),
+                run_id=ctx.attempt_id,
+                trial_dir=ctx.trial_dir,
+                environment={},
+                deadline=time.monotonic() + 10,
+            )
+            lifecycle = read_attempt_lifecycle(ctx.trial_dir, expected_attempt_id=ctx.attempt_id)
+            assert result.return_code == worker_return_code
+            assert lifecycle is not None and lifecycle.return_code == worker_return_code
+        return original_extract(
+            experiment=experiment, executed=executed, gates=gates, deadline=deadline
+        )
+
+    monkeypatch.setattr(phase_module, "extract_trial_result", extract_after_sdk_worker)
     real_set_user_attr = patch_rejected_trial_user_attr(
         monkeypatch,
         TRIAL_OUTCOME_ATTR,
@@ -1143,21 +1215,32 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     assert winners["p"].metric == pytest.approx(0.5)
     study = phase_study(exp)
     trials = study.get_trials(deepcopy=False)
-    # Recovery cannot prove what the unrecorded trial measured, so it is
-    # interrupted and reruns (trial 1) before the second draw (trial 2).
-    assert [trial.state for trial in trials] == [
-        optuna.trial.TrialState.FAIL,
-        optuna.trial.TrialState.COMPLETE,
-        optuna.trial.TrialState.COMPLETE,
-    ]
-    assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
-        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-        "sequence": 1,
-        "outcome": "interrupted",
-        "cause": "stale RUNNING trial recovered after its orchestrator stopped",
-    }
-    assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
-    assert _load_phase_policy_state(study).max_sequence == 3
+    if recovered_complete:
+        assert [trial.state for trial in trials] == [optuna.trial.TrialState.COMPLETE] * 2
+        assert trials[0].user_attrs[FEASIBLE_ATTR] is (constraints is None)
+        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == (
+            "success" if constraints is None else "failure"
+        )
+        assert not any(RERUN_OF_ATTR in trial.user_attrs for trial in trials)
+        assert _load_phase_policy_state(study).max_sequence == 2
+        assert launches.read_text().splitlines() == ["0", "1"]
+        assert trials[0].user_attrs[DURATION_ATTR] == trainer_durations[0]
+        assert len(trainer_durations) == 1
+    else:
+        assert [trial.state for trial in trials] == [
+            optuna.trial.TrialState.FAIL,
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.COMPLETE,
+        ]
+        assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
+            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+            "sequence": 1,
+            "outcome": "interrupted",
+            "cause": "stale RUNNING trial recovered after its orchestrator stopped",
+        }
+        assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
+        assert _load_phase_policy_state(study).max_sequence == 3
+        assert launches.read_text().splitlines() == ["0", "1", "2"]
 
 
 @pytest.mark.integration
@@ -1262,7 +1345,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     monkeypatch.setattr(optuna.Trial, "set_user_attr", maybe_refuse_cleanup_attr)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: cleanup_safe["value"],
+        lambda _identity, **_kwargs: cleanup_safe["value"],
     )
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))
@@ -1287,19 +1370,21 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     # A preview cannot confirm cleanup, so it names the recovery that retires the abort.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as previewed:
         run_experiment(_exp(2), dry_run=True)
-    message = str(previewed.value)
+    message = _operational_error_text(previewed.value)
     assert "cleanup could not be confirmed" in message
     assert "A larger n_trials does not retire this abort" in message
     assert "phasesweep run" in message and "phasesweep mcp recover-run" in message
     assert "Then raise phases[p].n_trials above 2 in the config" in message
-    # The closing sentence introduces the recorded results itself, after any remedy.
-    assert "in the config. The recorded trial results stay in the study; " in message
+    assert "Raising n_trials does not change the study fingerprint." in message
+    assert "The recorded trial results stay in the study; " in message
     # A preview of the larger target refuses the same way, as the live run below does,
     # and asks only for the cleanup that target still waits on.
-    with pytest.raises(PhaseAbortRefusedError, match="A larger n_trials does not retire") as raised:
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as raised:
         run_experiment(_exp(3), dry_run=True)
-    assert "phasesweep mcp recover-run" in str(raised.value)
-    assert "Then n_trials=3 retires it." in str(raised.value)
+    message = _operational_error_text(raised.value)
+    assert "A larger n_trials does not retire" in message
+    assert "phasesweep mcp recover-run" in message
+    assert "Then n_trials=3 retires it." in message
 
     # A larger target is not cleanup authority and launches no new trial.
     before = len(study.trials)
@@ -1325,8 +1410,8 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     # Once the preflight has confirmed cleanup, only the target is left to raise.
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as confirmed:
         run_experiment(_exp(2))
-    assert "phases[p].n_trials above 2 in the config" in str(confirmed.value)
-    assert "mcp recover-run" not in str(confirmed.value)
+    assert "phases[p].n_trials above 2 in the config" in _operational_error_text(confirmed.value)
+    assert "mcp recover-run" not in _operational_error_text(confirmed.value)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 

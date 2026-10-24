@@ -217,11 +217,14 @@ def test_exact_tie_goes_to_the_lowest_draw_position_not_the_lowest_trial_number(
     assert winner.confound["checks"]["tie"]["detail"]["tied_trials"] == [2]
 
 
-def test_rejects_nan_constraint_values_defensively():
-    """If a NaN somehow reaches user_attrs, the selector must reject it."""
+@pytest.mark.parametrize(
+    "invalid", [float("nan"), 10**400, -(10**400)], ids=["nan", "huge", "small"]
+)
+def test_rejects_nonfinite_constraint_values(invalid: float | int) -> None:
+    """A nonfinite or unrepresentable stored constraint makes a trial ineligible."""
     study = _make_study()
     _add_trial(study, 0.5, constraint_vals={"size": 100.0})
-    _add_trial(study, 0.1, constraint_vals={"size": float("nan")})
+    _add_trial(study, 0.1, constraint_vals={"size": invalid})
 
     exp = _make_exp(
         [
@@ -234,7 +237,7 @@ def test_rejects_nan_constraint_values_defensively():
     )
     sel = select_winner(study, exp)
     assert sel.trial_number == 0, (
-        "NaN-constraint trial 1 must be rejected even though metric was lower"
+        "Invalid-constraint trial 1 must be rejected even though metric was lower"
     )
 
 

@@ -26,6 +26,7 @@ from typing import Any, Literal, NoReturn
 
 from pydantic import ValidationError
 
+from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
 from phasesweep.config.reference import (
     ReferenceEntry,
@@ -42,8 +43,9 @@ from phasesweep.engine.errors import (
     ResumeWinnerMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    WinnerIntegrityError,
 )
-from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
@@ -87,7 +89,6 @@ from phasesweep.mcp.runs import (
     RunObservation,
     RunState,
     RunStore,
-    load_experiment_snapshot,
     write_status_file_if_absent,
 )
 from phasesweep.mcp.snapshots import (
@@ -230,8 +231,7 @@ def _cursor_offset(cursor: str | None) -> int:
 
     :param str | None cursor: Cursor supplied by the agent.
     :return int: Zero-based catalog offset.
-    :raises McpToolError: If the cursor is not a non-negative integer produced
-        by ``list_experiments``.
+    :raises McpToolError: If the cursor cannot be parsed as a non-negative integer offset.
     """
     if cursor is None:
         return 0
@@ -407,6 +407,20 @@ class PhaseSweepMCP:
         registry, _refusal = self._refresh_registry()
         return registry
 
+    def _catalog_status(self) -> JsonObject:
+        """Describe whether this response uses a catalog whose reload was refused.
+
+        :return JsonObject: Path-free catalog freshness and operator remedy.
+        """
+        refusal = self._reload_refusal
+        return {
+            "stale": refusal is not None,
+            "reload_refusal": refusal.reason if refusal is not None else None,
+            "remediation": str(CatalogReloadRefusedError(refusal.reason))
+            if refusal is not None
+            else None,
+        }
+
     def _audit_success(
         self,
         tool: str,
@@ -475,8 +489,7 @@ class PhaseSweepMCP:
         :param int limit: Maximum catalog entries to return.
         :param str | None cursor: Optional pagination cursor returned by a prior call.
         :return dict[str, Any]: Catalog page safe for the agent.
-        :raises McpToolError: If ``limit`` is outside ``1..MAX_LIST_LIMIT``, or
-            the cursor is not one this tool returned.
+        :raises McpToolError: If ``limit`` is outside ``1..MAX_LIST_LIMIT`` or the cursor is not a non-negative integer offset.
         """
         if limit < 1 or limit > MAX_LIST_LIMIT:
             raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
@@ -489,6 +502,7 @@ class PhaseSweepMCP:
             "experiments": page,
             "total_count": total_count,
             "next_cursor": str(next_offset) if next_offset < total_count else None,
+            "catalog_status": self._catalog_status(),
         }
 
     @staticmethod
@@ -566,6 +580,7 @@ class PhaseSweepMCP:
             "metric": reg.metric_payload,
             "capabilities": reg.capabilities,
             "phases": phases,
+            "catalog_status": self._catalog_status(),
         }
 
     def latest_run(self, experiment_id: str) -> dict[str, Any]:
@@ -581,6 +596,7 @@ class PhaseSweepMCP:
             "experiment_id": reg.id,
             "found": run is not None,
             "run": run,
+            "catalog_status": self._catalog_status(),
         }
 
     def _run_payload(
@@ -618,6 +634,7 @@ class PhaseSweepMCP:
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
             "failure": self._run_failure_payload(
                 handle,
+                view=view,
                 observation=observation,
                 force_snapshot_unavailable=force_snapshot_unavailable,
             ),
@@ -647,9 +664,59 @@ class PhaseSweepMCP:
             snapshot-unavailable failure; otherwise returns ``None`` when no
             valid failure was recorded.
         """
+        if view is None:
+            view = self._runs.runner_view(handle)
         if observation is None:
             observation = self._runs.observe(handle, view=view)
         terminal: Mapping[str, object] = observation.terminal_status or {}
+        runner_ended_with_boot = (
+            observation.terminal_status is None
+            and handle.launch_state == "spawned"
+            and view.visibility == "gone"
+        )
+        runner_exited = terminal.get("error_class") == "RunnerExitedWithoutStatus" or (
+            observation.terminal_status is None
+            and handle.launch_state == "spawned"
+            and observation.recovery_required
+            and not observation.runner_heartbeat_stale
+            and not self._runs.runner_may_be_alive(handle, view=view)
+        )
+        if runner_exited or runner_ended_with_boot or observation.runner_heartbeat_stale:
+            recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
+            if runner_ended_with_boot:
+                remedy = (
+                    "The runner ended with an earlier host boot. No process from that boot "
+                    "remains, so process cleanup and recover-run are not required. This "
+                    "run's historical results are unavailable; do not substitute mutable "
+                    "experiment-level results."
+                )
+            elif observation.runner_heartbeat_stale:
+                remedy = (
+                    "The runner is in another PID namespace and its heartbeat is stale; "
+                    "it may have stopped. Stop monitoring and ask the operator to inspect "
+                    "this run with `phasesweep mcp recover-run` from a host shell outside "
+                    "the sandbox. Liveness and trial cleanup must be checked there."
+                )
+            else:
+                remedy = (
+                    "The runner exited without writing a final status; its trial processes may "
+                    "still be alive. Stop monitoring and ask the operator to inspect this run "
+                    "with `phasesweep mcp recover-run` from a host shell, then repeat with "
+                    "`--confirm` after reviewing the process cleanup preview."
+                    if recovery_required
+                    else "The runner exited without writing a final status. Operator recovery "
+                    "settled process cleanup; this run's historical results remain unavailable. "
+                    "Do not substitute mutable experiment-level results."
+                )
+            return {
+                "code": (
+                    "cleanup_uncertain" if recovery_required else "result_snapshot_unavailable"
+                ),
+                "stage": "cleanup",
+                "retryable": False,
+                "actor": "operator",
+                "remediation": remedy,
+            }
         persisted: dict[str, Any] | None = None
         try:
             if terminal.get("failure") is not None:
@@ -873,7 +940,7 @@ class PhaseSweepMCP:
         experiment: Experiment,
         handle: RunHandle,
     ) -> tuple[EngineStatus, list[PhaseWinnerView]]:
-        """Read one publication's live status and winners using the saved run config.
+        """Read run-pinned generation status and winners using the saved run config.
 
         After decataloging, that config still locates artifacts but cannot establish current
         catalog drift; leave the drift verdict unknown.
@@ -895,6 +962,7 @@ class PhaseSweepMCP:
             ArtifactRootConflictError,
             StudySchemaMismatchError,
             StudyStorageUnavailableError,
+            WinnerIntegrityError,
         ) as exc:
             self._raise_persistent_read_error(handle, exc)
         if comparison is None:
@@ -904,13 +972,15 @@ class PhaseSweepMCP:
     @staticmethod
     def _raise_persistent_read_error(
         handle: RunHandle,
-        exc: ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError,
+        exc: ArtifactRootConflictError
+        | StudySchemaMismatchError
+        | StudyStorageUnavailableError
+        | WinnerIntegrityError,
     ) -> NoReturn:
         """Replace a path-bearing live-study read failure with a safe tool error.
 
         :param RunHandle handle: Run whose immutable config selected the failed state.
-        :param ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError exc:
-            Explicit persistent-state failure to redact.
+        :param ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError | WinnerIntegrityError exc: Explicit persistent-state failure to redact.
         :raises RunPersistentStateUnavailableError: Always, without storage details.
         """
         log.info("persistent state read failed for run=%s: %s", handle.run_id, exc)
@@ -935,12 +1005,13 @@ class PhaseSweepMCP:
         """
         status = snapshot.status_payload()
         comparison = self._catalog_comparison_experiment(experiment_id)
-        represented_fingerprint = snapshot.represented_config_fingerprint
         status["published_config_matches_current"] = (
-            represented_fingerprint == _experiment_semantic_fingerprint(comparison)
-            if comparison is not None
-            and represented_fingerprint is not None
-            and result_source != "terminal_snapshot_unavailable"
+            _recorded_config_matches(
+                comparison,
+                snapshot.represented_config_fingerprint,
+                phase_count=len(snapshot.status.result_phase_plan),
+            )
+            if comparison is not None and result_source != "terminal_snapshot_unavailable"
             else None
         )
         return status
@@ -963,18 +1034,18 @@ class PhaseSweepMCP:
         :return dict[str, Any]: Agent-safe status response.
         """
         elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
-        return status_payload(
+        result = status_payload(
             target_id,
             dict(status),
             run,
             result_source=result_source,
             elapsed_seconds=elapsed_seconds,
         )
+        result["catalog_status"] = self._catalog_status()
+        return result
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load the exact config snapshot pinned by the run handle.
-
-        Reject missing, unreadable, altered or non-experiment snapshots, including after restart.
 
         :param RunHandle handle: Persisted run identity whose snapshot should be loaded.
         :return Experiment: Parsed experiment from the launched per-run snapshot.
@@ -1041,6 +1112,7 @@ class PhaseSweepMCP:
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
         )
+        result["catalog_status"] = self._catalog_status()
         return result
 
     def _effective_visible_params(
@@ -1150,11 +1222,6 @@ class PhaseSweepMCP:
 
     def launch(self, experiment_id: str, from_phase: str | None = None) -> JsonObject:
         """Start the sweep as a detached background run; return its run_id.
-
-        Refuses while the latest reread of an edited catalog was refused, if launch is
-        not permitted, if a ``from_phase`` resume is not ready (an earlier phase the
-        remaining phases inherit has no compatible published winner), if this experiment
-        already has a live run, or if the server is at its max_concurrent_runs cap.
 
         :param str experiment_id: Catalog experiment id to launch.
         :param str | None from_phase: Optional phase to resume from once the earlier phases
@@ -1530,9 +1597,6 @@ class PhaseSweepMCP:
         reg: RegisteredExperiment, refusal: _CatalogReloadRefusal | None = None
     ) -> bytes:
         """Read a cataloged config only while it still holds the bytes its registry validated.
-
-        The call's reread makes the bytes match, unless the file changed after it or
-        that reread was refused and the served registry is the last valid one.
 
         :param RegisteredExperiment reg: Catalog entry to verify.
         :param _CatalogReloadRefusal | None refusal: Refusal of this call's reread, if any.

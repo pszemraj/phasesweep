@@ -65,6 +65,20 @@ def test_validate_and_dry_run_warn_about_numeric_looking_string_choices(
     ]
 
 
+@pytest.mark.parametrize("exponent", ["999999999", "999999999999999999999"])
+def test_extreme_exponent_warning_keeps_its_compact_spelling(
+    tmp_path: Path, exponent: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Validation and dry runs warn without expanding enormous decimal alternatives."""
+    path = _write_choices_config(tmp_path, f"[1e-{exponent}, adam, sgd, rmsprop]")
+    result = CliRunner().invoke(cli_main, ["validate", str(path)])
+    assert result.exit_code == 0, result.output
+    spelling = f"Write 1e-{exponent} as 1.0e-{exponent},"
+    assert spelling in result.output
+    run_experiment(load_experiment(path), dry_run=True)
+    assert any(spelling in record.getMessage() for record in caplog.records)
+
+
 @pytest.mark.parametrize(
     "choices",
     [

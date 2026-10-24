@@ -31,7 +31,7 @@ The depth winner's `model.n_layers: 8` becomes a fixed input to every learning-r
 
 ![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
-Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints the validated generation directory and winners; `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
+Results live under `runs/phasesweep_starter/` beside the config, including `run.log`. `show-winners` prints concise phase winners, the generation directory, and publication state; finished phases appear as unpublished while later phases run. `status --trials` inspects recorded attempts. See [inspection commands](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) for the output.
 
 ## Use your own trainer
 
@@ -50,8 +50,6 @@ phasesweep run starter.yaml --dry-run
 phasesweep explain
 phasesweep explain 'phases[].sampler'
 ```
-
-The [inspection guide](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) covers inherited placeholders and preview limits.
 
 W&B and MLflow require their optional extras, `phasesweep[wandb]` and `phasesweep[mlflow]`; follow the [W&B setup](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#wb-evidence) or [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md). For noisy measurements, see [small-budget advice and repeats](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets).
 

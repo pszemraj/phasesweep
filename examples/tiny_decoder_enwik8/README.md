@@ -50,7 +50,7 @@ Checkpoint loading and final evaluation belong to this example's trainer wrapper
 
 ## Learning rates over seeds
 
-The runnable [`repeats.yaml`](repeats.yaml) demonstrates the repeats workflow: three learning rates, each run over seeds 7, 17, and 27. For a continuous key such as the learning rate, [more distinct values with one trial each](../../docs/config.md#noisy-objectives-and-small-budgets) usually tell more; repeats suit a few discrete finalists. It includes `storage: auto` and the required nonempty `provenance`, so it supports persisted status and same-config resume without editing the ephemeral smoke config. It resolves the trainer's working directory relative to the YAML file. When copying this YAML outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After the setup above, run from the PhaseSweep repository root:
+The runnable [`repeats.yaml`](repeats.yaml) compares three learning rates over seeds 7, 17, and 27. For a continuous key such as learning rate, [more distinct values with one trial each](../../docs/config.md#noisy-objectives-and-small-budgets) usually tell more; repeats suit a few discrete finalists. This config includes persistent storage and provenance, and resolves the trainer's working directory relative to the YAML file. When copying it outside the checkout, set `execution.cwd` to the absolute PhaseSweep repository path. After setup, run from the repository root:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/repeats.yaml
@@ -63,11 +63,11 @@ phasesweep run examples/tiny_decoder_enwik8/repeats.yaml
 
 The nine trials run sequentially on CUDA device `0`, with 80 optimizer updates, batch size 4, and sequence length 128 each. The objective is the saved step-80 `final.pt` loss over eight held-out validation batches. Each learning rate is ranked by its mean over the three seeds; `status --trials` includes every group's mean and sample SD. A within-noise advisory means the current seeds do not separate the candidate rates; this short example demonstrates the workflow rather than convergence.
 
-The last command replays a completed study without training again. After an interruption, the same command keeps completed trials and reruns interrupted attempts before new cells. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for failure aborts and retry budgets.
+The last command replays a completed study without training again. Artifacts and the journal stay under `/tmp/phasesweep-tiny-decoder-enwik8-repeats`. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for interruption recovery, failure aborts and retry budgets.
 
 ## Continue one checkpoint
 
-To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints each winning member's seed, trial number, and exact `trial_dir` before the evidence YAML. This example saves its checkpoint at `trainer/final.pt` below that directory.
+To continue training a particular saved model, use the pinned upstream trainer's existing `--resume` option. For a repeat winner, choose a seed explicitly; the aggregate score summarizes several models. `show-winners` prints `repeats.key` and each winning member's `repeat`, `trial_number` and `trial_dir` under `repeats.members`. Choose the member there; this example saves its checkpoint at `trainer/final.pt` below that `trial_dir`. The `# full record:` path retains the complete checkpoint evidence.
 
 Run this from the PhaseSweep repository root, replacing the checkpoint path with the chosen member's file. The recipe reads the checkpoint's own trainer config and requests five additional optimizer updates. A step-80 checkpoint therefore finishes at step 85. The pinned trainer interprets `num_batches` as additional updates when resuming; setting it to 85 would instead finish at 165.
 
@@ -114,7 +114,7 @@ The wrapper's `--mlflow` option logs the evaluated `final.pt` loss as native `va
 
 The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. The wrapper then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
 
-Unlike `gpu_smoke.yaml`, this variant uses persistent storage: a completed `run` is reused without training again. For fresh trials, copy the config with a new local experiment name and workdir. When placing a copy outside the repo, set `execution.cwd` to the absolute PhaseSweep repository path so the relative trainer command still resolves. To use another server, change `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
+Completed trials are reused. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for a fresh study and [copying the repeats config](#learning-rates-over-seeds) for the working-directory rule. To use another server, change `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
 
 ## MCP smoke
 

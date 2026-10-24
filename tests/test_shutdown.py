@@ -19,7 +19,7 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.runtime import shutdown as runtime_shutdown
-from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, run_supervised
+from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, fd_ready, run_supervised
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -471,6 +471,15 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
     ("body", "marker"),
     [
         pytest.param(
+            "signal.signal(signal.SIGTERM, lambda *_: print('host-handler', flush=True))\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
+            "print('queued', flush=True)\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "install_signal_handlers()\n",
+            "queued",
+            id="pending-before-installation",
+        ),
+        pytest.param(
             "signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))\n"
             "install_signal_handlers()\n"
             "with defer_shutdown_signals():\n"
@@ -499,7 +508,7 @@ def test_defer_shutdown_signals_blocks_and_restores() -> None:
     ],
 )
 def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> None:
-    """Queued shutdown exits after restoring inherited masks or leaving held critical locks."""
+    """Queued shutdown uses installed handlers before unblocking or leaving critical locks."""
     code = (
         "import os, signal\n"
         "from phasesweep.runtime.shutdown import (install_signal_handlers, "
@@ -515,6 +524,7 @@ def test_deferred_sigterm_exits_without_deadlocking(body: str, marker: str) -> N
         check=False,
     )
     assert marker in proc.stdout
+    assert "host-handler" not in proc.stdout
     assert proc.returncode == 128 + signal.SIGTERM
 
 
@@ -640,3 +650,59 @@ def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
     lifecycle = json.loads((trial_dir / ATTEMPT_LIFECYCLE_FILE).read_text())
     assert lifecycle["state"] == "exited"
     assert lifecycle["cleanup_confirmed"] is True
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("guardian_wait_locked", [False, True])
+def test_cleanup_takes_over_when_guardian_dies_in_final_confirmation(
+    monkeypatch: pytest.MonkeyPatch, guardian_wait_locked: bool
+) -> None:
+    """Final-window guardian death triggers direct cleanup even when its waitpid lock is held."""
+    import phasesweep.runtime.reaper as reaper
+
+    command = [
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(60)",
+    ]
+    trainer = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
+    guardian = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
+    real_probe = reaper._process_group_alive_with_members
+    killed_guardian = False
+
+    def probe(pgid: int, members: set[int] | None) -> bool:
+        nonlocal killed_guardian
+        if pgid == trainer.pid and not killed_guardian:
+            killed_guardian = True
+            guardian.kill()
+            deadline = time.monotonic() + 5
+            while reaper._process_group_alive(guardian.pid):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        return real_probe(pgid, members)
+
+    try:
+        for proc in (trainer, guardian):
+            assert proc.stdout is not None and fd_ready(proc.stdout.fileno(), timeout=5)
+            assert proc.stdout.readline() == b"ready\n"
+        monkeypatch.setattr(reaper, "_process_group_alive_with_members", probe)
+        if guardian_wait_locked:
+            guardian._waitpid_lock.acquire()
+        try:
+            verdicts = reaper._terminate_process_groups(
+                (trainer.pid,), grace_seconds=0.0, guardians={trainer.pid: guardian}
+            )
+        finally:
+            if guardian_wait_locked:
+                guardian._waitpid_lock.release()
+        assert killed_guardian
+        assert verdicts == {trainer.pid: True}
+        assert not real_probe(trainer.pid, None)
+    finally:
+        for proc in (trainer, guardian):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            if proc.stdout is not None:
+                proc.stdout.close()

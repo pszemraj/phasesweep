@@ -12,7 +12,11 @@ import os
 import resource
 import select
 import shlex
+import signal
 import stat
+import subprocess
+import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +27,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import TRIAL_DIR_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     ExecutedTrial,
@@ -39,14 +43,25 @@ from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequir
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
 from phasesweep.tracking.session import write_record
-from tests.conftest import make_experiment, make_trial_context, phase_study
+from tests.conftest import make_experiment, make_trial_context, phase_study, write_trainer
 from tests.tracking_helpers import attempt_identity, mlflow_binding
 
 #: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
 #: process identity exists, so anything else it loaded could start code that
 #: cleanup can never find.
 SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
-    {"__future__", "contextlib", "json", "os", "signal", "sys", "time"}
+    {
+        "__future__",
+        "contextlib",
+        "json",
+        "os",
+        "pathlib",
+        "signal",
+        "sys",
+        "tempfile",
+        "time",
+        "types",
+    }
 )
 
 
@@ -1273,3 +1288,87 @@ def test_trial_directory_and_allocated_lifecycle_precede_launch(
 
     assert observed["trial_dir_attr"] == observed["trial_dir"]
     assert observed["lifecycle"] == "allocated"
+
+
+@pytest.mark.integration
+def test_guardian_sigkill_fails_one_trial_and_continues_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A killed guardian leaves its live trainer for direct cleanup and later trials still run."""
+    import phasesweep.runtime.process as process
+    from phasesweep.runtime.reaper import _process_group_alive, read_stale_process_identity
+
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse, json, os, signal, sys, time
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        args, _ = parser.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            Path(args.out).write_text(json.dumps({"x": 0.25}))
+            os.kill(os.getppid(), signal.SIGKILL)
+            while True:
+                time.sleep(1)
+        Path(args.out).write_text(json.dumps({"x": 0.5}))
+        print("x=0.5")
+        """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trial_command=(
+            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(trainer))} "
+            "--out {trial_dir}/r.json {overrides}"
+        ),
+        n_trials=2,
+        max_consecutive_failures=2,
+        timeout_seconds_per_trial=5,
+        gpu_policy="none",
+    )
+    real_terminate = process._terminate_process_groups
+    cleaned: list[int] = []
+
+    def terminate(
+        pgids: tuple[int, ...],
+        *,
+        grace_seconds: float,
+        guardians: Mapping[int, subprocess.Popen[bytes]] | None = None,
+    ) -> dict[int, bool]:
+        assert guardians is None
+        first = phase_study(experiment).trials[0]
+        directory = first.user_attrs[TRIAL_DIR_ATTR]
+        attempt = first.user_attrs[ATTEMPT_ID_ATTR]
+        assert isinstance(directory, str) and isinstance(attempt, str)
+        lifecycle = read_attempt_lifecycle(Path(directory), expected_attempt_id=attempt)
+        assert lifecycle is not None and lifecycle.state == "terminating"
+        assert lifecycle.return_code == -signal.SIGTERM
+        cleaned.extend(pgids)
+        return real_terminate(pgids, grace_seconds=grace_seconds, guardians=guardians)
+
+    monkeypatch.setattr(process, "_terminate_process_groups", terminate)
+    try:
+        winners = run_experiment(experiment)
+    finally:
+        for trial in phase_study(experiment).trials:
+            directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+            attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(directory, str) and isinstance(attempt, str):
+                identity = read_stale_process_identity(Path(directory), expected_attempt_id=attempt)
+                if _process_group_alive(identity.pgid):
+                    real_terminate((identity.pgid,), grace_seconds=0.05)
+
+    first, second = phase_study(experiment).trials
+    assert [first.state.name, second.state.name] == ["FAIL", "COMPLETE"]
+    assert winners["p"].trial_number == second.number
+    assert winners["p"].metric == 0.5
+    assert len(cleaned) == 1 and not _process_group_alive(cleaned[0])
+    lifecycle = read_attempt_lifecycle(
+        Path(first.user_attrs[TRIAL_DIR_ATTR]),
+        expected_attempt_id=first.user_attrs[ATTEMPT_ID_ATTR],
+    )
+    assert lifecycle is not None and lifecycle.state == "exited" and lifecycle.cleanup_confirmed
+    assert lifecycle.return_code == -signal.SIGTERM
+    assert "Lease guardian" in caplog.text
+    assert "root process exited with code -9" not in caplog.text

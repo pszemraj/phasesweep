@@ -30,14 +30,22 @@ def _load_wrapper() -> ModuleType:
     return module
 
 
+@pytest.fixture
+def trainer_script(tmp_path: Path) -> Path:
+    """Provide a checkout marker for workflows that replace training with a stub."""
+    script = tmp_path / "upstream" / "train.py"
+    script.parent.mkdir()
+    script.touch()
+    return script
+
+
 @pytest.mark.parametrize("device_type", ["cuda", "mps", "cpu"])
 def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
-    tmp_path, monkeypatch, device_type
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device_type: str, trainer_script: Path
+) -> None:
     wrapper = _load_wrapper()
     monkeypatch.setitem(sys.modules, "mlflow", None)
-    template_root = tmp_path / "upstream"
-    template_root.mkdir()
+    template_root = trainer_script.parent
     trial_dir = tmp_path / "trial"
     config_path = trial_dir / "trainer_config.yaml"
     trial_dir.mkdir()
@@ -50,14 +58,16 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
     )
     observed: dict[str, object] = {}
 
-    def fake_run(_template_root: Path, config_path: Path) -> None:
+    def fake_run(train_py: Path, config_path: Path) -> None:
+        assert train_py == trainer_script
         config = yaml.safe_load(config_path.read_text())
         observed["config"] = config
         run_dir = Path(config["run_dir"])
         run_dir.mkdir(parents=True)
         (run_dir / "final.pt").write_bytes(b"checkpoint")
 
-    def fake_evaluate(_template_root: Path, run_dir: Path) -> dict[str, object]:
+    def fake_evaluate(train_py: Path, run_dir: Path) -> dict[str, object]:
+        assert train_py == trainer_script
         assert (run_dir / "final.pt").read_bytes() == b"checkpoint"
         return {
             "checkpoint": "final.pt",
@@ -118,7 +128,12 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(
     ids=["cuda-success", "cpu-success", "trainer-failure"],
 )
 def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
-    tmp_path, monkeypatch, managed, device_type, trainer_fails
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+    device_type: str,
+    trainer_fails: bool,
+    trainer_script: Path,
 ) -> None:
     """The native run covers training and closes on failure without logging a score."""
     wrapper = _load_wrapper()
@@ -141,7 +156,8 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
         finally:
             observed["active"] = False
 
-    def train(_root: Path, _config: Path) -> None:
+    def train(train_py: Path, _config: Path) -> None:
+        assert train_py == trainer_script
         assert observed["active"] is True
         assert observed["params"] == config
         if trainer_fails:
@@ -182,7 +198,7 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
     )
     # Native mode has no JSON-envelope destination supplied by the controller.
     monkeypatch.delenv("PHASESWEEP_OBJECTIVE_PATH", raising=False)
-    args = ["--config", str(config_path), "--mlflow"]
+    args = ["--template-root", str(trainer_script.parent), "--config", str(config_path), "--mlflow"]
     if trainer_fails:
         with pytest.raises(RuntimeError, match="trainer failed"):
             wrapper.main(args)
@@ -208,7 +224,9 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
 
 
 @pytest.mark.parametrize("mlflow_mode", [False, True])
-def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch, mlflow_mode) -> None:
+def test_wrapper_rejects_a_config_from_another_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mlflow_mode: bool, trainer_script: Path
+) -> None:
     """Neither reporting mode publishes an evaluation of another attempt's config."""
     wrapper = _load_wrapper()
     trial_dir = tmp_path / "trial"
@@ -246,7 +264,7 @@ def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch, ml
     monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "different")
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
-    args = ["--config", str(config_path)]
+    args = ["--template-root", str(trainer_script.parent), "--config", str(config_path)]
     with pytest.raises(ValueError, match="Trainer config does not match"):
         wrapper.main([*args, "--mlflow"] if mlflow_mode else args)
 
@@ -285,7 +303,7 @@ def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
 
     with pytest.raises(RuntimeError, match="evaluation reached data"):
-        wrapper._evaluate_final_checkpoint(tmp_path, tmp_path)
+        wrapper._evaluate_final_checkpoint(tmp_path / "train.py", tmp_path)
 
     assert observed == [0]
 
@@ -317,4 +335,4 @@ def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) 
     monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
 
     with pytest.raises(ValueError, match="evaluated no validation tokens"):
-        wrapper._evaluate_final_checkpoint(tmp_path, tmp_path)
+        wrapper._evaluate_final_checkpoint(tmp_path / "train.py", tmp_path)

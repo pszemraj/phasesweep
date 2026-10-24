@@ -18,10 +18,11 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
+from phasesweep.config.common import ConfigInt, _validate_safe_name
 from phasesweep.config.io import (
     _load_yaml_mapping_from_text,
     describe_validation_error,
+    format_validation_error,
     load_experiment_bytes,
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
@@ -107,9 +108,7 @@ class _Entry(_CatalogModel):
         :return str: The validated id.
         :raises ValueError: If the id is not ``[A-Za-z0-9_-]+``.
         """
-        if not SAFE_NAME_PATTERN.fullmatch(value):
-            raise ValueError(f"catalog id {value!r} must match [A-Za-z0-9_-]+")
-        return value
+        return _validate_safe_name("catalog id", value)
 
     @field_validator("visible_params")
     @classmethod
@@ -302,7 +301,7 @@ def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path, str]:
     try:
         catalog = _Catalog.model_validate(raw)
     except ValidationError as exc:
-        raise CatalogError(f"catalog {catalog_path}: {exc}") from exc
+        raise CatalogError(f"catalog {catalog_path}: {format_validation_error(exc)}") from exc
     return catalog, catalog_path.resolve().parent, hashlib.sha256(data).hexdigest()
 
 
@@ -527,8 +526,7 @@ class Registry:
     def load(cls, catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
         """Load validated experiments with persistent local journal storage.
 
-        Any invalid catalog, config or state directory raises ``CatalogError``. A
-        running server reloads an edited catalog by passing the state directory its
+        A running server reloads an edited catalog by passing the state directory its
         run store already serves as ``bound_state_dir``. That directory is neither
         provisioned nor probed again, so a reload writes nothing.
 

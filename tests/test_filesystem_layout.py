@@ -9,13 +9,15 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_summary_path,
     _generation_winner_path,
     _phase_dir,
 )
-from phasesweep.engine.run import experiment_status, run_experiment
+from phasesweep.engine.read import experiment_status
+from phasesweep.engine.run import run_experiment
 from phasesweep.runtime.files import (
     atomic_create_text,
     atomic_text_writer,
@@ -90,6 +92,7 @@ def test_run_experiment_writes_summary_at_namespaced_path(
     # Nothing is written directly under the bare workdir.
     assert not (Path(exp.workdir).resolve() / "summary.yaml").exists()
     assert (_experiment_dir(exp) / ".gitignore").read_text() == "*\n"
+    assert (_experiment_dir(exp) / ".ignore").read_text() == "!**\n"
     assert not (Path(exp.workdir) / ".gitignore").exists()
     visible = subprocess.run(
         [
@@ -119,6 +122,7 @@ def test_existing_artifact_dir_adds_only_missing_ignore(
         ignore.write_text(existing_ignore)
     ensure_artifact_dir(artifact_dir)
     assert ignore.read_text() == (existing_ignore if existing_ignore is not None else "*\n")
+    assert (artifact_dir / ".ignore").read_text() == "!**\n"
 
 
 def test_new_artifact_dir_does_not_modify_repository_ignore(tmp_path: Path) -> None:
@@ -130,9 +134,11 @@ def test_new_artifact_dir_does_not_modify_repository_ignore(tmp_path: Path) -> N
 
 
 def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
+    """Dry runs and refused inspection leave missing artifact directories absent."""
     exp = make_experiment(workdir=str(tmp_path / "runs"))
     run_experiment(exp, dry_run=True)
-    experiment_status(exp)
+    with pytest.raises(StudyStorageUnavailableError, match="contains a started study"):
+        experiment_status(exp)
     assert not Path(exp.workdir).exists()
 
 

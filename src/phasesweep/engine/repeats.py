@@ -347,12 +347,15 @@ def _finite_number(value: object, *, label: str) -> float:
 
     :param object value: Parsed value.
     :param str label: Field name for the diagnostic.
-    :raises ValueError: The value is not a finite number.
+    :raises ValueError: The value is not representable as a finite float.
     :return float: The value as a float.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
-        raise ValueError(f"repeats {label} is not a finite number")
-    return float(value)
+    try:
+        if not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(value):
+            return float(value)
+    except OverflowError:
+        pass
+    raise ValueError(f"repeats {label} is not a finite number")
 
 
 def _repeat_value(value: object) -> RepeatValue:

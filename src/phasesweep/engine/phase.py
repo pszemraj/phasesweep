@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NamedTuple
 from uuid import uuid4
 
@@ -40,7 +41,12 @@ from phasesweep.engine.optuna import (
     _suggest,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
-from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
+from phasesweep.engine.progress import (
+    _log_finished_trial,
+    _log_phase_header,
+    _log_reruns,
+    _warn_deferred_extraction,
+)
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -55,10 +61,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
-    FEASIBLE_ATTR,
-    GATES_ATTR,
     GENERATION_ID_ATTR,
-    OBJECTIVE_PROVENANCE_ATTR,
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -70,10 +73,9 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     Winner,
     WinnerSource,
+    _completed_trainer_duration,
     _parsed_trial_outcome,
     _trial_outcome_payload,
-    constraint_attr,
-    observed_attr,
 )
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
@@ -105,15 +107,17 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
+    record_trial_result,
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
-from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
     servicing_shutdown_signal,
 )
@@ -397,9 +401,9 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
-        "Refusing to reinterpret those finished attempts as a successful phase."
-        + ("" if advice is None else f" {advice}"),
+        "Refusing to reinterpret those finished attempts as a successful phase.",
         action=_recovery_action(study, abort_record),
+        remediation=advice,
     )
 
 
@@ -420,9 +424,9 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
         f"max_consecutive_failures={phase.max_consecutive_failures}, so it launches no more "
-        f"trials at its accepted n_trials={abort_record['trial_target']}."
-        + ("" if advice is None else f" {advice}"),
+        f"trials at its accepted n_trials={abort_record['trial_target']}.",
         action=OperatorAction.FIX_CONFIG,
+        remediation=advice,
     )
 
 
@@ -926,6 +930,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         phase hard-aborts before another trial can acquire the just-released GPU lease.
     :raises TrialExecutionError: The subprocess returned non-zero or produced no metric.
         Caught by ``study.optimize(catch=...)``.
+    :raises PhaseSweepShutdown: Shutdown interrupted the trial or left completed training pending extraction.
     :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
         persisted; nothing was launched and no GPU lease was consumed.
     :raises _TrialOutcomeUnrecordedAbort: A successful trial's terminal outcome could not be
@@ -978,6 +983,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(GENERATION_ID_ATTR, run.generation_id)
     trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
     # GPU lease covers only subprocess lifetime, not extraction.
     try:
         _refuse_launch_after_deadline(run)
@@ -1071,41 +1077,40 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _refuse_launch_during_shutdown()
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
+    # SDK readers reuse the process slot; preserve the trainer's result before extraction.
+    if executed.process.failure_reason is not None:
+        trial.set_user_attr(FAILURE_REASON_ATTR, executed.process.failure_reason)
+    trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
+    trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
+
+    def preserve_trainer_on_shutdown() -> None:
+        """Leave extraction pending when shutdown has already cleaned this process slot.
+
+        :raises PhaseSweepShutdown: Shutdown is being serviced after trainer cleanup.
+        """
+        signum = servicing_shutdown_signal()
+        if signum is not None and _completed_trainer_duration(trial, None) is not None:
+            raise PhaseSweepShutdown(signum, ShutdownCleanupReport(signum, True, ()))
+
     # Extraction releases the GPU but still consumes the phase/run budget.
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=executed,
-        gates=phase.gates,
-        deadline=run.optimize_deadline,
-    )
+    preserve_trainer_on_shutdown()
+    try:
+        result = extract_trial_result(
+            experiment=experiment,
+            executed=executed,
+            gates=phase.gates,
+            deadline=run.optimize_deadline,
+        )
+    except ShutdownLaunchRefusedError as exc:
+        raise PhaseSweepShutdown(exc.signum, ShutdownCleanupReport(exc.signum, True, ())) from exc
+    preserve_trainer_on_shutdown()
     if result.deadline_exhausted:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
 
-    trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
-    trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
-    trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
-    trial.set_user_attr(OVERRIDES_ATTR, json.dumps(overrides, default=str, sort_keys=True))
-    if result.objective_provenance is not None:
-        trial.set_user_attr(
-            OBJECTIVE_PROVENANCE_ATTR,
-            json.dumps(result.objective_provenance, sort_keys=True),
-        )
-    if result.gate_results is not None:
-        trial.set_user_attr(
-            GATES_ATTR,
-            json.dumps(
-                [
-                    {
-                        "type": gate.gate_type,
-                        "passed": gate.passed,
-                        "detail": gate.detail,
-                    }
-                    for gate in result.gate_results
-                ],
-                sort_keys=True,
-            ),
-        )
+    record_trial_result(
+        trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
+    )
 
     # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
     if result.failure_reason:
@@ -1114,11 +1119,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             _DeadlineTrialExecutionError if result.deadline_exhausted else TrialExecutionError
         )
         raise error_type(result.failure_reason)
-
-    for cname, cval in result.constraints.items():
-        trial.set_user_attr(constraint_attr(cname), cval)
-    for oname, oval in result.observed.items():
-        trial.set_user_attr(observed_attr(oname), oval)
 
     assert result.metric is not None  # guaranteed when failure_reason is None
     violations: list[str] = []
@@ -1150,7 +1150,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
 
 def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
-    """Record each objective outcome before returning or re-raising its exception.
+    """Record objective outcomes, preserving completed training when shutdown interrupts extraction.
 
     :param _PhaseExecution run: Phase execution receiving the outcome and any fatal error.
     :param optuna.Trial trial: Active Optuna trial.
@@ -1201,13 +1201,25 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             )
             raise
         except PhaseSweepShutdown as exc:
-            # Preserve shutdown as an interruption for stale recovery and failure-streak replay.
-            _record_outcome(
-                run,
-                trial,
-                "interrupted",
-                cause=f"orchestrator interrupted by signal {exc.signum}",
-            )
+            lifecycle = None
+            directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(directory, str) and isinstance(attempt_id, str):
+                try:
+                    lifecycle = read_attempt_lifecycle(
+                        Path(directory), expected_attempt_id=attempt_id
+                    )
+                except ValueError as lifecycle_error:
+                    raise exc from lifecycle_error
+            if _completed_trainer_duration(trial, lifecycle) is None:
+                _record_outcome(
+                    run,
+                    trial,
+                    "interrupted",
+                    cause=f"orchestrator interrupted by signal {exc.signum}",
+                )
+            elif isinstance(attempt_id, str):
+                _warn_deferred_extraction(attempt_id, run.phase.name, trial.number)
             raise
         except BaseException as exc:
             run.record_fatal(exc)
@@ -1345,9 +1357,9 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         )
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(
-            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}"
-            + ("" if advice is None else f" {advice}"),
+            f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}",
             action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
+            remediation=advice,
         )
     if (
         finished_after < phase.n_trials
@@ -1636,6 +1648,7 @@ def _replay_met_target(
                 timeout_scope=None,
             ),
             verify_evidence=verify_evidence,
+            emit_advisories=False,
         )
     except NoFeasibleTrialError as exc:
         raise ReplayWithoutFeasibleTrialError.rewrap(
@@ -1654,6 +1667,7 @@ def _select_phase_winner(
     phase_fingerprint: str,
     completion: dict[str, Any],
     verify_evidence: bool = True,
+    emit_advisories: bool = True,
 ) -> Winner:
     """Select the phase winner and preserve its execution identity.
 
@@ -1665,6 +1679,7 @@ def _select_phase_winner(
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
     :param bool verify_evidence: Whether to verify the selected trial against its
         frozen evidence and warn if its environment differs from the current run.
+    :param bool emit_advisories: Whether to log fresh selection diagnostics instead of silently replaying them.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
@@ -1673,7 +1688,13 @@ def _select_phase_winner(
         frozen when its metric was extracted.
     :return Winner: The selected winner with composed overrides and source identity.
     """
-    selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
+    selected = select_winner(
+        study,
+        experiment,
+        phase_name=phase.name,
+        repeats=repeat_axis(phase),
+        emit_advisories=emit_advisories,
+    )
     if verify_evidence:
         _verify_winner_evidence(experiment, phase, selected)
         # Replayed winners may predate the current environment cohort.

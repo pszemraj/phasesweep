@@ -1,6 +1,6 @@
 experiment: t
-storage: journal:////Users/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
-workdir: /Users/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
+storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
+workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
 trial_command: printf 'PSWOBJ=0.5\n' {overrides}
 trainer_config: {}
 provenance:
@@ -32,6 +32,7 @@ phases:
       log: false
       step: 1
   repeats: null
+  cost_key: null
   n_trials: 2
   n_jobs: 1
   gpu_policy: single_per_trial

@@ -11,7 +11,7 @@ import signal
 import stat
 import sys
 import textwrap
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn, ParamSpec, TypeVar
@@ -21,6 +21,9 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.ledger as engine_ledger
 from phasesweep import load_experiment
 from phasesweep.cli import main as cli_boundary
 from phasesweep.config.models import (
@@ -36,14 +39,21 @@ from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
+from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
+from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FEASIBLE_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_SCHEMA_VERSION,
+    TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION, TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.darwin import read_process_info
@@ -111,6 +121,83 @@ def patch_path_method_failure(
         return original_method(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, method_name, fail_target)
+
+
+def lose_record_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException | None = None,
+    *,
+    only: Path | None = None,
+) -> None:
+    """Fail generation-record creation while forwarding other writes.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the write failure.
+    :param BaseException | None error: Injected error, or an OSError by default.
+    :param Path | None only: Restrict the failure to this record path.
+    """
+    original = generation_ops.atomic_create_text
+    failure = OSError("simulated record write failure") if error is None else error
+
+    def flaky(path: Path, text: str) -> bool:
+        if path.name == "generation.yaml" and (only is None or path == only):
+            raise failure
+        return original(path, text)
+
+    monkeypatch.setattr(generation_ops, "atomic_create_text", flaky)
+
+
+def fail_pointer_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    experiment: Experiment,
+    error: BaseException | None = None,
+) -> None:
+    """Fail writing the experiment's last-success pointer.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the write failure.
+    :param Experiment experiment: Experiment whose pointer must fail.
+    :param BaseException | None error: Injected error, or an OSError by default.
+    """
+    pointer_path = _last_successful_generation_path(experiment)
+    original_write = artifact_io._write_yaml_atomic
+    failure = OSError("simulated pointer commit failure") if error is None else error
+
+    def flaky_write(path: Path, payload: object) -> None:
+        if path == pointer_path:
+            raise failure
+        original_write(path, payload)
+
+    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
+
+
+def patch_published_trial_read_failure(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Fail trial reads only during the published-study check, after study opening.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the published check.
+    :param Exception error: Error raised by the check's trial reads.
+    """
+    real_check = engine_ledger._check_published_phase_studies
+
+    def fail_trial_read(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    def check_while_reads_fail(
+        experiment: Experiment,
+        loaded: Mapping[str, optuna.Study],
+        *,
+        from_phase: str | None = None,
+    ) -> None:
+        with monkeypatch.context() as reads:
+            reads.setattr(optuna.Study, "get_trials", fail_trial_read)
+            real_check(experiment, loaded, from_phase=from_phase)
+
+    monkeypatch.setattr(engine_ledger, "_check_published_phase_studies", check_while_reads_fail)
+
+
+def assert_advises_target(message: str, before: int, after: int, action: str) -> None:
+    """Assert phase p's retry target, action and failure-count reset advice."""
+    assert f"phases[p].n_trials from {before} to {after} in the config" in message
+    assert action in message
+    assert "the failure count starts again from zero" in message
 
 
 def patch_rejected_trial_user_attr(
@@ -282,6 +369,29 @@ def phase_trials(experiment: Experiment, phase_name: str = "p") -> list[optuna.t
     :return list[optuna.trial.FrozenTrial]: Its trials in number order.
     """
     return phase_study(experiment, phase_name).get_trials(deepcopy=False)
+
+
+def record_accepted_partial_timeout(study: optuna.Study, target: int) -> None:
+    """Record a phase timeout decision at the study's current outcome boundary.
+
+    :param optuna.Study study: Study containing the completed partial run.
+    :param int target: Requested trial target accepted by the timeout decision.
+    """
+    trials = study.get_trials(deepcopy=False)
+    study.set_user_attr(TRIAL_TARGET_ATTR, target)
+    study.set_user_attr(
+        PHASE_DECISION_ATTR,
+        {
+            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+            "decision": "accepted_partial_timeout",
+            "trial_target": target,
+            "outcome_sequence": _load_phase_policy_state(study).max_sequence,
+            "finished_trials": _finished_trial_count(trials),
+            "completed_trials": _completed_trial_count(trials),
+            "timeout_scope": "phase",
+            "recovered_abort_sequence": None,
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -656,7 +766,7 @@ def log_regex_provenance() -> JsonObject:
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
     """Return the confound block selection records for a one-trial population."""
     return {
-        "schema_version": 2,
+        "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": [trial_number],
         "ranked_groups": None,
         "checks": {

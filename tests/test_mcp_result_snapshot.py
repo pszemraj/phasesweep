@@ -10,16 +10,13 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
 from pathlib import Path
 
 import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.generation as generation_ops
-import phasesweep.engine.ledger as engine_ledger
-import phasesweep.engine.optuna as engine_optuna
+import phasesweep.mcp.recovery as mcp_recovery
 from phasesweep.config.io import load_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -37,7 +34,10 @@ from phasesweep.engine.repeats import RepeatMember, spread
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    CLEANUP_RECOVERED_TRIALS_ATTR,
+    FEASIBLE_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TrialStateName,
     Winner,
     WinnerSource,
 )
@@ -45,15 +45,28 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
 from phasesweep.mcp.snapshots import RunResultSnapshot
 from tests.conftest import (
+    fail_pointer_commit,
     make_experiment,
     mark_current_format,
+    phase_study,
     single_trial_confound,
     trial_outcome,
     write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import published_generation_id
-from tests.mcp_helpers import SEEDED_RANDOM, write_slow_mcp_config
+from tests.mcp_helpers import (
+    ALLOW_SIDE_EFFECTS,
+    SEEDED_RANDOM,
+    fail_prepared_snapshot_reads,
+    make_mcp_app,
+    stage_dead_run,
+    write_run_status,
+    write_slow_mcp_config,
+    write_srv_catalog,
+    write_srv_config,
+)
+from tests.recovery_helpers import write_launched_stale_trial
 
 
 def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
@@ -394,37 +407,9 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         n_trials=1,
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
-    capture_reads = 0
-    original_stats = engine_ledger.read_trial_stats
-
-    def transient_capture_failure(
-        ledger: engine_ledger.ValidatedLedger,
-        published_trials: Mapping[str, engine_optuna._TrialRef | None],
-    ) -> dict[str, engine_optuna._PhaseTrialStats]:
-        nonlocal capture_reads
-        if _generation_summary_path(ledger.experiment, generation_id).is_file():
-            capture_reads += 1
-
-            def locked_read(*_args: object, **_kwargs: object) -> None:
-                raise OSError("journal storage is locked")
-
-            with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, published_trials)
-
-        return original_stats(ledger, published_trials)
-
-    monkeypatch.setattr("phasesweep.engine.read.read_trial_stats", transient_capture_failure)
+    capture_reads = fail_prepared_snapshot_reads(monkeypatch, generation_id)
     if not pointer_commits:
-        pointer_path = _last_successful_generation_path(experiment)
-        original_write = generation_ops.artifact_io._write_yaml_atomic
-
-        def fail_pointer_write(path: Path, payload: object) -> None:
-            if path == pointer_path:
-                raise OSError("simulated publication abort")
-            original_write(path, payload)
-
-        monkeypatch.setattr(generation_ops.artifact_io, "_write_yaml_atomic", fail_pointer_write)
+        fail_pointer_commit(monkeypatch, experiment, OSError("simulated publication abort"))
 
     hook = mcp_runner._RunnerPublicationHook(
         tmp_path / "status.json",
@@ -442,7 +427,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         with pytest.raises(OSError, match="simulated publication abort"):
             run_experiment(experiment, generation_id=generation_id, publication_hook=hook)
 
-    assert capture_reads == 1
+    assert len(capture_reads) == 1
     assert hook.snapshot is not None
     phase = hook.snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is False
@@ -802,7 +787,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         *(_generation_winner_path(experiment, first_generation, phase.name) for phase in phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
-    generations_before = set(_generations_dir(experiment).iterdir())
+    generations_before = set(_generations_dir(_experiment_dir(experiment)).iterdir())
     changed = experiment.model_copy(
         update={
             "phases": [
@@ -844,4 +829,82 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     assert snapshot["winners"] == []
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert published_generation_id(experiment) == first_generation
-    assert set(_generations_dir(experiment).iterdir()) == generations_before
+    assert set(_generations_dir(_experiment_dir(experiment)).iterdir()) == generations_before
+
+
+@pytest.mark.parametrize("terminal_state", ["COMPLETE", "INFEASIBLE", "FAIL", "INTERRUPTED"])
+def test_pending_snapshot_uses_actual_recovered_state_without_changing_frozen_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_state: TrialStateName
+) -> None:
+    """Recovered pending evidence updates only its frozen row, including a finalization retry."""
+    run_id = "srv-pending-result"
+    config = write_srv_config(tmp_path)
+    number = write_launched_stale_trial(config, cleanup_confirmed=False, generation_id=run_id)
+    experiment = load_experiment(config)
+    assert isinstance(experiment, Experiment)
+    _app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    raw = mcp_runner.capture_result_snapshot(experiment, generation_id=run_id)
+    frozen = RunResultSnapshot.model_validate(raw)
+    phase = frozen.status.phases[0]
+    assert phase.running_attempts is not None
+    attempt_id = phase.running_attempts[0].attempt_id
+    assert attempt_id is not None
+    phase.running_attempts[0].recovers_as = "EVIDENCE_PENDING"
+    phase.trials["FAIL"] = 4
+    raw = frozen.model_dump(mode="json")
+    with pytest.raises(RuntimeError, match="lacks the terminal state"):
+        mcp_runner.finalize_result_snapshot(raw, confirmed_attempt_ids={attempt_id})
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=raw,
+    )
+    study = phase_study(experiment)
+    pending = study.get_trials()[number]
+    active = optuna.Trial(study, pending._trial_id)
+    active.set_user_attr(FEASIBLE_ATTR, terminal_state != "INFEASIBLE")
+    active.set_user_attr(
+        TRIAL_OUTCOME_ATTR,
+        trial_outcome(
+            1,
+            "interrupted"
+            if terminal_state == "INTERRUPTED"
+            else "failure"
+            if terminal_state in {"INFEASIBLE", "FAIL"}
+            else "success",
+        ),
+    )
+    if terminal_state in {"COMPLETE", "INFEASIBLE"}:
+        study.tell(number, 1.0)
+    else:
+        study.tell(number, state=optuna.trial.TrialState.FAIL)
+    study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, [number])
+    monkeypatch.setattr(mcp_recovery, "kill_stale_group", lambda *_args, **_kwargs: True)
+
+    def interrupted_finalization(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise OSError("interrupted snapshot persistence")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(mcp_recovery, "finalize_result_snapshot", interrupted_finalization)
+        with pytest.raises(mcp_recovery.RunRecoveryError, match="failed to finalize"):
+            mcp_recovery.recover_run(registry.state_dir, run_id, confirm=True, emit=lambda _: None)
+    # A later measured trial must not replace the captured counts on retry.
+    study.add_trial(optuna.trial.create_trial(value=2.0))
+    mcp_recovery.recover_run(registry.state_dir, run_id, confirm=True, emit=lambda _: None)
+    status = json.loads(store.status_path(run_id).read_text())
+    recovered = status["result_snapshot"]["status"]["phases"][0]
+    expected = {"RUNNING": 0, "FAIL": 4}
+    expected[terminal_state] = expected.get(terminal_state, 0) + 1
+    assert recovered["trials"] == expected
+    assert recovered["generation_trials"] == {"RUNNING": 0, terminal_state: 1}
+    assert recovered["running_attempts"] == []
+    assert "EVIDENCE_PENDING" not in recovered["trials"]
+    assert status["result_snapshot_state"] == "complete"
+    assert len(study.get_trials()) == 2

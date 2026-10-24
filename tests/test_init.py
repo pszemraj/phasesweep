@@ -15,6 +15,7 @@ from optuna import create_study
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
+import phasesweep.config.reference as reference
 from phasesweep import load_experiment
 from phasesweep.cli import _template_names, _template_purpose
 from phasesweep.cli import cli as cli_main
@@ -133,13 +134,38 @@ def test_template_headers_name_explain(template: str) -> None:
 
 
 @pytest.mark.parametrize("template", TEMPLATES)
-def test_init_writes_template_bytes_verbatim(tmp_path: Path, template: str) -> None:
+def test_init_preserves_template_except_documentation_links(tmp_path: Path, template: str) -> None:
+    """Generated templates retain their content while pinning project documentation links."""
     output = tmp_path / "out" / "chosen.yaml"
 
     result = CliRunner().invoke(cli_main, ["init", "--template", template, "-o", str(output)])
 
     assert result.exit_code == 0, result.output
-    assert output.read_bytes() == _template_bytes(template)
+    assert output.read_text(encoding="utf-8") == reference.pin_documentation_links(
+        _template_bytes(template).decode("utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "ref"),
+    [("0.3.11", "v0.3.11"), ("0.3.12.dev4+g123abcd.d20261023", "123abcd")],
+)
+def test_init_pins_template_documentation_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, ref: str
+) -> None:
+    """A generated template links to documentation for its installed source."""
+    monkeypatch.setattr(reference, "__version__", version)
+    output = tmp_path / "noisy.yaml"
+
+    result = CliRunner().invoke(cli_main, ["init", "--template", "noisy", "-o", str(output)])
+
+    assert result.exit_code == 0, result.output
+    text = output.read_text(encoding="utf-8")
+    assert (
+        f"https://github.com/pszemraj/phasesweep/blob/{ref}/"
+        "docs/config.md#noisy-objectives-and-small-budgets"
+    ) in text
+    assert "/blob/main/" not in text
 
 
 @pytest.mark.parametrize("template", TEMPLATES)

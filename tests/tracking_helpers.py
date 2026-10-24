@@ -1,4 +1,4 @@
-"""Shared MLflow binding, worker, and experiment support for tracking tests."""
+"""Shared polling clocks, MLflow bindings, workers and experiment setup for tracking tests."""
 
 from __future__ import annotations
 
@@ -26,6 +26,26 @@ from phasesweep.runtime import process
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import session
 from phasesweep.tracking.mlflow import _capture
+
+
+class ManualClock:
+    """A monotonic clock whose sleeps advance instantly and record their durations."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        """Return the current simulated monotonic time in seconds."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Record a requested sleep and advance time without waiting.
+
+        :param float seconds: Simulated sleep duration.
+        """
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 def mlflow_binding():

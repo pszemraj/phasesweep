@@ -23,7 +23,7 @@ import pytest
 import yaml
 
 import phasesweep
-from phasesweep.engine.paths import _generation_dir
+from phasesweep.engine.paths import _experiment_dir, _generation_dir
 from phasesweep.engine.run import run_experiment
 from tests.conftest import make_experiment, write_constant_trainer
 from tests.ledger_fixtures import published_generation_id
@@ -185,7 +185,7 @@ def test_root_facade_exports_definition_objects() -> None:
     from phasesweep._metadata import __version__
     from phasesweep.config.io import load_experiment
     from phasesweep.config.models import Experiment
-    from phasesweep.engine.run import experiment_status
+    from phasesweep.engine.read import experiment_status
     from phasesweep.engine.selection import NoFeasibleTrialError
     from phasesweep.engine.state import Winner
     from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
@@ -229,7 +229,7 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
 
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    generation_dir = _generation_dir(experiment, generation_id)
+    generation_dir = _generation_dir(_experiment_dir(experiment), generation_id)
 
     carriers = []
     for path in sorted(generation_dir.rglob("*")):

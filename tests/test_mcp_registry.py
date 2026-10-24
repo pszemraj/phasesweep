@@ -132,8 +132,8 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
 def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     import yaml
 
+    from phasesweep.config.io import load_experiment_snapshot
     from phasesweep.config.models import Experiment
-    from phasesweep.mcp.runs import load_experiment_snapshot
     from phasesweep.runtime.files import canonical_storage_identity, file_sha256
 
     payload = yaml.safe_load(_experiment_yaml(tmp_path))

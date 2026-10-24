@@ -8,17 +8,22 @@ from typing import Any
 
 import optuna
 import pytest
+import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config.models import Experiment
+from phasesweep.cli import _operational_error_text
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
-from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.paths import _last_successful_generation_path, _run_log_path
+from phasesweep.engine.preview import _recorded_phase
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
@@ -27,7 +32,11 @@ from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _PhasePolicyState,
 )
+from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
+from phasesweep.mcp import runner as mcp_runner
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     phase_study,
     trial_outcome,
@@ -36,6 +45,67 @@ from tests.conftest import (
     write_trainer,
     write_trial_zero_trainer,
 )
+
+
+def test_cli_abort_advice_is_logged_once_per_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A live abort and its refused restart each print and durably log one concrete fix."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trial_command="false {overrides}",
+        n_trials=1,
+        max_consecutive_failures=1,
+        sampler=Sampler(type="random", seed=0),
+        gpu_policy="none",
+    )
+    config = tmp_path / "abort.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")), encoding="utf-8")
+    run_log = _run_log_path(experiment)
+    for invocation in range(2):
+        caplog.clear()
+        assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+        output = capsys.readouterr()
+        fixes = [
+            line.removeprefix("fix: ")
+            for line in output.err.splitlines()
+            if line.startswith("fix: ")
+        ]
+        assert len(fixes) == 1
+        advice = fixes[0]
+        assert "phases[p].n_trials above 1 in the config" in advice
+        assert (output.err + output.out + caplog.text).count(advice) == 1
+        assert run_log.read_text(encoding="utf-8").count(advice) == invocation + 1
+    assert len(phase_study(experiment).trials) == 1
+
+
+def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
+    """Completed trainer evidence makes dry-run request recovery rather than a config edit."""
+    directory = tmp_path / "trial"
+    directory.mkdir()
+    write_attempt_lifecycle(
+        directory, attempt_id="attempt", state="exited", return_code=0, duration_seconds=1.0
+    )
+    study = optuna.create_study()
+    running = study.ask()
+    running.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
+    running.set_user_attr(TRIAL_DIR_ATTR, str(directory))
+    with pytest.raises(
+        PhaseSweepError, match="completed trainer evidence awaiting recovery"
+    ) as caught:
+        _recorded_phase(Phase(name="p", n_trials=1, gpu_policy="none"), study)
+
+    error = caught.value
+    assert error.action is OperatorAction.RUN_RECOVER_RUN
+    advice = operator_step(error)
+    assert "phasesweep run with the same config, without --dry-run" in advice
+    assert "correct the experiment configuration" not in _operational_error_text(error)
+    assert _operational_error_text(error).count(advice) == 1
+    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
+    assert failure["remediation"] == f"Ask the operator: {advice}"
 
 
 @pytest.mark.integration
@@ -316,7 +386,7 @@ def test_raised_failure_limit_retires_a_streak_abort_while_trials_remain(tmp_pat
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(initial)
     assert [trial.state.name for trial in phase_study(initial).trials] == ["FAIL", "FAIL"]
-    message = str(aborted.value)
+    message = _operational_error_text(aborted.value)
     assert "phases[p].max_consecutive_failures above 2 in the config" in message
     assert "run the 2 trials still left at n_trials=4" in message
     assert "phases[p].n_trials above 4 in the config" in message
@@ -355,11 +425,11 @@ def test_raised_failure_limit_leaves_an_abort_with_no_trials_left(tmp_path: Path
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(initial)
 
-    refusals = [str(aborted.value)]
+    refusals = [_operational_error_text(aborted.value)]
     for dry_run in (True, False):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(_with_limit(initial, 5), dry_run=dry_run)
-        refusals.append(str(refused.value))
+        refusals.append(_operational_error_text(refused.value))
     for message in refusals:
         assert "phases[p].n_trials above 2 in the config" in message
         assert "max_consecutive_failures above" not in message
@@ -430,7 +500,7 @@ def test_aborted_phase_headline_states_the_recorded_cause_of_a_fatal_abort(
     with pytest.raises(NoFeasibleTrialError) as aborted:
         phase_module._finish_phase(run, phase_fingerprint="unused")
 
-    message = str(aborted.value)
+    message = _operational_error_text(aborted.value)
     assert "Phase 'p' aborted: RuntimeError: simulated objective defect" in message
     assert "consecutive" not in message
     assert "phases[p].n_trials above 3 in the config" in message
@@ -453,7 +523,7 @@ def test_fatal_abort_of_a_grid_advises_the_retry_target_without_a_failure_count(
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
 
-    message = str(refused.value)
+    message = _operational_error_text(refused.value)
     assert "phases[p].n_trials from 3 to 4 in the config" in message
     assert "retry its 1 failed cell and run its 2 remaining cells" in message
     assert "failure count" not in message
@@ -472,7 +542,7 @@ def test_raised_failure_limit_does_not_retire_a_fatal_abort(
     for dry_run in (True, False):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(roomy, dry_run=dry_run)
-        refusals.append(str(refused.value))
+        refusals.append(_operational_error_text(refused.value))
     for message in refusals:
         assert "simulated objective defect" in message
         assert "phases[p].n_trials above 3 in the config" in message

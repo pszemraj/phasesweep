@@ -1,4 +1,4 @@
-"""engine.read: permissive status/winner reads that never raise on a partial file."""
+"""Read status and winners under their recorded semantics, including partial results."""
 
 from __future__ import annotations
 
@@ -27,9 +27,8 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.read import read_result, read_status, read_trial_tables
-from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import TRIAL_OUTCOME_ATTR
+from phasesweep.engine.read import experiment_status, read_result, read_status, read_trial_tables
+from phasesweep.engine.state import DURATION_ATTR, TRIAL_OUTCOME_ATTR, observed_attr
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
@@ -789,6 +788,8 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
         drifted, phase_names=[phase.name for phase in drifted.phases]
     )
     assert len(winners) == 1
+    assert winners[0].config_matches_current is False
+    assert result_status["published_config_matches_current"] is False
     assert winners[0].effective_overrides == {"a": 1}
     assert (result_status["metric"]["name"], result_status["metric"]["goal"]) == (
         "objective",
@@ -806,6 +807,33 @@ def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None
     status = read_status(topped_up)
     assert status["published_config_matches_current"] is True
     assert status["metric"]["name"] == "objective"
+
+
+@pytest.mark.parametrize("change", ["append", "prepend", "phase"])
+def test_config_agreement_uses_the_producing_phase_prefix(tmp_path: Path, change: str) -> None:
+    """Live and frozen results preserve agreement only for an unchanged producing prefix."""
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    published = _published(tmp_path)
+    extra = Phase(name="next", n_trials=1, gpu_policy="none")
+    if change == "append":
+        phases = [*published.phases, extra]
+    elif change == "prepend":
+        phases = [extra, *published.phases]
+    else:
+        phases = [published.phases[0].model_copy(update={"fixed_overrides": {"changed": True}})]
+    comparison = published.model_copy(update={"phases": phases})
+
+    status, (winner,) = read_result(published, comparison_experiment=comparison)
+
+    assert status["published_config_matches_current"] is (change == "append")
+    assert winner.config_matches_current is (change == "append")
+    original_snapshot = capture_result_snapshot(published)
+    assert isinstance(original_snapshot["represented_config_fingerprint"], str)
+    comparison_snapshot = capture_result_snapshot(comparison)
+    assert comparison_snapshot["represented_config_fingerprint"] == (
+        original_snapshot["represented_config_fingerprint"] if change == "append" else None
+    )
 
 
 def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:
@@ -886,18 +914,26 @@ def test_read_result_rejects_a_malformed_winner_source(
     [
         pytest.param(b"\xff", id="invalid-utf8"),
         pytest.param(b"completed_at: 2026-99-99\n", id="invalid-timestamp"),
+        pytest.param(None, id="metric-overflow"),
     ],
 )
 @pytest.mark.parametrize("reader", ["winner", "snapshot"])
 def test_pinned_reads_treat_malformed_winner_as_absent(
-    tmp_path: Path, contents: bytes, reader: str
+    tmp_path: Path, contents: bytes | None, reader: str
 ) -> None:
+    """Pinned winner and snapshot reads omit invalid or unrepresentable winner data."""
     from phasesweep.mcp.snapshots import capture_result_snapshot
 
     experiment = _published(tmp_path)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
-    _generation_winner_path(experiment, generation_id, "p").write_bytes(contents)
+    path = _generation_winner_path(experiment, generation_id, "p")
+    if contents is None:
+        winner = yaml.safe_load(path.read_text())
+        winner["metric"][experiment.metric.name] = 10**400
+        path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    else:
+        path.write_bytes(contents)
 
     if reader == "winner":
         assert read_result(experiment, generation_id=generation_id, phase_names=["p"])[1] == []
@@ -1019,6 +1055,31 @@ def test_read_trial_tables_has_no_rows_without_a_persisted_study(tmp_path: Path)
         assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
         assert tables.publication_integrity == "absent"
         assert tables.published_generation_id is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(10**400, None, id="positive-overflow"),
+        pytest.param(-(10**400), None, id="negative-overflow"),
+        pytest.param(7, 7.0, id="integer"),
+    ],
+)
+def test_read_trial_tables_projects_unrepresentable_numbers_as_empty_cells(
+    tmp_path: Path, value: int, expected: float | None
+) -> None:
+    """Unrepresentable attributes leave empty cells; representable integers remain numeric."""
+    experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path / 'study.journal'}")
+    trial = new_phase_study(experiment, "p").ask()
+    trial.set_user_attr(DURATION_ATTR, value)
+    trial.set_user_attr(observed_attr("peak"), value)
+
+    (table,) = read_trial_tables(experiment).phases
+
+    assert table.available
+    assert table.rows[0]["state"] == "RUNNING"
+    assert table.rows[0]["duration_s"] == expected
+    assert table.rows[0]["observed:peak"] == expected
 
 
 def _trial_id_trainer(tmp_path: Path, *, mem: dict[str, str] | None = None) -> Path:

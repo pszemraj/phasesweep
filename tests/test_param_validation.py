@@ -910,7 +910,7 @@ def test_placeholder_values_for_categorical_is_first_choice() -> None:
 
 
 def test_grid_repeat_axis_visits_each_configuration_once_per_value() -> None:
-    """The grid treats the repeat key as one more axis, so every cell runs exactly once."""
+    """A grid visits each configuration's repeat values consecutively and every cell once."""
     phase = Phase(
         name="p",
         n_trials=6,
@@ -927,6 +927,11 @@ def test_grid_repeat_axis_visits_each_configuration_once_per_value() -> None:
     )
     cells = [(trial.params["x"], trial.params["seed"]) for trial in study.trials]
     assert sorted(cells) == [(x, seed) for x in ("a", "b") for seed in (0, 1, 2)]
+    assert all(
+        len({x for x, _ in cells[start : start + 3]}) == 1
+        and [seed for _, seed in cells[start : start + 3]] == [0, 1, 2]
+        for start in (0, 3)
+    )
 
 
 def test_repeat_values_need_distinct_cli_wire_forms() -> None:
