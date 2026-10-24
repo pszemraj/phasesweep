@@ -43,6 +43,8 @@ This exercises server startup validation and provisions/probes its private state
 
 Configure your client's stdio server with the absolute `phasesweep-mcp` executable and reviewed catalog path, following its documentation for configuration scope and restart behavior:
 
+PhaseSweep never reads or writes MCP client configuration files; the operator manages the client-owned server entry.
+
 ```text
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml
 ```
