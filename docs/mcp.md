@@ -1,12 +1,12 @@
 # MCP operator guide
 
-The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
+The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio on Linux and macOS. Cancellation and recovery require the trial launcher's [native process identity reads](runtime.md): exact process start time, boot identity and host PID namespace. An unreadable or mismatched identity refuses signalling.
+The server runs over local stdio on Linux and macOS. Cancellation and recovery use the trial launcher's [native process identity reads](runtime.md): exact process start time, boot identity and host PID namespace. Recovery uses that evidence to distinguish groups that are gone, safe to signal, or require operator inspection.
 
 ## The catalog
 
-The catalog maps opaque agent-visible IDs to operator-owned experiment YAML paths. Paths, commands, environments, storage URLs, and raw logs never appear in normal tool responses.
+The catalog maps opaque agent-visible IDs to operator-owned experiment YAML paths.
 
 ```yaml
 state_dir: /absolute/path/to/phasesweep-mcp-state
@@ -23,7 +23,7 @@ experiments:
     visible_params: none
 ```
 
-The catalog is a separate YAML configuration from the experiment. Both reject unknown fields and duplicate YAML keys. The server validates the catalog and the experiment configurations it lists at startup, and rereads them before the next tool call after either changes, so an added entry, a permission change or an edited experiment applies to the next call without a restart, within the limits `allow.cancel` and `visible_params` set for runs already launched. A changed `state_dir` is the exception: the server keeps its runs in the state directory it started with, so it applies none of that edit, keeps serving the last catalog it loaded with that directory, and refuses launches until it is restarted. An edit that fails validation keeps the server on the last valid catalog: reads and cancellation use it, `inspect_experiment` refuses an entry whose own config file changed, and launches are refused until the files validate again; `phasesweep mcp check` shows why. The server's stderr log records each reload and each refused one. A detached run keeps the configuration snapshot it launched with.
+The catalog is a separate YAML configuration from the experiment. Both reject unknown fields and duplicate YAML keys. The server validates the catalog and the experiment configurations it lists at startup, and rereads them before the next tool call after either changes, so an added entry, a permission change or an edited experiment applies to the next call without a restart, within the limits `allow.cancel` and `visible_params` set for runs already launched. A changed `state_dir` is the exception: the server keeps its runs in the state directory it started with, so it applies none of that edit, keeps serving the last catalog it loaded with that directory, and refuses launches until it is restarted. An edit that fails validation keeps the server on the last valid catalog: reads and cancellation use it, `inspect_experiment` refuses an entry whose own config file changed, and launches are refused until the files validate again; `phasesweep mcp check` shows why. Catalog-backed read responses expose `catalog_status`, with `stale`, `reload_refusal` (`invalid` or `state_dir_changed`) and a path-free operator `remediation`; a successful reload clears the stale flag. The server's stderr log records each reload and each refused one. A detached run keeps the configuration snapshot it launched with.
 
 These are all accepted catalog fields. Entry paths expand `~`; relative `state_dir`, `experiments[].config` and `experiments[].cwd` paths resolve against the directory containing the catalog, independently of the server's launch directory.
 
@@ -82,6 +82,7 @@ Launch returns a top-level `run_id`; `get_latest_run` nests it under `run`, and 
 ```json
 {
   "experiment_id": "tiny_lm",
+  "catalog_status": {"stale": false, "reload_refusal": null, "remediation": null},
   "found": true,
   "run": {
     "run_id": "tiny_lm-0123456789abcdef0123456789abcdef",
@@ -98,7 +99,7 @@ Launch returns a top-level `run_id`; `get_latest_run` nests it under `run`, and 
 
 `cancel_run` sends SIGTERM to the runner's process group, waits up to 30 seconds, then sends SIGKILL. It returns the run's `state`, `cleanup_confirmed` (null when the run was already terminal) and `recovery_required`. It refuses a run whose launch has not yet saved its process identity, and a runner in another [PID namespace](#pid-namespaces), signalling nothing in either case.
 
-`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` (add `--trials` for one row per trial) and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
+`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` (add `--trials` for one row per trial) and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree. Those CLI reads choose each phase's winner from the latest generation, falling back to its published winner when that generation has none, and label its source. MCP reads stay pinned to the requested run.
 
 ### Calling a tool from a shell
 
@@ -128,9 +129,9 @@ The loop ends when the run reaches a terminal state, requires recovery, or a cal
 
 ## Reading status responses
 
-Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned. When `trial_data_available` is false, `trials`, trial counters, `remaining_trials`, and `target_already_satisfied` are `null`; the configured `target_finished_trials` remains known. A confirmed empty study reports zero counts. `trials` counts each state under the same names as [`phasesweep status`](runtime.md#inspection-commands). `COMPLETE`, `INFEASIBLE` and `FAIL` are the finished trials that `finished_trials_total`, `finished_trials_before_run` and `finished_trials_this_run` count. [`INTERRUPTED`](runtime.md#interrupted-trials-rerun) trials never count toward `n_trials`; each reruns before any new draw, `WAITING` counts those scheduled reruns, and `remaining_trials` includes them. `attempts_this_run` counts every attempt the queried run's generation started, in any state, including any that a deadline, abort or shutdown stopped before their trainer launched; it is zero for a run that started none.
+Run status and results expose the run state, phase counts, winner presence, metric semantics, and sampled winner parameters under the [visibility policy](#security-boundary). When `trial_data_available` is false, `trials`, trial counters, `remaining_trials`, and `target_already_satisfied` are `null`; the configured `target_finished_trials` remains known. A confirmed empty study reports zero counts. `trials` counts each state under the same names as [`phasesweep status`](runtime.md#inspection-commands). `COMPLETE`, `INFEASIBLE` and `FAIL` are the finished trials that `finished_trials_total`, `finished_trials_before_run` and `finished_trials_this_run` count. [`INTERRUPTED`](runtime.md#interrupted-trials-rerun) trials never count toward `n_trials`; each reruns before any new draw, `WAITING` counts those scheduled reruns, and `remaining_trials` includes them. `attempts_this_run` counts every attempt the queried run's generation started, in any state, including any that a deadline, abort or shutdown stopped before their trainer launched; it is zero for a run that started none.
 
-For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
+For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. `catalog_status` describes the current catalog reload state separately from those frozen scientific facts. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
 Read provenance and labels together; each tool's output schema also describes every field:
 
@@ -140,9 +141,10 @@ Read provenance and labels together; each tool's output schema also describes ev
 | `current_generation_id`, `published_generation_id` | The current and last-success pointers at the live read or at snapshot capture; either can name another run's generation. |
 | `represented_generation_id` | Generation whose winners and completeness the response describes; null when no generation can be represented. |
 | `run_wrote_generation` | Whether the queried run wrote its own generation; the `*_this_run` counts describe that generation and are zero when it wrote none. Null when the terminal snapshot is unavailable. |
-| `winner_generation` | Per-winner enum: `represented_generation` was selected in the represented generation; `prior_generation` was carried from an earlier one; `unknown` means no represented generation is available for comparison. It is not a generation ID. |
+| `winner_generation` | Per-winner enum comparing the source trial's generation: `represented_generation` belongs to the represented generation; `prior_generation` belongs to an earlier one; `unknown` means no represented generation is available for comparison. It is not a generation ID. |
+| `winner_source` | The source kind, phase and trial number that supplied this winner. A carried winner does not establish that the requested run measured it again. |
 | `result_context` | `represented_generation` uses that generation's recorded metric name, goal, and phase plan; `current_config` uses the loaded configuration when no recorded semantics are available. |
-| `published_config_matches_current` | Whether the producing configuration matches the current catalog configuration. `false` means the historical labels may differ from the next run's; null does not establish a match. |
+| `published_config_matches_current` | Whether the producing configuration matches the corresponding prefix of the current phase plan. Appended phases preserve agreement; changed producing phases or metric semantics do not. `false` marks historical labels; null does not establish a match. |
 
 A run [writes a generation](runtime.md#timeouts-cleanup-and-continuation), named by its run ID, only when it launches a trial or publishes, and then represents that generation. A run that launches nothing because its winners equal the published ones writes no generation and succeeds: it represents the published generation that holds those winners, so `is_published` and `summary_present` are true, `run_wrote_generation` is false and its `*_this_run` counts are zero. A run refused before its first trial also writes no generation and represents none: `represented_generation_id` is null, and `is_published`, `summary_present` and `run_wrote_generation` are false.
 
@@ -150,7 +152,7 @@ A failed run's `failure.stage` follows the same claim. It is `preflight` while t
 
 A phase that ends without a trial inside every metric bound and constraint fails with one of three codes, read from its recorded trials. `trials_failed` means a trial counted `FAIL`, because its trainer exited nonzero, its objective could not be extracted, its metric was not finite or it failed a gate, or a failure streak that included one aborted the phase. `trials_infeasible` means the trainer ran but only `INFEASIBLE` trials kept the phase from a winner, either at the end of the phase or in the streak that aborted it. `replay_without_feasible_trial` means the phase's recorded trials already met `n_trials`, so the run launched no trial, and those trials hold no feasible one. A deadline that leaves no feasible trial reports `timeout` instead.
 
-Besides `code`, `stage` and any `cause`, a `failure` carries `retryable`, the `actor` who must act (`agent` or `operator`) and a path-free `remediation`. The codes are `fingerprint_mismatch`, `artifact_root_conflict`, `study_schema_mismatch`, `storage_unavailable`, `tracking_unavailable`, `published_study_missing`, `trial_target_refused`, `experiment_busy`, `trials_failed`, `trials_infeasible`, `replay_without_feasible_trial`, `timeout`, `cleanup_uncertain`, `cancelled`, `result_snapshot_unavailable` (set at read time for a stopped run without a readable snapshot), `publication_not_committed` and `internal_error`.
+Besides `code`, `stage` and any `cause`, a `failure` carries `retryable`, the `actor` who must act (`agent` or `operator`) and a path-free `remediation`. For a recorded phase abort, report its applicable trial-target, failure-limit, search-space or cleanup steps; the same concrete advice appears in the CLI and engine `run.log`. The codes are `fingerprint_mismatch`, `artifact_root_conflict`, `study_schema_mismatch`, `storage_unavailable`, `tracking_unavailable`, `published_study_missing`, `trial_target_refused`, `experiment_busy`, `trials_failed`, `trials_infeasible`, `replay_without_feasible_trial`, `timeout`, `cleanup_uncertain`, `cancelled`, `result_snapshot_unavailable` (set at read time for a stopped run without a readable snapshot), `publication_not_committed` and `internal_error`.
 
 `get_run_results` measures `missing_phases` and `all_phases_have_winners` against the represented generation's plan. The config-match comparison is refreshed on terminal reads; the scientific facts stay frozen.
 
@@ -164,17 +166,17 @@ Besides `code`, `stage` and any `cause`, a `failure` carries `retryable`, the `a
 | `permission_denied` | The server process could not read the publishing tree for validation. |
 | `unknown` | The run's terminal snapshot cannot establish an answer. |
 
-Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `evaluation_point` exposes `distinct_values` and `winner_value`; `survivorship` includes `incomplete_group`; `tie` exposes `tied_trials` and `within_noise`, counting groups in a repeats phase. MCP returns only enums and numbers; evidence strings stay private. `incomplete: true` means a wallclock timeout left a partial population, which the checks do not cover.
+Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `evaluation_point` exposes `axis`, `distinct_values`, `winner_value` and a `remedy` for the reader in use when positions differ. `survivorship` includes `incomplete_group`; `tie` exposes `tied_trials` and `within_noise`, counting groups in a repeats phase, plus a `remedy` for a configuration comparison without a noise estimate. The trial evidence stays in the full winner record. `incomplete: true` means a wallclock timeout left a partial population, which the checks do not cover. Verdicts and repeat-noise overlap are advisory, not significance tests. Winner-only data cannot establish convergence, trends, robustness, causality, or search-boundary behavior.
 
 `observed` contains [report-only measurements](config.md#report-only-observations), never reasons a winner won. With non-null `repeats`, `metric` is the group's reduced value: report it with `sd`, `min`, `max`, and `n`. The [repeat-group contract](runtime.md#repeat-groups) explains aggregation; MCP returns the reducer, spread and `member_trials`, but never the repeat key or values.
+
+With a configured [`cost_key`](config.md#repeats), a non-null `cost_advisory` identifies a cheaper complete feasible repeat group within one standard error of the winning mean; it never changes the selected winner. Parameter details appear only under `visible_params: all`; other policies return a generic advisory for operator inspection with `show-winners`. Terminal snapshots retain the advisory captured for that run. Changing `cost_key` later can recompute advice through the CLI, but does not rewrite a terminal MCP snapshot.
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery, or that a runner in another PID namespace stopped refreshing its [heartbeat](#pid-namespaces). [Run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
 `runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone; [PID namespaces](#pid-namespaces) explains the consequences and the heartbeat.
 
-Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
-
-Frozen scientific reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. Follow the [objective evidence contract](config.md#objective-evidence-constraints-and-gates) when interpreting them: all-false flags for JSON/log sources mean identities are not enforced, not failed, and their `evaluation_point` is always `n/a`. W&B and MLflow record selected history positions; only envelopes validate evaluation metadata. `expected_step_declared` and `expected_step_value_bound` remain false for native MLflow exact-step selection.
+Frozen scientific reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. Interpret those fields using the [objective evidence contract](config.md#objective-evidence-constraints-and-gates).
 
 For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Missing or null delivery information does not establish successful delivery. [Result delivery and recovery](mlflow.md#result-delivery-and-recovery) covers pending uploads and the operator's retry.
 
@@ -197,15 +199,15 @@ flowchart TD
     unsettled -->|"operator runs recover-run and confirms, or the next launch_run finds that no runner can still start"| removed["abandoned launch removed"]
 ```
 
-In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. The next `launch_run` settles one case itself: it removes a launch whose runner provably exited or never started before saving its identity, and keeps its log as `<run-id>.log.recovered` under `state_dir/logs/`. Busy and capacity refusals direct these blockers to operator recovery; healthy blockers can be monitored with `await_run`. When runner liveness cannot be verified across PID namespaces, the refusal explains that uncertainty: it directs the operator to recover from a host shell once the runner's heartbeat is stale, and otherwise to inspect from there if durable progress stops. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
+In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. A runner that exits without recording final status is named in the run's `failure.remediation`, which tells the agent to stop monitoring and request operator recovery; after recovery it retains that diagnosis and explains that process cleanup is settled while historical results remain unavailable. The next `launch_run` settles one case itself: it removes a launch whose runner provably exited or never started before saving its identity, and keeps its log as `<run-id>.log.recovered` under `state_dir/logs/`. Busy and capacity refusals name the blockers and their remedy; follow [PID namespaces](#pid-namespaces) for an unobservable runner. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
 
-Operator recovery is deliberately a CLI operation, not an agent tool. Its counts distinguish stale RUNNING trials reaped from cleanup confirmations for trials that were already terminal, including attempts reconciled through the registry:
+Operator recovery is deliberately a CLI operation, not an agent tool. Its counts distinguish stale RUNNING trials reconciled from cleanup confirmations for trials that were already terminal, including attempts reconciled through the registry. A trainer that completed after its runner died can retain its result: recovery re-extracts confirmed successful evidence under the producing configuration instead of rerunning the trainer. This does not reconstruct a missing historical MCP snapshot; see [interrupted trials](runtime.md#interrupted-trials-rerun).
 
 ```bash
 phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --run-id <run-id>
 ```
 
-Without `--confirm`, the command only inspects the run and reports the actions it would take. Read that report, then repeat the command with `--confirm` to perform them.
+Without `--confirm`, the command only inspects the run and reports the actions it would take. Each inspected trial process group is identified by its attempt, phase, PID and PGID. The report says whether confirmation would terminate it if still alive, reconcile without signalling, or refuse cleanup. It names a stored-PGID fallback when the original leader has exited or its PID was reused, and explicitly spares a group whose PGID has been reused by an unrelated leader. An earlier boot or host proof that foreign-namespace processes are absent requires no signal. Read that report, then repeat the command with `--confirm`; confirmation checks the process evidence again before acting.
 
 > [!WARNING]
 > Do not delete run-handle files individually: a run history consists of its handle and every `logs/` sidecar named after its run ID, such as its log, status, config, and heartbeat. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
@@ -220,7 +222,7 @@ After that sandbox ends, run `recover-run` from a host shell outside any sandbox
 
 ## Security boundary
 
-The server does not accept configuration YAML, paths, commands, storage URLs, environment values, search ranges, sampler settings, gates, or safety waivers as tool input. Only the operator-authored catalog maps an experiment ID to a config. A catalog permission is not a grant to alter its config.
+Tools take catalog experiment IDs, run IDs and their documented control arguments; the operator-authored catalog maps experiments to configs. A catalog permission is not a grant to alter its config.
 
 No tool returns raw trainer logs, a failed trial's reason (which quotes the last line of its `stderr.log`), result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
 

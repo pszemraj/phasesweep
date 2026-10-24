@@ -518,16 +518,17 @@ def test_cleanup_stale_trial_process_signals_only_within_the_same_namespace(
 ) -> None:
     monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
     monkeypatch.setattr(reaper, "read_pid_namespace", lambda: RECORDED)
-    signalled: list[tuple[int | None, int | None]] = []
-
-    def record(pid: int | None, starttime: int | None, **_kwargs: object) -> bool:
-        signalled.append((pid, starttime))
-        return True
-
-    monkeypatch.setattr(reaper, "kill_stale_group", record)
+    signalled: list[int] = []
+    monkeypatch.setattr(reaper, "is_pid_alive", lambda _: True)
+    monkeypatch.setattr(reaper, "read_proc_starttime", lambda _: 111)
+    monkeypatch.setattr(reaper.os, "getpgid", lambda _: 4242)
+    monkeypatch.setattr(reaper, "_process_group_alive", lambda _: True)
+    monkeypatch.setattr(
+        reaper, "_terminate_process_group", lambda pgid, **_: signalled.append(pgid) or True
+    )
 
     assert cleanup_stale_trial_process(_identity(pid_namespace=RECORDED)) is True
-    assert signalled == [(4242, 111)]
+    assert signalled == [4242]
 
 
 def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_its_birth(
@@ -901,9 +902,15 @@ def test_a_stale_heartbeat_asks_for_recovery_without_settling_the_run(
     for reported in (run, awaited["run"], latest):
         assert (reported["state"], reported["recovery_required"]) == ("running", stale)
         assert reported["runner_observable"] is False
+        if stale:
+            assert reported["failure"]["code"] == "cleanup_uncertain"
+            assert "heartbeat is stale" in reported["failure"]["remediation"]
+            assert "phasesweep mcp recover-run" in reported["failure"]["remediation"]
+        else:
+            assert reported["failure"] is None
     assert awaited["reason"] == ("recovery_required" if stale else "timeout")
     assert results["result_source"] == "current_shared_study"
-    assert results["failure"] is None
+    assert results["failure"] == run["failure"]
     assert live_runs(store) == [handle]
     assert tree_snapshot(registry.state_dir) == before
 
@@ -1067,6 +1074,8 @@ def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
 
     assert "nothing was signalled" in str(caught.value)
     assert "await_run" in str(caught.value)
+    assert "If get_run_status reports recovery_required, stop monitoring" in str(caught.value)
+    assert "phasesweep mcp recover-run" in str(caught.value)
     assert str(registry.state_dir) not in str(caught.value)
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
     assert store.observe(handle).state == "running"

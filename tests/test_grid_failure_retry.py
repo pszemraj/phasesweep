@@ -12,14 +12,13 @@ from pathlib import Path
 
 import optuna
 import pytest
-import yaml
 
 import phasesweep.engine.phase as phase_ops
 from phasesweep import load_experiment, run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
@@ -30,6 +29,7 @@ from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
 from tests.conftest import (
+    assert_advises_target,
     invoke_cli_boundary,
     make_experiment,
     phase_study,
@@ -38,6 +38,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.experiments import write_experiment
+from tests.ledger_fixtures import winner_payload
 
 
 def _grid(
@@ -192,13 +193,6 @@ def test_grid_seed_audit_retries_only_its_failed_repeat(tmp_path: Path) -> None:
     assert len(calls.read_text().splitlines()) == 3
 
 
-def _assert_advises_target(message: str, from_target: int, to_target: int, action: str) -> None:
-    """Assert the message tells the operator to raise phase ``p``'s target in the config."""
-    assert f"phases[p].n_trials from {from_target} to {to_target} in the config" in message
-    assert action in message
-    assert "the failure count starts again from zero" in message
-
-
 def _assert_advises_limit(message: str, above: int, left: int, target: int) -> None:
     """Assert the message tells the operator to raise phase ``p``'s failure limit in the config."""
     assert f"phases[p].max_consecutive_failures above {above} in the config" in message
@@ -227,13 +221,13 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     original = _grid(tmp_path, trainer, 2, repeats=repeats)
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
-    messages = [str(aborted.value)]
+    messages = [_operational_error_text(aborted.value)]
     for dry_run in (False, True):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(original, dry_run=dry_run)
-        messages.append(str(refused.value))
+        messages.append(_operational_error_text(refused.value))
     for message in messages:
-        _assert_advises_target(message, 2, 4, "retry its 2 failed cells")
+        assert_advises_target(message, 2, 4, "retry its 2 failed cells")
         # No cell is unrun, so a higher failure limit would schedule nothing.
         assert "max_consecutive_failures above" not in message
 
@@ -294,8 +288,8 @@ def test_aborted_grid_names_the_cells_it_never_reached(tmp_path: Path) -> None:
     assert [trial.state.name for trial in phase_trials(original)] == ["FAIL", "FAIL"]
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(original)
-    for message in (str(aborted.value), str(refused.value)):
-        _assert_advises_target(
+    for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
+        assert_advises_target(
             message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells"
         )
         _assert_advises_limit(message, 2, 2, 4)
@@ -317,11 +311,11 @@ def test_fully_measured_infeasible_grid_says_nothing_can_continue(tmp_path: Path
     original = _grid(tmp_path, trainer, 2, metric=bounded)
     with pytest.raises(NoFeasibleTrialError, match="2 consecutive failed/infeasible") as aborted:
         run_experiment(original)
-    messages = [str(aborted.value)]
+    messages = [_operational_error_text(aborted.value)]
     for dry_run in (False, True):
         with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
             run_experiment(original, dry_run=dry_run)
-        messages.append(str(refused.value))
+        messages.append(_operational_error_text(refused.value))
     for message in messages:
         assert "Every cell was measured and none is feasible" in message
         assert "change the search space or bounds" in message
@@ -461,11 +455,11 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
 
     with pytest.raises(PhaseAbortRefusedError) as refused:
         phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
-    message = str(refused.value)
+    message = _operational_error_text(refused.value)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
     assert "at its accepted n_trials=4" in message
-    _assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
+    assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
     _assert_advises_limit(message, 2, 2, 4)
 
 
@@ -501,7 +495,7 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
     with pytest.raises(PhaseAbortRefusedError) as at_limit:
         phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
 
-    for message in (str(aborted.value), str(refused.value), str(at_limit.value)):
+    for message in map(_operational_error_text, (aborted.value, refused.value, at_limit.value)):
         _assert_advises_limit(message, 2, 2, 4)
         assert message.endswith(_FRESH_START)
         _assert_no_fresh_namespace(message)
@@ -521,7 +515,7 @@ def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(original)
     assert [trial.state.name for trial in phase_trials(original)] == ["FAIL", "COMPLETE"]
-    message = str(aborted.value)
+    message = _operational_error_text(aborted.value)
     assert " for stderr logs." in message
     assert "completed outside the metric bounds" not in message
     assert message.endswith(_FRESH_START)
@@ -542,7 +536,7 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
         run_experiment(experiment)
     with pytest.raises(PhaseAbortRefusedError, match="previously aborted") as refused:
         run_experiment(experiment)
-    for message in (str(aborted.value), str(refused.value)):
+    for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
         assert "phases[p].n_trials above 2 in the config" in message
         assert "the failure count starts again from zero" in message
         # Both trials are spent, so a higher limit would schedule nothing.
@@ -577,11 +571,10 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
     )
     assert _coverage_warnings(caplog) == [expected]
 
-    # A replay selects from the recorded trials again and repeats the advisory.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    assert _coverage_warnings(caplog) == [expected]
+    assert _coverage_warnings(caplog) == []
 
 
 def test_grid_winner_warns_about_cells_the_abort_never_reached(
@@ -645,8 +638,13 @@ def _published_survivorship(experiment: Experiment) -> dict[str, object]:
     """Read the survivorship check that phase ``p``'s published winner.yaml records."""
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.generation_id is not None
-    path = _generation_winner_path(experiment, pointer.generation_id, "p")
-    return yaml.safe_load(path.read_text())["confound"]["checks"]["survivorship"]
+    confound = winner_payload(experiment, pointer.generation_id)["confound"]
+    assert isinstance(confound, dict)
+    checks = confound["checks"]
+    assert isinstance(checks, dict)
+    survivorship = checks["survivorship"]
+    assert isinstance(survivorship, dict)
+    return survivorship
 
 
 @pytest.mark.parametrize(

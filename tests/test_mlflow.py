@@ -1264,8 +1264,7 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
     """CLI status counts what sync retries; MCP status counts its run; results ignore both."""
     import yaml
 
-    from phasesweep.engine.read import read_status
-    from phasesweep.engine.run import experiment_status
+    from phasesweep.engine.read import experiment_status, read_status
     from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
     from phasesweep.tracking.session import tracking_root, write_record
     from tests.conftest import mark_current_format

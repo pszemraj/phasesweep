@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Mapping
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,6 @@ from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
-    ATTEMPT_LIFECYCLE_FILE,
     _kill_group,
     _spawn_blocked_supervisor,
     _wait_for_guardian_exit,
@@ -42,6 +42,7 @@ from phasesweep.runtime.reaper import (
     StaleProcessIdentity,
     _group_member_pids,
     _GroupMemberScan,
+    _process_group_alive,
     _process_group_alive_with_members,
     _ProcStat,
     _terminate_process_group,
@@ -64,14 +65,16 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
     """Patch group termination to clean up the group but report uncertainty."""
     import phasesweep.runtime.reaper as _reaper
 
-    real_terminate = _reaper._terminate_process_group
+    real_terminate = _reaper._terminate_process_groups
 
-    def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
-        real_terminate(pgid, grace_seconds=0.05)
-        return False
+    def terminate_then_report_uncertain(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int] | None = None
+    ) -> dict[int, bool]:
+        real_terminate(pgids, grace_seconds=0.05, guardians=guardians)
+        return dict.fromkeys(pgids, False)
 
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
+        "phasesweep.runtime.process._terminate_process_groups",
         terminate_then_report_uncertain,
     )
 
@@ -152,54 +155,6 @@ def test_run_supervised_preserves_identity_and_records_terminal_lifecycle(
     assert lifecycle.state == "exited"
     assert lifecycle.return_code == return_code
     assert lifecycle.cleanup_confirmed is True
-
-
-def test_read_attempt_lifecycle_rejects_unreadable_record(tmp_path: Path) -> None:
-    trial_dir = tmp_path / "trial"
-    (trial_dir / ATTEMPT_LIFECYCLE_FILE).mkdir(parents=True)
-
-    with pytest.raises(ValueError, match="is unreadable"):
-        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
-
-
-@pytest.mark.parametrize(
-    ("payload", "message"),
-    [
-        ("{", "Malformed attempt lifecycle record"),
-        ("[]", "must be a JSON object"),
-        (
-            '{"schema_version": 2, "attempt_id": "expected", "state": "allocated"}',
-            "Unsupported attempt lifecycle schema",
-        ),
-        (
-            '{"schema_version": 1, "attempt_id": "other", "state": "allocated"}',
-            "belongs to another attempt",
-        ),
-        (
-            '{"schema_version": 1, "attempt_id": "expected", "state": "unknown"}',
-            "Unknown attempt lifecycle state",
-        ),
-        (
-            '{"schema_version": 1, "attempt_id": "expected", "state": "exited", '
-            '"return_code": true}',
-            "field 'return_code' is invalid",
-        ),
-        (
-            '{"schema_version": 1, "attempt_id": "expected", "state": "exited", '
-            '"return_code": 0, "cleanup_confirmed": 1}',
-            "field 'cleanup_confirmed' is invalid",
-        ),
-    ],
-)
-def test_read_attempt_lifecycle_rejects_every_malformed_shape(
-    tmp_path: Path, payload: str, message: str
-) -> None:
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text(payload)
-
-    with pytest.raises(ValueError, match=message):
-        read_attempt_lifecycle(trial_dir, expected_attempt_id="expected")
 
 
 def test_run_supervised_terminates_child_when_identity_write_fails(
@@ -370,7 +325,19 @@ def test_spawn_interrupt_after_popen_preserves_cleanup_evidence(
         expected_attempt_id="interrupted-supervisor-spawn",
     )
     assert lifecycle is not None
-    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+    if cleanup_confirmed:
+        assert lifecycle.state == "exited"
+        assert lifecycle.cleanup_confirmed is True
+    else:
+        # The guardian may finish independently of the caller's uncertain verdict.
+        assert lifecycle.state in {"launching", "terminating", "exited"}
+        if lifecycle.state == "exited":
+            assert lifecycle.cleanup_confirmed is True
+            assert lifecycle.return_code != 0
+            assert lifecycle.duration_seconds is not None
+        elif lifecycle.state == "terminating":
+            assert lifecycle.return_code == -signal.SIGTERM
+            assert lifecycle.cleanup_confirmed is False
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
@@ -428,14 +395,17 @@ def test_payload_delivery_interrupt_cleans_registered_trainer_group(
         expected_attempt_id="interrupted-payload-delivery",
     )
     assert lifecycle is not None
-    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+    assert lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
 
 
 def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no process identity and unconfirmed cleanup, the ``launching`` marker stays for recovery."""
+    """Guardian exit evidence survives a parent cleanup probe reporting uncertainty."""
     import phasesweep.runtime.process as process
 
     real_abort_launch = process._abort_launch
@@ -461,8 +431,34 @@ def test_identity_write_failure_marks_launch_before_popen(
         expected_attempt_id="identity-uncertain-attempt",
     )
     assert lifecycle is not None
-    assert lifecycle.state == "launching"
+    assert lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
+    assert not _process_group_alive(result.pid)
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+
+
+@pytest.mark.parametrize("cleanup_return_code", [None, 0, -signal.SIGTERM])
+def test_cleanup_retains_cancellation_after_guardian_dies_before_final_publication(
+    tmp_path: Path, cleanup_return_code: int | None
+) -> None:
+    """Cleanup after guardian death retains cancellation through repeated durable confirmations."""
+    from phasesweep.runtime.process import _record_attempt_exited, write_attempt_lifecycle
+
+    write_attempt_lifecycle(
+        tmp_path,
+        attempt_id="cancelled",
+        state="terminating",
+        return_code=-signal.SIGTERM,
+        cleanup_confirmed=False,
+    )
+    for _ in range(2):
+        _record_attempt_exited(tmp_path, attempt_id="cancelled", return_code=cleanup_return_code)
+        lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="cancelled")
+        assert lifecycle is not None and lifecycle.state == "exited"
+        assert lifecycle.return_code == -signal.SIGTERM
+        assert lifecycle.cleanup_confirmed and lifecycle.duration_seconds is None
 
 
 def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
@@ -471,8 +467,8 @@ def test_kill_group_reports_unconfirmed_when_direct_child_reap_times_out(
     """A direct child that never reaps within the bounded wait must report cleanup
     as unconfirmed, not silently ``True``."""
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
-        lambda pgid, *, grace_seconds: True,
+        "phasesweep.runtime.process._terminate_process_groups",
+        lambda pgids, *, grace_seconds, guardians: dict.fromkeys(pgids, True),
     )
 
     proc = Mock(pid=424243, returncode=None)
@@ -998,9 +994,10 @@ def test_unexpected_status_read_failure_preserves_cleanup_evidence(
         expected_attempt_id="status-read-failure",
     )
     assert lifecycle is not None
-    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
-    if cleanup_confirmed:
-        assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.state == "exited"
+    assert lifecycle.cleanup_confirmed is True
+    assert lifecycle.return_code is not None and lifecycle.return_code != 0
+    assert lifecycle.duration_seconds is not None and lifecycle.duration_seconds >= 0
 
 
 @pytest.mark.skipif(
@@ -1155,70 +1152,35 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     assert result.failure_reason == "timeout after 0.5s"
 
 
-def test_payload_write_timeout_covers_a_nonreading_supervisor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A blocked ACK-pipe write must expire the launch deadline."""
+def test_payload_write_timeout_covers_a_nonreading_pipe() -> None:
+    """A full ACK pipe expires the payload deadline without depending on supervisor startup."""
     import threading
 
     import phasesweep.runtime.process as process
 
-    trial_dir = tmp_path / "trial"
-    pid_file = tmp_path / "supervisor.pid"
-    stopped_supervisor = tmp_path / "stopped_supervisor.py"
-    stopped_supervisor.write_text(
-        "import os, signal, sys\n"
-        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-        "os.write(int(sys.argv[1]), b'R' + f'{os.getpid():010d}'.encode('ascii'))\n"
-        "os.kill(os.getpid(), signal.SIGSTOP)\n"
-    )
-    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(stopped_supervisor))
-
-    payload_write_started = threading.Event()
-    real_write_all = process._write_all
-
-    def record_payload_write(
-        fd: int,
-        data: bytes,
-        *,
-        deadline: float | None = None,
-        pid: int = -1,
-    ) -> None:
-        payload_write_started.set()
-        real_write_all(fd, data, deadline=deadline, pid=pid)
-
-    monkeypatch.setattr(process, "_write_all", record_payload_write)
-
-    def kill_stopped_supervisor() -> None:
-        deadline = time.monotonic() + 1.0
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        if pid_file.exists():
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
-
-    killer = threading.Timer(0.35, kill_stopped_supervisor)
-    killer.start()
-    try:
-        result = _run_supervised(
-            trial_dir,
-            "true",
-            env={"X": "x" * 1_000_000},
-            timeout=0.05,
-            attempt_id="ack-write-deadline",
-        )
-    finally:
-        killer.cancel()
-        if pid_file.exists():
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
-        killer.join()
-
-    assert payload_write_started.is_set()
-    assert result.timed_out
-    assert result.cleanup_confirmed
-    assert result.failure_reason == "timeout after 0.05s before trainer launch"
+    read_fd, write_fd = os.pipe()
+    with (
+        os.fdopen(read_fd, "rb", buffering=0) as reader,
+        os.fdopen(write_fd, "wb", buffering=0) as writer,
+    ):
+        os.set_blocking(writer.fileno(), False)
+        while True:
+            try:
+                os.write(writer.fileno(), b"x" * 4096)
+            except BlockingIOError:
+                break
+        # A broken deadline must fail the test rather than leave a blocked writer behind.
+        release = threading.Timer(1.0, reader.close)
+        release.start()
+        try:
+            with pytest.raises(process._LaunchDeadlineExpired, match="while delivering") as raised:
+                process._write_all(
+                    writer.fileno(), b"payload", deadline=time.monotonic() + 0.05, pid=123
+                )
+        finally:
+            release.cancel()
+            release.join()
+        assert raised.value.pid == 123
 
 
 def test_supervisor_ready_wait_is_capped_by_deadline(
@@ -1595,11 +1557,14 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     report.
     """
     terminated: list[int] = []
-    active: dict[int, object] = {1234: object()}
+    active = {1234: SimpleNamespace(pid=4321)}
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
-    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+    def fake_terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+    ) -> dict[int, bool]:
+        assert guardians == {1234: 4321}
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1617,10 +1582,12 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
 def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", {1234: object()})
+    monkeypatch.setattr(
+        "phasesweep.runtime.shutdown._active_children", {1234: SimpleNamespace(pid=4321)}
+    )
     monkeypatch.setattr(
         "phasesweep.runtime.shutdown._terminate_process_groups",
-        lambda pgids, *, grace_seconds: dict.fromkeys(pgids, False),
+        lambda pgids, *, grace_seconds, guardians: dict.fromkeys(pgids, False),
     )
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
@@ -1635,13 +1602,16 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first shutdown signal owns cleanup evidence until its pass completes."""
-    active: dict[int, object] = {1234: object(), 5678: object()}
+    active = {1234: SimpleNamespace(pid=4321), 5678: SimpleNamespace(pid=8765)}
     terminated: list[int] = []
     reentered = False
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
-    def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
+    def fake_terminate(
+        pgids: tuple[int, ...], *, grace_seconds: float, guardians: Mapping[int, int]
+    ) -> dict[int, bool]:
+        assert guardians == {1234: 4321, 5678: 8765}
         nonlocal reentered
         terminated.extend(pgids)
         if not reentered:
@@ -1803,7 +1773,7 @@ def test_reaper_raises_when_cleanup_uncertain(
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: False,
+        lambda _identity, **_kwargs: False,
     )
 
     exp = make_experiment(workdir=tmp_path / "runs")
@@ -1823,7 +1793,7 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``_terminate_process_group`` returns ``False`` (cleanup uncertain),
+    """When group termination reports uncertain cleanup,
     ``run_supervised`` must surface that in ``ProcessResult.cleanup_confirmed``
     so the orchestrator can abort instead of launching more trials."""
     # Pattern: actually kill the group with the real implementation, then

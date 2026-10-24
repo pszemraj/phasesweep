@@ -1,4 +1,4 @@
-"""Public engine entrypoints for experiment execution and status."""
+"""Experiment execution and publication orchestration."""
 
 from __future__ import annotations
 
@@ -28,7 +28,6 @@ from phasesweep.config.models import (
     _metric_semantics_payload,
     experiment_disclosures,
 )
-from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
@@ -38,7 +37,6 @@ from phasesweep.engine.preview import (
     _preview_ledger,
     _preview_phase,
 )
-from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import _environment_identity
@@ -51,9 +49,6 @@ from phasesweep.runtime.shutdown import (
 )
 
 log = logging.getLogger("phasesweep.engine.run")
-
-# read_status phase keys the CLI status view replaces with ``name`` and ``winner``.
-_MCP_ONLY_PHASE_KEYS = frozenset({"phase", "winner_present", "running_attempts"})
 
 
 def _preflight_missing_reached_phase_environments(
@@ -640,7 +635,6 @@ def _run_experiment_inner(
             continue
         skip_until = False
 
-        _warn_flagged_inheritance(phase.name, inherited)
         if ledger is None:
             previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
             winner = previews[-1].winner
@@ -727,105 +721,3 @@ def _run_experiment_inner(
     log.info("Wrote %s", summary_path)
 
     return winners
-
-
-def _warn_flagged_inheritance(phase_name: str, inherited: Mapping[str, Winner]) -> None:
-    """Warn when a phase is about to build on a winner whose selection flagged confounds.
-
-    Downstream phases inherit a winner's values, not its file, so without this
-    the verdict stays invisible unless someone opens the upstream winner. The
-    in-process and ``--from-phase`` paths both resolve ``inherited`` before
-    running a phase, so this one call covers both.
-
-    :param str phase_name: Phase about to run.
-    :param Mapping[str, Winner] inherited: Winners the phase inherits, by phase.
-    """
-    for parent, winner in inherited.items():
-        if winner.confound is None:  # dry-run placeholder
-            continue
-        flagged = _describe_flagged(winner.confound)
-        if flagged:
-            log.warning(
-                "[%s] inherits the winner of phase %r, whose selection flagged potential "
-                "confounds: %s. Its winner's confound block has the evidence; confirm they do "
-                "not undermine that choice before relying on this phase's results.",
-                phase_name,
-                parent,
-                "; ".join(flagged),
-            )
-
-
-def _cli_phase_payloads(
-    experiment: Experiment,
-    phases: list[dict[str, Any]],
-    published_generation_id: str | None,
-) -> list[dict[str, Any]]:
-    """Rebuild ``read_status``'s path-free phase payloads into the CLI's view.
-
-    Use the unpinned published generation for winner paths. Replace MCP's ``phase``,
-    ``winner_present`` and ``running_attempts`` with CLI ``name`` and ``winner`` fields.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param list[dict[str, Any]] phases: Path-free phase payloads from ``read_status``.
-    :param str | None published_generation_id: Already-resolved last-success generation id.
-    :return list[dict[str, Any]]: Path-bearing phase payloads for the CLI status view.
-    """
-    cli_phases: list[dict[str, Any]] = []
-    for phase in phases:
-        winner_path = (
-            path_ops._generation_winner_path(experiment, published_generation_id, phase["phase"])
-            if phase["winner_present"] and published_generation_id is not None
-            else None
-        )
-        cli_phases.append(
-            {
-                "name": phase["phase"],
-                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
-                "winner": None if winner_path is None else str(winner_path),
-            }
-        )
-    return cli_phases
-
-
-def experiment_status(experiment: Experiment) -> dict[str, Any]:
-    """Collect CLI status from one read-only generation snapshot.
-
-    Return experiment and ledger paths, current/published/represented generation
-    ids, publication integrity, and phase counts and winner paths. MLflow configs
-    also include delivery counts across generations. Winner paths use the captured
-    published generation. Fresh experiments have null generation ids. Failed trial inspection is
-    distinguished from confirmed absence by ``trial_data_available``.
-
-    CLI callers escalate failed or inaccessible publications after rendering the
-    payload. Metric and result-context fields remain in the MCP read view.
-
-    :param Experiment experiment: Parsed experiment config to inspect.
-    :return dict: Status payload with generation identity and per-phase results.
-    """
-    status = read_status(experiment)
-    integrity = status["publication_integrity"]
-    ledger_path = ledger_ops.resolved_ledger_path(experiment)
-    payload: dict[str, object] = {
-        "kind": "experiment",
-        "experiment": status["experiment"],
-        "workdir": str(path_ops._experiment_dir(experiment)),
-        "ledger_path": None if ledger_path is None else str(ledger_path),
-        "current_generation_id": status["current_generation_id"],
-        "published_generation_id": status["published_generation_id"],
-        "represented_generation_id": status["represented_generation_id"],
-        "is_published": status["is_published"],
-        "publication_integrity": integrity,
-        **(
-            {"publication_error": status["publication_error"]}
-            if integrity in {"failed", "permission_denied"}
-            else {}
-        ),
-        "phases": _cli_phase_payloads(
-            experiment, status["phases"], status["published_generation_id"]
-        ),
-    }
-    if experiment.mlflow is not None:
-        from phasesweep.tracking.publication import delivery_status
-
-        payload["tracking_delivery"] = delivery_status(experiment)
-    return payload

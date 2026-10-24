@@ -58,10 +58,6 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
     """
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
     if storage_identity is None:
-        # In-memory storage (``storage: null``) has no shared backend to
-        # guard; locking its canonical identity would make two unrelated
-        # in-memory runs that share an experiment name contend on a lock
-        # naming a backend that does not exist.
         return None
     return {
         "kind": "persistent_storage",

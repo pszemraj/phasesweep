@@ -1,7 +1,7 @@
 # AGENTS.md — phasesweep
 
 > [!IMPORTANT]
-> **Read `LOCAL.md` (beside this file) before running anything.** It holds this machine's setup: which Python environment to use and how to invoke it, tool paths, hardware and GPU notes. This file holds only the repository's rules.
+> **Read `LOCAL.md` (beside this file) before running anything.** It holds this machine's setup: which Python environment to use and how to invoke it, how to run the test suite in parallel, tool paths, hardware and GPU notes. This file holds only the repository's rules.
 
 phasesweep automates hyperparameter sweeps over a training codebase on a single node with one or a few GPUs. It is unstable and unfinished, and nobody uses it yet, not even the maintainer. Most of it was written by agents, so treat code, defaults and docs as changeable unless this file says otherwise or the intent is blindingly obvious.
 
@@ -59,7 +59,7 @@ phasesweep automates hyperparameter sweeps over a training codebase on a single 
 
 - **If you changed runnable code, run it now**, with minimal input or a short timeout, before anything else. Lint and type checks prove little by themselves. Exercise the changed path, confirm state after mutations, and never trust exit codes or log lines alone.
 - Storage, write paths, publication and recovery changes need a check that survives a restart or interruption.
-- `docs/development.md` ("Quality gates", "Test tiers") owns the checks and test lanes. During iteration, run the mandatory checks plus the changed subsystem's tests. Plain `pytest` is the full gate.
+- `docs/development.md` ("Quality gates", "Test tiers") owns the checks and test lanes. During iteration, run the mandatory checks plus the changed subsystem's tests. Broad runs and final qualification use the parallel non-live lane, including integration tests, with the command and bounded worker count `LOCAL.md` gives for this machine, followed by the serial `signals_own_pid` lane. Together they cover the full non-live suite; do not add a duplicate full serial run. Other projects may run concurrently. Rerun only failed node IDs serially before diagnosing them. If a failure could depend on contention and another project was active, wait for an idle machine for that retry; deterministic static failures need no such wait.
 - mypy runs only at pre-push, so passing commit hooks prove nothing about types. Before handing off any `src/` change, run `pre-commit run --all-files --hook-stage pre-push` with the environment on `PATH`.
 - Scale validation to the change. Docs-only changes need targeted checks for the touched files.
 - A test that tampers with a published artifact must re-anchor the summary pointer (`tests/ledger_fixtures.py`: `reanchor_summary_pointer`, `reseal_winner`) and assert the intended error text. An outcome-only assert usually passes on an earlier integrity check. The same shadowing hits config tests whose input a field validator rejects first.

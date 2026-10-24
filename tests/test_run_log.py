@@ -140,8 +140,8 @@ def test_infeasible_reason_names_measured_value_and_violated_bound(
     assert any(line.endswith(f" reason={cause}") for line in lines)
 
 
-def test_run_log_names_the_repeat_value_of_each_trial(tmp_path: Path) -> None:
-    """A repeats phase shows which seed every trial ran."""
+def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path: Path) -> None:
+    """A repeats phase identifies the configuration and seed every trial ran."""
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=_x_trainer(tmp_path),
@@ -160,6 +160,8 @@ def test_run_log_names_the_repeat_value_of_each_trial(tmp_path: Path) -> None:
 
     lines = _trial_lines(_experiment_dir(experiment) / "run.log", "p")
     assert [_field(line, r"repeat=seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
+    assert all("params={'x': " in line for line in lines)
+    assert all("'seed':" not in line for line in lines)
 
 
 def _stderr_cause_trainer(tmp_path: Path) -> Path:

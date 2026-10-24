@@ -9,14 +9,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
+from click.testing import CliRunner
 
+import phasesweep.engine.read as engine_read
 from phasesweep import experiment_status, run_experiment
+from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.paths import _generation_dir, _generation_path, _generation_winner_path
 from phasesweep.engine.read import read_status, read_trial_tables
 from phasesweep.evidence.models import LogRegexExtractor
+from phasesweep.runtime.json import JsonValue
 from tests.conftest import make_experiment, write_trainer
 from tests.ledger_fixtures import materialize, published_generation_id
 
@@ -55,6 +60,9 @@ payload carries no empty error field.
 """
 
 PHASE_STATUS_KEYS = {
+    "winner_generation_id",
+    "winner_is_published",
+    "winner_config_matches_current",
     "trials",
     "n_trials",
     "generation_trials",
@@ -95,6 +103,45 @@ keeps exactly ``PHASE_STATUS_KEYS`` and republishes none of it.
 def _published(tmp_path: Path) -> Experiment:
     """Return the config that reads the golden fixture's two-trial publication."""
     return materialize("current-journal", tmp_path, mode="tree").experiment
+
+
+@pytest.mark.parametrize("arguments", [("status",), ("status", "--trials"), ("show-winners",)])
+def test_inspection_uses_one_current_pointer_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
+) -> None:
+    """A concurrent generation claim cannot split inspection identity and results."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
+    generation = published_generation_id(experiment)
+    assert generation is not None
+    pointer = _generation_path(experiment)
+    _generation_dir(experiment, "next-generation").mkdir()
+    original_read = engine_read.read_yaml_or_none
+    reads: list[None] = []
+
+    def claim_after_read(path: Path) -> JsonValue:
+        payload = original_read(path)
+        if path == pointer:
+            reads.append(None)
+            pointer.write_text(yaml.safe_dump({"generation_id": "next-generation"}))
+        return payload
+
+    with monkeypatch.context() as capture:
+        capture.setattr(engine_read, "read_yaml_or_none", claim_after_read)
+        result = CliRunner().invoke(cli, [*arguments, str(materialized.config_path)])
+    assert result.exit_code == 0, result.output
+    assert len(reads) == 1
+    if arguments == ("status",):
+        payload = yaml.safe_load(result.output)
+        assert (
+            payload["current_generation_id"] == payload["represented_generation_id"] == generation
+        )
+        assert payload["phases"][0]["generation_trials"] == {"COMPLETE": 2}
+    else:
+        assert generation in result.output
+    pinned = experiment_status(experiment, generation_id=generation)
+    assert pinned["current_generation_id"] == "next-generation"
+    assert pinned["represented_generation_id"] == generation
 
 
 def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
@@ -240,7 +287,9 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
 
 def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
     """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
-    payload = experiment_status(make_experiment(workdir=tmp_path / "runs"))
+    experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
+    run_experiment(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert payload["ledger_path"] is None

@@ -138,6 +138,12 @@ def winners_payload(
                     if isinstance(view, WinnerSnapshot) and view.repeats is not None
                     else view.repeats
                 ),
+                "cost_advisory": (
+                    view.cost_advisory
+                    if visible_params == "all" or view.cost_advisory is None
+                    else "A cheaper configuration is within one standard error of the winner; "
+                    "the operator can inspect show-winners for its parameters."
+                ),
             }
         )
     return {

@@ -299,7 +299,8 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         "phasesweep init --list",
         "phasesweep init --template NAME",
         "Default `inherit_env: none` drops ambient `PYTHONPATH`",
-        "https://github.com/pszemraj/phasesweep/blob/main/docs/",
+        "Winner-only data cannot establish convergence, trends, robustness, causality",
+        "advisory, not significance tests",
     ):
         assert safety_contract in initialization.instructions
     assert "../../../docs/" not in initialization.instructions
@@ -398,7 +399,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
-    assert "Whether this winner was selected in the represented generation" in json.dumps(
+    assert "winner's source trial belongs to the represented generation" in json.dumps(
         output_schemas[TOOL_GET_RUN_RESULTS]
     )
     # Both result surfaces disclose which config labeled the result they show.
@@ -461,6 +462,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     app, _registry, _store = make_mcp_app(catalog)
     awaited = {
         "experiment_id": "e2e_lm",
+        "catalog_status": {"stale": False, "reload_refusal": None, "remediation": None},
         "result_source": "current_shared_study",
         "current_generation_id": "r1",
         "published_generation_id": None,

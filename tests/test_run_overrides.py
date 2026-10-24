@@ -7,12 +7,28 @@ import yaml
 from click.testing import CliRunner
 
 import phasesweep.cli as cli_module
+from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import Experiment
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.paths import (
+    _generation_config_snapshot_path,
+    _generation_dir,
+    _generation_path,
+    _last_successful_generation_path,
+)
+from phasesweep.engine.read import experiment_status, read_result
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from tests.conftest import invoke_cli_boundary
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.experiments import phase_payload, write_experiment
+from tests.ledger_fixtures import materialize, published_generation_id
 
 
 @pytest.mark.parametrize(
@@ -43,45 +59,21 @@ def test_run_overrides_are_typed_validated_and_leave_yaml_unchanged(
         phases=[phase_payload(n_trials=0)],
     )
     original = path.read_bytes()
-    received: list[Experiment] = []
     caller = tmp_path / "caller"
     caller.mkdir()
     monkeypatch.chdir(caller)
 
-    def capture(
-        experiment: Experiment, *, from_phase: str | None, dry_run: bool
-    ) -> dict[str, Winner]:
-        assert dry_run
-        assert from_phase is None
-        received.append(experiment)
-        return {}
-
-    monkeypatch.setattr(cli_module, "run_experiment", capture)
-    result = CliRunner().invoke(
-        cli,
-        [
-            "run",
-            str(path),
-            "--dry-run",
-            "--workdir",
-            "derived",
-            "--set",
-            "workdir=ignored",
-            "--set",
-            "experiment=smoke",
-            "--set",
-            "phases.0.n_trials=2",
-            "--set",
-            "phases.0.fixed_overrides={seed: 9, enabled: true}",
-            "--set",
-            "env.NOTE='a=b'",
-        ],
+    experiment = _derived(
+        path,
+        monkeypatch,
+        "workdir=derived",
+        "experiment=smoke",
+        "phases.0.n_trials=2",
+        "phases.0.fixed_overrides={seed: 9, enabled: true}",
+        "env.NOTE='a=b'",
     )
-
-    assert result.exit_code == 0, result.output
-    (experiment,) = received
     assert experiment.experiment == "smoke"
-    assert Path(experiment.workdir) == caller / "derived"
+    assert Path(experiment.workdir) == tmp_path / "derived"
     assert experiment.execution.cwd == str(tmp_path)
     assert experiment.phases[0].n_trials == 2
     assert experiment.phases[0].fixed_overrides == {"seed": 9, "enabled": True}
@@ -105,8 +97,8 @@ def test_derived_run_writes_its_overrides_to_the_config_snapshot(tmp_path: Path)
         [
             "run",
             str(path),
-            "--workdir",
-            str(tmp_path / "derived"),
+            "--set",
+            "workdir=derived",
             "--set",
             "experiment=smoke",
             "--set",
@@ -124,6 +116,255 @@ def test_derived_run_writes_its_overrides_to_the_config_snapshot(tmp_path: Path)
     assert recorded["workdir"] == str(tmp_path / "derived")
     assert path.read_bytes() == original
     assert not (tmp_path / "original").exists()
+
+    for command in ("validate", "status", "show-winners"):
+        inspected = CliRunner().invoke(
+            cli, [command, str(path), "--set", "workdir=derived", "--set", "experiment=smoke"]
+        )
+        assert inspected.exit_code == 0, inspected.output
+        assert "smoke" in inspected.output or "trial_number: 0" in inspected.output
+
+
+@pytest.mark.parametrize("empty_directory", [False, True])
+@pytest.mark.parametrize("command", ["status", "show-winners", "sync-tracking"])
+def test_study_reads_name_the_missing_directory(
+    tmp_path: Path,
+    command: str,
+    empty_directory: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Study reads refuse a missing output tree instead of inventing empty results."""
+    path = write_experiment(tmp_path / "sweep.yaml", workdir="absent")
+    if empty_directory:
+        (tmp_path / "absent" / "t").mkdir(parents=True)
+    assert invoke_cli_boundary([command, str(path)], monkeypatch) == 1
+    message = capsys.readouterr().err
+    assert "phasesweep: No study directory at" in message
+    assert "fix:" in message
+    assert str(tmp_path / "absent" / "t") in message
+    with pytest.raises(StudyStorageUnavailableError, match="No study directory at"):
+        experiment_status(cli_module._load_cli_config(path))
+
+
+@pytest.mark.parametrize(
+    ("command", "supports_override"),
+    [
+        (("run",), True),
+        (("validate",), True),
+        (("status",), True),
+        (("show-winners",), True),
+        (("sync-tracking",), True),
+        (("init",), False),
+        (("explain",), False),
+        (("mcp", "serve"), False),
+        (("mcp", "init-catalog"), False),
+        ((), False),
+    ],
+)
+def test_removed_workdir_option_points_to_config_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: tuple[str, ...],
+    supports_override: bool,
+) -> None:
+    """Only commands accepting configuration overrides suggest the replacement spelling."""
+    path = write_experiment(tmp_path / "sweep.yaml")
+    arguments = [*command, *([str(path)] if supports_override else []), "--workdir", "runs"]
+    assert invoke_cli_boundary(arguments, monkeypatch) == 2
+    message = capsys.readouterr().err
+    assert ("--set workdir=PATH" in message) is supports_override
+    assert ("config file's directory" in message) is supports_override
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("continuation", ["topup", "append", "prepend_drift"])
+def test_published_winner_survives_a_failed_later_generation(
+    tmp_path: Path,
+    continuation: str,
+) -> None:
+    """Failed continuations retain each winner's producing metric, annotations and trainer base."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os, sys
+        if os.environ['PHASESWEEP_TRIAL_ID'] != '0' or '--fail=1' in sys.argv or '--fail' in sys.argv:
+            sys.exit(1)
+        print('x=0.5')
+    """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=1,
+        trainer_config={"caption": "original-base"},
+        comment="original annotation",
+    )
+    run_experiment(experiment)
+    published_id = published_generation_id(experiment)
+    assert published_id is not None
+    if continuation == "append":
+        phases = [
+            *experiment.phases,
+            Phase(
+                name="next",
+                n_trials=1,
+                gpu_policy="none",
+                max_consecutive_failures=1,
+                fixed_overrides={"fail": 1},
+            ),
+        ]
+    elif continuation == "prepend_drift":
+        phases = [
+            Phase(name="lead", n_trials=1, gpu_policy="none"),
+            experiment.phases[0].model_copy(update={"comment": "changed annotation"}),
+        ]
+    else:
+        phases = [
+            experiment.phases[0].model_copy(
+                update={
+                    "n_trials": 2,
+                    "max_consecutive_failures": 1,
+                }
+            )
+        ]
+    changed = experiment.model_copy(update={"phases": phases})
+    if continuation == "prepend_drift":
+        changed = changed.model_copy(
+            update={
+                "metric": experiment.metric.model_copy(update={"name": "changed_metric"}),
+                "trainer_config": {"caption": "changed-base"},
+            }
+        )
+        with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
+            run_experiment(changed)
+    else:
+        with pytest.raises(NoFeasibleTrialError, match="aborted"):
+            run_experiment(changed)
+    path = tmp_path / "sweep.yaml"
+    write_experiment_config(path, changed)
+    winners = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert winners.exit_code == 0, winners.exception
+    assert "trial_number: 0" in winners.output
+    status = experiment_status(changed)
+    expected_generation = (
+        status["current_generation_id"] if continuation == "append" else published_id
+    )
+    expected_label = "unpublished" if continuation == "append" else "published"
+    assert f"# winner generation: {expected_generation} ({expected_label})" in winners.output
+    phases_payload = status["phases"]
+    assert isinstance(phases_payload, list) and isinstance(phases_payload[0], dict)
+    phase_payload = next(phase for phase in phases_payload if phase["name"] == "p")
+    assert phase_payload["winner_generation_id"] == expected_generation
+    assert phase_payload["winner_is_published"] is (continuation != "append")
+    assert str(expected_generation) in str(phase_payload["winner"])
+    if continuation == "prepend_drift":
+        lead, published = winners.output.split("=== lead ===", 1)[1].split("=== p ===", 1)
+        assert "changed_metric: 0.5" in lead
+        assert "objective: 0.5" in published and "changed_metric:" not in published
+        assert "# original annotation" in published and "changed annotation" not in published
+        assert (
+            "# Historical published phase result: does not match the current config." in published
+        )
+        assert "# Historical experiment result: unpublished generation" not in winners.output
+        for generation, base in (
+            (published_id, "original-base"),
+            (status["current_generation_id"], "changed-base"),
+        ):
+            assert (
+                f"# Producing argparse trainer base for generation {generation}, before phase overrides.\n"
+                f"trainer_config:\n  caption: {base}"
+            ) in winners.output
+            assert winners.output.count(f"caption: {base}") == 1
+    table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
+    assert table.exit_code == 0, table.exception
+    assert f"winner generation: {expected_generation} ({expected_label})" in table.output
+
+
+def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_path: Path) -> None:
+    """Appending a phase keeps finished phase results current and names the pending phase."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    path = materialized.config_path
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["phases"].append({"name": "next", "inherits": ["p"], "n_trials": 1})
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    result = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "appended phases have not run yet" in result.output
+    assert "Historical experiment result" not in result.output
+    assert "=== next === (no winner yet)" in result.output
+    producing = cli_module._load_cli_config(path)
+    result_status, (winner,) = read_result(producing)
+    assert result_status["published_config_matches_current"] is True
+    assert winner.config_matches_current is True
+    _last_successful_generation_path(materialized.experiment).unlink()
+    status = CliRunner().invoke(cli, ["status", str(path)])
+    assert status.exit_code == 0, status.output
+    payload = yaml.safe_load(status.output)
+    assert payload["is_published"] is False
+    assert payload["phases"][0]["winner_config_matches_current"] is True
+    assert payload["phases"][0]["winner"].endswith("/phases/p/winner.yaml")
+    table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
+    assert table.exit_code == 0, table.output
+    assert "marks unpublished generation" in table.output
+
+
+def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> None:
+    """An unpublished saved winner reports drift in both CLI labels and status facts."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    _last_successful_generation_path(materialized.experiment).unlink()
+    path = materialized.config_path
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["metric"]["name"] = "changed_metric"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "# Historical experiment result: unpublished generation" in result.output
+    assert "does not match the current config" in result.output
+    assert "objective: 0.5" in result.output
+    inspected = CliRunner().invoke(cli, ["status", str(path)])
+    assert inspected.exit_code == 0, inspected.output
+    status = yaml.safe_load(inspected.output)
+    assert status["phases"][0]["winner_config_matches_current"] is False
+    comparison = cli_module._load_cli_config(path)
+    result_status, (winner,) = read_result(
+        comparison, generation_id=status["represented_generation_id"]
+    )
+    assert result_status["published_config_matches_current"] is False
+    assert winner.config_matches_current is False
+
+
+@pytest.mark.parametrize("damage", ["missing", "yaml", "model"])
+@pytest.mark.parametrize("command", ["status", "show-winners"])
+def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    damage: str,
+) -> None:
+    """Missing or invalid producing snapshots yield one routed restore-tree refusal."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    generation_id = published_generation_id(materialized.experiment)
+    assert generation_id is not None
+    _last_successful_generation_path(materialized.experiment).unlink()
+    snapshot = _generation_config_snapshot_path(materialized.experiment, generation_id)
+    if damage == "missing":
+        snapshot.unlink()
+    else:
+        snapshot.write_text(
+            "broken: [" if damage == "yaml" else "experiment: invalid\n", encoding="utf-8"
+        )
+
+    assert invoke_cli_boundary([command, str(materialized.config_path)], monkeypatch) == 1
+    message = capsys.readouterr().err
+    assert "Cannot read configuration snapshot for generation" in message
+    assert generation_id in message and str(snapshot) in message
+    assert message.count("fix:") == 1
+    assert "restore the files and permissions identified in the error" in message
+    assert "Traceback" not in message
 
 
 @pytest.mark.parametrize(
@@ -151,6 +392,63 @@ def test_run_override_errors_refuse_before_launch(
     assert not (tmp_path / "original").exists()
 
 
+def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
+    """Finished phase results remain visible before the run publishes."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment, config_path = materialized.experiment, materialized.config_path
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    generation_path = _generation_dir(experiment, generation_id)
+    _generation_path(experiment).write_text("generation_id: interrupted\n")
+
+    published = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+
+    assert published.exit_code == 0
+    assert "trial_number: 0" in published.output
+    assert f"# generation: {generation_path}" in published.output
+    assert (generation_path / "summary.yaml").is_file()
+    assert (generation_path / "phases/p/winner.yaml").is_file()
+
+    _last_successful_generation_path(experiment).unlink()
+    _generation_path(experiment).write_text(f"generation_id: {generation_id}\n")
+    unpublished = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+
+    assert unpublished.exit_code == 0
+    assert "trial_number: 0" in unpublished.output
+    assert "(unpublished)" in unpublished.output
+    assert "ranked_trials:" not in unpublished.output
+
+
+def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:
+    """Config edits cannot relabel an unfinished generation's objective, phases or base."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    _last_successful_generation_path(materialized.experiment).unlink()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "show-winners",
+            str(materialized.config_path),
+            "--set",
+            "metric.name=renamed_objective",
+            "--set",
+            "phases.0.name=renamed_phase",
+            "--set",
+            "phases.0.comment=Changed annotation",
+            "--set",
+            "trainer_config={changed_base: 17}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "(unpublished)" in result.output
+    assert "metric:\n  objective: 0.5" in result.output
+    assert "=== p ===" in result.output
+    assert "trainer_config: {}" in result.output
+    for edited in ("renamed_objective", "renamed_phase", "Changed annotation", "changed_base"):
+        assert edited not in result.output
+
+
 def _two_phase_config(tmp_path: Path) -> Path:
     """Write a config with phases ``lr`` and ``wd``, a dotted search-space key and a trainer_config."""
     return write_experiment(
@@ -175,6 +473,8 @@ def _derived(path: Path, monkeypatch: pytest.MonkeyPatch, *settings: str) -> Exp
     def capture(
         experiment: Experiment, *, from_phase: str | None, dry_run: bool
     ) -> dict[str, Winner]:
+        assert dry_run
+        assert from_phase is None
         received.append(experiment)
         return {}
 

@@ -285,10 +285,16 @@ def experiment_disclosures(
     :return Iterator[tuple[Phase | None, list[tuple[bool, str]]]]: Context and
         ordered warning/content pairs; ``None`` identifies the experiment block.
     """
+    from phasesweep.engine.paths import _experiment_dir
+
     yield (
         None,
         [
             *((False, line) for line in experiment_contract_lines(experiment)),
+            (
+                False,
+                f"artifact root: {_experiment_dir(experiment)}",
+            ),
             *((True, line) for line in experiment_warnings(experiment)),
         ],
     )
@@ -593,6 +599,15 @@ class Phase(_Frozen):
             "configurations by a reducer over their complete groups."
         ),
     )
+    cost_key: str | None = Field(
+        default=None,
+        description=(
+            "Numeric sampled parameter whose smaller values cost less. With mean repeats, "
+            "advise the cheapest configuration within one standard error of the winner's "
+            "mean, preferring better objectives for cost ties. Selection and result reads "
+            "report this without changing the winner. Excluded from study fingerprints."
+        ),
+    )
     n_trials: ConfigInt = Field(ge=1)
     n_jobs: ConfigInt = Field(
         default=1,
@@ -831,6 +846,31 @@ class Phase(_Frozen):
                     "repeat axis supplies that key's value on every trial; remove it from "
                     f"{field}."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cost_key(self) -> Phase:
+        """Require mean repeats and a numeric sampled parameter for the cost advisory.
+
+        :raises ValueError: The cost key is not a numeric search-space key or repeats do not use the mean reducer.
+        :return Phase: Self, unchanged.
+        """
+        if self.cost_key is None:
+            return self
+        if self.repeats is None or self.repeats.reduce != "mean":
+            raise ValueError("cost_key requires repeats with reduce: mean.")
+        parameter = self.search_space.get(self.cost_key)
+        if parameter is None or (
+            isinstance(parameter, CategoricalParam)
+            and not all(
+                isinstance(value, int | float) and not isinstance(value, bool)
+                for value in parameter.choices
+            )
+        ):
+            raise ValueError(
+                f"cost_key {self.cost_key!r} must name a numeric search_space parameter "
+                "whose smaller values cost less."
+            )
         return self
 
     @model_validator(mode="after")
@@ -1154,8 +1194,9 @@ class Experiment(_Frozen):
         """
         if self.storage != "auto":
             return self.storage
-        root = Path(self.workdir).expanduser().resolve() / self.experiment
-        return local_storage_url(root / "study.journal")
+        from phasesweep.engine.paths import _experiment_dir
+
+        return local_storage_url(_experiment_dir(self) / "study.journal")
 
     def phase(self, name: str) -> Phase:
         """Look up a configured phase by its unique name.
@@ -1313,7 +1354,7 @@ class Experiment(_Frozen):
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
         if self.resolved_storage is not None and not self.provenance:
             raise ValueError(
-                "Persistent storage requires a nonempty provenance mapping that identifies "
+                f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
                 "the data and dependency revisions used by this experiment; each generation "
                 "records the trainer's git commit on its own."
             )

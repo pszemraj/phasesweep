@@ -118,7 +118,8 @@ def register_shutdown_waker(waker: Callable[[], None]) -> None:
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Terminate all tracked process groups, then exit.
 
-    One PGID snapshot under the launch lock drives both termination stages.
+    One guardian snapshot under the launch lock requests cancellation; each guardian
+    records its intent and owns trainer termination while this handler confirms cleanup.
     Never call ``proc.wait()`` here: its interrupted waitpid lock is non-reentrant.
     A main-thread critical section records the signal for its exit checkpoint;
     a concurrent handler invocation returns without interrupting cleanup.
@@ -150,7 +151,8 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
-            pgids = tuple(_active_children)
+            guardians = {pgid: proc.pid for pgid, proc in _active_children.items()}
+            pgids = tuple(guardians)
 
         log.warning("Received signal %d — killing %d active child group(s)", signum, len(pgids))
 
@@ -159,6 +161,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             confirmed_by_pgid = _terminate_process_groups(
                 pgids,
                 grace_seconds=_KILL_GRACE_SECONDS,
+                guardians=guardians,
             )
         except Exception:
             log.exception("Failed while cleaning child process groups after signal %d", signum)

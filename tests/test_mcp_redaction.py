@@ -243,10 +243,13 @@ def test_winners_payload_applies_visible_params_policy(
             generation_id="generation-1",
             attempt_id="attempt-1",
         ),
+        cost_advisory="one-standard-error cost advisory: params={'dataset': 'SECRET_DATASET'}",
     )
     phase = _winners_payload("redact_me", [view], visible_params=policy)["phases"][0]
     assert phase["params"] == expected
     assert phase["params_redacted"] is redacted
+    assert "cost_advisory" in phase
+    assert ("SECRET_DATASET" in phase["cost_advisory"]) == (policy == "all")
 
 
 @pytest.mark.parametrize(

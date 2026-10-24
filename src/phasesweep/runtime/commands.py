@@ -144,7 +144,12 @@ def format_cli_overrides(overrides: Mapping[str, object], fmt: _CliOverrideForma
 
 
 def _validate_file_config_value(payload: object, *, position: str) -> None:
-    """Report invalid trainer values with dotted keys and list indices."""
+    """Report invalid trainer values with dotted keys and list indices.
+
+    :param object payload: Trainer configuration subtree to validate as finite JSON values.
+    :param str position: Root label prepended to the failing value's nested path.
+    :raises ValueError: A value is non-finite, recursive, has a non-string key, or is outside the JSON domain.
+    """
     try:
         _FILE_CONFIG_VALUE.validate_python(payload)
     except ValidationError as exc:

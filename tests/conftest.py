@@ -11,7 +11,7 @@ import signal
 import stat
 import sys
 import textwrap
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn, ParamSpec, TypeVar
@@ -21,6 +21,9 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.ledger as engine_ledger
 from phasesweep import load_experiment
 from phasesweep.cli import main as cli_boundary
 from phasesweep.config.models import (
@@ -36,7 +39,9 @@ from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
     _write_artifact_root_binding,
 )
+from phasesweep.engine.confound import CONFOUND_SCHEMA_VERSION
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     FEASIBLE_ATTR,
@@ -111,6 +116,83 @@ def patch_path_method_failure(
         return original_method(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, method_name, fail_target)
+
+
+def lose_record_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException | None = None,
+    *,
+    only: Path | None = None,
+) -> None:
+    """Fail generation-record creation while forwarding other writes.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the write failure.
+    :param BaseException | None error: Injected error, or an OSError by default.
+    :param Path | None only: Restrict the failure to this record path.
+    """
+    original = generation_ops.atomic_create_text
+    failure = OSError("simulated record write failure") if error is None else error
+
+    def flaky(path: Path, text: str) -> bool:
+        if path.name == "generation.yaml" and (only is None or path == only):
+            raise failure
+        return original(path, text)
+
+    monkeypatch.setattr(generation_ops, "atomic_create_text", flaky)
+
+
+def fail_pointer_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    experiment: Experiment,
+    error: BaseException | None = None,
+) -> None:
+    """Fail writing the experiment's last-success pointer.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the write failure.
+    :param Experiment experiment: Experiment whose pointer must fail.
+    :param BaseException | None error: Injected error, or an OSError by default.
+    """
+    pointer_path = _last_successful_generation_path(experiment)
+    original_write = artifact_io._write_yaml_atomic
+    failure = OSError("simulated pointer commit failure") if error is None else error
+
+    def flaky_write(path: Path, payload: object) -> None:
+        if path == pointer_path:
+            raise failure
+        original_write(path, payload)
+
+    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
+
+
+def patch_published_trial_read_failure(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Fail trial reads only during the published-study check, after study opening.
+
+    :param pytest.MonkeyPatch monkeypatch: Patch scope for the published check.
+    :param Exception error: Error raised by the check's trial reads.
+    """
+    real_check = engine_ledger._check_published_phase_studies
+
+    def fail_trial_read(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    def check_while_reads_fail(
+        experiment: Experiment,
+        loaded: Mapping[str, optuna.Study],
+        *,
+        from_phase: str | None = None,
+    ) -> None:
+        with monkeypatch.context() as reads:
+            reads.setattr(optuna.Study, "get_trials", fail_trial_read)
+            real_check(experiment, loaded, from_phase=from_phase)
+
+    monkeypatch.setattr(engine_ledger, "_check_published_phase_studies", check_while_reads_fail)
+
+
+def assert_advises_target(message: str, before: int, after: int, action: str) -> None:
+    """Assert phase p's retry target, action and failure-count reset advice."""
+    assert f"phases[p].n_trials from {before} to {after} in the config" in message
+    assert action in message
+    assert "the failure count starts again from zero" in message
 
 
 def patch_rejected_trial_user_attr(
@@ -656,7 +738,7 @@ def log_regex_provenance() -> JsonObject:
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
     """Return the confound block selection records for a one-trial population."""
     return {
-        "schema_version": 2,
+        "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": [trial_number],
         "ranked_groups": None,
         "checks": {

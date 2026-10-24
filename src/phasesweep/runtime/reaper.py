@@ -14,10 +14,10 @@ import re
 import signal
 import sys
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeGuard
+from typing import Literal, TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
 from phasesweep.runtime.darwin import read_boot_session_uuid, read_process_info
@@ -336,7 +336,7 @@ def read_proc_starttime(pid: int) -> int | None:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Check if a PID exists (best-effort; race-free check is impossible).
+    """Check whether a PID exists.
 
     :param int pid: The process ID to probe via ``kill(pid, 0)``.
     :return bool: ``True`` if the PID exists (or exists but is owned by another user);
@@ -459,65 +459,84 @@ def read_stale_process_identity(
     )
 
 
-def cleanup_stale_trial_process(
-    identity: StaleProcessIdentity,
-    *,
-    grace_seconds: float = _KILL_GRACE_SECONDS,
-) -> bool:
-    """Clean a stale trial group using boot, namespace and process identity.
+@dataclass(frozen=True)
+class StaleProcessDecision:
+    """One read-only cleanup decision, shared by inspection and termination."""
 
-    A different known boot proves cleanup complete. Foreign-namespace processes must
-    be proven absent without signaling. Same-namespace cleanup requires known boot
-    IDs and saved start time before delegating to :func:`kill_stale_group`.
+    action: Literal["gone", "terminate", "refuse"]
+    reason: str
+    pgid: int | None = None
 
-    :param StaleProcessIdentity identity: Durable process identity read from
-        ``process_identity.json``.
-    :param float grace_seconds: Seconds to wait after SIGTERM before escalating
-        to SIGKILL; forwarded to :func:`kill_stale_group`.
-    :raises ForeignPidNamespaceError: The identity was recorded in another PID
-        namespace and its processes cannot be proven gone from here.
-    :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (nothing
-        to clean, the host rebooted, its processes in another namespace are
-        provably gone, or cleanup was confirmed). ``False`` when identity
-        cannot be verified or :func:`kill_stale_group` reports cleanup is
-        uncertain; callers must not advance state in that case.
+
+def stale_trial_process_decision(identity: StaleProcessIdentity) -> StaleProcessDecision:
+    """Decide whether a recorded trial group is absent, safe to signal, or unsafe.
+
+    :param StaleProcessIdentity identity: Attempt-bound durable process identity.
+    :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
+    :return StaleProcessDecision: Current action and the evidence supporting it.
     """
     current_boot_id = read_boot_id()
     if identity_from_earlier_boot(identity.boot_id, current_boot_id):
-        log.warning(
-            "Attempt %s belongs to an earlier host boot; no process from that boot remains.",
-            identity.attempt_id,
-        )
-        return True
+        return StaleProcessDecision("gone", "an earlier host boot proves the process group gone")
     if not same_pid_namespace(identity.pid_namespace):
         blocker = recorded_process_blocker(
             identity.pid_namespace, pids=(identity.pid,), pgids=(identity.pgid,)
         )
         if blocker is None:
-            log.warning(
-                "Attempt %s was recorded in PID namespace %s, where none of its processes remains.",
-                identity.attempt_id,
-                identity.pid_namespace,
+            return StaleProcessDecision(
+                "gone", "the host proves its foreign-namespace processes absent"
             )
-            return True
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
             f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}. "
             "Nothing was signalled."
         )
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
-        log.warning(
-            "Refusing automatic cleanup for attempt %s because robust process-birth identity "
-            "(boot id or process start time) is unavailable.",
-            identity.attempt_id,
-        )
-        return False
-    return kill_stale_group(
-        identity.pid,
-        identity.proc_starttime,
-        pgid=identity.pgid,
+        return StaleProcessDecision("refuse", "robust process-birth identity is unavailable")
+    return _stale_group_decision(identity.pid, identity.proc_starttime, pgid=identity.pgid)
+
+
+def cleanup_stale_trial_process(
+    identity: StaleProcessIdentity,
+    *,
+    grace_seconds: float = _KILL_GRACE_SECONDS,
+    before_terminate: Callable[[], None] | None = None,
+) -> bool:
+    """Apply the same boot, namespace and group decision used by recovery inspection.
+
+    :param StaleProcessIdentity identity: Attempt-bound durable process identity.
+    :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_terminate: Commit recovery intent before signalling a live group; a raised exception prevents termination.
+    :raises ForeignPidNamespaceError: Another namespace's processes cannot be proven absent.
+    :return bool: Whether cleanup is confirmed; unsafe identities remain untouched.
+    """
+    return _apply_stale_process_decision(
+        stale_trial_process_decision(identity),
         grace_seconds=grace_seconds,
+        before_terminate=before_terminate,
     )
+
+
+def _apply_stale_process_decision(
+    decision: StaleProcessDecision,
+    *,
+    grace_seconds: float,
+    before_terminate: Callable[[], None] | None = None,
+) -> bool:
+    """Apply a freshly probed cleanup decision.
+
+    :param StaleProcessDecision decision: Current process evidence and signal target.
+    :param float grace_seconds: SIGTERM grace before SIGKILL.
+    :param Callable[[], None] | None before_terminate: Persist recovery intent before sending a signal.
+    :return bool: Whether the group is confirmed gone.
+    """
+    log.warning("Stale process cleanup: %s.", decision.reason)
+    if decision.action != "terminate":
+        return decision.action == "gone"
+    assert decision.pgid is not None
+    if before_terminate is not None:
+        before_terminate()
+    return _terminate_process_group(decision.pgid, grace_seconds=grace_seconds)
 
 
 def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
@@ -532,29 +551,38 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
     return _terminate_process_groups((pgid,), grace_seconds=grace_seconds)[pgid]
 
 
-def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
-    """Escalate SIGTERM to SIGKILL with shared wait windows across all groups.
+def _terminate_process_groups(
+    pgids: tuple[int, ...],
+    *,
+    grace_seconds: float,
+    guardians: Mapping[int, int] | None = None,
+) -> dict[int, bool]:
+    """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
-    Per-group verdicts match :func:`_terminate_process_group`; all groups share one
-    SIGTERM grace and one post-SIGKILL confirmation window.
+    All groups share one grace period and one final confirmation window. Unguarded
+    groups receive direct SIGKILL after the grace period; guardians own escalation
+    for their groups and must finish lifecycle publication before cleanup is confirmed.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
-    :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL,
-        shared across all groups.
+    :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
+    :param Mapping[int, int] | None guardians: Group-to-guardian PIDs whose cancellation protocol owns durable intent and all trainer signals; the caller only requests cancellation and observes cleanup.
     :return dict[int, bool]: Confirmation verdict per requested pgid, ``True`` only when that
-        group is confirmed dead.
+        group and any assigned guardian are confirmed dead, so lifecycle publication has finished.
     """
     confirmed: dict[int, bool] = {}
     members: dict[int, set[int]] = {}
     pending: list[int] = []
     for pgid in pgids:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            if guardians is None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(guardians[pgid], signal.SIGTERM)
         except ProcessLookupError:
-            confirmed[pgid] = True
+            confirmed[pgid] = not _process_group_alive(pgid)
             continue
         except OSError as exc:
-            log.error("Failed to send SIGTERM to process group %d: %s", pgid, exc)
+            log.error("Failed to request termination for process group %d: %s", pgid, exc)
             confirmed[pgid] = False
             continue
         members[pgid] = set(_group_member_pids(pgid).pids)
@@ -568,7 +596,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
                 # An owned zombie keeps killpg(0) positive until its parent reaps it.
                 # Other parents' children remain untouched; their groups stay uncertain.
                 reap_child(pgid)
-            if _process_group_alive_with_members(pgid, members[pgid]):
+            if _process_group_alive_with_members(pgid, members[pgid]) or (
+                guardians is not None and _process_group_alive(guardians[pgid])
+            ):
                 still_alive.append(pgid)
             else:
                 confirmed[pgid] = True
@@ -578,6 +608,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
 
     survivors: list[int] = []
     for pgid in pending:
+        if guardians is not None:
+            survivors.append(pgid)
+            continue
         if sys.platform == "darwin":
             reap_child(pgid)
             if not _process_group_exists(pgid):
@@ -603,7 +636,9 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
         for pgid in survivors:
             if sys.platform == "darwin":
                 reap_child(pgid)
-            if _process_group_alive_with_members(pgid, members[pgid]):
+            if _process_group_alive_with_members(pgid, members[pgid]) or (
+                guardians is not None and _process_group_alive(guardians[pgid])
+            ):
                 still_alive.append(pgid)
             else:
                 confirmed[pgid] = True
@@ -612,7 +647,11 @@ def _terminate_process_groups(pgids: tuple[int, ...], *, grace_seconds: float) -
             time.sleep(0.1)
 
     for pgid in survivors:
-        log.error("Process group %d still appears alive after SIGKILL", pgid)
+        log.error(
+            "Process group %d still appears alive after %s",
+            pgid,
+            "guardian cancellation" if guardians is not None else "SIGKILL",
+        )
         confirmed[pgid] = False
     return confirmed
 
@@ -787,88 +826,81 @@ def kill_stale_group(
     :param int | None pgid: Process-group ID from the same durable identity.
     :param float grace_seconds: Seconds to wait after SIGTERM before escalating to SIGKILL;
         passed through to :func:`_terminate_process_group`.
-    :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (cleanup confirmed or
-        nothing to clean). ``False`` when cleanup is uncertain and callers must NOT advance
-        state.
+    :return bool: ``True`` when cleanup is confirmed or nothing needs cleaning, permitting the trial to be settled; ``False`` when cleanup is uncertain and callers must not advance state.
+    """
+    return _apply_stale_process_decision(
+        _stale_group_decision(pid, saved_starttime, pgid=pgid), grace_seconds=grace_seconds
+    )
+
+
+def _stale_group_decision(
+    pid: int | None, saved_starttime: int | None, *, pgid: int | None
+) -> StaleProcessDecision:
+    """Resolve a signal target inside an already verified PID namespace.
+
+    :param int | None pid: Recorded process leader.
+    :param int | None saved_starttime: Recorded leader birth time.
+    :param int | None pgid: Recorded process group.
+    :return StaleProcessDecision: Absence, refusal, or the safe signal target.
     """
     target_pgid: int | None = None
-
     if saved_starttime is None:
-        pid_alive = pid is not None and is_pid_alive(pid)
-        pgid_alive = pgid is not None and _process_group_exists(pgid)
-        if pid_alive or pgid_alive:
-            log.warning(
-                "Refusing to signal stale pid=%s pgid=%s without a saved process start time.",
-                pid,
-                pgid,
+        if (pid is not None and is_pid_alive(pid)) or (
+            pgid is not None and _process_group_exists(pgid)
+        ):
+            return StaleProcessDecision(
+                "refuse", "saved process start time is unavailable; nothing will be signalled"
             )
-            return False
-        return True
-
+        return StaleProcessDecision("gone", "no recorded process remains")
     if pid is not None:
         pid_alive = is_pid_alive(pid)
         same_process = False
         if pid_alive:
             current_starttime = read_proc_starttime(pid)
             if current_starttime is None:
-                log.warning(
-                    "PID %d is alive but its process start time is unreadable; "
-                    "refusing cleanup because process identity is unknown.",
-                    pid,
+                return StaleProcessDecision(
+                    "refuse", "live PID has an unreadable start time; nothing will be signalled"
                 )
-                return False
             same_process = current_starttime == saved_starttime
         if same_process:
             try:
                 target_pgid = os.getpgid(pid)
             except ProcessLookupError:
                 target_pgid = None
-            except OSError as exc:
-                log.error("Failed reading PGID for stale PID %d: %s", pid, exc)
-                return False
+            except OSError:
+                return StaleProcessDecision(
+                    "refuse", "live PID's process group is unreadable; nothing will be signalled"
+                )
         elif pid_alive and pgid is None:
-            log.warning(
-                "PID %d is alive but starttime does not match saved value; "
-                "PID was reused and no stored PGID is available. Cleanup "
-                "status is uncertain.",
-                pid,
+            return StaleProcessDecision(
+                "refuse", "PID was reused and no stored PGID exists; nothing will be signalled"
             )
-            return False
-
     if target_pgid is None and pgid is not None:
         if not _process_group_exists(pgid):
-            return True
+            return StaleProcessDecision("gone", "recorded process group has exited")
         pgid_reused = _stored_pgid_is_reused_group_leader(pgid, saved_starttime)
         if pgid_reused is None:
-            log.warning(
-                "Stored PGID %d has a live but unreadable leader; refusing PGID "
-                "fallback because process identity is unknown.",
-                pgid,
+            return StaleProcessDecision(
+                "refuse", "stored PGID has an unreadable leader; nothing will be signalled"
             )
-            return False
         if pgid_reused:
-            log.warning(
-                "Stored PGID %d is now led by a different process. Refusing "
-                "PGID fallback to avoid killing an unrelated process group "
-                "(saved starttime %s).",
-                pgid,
-                saved_starttime,
+            return StaleProcessDecision(
+                "refuse",
+                "stored PGID is led by a reused process; that unrelated group will be spared",
             )
-            return False
-
-    if target_pgid is None:
+    fallback = target_pgid is None
+    if fallback:
         if pgid is None:
-            # No identity at all → nothing alive to clean up.
-            return True
-        log.warning(
-            "Root PID is gone, reused, or unrecoverable; using stored PGID %d for "
-            "best-effort cleanup of stale trial process group.",
-            pgid,
-        )
+            return StaleProcessDecision("gone", "no recorded process group remains")
         target_pgid = pgid
-
+    assert target_pgid is not None
     if not _process_group_alive(target_pgid):
-        return True
-
-    log.warning("Terminating stale training process group pgid=%d (pid=%s)", target_pgid, pid)
-    return _terminate_process_group(target_pgid, grace_seconds=grace_seconds)
+        return StaleProcessDecision("gone", "recorded process group has exited")
+    source = (
+        "stored PGID fallback after leader exit or PID reuse"
+        if fallback
+        else "matching process-birth identity"
+    )
+    return StaleProcessDecision(
+        "terminate", f"live process group verified using {source}", target_pgid
+    )

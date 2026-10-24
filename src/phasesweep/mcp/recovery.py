@@ -41,7 +41,9 @@ from phasesweep.engine.ledger import (
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
@@ -96,6 +98,7 @@ class _CleanupEvidence:
     reaped_attempt_ids: set[str]
     reaped_attempt_locations: dict[str, tuple[str, int, str]]
     registered_recovery_attempt_ids: set[str] = field(default_factory=set)
+    reaped_attempt_states: dict[str, TrialStateName] = field(default_factory=dict)
     reaped: int = 0
     registered_attempts_reconciled: int = 0
     cleanup_recovered: int = 0
@@ -430,14 +433,14 @@ def _require_dead_runner(
     """Reject live runners and identities without a safe process-visibility proof.
 
     Ended boots and host-proven foreign-namespace absence need no PID probe. Other cleanup
-    requires a recorded Linux start time before checking liveness.
+    requires a recorded native process start time before checking liveness.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
     :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
     """
-    # PID and /proc start time are unique only within one boot and PID
+    # PID and native process start time are unique only within one boot and PID
     # namespace, and only this namespace's numbers may be probed.
     if view.visibility != "observable":
         return
@@ -665,6 +668,7 @@ def _recover_trial_evidence(
     causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
     inspected_attempts: dict[str, _AttemptRecord] = {}
     inspected_studies = 0
+    loaded_studies: dict[str, optuna.Study] = {}
     if needs.cleanup_needed:
         loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         active_report = _PreflightCleanupReport()
@@ -732,6 +736,30 @@ def _recover_trial_evidence(
                         record.trial_number,
                         record.generation_id,
                     )
+    if confirm and needs.stored_snapshot is not None:
+        pending_ids = {
+            attempt.attempt_id
+            for phase in needs.stored_snapshot.status.phases
+            for attempt in phase.running_attempts or ()
+            if attempt.recovers_as == "EVIDENCE_PENDING" and attempt.attempt_id is not None
+        } & evidence.reaped_attempt_ids
+        if pending_ids:
+            if not loaded_studies:
+                loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+            for phase_name, study in loaded_studies.items():
+                for trial in study.get_trials(deepcopy=False):
+                    trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+                    if (
+                        not isinstance(trial_attempt_id, str)
+                        or trial_attempt_id not in pending_ids
+                        or not trial.state.is_finished()
+                    ):
+                        continue
+                    location = evidence.reaped_attempt_locations.get(trial_attempt_id)
+                    generation = trial.user_attrs.get(GENERATION_ID_ATTR)
+                    if location != (phase_name, trial.number, generation):
+                        continue
+                    evidence.reaped_attempt_states[trial_attempt_id] = _trial_count_state(trial)
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 
@@ -919,6 +947,7 @@ def _finish_result_recovery(
             terminal_status,
             confirmed_attempt_ids=evidence.reaped_attempt_ids,
             confirmed_attempt_locations=evidence.reaped_attempt_locations,
+            confirmed_attempt_states=evidence.reaped_attempt_states,
         )
         emit(f"Finalized stored terminal result snapshot for {run_id}.")
     elif needs.snapshot_unavailable:
@@ -935,14 +964,16 @@ def _finalize_stored_terminal_result_snapshot(
     *,
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
+    confirmed_attempt_states: Mapping[str, TrialStateName] | None = None,
 ) -> None:
     """Finalize and persist the stored snapshot without losing a completed prior view.
 
     :param RunStore store: Existing run store containing the terminal status.
     :param str run_id: Run whose stored terminal snapshot should be finalized.
     :param dict[str, object] terminal_status: Validated terminal process status to enrich.
-    :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
-    :param dict confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
+    :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to terminal states.
+    :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
+    :param Mapping[str, TrialStateName] | None confirmed_attempt_states: Actual terminal state of pending evidence.
     :raises RunRecoveryError: The stored snapshot is unavailable or persistence fails.
     """
     snapshot = parse_result_snapshot(terminal_status)
@@ -958,6 +989,7 @@ def _finalize_stored_terminal_result_snapshot(
             raw_snapshot,
             confirmed_attempt_ids=confirmed_attempt_ids,
             confirmed_attempt_locations=confirmed_attempt_locations,
+            confirmed_attempt_states=confirmed_attempt_states,
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)

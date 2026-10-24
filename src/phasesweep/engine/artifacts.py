@@ -34,7 +34,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
 from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
@@ -66,9 +66,10 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
 
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
-    """Attach a durable file handler for phasesweep logs.
+    """Capture phasesweep logs and a routed failure's advice in the run log.
 
     :param Path path: Log file path to append to.
+    :raises PhaseSweepError: The operational failure raised inside the context.
     :return Iterator[None]: Context manager that removes the handler on exit.
     """
     logger = logging.getLogger("phasesweep")
@@ -87,6 +88,13 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     logger.addHandler(handler)
     try:
         yield
+    except PhaseSweepError as exc:
+        handler.handle(
+            logger.makeRecord(
+                logger.name, logging.ERROR, __file__, 0, "fix: %s", (operator_step(exc),), None
+            )
+        )
+        raise
     finally:
         logger.removeHandler(handler)
         handler.close()
@@ -285,19 +293,23 @@ def _load_winner(
         computed one.
     :return Winner: The reconstructed winner for ``phase``.
     """
-    if publication is None:
+    if publication is None or phase.name not in publication.winners:
+        absent = (
+            "no generation has been published."
+            if publication is None
+            else "The last published generation holds no winner for it."
+        )
         raise ResumeWinnerMissingError(
-            f"Winner file missing for phase {phase.name!r}: no generation has completed, so "
-            "the workdir has no earlier results to resume from. Run without --from-phase so "
-            "the earlier phases run first, or use the workdir that holds their results."
+            f"Winner file missing for phase {phase.name!r}: {absent} "
+            "Unpublished phase winners can be inspected, but --from-phase requires published "
+            "predecessors.",
+            remediation=(
+                "Resume without --from-phase to reuse completed trials, or use the workdir "
+                "that holds the publication."
+            ),
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
-    validated = publication.winners.get(phase.name)
-    if validated is None:
-        raise ResumeWinnerMissingError(
-            f"Winner file missing for phase {phase.name!r}: {path}. The last published "
-            "generation holds no winner for it. Run without --from-phase so it runs first."
-        )
+    validated = publication.winners[phase.name]
     data = validated.payload
 
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)

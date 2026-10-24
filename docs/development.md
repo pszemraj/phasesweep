@@ -18,7 +18,7 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 
 ## Quality gates
 
-During iteration, run the mandatory checks and tests for the changed subsystem. Use the parallel fast lane below for broader coverage; reserve the complete suite for qualification. Run the repository checks sequentially:
+During iteration, run the mandatory checks and tests for the changed subsystem. Complete qualification uses [both non-live lanes](#test-tiers). Run the repository checks sequentially:
 
 ```bash
 pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
@@ -30,7 +30,7 @@ bash scripts/check_module_size.sh
 ```
 
 > [!IMPORTANT]
-> Run `pytest` by itself, with no concurrent lint or type check: process-supervision and timeout tests are timing-sensitive.
+> Within this checkout, run one test lane at a time and keep `pytest` separate from lint and type checks: process-supervision and timeout tests are timing-sensitive. Bounded test overlap with other projects is allowed.
 
 ### Git hooks
 
@@ -55,7 +55,7 @@ Ruff checks public docstrings and function annotations, and mypy checks source t
 
 The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 
-`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone. The hooks are a fast subset, and plain `pytest` is the full gate.
+`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone.
 
 ### Source prose review
 
@@ -68,28 +68,24 @@ The audit scans every source docstring (including attribute documentation) and c
 
 ### Test tiers
 
-Plain `pytest` runs the complete non-live qualification suite. For broader checks while iterating, use two process workers for the fast lane:
+Complete non-live qualification runs the parallel lane, including integration tests, followed by the serial self-signalling lane. Use a bounded worker count, for example:
 
 ```bash
-pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid" \
+pytest -n 2 --dist worksteal -m "not live and not signals_own_pid" \
   --durations=25 --durations-min=1
 ```
 
-`loadfile` keeps each test module in one worker. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks.
+`worksteal` balances tests across workers. Test homes, caches, journals and host-lock directories use per-test temporary paths. Keep the worker count bounded; `-n auto` can overload process-launch and deadline checks. For fast iteration, add `and not integration` to the parallel marker expression.
 
-Run the complementary lane serially, after the workers have exited:
-
-```bash
-pytest -m "not live and (integration or signals_own_pid)"
-```
-
-Both lanes run on Linux and macOS. Tests whose subject requires real Linux procfs or PID namespaces skip on macOS; synthetic procfs tests retain their Linux provider explicitly, and macOS native identity and MPS lease tests cover the host paths. Together these lanes cover the same cases as plain `pytest`. The serial lane runs the integration timing checks and every test that signals its own process, including self-signalling cases outside the integration tier. Run both lanes without concurrent lint, type checks or other validation.
-
-To inspect the cost of a qualification run:
+Run only the complementary self-signalling lane serially, after this checkout's parallel lane exits:
 
 ```bash
-pytest --durations=25 --durations-min=1
+pytest -m "not live and signals_own_pid"
 ```
+
+Both lanes run on Linux and macOS. Tests that require real Linux procfs or PID namespaces skip on macOS; native macOS identity tests require a macOS host. Synthetic providers exercise parsing and routing across hosts, while native identity and MPS lease tests cover macOS host paths. Together these lanes cover the same cases as plain `pytest`, so qualification needs no duplicate full serial pass. Only tests that signal their own runner require the serial lane within this checkout.
+
+If tests fail under contention, wait for an idle machine and rerun only the failing node IDs serially. Do not rerun the whole suite. Add the duration-report options shown above to either lane to inspect its runtime.
 
 > [!NOTE]
 > A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why both commands above spell out `not live`.
@@ -145,11 +141,11 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 
 ## Package map
 
-- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and the `run --set` path edits (`run_overrides`).
+- `phasesweep.config`: Pydantic Experiment models, strict YAML loading, and shared config `--set` path edits (`run_overrides`).
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence, immutable generation publication, and read-only status.
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
-- `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
+- `phasesweep.tracking`: MLflow run bindings, the `mlflow_launch` trainer-script launcher, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. Keep `runtime/supervisor.py` stdlib-only; see the [launch ordering](invariants.md#9-nothing-runs-before-its-process-identity-is-durable).
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
@@ -157,7 +153,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 - `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train` that the templates and examples run.
 - Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (served to MCP clients).
 
-The configuration reference is written by hand. `tests/test_config_reference.py` expands its shared blocks and compares every key path, variant, type and default with the schema; it does not check the prose, so bounds, units and interactions are only as current as their last review against the code.
+The configuration reference is written by hand. `tests/test_config_reference.py` compares its expanded key paths, variants, types and defaults with the schema. It does not validate prose about bounds, units or interactions.
 
 Its first header block is the title, and the second is the general notes that `phasesweep explain --notes` prints and `explain_config` returns without a key, so keep that block to what someone writing a config acts on. A `# ---------- Title ----------` banner, at any indent, starts a section, and the comment block right after it, ending at a blank line, is the section's rules, which `explain` prints before the section's keys. A column-0 `TitleCase:` line below the Shared blocks banner defines a shared block, described by the comment lines directly above it. A signature that names blocks, such as `JsonExtractor | WandbExtractor (required)`, expands each block's fields below that key, tagged by the block's `type` field, and `<<: Name` merges a block's fields at its indent. The parser rejects an unknown or unused block and a comment block it cannot attach to a key, a section head or a block.
 
@@ -215,17 +211,13 @@ The principal test groups and what each covers:
 
 - `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
 - `tests/test_config.py`, `tests/test_param_validation.py`, and `tests/test_overrides.py`: Experiment validation, composition, parameter domains, and retained input boundaries.
-- `tests/test_run_overrides.py`: `run --set` key syntax, created-key notes, and the derived config's validation.
+- `tests/test_run_overrides.py`: shared `--set` key syntax, created-key notes, derived-config validation and study inspection with overrides.
 - `tests/test_config_reference.py` and `tests/test_explain.py`: the configuration reference against the schema, its parser's shared blocks and section rules, and `phasesweep explain`.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates, supervised trials, and durable input verification.
+- `tests/test_attempt_lifecycle.py` and `tests/test_process_supervision.py`: lifecycle parsing, process identity and launch ordering, descendant cleanup, and guardian completion evidence.
 - `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
 - `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
-- `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`, `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`: continuation, current-format publication, and read-only views.
-- `tests/test_generation_claim.py`: no generation for a refused run or a replay of the published winners, from the CLI, the engine and a detached MCP run.
-- `tests/test_interrupted_trials.py`, `tests/test_draw_positions.py`, and `tests/test_rerun_real_runs.py`: interrupted outcomes and their reruns, draw positions and sampler resume, and real runs stopped by SIGINT, SIGKILL, and deadlines.
-- `tests/test_grid_failure_retry.py` and `tests/test_fixed_configuration_retry.py`: raised-target retries of failed grid cells and fixed configurations, raised-limit recovery of a streak abort, the abort advice, and the grid winner advisories.
-- `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
-- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing.
+- Storage, publication, recovery, interrupted trials and sampler resume: owning code and representative tests are listed by [durability invariant](invariants.md).
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
 - `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and the objective-envelope writer (`report_objective` and `report-objective`).
 
@@ -239,18 +231,20 @@ The principal test groups and what each covers:
 
 These have been requested and declined. Check this list before proposing one again, and reopen an item only with a reason its entry does not already answer.
 
-- **Reading or migrating trees and ledgers written in an older format.** PhaseSweep keeps no compatibility layer. Each persisted-format change bumps the study and artifact-root stamps, so older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
+- **Reading or migrating trees and ledgers written in an older format.** PhaseSweep is still unstable and does not support backward compatibility until it stabilizes. Ledger and artifact format changes bump their record schemas and the respective study or artifact-root stamp; frozen MCP snapshot changes bump the MCP state-format marker. Older data is refused as an unsupported format with a fix line, and the checkout that produced it can still inspect it.
 - **Advice for removed config keys** such as `allow_seed_search`. A removed key fails as an unknown key, like any other; configs that use one stay on the revision that accepted it.
 - **An `await_run` limit above 600 seconds, or a streaming watch tool.** MCP tool calls are request and response, and clients bound how long one may block. An agent repeats `await_run` with the same `run_id`; [MCP](mcp.md) gives the loop.
 - **Importing trials from another experiment or a changed study.** A changed study fingerprint means the recorded trials answered a different question. Derive the new configuration with `run --set` under a new `experiment` name and run it.
 - **An audit-only mode for seed or repeat phases that publishes no winner.** `repeats` already publishes each group's spread with the winner, and a phase that publishes nothing would be a second phase kind for the same need.
 - **A launch queue that chains sweeps.** A scheduler is outside a single-node sweep tool. An agent waits on the blocking run with `await_run` and launches the next one.
-- **Per-item paired bootstrap or a cost tiebreak for near ties.** Both need per-example evaluation data that PhaseSweep never collects. The tie warning reports the gap, the combined SE and each group's params.
+- **Per-item paired bootstrap.** This needs per-example evaluation data that PhaseSweep never collects. The tie warning reports the gap, the combined SE and each group's params; a phase's `cost_key` can advise a cheaper configuration within one standard error from repeat-level objectives without changing selection.
+- **Cost tiebreak for near ties.** Selection ranks the configured objective and keeps its draw-position tiebreak. `cost_key` advises a cheaper configuration within the winning mean's standard error; it does not select a different winner or alter inherited parameters.
+- **Visiting grid configurations in listed order.** A seeded configuration shuffle gives a partial or deadline-truncated search a spread across the space instead of one corner. Each configuration's repeat values stay consecutive in their listed order, so the shuffle does not scatter repeat groups.
 - **A nonzero exit for an accepted incomplete winner or pending MLflow uploads.** Both are configured successes: an incomplete winner is published only under `allow_incomplete_on_timeout`, and its `WINNER` line says `INCOMPLETE`; pending uploads end with a closing line that points to `sync-tracking`.
 - **Shorter trial directory names.** `trials.csv` and `status --trials` are the interfaces for scripts; the directory name carries the generation and attempt IDs that keep attempts apart.
 - **Reporting a name missing from `mlflow_required` as a gate failure rather than an objective read error.** The gate and the objective read one shared capture, and a finished run that lacks a required name fails that capture at once, so the trial fails either way; the error names the missing key and lists the run's keys of that kind.
 - **Restricting `record_env` to `true` and `false`.** It is a plain boolean, and every boolean key accepts the same YAML forms.
 - **Treating a key that overrides a `<<:` merge as a duplicate key.** Keys written in a mapping win over merged ones under standard YAML merge semantics. A key written twice in one mapping, or a second `<<`, is still rejected.
 - **Dropping the experiment-level `trainer_config` check because each phase's composition check repeats it.** The experiment-level check names the `trainer_config` key the override format cannot carry; the phase check only reports that composition failed for that phase.
-- **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and the fast lane leaves it out.
+- **A separate `slow` test marker with a counted budget.** `integration` is the slow tier: a test whose call phase takes at least one second carries it, and fast focused runs leave it out.
 - **One shared failure boundary for the `json_equals`, `json_scalar_bound` and JSON `artifact_size` gates.** Each handler's read-and-report block is four lines and converts a different value. A shared boundary needs a new exception type or a union return, which adds more indirection than the three copies cost.

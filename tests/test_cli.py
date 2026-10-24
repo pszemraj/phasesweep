@@ -36,9 +36,8 @@ from phasesweep.engine.errors import (
     TrialTargetRefusedError,
 )
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_dir,
-    _generation_path,
-    _last_successful_generation_path,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseTrialsFailedError
 from phasesweep.engine.state import Winner
@@ -309,7 +308,7 @@ def test_dry_run_logs_environment_contract(
 def test_validate_and_dry_run_disclose_the_trainer_cwd(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, configured: bool
 ) -> None:
-    """The trainer cwd line says what pins the directory, since it is part of the study identity."""
+    """Validation and dry runs disclose the trainer cwd and resolved artifact root."""
     trainer_dir = tmp_path / "trainer"
     trainer_dir.mkdir()
     execution = ExecutionContext(cwd=str(trainer_dir)) if configured else ExecutionContext()
@@ -328,6 +327,15 @@ def test_validate_and_dry_run_disclose_the_trainer_cwd(
         run_experiment(experiment, dry_run=True)
 
     assert result.exit_code == 0, result.output
+    artifact_root = f"artifact root: {_experiment_dir(experiment)}"
+    assert [line.strip() for line in result.output.splitlines() if "artifact root:" in line] == [
+        artifact_root
+    ]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("DRY RUN artifact root:")
+    ] == [f"DRY RUN {artifact_root}"]
     assert [line.strip() for line in result.output.splitlines() if "trainer cwd:" in line] == [
         expected
     ]
@@ -376,7 +384,7 @@ def test_help_registers_commands_and_options() -> None:
 
     winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
     assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
-    assert "Print published experiment winners." in winners_help
+    assert "including unpublished results from the latest run" in winners_help
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
@@ -880,7 +888,7 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
 
 _REPEATS_BUDGET_WARNING = (
     "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
-    "that fails on every repeat value can abort the phase by itself; under seeded random its "
+    "that fails on every repeat value can abort the phase by itself; under grid and seeded random its "
     "repeats run back to back. Set max_consecutive_failures above 3."
 )
 _REPEATS_BODY = (
@@ -931,7 +939,11 @@ def test_dry_run_warns_when_one_configuration_can_exhaust_the_failure_budget(
     ]
 
 
-def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
+def test_show_winners_renders_comment_before_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """``show-winners`` prints phase comments before results and for phases without a winner."""
 
     def make_cfg(workdir: Path) -> Path:
@@ -960,36 +972,12 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert metric_line in result_with.output
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
 
-    # Without a winner (different workdir → no winner.yaml): comment is still surfaced.
-    result_without = runner.invoke(cli_main, ["show-winners", str(make_cfg(tmp_path / "empty_wd"))])
-    assert result_without.exit_code == 0
-    assert "(no winner yet)" in result_without.output
-    assert comment_line in result_without.output
-
-
-def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
-    """Winner display locates the validated generation even when the current pointer differs."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    experiment, config_path = materialized.experiment, materialized.config_path
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    generation_path = _generation_dir(experiment, generation_id)
-    _generation_path(experiment).write_text("generation_id: interrupted\n")
-
-    published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
-
-    assert published.exit_code == 0
-    assert "trial_number: 0" in published.output
-    assert f"# generation: {generation_path}" in published.output
-    assert (generation_path / "summary.yaml").is_file()
-    assert (generation_path / "phases/p/winner.yaml").is_file()
-
-    _last_successful_generation_path(experiment).unlink()
-    unpublished = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
-
-    assert unpublished.exit_code == 0
-    assert "(no winner yet)" in unpublished.output
-    assert "# generation:" not in unpublished.output
+    # A missing study directory is a path error.
+    assert (
+        invoke_cli_boundary(["show-winners", str(make_cfg(tmp_path / "empty_wd"))], monkeypatch)
+        == 1
+    )
+    assert "No study directory at" in capsys.readouterr().err
 
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
@@ -1302,6 +1290,8 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
     config_path = tmp_path / "experiment.yaml"
     write_experiment_config(config_path, experiment)
 
+    _experiment_dir(experiment).mkdir(parents=True)
+
     result = subprocess.run(
         [sys.executable, "-m", "phasesweep", "status", str(config_path)],
         capture_output=True,
@@ -1454,15 +1444,15 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A healthy publication and a never-published tree both stay exit 0."""
+    """Absent studies fail clearly while a healthy publication remains readable."""
     fresh_config = tmp_path / "fresh.yaml"
     experiment = make_experiment(workdir=tmp_path / "runs")
     write_experiment_config(fresh_config, experiment)
 
-    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 1
     fresh = capsys.readouterr()
-    assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
-    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
+    assert "No study directory at" in fresh.err
+    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 1
     capsys.readouterr()
 
     config_path = materialize("current-journal", tmp_path, mode="tree").config_path
@@ -1489,7 +1479,8 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
     lines = capsys.readouterr().out.splitlines()
     assert generation_id in lines[0] and "winner (*)" in lines[0]
-    assert lines[lines.index(heading) + 1].split() == [
+    assert lines[lines.index(heading) + 1] == f"winner generation: {generation_id} (published)"
+    assert lines[lines.index(heading) + 2].split() == [
         "trial",
         "state",
         "value",
@@ -1497,7 +1488,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
         "duration_s",
         "winner",
     ]
-    rows = lines[lines.index(heading) + 2 :]
+    rows = lines[lines.index(heading) + 3 :]
     assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
     # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
     assert rows[0].endswith("*") and not rows[1].endswith("*")
@@ -1940,7 +1931,7 @@ def test_sync_tracking_without_an_mlflow_block_uses_the_standard_error_format(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A config with nothing to sync is refused as `phasesweep:` plus a fix line, not Click's `Error:`."""
-    config = write_experiment(tmp_path / "exp.yaml")
+    config = materialize("current-journal", tmp_path, mode="tree").config_path
 
     status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 
@@ -1961,10 +1952,9 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
         "phasesweep.tracking.publication.sync_tracking",
         lambda *_args: {"pending": 2, "delivered": 1},
     )
+    config = materialize("current-journal", tmp_path, mode="tree").config_path
 
-    status = invoke_cli_boundary(
-        ["sync-tracking", str(write_experiment(tmp_path / "exp.yaml"))], monkeypatch
-    )
+    status = invoke_cli_boundary(["sync-tracking", str(config)], monkeypatch)
 
     captured = capsys.readouterr()
     assert status == 1

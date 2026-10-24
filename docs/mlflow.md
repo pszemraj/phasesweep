@@ -1,6 +1,6 @@
 # Native MLflow tracking
 
-PhaseSweep reads metrics that your trainer logs natively to MLflow, selects winners locally, and mirrors results to the same MLflow experiment. A sweep uses one tracking backend. W&B-to-MLflow publishing and publishing-only MLflow configuration are unsupported.
+PhaseSweep reads metrics that your trainer logs natively to MLflow, selects winners locally, and mirrors results to the same MLflow experiment. A sweep uses one tracking backend.
 
 ## Run the CPU example locally
 
@@ -15,17 +15,17 @@ mlflow server --host 127.0.0.1 --port 5000 \
   --artifacts-destination /tmp/phasesweep-mlflow-demo/artifacts
 ```
 
-In another terminal, provision the experiment explicitly, then run the example from the repository root:
+In another terminal, save the [complete configuration](../examples/mlflow.yaml) as `mlflow.yaml` in your working directory, then provision the experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
 
 ```bash
 python -c 'from mlflow import MlflowClient; MlflowClient(tracking_uri="http://127.0.0.1:5000").create_experiment("phasesweep-native")'
-phasesweep validate examples/mlflow.yaml
-phasesweep run examples/mlflow.yaml
-phasesweep show-winners examples/mlflow.yaml
-phasesweep status examples/mlflow.yaml
+phasesweep validate mlflow.yaml
+phasesweep run mlflow.yaml
+phasesweep show-winners mlflow.yaml
+phasesweep status mlflow.yaml
 ```
 
-The [complete configuration](../examples/mlflow.yaml) launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
+This configuration launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
 For real training on a GPU, the [Tiny Decoder MLflow smoke guide](../examples/tiny_decoder_enwik8/README.md#native-mlflow-gpu-smoke) provides a complete two-trial, ten-batch configuration using native final-checkpoint metrics, with both run ownership modes supported.
 
@@ -44,13 +44,13 @@ metric:
   extractor: {type: mlflow, metric_key: eval/loss, select: last}
 ```
 
-The experiment must already exist and be active. PhaseSweep never creates it implicitly. Quote a numeric `experiment_id` so YAML keeps it a string. Before a phase with trials left to run allocates any trial, it resolves the experiment, and the first such phase also creates the generation-summary run; if the server, credentials, or experiment are not ready, the run stops there without using any of that phase's trial slots, and a refusal before any trial launched writes no generation. The refusal names the configured experiment name or ID and tracking URI. The first resolution is saved in `<workdir>/<experiment>/tracking/source.json`, and a later run whose experiment resolves to a different ID, as after the experiment was deleted and recreated, is refused. A target lost after a phase starts fails that phase's remaining trials, which count toward its `n_trials`. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`. HTTP credentials belong in the SDK's authentication configuration or environment rather than the URI. The top-level `mlflow` block requires an MLflow objective. Local constraint extractors and local gates can still accompany it, but every remote consumer uses the bound MLflow run.
+The experiment must already exist and be active. Quote a numeric `experiment_id` so YAML keeps it a string. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`; HTTP credentials belong in SDK authentication or the environment rather than the URI. Before a phase allocates its first trial, PhaseSweep resolves the experiment; the first such phase also creates the generation-summary run. A server, credential or experiment failure spends none of that phase's trial slots; when no trial has launched, it writes no generation. The refusal names the target. The resolved ID is saved in `<workdir>/<experiment>/tracking/source.json`; an experiment deleted and recreated under a different ID is refused. Losing the target after a phase starts fails its remaining trials, which count toward `n_trials`.
 
 The MLflow client retries a server that refuses or does not answer. When those retries outlast `timeout_seconds`, the refusal says the target did not answer within `timeout_seconds`; when they end sooner, it says the server refused the connection, including when MLflow wraps the transport failure. Either way, check `tracking_uri` and that the server is running.
 
 `tracking_uri`, `experiment_id`, `experiment_name` and `run_mode` are in the study fingerprint, so changing one needs a new experiment name; `poll_seconds` and `timeout_seconds` are not. `phasesweep validate` and `run --dry-run` check neither authentication nor the experiment. The credentials need write access: PhaseSweep creates runs, logs metrics, params and tags, uploads artifacts and ends runs. An `env` entry for `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID` or `MLFLOW_EXPERIMENT_NAME` must equal the block's own normalized value (lowercase scheme and host, no trailing slash), so the selector the block leaves unset cannot appear, and `env` may not set `MLFLOW_RUN_ID`; config load fails otherwise.
 
-All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation. A phase or whole-run deadline also caps experiment resolution, run creation and evidence capture; result uploads happen after acceptance and, like other publication, can extend past those deadlines. Within that bound the MLflow client retries transient HTTP failures. HTTP(S) run creation uses [identity reconciliation](#choose-run-ownership) after an unconfirmed response. The Databricks SDK keeps its own retries for creation too, so a rare lost response there can leave an extra, unbound run in the experiment. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease. When preparing an attempt's run fails, including by outlasting `timeout_seconds`, the trial fails before its trainer starts and counts toward `max_consecutive_failures`. A phase or run deadline that stops the preparation records the trial as interrupted instead.
+Controller tracking operations run in supervised workers outside GPU leases. Each has a `timeout_seconds` budget; phase/run deadlines also cap experiment resolution, run creation and evidence capture. Result uploads happen after acceptance and can extend past those deadlines. The SDK retries transient HTTP failures within that budget. A failed attempt-run preparation spends a trial and counts toward `max_consecutive_failures`; a phase/run deadline records it as interrupted instead. See [trial execution and evidence](runtime.md#trial-execution-and-evidence) for process cleanup and lease ordering.
 
 ## Choose run ownership
 
@@ -64,7 +64,7 @@ with mlflow.start_run(run_id=os.environ["MLFLOW_RUN_ID"]):
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-PhaseSweep finishes a still-running managed run after confirmed process cleanup: FINISHED after successful trainer exit, FAILED after a failed trial, or KILLED after an [interrupted](runtime.md#interrupted-trials-rerun) one. A rerun of an interrupted trial gets its own managed run. A run that is already terminal keeps its status, and its `phasesweep.outcome` tag records a later trial failure. A FAILED or KILLED run is never converted into accepted evidence. Every creation request first searches the exact generation and attempt identity tags and binds a run it finds, and it creates one only when the search finds none. A creation that may have been sent but was not confirmed is never sent again: a durable pending record keeps it unresolved, across controller restarts, until an identity search finds the run, which the next reconciliation or `sync-tracking` then binds.
+After confirmed cleanup, PhaseSweep finishes a still-running managed run as FINISHED after success, FAILED after a failed trial, or KILLED after an [interruption](runtime.md#interrupted-trials-rerun). Interrupted reruns receive new managed runs. Terminal statuses are preserved; `phasesweep.outcome` records a later trial failure. FAILED and KILLED runs cannot supply accepted evidence.
 
 In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
@@ -81,35 +81,14 @@ The helper verifies the configured experiment and that the run is still RUNNING,
 
 ### Transformers Trainer
 
-For native Transformers logging, set `report_to: [mlflow]` in the trainer's arguments. Keep the managed run active across both training and any subsequent evaluation:
+For native Transformers logging with managed ownership, set `report_to: [mlflow]` in the trainer's arguments and invoke the packaged launcher from `trial_command`:
 
-```python
-import os
-import mlflow
-
-run_id = os.environ.pop("MLFLOW_RUN_ID")
-with mlflow.start_run(run_id=run_id):
-    trainer.train()
-    trainer.evaluate()
+```yaml
+trial_command: "python -m phasesweep.tracking.mlflow_launch /absolute/path/to/run_seq2seq.py --report_to mlflow {overrides}"
+override_format: argparse
 ```
 
-Here `trainer` is your configured Transformers Trainer. Removing `MLFLOW_RUN_ID` before its MLflow callback starts lets the callback use the active run without taking ownership of closing it. Otherwise, the callback can close the run when training ends, and a later evaluation can log to a different run. When wrapping an official example script, keep its entire execution inside this context. For example, save this small launcher next to your experiment configuration:
-
-```python
-import os
-import runpy
-import sys
-
-import mlflow
-
-script = sys.argv[1]
-sys.argv = sys.argv[1:]  # Preserve the example's own argument parsing.
-run_id = os.environ.pop("MLFLOW_RUN_ID")
-with mlflow.start_run(run_id=run_id):
-    runpy.run_path(script, run_name="__main__")
-```
-
-Configure `trial_command` to invoke this launcher with the absolute example path followed by its normal arguments and `{overrides}`; set `override_format: argparse` for command-line Transformers arguments. This launcher is for managed ownership only. It preserves native logging through `report_to: [mlflow]`, and an exception exits the context as a failed run. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
+Pass the absolute trainer script path, its normal arguments, and `{overrides}`. The launcher preserves the script's argument parsing, sibling imports and explicit `PYTHONPATH` entries, including under `python -P` or `PYTHONSAFEPATH`. It uses the script directory instead of Python's ordinary cwd import entry. It removes `MLFLOW_RUN_ID` before the Transformers callback starts and keeps the supplied managed run active across the entire script, including final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. A script error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it. The launcher requires `mlflow.run_mode: managed` and the `phasesweep[mlflow]` extra. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 
@@ -118,6 +97,8 @@ With `load_best_model_at_end=True`, the logged step does not identify the evalua
 ## Select metrics and require evidence
 
 Every MLflow extractor declares its selector explicitly. Selection is independent of `metric.goal`, which ranks the selected scalars across trials.
+
+For a few finalists that need ranking over seeds, use `phases[].repeats` with `key: seed` and the desired seed values. PhaseSweep launches one trial and one tracked run per seed, reads each run's scalar objective, and ranks configurations by their group mean (or the configured `reduce`). A trainer that creates several MLflow runs inside one trial does not supply a repeat group; the reader uses only the bound attempt run. See [repeats](config.md#repeats) for the complete configuration.
 
 | Selector | Selection from native metric history |
 | --- | --- |
@@ -138,23 +119,25 @@ gates:
     tags: [dataset_revision]
 ```
 
-At least one namespace must be nonempty. Missing evidence fails the trial; values from another run or a PhaseSweep result metric cannot substitute for it. A finished run that lacks a required metric, param or tag fails the trial at once, so a misspelled name does not cost the timeout. The failure names what is missing and lists the keys of that kind the run does have, for example `MLflow run finished without metric 'loss'; available metric keys: ['accuracy', 'eval_loss'].` The capture budget includes worker startup, and polling stops `min(5, timeout_seconds / 2)` seconds before it runs out so the timeout error can report the run's last state. PhaseSweep reads only after the trainer process has exited, and the MLflow client sends everything that process logged, including asynchronous batches, before it marks a run FINISHED, so a finished run is not polled for a name it lacks. A run that has not finished is polled every `poll_seconds` until `timeout_seconds` runs out, which fails the trial with `MLflow run was still RUNNING when timeout_seconds ran out.`; a trainer-owned run that was never closed ends this way. Accepted evidence freezes the selected value, step, timestamp, verified native run identity, and required metadata. Local reads and no-work replay require neither an MLflow import nor server access. A no-work replay that [publishes a generation](runtime.md#timeouts-cleanup-and-continuation) creates no tracking generation directories and uploads nothing to MLflow. See [confound verdicts](runtime.md#confound-verdicts) for evaluation-position checks.
+At least one namespace must be nonempty. A finished run missing a required metric, param or tag fails at once, naming the missing and available keys, for example `MLflow run finished without metric 'loss'; available metric keys: ['accuracy', 'eval_loss'].` An unfinished run is polled every `poll_seconds` until timeout, which reports its last state; a trainer-owned run left open fails this way. The capture budget includes worker startup and stops polling `min(5, timeout_seconds / 2)` seconds before expiry to retain that diagnostic. Accepted evidence freezes the selected value, step, timestamp, native run identity and required metadata. Local reads and no-work replay need no SDK or server access; a replay that [publishes a generation](runtime.md#timeouts-cleanup-and-continuation) creates no tracking directories or uploads. See [confound verdicts](runtime.md#confound-verdicts) for evaluation-position checks.
 
 ## Result delivery and recovery
 
 Accepted trials receive reserved `phasesweep.*` metrics, parameters, and tags: objective, measured constraints, report-only `observe` values (`phasesweep.observed.<name>`), feasibility, trainer duration, effective fixed/inherited/sampled overrides, and phase/inheritance references. Trainers should leave this namespace to PhaseSweep. The `phasesweep.*` metrics are logged at step 0. MLflow truncates a parameter value longer than 6000 characters, so the attempt's summary artifact below is the full record of its overrides; with the `mlflow` block set, config load refuses constraint names, observation names and override keys whose published key contains characters outside alphanumerics, underscores, periods, dashes, slashes, colons and spaces, exceeds 250 characters, or is not a normalized relative path. The `phasesweep.override.` prefix bounds an override key to 230 characters. A generation-summary run in the same experiment groups managed attempts and holds `phasesweep/generation.json` plus winner references. Each attempt run holds `phasesweep/attempt-<attempt-id>.json`, and a winning run also holds `phasesweep/winner-<phase>.json`. For a phase with [`repeats`](config.md#repeats), the winning run is the last member of the winning group, and its winner reference records the group's reduced metric, while every member's run keeps its own objective. Trainer-owned attempts retain their own parents.
 
-An upload failure after acceptance warns and leaves a pending delivery record. It does not change the accepted score, complete trial, or committed winner. After result delivery, a `PENDING` closeout names the generation and its remaining upload count and points to `sync-tracking`; the published result is saved locally and the run remains successful. Once a generation is published, no MLflow failure fails the run: winner references that could not be saved or sent wait for `sync-tracking`, and an upload worker that may still be running makes the successful run report unconfirmed cleanup. `phasesweep status` exposes path-free `tracking_delivery` counts across every generation, and MCP status counts the queried run's own uploads; scientific terminal snapshots remain frozen. Retry the saved projections:
+After confirmed cleanup of a failed invocation, PhaseSweep queues a FAILED generation-summary projection for an ordinary failure, or KILLED for shutdown or keyboard interruption. Accepted attempts keep their accepted projections; interrupted attempts are KILLED, and other unaccepted managed attempts receive the invocation's status. A failed delivery can leave native runs RUNNING until retrying.
+
+Result uploads leave pending records on failure without changing accepted scores, trial states or winners. Once published, the local result stays successful even when a winner reference could not be saved or sent, or upload-worker cleanup is uncertain. A `PENDING` closeout names the generation, upload count and retry command. CLI `status` reports `tracking_delivery` counts across generations; MCP status reports its run's uploads separately from its frozen scientific result:
 
 ```bash
-phasesweep sync-tracking examples/mlflow.yaml
+phasesweep sync-tracking mlflow.yaml
 ```
 
-This requires the original target configuration and retries every generation's pending projections; `--generation GENERATION_ID` limits it to one generation, which for an MCP run is its run ID. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. A projection that was never saved, because a local write failed or the controller died, is rebuilt: an attempt's from its settled trial in the Optuna ledger, and a published generation's winner references from its committed artifacts. It takes the experiment lock, so it cannot run during a sweep of that experiment, and it exits nonzero while uploads remain pending, when the scope has no delivery records, or when the config has no `mlflow` block. An upload MLflow rejects, such as a run deleted from MLflow, fails the same way on every retry and stays pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials, and it records a confirmed worker cleanup as a receipt under `tracking/<generation-id>/cleanup-receipts/` before retiring the registry entry; `phasesweep mcp recover-run` accepts that receipt as cleanup evidence for that generation's run, or for a run whose runner reported the worker. A damaged receipt is ignored with a warning, so recovery then refuses for lack of evidence.
+`sync-tracking` retries uploads only, using the original target configuration. `--generation GENERATION_ID` limits retries to one generation, whose ID is the MCP run ID for detached runs. `sync-tracking` holds the experiment lock, skips delivered projections, and exits nonzero while uploads remain pending, when no delivery records exist in scope, or without an `mlflow` block. Permanent remote refusals, such as a deleted run, remain pending.
 
-After confirmed cleanup of a failed invocation, PhaseSweep queues projections for its generation-summary run and for every attempt whose outcome was not yet recorded. The attempt's Optuna trial decides its projection: an accepted trial gets its accepted projection, and any other managed run is finished FAILED for ordinary failure, or KILLED for an interrupted trial or a shutdown or keyboard interruption. Upload failures leave these projections pending for `sync-tracking`; those runs can remain RUNNING until delivery succeeds. This does not change accepted scores or committed winners. A remote terminal status is never overwritten.
+Run creation searches exact generation/attempt identity tags before creating anything. An unconfirmed creation request is not sent again: its pending record survives restarts, and reconciliation or `sync-tracking` binds the run if it appears. HTTP(S) uses this identity reconciliation; Databricks retains its SDK creation retries, so a lost response there can leave an extra unbound run.
 
-Abrupt controller death, uncertain cleanup, or an unresolved generation binding can still leave no terminal projection. These require operator inspection and, where indicated, [MCP recovery](mcp.md#run-state-and-recovery) before further action. `sync-tracking` rebuilds an attempt's projection only from an accepted trial, or from a failed or interrupted trial whose process cleanup is confirmed, and leaves a run whose trial Optuna still records as running, or whose cleanup is still unconfirmed, untouched. Once `recover-run` or the next run's preflight confirms that cleanup in the study's recovery ledger, the next `sync-tracking` delivers the projection; the trial's own record is never rewritten. `sync-tracking` does not manufacture a failed invocation's missing generation-summary record.
+Missing projections are rebuilt from settled trials or committed winner artifacts. An attempt must be accepted or terminal with confirmed cleanup; RUNNING or uncertain-cleanup trials require [MCP recovery](mcp.md#run-state-and-recovery) or the next run's preflight before retrying. A failed invocation's missing generation-summary record is not manufactured. Tracking-worker recovery saves a receipt under `tracking/<generation-id>/cleanup-receipts/` before retiring the registry entry; `recover-run` accepts it for that generation or a runner that reported the worker. An unreadable receipt is ignored, leaving recovery without that cleanup evidence.
 
 ## Databricks status
 

@@ -172,19 +172,41 @@ def _resume(
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
-def test_grid_covers_every_point_once_across_interruptions(n_jobs: int) -> None:
-    """Each interrupted grid point reruns, the grid never stops early, and no point repeats."""
-    sampler = _build_sampler(Sampler(type="grid", seed=3), _GRID_SPACE)
-    control = _study(_build_sampler(Sampler(type="grid", seed=3), _GRID_SPACE))
-    _run(control, _GRID_SPACE, 6)
+@pytest.mark.parametrize(
+    "repeat_key", [None, "seed", "z"], ids=["plain", "repeat-first", "repeat-last"]
+)
+def test_grid_covers_every_point_once_across_interruptions(
+    n_jobs: int, repeat_key: str | None
+) -> None:
+    """Grid configurations stay shuffled, repeats stay consecutive, and interrupted points rerun after reopening."""
+    repeats = None if repeat_key is None else Repeats(key=repeat_key, values=[2, 0, 1])
+    space = dict(_GRID_SPACE)
+    if repeats is not None:
+        space[repeats.key] = CategoricalParam(type="categorical", choices=repeats.values)
+    count = 6 if repeats is None else 18
+    cfg = Sampler(type="grid", seed=3)
+    sampler = _build_sampler(cfg, space, repeats=repeats)
+    control = _study(_build_sampler(cfg, space, repeats=repeats))
+    _run(control, space, count)
+    if repeats is not None:
+        trials = control.get_trials()
+        for start in range(0, count, len(repeats.values)):
+            group = trials[start : start + len(repeats.values)]
+            assert [trial.params[repeats.key] for trial in group] == repeats.values
+            assert len({(trial.params["x"], trial.params["y"]) for trial in group}) == 1
+        configurations = [
+            (trial.params["x"], trial.params["y"]) for trial in trials[:: len(repeats.values)]
+        ]
+        assert configurations != [(x, y) for x in (1, 2, 3) for y in ("a", "b")]
 
     study = _study(sampler)
-    _run(study, _GRID_SPACE, 6, interrupt_at=frozenset({1}))
-    _resume(study, _GRID_SPACE, 6, n_jobs=n_jobs)
+    _run(study, space, count, interrupt_at=frozenset({1}))
+    study = _reopen(study, cfg, space, n_jobs, repeats=repeats)
+    _resume(study, space, count, n_jobs=n_jobs)
 
     assert _finished_draws(study) == _finished_draws(control)
     grid_ids = [t.system_attrs["grid_id"] for t in study.get_trials() if t.state.name == "COMPLETE"]
-    assert sorted(grid_ids) == list(range(6))
+    assert sorted(grid_ids) == list(range(count))
 
 
 def test_a_fixed_configuration_gets_no_grid_and_its_retries_no_grid_attributes() -> None:
@@ -274,7 +296,12 @@ _CMAES = Sampler(type="cmaes", seed=5)
 
 
 def _reopen(
-    study: optuna.Study, cfg: Sampler, space: dict[str, SearchParam], n_jobs: int = 1
+    study: optuna.Study,
+    cfg: Sampler,
+    space: dict[str, SearchParam],
+    n_jobs: int = 1,
+    *,
+    repeats: Repeats | None = None,
 ) -> optuna.Study:
     """Open ``study`` again under a new sampler object, as a new process would.
 
@@ -282,12 +309,13 @@ def _reopen(
     :param Sampler cfg: Sampler config to build the new sampler from.
     :param dict[str, SearchParam] space: The phase's search space.
     :param int n_jobs: Optuna worker threads the sampler is built for.
+    :param Repeats | None repeats: Repeat axis to preserve across the new sampler.
     :return optuna.Study: The same study under a fresh sampler.
     """
     return optuna.load_study(
         study_name=study.study_name,
         storage=study._storage,
-        sampler=_build_sampler(cfg, space, n_jobs),
+        sampler=_build_sampler(cfg, space, n_jobs, repeats=repeats),
     )
 
 

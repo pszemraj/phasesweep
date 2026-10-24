@@ -31,7 +31,7 @@ from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
     _process_group_alive,
-    _terminate_process_group,
+    _terminate_process_groups,
     read_boot_id,
     read_pid_namespace,
     read_proc_starttime,
@@ -76,20 +76,23 @@ _SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 
 
 def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
-    """Terminate the trial process group and confirm cleanup.
+    """Request guardian cancellation and confirm the trial group is gone.
 
-    After group termination, perform a bounded wait to reap the direct child.
-    This runs outside the signal handler; uncertain cleanup must block new work.
+    A known trainer group is terminated by its guardian after durable cancellation intent.
+    Before trainer readiness, only the guardian's own group is terminated directly.
+    A bounded wait then reaps the guardian; uncertain cleanup blocks new work.
 
     :param int pgid: Process-group ID of the trial subprocess.
-    :param subprocess.Popen[bytes] proc: The root subprocess's :class:`subprocess.Popen`
-        handle. Reaped via a bounded ``wait`` once the group is terminated.
-    :return bool: ``True`` if every process in the group is gone after the SIGTERM → SIGKILL
-        escalation AND the direct child was reaped within
+    :param subprocess.Popen[bytes] proc: Guardian subprocess, reaped with a bounded wait.
+    :return bool: ``True`` if every process in the group is gone and the guardian was reaped within
         ``_DIRECT_CHILD_REAP_TIMEOUT_SECONDS``; ``False`` if at least one group member
         survived, cleanup status was inconclusive, or the direct child failed to reap in time.
     """
-    cleanup_confirmed = _terminate_process_group(pgid, grace_seconds=_KILL_GRACE_SECONDS)
+    cleanup_confirmed = _terminate_process_groups(
+        (pgid,),
+        grace_seconds=_KILL_GRACE_SECONDS,
+        guardians=None if pgid == proc.pid else {pgid: proc.pid},
+    )[pgid]
     try:
         proc.wait(timeout=_DIRECT_CHILD_REAP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -259,8 +262,8 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
 
 
 ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
-ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 1
-_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "exited"})
+ATTEMPT_LIFECYCLE_SCHEMA_VERSION = _supervisor.ATTEMPT_LIFECYCLE_SCHEMA_VERSION
+_ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "terminating", "exited"})
 
 
 @dataclass(frozen=True)
@@ -269,12 +272,14 @@ class AttemptLifecycle:
 
     ``allocated`` identifies a durable RUNNING trial before launch, possibly queued
     for a GPU. ``launching`` is recorded before spawning, so a missing identity
-    then requires recovery. ``exited`` confirms group cleanup before Optuna completion.
+    then requires recovery. ``terminating`` preserves cancellation before the guardian
+    signals the trainer. ``exited`` confirms group cleanup before Optuna completion.
     """
 
     state: str
     return_code: int | None
     cleanup_confirmed: bool | None
+    duration_seconds: float | None
 
 
 def write_attempt_lifecycle(
@@ -284,34 +289,29 @@ def write_attempt_lifecycle(
     state: str,
     return_code: int | None = None,
     cleanup_confirmed: bool | None = None,
+    duration_seconds: float | None = None,
 ) -> None:
     """Atomically persist the attempt's coarse lifecycle state.
 
     :param Path trial_dir: Per-trial directory (attempt-scoped, so states from different
         attempts can never collide).
     :param str attempt_id: Immutable attempt identity binding the record.
-    :param str state: One of ``"allocated"``, ``"launching"``, or ``"exited"``.
-    :param int | None return_code: Root return code; only meaningful for ``"exited"``.
-    :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone;
-        only meaningful for ``"exited"``.
+    :param str state: Allocated, launching, terminating, or exited lifecycle state.
+    :param int | None return_code: Root return code or a guardian's nonzero cancellation code.
+    :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone; false while cancellation is in progress.
+    :param float | None duration_seconds: Supervised elapsed time when the group exited.
     :raises ValueError: ``state`` is not a known lifecycle state.
     :raises OSError: The record could not be written.
     """
     if state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state {state!r}.")
-    atomic_write_text(
+    _supervisor.write_lifecycle_record(
         trial_dir / ATTEMPT_LIFECYCLE_FILE,
-        json.dumps(
-            {
-                "schema_version": ATTEMPT_LIFECYCLE_SCHEMA_VERSION,
-                "attempt_id": attempt_id,
-                "state": state,
-                "return_code": return_code,
-                "cleanup_confirmed": cleanup_confirmed,
-            },
-            sort_keys=True,
-        )
-        + "\n",
+        attempt_id=attempt_id,
+        state=state,
+        return_code=return_code,
+        cleanup_confirmed=cleanup_confirmed,
+        duration_seconds=duration_seconds,
     )
 
 
@@ -349,7 +349,7 @@ def read_attempt_lifecycle(
     if payload.get("attempt_id") != expected_attempt_id:
         raise ValueError(f"Attempt lifecycle record at {path} belongs to another attempt.")
     state = payload.get("state")
-    if state not in _ATTEMPT_LIFECYCLE_STATES:
+    if not isinstance(state, str) or state not in _ATTEMPT_LIFECYCLE_STATES:
         raise ValueError(f"Unknown attempt lifecycle state at {path}: {state!r}.")
     return_code = payload.get("return_code")
     if return_code is not None and (isinstance(return_code, bool) or type(return_code) is not int):
@@ -357,10 +357,19 @@ def read_attempt_lifecycle(
     cleanup_confirmed = payload.get("cleanup_confirmed")
     if cleanup_confirmed is not None and not isinstance(cleanup_confirmed, bool):
         raise ValueError(f"Attempt lifecycle field 'cleanup_confirmed' is invalid at {path}.")
+    duration = payload.get("duration_seconds")
+    if duration is not None and (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        raise ValueError(f"Attempt lifecycle field 'duration_seconds' is invalid at {path}.")
     return AttemptLifecycle(
         state=state,
         return_code=return_code,
         cleanup_confirmed=cleanup_confirmed,
+        duration_seconds=duration,
     )
 
 
@@ -372,6 +381,7 @@ def _record_attempt_exited(
 ) -> None:
     """Best-effort persistence of confirmed process cleanup.
 
+    Recorded exit or cancellation status survives repeated cleanup confirmations.
     A write failure preserves the primary error; the retained identity permits recovery.
 
     :param Path trial_dir: Per-trial directory holding the lifecycle record.
@@ -379,14 +389,29 @@ def _record_attempt_exited(
     :param int | None return_code: Root process return code observed by the supervisor wait.
     """
     try:
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+        if (
+            lifecycle is not None
+            and lifecycle.state == "exited"
+            and lifecycle.cleanup_confirmed
+            and lifecycle.duration_seconds is not None
+        ):
+            return
         write_attempt_lifecycle(
             trial_dir,
             attempt_id=attempt_id,
             state="exited",
-            return_code=return_code,
+            return_code=(
+                lifecycle.return_code
+                if lifecycle is not None
+                and lifecycle.state in {"terminating", "exited"}
+                and lifecycle.return_code is not None
+                else return_code
+            ),
             cleanup_confirmed=True,
+            duration_seconds=None if lifecycle is None else lifecycle.duration_seconds,
         )
-    except OSError:
+    except (OSError, ValueError):
         log.warning(
             "Could not persist the 'exited' lifecycle transition for attempt %s; "
             "recovery will fall back to verifying the retained process identity.",
@@ -514,6 +539,7 @@ def _spawn_blocked_supervisor(
     stderr: IO[str],
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
+    lifecycle_args: tuple[str, str, str] | tuple[()] = (),
 ) -> tuple[subprocess.Popen[bytes], int, int, int]:
     """Spawn and register a supervisor whose trainer waits for a launch payload.
 
@@ -525,6 +551,7 @@ def _spawn_blocked_supervisor(
     :param float | None deadline: Absolute ``time.monotonic()`` launch deadline, or ``None``.
     :param Collection[int] gpu_lease_fds: Host GPU-lock descriptors inherited only by the
         guardian, keeping leases held after an orchestrator exit until cleanup finishes.
+    :param tuple[str, str, str] | tuple[()] lifecycle_args: Optional attempt directory, identity, and monotonic start.
     :raises _LaunchDeadlineExpired: Readiness exceeded the launch deadline; the group was
         aborted and the exception carries cleanup confirmation.
     :raises RuntimeError: Supervisor readiness timed out or returned an invalid ready frame
@@ -550,6 +577,7 @@ def _spawn_blocked_supervisor(
                 _SUPERVISOR_SCRIPT_PATH,
                 str(ready_write),
                 str(ack_read),
+                *lifecycle_args,
             ],
             env=_sanitized_supervisor_env(),
             stdout=stdout,
@@ -703,6 +731,7 @@ def run_supervised(
                 stderr=stderr,
                 deadline=deadline,
                 gpu_lease_fds=gpu_lease_fds,
+                lifecycle_args=(str(trial_dir), attempt_id, str(started)),
             )
             identity = _trial_process_identity(
                 attempt_id=attempt_id,

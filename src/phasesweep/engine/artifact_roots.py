@@ -60,14 +60,11 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     return experiment.resolved_storage is not None
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 11
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 14
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:
-    """Return an opaque comparison key, or an explicit in-memory identity.
-
-    The artifact tree stores only the identity digest. Private recovery state
-    retains the operational URL, including any target selectors and credentials.
+    """Hash the canonical local ledger identity, or return None for in-memory storage.
 
     :param Experiment experiment: Experiment whose persistent ledger is identified.
     :return str | None: Full SHA-256 hex digest of the canonical persistent

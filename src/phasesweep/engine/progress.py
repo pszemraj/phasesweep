@@ -72,7 +72,7 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
     The state is the one :func:`~phasesweep.engine.optuna._trial_count_state` reports, which
     fixes the trial's recorded outcome: ``COMPLETE`` is a success, ``INFEASIBLE`` and
     ``FAIL`` are failures, and ``INTERRUPTED`` is an interruption. Repeat values and rerun
-    sources are included; params remain on the phase's WINNER line.
+    sources and configuration parameters are included.
 
     :param Phase phase: The phase the trial belongs to.
     :param optuna.trial.FrozenTrial trial: The just-finished trial.
@@ -85,16 +85,18 @@ def _log_finished_trial(phase: Phase, trial: optuna.trial.FrozenTrial, finished:
     repeat = ""
     if axis is not None and axis.key in trial.params:
         repeat = f" repeat={axis.key}={trial.params[axis.key]}"
+    params = {key: value for key, value in trial.params.items() if axis is None or key != axis.key}
     source = trial.user_attrs.get(RERUN_OF_ATTR)
     rerun = "" if source is None else f" rerun_of={source}"
     reason = _first_cause_line(trial)
     log.info(
-        "phase=%s TRIAL trial=%d state=%s value=%s duration=%s%s%s (%d/%d finished)%s",
+        "phase=%s TRIAL trial=%d state=%s value=%s duration=%s params=%s%s%s (%d/%d finished)%s",
         phase.name,
         trial.number,
         _trial_count_state(trial),
         value,
         duration,
+        params,
         repeat,
         rerun,
         finished,

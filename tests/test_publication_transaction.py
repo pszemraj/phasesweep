@@ -62,9 +62,12 @@ from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
+    fail_pointer_commit,
+    lose_record_writes,
     make_experiment,
     patch_directory_fsync_failure,
     patch_path_method_failure,
@@ -191,19 +194,6 @@ def _fail_precommit_validation(monkeypatch: pytest.MonkeyPatch, experiment: Expe
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
 
-def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
-    """Make writing the last-success pointer raise ``OSError``."""
-    pointer_path = _last_successful_generation_path(experiment)
-    original_write = artifact_io._write_yaml_atomic
-
-    def flaky_write(path: Path, payload: object) -> None:
-        if path == pointer_path:
-            raise OSError("simulated pointer commit failure")
-        return original_write(path, payload)
-
-    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize(
     ("inject_failure", "error_type", "error_match"),
@@ -216,7 +206,7 @@ def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment
         ),
         # A failure writing the last-success pointer itself is the same failure shape as validation.
         pytest.param(
-            _fail_pointer_commit,
+            fail_pointer_commit,
             OSError,
             "simulated pointer commit failure",
             id="pointer-commit",
@@ -356,7 +346,7 @@ def test_postcommit_write_failure_leaves_run_successful(
     record_write = fault == "atomic_create_text"
 
     if record_write:
-        _lose_record_writes(monkeypatch)
+        lose_record_writes(monkeypatch)
     else:
         original = generation_ops._write_generation_state
 
@@ -399,6 +389,7 @@ def test_postcommit_write_failure_leaves_run_successful(
 def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A directory-fsync failure after the pointer rename cannot fail the publication.
 
@@ -408,16 +399,41 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     ``publication_failed``.
     """
     experiment = _stored_experiment(tmp_path)
+    pointer = _last_successful_generation_path(experiment)
+    original_fsync_directory = runtime_files.fsync_directory
+    committed_pointers: list[bytes] = []
 
-    patch_directory_fsync_failure(monkeypatch, "simulated directory fsync failure")
+    def fail_pointer_directory_fsync(path: Path) -> None:
+        """Fail the directory flush only after the publication pointer has committed."""
+        if path == pointer.parent and pointer.is_file() and not committed_pointers:
+            committed_pointers.append(pointer.read_bytes())
+            with monkeypatch.context() as fault:
+                patch_directory_fsync_failure(fault, "simulated directory fsync failure")
+                original_fsync_directory(path)
+        else:
+            original_fsync_directory(path)
 
-    winners = run_experiment(experiment)
+    with monkeypatch.context() as publication_patch:
+        publication_patch.setattr(runtime_files, "fsync_directory", fail_pointer_directory_fsync)
+        winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
+    assert committed_pointers == [pointer.read_bytes()]
+    assert any(
+        record.name == "phasesweep.runtime.files"
+        and "Directory fsync failed after an atomic write" in record.message
+        for record in caplog.records
+    )
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     assert _record_state(experiment, generation_id) == "published"
     assert _current_pointer_state(experiment) == "published"
+    assert run_experiment(experiment)["p"].metric == winners["p"].metric
+    assert published_generation_id(experiment) == generation_id
+    status, (published,) = read_result(experiment)
+    assert status["publication_integrity"] == "ok"
+    assert published is not None and published.metric == winners["p"].metric
+    assert committed_pointers == [pointer.read_bytes()]
 
 
 @pytest.mark.integration
@@ -433,14 +449,7 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     """
     experiment = _stored_experiment(tmp_path)
 
-    original = generation_ops.atomic_create_text
-
-    def interrupt_record_write(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml":
-            raise KeyboardInterrupt
-        return original(path, text)
-
-    monkeypatch.setattr(generation_ops, "atomic_create_text", interrupt_record_write)
+    lose_record_writes(monkeypatch, KeyboardInterrupt())
 
     winners = run_experiment(experiment)
 
@@ -613,18 +622,6 @@ def test_successful_publication_never_logs_a_record_refusal(
 # --------------------------------------------------------------------------
 
 
-def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
-    """Make writing an immutable record raise ``OSError``, for one record path or every one."""
-    original = generation_ops.atomic_create_text
-
-    def flaky(path: Path, text: str) -> bool:
-        if path.name == "generation.yaml" and (only is None or path == only):
-            raise OSError("simulated record write failure")
-        return original(path, text)
-
-    monkeypatch.setattr(generation_ops, "atomic_create_text", flaky)
-
-
 def _publish_without_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Experiment, str]:
@@ -636,7 +633,7 @@ def _publish_without_record(
     """
     experiment = _stored_experiment(tmp_path)
     with monkeypatch.context() as crash:
-        _lose_record_writes(crash)
+        lose_record_writes(crash)
         run_experiment(experiment)
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
@@ -699,7 +696,7 @@ def test_replacing_the_pointer_never_rewrites_an_existing_record(
     "inject_failure",
     [
         pytest.param(_fail_precommit_validation, id="precommit-validation"),
-        pytest.param(_fail_pointer_commit, id="pointer-commit"),
+        pytest.param(fail_pointer_commit, id="pointer-commit"),
     ],
 )
 def test_failed_publication_is_never_recorded_as_published(
@@ -740,7 +737,7 @@ def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer
     topped_up = _topped_up(experiment)
 
     with monkeypatch.context() as failing:
-        _lose_record_writes(failing, only=first_record)
+        lose_record_writes(failing, only=first_record)
         with pytest.raises(OSError, match="simulated record write failure"):
             run_experiment(topped_up, terminal_callback=lambda r: captured.append(r.generation_id))
 
@@ -994,7 +991,8 @@ def test_published_reads_consume_the_bytes_validation_read(
     write_experiment_config(config_path, experiment)
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
-    assert validated_bytes.decode("utf-8") in result.output
+    rendered = yaml.safe_load(result.output.split("=== p ===\n", 1)[1])
+    assert rendered["metric"][experiment.metric.name] == validated_metric
 
 
 # --------------------------------------------------------------------------

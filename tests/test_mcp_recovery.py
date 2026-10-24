@@ -385,6 +385,11 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     run_id = "srv-operator-recover"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
 
+    before = app.status(run_id=run_id)
+    assert before["run"]["failure"]["code"] == "cleanup_uncertain"
+    assert "runner exited without writing a final status" in before["run"]["failure"]["remediation"]
+    assert "phasesweep mcp recover-run" in before["run"]["failure"]["remediation"]
+
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
@@ -413,6 +418,11 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     unavailable = app.status(run_id=run_id)
     assert unavailable["result_source"] == "terminal_snapshot_unavailable"
     assert unavailable["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert (
+        "runner exited without writing a final status"
+        in unavailable["run"]["failure"]["remediation"]
+    )
+    assert "settled process cleanup" in unavailable["run"]["failure"]["remediation"]
     assert unavailable["phases"][0]["trial_data_available"] is False
 
     captured = patch_popen_capture(monkeypatch)
@@ -556,9 +566,10 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "Report that this run's historical results are unavailable and ask "
-            "the operator to inspect the PhaseSweep run or server diagnostics; "
-            "do not substitute mutable experiment-level results."
+            "The runner ended with an earlier host boot. No process from that boot "
+            "remains, so process cleanup and recover-run are not required. This "
+            "run's historical results are unavailable; do not substitute mutable "
+            "experiment-level results."
         ),
     }
     for payload in (status, awaited):
@@ -1210,7 +1221,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
+        lambda _identity, **_kwargs: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
     entry_path = _attempts_dir(experiment) / f"{attempt_id}.json"
@@ -1410,7 +1421,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
 
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
-    def fake_trial_cleanup(identity: StaleProcessIdentity) -> bool:
+    def fake_trial_cleanup(identity: StaleProcessIdentity, **_kwargs: object) -> bool:
+        """Record the durable identity selected for trial cleanup.
+
+        :param StaleProcessIdentity identity: Trial group selected for cleanup.
+        :param object _kwargs: Optional cleanup callbacks supplied by recovery.
+        :return bool: Confirmed cleanup for the staged identity.
+        """
         trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
@@ -1667,7 +1684,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     reconciled_attempts: dict[str, _AttemptRecord] = {}
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
+        lambda _identity, **_kwargs: True,
     )
     assert (
         _reap_stale_trials(
@@ -1734,7 +1751,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
         mark_cleanup_uncertain=True,
         snapshot_bound_to_generation=False,
         kill_stale_group_stub=lambda *args, **kwargs: True,
-        cleanup_trial_stub=lambda _identity: True,
+        cleanup_trial_stub=lambda _identity, **_kwargs: True,
         monkeypatch=monkeypatch,
     )
 

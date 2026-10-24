@@ -19,10 +19,22 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import optuna
+
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
 from phasesweep.engine.progress import _warn_once
-from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
+from phasesweep.engine.state import (
+    DURATION_ATTR,
+    FEASIBLE_ATTR,
+    GATES_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
+    OVERRIDES_ATTR,
+    RETURN_CODE_ATTR,
+    TRAINER_INPUT_SCHEMA_VERSION,
+    constraint_attr,
+    observed_attr,
+)
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -107,6 +119,39 @@ class TrialResult:
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
     observed: dict[str, float] = field(default_factory=dict)
+
+
+def record_trial_result(trial: optuna.Trial, result: TrialResult, *, overrides_json: str) -> None:
+    """Persist extracted evidence before committing a trial's terminal outcome.
+
+    :param optuna.Trial trial: Active trial receiving extracted evidence.
+    :param TrialResult result: Canonical extraction result.
+    :param str overrides_json: Fully composed trainer overrides serialized as JSON.
+    """
+    trial.set_user_attr(FEASIBLE_ATTR, result.feasible)
+    trial.set_user_attr(RETURN_CODE_ATTR, result.return_code)
+    trial.set_user_attr(DURATION_ATTR, result.duration_seconds)
+    trial.set_user_attr(OVERRIDES_ATTR, overrides_json)
+    if result.objective_provenance is not None:
+        trial.set_user_attr(
+            OBJECTIVE_PROVENANCE_ATTR, json.dumps(result.objective_provenance, sort_keys=True)
+        )
+    if result.gate_results is not None:
+        trial.set_user_attr(
+            GATES_ATTR,
+            json.dumps(
+                [
+                    {"type": gate.gate_type, "passed": gate.passed, "detail": gate.detail}
+                    for gate in result.gate_results
+                ],
+                sort_keys=True,
+            ),
+        )
+    if result.failure_reason is None:
+        for name, value in result.constraints.items():
+            trial.set_user_attr(constraint_attr(name), value)
+        for name, value in result.observed.items():
+            trial.set_user_attr(observed_attr(name), value)
 
 
 # How far back from the end of ``stderr.log`` a failed trial's reason reads.
@@ -448,7 +493,7 @@ def prepare_trainer_input(
 ) -> PreparedTrainerInput:
     """Atomically write and identify the exact input one trainer will consume.
 
-    One serialized byte string is used for the atomic write, environment
+    One serialized byte string is used for the atomic write, trainer-input
     digest, and durable trial record. Argparse and hydra consume the flat
     ``overrides_resolved.json``, which holds the base trainer config merged
     with the overrides; YAML and JSON modes consume their generated file and

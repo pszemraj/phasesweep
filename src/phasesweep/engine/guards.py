@@ -107,12 +107,6 @@ def _preflight_existing_studies(
     """
     experiment = ledger.experiment
     report = cleanup_report or _PreflightCleanupReport()
-    # Discovery, root checks, and claims already happened in ONE strict pass
-    # (claim_ledger), and its study objects are the ones every later step
-    # operates on: an invocation offering a second publication root must not
-    # reap, inspect, or claim anything in either tree, and a storage read that
-    # fails must abort rather than let a second, luckier read hand recovery a
-    # study whose root was never checked.
     loaded = ledger.studies
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []

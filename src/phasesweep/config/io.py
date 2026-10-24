@@ -139,6 +139,20 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     return data
 
 
+def format_validation_error(exc: ValidationError) -> str:
+    """Render validation locations and messages without inputs or library help URLs.
+
+    :param ValidationError exc: Model validation failure.
+    :return str: One concise line per invalid field or model-level condition.
+    """
+    lines: list[str] = []
+    for error in exc.errors(include_input=False, include_url=False):
+        location = ".".join(str(part) for part in error["loc"])
+        message = error["msg"].removeprefix("Value error, ")
+        lines.append(f"{location}: {message}" if location else message)
+    return "\n".join(lines)
+
+
 def describe_validation_error(exc: ValidationError) -> str:
     """Append up to three configuration-reference hints to a validation error.
 
@@ -146,7 +160,7 @@ def describe_validation_error(exc: ValidationError) -> str:
     in error order, and are shell-quoted. Undocumented locations add no hint.
 
     :param ValidationError exc: Validation failure of an :class:`Experiment`.
-    :return str: ``str(exc)`` plus up to three hint lines.
+    :return str: Concise validation messages plus up to three hint lines.
     """
     paths: list[str] = []
     for error in exc.errors(include_input=False):
@@ -154,7 +168,7 @@ def describe_validation_error(exc: ValidationError) -> str:
         if path is not None and path not in paths:
             paths.append(path)
     hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
-    return "\n".join([str(exc), *hints])
+    return "\n".join([format_validation_error(exc), *hints])
 
 
 def load_experiment_bytes(
