@@ -97,7 +97,7 @@ def _assert_repeat_summary(saved: bytes, output: str) -> None:
         f"# trial_number {full['trial_number']} names the group's last member."
     ) in output.splitlines()
     assert (
-        "# Choose a checkpoint explicitly from repeats.members in the full record."
+        "# Choose a checkpoint explicitly from repeats.members below; each member includes its trial_dir."
     ) in output.splitlines()
 
 

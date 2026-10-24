@@ -360,7 +360,8 @@ def sampler_warnings(phase: Phase) -> list[str]:
         warnings.append(
             f"Phase {phase.name!r}: max_consecutive_failures={phase.max_consecutive_failures} "
             f"<= {count} repeats.values, so one configuration that fails on every repeat value "
-            "can abort the phase by itself; under seeded random its repeats run back to back. "
+            "can abort the phase by itself; under grid and seeded random its repeats run back to "
+            "back. "
             f"Set max_consecutive_failures above {count}."
         )
     return warnings

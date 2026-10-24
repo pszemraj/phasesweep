@@ -416,17 +416,26 @@ def reference_notes() -> tuple[str, ...]:
     return _parse_notes(_reference_text())
 
 
-def _reference_text() -> str:
-    """Read the reference with documentation links pinned to the installed source.
+def pin_documentation_links(text: str) -> str:
+    """Pin project documentation links to the installed release or source revision.
 
-    :return str: Reference text with release-tag or setuptools-scm revision URLs.
+    :param str text: Packaged text containing project documentation URLs.
+    :return str: Text with release-tag or setuptools-scm revision URLs.
     """
     revision = re.search(r"\+g([0-9a-f]+)(?:\.|$)", __version__)
     ref = revision[1] if revision else f"v{__version__}"
     return _DOC_URL.sub(
         f"https://github.com/pszemraj/phasesweep/blob/{ref}/",
-        _reference_resource().read_text(encoding="utf-8"),
+        text,
     )
+
+
+def _reference_text() -> str:
+    """Read the reference with documentation links pinned to the installed source.
+
+    :return str: Reference text with release-tag or setuptools-scm revision URLs.
+    """
+    return pin_documentation_links(_reference_resource().read_text(encoding="utf-8"))
 
 
 @functools.cache

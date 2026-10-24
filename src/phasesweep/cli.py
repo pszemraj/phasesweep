@@ -27,6 +27,7 @@ from phasesweep.config.reference import (
     ReferenceEntry,
     first_sentence,
     lookup_or_suggest,
+    pin_documentation_links,
     plain_path,
     reference_notes,
     rules_for,
@@ -36,15 +37,15 @@ from phasesweep.config.reference import (
 from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
-from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import (
     _experiment_dir,
-    _generation_config_snapshot_path,
     _generation_dir,
     _generation_winner_path,
     _trial_dir_for,
 )
+from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
@@ -164,7 +165,15 @@ def main() -> None:
         status = cli.main(standalone_mode=False, obj=operation)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
-        if isinstance(exc, click.NoSuchOption) and exc.option_name == "--workdir":
+        if (
+            isinstance(exc, click.NoSuchOption)
+            and exc.option_name == "--workdir"
+            and exc.ctx is not None
+            and any(
+                isinstance(param, click.Option) and "--set" in param.opts
+                for param in exc.ctx.command.params
+            )
+        ):
             exc = click.UsageError(
                 f"{exc.message} Use --set workdir=PATH; relative paths resolve against the config file's directory.",
                 ctx=exc.ctx,
@@ -235,12 +244,12 @@ def _template_names() -> list[str]:
 
 
 def _template_text(name: str) -> str:
-    """Read one packaged template exactly as shipped.
+    """Read one packaged template with links pinned to the installed source.
 
     :param str name: Template name from ``_template_names``.
     :return str: The template's YAML text.
     """
-    return (
+    return pin_documentation_links(
         resources.files("phasesweep")
         .joinpath("templates", f"{name}.yaml")
         .read_text(encoding="utf-8")
@@ -703,6 +712,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
     experiment = _command_config(config_path, settings=settings)
@@ -715,7 +725,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     is_published = publication.validated is not None and generation_id == publication.generation_id
     validated = publication.validated if is_published else None
     producing = (
-        _load_cli_config(_generation_config_snapshot_path(experiment, generation_id))
+        _load_generation_experiment(experiment, generation_id)
         if generation_id is not None and not is_published
         else experiment
     )
@@ -745,25 +755,23 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
         )
     if validated is not None:
         phase_plan = [(phase.name, phase.comment) for phase in validated.phase_plan]
-        stored_fingerprint = validated.summary.get("config_fingerprint")
-        if isinstance(
-            stored_fingerprint, str
-        ) and stored_fingerprint != _experiment_semantic_fingerprint(experiment):
-            published_prefix = experiment.model_copy(
-                update={"phases": experiment.phases[: len(validated.phase_plan)]}
+        config_matches = _recorded_config_matches(
+            experiment,
+            validated.summary.get("config_fingerprint"),
+            phase_count=len(validated.phase_plan),
+        )
+        if config_matches is True and len(experiment.phases) > len(validated.phase_plan):
+            click.echo("# Published phase results; appended phases have not run yet.")
+            phase_plan.extend(
+                (phase.name, phase.comment)
+                for phase in experiment.phases[len(validated.phase_plan) :]
             )
-            if stored_fingerprint == _experiment_semantic_fingerprint(published_prefix):
-                click.echo("# Published phase results; appended phases have not run yet.")
-                phase_plan.extend(
-                    (phase.name, phase.comment)
-                    for phase in experiment.phases[len(validated.phase_plan) :]
-                )
-            else:
-                click.echo(
-                    "# Historical experiment result: published generation "
-                    f"{validated.generation_id} does not match the current config."
-                )
-                click.echo("# Rendering the saved phase plan and annotations.")
+        elif config_matches is False:
+            click.echo(
+                "# Historical experiment result: published generation "
+                f"{validated.generation_id} does not match the current config."
+            )
+            click.echo("# Rendering the saved phase plan and annotations.")
         revision = validated.code_revision
         if revision is None:
             click.echo("# code revision: unknown (not a git work tree or git unavailable)")
@@ -813,7 +821,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 click.echo(f"# metric is the {repeats['reduce']} over {repeats['n']} repeats.")
                 click.echo(f"# trial_number {winner.trial_number} names the group's last member.")
                 click.echo(
-                    "# Choose a checkpoint explicitly from repeats.members in the full record."
+                    "# Choose a checkpoint explicitly from repeats.members below; each member includes its trial_dir."
                 )
             if winner.generation_id is not None:
                 click.echo(

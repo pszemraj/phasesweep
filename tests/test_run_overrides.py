@@ -13,11 +13,12 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.paths import (
+    _generation_config_snapshot_path,
     _generation_dir,
     _generation_path,
     _last_successful_generation_path,
 )
-from phasesweep.engine.read import experiment_status
+from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
 from tests.conftest import (
@@ -146,17 +147,35 @@ def test_study_reads_name_the_missing_directory(
         experiment_status(cli_module._load_cli_config(path))
 
 
+@pytest.mark.parametrize(
+    ("command", "supports_override"),
+    [
+        (("run",), True),
+        (("validate",), True),
+        (("status",), True),
+        (("show-winners",), True),
+        (("sync-tracking",), True),
+        (("init",), False),
+        (("explain",), False),
+        (("mcp", "serve"), False),
+        (("mcp", "init-catalog"), False),
+        ((), False),
+    ],
+)
 def test_removed_workdir_option_points_to_config_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    command: tuple[str, ...],
+    supports_override: bool,
 ) -> None:
-    """A stale option identifies the supported spelling and its path anchor."""
+    """Only commands accepting configuration overrides suggest the replacement spelling."""
     path = write_experiment(tmp_path / "sweep.yaml")
-    assert invoke_cli_boundary(["run", str(path), "--workdir", "runs"], monkeypatch) == 2
+    arguments = [*command, *([str(path)] if supports_override else []), "--workdir", "runs"]
+    assert invoke_cli_boundary(arguments, monkeypatch) == 2
     message = capsys.readouterr().err
-    assert "--set workdir=PATH" in message
-    assert "config file's directory" in message
+    assert ("--set workdir=PATH" in message) is supports_override
+    assert ("config file's directory" in message) is supports_override
 
 
 @pytest.mark.integration
@@ -275,15 +294,77 @@ def test_show_winners_distinguishes_appended_phases_from_historical_results(tmp_
     assert "appended phases have not run yet" in result.output
     assert "Historical experiment result" not in result.output
     assert "=== next === (no winner yet)" in result.output
+    producing = cli_module._load_cli_config(path)
+    result_status, (winner,) = read_result(producing)
+    assert result_status["published_config_matches_current"] is True
+    assert winner.config_matches_current is True
     _last_successful_generation_path(materialized.experiment).unlink()
     status = CliRunner().invoke(cli, ["status", str(path)])
     assert status.exit_code == 0, status.output
     payload = yaml.safe_load(status.output)
     assert payload["is_published"] is False
+    assert payload["phases"][0]["winner_config_matches_current"] is True
     assert payload["phases"][0]["winner"].endswith("/phases/p/winner.yaml")
     table = CliRunner().invoke(cli, ["status", str(path), "--trials"])
     assert table.exit_code == 0, table.output
     assert "marks unpublished generation" in table.output
+
+
+def test_unpublished_winner_discloses_semantic_config_drift(tmp_path: Path) -> None:
+    """An unpublished saved winner reports drift in both CLI labels and status facts."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    _last_successful_generation_path(materialized.experiment).unlink()
+    path = materialized.config_path
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["metric"]["name"] = "changed_metric"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["show-winners", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "# Historical experiment result: unpublished generation" in result.output
+    assert "does not match the current config" in result.output
+    assert "objective: 0.5" in result.output
+    inspected = CliRunner().invoke(cli, ["status", str(path)])
+    assert inspected.exit_code == 0, inspected.output
+    status = yaml.safe_load(inspected.output)
+    assert status["phases"][0]["winner_config_matches_current"] is False
+    comparison = cli_module._load_cli_config(path)
+    result_status, (winner,) = read_result(
+        comparison, generation_id=status["represented_generation_id"]
+    )
+    assert result_status["published_config_matches_current"] is False
+    assert winner.config_matches_current is False
+
+
+@pytest.mark.parametrize("damage", ["missing", "yaml", "model"])
+@pytest.mark.parametrize("command", ["status", "show-winners"])
+def test_unpublished_snapshot_damage_uses_the_artifact_error_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    damage: str,
+) -> None:
+    """Missing or invalid producing snapshots yield one routed restore-tree refusal."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    generation_id = published_generation_id(materialized.experiment)
+    assert generation_id is not None
+    _last_successful_generation_path(materialized.experiment).unlink()
+    snapshot = _generation_config_snapshot_path(materialized.experiment, generation_id)
+    if damage == "missing":
+        snapshot.unlink()
+    else:
+        snapshot.write_text(
+            "broken: [" if damage == "yaml" else "experiment: invalid\n", encoding="utf-8"
+        )
+
+    assert invoke_cli_boundary([command, str(materialized.config_path)], monkeypatch) == 1
+    message = capsys.readouterr().err
+    assert "Cannot read configuration snapshot for generation" in message
+    assert generation_id in message and str(snapshot) in message
+    assert message.count("fix:") == 1
+    assert "restore the files and permissions identified in the error" in message
+    assert "Traceback" not in message
 
 
 @pytest.mark.parametrize(

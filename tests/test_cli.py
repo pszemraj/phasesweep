@@ -308,7 +308,7 @@ def test_dry_run_logs_environment_contract(
 def test_validate_and_dry_run_disclose_the_trainer_cwd(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, configured: bool
 ) -> None:
-    """The trainer cwd line says what pins the directory, since it is part of the study identity."""
+    """Validation and dry runs disclose the trainer cwd and resolved artifact root."""
     trainer_dir = tmp_path / "trainer"
     trainer_dir.mkdir()
     execution = ExecutionContext(cwd=str(trainer_dir)) if configured else ExecutionContext()
@@ -327,6 +327,15 @@ def test_validate_and_dry_run_disclose_the_trainer_cwd(
         run_experiment(experiment, dry_run=True)
 
     assert result.exit_code == 0, result.output
+    artifact_root = f"artifact root: {_experiment_dir(experiment)}"
+    assert [line.strip() for line in result.output.splitlines() if "artifact root:" in line] == [
+        artifact_root
+    ]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("DRY RUN artifact root:")
+    ] == [f"DRY RUN {artifact_root}"]
     assert [line.strip() for line in result.output.splitlines() if "trainer cwd:" in line] == [
         expected
     ]
@@ -879,7 +888,7 @@ def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
 
 _REPEATS_BUDGET_WARNING = (
     "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
-    "that fails on every repeat value can abort the phase by itself; under seeded random its "
+    "that fails on every repeat value can abort the phase by itself; under grid and seeded random its "
     "repeats run back to back. Set max_consecutive_failures above 3."
 )
 _REPEATS_BODY = (
