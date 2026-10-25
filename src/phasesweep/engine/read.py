@@ -35,12 +35,15 @@ from phasesweep.engine.fingerprints import (
 )
 from phasesweep.engine.ledger import (
     log_storage_read_failure,
+    read_phase_studies,
     read_phase_trials,
     read_trial_stats,
     resolved_ledger_path,
     validate_ledger,
 )
+from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.optuna import (
+    _finished_trial_count,
     _PhaseTrialStats,
     _published_phase_trial_refs,
     _published_trial_history_available,
@@ -72,6 +75,8 @@ from phasesweep.engine.repeats import (
 from phasesweep.engine.selection import (
     TieGroupComparison,
     _cost_advisory,
+    _eligible,
+    _no_feasible_remedy,
     _rank_groups,
     tie_group_comparisons,
 )
@@ -90,7 +95,8 @@ from phasesweep.engine.state import (
     _trial_interrupted,
     _validate_observed_block,
 )
-from phasesweep.errors import OperatorAction
+from phasesweep.engine.study_policy import _load_phase_policy_state, _recovery_advice
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
@@ -1039,6 +1045,39 @@ def _cli_phase_payloads(
             }
         )
     return cli_phases
+
+
+def unpublished_winner_step(experiment: Experiment) -> str | None:
+    """Give one publication remedy from recorded failures, suppressing it during live work.
+
+    :param Experiment experiment: Current config used to inspect durable phase policy.
+    :return str | None: The recorded failure's remedy or a resume instruction; none while busy.
+    """
+    if experiment_is_busy(experiment):
+        return None
+    ledger = validate_ledger(experiment)
+    studies = read_phase_studies(ledger)
+    for phase in experiment.phases:
+        study = studies[phase.name]
+        if study is None:
+            continue
+        abort = _load_phase_policy_state(study).abort
+        if abort is not None:
+            cause = str(abort["cause"]).rstrip(".")
+            advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
+            return f"Phase {phase.name!r}: {cause}. fix: {advice}"
+        trials = study.get_trials(deepcopy=False)
+        if _finished_trial_count(trials) < phase.n_trials:
+            continue
+        axis = repeat_axis(phase)
+        eligible = (
+            any(_eligible(trial, experiment) for trial in trials)
+            if axis is None
+            else bool(_rank_groups(trials, experiment, axis).groups)
+        )
+        if not eligible:
+            return f"Phase {phase.name!r} has no feasible winner. fix: {_no_feasible_remedy(experiment, trials, phase.name)}"
+    return "Rerun the same config to resume and publish; completed trials are kept."
 
 
 def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:

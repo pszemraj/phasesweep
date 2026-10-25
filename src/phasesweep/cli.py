@@ -57,10 +57,10 @@ from phasesweep.engine.read import (
     experiment_status,
     read_trial_tables,
     require_study,
+    unpublished_winner_step,
 )
 from phasesweep.engine.run import run_experiment
 from phasesweep.errors import (
-    UNPUBLISHED_WINNER_STEP,
     OperatorAction,
     PhaseSweepError,
     operator_step,
@@ -1099,17 +1099,15 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         return
     payload = experiment_status(config)
     phases = payload.get("phases")
-    if isinstance(phases, list):
-        for phase in phases:
-            if (
-                isinstance(phase, dict)
-                and phase.get("winner") is not None
-                and phase.get("winner_is_published") is False
-            ):
-                click.echo(
-                    f"# {phase['name']}: winner retained but not published; "
-                    f"{UNPUBLISHED_WINNER_STEP}"
-                )
+    if isinstance(phases, list) and any(
+        isinstance(phase, dict)
+        and phase.get("winner") is not None
+        and phase.get("winner_is_published") is False
+        for phase in phases
+    ):
+        step = unpublished_winner_step(config)
+        if step is not None:
+            click.echo(f"# Winner retained but not published; {step}")
     click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),

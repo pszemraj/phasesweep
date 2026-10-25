@@ -505,10 +505,6 @@ class GetRunStatusResult(_ToolPayload):
 
     experiment_id: ExperimentId
     catalog_status: CatalogStatusPayload
-    continuation: str | None = Field(
-        default=None,
-        description="Safe next step for a retained unpublished winner; the run's failure remedy takes precedence.",
-    )
     result_source: ResultSource = Field(
         description=(
             "Result source: mutable shared study, immutable terminal snapshot, or unavailable "
@@ -685,10 +681,6 @@ class GetRunResultsResult(_ToolPayload):
 
     experiment_id: ExperimentId
     catalog_status: CatalogStatusPayload
-    continuation: str | None = Field(
-        default=None,
-        description="Safe next step for a retained unpublished winner; the run's failure remedy takes precedence.",
-    )
     run_id: RunId
     result_source: ResultSource = Field(
         description=(

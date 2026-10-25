@@ -12,7 +12,9 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_config_snapshot_path,
@@ -23,6 +25,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import experiment_status, read_result
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
+from phasesweep.errors import operator_step
 from phasesweep.runtime.files import file_sha256
 from tests.conftest import (
     invoke_cli_boundary,
@@ -465,11 +468,49 @@ def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
     status = CliRunner().invoke(cli, ["status", str(config_path)])
     assert status.exit_code == 0, status.output
     assert (
-        "winner retained but not published; If a PhaseSweep operation is still active"
+        "Winner retained but not published; Rerun the same config to resume and publish"
         in status.output
     )
-    assert "follow the failing phase's reported remedy before rerunning" in status.output
+    assert status.output.count("Winner retained but not published") == 1
     assert yaml.safe_load(status.output)["phases"][0]["winner_is_published"] is False
+    with _experiment_lock(experiment):
+        live = CliRunner().invoke(cli, ["status", str(config_path)])
+        assert live.exit_code == 0, live.output
+        assert "Winner retained but not published" not in live.output
+
+
+@pytest.mark.parametrize("streak_abort", [False, True], ids=["no-feasible", "streak-abort"])
+def test_unpublished_status_prints_the_recorded_failure_remedy_once(
+    tmp_path: Path, streak_abort: bool
+) -> None:
+    """Several retained winners share the failing phase's actual remedy in status."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import os, sys\nprint('x=0.5')\nsys.exit(os.environ['PHASESWEEP_PHASE'] == 'c')",
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[
+            Phase(
+                name=name,
+                n_trials=2 if name == "c" else 1,
+                max_consecutive_failures=1 if streak_abort else 10,
+                gpu_policy="none",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+            for name in ("a", "b", "c")
+        ],
+    )
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        run_experiment(experiment)
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert shown.output.count("Winner retained but not published") == 1
+    assert operator_step(refused.value) in shown.output
+    assert "phases[c].n_trials" in shown.output
 
 
 def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:

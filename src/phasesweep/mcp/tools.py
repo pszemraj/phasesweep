@@ -48,7 +48,6 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
-from phasesweep.errors import UNPUBLISHED_WINNER_STEP
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
     CatalogError,
@@ -317,18 +316,6 @@ class _CatalogReloadRefusal:
 
     reason: CatalogReloadRefusal
     detail: str
-
-
-def _unpublished_winner_step(status: EngineStatus, failure: JsonObject | None) -> str | None:
-    """Describe safe continuation for a retained winner outside a publication.
-
-    :param EngineStatus status: Live or frozen result facts already read for this response.
-    :param JsonObject | None failure: Validated run failure, whose remedy takes precedence.
-    :return str | None: Concrete failure remedy or shared conditional advice; None without an unpublished winner.
-    """
-    if status["is_published"] or not any(phase["winner_present"] for phase in status["phases"]):
-        return None
-    return str(failure["remediation"]) if failure is not None else UNPUBLISHED_WINNER_STEP
 
 
 class PhaseSweepMCP:
@@ -1064,7 +1051,6 @@ class PhaseSweepMCP:
             elapsed_seconds=elapsed_seconds,
         )
         result["catalog_status"] = self._catalog_status()
-        result["continuation"] = _unpublished_winner_step(status, run["failure"])
         return result
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
@@ -1135,7 +1121,6 @@ class PhaseSweepMCP:
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
         )
-        result["continuation"] = _unpublished_winner_step(status, result["failure"])
         result["catalog_status"] = self._catalog_status()
         return result
 

@@ -34,7 +34,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.errors import UNPUBLISHED_WINNER_STEP
 from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
 from phasesweep.mcp.errors import (
     McpToolError,
@@ -1117,10 +1116,10 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
 
 @pytest.mark.parametrize("failed", [False, True], ids=["live", "aborted"])
 @pytest.mark.integration
-def test_unpublished_winner_continuation_is_safe_for_live_and_failed_runs(
+def test_unpublished_winner_reads_keep_failure_without_duplicate_guidance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: bool
 ) -> None:
-    """Run reads wait on live work and preserve a failed phase's concrete publication remedy."""
+    """Run reads expose state and failure without a redundant continuation field."""
     app, registry, store, handle, terminal = _published_run_terminal(tmp_path)
     _remove_the_publication_pointer(registry.get("srv").experiment, handle.run_id)
     snapshot = RunResultSnapshot.model_validate(terminal["result_snapshot"])
@@ -1145,9 +1144,15 @@ def test_unpublished_winner_continuation_is_safe_for_live_and_failed_runs(
     )
     if not failed:
         monkeypatch.setattr(store, "runner_may_be_alive", lambda *_args, **_kwargs: True)
-    expected = failure["remediation"] if failed else UNPUBLISHED_WINNER_STEP
 
     for tool in ("get_run_status", "get_run_results"):
         result = call_mcp_tool(app, tool, {"run_id": handle.run_id})
         assert not result.isError, result
-        assert result.structuredContent["continuation"] == expected
+        assert "continuation" not in result.structuredContent
+        payload = result.structuredContent
+        recorded = payload["run"]["failure"] if tool == "get_run_status" else payload["failure"]
+        if failed:
+            assert recorded["code"] == failure["code"]
+            assert recorded["remediation"] == failure["remediation"]
+        else:
+            assert recorded is None

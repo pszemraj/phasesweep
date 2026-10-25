@@ -98,13 +98,6 @@ NEW_STUDY_STEP = (
 )
 
 
-UNPUBLISHED_WINNER_STEP = (
-    "If a PhaseSweep operation is still active, wait for it to finish. If the run failed, "
-    "follow the failing phase's reported remedy before rerunning the same config to "
-    "resume publication."
-)
-
-
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
