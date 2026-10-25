@@ -517,6 +517,57 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
     assert "raise phases[c].n_trials" not in authorized.output
 
 
+def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -> None:
+    """An in-memory failure's status describes the full restart its rerun performs."""
+    launches = tmp_path / "launches"
+    repaired = tmp_path / "repaired"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os, sys
+        from pathlib import Path
+        phase = os.environ['PHASESWEEP_PHASE']
+        with Path({str(launches)!r}).open('a') as handle:
+            handle.write(phase + '\\n')
+        if phase == 'b' and not Path({str(repaired)!r}).exists():
+            sys.exit(3)
+        print('x=0.5')
+        """,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        phases=[
+            Phase(
+                name=name,
+                n_trials=2 if name == "a" else 3,
+                max_consecutive_failures=2,
+                gpu_policy="none",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+            for name in ("a", "b")
+        ],
+    )
+    assert experiment.resolved_storage is None
+    config = write_experiment_config(tmp_path / "memory.yaml", experiment)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    shown = CliRunner().invoke(cli, ["status", str(config)])
+    assert shown.exit_code == 0, shown.output
+    assert (
+        "start the run again; storage: null keeps no completed trials between runs" in shown.output
+    )
+    assert "resume and publish" not in shown.output
+    assert "completed trials are kept" not in shown.output
+    assert launches.read_text().splitlines() == ["a", "a", "b", "b"]
+
+    repaired.touch()
+    run_experiment(experiment)
+    assert launches.read_text().splitlines() == ["a", "a", "b", "b", "a", "a", "b", "b", "b"]
+
+
 def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:
     """Config edits cannot relabel an unfinished generation's objective, phases or base."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
