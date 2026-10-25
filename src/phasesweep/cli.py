@@ -919,12 +919,11 @@ def _param_text(value: JsonValue) -> str:
     return str(value)
 
 
-def _trial_cell(column: str, value: JsonValue) -> str:
+def _trial_cell(value: JsonValue) -> str:
     """Format one trial-table cell for the terminal.
 
     All floats use the shared display precision; a missing value prints as ``-``.
 
-    :param str column: Column header the cell sits under.
     :param JsonValue value: The row's value for that column.
     :return str: Terminal text for the cell.
     """
@@ -963,7 +962,7 @@ def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str
     :param Sequence[JsonObject] rows: Rows to display, with every named column present.
     :return list[str]: The header line followed by one line per row, without trailing spaces.
     """
-    cells = [[_trial_cell(column, row[column]) for column in columns] for row in rows]
+    cells = [[_trial_cell(row[column]) for column in columns] for row in rows]
     widths = [
         max(len(column), *(len(row[index]) for row in cells))
         for index, column in enumerate(columns)
