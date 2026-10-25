@@ -309,6 +309,16 @@ def experiment_disclosures(
             phase,
             [
                 (False, sampler_capability_line(phase, experiment.resolved_storage)),
+                *(
+                    [
+                        (
+                            False,
+                            "grid order: configurations are shuffled by sampler.seed, not listed choice order; repeat values stay consecutive in their listed order.",
+                        )
+                    ]
+                    if phase.sampler.type == "grid" and phase_draws(phase)
+                    else []
+                ),
                 *((True, line) for line in sampler_warnings(phase)),
                 *((True, line) for line in search_space_warnings(phase)),
             ],
@@ -1362,7 +1372,8 @@ class Experiment(_Frozen):
             raise ValueError(
                 f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
                 "the data and dependency revisions used by this experiment; each generation "
-                "records the trainer's git commit on its own."
+                "records the trainer's git commit on its own. For example: "
+                "provenance: {data_revision: DATA_REVISION, dependencies: DEPENDENCY_REVISION}."
             )
         return self
 

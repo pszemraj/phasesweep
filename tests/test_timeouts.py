@@ -94,6 +94,13 @@ def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_p
         run_experiment(exp)
 
     assert "Run wallclock deadline" not in str(refused.value)
+    from phasesweep.errors import operator_step
+
+    assert isinstance(refused.value, PhaseSweepError)
+    assert "Raise timeout_seconds_per_phase" in operator_step(refused.value)
+    assert "resume the phase" in operator_step(refused.value)
+    run_log = tmp_path / "runs" / "phase_zero_timeout" / "run.log"
+    assert "fix: Raise timeout_seconds_per_phase" in run_log.read_text()
 
 
 def test_runtime_rejects_unexplained_trial_budget_shortfall(

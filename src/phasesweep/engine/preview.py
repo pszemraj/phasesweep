@@ -15,7 +15,7 @@ import optuna
 
 import phasesweep.engine.resume as resume_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import _placeholder_values_for, sampler_search_space
+from phasesweep.config.search import _placeholder_values_for, grid_cardinality, sampler_search_space
 from phasesweep.engine.artifact_roots import _check_published_phase_studies
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
@@ -182,6 +182,31 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
         )
         return {phase.name: None for phase in experiment.phases}
     return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
+
+
+def validate_grid_targets(experiment: Experiment) -> None:
+    """Check oversized persistent grid targets against their recorded failed cells.
+
+    :param Experiment experiment: Config whose grid targets may retry recorded failures.
+    :raises TrialTargetRefusedError: A grid requests more attempts than available cells allow.
+    :raises StudyStorageUnavailableError: The ledger cannot be read to justify a raised target.
+    """
+    phases = [
+        phase
+        for phase in experiment.phases
+        if phase.sampler.type == "grid" and phase.n_trials > grid_cardinality(phase)
+    ]
+    if not phases:
+        return
+    studies = read_phase_studies(validate_ledger(experiment))
+    for phase in phases:
+        study = studies[phase.name]
+        trials = [] if study is None else study.get_trials(deepcopy=False)
+        _validate_fixed_configuration_target(
+            phase,
+            finished=_finished_trial_count(trials),
+            measured=_measured_trial_count(trials),
+        )
 
 
 def _refuse_as_a_launch_would(

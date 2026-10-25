@@ -57,6 +57,18 @@ log = logging.getLogger("phasesweep.engine.selection")
 _MAX_LISTED_CELLS = 10
 
 
+def _no_feasible_remedy() -> str:
+    """Name the trial evidence and the identity change required by different bounds.
+
+    :return str: Operator steps for a phase with no eligible winner.
+    """
+    return (
+        "Inspect the phase's trials.csv and trial_* trainer logs for failed or infeasible "
+        "trials. To change metric.min, metric.max or constraints, set a new experiment "
+        "name and rerun: these bounds are part of the study identity."
+    )
+
+
 @dataclass
 class SelectedTrial:
     """The best feasible trial from a completed phase.
@@ -206,13 +218,15 @@ def select_winner(
             f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
             "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
             "why each failed or infeasible trial finished that way."
-            + _metric_bounds_note(trials, experiment)
+            + _metric_bounds_note(trials, experiment),
+            remediation=_no_feasible_remedy(),
         )
     if not survivors:
         raise _no_feasible_error_type(trials)(
             "No completed trials in phase. The phase's trials.csv records why each "
             "failed or infeasible trial finished that way; trainer output is in its "
-            "trial_* directory." + _metric_bounds_note(trials, experiment)
+            "trial_* directory." + _metric_bounds_note(trials, experiment),
+            remediation=_no_feasible_remedy(),
         )
 
     winning: RankedGroup | None = None

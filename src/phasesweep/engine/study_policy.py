@@ -450,7 +450,8 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} finished "
             f"trial(s), but the current config requests {phase.n_trials}. Set "
-            f"phases[{phase.name}].n_trials to at least {accepted_target} in the config."
+            f"phases[{phase.name}].n_trials to at least {accepted_target} in the config.",
+            remediation=f"Set phases[{phase.name}].n_trials to at least {accepted_target} and rerun.",
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
@@ -481,7 +482,7 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     if refusal is None:
         refusal = grid_target_refusal(phase, finished=finished, measured=measured)
     if refusal is not None:
-        raise TrialTargetRefusedError(refusal)
+        raise TrialTargetRefusedError(refusal, remediation=refusal)
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
@@ -786,7 +787,9 @@ def _retry_remedy(
 
 _FRESH_START = (
     "The recorded trial results stay in the study; if a defect you have since fixed "
-    "produced them, set a new `experiment` name in the config to start fresh."
+    "produced them, set a new `experiment` name in the config to start fresh. "
+    "Changing metric.min, metric.max, constraints, or the search space changes the study "
+    "identity and requires a new `experiment` name."
 )
 
 

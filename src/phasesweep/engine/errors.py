@@ -122,6 +122,29 @@ class ExperimentLockBusyError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
 
 
+class PhaseTimeoutError(PhaseSweepError, TimeoutError):
+    """A phase or whole-run wallclock budget stopped resumable work."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+def phase_timeout(message: str, *, scope: str | None) -> PhaseTimeoutError:
+    """Attach the budget edit that resumes the timed-out phase.
+
+    :param str message: Diagnostic describing where the deadline stopped work.
+    :param str | None scope: ``run`` for the run guard, otherwise the phase guard.
+    :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
+    """
+    key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
+    return PhaseTimeoutError(
+        message,
+        remediation=(
+            f"Raise {key} in the config and rerun with the same config and --set "
+            "overrides to resume the phase; completed trials are kept."
+        ),
+    )
+
+
 class TrialTargetRefusedError(PhaseSweepError):
     """Raised when a phase target contradicts its durable study state.
 

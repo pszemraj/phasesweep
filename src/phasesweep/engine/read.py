@@ -409,6 +409,10 @@ def require_study(experiment: Experiment) -> None:
             f"No study directory at {_experiment_dir(experiment)} contains a started study. "
             "Use the same config and --set overrides as run.",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Use the same config and --set overrides as the run that created the study. "
+                "If no run has started, run `phasesweep run CONFIG` first."
+            ),
         )
 
 

@@ -572,6 +572,10 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     # Grid shuffles with a fixed seed when none is set, so it reproduces unseeded.
     assert "phase 'depth': sampler=grid (resumable, reproducible)" in result.output
+    assert (
+        "grid order: configurations are shuffled by sampler.seed, not listed choice order"
+        in result.output
+    )
     assert "phase 'lr': sampler=tpe seed=0 (resumable, reproducible)" in result.output
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
     # Under several workers a model sampler's draws depend on which trials have finished.
@@ -1452,6 +1456,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 1
     fresh = capsys.readouterr()
     assert "No study directory at" in fresh.err
+    assert "fix: Use the same config and --set overrides" in fresh.err
     assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 1
     capsys.readouterr()
 

@@ -45,6 +45,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _trial_dir_for,
 )
+from phasesweep.engine.preview import validate_grid_targets
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import (
     raise_for_unusable_publication,
@@ -552,8 +553,11 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     :param Path config_path: Experiment YAML whose relative paths anchor to its directory.
     :param tuple[str, ...] settings: Config overrides applied before validation.
     :raises ConfigError: The derived configuration cannot be loaded or validated.
+    :raises TrialTargetRefusedError: A grid target exceeds its recorded retry ceiling.
+    :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised grid target.
     """
     config = _command_config(config_path, settings=settings)
+    validate_grid_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")

@@ -111,7 +111,11 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
                     f"experiment backend or output namespace for "
                     f"{experiment.experiment!r} (lock file: {path}). phasesweep "
                     f"supports one active orchestrator per experiment output "
-                    f"namespace and per persistent storage identity."
+                    f"namespace and per persistent storage identity.",
+                    remediation=(
+                        "Wait for the active sweep using this experiment output or storage "
+                        "namespace to finish, or cancel it before retrying the same command."
+                    ),
                 )
             handles.append(handle)
         yield

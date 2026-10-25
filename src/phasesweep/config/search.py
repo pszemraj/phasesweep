@@ -536,7 +536,9 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | 
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
         f"attempts: {finished} finished attempts and {measured} COMPLETE or INFEASIBLE cells "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
-        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated."
+        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated. "
+        f"Set phases[{phase.name}].n_trials to at most {maximum}, or use a new experiment "
+        "name to run a changed search space or bounds."
     )
 
 

@@ -19,6 +19,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
+from phasesweep.engine.preview import validate_grid_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -33,6 +34,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     phase_trials,
+    write_experiment_config,
     write_flaky_trainer,
     write_trainer,
 )
@@ -74,6 +76,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert len(calls.read_text().splitlines()) == 2
 
     raised = _grid(tmp_path, trainer, 3, repeats=repeats)
+    validate_grid_targets(raised)
     if repeats:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(raised)
@@ -464,7 +467,9 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
 
 _FRESH_START = (
     "The recorded trial results stay in the study; if a defect you have since fixed "
-    "produced them, set a new `experiment` name in the config to start fresh."
+    "produced them, set a new `experiment` name in the config to start fresh. "
+    "Changing metric.min, metric.max, constraints, or the search space changes the study "
+    "identity and requires a new `experiment` name."
 )
 
 
@@ -730,3 +735,19 @@ def test_in_memory_grid_abort_gets_no_recovery_advice(tmp_path: Path) -> None:
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(make_experiment(trainer=trainer, phases=[phase]))
     assert str(aborted.value).endswith("for stderr logs.")
+
+
+def test_validate_refuses_an_oversized_fresh_persistent_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Validation applies the launch ceiling before a fresh grid can spend any trials."""
+    experiment = _grid(tmp_path, tmp_path / "trainer.py", 3)
+    path = tmp_path / "grid.yaml"
+    write_experiment_config(path, experiment)
+    assert invoke_cli_boundary(["validate", str(path)], monkeypatch) == 1
+    error = capsys.readouterr().err
+    assert "fix:" in error
+    assert "Set phases[p].n_trials to at most 2" in error
+    assert "correct the experiment configuration" not in error

@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
+    PhaseTimeoutError,
     PublishedStudyMissingError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -175,6 +176,7 @@ def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, o
 
 # First matching exception type determines the durable failure code.
 _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
+    (PhaseTimeoutError, "timeout"),
     (ProcessCleanupUncertainError, "cleanup_uncertain"),
     (ExperimentLockBusyError, "experiment_busy"),
     (ArtifactRootConflictError, "artifact_root_conflict"),

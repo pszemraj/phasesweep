@@ -26,9 +26,11 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
+    PhaseTimeoutError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     WinnerIntegrityError,
+    phase_timeout,
 )
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
@@ -490,17 +492,18 @@ def _resume_phase(
     )
 
 
-def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> TimeoutError:
+def _no_feasible_before_deadline(phase_name: str, timeout_scope: str) -> PhaseTimeoutError:
     """Describe a deadline that prevented the phase from producing a feasible winner.
 
     :param str phase_name: Phase whose winner cannot be selected.
     :param str timeout_scope: Deadline responsible for exhausting feasible work.
-    :return TimeoutError: Refusal shared by live completion and recorded-result replay.
+    :return PhaseTimeoutError: Refusal shared by live completion and recorded-result replay.
     """
-    return TimeoutError(
+    return phase_timeout(
         f"Phase {phase_name!r} hit its {timeout_scope} deadline "
         "before any trial completed inside the metric bounds and constraints; no winner can "
-        "be selected."
+        "be selected.",
+        scope=timeout_scope,
     )
 
 
@@ -643,11 +646,13 @@ def _phase_budget(phase: Phase, run_deadline: float | None) -> _PhaseBudget:
         )
     if optimize_timeout is not None and optimize_timeout <= 0.0:
         if timeout_source == "run":
-            raise TimeoutError(
-                f"Run wallclock deadline reached before phase {phase.name!r} could launch."
+            raise phase_timeout(
+                f"Run wallclock deadline reached before phase {phase.name!r} could launch.",
+                scope="run",
             )
-        raise TimeoutError(
-            f"Phase {phase.name!r} sets timeout_seconds_per_phase to 0, so it could not launch."
+        raise phase_timeout(
+            f"Phase {phase.name!r} sets timeout_seconds_per_phase to 0, so it could not launch.",
+            scope="phase",
         )
     optimize_deadline = None if optimize_timeout is None else time.monotonic() + optimize_timeout
     return _PhaseBudget(optimize_timeout, optimize_deadline, timeout_source)
@@ -1395,12 +1400,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         # Consume the abort before timeout handling so a larger timeout can resume refused work.
         _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
-        raise TimeoutError(
+        raise phase_timeout(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
             f"after {finished_after}/{phase.n_trials} finished trials "
             f"({completed_after} completed). "
             "Refusing to select a winner from an incomplete phase; set "
-            "allow_incomplete_on_timeout: true only when a partial decision is intentional."
+            "allow_incomplete_on_timeout: true only when a partial decision is intentional.",
+            scope=run.timeout_source,
         )
     try:
         return _select_phase_winner(

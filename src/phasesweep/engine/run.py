@@ -28,7 +28,11 @@ from phasesweep.config.models import (
     _metric_semantics_payload,
     experiment_disclosures,
 )
-from phasesweep.engine.errors import IncompleteJournalRecordError, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    IncompleteJournalRecordError,
+    StudyStorageUnavailableError,
+    phase_timeout,
+)
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
@@ -613,8 +617,9 @@ def _run_experiment_inner(
             and run_deadline is not None
             and time.monotonic() >= run_deadline
         ):
-            raise TimeoutError(
-                f"Run wallclock deadline reached before phase {phase.name!r} could start."
+            raise phase_timeout(
+                f"Run wallclock deadline reached before phase {phase.name!r} could start.",
+                scope="run",
             )
         if (
             using_preloaded_winner
