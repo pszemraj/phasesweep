@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import posixpath
 import re
-import shlex
 import string
 import sys
 from collections.abc import Iterator, Mapping
@@ -52,7 +51,6 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
     LocalExtractor,
-    MlflowExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -201,83 +199,7 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "ledger, and rotating one refuses a resume. Credentials belong in "
             "execution.passthrough_env, which is inherited without being recorded or compared."
         )
-    if isinstance(experiment.metric.extractor, WandbExtractor | MlflowExtractor):
-        reload_sources = _best_model_reload_sources(experiment)
-        if reload_sources:
-            warnings.append(
-                f"load_best_model_at_end=True (set in {', '.join(reload_sources)}): scored "
-                "best-checkpoint weights may differ from the terminal training step reported "
-                "in remote history. The evaluation_point check compares logged progress and "
-                "does not verify checkpoint identity. Use json_envelope to report policy, "
-                "checkpoint and the evaluated step; report total training progress in "
-                "evaluation.progress and select it with evaluation_axis."
-            )
     return warnings
-
-
-_BEST_MODEL_RELOAD_FLAG = "load_best_model_at_end"
-_TRUTHY_WORDS = frozenset({"true", "1", "yes"})
-
-
-def _best_model_reload_sources(experiment: Experiment) -> list[str]:
-    """Name each place that explicitly enables ``load_best_model_at_end``.
-
-    :param Experiment experiment: Loaded experiment.
-    :return list[str]: ``trainer_config``, ``fixed_overrides`` and ``trial_command``, in
-        that order, for each that enables it; empty when none does.
-    """
-
-    def enabled(settings: Mapping[str, JsonValue]) -> bool:
-        """Return whether a flat dotted mapping sets the flag to ``True``.
-
-        :param Mapping[str, JsonValue] settings: Flat dotted keys and their values.
-        :return bool: Whether any key ending in the flag name holds ``True``.
-        """
-        return any(
-            key.rsplit(".", 1)[-1] == _BEST_MODEL_RELOAD_FLAG and value is True
-            for key, value in settings.items()
-        )
-
-    sources: list[str] = []
-    if enabled(flatten_trainer_config(experiment.trainer_config)):
-        sources.append("trainer_config")
-    if any(enabled(phase.fixed_overrides) for phase in experiment.phases):
-        sources.append("fixed_overrides")
-    if _command_enables_flag(experiment.trial_command, _BEST_MODEL_RELOAD_FLAG):
-        sources.append("trial_command")
-    return sources
-
-
-def _command_enables_flag(command: str, name: str) -> bool:
-    """Whether a trial command switches the boolean option ``name`` on.
-
-    Matches argparse's bare ``--name``, ``--name true`` and ``--name=true``, and Hydra's
-    ``[+|++|~]dotted.path.name=true``. A bare flag counts when nothing, another option or a
-    ``{placeholder}`` follows it, since a placeholder renders to options rather than a value;
-    a falsy value or any other word after it leaves the option off.
-
-    :param str command: The ``trial_command`` template, split like a shell would.
-    :param str name: The option's final dotted name, for example ``load_best_model_at_end``.
-    :return bool: True when a token explicitly enables the option.
-    """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    for index, token in enumerate(tokens):
-        key, equals, value = token.partition("=")
-        if equals:
-            if key.lstrip("-+~").rsplit(".", 1)[-1] == name and value.lower() in _TRUTHY_WORDS:
-                return True
-        elif token == f"--{name}":
-            following = tokens[index + 1] if index + 1 < len(tokens) else None
-            if (
-                following is None
-                or following.startswith(("-", "{"))
-                or following.lower() in _TRUTHY_WORDS
-            ):
-                return True
-    return False
 
 
 def experiment_disclosures(

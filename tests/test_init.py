@@ -444,9 +444,8 @@ def test_init_losing_publish_race_preserves_other_writer(
 
 
 def test_init_mlflow_names_its_setup_and_demo_replacements(tmp_path: Path) -> None:
-    """MLflow setup appears before run commands and identifies demo-only evidence requirements."""
+    """MLflow setup precedes launch commands and identifies demo-only evidence requirements."""
     result = CliRunner().invoke(cli_main, ["init", "--template", "mlflow", "-o", str(tmp_path)])
-
     assert result.exit_code == 0, result.output
     assert "start an MLflow tracking server" in result.output
     assert "create the experiment" in result.output
@@ -455,12 +454,13 @@ def test_init_mlflow_names_its_setup_and_demo_replacements(tmp_path: Path) -> No
     assert "remove or replace the demo constraints and gates" in result.output
     config = (tmp_path / "mlflow.yaml").read_text(encoding="utf-8")
     assert "Remove or replace the demo cost constraint and mlflow_required gates" in config
+    assert "first mlflow.start_run() or mlflow.log_* resumes MLFLOW_RUN_ID" in config
+    assert "mlflow.active_run().info.run_id" in config
 
 
 def test_init_help_identifies_mlflow_prerequisites() -> None:
-    """MLflow is not advertised as a serverless local toy-trainer run."""
+    """MLflow help names its server and experiment prerequisites."""
     result = CliRunner().invoke(cli_main, ["init", "--help"])
-
     assert result.exit_code == 0
     text = " ".join(result.output.split())
     assert "mlflow needs a tracking server and an existing experiment" in text

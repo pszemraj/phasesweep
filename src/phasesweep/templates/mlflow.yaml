@@ -12,7 +12,9 @@ execution:
   cwd: .
 # Replace the command, trainer_config and metric key for your own trainer.
 # Remove or replace the demo cost constraint and mlflow_required gates below.
-# For Transformers, explain mlflow.run_mode gives the managed launcher command.
+# Managed MLflow: the first mlflow.start_run() or mlflow.log_* resumes MLFLOW_RUN_ID; log everything into that one run.
+# To close and reopen it, save mlflow.active_run().info.run_id and resume by that ID; MLflow consumes the environment ID.
+# Do not call mlflow.set_experiment() with another name. phasesweep explain mlflow.run_mode gives the contract.
 trial_command: "phasesweep-mlflow-train --config {config_path}"
 trainer_config:
   model: {depth: 1}

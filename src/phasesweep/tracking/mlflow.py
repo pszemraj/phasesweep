@@ -629,6 +629,19 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                 tags=[key for gate in gates for key in gate.tags],
             )
             if lacking is not None:
+                if (
+                    binding["run_mode"] == "managed"
+                    and MlflowExtractor.model_validate(query["objective"]).metric_key
+                    not in run.data.metrics
+                ):
+                    lacking += (
+                        "\nThe trainer's logging probably went to a different MLflow run. Check:"
+                        "\n- The run was ended and logging continued, or a second start_run() "
+                        "was opened; keep logging in the supplied run or save and resume its ID."
+                        "\n- A logger creates its own run; pass MLFLOW_RUN_ID to that logger."
+                        "\n- The objective was never logged under the configured metric key; "
+                        "log that exact key."
+                    )
                 raise ValueError(lacking)
             observations: dict[str, Observation] = {}
             for key in keys:
@@ -673,10 +686,10 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
 
 
 def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
-    """Upload a retained projection and finish a still-running owned run.
+    """Upload a retained projection and apply its managed run's terminal outcome.
 
-    Terminal runs retain their status. Projection-specific artifact names keep
-    winner uploads distinct from trial summaries.
+    The retained outcome takes precedence over the status left by the trainer.
+    Projection-specific artifact names keep winner uploads distinct from trial summaries.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param PublishRequest request: Trusted target, bound run, and projection.
@@ -706,7 +719,7 @@ def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
             json.dumps(projection["summary"], sort_keys=True, allow_nan=False), encoding="utf-8"
         )
         client.log_artifact(binding["run_id"], str(path), artifact_path="phasesweep")
-    if finish and run.info.status not in {"FINISHED", "FAILED", "KILLED"}:
+    if finish and run.info.status != finish:
         client.set_terminated(binding["run_id"], status=finish)
     return {}
 

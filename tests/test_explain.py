@@ -148,15 +148,22 @@ def test_documentation_links_read_editable_install_metadata(
     )
 
 
-def test_explain_mlflow_mode_gives_an_offline_launcher_command() -> None:
-    """Managed-mode help includes the installed launcher and the trainer's install requirement."""
+def test_explain_mlflow_mode_gives_the_native_environment_contract() -> None:
+    """Managed-mode help keeps every log in the supplied native run."""
     code, out, err = _explain("mlflow.run_mode")
     assert code == 0 and not err
-    assert 'trial_command: "phasesweep mlflow-run dcl train' in out
-    assert "{overrides}" in out
-    assert 'pip install "phasesweep[mlflow]"' in out
-    assert "child-process trainers must resume MLFLOW_RUN_ID" in out
-    assert "Shell wrappers cannot transfer the active run context" in out
+    assert "first mlflow.start_run() or mlflow.log_* resumes it" in out
+    assert "mlflow.active_run().info.run_id" in out
+    assert "mlflow.start_run(run_id=...)" in out
+    assert "Do not call mlflow.set_experiment() with another name" in out
+
+
+def test_explain_wandb_gives_the_native_environment_contract() -> None:
+    """W&B help names identity overrides and premature finish as contract violations."""
+    code, out, err = _explain("metric.extractor")
+    assert code == 0 and not err
+    assert "Pass no project, entity or id to wandb.init()" in out
+    assert "wandb.finish() only after the final log" in out
 
 
 def test_explain_environment_points_to_queryable_tracker_keys() -> None:
@@ -384,7 +391,6 @@ def test_explain_prints_the_packaged_section_rules_and_shared_block_descriptions
 def test_explain_mlflow_target_uses_a_queryable_wandb_url_reference() -> None:
     """The normalization reference names a real extractor config key."""
     code, out, err = _explain("mlflow.tracking_uri")
-
     assert code == 0 and not err
     assert "WandbTarget" not in out
     assert "metric.extractor.base_url" in out

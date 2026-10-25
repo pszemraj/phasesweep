@@ -29,37 +29,6 @@ from phasesweep.tracking.publication import delivery_status, sync_tracking
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("exit_code", [0, 2])
-def test_command_wrapper_finishes_the_bound_http_run(
-    local_server, tmp_path: Path, exit_code: int
-) -> None:
-    """The command wrapper keeps final metrics in its supplied run and preserves failure status."""
-    uri, client, experiment_id, _process = local_server
-    run_id = client.create_run(experiment_id).info.run_id
-    trainer = tmp_path / "wrapped.py"
-    trainer.write_text(
-        "import sys, mlflow\n"
-        "assert sys.argv[1:] == ['--help']\n"
-        f"assert mlflow.active_run().info.run_id == {run_id!r}\n"
-        "mlflow.log_metric('training', 1.0, step=1)\n"
-        "mlflow.log_metric('final_evaluation', 0.4, step=2)\n"
-        f"raise SystemExit({exit_code})\n",
-        encoding="utf-8",
-    )
-    result = subprocess.run(
-        [str(Path(sys.executable).with_name("phasesweep")), "mlflow-run", str(trainer), "--help"],
-        cwd=tmp_path,
-        env={**os.environ, "MLFLOW_TRACKING_URI": uri, "MLFLOW_RUN_ID": run_id},
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == exit_code, result.stderr
-    recorded = client.get_run(run_id)
-    assert recorded.info.status == ("FINISHED" if exit_code == 0 else "FAILED")
-    assert recorded.data.metrics == {"training": 1.0, "final_evaluation": 0.4}
-
-
 @contextmanager
 def _server(tmp_path):
     """Provision explicit SQLite and proxied artifact storage outside the tree."""
@@ -330,7 +299,7 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
     """Both ownership modes publish four trials and replay without the SDK/server."""
     uri, client, experiment_id, process = offline_server
     config = yaml.safe_load(
-        (Path(__file__).parents[1] / "src" / "phasesweep" / "templates" / "mlflow.yaml").read_text()
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
     )
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
@@ -549,3 +518,73 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         a.path for a in client.list_artifacts(summaries[0].info.run_id, "phasesweep")
     ]
     assert read_status(experiment)["phases"] == status["phases"]
+
+
+@pytest.mark.parametrize(
+    "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
+)
+def test_managed_failed_trial_overrides_the_trainer_run_status(
+    local_server, tmp_path: Path, caplog: pytest.LogCaptureFixture, trainer_outcome: str
+) -> None:
+    """A failed managed trial closes its bound run as FAILED, including a trainer's FINISHED run."""
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.tracking.session import read_binding
+
+    uri, client, experiment_id, _process = local_server
+    programs = {
+        "bare_crash": "mlflow.log_metric('loss', 0.01)\nraise RuntimeError('trainer failed')\n",
+        "ended_crash": "mlflow.log_metric('loss', 0.01)\nmlflow.end_run()\nraise RuntimeError('trainer failed')\n",
+        "no_objective": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\n",
+        "ended_then_logged": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\nmlflow.log_metric('loss', 0.01)\n",
+    }
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text("import mlflow\n" + programs[trainer_outcome], encoding="utf-8")
+    experiment = Experiment.model_validate(
+        {
+            "experiment": "managed-contract",
+            "workdir": str(tmp_path / "runs"),
+            "storage": "auto",
+            "provenance": {"revision": "test-contract"},
+            "trial_command": f"{sys.executable} {trainer} {{overrides}}",
+            "override_format": "argparse",
+            "mlflow": {
+                "tracking_uri": uri,
+                "experiment_id": experiment_id,
+                "run_mode": "managed",
+                "timeout_seconds": 15,
+                "poll_seconds": 0.05,
+            },
+            "metric": {
+                "name": "loss",
+                "goal": "minimize",
+                "extractor": {"type": "mlflow", "metric_key": "loss", "select": "last"},
+            },
+            "phases": [
+                {
+                    "name": "p",
+                    "n_trials": 1,
+                    "gpu_policy": "none",
+                    "max_consecutive_failures": 1,
+                    "sampler": {"type": "random", "seed": 0},
+                    "search_space": {"x": {"type": "int", "low": 0, "high": 1}},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    (directory,) = (_experiment_dir(experiment) / "p").glob("trial_*")
+    binding = read_binding(directory)
+    remote = client.get_run(binding["run_id"])
+    assert (remote.info.status, remote.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
+    assert "phasesweep.objective" not in remote.data.metrics
+    assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
+    if trainer_outcome in {"no_objective", "ended_then_logged"}:
+        assert "probably went to a different MLflow run" in caplog.text
+        assert "pass MLFLOW_RUN_ID to that logger" in caplog.text
+        assert "loss" not in remote.data.metrics
+    else:
+        assert remote.data.metrics["loss"] == 0.01

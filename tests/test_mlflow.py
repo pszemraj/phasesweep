@@ -988,6 +988,7 @@ def _capture_request(binding, *, gates=(), timeout_seconds=120, timeout_at=100.0
     return {
         "binding": binding,
         "query": {
+            "objective": spec().model_dump(),
             "selections": {observation_id(spec()): spec().model_dump()},
             "gates": [gate.model_dump() for gate in gates],
         },
@@ -1030,7 +1031,7 @@ def _finished_failure(clock, *, gates=(), metrics=None, params=None, tags=None):
 
 def test_missing_metric_is_not_replaced_by_result_metric(clock):
     message = _finished_failure(clock, metrics={"phasesweep.objective": 1, "accuracy": 0.9})
-    assert message == (
+    assert message.splitlines()[0] == (
         "MLflow run finished without metric 'loss'; "
         "available metric keys: ['accuracy', 'phasesweep.objective']."
     )
@@ -1060,7 +1061,7 @@ def test_finished_run_missing_every_kind_names_each_once(clock):
         clock, gates=gates, metrics={"accuracy": 0.9}, params={"warmup": "1", "seed": "1"}
     )
     tags = sorted(mlflow_run(mlflow_binding()).data.tags)
-    assert message == (
+    assert message.splitlines()[0] == (
         "MLflow run finished without metric 'loss', param 'lr', tag 'dataset'; "
         f"available metric keys: ['accuracy']; param keys: ['seed', 'warmup']; tag keys: {tags}."
     )
@@ -1131,9 +1132,33 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
     monkeypatch.setattr(process, "run_supervised", run_in_process)
     with pytest.raises(ExtractorError) as failure:
         _capture_mlflow(ctx, deadline=None)
-    assert str(failure.value) == (
+    assert str(failure.value).splitlines()[0] == (
         "MLflow run finished without metric 'eval/loss'; "
         "available metric keys: ['accuracy', 'cost']."
+    )
+    assert "The trainer's logging probably went to a different MLflow run" in str(failure.value)
+
+
+def test_managed_missing_objective_explains_the_one_run_contract(clock: ManualClock) -> None:
+    """A missing managed objective names generic wrong-run causes once, without discovery."""
+    message = _finished_failure(clock, metrics={"other": 0.9})
+    lines = message.splitlines()
+    assert len(lines) == 5
+    assert "probably went to a different MLflow run" in lines[1]
+    assert "run was ended and logging continued" in lines[2]
+    assert "second start_run()" in lines[2]
+    assert "pass MLFLOW_RUN_ID to that logger" in lines[3]
+    assert "never logged under the configured metric key" in lines[4]
+
+
+def test_trainer_owned_missing_objective_keeps_the_key_diagnostic(clock: ManualClock) -> None:
+    """A trainer-owned run is judged without managed environment advice."""
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
+    client = _states_client(binding, "FINISHED", metrics={"other": 0.9})
+    with pytest.raises(ValueError) as failure:
+        _capture(client, _capture_request(binding))
+    assert str(failure.value) == (
+        "MLflow run finished without metric 'loss'; available metric keys: ['other']."
     )
 
 

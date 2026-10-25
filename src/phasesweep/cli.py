@@ -142,40 +142,6 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
-@cli.command(
-    "mlflow-run",
-    context_settings={
-        **CONTEXT_SETTINGS,
-        "ignore_unknown_options": True,
-        "allow_interspersed_args": False,
-    },
-    help=(
-        "Run COMMAND in-process inside the managed MLFLOW_RUN_ID. COMMAND must be an "
-        "installed console script or a Python script path. Trainer arguments, including "
-        "--help, pass through unchanged. Child processes cannot inherit the active run; "
-        "torchrun, accelerate launch and other spawning trainers must resume MLFLOW_RUN_ID "
-        "and close that run themselves. "
-        'Example trial_command: "phasesweep mlflow-run dcl train --report_to mlflow {overrides}" '
-        "with override_format: argparse and mlflow.run_mode: managed."
-    ),
-    short_help="Run a trainer inside its managed MLflow run.",
-)
-@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
-def mlflow_run(command: tuple[str, ...]) -> int:
-    """Forward an ordinary trainer command into its managed run in this process.
-
-    :param tuple[str, ...] command: Console script or Python script path and trainer arguments.
-    :raises click.UsageError: The command or managed-run prerequisites are invalid.
-    :return int: The trainer's successful exit status.
-    """
-    from phasesweep.tracking.mlflow_launch import TrainerCommandError, run_managed
-
-    try:
-        return run_managed(command)
-    except TrainerCommandError as error:
-        raise click.UsageError(str(error)) from error
-
-
 def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) -> str:
     """Format an operational diagnosis with advice for the requested operation.
 

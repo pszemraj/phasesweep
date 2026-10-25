@@ -322,11 +322,10 @@ Every trial has a draw position: a trial that is not a rerun takes the number of
 
 **Tests:** `tests/test_draw_positions.py::test_positions_count_new_draws_and_give_each_rerun_its_source_position`, `tests/test_draw_positions.py::test_grid_covers_every_point_once_across_interruptions`, `tests/test_draw_positions.py::test_seeded_random_draws_the_same_set_however_it_is_interrupted`, `tests/test_draw_positions.py::test_model_samplers_resume_exactly_as_an_uninterrupted_run`, `tests/test_draw_positions.py::test_model_samplers_top_up_exactly_as_one_larger_run`, `tests/test_draw_positions.py::test_model_samplers_resume_under_two_workers_drawing_by_position`, `tests/test_draw_positions.py::test_cmaes_restores_the_newest_generation_not_the_highest_numbered_snapshot`, `tests/test_rerun_real_runs.py::test_model_samplers_resume_real_runs_exactly`, `tests/test_rerun_real_runs.py::test_model_samplers_top_up_real_runs_exactly`
 
+#### 30. Managed run status follows the retained attempt outcome
 
-#### 30. The managed launcher and trainer share one process
+MLflow evidence is read only from the run bound to the attempt; another run's metrics cannot rescue a missing objective or a failed trainer. After confirmed cleanup, a terminal delivery applies the retained outcome to a managed run even when the trainer already ended it with a different status. A failed attempt therefore becomes FAILED remotely. Delivery never terminates a trainer-owned run, and retries use the same retained intent.
 
-`phasesweep mlflow-run` calls a console-script entry point from its Python environment or executes a Python script inside the supplied managed MLflow run. Trainer arguments pass through unchanged, including `--help`. The active context spans final evaluation and observes nonzero returns and exits; the launcher restores its argument list, import path and managed-run environment afterwards. That active context cannot pass to shell wrappers or child trainers: they must resume `MLFLOW_RUN_ID` and close their own run.
+**Held by:** `tracking.mlflow._capture`, `tracking.mlflow._publish`, `tracking.publication._unaccepted_projection` and `tracking.publication._save_intent`
 
-**Held by:** `cli.mlflow_run`, `tracking.mlflow_launch._resolve_trainer` and `tracking.mlflow_launch.run_managed`
-
-**Tests:** `tests/test_mlflow_launch.py::test_launcher_runs_trainer_and_final_evaluation_in_process`, `tests/test_mlflow_launch.py::test_console_return_status_marks_the_run_failed`, `tests/test_mlflow_launch.py::test_launcher_help_and_trainer_help_have_separate_owners`, `tests/test_mlflow_launch.py::test_installed_command_avoids_cwd_shadow_and_preserves_arguments`, `tests/test_mlflow_integration.py::test_command_wrapper_finishes_the_bound_http_run`
+**Tests:** `tests/test_mlflow_terminal_delivery.py::test_publish_applies_the_owned_run_outcome`, `tests/test_mlflow_integration.py::test_managed_failed_trial_overrides_the_trainer_run_status`, `tests/test_mlflow_integration.py::test_failed_trainer_http_summary_delivery_and_sync`
