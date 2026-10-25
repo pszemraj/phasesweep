@@ -20,6 +20,7 @@ from phasesweep.engine.state import WinnerSource
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.runtime.json import json_object
 from tests.conftest import make_experiment, write_experiment_config, write_trainer
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
@@ -244,12 +245,23 @@ def test_winners_payload_applies_visible_params_policy(
             attempt_id="attempt-1",
         ),
         cost_advisory="one-standard-error cost advisory: params={'dataset': 'SECRET_DATASET'}",
+        tie_groups=[
+            {
+                "trial_number": 2,
+                "params": json_object(params),
+                "gap": 0.01,
+                "combined_se": 0.008,
+                "threshold": 0.016,
+            }
+        ],
     )
     phase = _winners_payload("redact_me", [view], visible_params=policy)["phases"][0]
     assert phase["params"] == expected
     assert phase["params_redacted"] is redacted
     assert "cost_advisory" in phase
     assert ("SECRET_DATASET" in phase["cost_advisory"]) == (policy == "all")
+    assert phase["tie_groups"][0]["params"] == expected
+    assert phase["tie_groups"][0]["threshold"] == 0.016
 
 
 @pytest.mark.parametrize(

@@ -40,6 +40,8 @@ def _reap_stale_trials(
     confirm: bool,
     recovered_attempts: dict[str, _AttemptRecord] | None = None,
     uncertain_attempt_ids: set[str] | None = None,
+    process_actions: dict[_AttemptRecord, bool] | None = None,
+    inspection_messages: dict[_AttemptRecord, str] | None = None,
 ) -> int:
     """Resolve stale RUNNING attempts and recover completed evidence or interruptions.
 
@@ -56,6 +58,8 @@ def _reap_stale_trials(
         inspecting, would be) to its record.
     :param set[str] | None uncertain_attempt_ids: Optional collector for exact
         attempt identities whose cleanup could not be proven.
+    :param dict[_AttemptRecord, bool] | None process_actions: Collector of attempts whose live group requires termination.
+    :param dict[_AttemptRecord, str] | None inspection_messages: Deferred preview messages, replaced by each source's fresh inspection.
     :return int: Number of stale RUNNING trials settled, or found when inspecting.
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
@@ -85,14 +89,17 @@ def _reap_stale_trials(
             )
             if TRIAL_DIR_ATTR in trial.user_attrs:
                 record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
-                _resolve_attempt(
+                terminated = _resolve_attempt(
                     record,
                     context=f"RUNNING trial {trial.number} in study {study.study_name!r}",
                     evidence_action=OperatorAction.INSPECT_LOGS,
                     lifecycle_settles=True,
                     confirm=confirm,
                     before_terminate=partial(_record_recovery_interruption, study, trial),
+                    inspection_messages=inspection_messages,
                 )
+                if process_actions is not None:
+                    process_actions[record] = terminated
             else:
                 # The launch path records the directory before any process can
                 # start, so this allocation launched nothing to resolve.
@@ -180,6 +187,8 @@ def _recover_cleanup_uncertain_trials(
     *,
     confirm: bool,
     recovered_attempts: dict[str, _AttemptRecord] | None = None,
+    process_actions: dict[_AttemptRecord, bool] | None = None,
+    inspection_messages: dict[_AttemptRecord, str] | None = None,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
 
@@ -196,6 +205,8 @@ def _recover_cleanup_uncertain_trials(
     :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
         mapping from each attempt id whose cleanup was confirmed (or, when
         inspecting, would be) to its record.
+    :param dict[_AttemptRecord, bool] | None process_actions: Collector of attempts whose live group requires termination.
+    :param dict[_AttemptRecord, str] | None inspection_messages: Deferred preview messages, replaced by each source's fresh inspection.
     :return int: Number of cleanup-uncertain terminal trials confirmed clean,
         or found when inspecting.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
@@ -211,7 +222,7 @@ def _recover_cleanup_uncertain_trials(
             continue
         trial_dir = _trial_dir_from_attr(trial, study.study_name)
         record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
-        _resolve_attempt(
+        terminated = _resolve_attempt(
             record,
             context=(
                 f"Cleanup-uncertain terminal trial {trial.number} in study {study.study_name!r} "
@@ -220,7 +231,10 @@ def _recover_cleanup_uncertain_trials(
             evidence_action=OperatorAction.INSPECT_LOGS,
             lifecycle_settles=False,
             confirm=confirm,
+            inspection_messages=inspection_messages,
         )
+        if process_actions is not None:
+            process_actions[record] = terminated
         if confirm:
             _record_cleanup_recovery(study, trial)
         if recovered_attempts is not None:

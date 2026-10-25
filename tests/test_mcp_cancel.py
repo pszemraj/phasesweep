@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
+    McpToolError,
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
@@ -27,6 +29,7 @@ from tests.conftest import (
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
+    call_mcp_tool,
     earlier_boot_id,
     make_dead_run_handle,
     make_mcp_app,
@@ -99,12 +102,12 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     monkeypatch.setattr(store, "observe", complete_launch_after_observation)
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", kill_runner)
 
-    cancelled = app.cancel(pending.run_id)
+    with pytest.raises(McpToolError, match="recover-run"):
+        app.cancel(pending.run_id)
 
     assert store.get(pending.run_id) == spawned
-    assert signalled == [(runner_pid, 111, runner_pid)]
-    assert cancelled["state"] == "running"
-    assert cancelled["recovery_required"] is True
+    assert signalled == []
+    assert store.observe(spawned).recovery_required
 
 
 def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
@@ -169,12 +172,11 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
 
     monkeypatch.setattr(mcp_tools, "kill_stale_group", record_signal)
 
-    result = app.cancel(handle.run_id)
+    with pytest.raises(McpToolError, match="recover-run|PID namespace"):
+        app.cancel(handle.run_id)
 
     assert signalled == []
-    assert result["state"] == "running"
-    assert result["cleanup_confirmed"] is False
-    assert result["recovery_required"] is True
+    assert store.observe(handle).recovery_required
 
 
 @pytest.mark.parametrize(
@@ -330,21 +332,48 @@ def test_cancel_cleanup_confirmation_policy(
 
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
-    result = app.cancel(run_id)
-
     cleanup_confirmed = runner_group_gone and status_cleanup_confirmed is True
-    assert result == {
-        "run_id": run_id,
-        "state": "cancelled" if cleanup_confirmed else "running",
-        "cleanup_confirmed": cleanup_confirmed,
-        "recovery_required": not cleanup_confirmed,
-    }
+    if cleanup_confirmed:
+        result = app.cancel(run_id)
+        assert result == {
+            "run_id": run_id,
+            "state": "cancelled",
+            "cleanup_confirmed": True,
+            "recovery_required": False,
+        }
+    else:
+        with pytest.raises(McpToolError, match="recover-run"):
+            app.cancel(run_id)
     assert store.cleanup_uncertain_path(run_id).exists() is not cleanup_confirmed
     if status_cleanup_confirmed is None:
         assert not store.status_path(run_id).exists()
     if check_launch_gate:
         with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("srv")
+
+
+def test_dead_runner_cancel_retains_the_status_failure_for_other_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation fails with the status remedy and persists it for an unobservable reader."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    handle = stage_dead_run(
+        store, "srv-dead-cancel", config, "srv", cleanup_uncertain=False, allow_cancel=True
+    )
+    failure = app.status(handle.run_id)["run"]["failure"]
+
+    result = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+
+    assert result.isError
+    assert "recover-run" in result.content[0].text
+    assert failure["remediation"] in result.content[0].text
+    marker = json.loads(store.cleanup_uncertain_path(handle.run_id).read_text())
+    assert marker["failure"] == failure
+    monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
+    assert app.status(handle.run_id)["run"]["failure"] == failure
+    again = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+    assert again.isError
+    assert failure["remediation"] in again.content[0].text
 
 
 def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(

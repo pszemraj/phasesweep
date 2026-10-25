@@ -462,6 +462,14 @@ def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
     assert "(unpublished)" in unpublished.output
     assert "ranked_trials:" not in unpublished.output
 
+    status = CliRunner().invoke(cli, ["status", str(config_path)])
+    assert status.exit_code == 0, status.output
+    assert (
+        "winner retained but not published; rerun the same config to resume and publish"
+        in status.output
+    )
+    assert yaml.safe_load(status.output)["phases"][0]["winner_is_published"] is False
+
 
 def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:
     """Config edits cannot relabel an unfinished generation's objective, phases or base."""

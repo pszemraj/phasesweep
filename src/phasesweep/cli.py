@@ -834,7 +834,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 )
             payload: JsonObject = {
                 "trial_number": winner.trial_number,
-                "metric": {metric_name: winner.metric},
+                "metric": {metric_name: float(f"{winner.metric:.6g}")},
                 "params": json_object(winner.params),
                 "effective_overrides": json_object(winner.effective_overrides),
                 "gates_passed": winner.gates_passed,
@@ -843,6 +843,12 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 "confound": None if winner.confound is None else json_object(winner.confound),
                 "repeats": None if winner.repeats is None else json_object(dict(winner.repeats)),
                 "cost_advisory": winner.cost_advisory,
+                "cost_advisory_status": winner.cost_advisory_status,
+                "tie_groups": (
+                    None
+                    if winner.tie_groups is None
+                    else [json_object(dict(group)) for group in winner.tie_groups]
+                ),
             }
             if winner.repeats_detail is not None:
                 detail = winner.repeats_detail
@@ -1036,7 +1042,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. ``--trials`` prints the trial tables in its place, from one
+    on stderr. An unpublished winner gets a comment explaining how to resume publication.
+    ``--trials`` prints the trial tables in its place, from one
     publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
@@ -1060,6 +1067,18 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         )
         return
     payload = experiment_status(config)
+    phases = payload.get("phases")
+    if isinstance(phases, list):
+        for phase in phases:
+            if (
+                isinstance(phase, dict)
+                and phase.get("winner") is not None
+                and phase.get("winner_is_published") is False
+            ):
+                click.echo(
+                    f"# {phase['name']}: winner retained but not published; "
+                    "rerun the same config to resume and publish."
+                )
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),

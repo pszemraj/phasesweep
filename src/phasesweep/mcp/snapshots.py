@@ -21,12 +21,15 @@ from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import (
+    CostAdvisoryStatus,
     EngineStatus,
     PhaseWinnerView,
     ResultContext,
+    cost_advisory_status,
     read_result,
     read_status,
     winner_cost_advisory,
+    winner_tie_groups,
 )
 from phasesweep.engine.repeats import _repeats_summary
 from phasesweep.engine.state import (
@@ -46,6 +49,8 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
+
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[1] = 1
 
 
 class _SnapshotModel(BaseModel):
@@ -259,6 +264,16 @@ class RepeatsSpread(_SnapshotModel):
     )
 
 
+class TieGroupSnapshot(_SnapshotModel):
+    """Configuration overlapping the winner within two combined standard errors."""
+
+    trial_number: NonNegativeInt
+    params: dict[str, bool | int | float | str | None]
+    gap: NonNegativeFloat
+    combined_se: NonNegativeFloat
+    threshold: NonNegativeFloat
+
+
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
 
@@ -275,6 +290,8 @@ class WinnerSnapshot(_SnapshotModel):
     observed: dict[str, float]
     repeats: RepeatsSpread | None
     cost_advisory: str | None = None
+    cost_advisory_status: CostAdvisoryStatus
+    tie_groups: list[TieGroupSnapshot] | None
 
 
 def _winner_snapshot(
@@ -293,6 +310,7 @@ def _winner_snapshot(
     :raises ValueError: A stored ``Winner``'s confound block fails validation.
     :return WinnerSnapshot: Validated path-free winner snapshot.
     """
+    cost_status: CostAdvisoryStatus
     if isinstance(winner, Winner):
         gates_passed = (
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
@@ -307,22 +325,24 @@ def _winner_snapshot(
             extractor_kind=kind if isinstance(kind, str) else "unknown",
         )
         repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
-        cost_advisory = (
-            winner_cost_advisory(
-                experiment,
-                PhaseWinnerView(
-                    phase=phase,
-                    trial_number=winner.trial_number,
-                    metric=winner.metric,
-                    params=dict(winner.params),
-                    effective_overrides={},
-                    gates_passed=gates_passed,
-                    incomplete=incomplete,
-                    repeats=repeats,
-                ),
-            )
+        view = PhaseWinnerView(
+            phase=phase,
+            trial_number=winner.trial_number,
+            metric=winner.metric,
+            params=dict(winner.params),
+            effective_overrides={},
+            gates_passed=gates_passed,
+            incomplete=incomplete,
+            repeats=repeats,
+            repeats_detail=winner.repeats,
+            confound_detail=winner.confound,
+        )
+        cost_advisory = winner_cost_advisory(experiment, view) if experiment is not None else None
+        tie_groups = winner_tie_groups(experiment, view) if experiment is not None else None
+        cost_status = (
+            cost_advisory_status(experiment, phase, cost_advisory, available=tie_groups is not None)
             if experiment is not None
-            else None
+            else "unavailable"
         )
     else:
         gates_passed = winner.gates_passed
@@ -332,6 +352,8 @@ def _winner_snapshot(
         confound = winner.confound
         repeats = winner.repeats
         cost_advisory = winner.cost_advisory
+        tie_groups = winner.tie_groups
+        cost_status = winner.cost_advisory_status
     source = winner.source
     if source is None:
         raise RuntimeError("Current-format winner is missing source provenance.")
@@ -349,12 +371,17 @@ def _winner_snapshot(
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
         cost_advisory=cost_advisory,
+        cost_advisory_status=cost_status,
+        tie_groups=(
+            None if tie_groups is None else [TieGroupSnapshot.model_validate(g) for g in tie_groups]
+        ),
     )
 
 
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
+    schema_version: Literal[1]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None
@@ -395,6 +422,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultS
     """
     zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
     return RunResultSnapshot(
+        schema_version=RESULT_SNAPSHOT_SCHEMA_VERSION,
         status=StatusSnapshot(
             publication_integrity="unknown",
             result_context="current_config",
@@ -474,6 +502,7 @@ def capture_result_snapshot(
     if not generation_claimed:
         status["represented_generation_id"] = None
     snapshot = RunResultSnapshot(
+        schema_version=RESULT_SNAPSHOT_SCHEMA_VERSION,
         status=StatusSnapshot.model_validate(
             {key: value for key, value in status.items() if key in StatusSnapshot.model_fields}
         ),

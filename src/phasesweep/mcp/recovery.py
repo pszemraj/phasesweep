@@ -102,6 +102,9 @@ class _CleanupEvidence:
     reaped: int = 0
     registered_attempts_reconciled: int = 0
     cleanup_recovered: int = 0
+    terminated: int = 0
+    retained_results: int = 0
+    inspection_messages: dict[_AttemptRecord, str] = field(default_factory=dict)
 
 
 def recover_run(
@@ -185,6 +188,8 @@ def recover_run(
             publication_action, publication_summary = _publication_recovery_action(config, needs)
             evidence = _recover_trial_evidence(store, handle, config, needs, confirm=confirm)
             if not confirm:
+                for message in evidence.inspection_messages.values():
+                    emit(message)
                 emit(_preflight_message(run_id, needs, evidence, publication_action))
                 return
 
@@ -242,7 +247,9 @@ def recover_run(
                 emit(
                     f"Cleared cleanup uncertainty for {run_id}; reconciled "
                     f"{evidence.registered_attempts_reconciled} registered attempt(s), "
-                    f"reaped {evidence.reaped} stale trial(s), and confirmed "
+                    f"terminated {evidence.terminated} live process group(s), "
+                    f"settled {evidence.reaped} stale trial(s), kept "
+                    f"{evidence.retained_results} completed trial result(s), and confirmed "
                     f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)."
                 )
     except RunRecoveryError:
@@ -671,7 +678,7 @@ def _recover_trial_evidence(
     loaded_studies: dict[str, optuna.Study] = {}
     if needs.cleanup_needed:
         loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
-        active_report = _PreflightCleanupReport()
+        active_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
         registered_attempts = _preflight_active_attempts(
             config, active_report, confirm=confirm, retain_recovery_evidence=True
         )
@@ -719,6 +726,8 @@ def _recover_trial_evidence(
                 phase.name,
                 confirm=confirm,
                 recovered_attempts=inspected_attempts,
+                process_actions=active_report.process_actions,
+                inspection_messages=active_report.inspection_messages,
             )
             evidence.reaped += _reap_stale_trials(
                 study,
@@ -726,7 +735,11 @@ def _recover_trial_evidence(
                 phase.name,
                 confirm=confirm,
                 recovered_attempts=inspected_attempts,
+                process_actions=active_report.process_actions,
+                inspection_messages=active_report.inspection_messages,
             )
+        evidence.terminated = sum(active_report.process_actions.values())
+        evidence.inspection_messages = active_report.inspection_messages or {}
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
@@ -736,6 +749,14 @@ def _recover_trial_evidence(
                         record.trial_number,
                         record.generation_id,
                     )
+        if confirm:
+            evidence.retained_results = sum(
+                trial.state == optuna.trial.TrialState.COMPLETE
+                and isinstance(retained_attempt_id := trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
+                and retained_attempt_id in evidence.reaped_attempt_ids
+                for study in loaded_studies.values()
+                for trial in study.get_trials(deepcopy=False)
+            )
     if confirm and needs.stored_snapshot is not None:
         pending_ids = {
             attempt.attempt_id
@@ -815,7 +836,9 @@ def _preflight_message(
         actions.append(
             "attempt runner process-group cleanup, "
             f"reconcile {evidence.registered_attempts_reconciled} registered attempt(s), "
-            f"reap {evidence.reaped} stale trial(s), and recover {evidence.cleanup_recovered} "
+            f"terminate {evidence.terminated} live process group(s) if still alive, "
+            f"settle {evidence.reaped} stale trial(s), retaining completed results when "
+            f"their evidence confirms success, and recover {evidence.cleanup_recovered} "
             "cleanup-uncertain terminal trial(s)"
         )
     if needs.snapshot_finalize_needed:

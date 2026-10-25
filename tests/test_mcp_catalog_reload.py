@@ -150,7 +150,10 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     _break_catalog(tmp_path, catalog, config, damage)
 
     assert _listed_ids(app) == ["srv"]
-    catalog_status = app.list_experiments()["catalog_status"]
+    listed = app.list_experiments()
+    assert listed["experiments"][0]["capabilities"]["launch"] is False
+    assert listed["experiments"][0]["capabilities"]["cancel"] is True
+    catalog_status = listed["catalog_status"]
     assert catalog_status["stale"] is True
     assert catalog_status["reload_refusal"] == "invalid"
     assert "phasesweep mcp check" in catalog_status["remediation"]
@@ -186,6 +189,7 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     with pytest.raises(ExperimentBusyError):
         app.launch("srv")
     assert app.list_experiments()["catalog_status"]["stale"] is False
+    assert app.list_experiments()["experiments"][0]["capabilities"]["launch"] is True
     assert len(_messages(caplog, "again matches the loaded catalog")) == 1
 
 
@@ -206,6 +210,7 @@ def test_changed_state_dir_refuses_launch_and_keeps_the_original_store(tmp_path:
     assert str(tmp_path) not in str(excinfo.value)
     assert not moved.exists()
     assert _listed_ids(app) == ["srv"]
+    assert app.list_experiments()["experiments"][0]["capabilities"]["launch"] is False
     latest = app.latest_run("srv")
     assert latest["run"] is not None and latest["run"]["run_id"] == "srv-live"
     assert registry.state_dir == tmp_path / "state"

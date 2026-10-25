@@ -177,7 +177,10 @@ def test_cost_advisory_breaks_cost_ties_by_objective_then_trial_order(maximize: 
 
 
 @pytest.mark.integration
-def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(tmp_path: Path) -> None:
+@pytest.mark.parametrize("configured", [False, True])
+def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
+    tmp_path: Path, configured: bool
+) -> None:
     """Read-time advice uses retained groups without replacing the scientific winner."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -198,6 +201,7 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(tmp_pat
         repeats=Repeats(key="seed", values=[1, 2]),
         sampler=Sampler(type="grid", seed=0),
         search_space={"epochs": CategoricalParam(type="categorical", choices=[8, 16])},
+        cost_key="epochs" if configured else None,
     )
     original = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winner = run_experiment(original)["epochs"]
@@ -205,30 +209,86 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(tmp_pat
     assert generation is not None
     path = _generation_winner_path(original, generation, "epochs")
     saved = path.read_bytes()
+    _, initial_views = read_result(original)
+    assert initial_views[0].cost_advisory_status == (
+        "available" if configured else "not_configured"
+    )
     changed = original.model_copy(
         update={"phases": [phase.model_copy(update={"cost_key": "epochs"})]}
     )
     _, views = read_result(changed)
     assert views[0].cost_advisory is not None
     assert "epochs=8" in views[0].cost_advisory
+    assert views[0].cost_advisory_status == "available"
+    comparisons = views[0].tie_groups
+    assert comparisons is not None and len(comparisons) == 1
+    assert comparisons[0]["params"] == {"epochs": 8}
+    assert comparisons[0]["gap"] == pytest.approx(0.005)
+    assert comparisons[0]["threshold"] == 2 * comparisons[0]["combined_se"]
     drifted = changed.model_copy(
         update={"metric": changed.metric.model_copy(update={"goal": "maximize"})}
     )
     _, historical = read_result(drifted)
     assert historical[0].config_matches_current is False
     assert historical[0].cost_advisory is None
+    assert historical[0].cost_advisory_status == "unavailable"
+    removed_key = drifted.model_copy(
+        update={"phases": [phase.model_copy(update={"cost_key": None})]}
+    )
+    _, removed_views = read_result(removed_key)
+    assert removed_views[0].cost_advisory_status == (
+        "unavailable" if configured else "not_configured"
+    )
     config_path = tmp_path / "experiment.yaml"
     write_experiment_config(config_path, changed)
     displayed = CliRunner().invoke(cli, ["show-winners", str(config_path)])
     assert displayed.exit_code == 0, displayed.exception
     assert "one-standard-error cost advisory" in displayed.output
+    assert "tie_groups:" in displayed.output
+    assert "cost_advisory_status: available" in displayed.output
     replayed = run_experiment(changed)["epochs"]
     assert replayed.params == winner.params and replayed.metric == winner.metric
     snapshot = capture_result_snapshot(
         changed, generation_id=generation, engine_winners={"epochs": replayed}
     )
     assert "epochs=8" in snapshot["winners"][0]["cost_advisory"]
+    assert snapshot["schema_version"] == 1
+    assert snapshot["winners"][0]["tie_groups"][0]["params"] == {"epochs": 8}
+    assert snapshot["winners"][0]["cost_advisory_status"] == "available"
     assert path.read_bytes() == saved
+
+
+@pytest.mark.integration
+def test_repeat_overlap_details_keep_the_selected_population_after_top_up(tmp_path: Path) -> None:
+    """An older winner compares only the repeat groups it ranked before a top-up."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--seed', type=int)
+        args, _ = parser.parse_known_args()
+        print(f'x={0.39 if args.seed == 1 else 0.41}')
+        """,
+    )
+    phase = Phase(
+        name="epochs",
+        n_trials=4,
+        gpu_policy="none",
+        repeats=Repeats(key="seed", values=[1, 2]),
+        sampler=Sampler(type="random", seed=0),
+        search_space={"epochs": FloatParam(type="float", low=8, high=32)},
+    )
+    original = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    run_experiment(original)
+    generation = published_generation_id(original)
+    assert generation is not None
+    extended = original.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 6})]})
+    run_experiment(extended)
+    _, historical = read_result(extended, generation_id=generation)
+    _, current = read_result(extended)
+    assert historical[0].tie_groups is not None and len(historical[0].tie_groups) == 1
+    assert current[0].tie_groups is not None and len(current[0].tie_groups) == 2
 
 
 @pytest.mark.parametrize("sampler", ["grid", "random"])

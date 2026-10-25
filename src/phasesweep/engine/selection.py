@@ -50,11 +50,44 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger("phasesweep.engine.selection")
 
 # Grid cells without a successful trial that one advisory spells out before it counts the rest.
 _MAX_LISTED_CELLS = 10
+
+
+class TieGroupComparison(typing.TypedDict):
+    """One configuration compared with the selected repeat group."""
+
+    trial_number: int
+    params: JsonObject
+    gap: float
+    combined_se: float
+    threshold: float
+
+
+def tie_group_comparisons(
+    winner: RankedGroup, groups: Sequence[RankedGroup]
+) -> list[TieGroupComparison]:
+    """Describe other configurations within two combined standard errors.
+
+    :param RankedGroup winner: Selected repeat group.
+    :param Sequence[RankedGroup] groups: Groups from the same ranked population.
+    :return list[TieGroupComparison]: Parameters, objective gap and noise threshold for each overlap.
+    """
+    return [
+        {
+            "trial_number": group.representative,
+            "params": json_object(group.params),
+            "gap": abs(group.aggregate - winner.aggregate),
+            "combined_se": combined_standard_error(winner, group),
+            "threshold": 2 * combined_standard_error(winner, group),
+        }
+        for group in groups
+        if dict(group.params) != dict(winner.params) and within_noise(winner, group)
+    ]
 
 
 def _no_feasible_remedy() -> str:
@@ -293,6 +326,14 @@ def select_winner(
         incomplete_group=() if ranking is None else ranking.incomplete_group,
     )
     flagged = _describe_flagged(confound)
+    if winning is not None and ranking is not None:
+        for comparison in tie_group_comparisons(winning, ranking.groups):
+            flagged.append(
+                f"group {comparison['trial_number']} params={comparison['params']} versus "
+                f"winner params={dict(winning.params)}, "
+                f"gap={comparison['gap']:.6g}, combined_se={comparison['combined_se']:.6g}, "
+                f"threshold=2*combined_se={comparison['threshold']:.6g}"
+            )
     if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
         flagged.append(
             _evaluation_point_remedy(
@@ -300,15 +341,6 @@ def select_winner(
                 axis=confound["checks"]["evaluation_point"]["detail"]["axis"],
             )
         )
-    if winning is not None and ranking is not None:
-        for group in ranking.groups:
-            if dict(group.params) != dict(winning.params) and within_noise(winning, group):
-                flagged.append(
-                    f"group {group.representative} params={dict(group.params)} versus "
-                    f"winner params={dict(winning.params)}, "
-                    f"gap={abs(group.aggregate - winning.aggregate):.6g}, "
-                    f"combined_se={combined_standard_error(winning, group):.6g}"
-                )
     if flagged and emit_advisories:
         log.warning(
             "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "

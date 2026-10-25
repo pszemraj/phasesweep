@@ -11,7 +11,7 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -87,7 +87,8 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".transition.lock",
     ".heartbeat",
 )
-MCP_STATE_FORMAT_VERSION = 7
+MCP_STATE_FORMAT_VERSION = 8
+CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
@@ -1086,25 +1087,41 @@ class RunStore:
         status = self._read_status(handle)
         return None if status is None else dict(status)
 
-    def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
+    def mark_cleanup_uncertain(
+        self, handle: RunHandle, *, failure: Mapping[str, object] | None = None
+    ) -> None:
         """Persist unconfirmed process-group cleanup to reserve capacity until cleanup is settled.
 
         :param RunHandle handle: Run handle whose cleanup is uncertain.
+        :param Mapping[str, object] | None failure: Operator failure retained for readers that cannot inspect the runner.
         """
         existing = self._read_cleanup_identity(handle)
         candidate = handle.process_identity
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
         identity = existing if existing is not None and not candidate_has_identity else candidate
         payload = {
+            "schema_version": CLEANUP_UNCERTAINTY_SCHEMA_VERSION,
             "run_id": handle.run_id,
             "config_sha256": handle.config_sha256,
             **asdict(identity),
             "cleanup_confirmed": False,
+            "failure": dict(failure) if failure is not None else self.cleanup_failure(handle),
         }
         private_atomic_write_text(
             self.cleanup_uncertain_path(handle.run_id),
             json.dumps(payload, indent=2) + "\n",
         )
+
+    def cleanup_failure(self, handle: RunHandle) -> object:
+        """Read the failure attached to this run's valid cleanup marker.
+
+        :param RunHandle handle: Run whose cleanup failure should be read.
+        :return object: Recorded failure for validation by the tool layer, or None.
+        """
+        if self._read_cleanup_identity(handle) is None:
+            return None
+        payload = _read_json_object(self.cleanup_uncertain_path(handle.run_id))
+        return None if payload is None else payload.get("failure")
 
     def clear_cleanup_uncertain(self, handle: RunHandle) -> None:
         """Clear a previously persisted cleanup uncertainty marker.
@@ -1311,6 +1328,8 @@ class RunStore:
         """
         payload = _read_json_object(self.cleanup_uncertain_path(handle.run_id))
         if payload is None:
+            return None
+        if payload.get("schema_version") != CLEANUP_UNCERTAINTY_SCHEMA_VERSION:
             return None
         if payload.get("run_id") != handle.run_id:
             return None
