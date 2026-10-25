@@ -1,6 +1,7 @@
 """Derive a run from one config without editing or copying that config."""
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -515,6 +516,47 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
     assert authorized.exit_code == 0, authorized.output
     assert "Rerun the same config to resume and publish" in authorized.output
     assert "raise phases[c].n_trials" not in authorized.output
+
+
+def test_unreadable_unpublished_ledger_keeps_status_yaml_and_exit_code(tmp_path: Path) -> None:
+    """Unreadable trial data suppresses optional advice without losing the status payload."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        "import os, sys\nprint('x=0.5')\nsys.exit(os.environ['PHASESWEEP_PHASE'] == 'b')",
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[
+            Phase(
+                name=name,
+                n_trials=1,
+                max_consecutive_failures=1,
+                gpu_policy="none",
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=10)},
+            )
+            for name in ("a", "b")
+        ],
+    )
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    ledger = Path(str(experiment_status(experiment)["ledger_path"]))
+    original_mode = stat.S_IMODE(ledger.stat().st_mode)
+    original_bytes = ledger.read_bytes()
+    ledger.chmod(0)
+    try:
+        expected = experiment_status(experiment)
+        shown = CliRunner().invoke(cli, ["status", str(config)])
+        assert shown.exit_code == 0, shown.output
+        assert shown.stdout == yaml.safe_dump(expected, sort_keys=False)
+        phases = yaml.safe_load(shown.stdout)["phases"]
+        assert phases[0]["winner"] is not None
+        assert all(not phase["trial_data_available"] and phase["trials"] == {} for phase in phases)
+    finally:
+        ledger.chmod(original_mode)
+    assert ledger.read_bytes() == original_bytes
 
 
 def test_in_memory_unpublished_status_describes_a_full_restart(tmp_path: Path) -> None:

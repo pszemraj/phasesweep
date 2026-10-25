@@ -1056,14 +1056,17 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
     """Give one publication remedy from recorded failures, suppressing it during live work.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
-    :return str | None: The recorded remedy, persistent resume or in-memory restart; none while busy.
+    :return str | None: The recorded remedy or rerun instruction; none while busy or if storage is unreadable.
     """
     if experiment_is_busy(experiment):
         return None
     if experiment.resolved_storage is None:
         return "Rerun the same config to start the run again; storage: null keeps no completed trials between runs."
-    ledger = validate_ledger(experiment)
-    studies = read_phase_studies(ledger)
+    try:
+        ledger = validate_ledger(experiment)
+        studies = read_phase_studies(ledger)
+    except StudyStorageUnavailableError:
+        return None
     for phase in experiment.phases:
         study = studies[phase.name]
         if study is None:
