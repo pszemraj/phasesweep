@@ -492,35 +492,44 @@ def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
     assert json.dumps(actual) == json.dumps(value)
 
 
-@pytest.mark.parametrize("value", ["${oc.env:HOME}", "literal ${other}", ["${x}"], "line\nbreak"])
-def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
-    with pytest.raises(ValueError, match=r"Hydra cannot pass literal strings.*interpolation"):
-        make_experiment(
-            workdir=str(tmp_path / "runs"),
-            override_format="hydra",
-            trial_command="echo {overrides}",
-            phases=[Phase(name="p", n_trials=1, fixed_overrides={"value": value})],
+@pytest.mark.parametrize(
+    ("phase", "message"),
+    [
+        pytest.param(
+            Phase(name="p", n_trials=1, fixed_overrides={"value": value}),
+            r"Hydra cannot pass literal strings.*interpolation",
+            id=f"fixed-{label}",
         )
-    assert not (tmp_path / "runs").exists()
-
-
-@pytest.mark.parametrize("value", ["${oc.env:HOME}", "line\nbreak"])
-def test_hydra_unsupported_categorical_literals_fail_before_artifacts(tmp_path, value):
-    with pytest.raises(
-        ValueError,
-        match=r"categorical search_space key 'value'.*Hydra cannot pass literal strings.*interpolation",
-    ):
+        for label, value in [
+            ("environment", "${oc.env:HOME}"),
+            ("embedded", "literal ${other}"),
+            ("nested", ["${x}"]),
+            ("newline", "line\nbreak"),
+        ]
+    ]
+    + [
+        pytest.param(
+            Phase(
+                name="p",
+                n_trials=1,
+                search_space={"value": CategoricalParam(type="categorical", choices=["ok", value])},
+            ),
+            r"categorical search_space key 'value'.*Hydra cannot pass literal strings.*interpolation",
+            id=f"categorical-{label}",
+        )
+        for label, value in [("environment", "${oc.env:HOME}"), ("newline", "line\nbreak")]
+    ],
+)
+def test_hydra_unsupported_literals_fail_before_artifacts(
+    tmp_path: Path, phase: Phase, message: str
+) -> None:
+    """Unsupported fixed and categorical literals fail before creating the trial tree."""
+    with pytest.raises(ValueError, match=message):
         make_experiment(
             workdir=str(tmp_path / "runs"),
             override_format="hydra",
             trial_command="echo {overrides}",
-            phases=[
-                Phase(
-                    name="p",
-                    n_trials=1,
-                    search_space={"value": {"type": "categorical", "choices": ["ok", value]}},
-                )
-            ],
+            phases=[phase],
         )
     assert not (tmp_path / "runs").exists()
 
