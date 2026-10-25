@@ -602,7 +602,10 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
-    assert "cancel it before retrying the same command" in result.output
+    assert "Wait for the other PhaseSweep operation" in result.output
+    assert "then retry the same command" in result.output
+    assert "only if the user wants it stopped" in result.output
+    assert "MCP cannot cancel a CLI operation" in result.output
     assert "start a new run" not in result.output
     cleanup.assert_not_called()
     assert store.cleanup_uncertain_path(run_id).is_file()

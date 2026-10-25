@@ -171,7 +171,11 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
         assert refused_inspection.isError
         assert "inspection of changed configs" in str(refused_inspection.content)
     else:
-        assert app.validate("srv")["experiment_id"] == "srv"
+        inspected = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
+        assert not inspected.isError
+        assert inspected.structuredContent["experiment_id"] == "srv"
+        assert inspected.structuredContent["capabilities"]["launch"] is False
+        assert inspected.structuredContent["capabilities"]["cancel"] is True
     with pytest.raises(CatalogReloadRefusedError, match="no longer validates") as excinfo:
         app.launch("srv")
     refused = call_mcp_tool(app, TOOL_LAUNCH_RUN, {"experiment_id": "srv"})

@@ -505,6 +505,10 @@ class GetRunStatusResult(_ToolPayload):
 
     experiment_id: ExperimentId
     catalog_status: CatalogStatusPayload
+    continuation: str | None = Field(
+        default=None,
+        description="Safe next step for a retained unpublished winner; the run's failure remedy takes precedence.",
+    )
     result_source: ResultSource = Field(
         description=(
             "Result source: mutable shared study, immutable terminal snapshot, or unavailable "
@@ -681,6 +685,10 @@ class GetRunResultsResult(_ToolPayload):
 
     experiment_id: ExperimentId
     catalog_status: CatalogStatusPayload
+    continuation: str | None = Field(
+        default=None,
+        description="Safe next step for a retained unpublished winner; the run's failure remedy takes precedence.",
+    )
     run_id: RunId
     result_source: ResultSource = Field(
         description=(
@@ -721,7 +729,7 @@ class LaunchRunResult(_ToolPayload):
 
 
 class CancelRunResult(_ToolPayload):
-    """Structured output for cancel_run."""
+    """Successful cancellation output; unconfirmed cleanup returns an MCP tool error."""
 
     run_id: RunId
     state: RunState
@@ -732,7 +740,10 @@ class CancelRunResult(_ToolPayload):
         ),
     )
     recovery_required: bool = Field(
-        description="Whether this run requires operator attention after the cancellation call."
+        description=(
+            "Whether successful cancellation still needs operator result repair. "
+            "Unconfirmed process cleanup returns an MCP tool error with the run failure's remedy."
+        )
     )
 
 

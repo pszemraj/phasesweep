@@ -79,6 +79,7 @@ class _PreflightCleanupReport:
     recovered_attempt_generations: dict[str, str] = field(default_factory=dict)
     reaped_running_trials: int = 0
     cleanup_recovered_trials: int = 0
+    retained_results: int = 0
     uncertain_attempt_ids: set[str] = field(default_factory=set)
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
@@ -790,6 +791,7 @@ def _registry_attempt_fail_stale_trial(
         trial,
         record=_registry_attempt_record(entry, entry_path),
         artifact_root=entry_path.parent.parent,
+        report=report,
         failure_message=(
             f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
             f"but its stale RUNNING trial {trial.number} in study "
@@ -1030,6 +1032,7 @@ def _recover_completed_trial(
     *,
     record: _AttemptRecord,
     artifact_root: Path,
+    report: _PreflightCleanupReport | None = None,
 ) -> bool | None:
     """Accept a finished orphan through the producing configuration's extraction path.
 
@@ -1043,6 +1046,7 @@ def _recover_completed_trial(
     :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
     :param _AttemptRecord record: Attempt identity and original trial directory.
     :param Path artifact_root: Owning artifact root containing generation snapshots.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :return bool | None: True for recovered COMPLETE, False for unaccepted evidence, or None when shutdown leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
     :raises StudyStorageUnavailableError: Valid completed evidence could not be committed.
@@ -1142,6 +1146,8 @@ def _recover_completed_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
+    if report is not None:
+        report.retained_results += 1
     log.warning(
         "Kept completed trial result: phase=%r trial=%d value=%g (attempt=%s).",
         record.phase_name,
@@ -1159,6 +1165,7 @@ def _fail_stale_running_trial(
     failure_message: str,
     record: _AttemptRecord | None = None,
     artifact_root: Path | None = None,
+    report: _PreflightCleanupReport | None = None,
 ) -> bool:
     """Settle a resolved RUNNING trial using completed evidence when available.
 
@@ -1171,6 +1178,7 @@ def _fail_stale_running_trial(
         can no longer leak a process.
     :param _AttemptRecord | None record: Attempt record for recovering completed evidence.
     :param Path | None artifact_root: Artifact root containing the producing config snapshot.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
     :return bool: Whether the trial became terminal; False retains completed training during shutdown.
@@ -1187,7 +1195,7 @@ def _fail_stale_running_trial(
         ) from exc
     if record is not None and artifact_root is not None:
         recovered = _recover_completed_trial(
-            study, trial, record=record, artifact_root=artifact_root
+            study, trial, record=record, artifact_root=artifact_root, report=report
         )
         if recovered is None:
             return False

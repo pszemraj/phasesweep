@@ -154,6 +154,7 @@ def _preflight_existing_studies(
                     confirm=True,
                     recovered_attempts=reaped_attempts,
                     uncertain_attempt_ids=report.uncertain_attempt_ids,
+                    report=report,
                 )
             finally:
                 report.recovered_attempt_ids.update(reaped_attempts)

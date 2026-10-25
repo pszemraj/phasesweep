@@ -12,6 +12,7 @@ from phasesweep.engine.attempts import (
     _AttemptRecord,
     _cleanup_recovered_trial_numbers,
     _fail_stale_running_trial,
+    _PreflightCleanupReport,
     _record_cleanup_recovery,
     _record_recovery_interruption,
     _require_trial_attempt,
@@ -42,6 +43,7 @@ def _reap_stale_trials(
     uncertain_attempt_ids: set[str] | None = None,
     process_actions: dict[_AttemptRecord, bool] | None = None,
     inspection_messages: dict[_AttemptRecord, str] | None = None,
+    report: _PreflightCleanupReport | None = None,
 ) -> int:
     """Resolve stale RUNNING attempts and recover completed evidence or interruptions.
 
@@ -60,6 +62,7 @@ def _reap_stale_trials(
         attempt identities whose cleanup could not be proven.
     :param dict[_AttemptRecord, bool] | None process_actions: Collector of attempts whose live group requires termination.
     :param dict[_AttemptRecord, str] | None inspection_messages: Deferred preview messages, replaced by each source's fresh inspection.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :return int: Number of stale RUNNING trials settled, or found when inspecting.
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
@@ -117,6 +120,7 @@ def _reap_stale_trials(
                 trial,
                 record=record,
                 artifact_root=_experiment_dir(experiment),
+                report=report,
                 failure_message=(
                     f"Stale process cleanup completed for RUNNING trial {trial.number}, "
                     f"but Optuna state could not be updated to FAIL. Refusing to continue "

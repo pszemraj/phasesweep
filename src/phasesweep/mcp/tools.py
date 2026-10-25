@@ -48,6 +48,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
+from phasesweep.errors import UNPUBLISHED_WINNER_STEP
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
     CatalogError,
@@ -318,6 +319,18 @@ class _CatalogReloadRefusal:
     detail: str
 
 
+def _unpublished_winner_step(status: EngineStatus, failure: JsonObject | None) -> str | None:
+    """Describe safe continuation for a retained winner outside a publication.
+
+    :param EngineStatus status: Live or frozen result facts already read for this response.
+    :param JsonObject | None failure: Validated run failure, whose remedy takes precedence.
+    :return str | None: Concrete failure remedy or shared conditional advice; None without an unpublished winner.
+    """
+    if status["is_published"] or not any(phase["winner_present"] for phase in status["phases"]):
+        return None
+    return str(failure["remediation"]) if failure is not None else UNPUBLISHED_WINNER_STEP
+
+
 class PhaseSweepMCP:
     """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
 
@@ -582,7 +595,7 @@ class PhaseSweepMCP:
         return {
             "experiment_id": reg.id,
             "metric": reg.metric_payload,
-            "capabilities": reg.capabilities,
+            "capabilities": {**reg.capabilities, "launch": reg.allow_launch and refusal is None},
             "phases": phases,
             "catalog_status": self._catalog_status(),
         }
@@ -672,18 +685,20 @@ class PhaseSweepMCP:
             view = self._runs.runner_view(handle)
         if observation is None:
             observation = self._runs.observe(handle, view=view)
-        if observation.cleanup_recovery_required:
-            marker_failure = self._runs.cleanup_failure(handle)
-            if marker_failure is not None:
-                try:
-                    return json_object(
-                        FailurePayload.model_validate(marker_failure).model_dump(
-                            mode="json", exclude_none=True
-                        )
-                    )
-                except ValidationError:
-                    pass
         terminal: Mapping[str, object] = observation.terminal_status or {}
+        persisted: JsonObject | None = None
+        recorded_failure = terminal.get("failure")
+        if recorded_failure is None and observation.terminal_status is None:
+            recorded_failure = self._runs.cleanup_failure(handle)
+        if recorded_failure is not None:
+            with contextlib.suppress(ValidationError):
+                persisted = json_object(
+                    FailurePayload.model_validate(recorded_failure).model_dump(
+                        mode="json", exclude_none=True
+                    )
+                )
+        if persisted is not None and observation.cleanup_recovery_required:
+            return persisted
         runner_ended_with_boot = (
             observation.terminal_status is None
             and handle.launch_state == "spawned"
@@ -732,16 +747,6 @@ class PhaseSweepMCP:
                 "actor": "operator",
                 "remediation": remedy,
             }
-        persisted: JsonObject | None = None
-        try:
-            if terminal.get("failure") is not None:
-                persisted = json_object(
-                    FailurePayload.model_validate(terminal["failure"]).model_dump(
-                        mode="json", exclude_none=True
-                    )
-                )
-        except ValidationError:
-            pass
         if force_snapshot_unavailable or (
             observation.state != "running" and parse_result_snapshot(terminal) is None
         ):
@@ -1059,6 +1064,7 @@ class PhaseSweepMCP:
             elapsed_seconds=elapsed_seconds,
         )
         result["catalog_status"] = self._catalog_status()
+        result["continuation"] = _unpublished_winner_step(status, run["failure"])
         return result
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
@@ -1129,6 +1135,7 @@ class PhaseSweepMCP:
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
         )
+        result["continuation"] = _unpublished_winner_step(status, result["failure"])
         result["catalog_status"] = self._catalog_status()
         return result
 
@@ -1485,18 +1492,16 @@ class PhaseSweepMCP:
                         failure = self._run_failure_payload(
                             handle, view=view, observation=observation
                         )
-                        if failure is not None and observation.terminal_status is None:
-                            self._runs.mark_cleanup_uncertain(handle, failure=failure)
+                        if failure is not None:
+                            if observation.terminal_status is None:
+                                self._runs.mark_cleanup_uncertain(handle, failure=failure)
                             raise McpToolError(str(failure["remediation"]))
                     if before == "running" and view.visibility == "unobservable":
                         # Foreign-namespace numbers cannot be signalled locally.
                         raise RunNamespaceMismatchError(run_id)
                     if before == "running":
                         # Reserve cleanup before releasing the transition lock.
-                        failure = self._run_failure_payload(
-                            handle, view=view, observation=observation
-                        ) or json_object(_cleanup_uncertain_payload([]))
-                        self._runs.mark_cleanup_uncertain(handle, failure=failure)
+                        self._runs.mark_cleanup_uncertain(handle)
             after: RunState
             if before != "running":
                 after = before
@@ -1548,7 +1553,11 @@ class PhaseSweepMCP:
                         failure = self._run_failure_payload(
                             handle, view=view, observation=observation
                         ) or json_object(_cleanup_uncertain_payload([]))
-                        self._runs.mark_cleanup_uncertain(handle, failure=failure)
+                        if (
+                            observation.terminal_status is None
+                            and not self._runs.runner_may_be_alive(handle, view=view)
+                        ):
+                            self._runs.mark_cleanup_uncertain(handle, failure=failure)
                         raise McpToolError(str(failure["remediation"]))
             result = {
                 "run_id": run_id,

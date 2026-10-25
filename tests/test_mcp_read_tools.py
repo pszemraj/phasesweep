@@ -34,6 +34,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
+from phasesweep.errors import UNPUBLISHED_WINNER_STEP
 from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
 from phasesweep.mcp.errors import (
     McpToolError,
@@ -43,6 +44,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus
 from phasesweep.mcp.server import (
     AwaitRunResult,
@@ -59,6 +61,7 @@ from tests.conftest import (
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
+    call_mcp_tool,
     drift_experiment,
     make_mcp_app,
     make_run_handle,
@@ -1110,3 +1113,41 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
     assert winners["result_source"] == "current_shared_study"
     assert winners["represented_generation_id"] == run_id
     assert awaited["reason"] == "timeout"
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["live", "aborted"])
+@pytest.mark.integration
+def test_unpublished_winner_continuation_is_safe_for_live_and_failed_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: bool
+) -> None:
+    """Run reads wait on live work and preserve a failed phase's concrete publication remedy."""
+    app, registry, store, handle, terminal = _published_run_terminal(tmp_path)
+    _remove_the_publication_pointer(registry.get("srv").experiment, handle.run_id)
+    snapshot = RunResultSnapshot.model_validate(terminal["result_snapshot"])
+    snapshot.status.is_published = False
+    snapshot.status.published_generation_id = None
+    snapshot.status.publication_integrity = "absent"
+    failure = FailurePayload(
+        code="trials_failed",
+        stage="execution",
+        retryable=True,
+        actor="agent",
+        remediation="Fix the trainer, then raise phases.b.n_trials before rerunning.",
+    ).model_dump(mode="json", exclude_none=True)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1 if failed else 0,
+        cleanup_confirmed=True,
+        failure=failure if failed else None,
+        result_snapshot_state="complete" if failed else "pending",
+        result_snapshot=snapshot.model_dump(mode="json"),
+    )
+    if not failed:
+        monkeypatch.setattr(store, "runner_may_be_alive", lambda *_args, **_kwargs: True)
+    expected = failure["remediation"] if failed else UNPUBLISHED_WINNER_STEP
+
+    for tool in ("get_run_status", "get_run_results"):
+        result = call_mcp_tool(app, tool, {"run_id": handle.run_id})
+        assert not result.isError, result
+        assert result.structuredContent["continuation"] == expected

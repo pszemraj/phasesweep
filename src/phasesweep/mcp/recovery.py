@@ -737,8 +737,10 @@ def _recover_trial_evidence(
                 recovered_attempts=inspected_attempts,
                 process_actions=active_report.process_actions,
                 inspection_messages=active_report.inspection_messages,
+                report=active_report,
             )
         evidence.terminated = sum(active_report.process_actions.values())
+        evidence.retained_results = active_report.retained_results
         evidence.inspection_messages = active_report.inspection_messages or {}
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
@@ -749,14 +751,6 @@ def _recover_trial_evidence(
                         record.trial_number,
                         record.generation_id,
                     )
-        if confirm:
-            evidence.retained_results = sum(
-                trial.state == optuna.trial.TrialState.COMPLETE
-                and isinstance(retained_attempt_id := trial.user_attrs.get(ATTEMPT_ID_ATTR), str)
-                and retained_attempt_id in evidence.reaped_attempt_ids
-                for study in loaded_studies.values()
-                for trial in study.get_trials(deepcopy=False)
-            )
     if confirm and needs.stored_snapshot is not None:
         pending_ids = {
             attempt.attempt_id
