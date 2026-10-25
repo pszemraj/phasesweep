@@ -48,6 +48,11 @@ def test_busy_probe_observes_run_locks_without_creating_paths(
         before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
         assert experiment_is_busy(experiment)
         assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+        with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
+            pytest.fail("the probe released the live operation's locks")
+        assert "finish, then retry the same command" in str(busy.value.remediation)
+        assert "MCP" not in str(busy.value.remediation)
+        assert "only if the user" not in str(busy.value.remediation)
     assert not experiment_is_busy(experiment)
 
 

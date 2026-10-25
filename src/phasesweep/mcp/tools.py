@@ -1537,11 +1537,19 @@ class PhaseSweepMCP:
                     if not confirmed:
                         failure = self._run_failure_payload(
                             handle, view=view, observation=observation
-                        ) or json_object(_cleanup_uncertain_payload([]))
-                        if (
-                            observation.terminal_status is None
-                            and not self._runs.runner_may_be_alive(handle, view=view)
-                        ):
+                        )
+                        if failure is None:
+                            failure = json_object(_cleanup_uncertain_payload([]))
+                            if self._runs.runner_may_be_alive(handle, view=view):
+                                failure["remediation"] = (
+                                    "Cancellation could not stop the runner. Ask the operator "
+                                    "to inspect this run's saved runner PID/PGID on the host "
+                                    "and stop it there. Retry cancel_run after it exits; if "
+                                    "recovery is still required, run `phasesweep mcp recover-run` "
+                                    "from that host shell, review the preview, and repeat with "
+                                    "`--confirm`."
+                                )
+                        if observation.terminal_status is None:
                             self._runs.mark_cleanup_uncertain(handle, failure=failure)
                         raise McpToolError(str(failure["remediation"]))
             result = {

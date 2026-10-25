@@ -732,10 +732,7 @@ class CancelRunResult(_ToolPayload):
         ),
     )
     recovery_required: bool = Field(
-        description=(
-            "Whether successful cancellation still needs operator result repair. "
-            "Unconfirmed process cleanup returns an MCP tool error with the run failure's remedy."
-        )
+        description="Whether successful cancellation still needs operator result repair."
     )
 
 

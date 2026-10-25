@@ -139,9 +139,7 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
                     f"namespace and per persistent storage identity.",
                     remediation=(
                         "Wait for the other PhaseSweep operation using this experiment output "
-                        "or storage namespace to finish, then retry the same command. Stop it "
-                        "only if the user wants it stopped and through the interface that "
-                        "started it; MCP cannot cancel a CLI operation."
+                        "or storage namespace to finish, then retry the same command."
                     ),
                 )
             handles.append(handle)

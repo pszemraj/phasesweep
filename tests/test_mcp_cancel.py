@@ -314,9 +314,11 @@ def test_cancel_cleanup_confirmation_policy(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        config_dir=str(config.parent),
         allow_cancel=True,
     )
     store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     if preexisting_marker:
         store.mark_cleanup_uncertain(handle)
 
@@ -347,6 +349,14 @@ def test_cancel_cleanup_confirmation_policy(
         with pytest.raises(McpToolError, match="recover-run"):
             app.cancel(run_id)
     assert store.cleanup_uncertain_path(run_id).exists() is not cleanup_confirmed
+    if not runner_group_gone:
+        failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
+        assert "Cancellation could not stop the runner" in failure["remediation"]
+        assert "inspect this run's saved runner PID/PGID on the host" in failure["remediation"]
+        assert "Retry cancel_run after it exits" in failure["remediation"]
+        assert app.status(run_id)["run"]["failure"] == failure
+        monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
+        assert app.status(run_id)["run"]["failure"] == failure
     if status_cleanup_confirmed is None:
         assert not store.status_path(run_id).exists()
     if check_launch_gate:

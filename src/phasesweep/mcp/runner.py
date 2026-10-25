@@ -259,7 +259,13 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    return {"code": code, "stage": failure_stage, **_routed_next_steps(error)}
+    steps = _routed_next_steps(error)
+    if code == "experiment_busy":
+        steps["remediation"] = (
+            f"{steps['remediation']} Stop it only if the user wants it stopped and through "
+            "the interface that started it; MCP cannot cancel a CLI operation."
+        )
+    return {"code": code, "stage": failure_stage, **steps}
 
 
 def _cleanup_steps(
