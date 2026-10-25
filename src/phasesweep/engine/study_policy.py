@@ -482,7 +482,8 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     if refusal is None:
         refusal = grid_target_refusal(phase, finished=finished, measured=measured)
     if refusal is not None:
-        raise TrialTargetRefusedError(refusal, remediation=refusal)
+        message, remediation = refusal
+        raise TrialTargetRefusedError(message, remediation=remediation)
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:

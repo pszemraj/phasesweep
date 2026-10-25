@@ -1603,7 +1603,7 @@ def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
         return
     refusal = fixed_configuration_target_refusal(phase, finished=0, measured=0)
     if refusal is not None:
-        raise ValueError(refusal)
+        raise ValueError(" ".join(refusal))
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:

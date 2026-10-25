@@ -45,10 +45,8 @@ from tests.conftest import (
 from tests.experiments import write_experiment
 from tests.recovery_helpers import fabricate_stale_trial
 
-_FRESH_THREE = (
-    "Phase 'p': n_trials=3 with an empty search_space would run 3 identical trials. Use "
-    "n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
-)
+_FRESH_THREE = "Phase 'p': n_trials=3 with an empty search_space would run 3 identical trials."
+_FRESH_THREE_REMEDY = "Use n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
 _WARNING = (
     "phase 'p' is a fixed configuration: n_trials above 1 only retries failed attempts, and a "
     "launch refuses more than one past the failed ones."
@@ -122,8 +120,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         run_experiment(attempt(3))
     assert str(refused.value) == (
         "Phase 'p' is a fixed configuration with 1 failed attempt and no completed one; "
-        "raising n_trials retries it one attempt at a time, so use at most 2, not 3."
+        "raising n_trials retries it one attempt at a time."
     )
+    assert refused.value.remediation == "Use n_trials at most 2, not 3."
     assert _call_count(calls) == 1
 
     winners = run_experiment(attempt(2))
@@ -135,9 +134,9 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         run_experiment(attempt(3))
     assert str(repeated.value) == (
         "Phase 'p' is a fixed configuration that already has a COMPLETE or INFEASIBLE trial; "
-        "n_trials=3 would run the same configuration again. Keep n_trials at 2, or use "
-        "repeats to measure seed noise."
+        "n_trials=3 would run the same configuration again."
     )
+    assert repeated.value.remediation == "Keep n_trials at 2, or use repeats to measure seed noise."
     assert _call_count(calls) == 2
 
     # The finished target still replays its result without launching.
@@ -155,8 +154,9 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
         run_experiment(_fixed(tmp_path, trainer, 2))
     assert _call_count(calls) == 2
 
-    with pytest.raises(TrialTargetRefusedError, match="2 failed attempts .* at most 3, not 4"):
+    with pytest.raises(TrialTargetRefusedError, match="2 failed attempts") as refused:
         run_experiment(_fixed(tmp_path, trainer, 4))
+    assert refused.value.remediation == "Use n_trials at most 3, not 4."
     assert _call_count(calls) == 2
 
     assert run_experiment(_fixed(tmp_path, trainer, 3))["p"].metric == 1.0
@@ -334,11 +334,13 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
     with pytest.raises(TrialTargetRefusedError) as dry:
         run_experiment(exp, dry_run=True)
     assert str(dry.value) == _FRESH_THREE
+    assert dry.value.remediation == _FRESH_THREE_REMEDY
     assert not (tmp_path / "studies.journal").exists()
 
     with pytest.raises(TrialTargetRefusedError) as launched:
         run_experiment(exp)
     assert str(launched.value) == _FRESH_THREE
+    assert launched.value.remediation == _FRESH_THREE_REMEDY
     assert _call_count(calls) == 0
 
     # The MCP runner calls run_experiment, so this is the failure it records for a launch.
@@ -367,8 +369,9 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
         run_experiment(_fixed(tmp_path, trainer, 1))
 
     run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
+    with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as refused:
         run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
+    assert refused.value.remediation == "Use n_trials at most 2, not 3."
     assert _call_count(calls) == 1
 
     run_experiment(_fixed(tmp_path, trainer, 2))
@@ -401,7 +404,8 @@ def test_validate_warns_and_cli_dry_run_refuses_a_persistent_fixed_target(
     assert warnings == [f"warning: {_WARNING}"]
 
     assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) != 0
-    assert _FRESH_THREE in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert error.splitlines() == [f"phasesweep: {_FRESH_THREE}", f"fix: {_FRESH_THREE_REMEDY}"]
 
     one = _fixed_config(tmp_path, 1)
     clean = CliRunner().invoke(cli_main, ["validate", str(one)])
@@ -454,7 +458,7 @@ def test_fixed_configuration_target_rule(
         assert message is None
     else:
         assert message is not None
-        assert refusal in message
+        assert refusal in " ".join(message)
 
 
 def test_a_phase_that_draws_is_not_limited_to_retries() -> None:

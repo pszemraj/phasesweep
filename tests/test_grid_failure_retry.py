@@ -746,4 +746,10 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     error = capsys.readouterr().err
     assert "fix:" in error
     assert "Set phases[p].n_trials to at most 2" in error
+    assert "To enlarge the grid instead, change the search space" in error
+    diagnosis = error.splitlines()[0].removeprefix("phasesweep: ")
+    remedy = next(
+        line.removeprefix("fix: ") for line in error.splitlines() if line.startswith("fix: ")
+    )
+    assert diagnosis not in remedy
     assert "correct the experiment configuration" not in error
