@@ -484,8 +484,9 @@ def test_running_attempt_counts_as_failed_toward_a_fixed_configurations_retry_li
     _record(allowed, "a", _STATE.RUNNING, target=1, running_outcome="failure")
     run_experiment(allowed, dry_run=True)
 
-    with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
+    with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as refused:
         run_experiment(_persistent(tmp_path, _phase("a", 3, fixed=True)), dry_run=True)
+    assert refused.value.remediation == "Use n_trials at most 2, not 3."
 
 
 def test_running_attempt_that_will_rerun_leaves_a_fixed_configuration_at_one_attempt(
