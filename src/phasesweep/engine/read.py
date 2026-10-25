@@ -435,8 +435,7 @@ def require_study(experiment: Experiment) -> None:
         )
     ):
         raise StudyStorageUnavailableError(
-            f"No study directory at {_experiment_dir(experiment)} contains a started study. "
-            "Use the same config and --set overrides as run.",
+            f"No study directory at {_experiment_dir(experiment)} contains a started study.",
             action=OperatorAction.FIX_CONFIG,
             remediation=(
                 "Use the same config and --set overrides as the run that created the study. "

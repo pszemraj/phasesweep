@@ -284,7 +284,7 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
 
     :param list[tuple[str, object, object]] changes: Output of :func:`_changed_payload_keys`.
     :return str: A sentence naming up to :data:`_MAX_REPORTED_CHANGES` keys and a count of
-        the rest, followed by a space; empty when nothing changed.
+        the rest; empty when nothing changed.
     """
     if not changes:
         return ""
@@ -294,7 +294,7 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
         shown.append(f"{path}: {old_text} -> {new_text}")
     if len(changes) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(changes) - _MAX_REPORTED_CHANGES} more")
-    return f"Changed: {'; '.join(shown)}. "
+    return f"Changed: {'; '.join(shown)}."
 
 
 def _stamp_fingerprint(study: optuna.Study, fingerprint: str, payload: JsonObject) -> None:

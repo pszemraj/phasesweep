@@ -140,7 +140,7 @@ def phase_timeout(message: str, *, scope: str | None, persistent: bool) -> Phase
     continuation = (
         "resume the phase; completed trials are kept."
         if persistent
-        else "start the phase again; storage: null keeps no completed trials between runs."
+        else "start the run again; storage: null keeps no completed trials between runs."
     )
     return PhaseTimeoutError(
         message,

@@ -96,7 +96,8 @@ def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_di
 
     message = _operational_error_text(caught.value)
     # No ";" before the closing quote: the invocation directory is the only change.
-    assert re.search(r'Changed: execution\.cwd: [^;]*first" -> [^;]*second"\. ', message)
+    assert re.search(r'Changed: execution\.cwd: [^;]*first" -> [^;]*second"\.\nfix:', message)
+    assert str(caught.value) == str(caught.value).rstrip()
     assert (
         f"{_CWD_SENTENCE} when execution.cwd is unset; run from the original directory or set "
         "execution.cwd in the config (relative paths resolve against the config file)."
@@ -146,7 +147,7 @@ def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
 
     assert message.count(" -> <absent>") == 10
     assert 'Changed: env.K00: "1" -> <absent>; env.K01: "1" -> <absent>;' in message
-    assert 'env.K09: "1" -> <absent>; and 2 more. ' in message
+    assert message.endswith('env.K09: "1" -> <absent>; and 2 more.')
     assert "env.K10" not in message
 
 
@@ -156,7 +157,8 @@ def test_refusal_gives_the_step_that_runs_the_changed_config() -> None:
 
     error = _refusal(study, make_experiment(provenance={"revision": "toy-v2"}))
 
-    assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2". ' in str(error)
+    assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2".' in str(error)
+    assert str(error) == str(error).rstrip()
     assert error.remediation == NEW_STUDY_STEP
     assert _operational_error_text(error).endswith(NEW_STUDY_STEP)
     assert error.action is OperatorAction.FRESH_NAMESPACE
@@ -168,7 +170,8 @@ def test_refusal_for_a_configured_cwd_omits_the_unset_cwd_advice() -> None:
 
     error = _refusal(study, make_experiment(execution=ExecutionContext(cwd="/srv/b")))
 
-    assert 'Changed: execution.cwd: "/srv/a" -> "/srv/b". ' in str(error)
+    assert 'Changed: execution.cwd: "/srv/a" -> "/srv/b".' in str(error)
+    assert str(error) == str(error).rstrip()
     assert _CWD_SENTENCE not in str(error)
     assert error.action is OperatorAction.FRESH_NAMESPACE
 

@@ -1454,6 +1454,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     fresh = capsys.readouterr()
     assert "No study directory at" in fresh.err
     assert "fix: Use the same config and --set overrides" in fresh.err
+    assert fresh.err.count("Use the same config and --set overrides") == 1
     assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 1
     capsys.readouterr()
 

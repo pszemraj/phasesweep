@@ -92,9 +92,9 @@ RERUN_CLEANUP_RECOVERY = (
 
 
 NEW_STUDY_STEP = (
-    "For persistent storage, set a new `experiment` name in the config to start a fresh "
+    "Set a new `experiment` name in the config to start a fresh "
     "study (with `storage: auto`, a new `workdir` also works); the old study stays readable "
-    "with its original config. With `storage: null`, rerunning starts fresh."
+    "with its original config."
 )
 
 
