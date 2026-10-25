@@ -95,7 +95,12 @@ from phasesweep.engine.state import (
     _trial_interrupted,
     _validate_observed_block,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state, _recovery_advice
+from phasesweep.engine.study_policy import (
+    _awaits_cleanup_recovery,
+    _config_retires_abort,
+    _load_phase_policy_state,
+    _recovery_advice,
+)
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
@@ -1061,12 +1066,15 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
         study = studies[phase.name]
         if study is None:
             continue
+        trials = study.get_trials(deepcopy=False)
         abort = _load_phase_policy_state(study).abort
-        if abort is not None:
+        if abort is not None and (
+            _awaits_cleanup_recovery(study, abort)
+            or not _config_retires_abort(phase, trials, abort)
+        ):
             cause = str(abort["cause"]).rstrip(".")
             advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
             return f"Phase {phase.name!r}: {cause}. fix: {advice}"
-        trials = study.get_trials(deepcopy=False)
         if _finished_trial_count(trials) < phase.n_trials:
             continue
         axis = repeat_axis(phase)

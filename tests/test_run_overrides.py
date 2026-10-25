@@ -511,6 +511,10 @@ def test_unpublished_status_prints_the_recorded_failure_remedy_once(
     assert shown.output.count("Winner retained but not published") == 1
     assert operator_step(refused.value) in shown.output
     assert "phases[c].n_trials" in shown.output
+    authorized = CliRunner().invoke(cli, ["status", str(config), "--set", "phases[2].n_trials=3"])
+    assert authorized.exit_code == 0, authorized.output
+    assert "Rerun the same config to resume and publish" in authorized.output
+    assert "raise phases[c].n_trials" not in authorized.output
 
 
 def test_unpublished_winners_keep_the_producing_config_metadata(tmp_path: Path) -> None:
