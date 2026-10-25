@@ -1815,13 +1815,21 @@ def test_raise_sites_route_their_declared_action(
         failure = mcp_runner._terminal_failure_payload(
             error, stage="execution", cleanup_confirmed=True
         )
-        assert failure["remediation"] == f"Ask the operator: {error.remediation}"
+        expected = (
+            error.remediation
+            if error.action is OperatorAction.RETRY
+            else f"Ask the operator: {error.remediation}"
+        )
+        assert failure["remediation"] == expected
         if case.id.startswith("live_abort_with_"):
             run_log = tmp_path / "runs" / "t" / "run.log"
             assert run_log.read_text(encoding="utf-8").count(error.remediation) == 1
     if case.action is OperatorAction.RETRY:
         rendered = _operational_error_text(error)
-        assert "retry the same operation once the reported blocker is resolved" in rendered
+        if error.remediation is None:
+            assert "retry the same operation once the reported blocker is resolved" in rendered
+        else:
+            assert error.remediation in rendered
         assert "start a new run" not in rendered
 
 

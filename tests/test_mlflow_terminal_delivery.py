@@ -68,8 +68,8 @@ from tests.tracking_helpers import (
 
 @pytest.mark.parametrize("requested", ["FINISHED", "FAILED", "KILLED"])
 @pytest.mark.parametrize("actual", ["RUNNING", "FINISHED", "FAILED", "KILLED"])
-def test_publish_finishes_only_a_running_owned_run(actual, requested):
-    """A terminal run keeps its status, so a retry or later outcome never rewrites it."""
+def test_publish_applies_the_owned_run_outcome(actual: str, requested: str) -> None:
+    """The retained managed outcome overrides a different trainer status and retries idempotently."""
     pytest.importorskip("mlflow")
     binding = mlflow_binding()
     calls = []
@@ -88,7 +88,7 @@ def test_publish_finishes_only_a_running_owned_run(actual, requested):
             "finish": requested,
         },
     )
-    assert calls == ["batch", "artifact", *([requested] if actual == "RUNNING" else [])]
+    assert calls == ["batch", "artifact", *([requested] if actual != requested else [])]
 
 
 def test_trainer_owned_run_is_never_terminated():

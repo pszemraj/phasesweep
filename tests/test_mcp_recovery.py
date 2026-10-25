@@ -602,7 +602,10 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
     assert result.exit_code != 0
     assert "Another phasesweep process" in result.output
-    assert "retry the same operation" in result.output
+    assert "Wait for the other PhaseSweep operation" in result.output
+    assert "then retry the same command" in result.output
+    assert "only if the user wants it stopped" not in result.output
+    assert "MCP cannot cancel a CLI operation" not in result.output
     assert "start a new run" not in result.output
     cleanup.assert_not_called()
     assert store.cleanup_uncertain_path(run_id).is_file()
@@ -1333,11 +1336,24 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
         "phasesweep.engine.attempts.cleanup_stale_trial_process", Mock(return_value=True)
     )
 
+    if terminal:
+        write_attempt_lifecycle(
+            _trial_dir_for(
+                experiment, phase.name, trial_number, generation_id=run_id, attempt_id=attempt_id
+            ),
+            attempt_id=attempt_id,
+            state="exited",
+            return_code=0,
+            cleanup_confirmed=True,
+        )
+
     preflight = recover_run_cli(registry.state_dir, run_id)
 
     assert preflight.exit_code == 0, preflight.output
-    planned = "recover 1 cleanup-uncertain terminal trial" if terminal else "reap 1 stale trial"
+    planned = "recover 1 cleanup-uncertain terminal trial" if terminal else "settle 1 stale trial"
     assert planned in preflight.output
+    assert preflight.output.count(f"Attempt {attempt_id} phase=") == 1
+    assert "training process group: recorded process group has exited" in preflight.output
     confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
 
     assert confirmed.exit_code == 0, confirmed.output
@@ -1345,7 +1361,7 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
     assert recovery["registered_attempts_reconciled"] == 1
     assert recovery["reaped_running_trials"] == (0 if terminal else 1)
     assert recovery["cleanup_uncertain_terminal_trials"] == (1 if terminal else 0)
-    actual = "confirmed 1 cleanup-uncertain trial" if terminal else "reaped 1 stale trial"
+    actual = "confirmed 1 cleanup-uncertain trial" if terminal else "settled 1 stale trial"
     assert actual in confirmed.output
     trial = _load_phase_trial(config, trial_number)
     assert trial.state == optuna.trial.TrialState.FAIL
@@ -1377,8 +1393,8 @@ def test_registered_trial_recovery_counts_match_preflight_and_ledger(
         pytest.param(
             partial(write_launched_stale_trial, cleanup_confirmed=False),
             222,
-            "reap 1 stale trial",
-            "reaped 1 stale trial",
+            "settle 1 stale trial",
+            "settled 1 stale trial",
             1,
             0,
             True,

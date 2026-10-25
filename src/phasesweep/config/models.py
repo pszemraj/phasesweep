@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import posixpath
 import re
-import shlex
 import string
 import sys
 from collections.abc import Iterator, Mapping
@@ -52,7 +51,6 @@ from phasesweep.evidence.models import (
     JsonEnvelopeExtractor,
     JsonExtractor,
     LocalExtractor,
-    MlflowExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -169,6 +167,13 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
         *(_observation_line(observation) for observation in experiment.observe),
         _environment_contract_line(experiment),
         _trainer_cwd_line(experiment),
+        *(
+            [
+                "MLflow target: unchecked by validate and dry-run; credentials and experiment access are checked before the phase's first trial."
+            ]
+            if experiment.mlflow is not None
+            else []
+        ),
     ]
 
 
@@ -194,83 +199,7 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "ledger, and rotating one refuses a resume. Credentials belong in "
             "execution.passthrough_env, which is inherited without being recorded or compared."
         )
-    if isinstance(experiment.metric.extractor, WandbExtractor | MlflowExtractor):
-        reload_sources = _best_model_reload_sources(experiment)
-        if reload_sources:
-            warnings.append(
-                f"load_best_model_at_end=True (set in {', '.join(reload_sources)}): scored "
-                "best-checkpoint weights may differ from the terminal training step reported "
-                "in remote history. The evaluation_point check compares logged progress and "
-                "does not verify checkpoint identity. Use json_envelope to report policy, "
-                "checkpoint and the evaluated step; report total training progress in "
-                "evaluation.progress and select it with evaluation_axis."
-            )
     return warnings
-
-
-_BEST_MODEL_RELOAD_FLAG = "load_best_model_at_end"
-_TRUTHY_WORDS = frozenset({"true", "1", "yes"})
-
-
-def _best_model_reload_sources(experiment: Experiment) -> list[str]:
-    """Name each place that explicitly enables ``load_best_model_at_end``.
-
-    :param Experiment experiment: Loaded experiment.
-    :return list[str]: ``trainer_config``, ``fixed_overrides`` and ``trial_command``, in
-        that order, for each that enables it; empty when none does.
-    """
-
-    def enabled(settings: Mapping[str, JsonValue]) -> bool:
-        """Return whether a flat dotted mapping sets the flag to ``True``.
-
-        :param Mapping[str, JsonValue] settings: Flat dotted keys and their values.
-        :return bool: Whether any key ending in the flag name holds ``True``.
-        """
-        return any(
-            key.rsplit(".", 1)[-1] == _BEST_MODEL_RELOAD_FLAG and value is True
-            for key, value in settings.items()
-        )
-
-    sources: list[str] = []
-    if enabled(flatten_trainer_config(experiment.trainer_config)):
-        sources.append("trainer_config")
-    if any(enabled(phase.fixed_overrides) for phase in experiment.phases):
-        sources.append("fixed_overrides")
-    if _command_enables_flag(experiment.trial_command, _BEST_MODEL_RELOAD_FLAG):
-        sources.append("trial_command")
-    return sources
-
-
-def _command_enables_flag(command: str, name: str) -> bool:
-    """Whether a trial command switches the boolean option ``name`` on.
-
-    Matches argparse's bare ``--name``, ``--name true`` and ``--name=true``, and Hydra's
-    ``[+|++|~]dotted.path.name=true``. A bare flag counts when nothing, another option or a
-    ``{placeholder}`` follows it, since a placeholder renders to options rather than a value;
-    a falsy value or any other word after it leaves the option off.
-
-    :param str command: The ``trial_command`` template, split like a shell would.
-    :param str name: The option's final dotted name, for example ``load_best_model_at_end``.
-    :return bool: True when a token explicitly enables the option.
-    """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    for index, token in enumerate(tokens):
-        key, equals, value = token.partition("=")
-        if equals:
-            if key.lstrip("-+~").rsplit(".", 1)[-1] == name and value.lower() in _TRUTHY_WORDS:
-                return True
-        elif token == f"--{name}":
-            following = tokens[index + 1] if index + 1 < len(tokens) else None
-            if (
-                following is None
-                or following.startswith(("-", "{"))
-                or following.lower() in _TRUTHY_WORDS
-            ):
-                return True
-    return False
 
 
 def experiment_disclosures(
@@ -302,6 +231,21 @@ def experiment_disclosures(
             phase,
             [
                 (False, sampler_capability_line(phase, experiment.resolved_storage)),
+                *(
+                    [
+                        (
+                            False,
+                            "grid order: configurations are shuffled by sampler.seed, not listed choice order."
+                            + (
+                                " Repeat values stay consecutive in their listed order."
+                                if phase.repeats is not None
+                                else ""
+                            ),
+                        )
+                    ]
+                    if phase.sampler.type == "grid" and phase_draws(phase)
+                    else []
+                ),
                 *((True, line) for line in sampler_warnings(phase)),
                 *((True, line) for line in search_space_warnings(phase)),
             ],
@@ -1355,7 +1299,8 @@ class Experiment(_Frozen):
             raise ValueError(
                 f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
                 "the data and dependency revisions used by this experiment; each generation "
-                "records the trainer's git commit on its own."
+                "records the trainer's git commit on its own. For example: "
+                "provenance: {data_revision: DATA_REVISION, dependencies: DEPENDENCY_REVISION}."
             )
         return self
 
@@ -1658,7 +1603,7 @@ def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
         return
     refusal = fixed_configuration_target_refusal(phase, finished=0, measured=0)
     if refusal is not None:
-        raise ValueError(refusal)
+        raise ValueError(" ".join(refusal))
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:

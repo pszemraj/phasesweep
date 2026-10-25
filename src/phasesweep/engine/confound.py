@@ -607,7 +607,7 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
             tied = ", ".join(str(number) for number in detail["tied_trials"])
             lines.append(
                 f"tie: trial(s) {tied} matched the winner's value exactly with different "
-                "params, and the lower draw position won"
+                "params, and the lower draw position won. " + _noise_remedy()
             )
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))

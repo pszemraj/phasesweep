@@ -147,14 +147,21 @@ def test_init_preserves_template_except_documentation_links(tmp_path: Path, temp
 
 
 @pytest.mark.parametrize(
-    ("version", "ref"),
-    [("0.3.11", "v0.3.11"), ("0.3.12.dev4+g123abcd.d20261023", "123abcd")],
+    ("version", "editable", "ref"),
+    [
+        ("0.3.11", False, "v0.3.11"),
+        ("0.3.11", True, "main"),
+        ("0.3.12.dev4+g123abcd.d20261023", False, "main"),
+        ("0.3.13.dev0", False, "main"),
+        ("0.0.0+unknown", False, "main"),
+    ],
 )
 def test_init_pins_template_documentation_links(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, ref: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, editable: bool, ref: str
 ) -> None:
     """A generated template links to documentation for its installed source."""
     monkeypatch.setattr(reference, "__version__", version)
+    monkeypatch.setattr(reference, "_editable_install", lambda: editable)
     output = tmp_path / "noisy.yaml"
 
     result = CliRunner().invoke(cli_main, ["init", "--template", "noisy", "-o", str(output)])
@@ -165,7 +172,7 @@ def test_init_pins_template_documentation_links(
         f"https://github.com/pszemraj/phasesweep/blob/{ref}/"
         "docs/config.md#noisy-objectives-and-small-budgets"
     ) in text
-    assert "/blob/main/" not in text
+    assert ("/blob/main/" in text) == (ref == "main")
 
 
 @pytest.mark.parametrize("template", TEMPLATES)
@@ -191,7 +198,10 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert experiment.workdir == str(config_path.parent / "runs")
         assert experiment.execution.cwd == str(config_path.parent)
         assert experiment.storage == "auto"
-        assert "phasesweep.examples.fake_train" in experiment.trial_command
+        if template == "mlflow":
+            assert experiment.trial_command == "phasesweep-mlflow-train --config {config_path}"
+        else:
+            assert "phasesweep.examples.fake_train" in experiment.trial_command
 
         validated = runner.invoke(cli_main, ["validate", config])
         assert validated.exit_code == 0, validated.output
@@ -247,11 +257,13 @@ def test_argparse_template_renders_trainer_config_leaves_as_flags(
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("trainer_python_on_path")
-@pytest.mark.parametrize("template", [name for name in TEMPLATES if name != "noisy"])
+@pytest.mark.parametrize(
+    "template", [name for name in TEMPLATES if name not in {"noisy", "mlflow"}]
+)
 def test_init_template_runs_to_a_winner_per_phase_on_the_toy_trainer(
     tmp_path: Path, template: str
 ) -> None:
-    """Every template but ``noisy``, which its own test below runs, publishes a winner per phase."""
+    """Local templates publish winners without an external tracking server."""
     assert _init_and_run(tmp_path, template)
 
 
@@ -429,3 +441,25 @@ def test_init_losing_publish_race_preserves_other_writer(
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "other process\n"
     assert not list(tmp_path.glob(".starter.yaml.*.tmp"))
+
+
+def test_init_points_to_template_prerequisites_and_adaptation(tmp_path: Path) -> None:
+    """The generated header owns setup and adaptation advice before launch commands."""
+    result = CliRunner().invoke(cli_main, ["init", "--template", "mlflow", "-o", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "read the template header for prerequisites and trainer adaptation" in result.output
+    assert result.output.index("template header") < result.output.index("phasesweep validate")
+    assert "Before running:" not in result.output
+    config = (tmp_path / "mlflow.yaml").read_text(encoding="utf-8")
+    assert "Remove or replace the demo cost constraint and mlflow_required gates" in config
+    assert "first mlflow.start_run() or mlflow.log_* resumes MLFLOW_RUN_ID" in config
+    assert "mlflow.active_run().info.run_id" in config
+
+
+def test_init_help_identifies_mlflow_prerequisites() -> None:
+    """MLflow help names its server and experiment prerequisites."""
+    result = CliRunner().invoke(cli_main, ["init", "--help"])
+    assert result.exit_code == 0
+    text = " ".join(result.output.split())
+    assert "mlflow needs a tracking server and an existing experiment" in text
+    assert "Every one runs as written" not in text

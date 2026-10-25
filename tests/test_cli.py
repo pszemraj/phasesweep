@@ -364,7 +364,7 @@ def test_help_registers_commands_and_options() -> None:
     init_help = runner.invoke(cli_main, ["init", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "-o, --output PATH" in init_help.output
-    assert "--template [starter|architectures|argparse|chained|noisy]" in init_help.output
+    assert "--template [starter|architectures|argparse|chained|mlflow|noisy]" in init_help.output
     assert "--list" in init_help.output
 
     recovery_help = runner.invoke(cli_main, ["mcp", "recover-run", "--help"], terminal_width=120)
@@ -572,6 +572,10 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     # Grid shuffles with a fixed seed when none is set, so it reproduces unseeded.
     assert "phase 'depth': sampler=grid (resumable, reproducible)" in result.output
+    assert (
+        "grid order: configurations are shuffled by sampler.seed, not listed choice order"
+        in result.output
+    )
     assert "phase 'lr': sampler=tpe seed=0 (resumable, reproducible)" in result.output
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
     # Under several workers a model sampler's draws depend on which trials have finished.
@@ -679,36 +683,25 @@ def test_validate_does_not_warn_when_tpe_leaves_startup(tmp_path: Path, phase_bo
     assert "warning:" not in result.output
 
 
-def test_dry_run_warns_when_tpe_never_leaves_startup(tmp_path: Path, caplog) -> None:
-    caplog.set_level(logging.INFO)
-    exp = make_experiment(
-        trial_command="echo {overrides}",
-        phases=[
+@pytest.mark.parametrize(
+    ("phase", "expected_warnings"),
+    [
+        pytest.param(
             Phase(
                 name="lr",
                 n_trials=5,
                 search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
-            )
-        ],
-    )
-
-    run_experiment(exp, dry_run=True)
-
-    warnings = [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
-    assert [(r.levelno, r.getMessage()) for r in warnings] == [
-        (logging.WARNING, f"DRY RUN {_TPE_STARTUP_WARNING}")
-    ]
-
-
-@pytest.mark.parametrize(
-    "phase",
-    [
+            ),
+            [(logging.WARNING, f"DRY RUN {_TPE_STARTUP_WARNING}")],
+            id="startup-only-budget",
+        ),
         pytest.param(
             Phase(
                 name="lr",
                 n_trials=11,
                 search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
             ),
+            [],
             id="budget-exceeds-startup",
         ),
         pytest.param(
@@ -718,22 +711,30 @@ def test_dry_run_warns_when_tpe_never_leaves_startup(tmp_path: Path, caplog) -> 
                 sampler=Sampler(type="random", seed=0),
                 search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
             ),
+            [],
             id="random-sampler",
         ),
         pytest.param(
-            Phase(name="lr", n_trials=1, fixed_overrides={"lr": 0.1}), id="empty-search-space"
+            Phase(name="lr", n_trials=1, fixed_overrides={"lr": 0.1}),
+            [],
+            id="empty-search-space",
         ),
     ],
 )
-def test_dry_run_does_not_warn_when_tpe_leaves_startup(
-    tmp_path: Path, caplog, phase: Phase
+def test_dry_run_reports_tpe_startup_warnings(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    phase: Phase,
+    expected_warnings: list[tuple[int, str]],
 ) -> None:
+    """Only a nonempty TPE search confined to startup warns, with the exact diagnostic."""
     caplog.set_level(logging.INFO)
     exp = make_experiment(trial_command="echo {overrides}", phases=[phase])
 
     run_experiment(exp, dry_run=True)
 
-    assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+    warnings = [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+    assert [(r.levelno, r.getMessage()) for r in warnings] == expected_warnings
 
 
 _ARGPARSE_BOOLEAN_WARNING = (
@@ -1452,6 +1453,8 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 1
     fresh = capsys.readouterr()
     assert "No study directory at" in fresh.err
+    assert "fix: Use the same config and --set overrides" in fresh.err
+    assert fresh.err.count("Use the same config and --set overrides") == 1
     assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 1
     capsys.readouterr()
 

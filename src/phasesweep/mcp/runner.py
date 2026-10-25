@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
+    PhaseTimeoutError,
     PublishedStudyMissingError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -175,6 +176,7 @@ def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, o
 
 # First matching exception type determines the durable failure code.
 _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
+    (PhaseTimeoutError, "timeout"),
     (ProcessCleanupUncertainError, "cleanup_uncertain"),
     (ExperimentLockBusyError, "experiment_busy"),
     (ArtifactRootConflictError, "artifact_root_conflict"),
@@ -257,7 +259,13 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         return _cleanup_uncertain_payload([error.action])
-    return {"code": code, "stage": failure_stage, **_routed_next_steps(error)}
+    steps = _routed_next_steps(error)
+    if code == "experiment_busy":
+        steps["remediation"] = (
+            f"{steps['remediation']} Stop it only if the user wants it stopped and through "
+            "the interface that started it; MCP cannot cancel a CLI operation."
+        )
+    return {"code": code, "stage": failure_stage, **steps}
 
 
 def _cleanup_steps(

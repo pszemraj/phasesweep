@@ -32,8 +32,6 @@ trial_command: string (required)
 
 # ---------- Objective ----------
 # A read by metric.extractor that fails, or that yields a value that is not a finite number, fails the trial.
-# Warning: under Transformers load_best_model_at_end=True, a wandb or mlflow position cannot show which checkpoint was scored. Use json_envelope then.
-# validate and run --dry-run warn when trainer_config, fixed_overrides or trial_command enables it under a wandb or mlflow metric.extractor.
 
 # Primary objective: the scalar each trial reports and how trials rank. PhaseSweep does no pruning, evaluation scheduling or checkpoint selection.
 # Selection records advisory confound verdicts on the winner, which never block selection or publication.
@@ -445,7 +443,7 @@ observe: list[object] = []
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md for run ownership, result delivery and sync-tracking.
 mlflow: object | null = null
   # MLflow tracking server: an http or https URL, databricks, or databricks://profile. Local file and sqlite URIs are rejected.
-  # An http URL is checked and normalized as WandbTarget.base_url is. A databricks profile with whitespace or a path is rejected.
+  # An http URL is checked and normalized as metric.extractor.base_url (wandb) is. A databricks profile with whitespace or a path is rejected.
   # The normalized value goes to the MLflow client and to the trainer as MLFLOW_TRACKING_URI. Put credentials in environment variables, not the URI.
   tracking_uri: string (required)
 
@@ -457,10 +455,10 @@ mlflow: object | null = null
   # Exact nonempty name of an existing active MLflow experiment, for example bart-search.
   experiment_name: string | null = null
 
-  # Who creates and ends each attempt's run. managed: PhaseSweep creates it before the trainer starts and supplies MLFLOW_RUN_ID.
+  # Who creates and ends each attempt's run. managed: PhaseSweep supplies MLFLOW_RUN_ID; the trainer's first mlflow.start_run() or mlflow.log_* resumes it.
+  # Log everything into that one run. To close and reopen it, save mlflow.active_run().info.run_id and pass the saved ID to mlflow.start_run(run_id=...).
+  # Warning: MLflow consumes the environment ID on resume. Do not call mlflow.set_experiment() with another name or log into a separate run.
   # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(run_id) inside it.
-  # Warning: a trainer that starts a different run instead of attaching to the managed ID logs evidence PhaseSweep does not read.
-  # Recommended: managed when the trainer can honor MLFLOW_RUN_ID, and trainer for code that must own start_run(). Disable autologging and nested runs either way.
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md#choose-run-ownership
   run_mode: "managed" | "trainer" = "managed"
 
@@ -481,7 +479,7 @@ mlflow: object | null = null
 
 # Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
 # The per-attempt PHASESWEEP_* names, listed in https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract, fail config load.
-# See: the MLflow section rules and WandbTarget for the tracking variables it may set.
+# See: mlflow and metric.extractor.entity (wandb) for the tracking variables it may set.
 # Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
 # Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
 env: map[string, string] = {}
@@ -625,7 +623,8 @@ WandbExtractor:
 # The W&B target and polling fields of the wandb reader and the wandb_summary_required gate. Within a phase, every W&B reader and gate agrees on all five.
 # For seed ranking, phases[].repeats creates one trial and tracked run per seed and ranks configuration groups.
 # A run that ends failed, crashed, killed or preempted fails the read at once, and one that has not finished is polled until timeout_seconds runs out.
-# Requires: the phasesweep[wandb] extra, and a trainer that honors the managed WANDB_* variables, including WANDB_RESUME never, and finishes its run.
+# Requires: the phasesweep[wandb] extra. The trainer's wandb.init() picks up the managed WANDB_* variables, including WANDB_RESUME never.
+# Pass no project, entity or id to wandb.init(); log into that one run, and call wandb.finish() only after the final log.
 # Requires: env.WANDB_BASE_URL, WANDB_ENTITY and WANDB_PROJECT, when set, match the target, env.WANDB_RESUME, when set, is never, and env has no WANDB_RUN_ID.
 # Requires: no WANDB_MODE of offline, dryrun or disabled and no WANDB_DISABLED of 1, true, yes or on, in any case, in env or, at launch, inherited.
 WandbTarget:

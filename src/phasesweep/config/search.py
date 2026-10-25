@@ -18,6 +18,7 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
+from phasesweep.errors import NEW_STUDY_STEP
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -463,7 +464,9 @@ def retry_target_ceiling(phase: Phase, *, finished: int, measured: int) -> int |
     return finished + grid_cardinality(phase) - measured
 
 
-def fixed_configuration_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
+def fixed_configuration_target_refusal(
+    phase: Phase, *, finished: int, measured: int
+) -> tuple[str, str] | None:
     """Refuse extra measurements of an already completed fixed configuration.
 
     A fixed configuration keeps at most one COMPLETE result, feasible or not.
@@ -476,8 +479,7 @@ def fixed_configuration_target_refusal(phase: Phase, *, finished: int, measured:
         ones left out, zero when the study does not exist yet.
     :param int measured: How many of those attempts are COMPLETE, whether or
         not they are feasible.
-    :return str | None: The refusal, which names the fix, or ``None`` when the
-        target is allowed.
+    :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the target is allowed.
     """
     if phase_draws(phase):
         return None
@@ -488,20 +490,20 @@ def fixed_configuration_target_refusal(phase: Phase, *, finished: int, measured:
     if measured >= 1:
         return (
             f"Phase {name!r} is a fixed configuration that already has a COMPLETE or "
-            f"INFEASIBLE trial; n_trials={target} would run the same configuration again. "
-            f"Keep n_trials at {finished}, or use repeats to measure seed noise."
+            f"INFEASIBLE trial; n_trials={target} would run the same configuration again.",
+            f"Keep n_trials at {finished}, or use repeats to measure seed noise.",
         )
     if finished == 0:
         return (
             f"Phase {name!r}: n_trials={target} with an empty search_space would run {target} "
-            "identical trials. Use n_trials: 1 for a fixed configuration, or repeats to "
-            "measure seed noise."
+            "identical trials.",
+            "Use n_trials: 1 for a fixed configuration, or repeats to measure seed noise.",
         )
     plural = "" if finished == 1 else "s"
     return (
         f"Phase {name!r} is a fixed configuration with {finished} failed attempt{plural} and "
-        "no completed one; raising n_trials retries it one attempt at a time, so use at most "
-        f"{finished + 1}, not {target}."
+        "no completed one; raising n_trials retries it one attempt at a time.",
+        f"Use n_trials at most {finished + 1}, not {target}.",
     )
 
 
@@ -516,7 +518,7 @@ def grid_cardinality(phase: Phase) -> int:
     )
 
 
-def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | None:
+def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> tuple[str, str] | None:
     """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
     Finished failures remain spent. Raising the target may retry each failed
@@ -526,7 +528,7 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | 
     :param Phase phase: Phase whose target is checked.
     :param int finished: Finished attempts, excluding interruptions.
     :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
-    :return str | None: Refusal when the target exceeds the available cells.
+    :return tuple[str, str] | None: Refusal diagnosis and remedy when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
@@ -534,9 +536,12 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | 
     cardinality = grid_cardinality(phase)
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
-        f"attempts: {finished} finished attempts and {measured} COMPLETE or INFEASIBLE cells "
+        f"attempts: {finished} finished attempt{'s' if finished != 1 else ''} and "
+        f"{measured} COMPLETE or INFEASIBLE cell{'s' if measured != 1 else ''} "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
-        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated."
+        "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
+        f"Set phases[{phase.name}].n_trials to at most {maximum}. "
+        f"To enlarge the grid instead, change the search space. {NEW_STUDY_STEP}",
     )
 
 

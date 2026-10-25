@@ -35,12 +35,15 @@ from phasesweep.engine.fingerprints import (
 )
 from phasesweep.engine.ledger import (
     log_storage_read_failure,
+    read_phase_studies,
     read_phase_trials,
     read_trial_stats,
     resolved_ledger_path,
     validate_ledger,
 )
+from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.optuna import (
+    _finished_trial_count,
     _PhaseTrialStats,
     _published_phase_trial_refs,
     _published_trial_history_available,
@@ -59,15 +62,24 @@ from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
+    RankedGroup,
     ReduceName,
     RepeatsRecord,
     RepeatsSummary,
     _repeats_summary,
     _validate_repeats_block,
     group_labels_for,
+    ranked_group,
     repeat_axis,
 )
-from phasesweep.engine.selection import _cost_advisory, _rank_groups
+from phasesweep.engine.selection import (
+    TieGroupComparison,
+    _cost_advisory,
+    _eligible,
+    _no_feasible_remedy,
+    _rank_groups,
+    tie_group_comparisons,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     DURATION_ATTR,
@@ -83,7 +95,13 @@ from phasesweep.engine.state import (
     _trial_interrupted,
     _validate_observed_block,
 )
-from phasesweep.errors import OperatorAction
+from phasesweep.engine.study_policy import (
+    _awaits_cleanup_recovery,
+    _config_retires_abort,
+    _load_phase_policy_state,
+    _recovery_advice,
+)
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
@@ -97,6 +115,10 @@ generation's own recorded summary, so they describe the result as it was
 produced. ``"current_config"``: no represented result is available, so the
 currently loaded config describes the status payload.
 """
+
+CostAdvisoryStatus: TypeAlias = Literal[
+    "not_configured", "unavailable", "no_cheaper_configuration", "available"
+]
 
 
 class EngineStatus(typing.TypedDict):
@@ -149,6 +171,10 @@ class PhaseWinnerView:
     is_published: bool = False
     config_matches_current: bool | None = None
     cost_advisory: str | None = None
+    cost_advisory_status: CostAdvisoryStatus = "not_configured"
+    tie_groups: list[TieGroupComparison] | None = None
+    # Frozen population identity used to reconstruct display details from retained trials.
+    confound_detail: Mapping[str, object] | None = None
 
 
 def _phase_status_payloads(
@@ -282,6 +308,7 @@ def _winner_view(
             incomplete=bool(completion.get("incomplete", False)),
             source=source,
             confound=confound,
+            confound_detail=confound_block,
             observed=observed,
             repeats=None if repeats is None else _repeats_summary(repeats),
             repeats_detail=repeats,
@@ -376,15 +403,28 @@ def _represented_winners(
                     _experiment_semantic_fingerprint(producing),
                     phase_count=len(producing.phases),
                 )
+            advisory = winner_cost_advisory(experiment, view) if config_matches is True else None
+            tie_groups = winner_tie_groups(experiment, view)
+            cost_status = cost_advisory_status(
+                experiment,
+                name,
+                advisory,
+                available=config_matches is True and tie_groups is not None,
+            )
+            if config_matches is not True and cost_status == "not_configured":
+                producing = _load_generation_experiment(
+                    _experiment_dir(experiment), view_generation
+                )
+                cost_status = cost_advisory_status(producing, name, None, available=False)
             chosen.append(
                 replace(
                     view,
                     generation_id=view_generation,
                     is_published=is_published,
                     config_matches_current=config_matches,
-                    cost_advisory=(
-                        winner_cost_advisory(experiment, view) if config_matches is True else None
-                    ),
+                    cost_advisory=advisory,
+                    cost_advisory_status=cost_status,
+                    tie_groups=tie_groups,
                 )
             )
     return chosen
@@ -406,41 +446,119 @@ def require_study(experiment: Experiment) -> None:
         )
     ):
         raise StudyStorageUnavailableError(
-            f"No study directory at {_experiment_dir(experiment)} contains a started study. "
-            "Use the same config and --set overrides as run.",
+            f"No study directory at {_experiment_dir(experiment)} contains a started study.",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Use the same config and --set overrides as the run that created the study. "
+                "If no run has started, run `phasesweep run CONFIG` first."
+            ),
         )
 
 
-def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
-    """Recompute cost advice from retained repeat groups under the current display config.
+def cost_advisory_status(
+    experiment: Experiment, phase_name: str, advisory: str | None, *, available: bool
+) -> CostAdvisoryStatus:
+    """Distinguish a disabled cost comparison from its checked and unavailable outcomes.
 
-    :param Experiment experiment: Current selection semantics and optional cost key.
+    :param Experiment experiment: Display config carrying the optional cost key.
+    :param str phase_name: Phase whose cost comparison is described.
+    :param str | None advisory: A cheaper configuration, if one was found.
+    :param bool available: Whether the winner agrees with the display config and its retained groups are readable.
+    :return CostAdvisoryStatus: Whether cost advice was configured, available, or found.
+    """
+    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
+    if phase is None:
+        return "unavailable"
+    if phase.cost_key is None:
+        return "not_configured"
+    if not available:
+        return "unavailable"
+    return "no_cheaper_configuration" if advisory is None else "available"
+
+
+def _winner_ranked_groups(
+    experiment: Experiment, winner: PhaseWinnerView
+) -> tuple[RankedGroup, list[RankedGroup]] | None:
+    """Reconstruct the exact repeat-group population that selected one winner.
+
+    :param Experiment experiment: Config locating the retained phase ledger.
+    :param PhaseWinnerView winner: Winner carrying its frozen confound population and reducer.
+    :return tuple[RankedGroup, list[RankedGroup]] | None: Winner and recorded groups, or null when unavailable.
+    """
+    if winner.repeats is None or winner.confound_detail is None:
+        return None
+    raw_groups = winner.confound_detail["ranked_groups"]
+    if not isinstance(raw_groups, list):
+        return None
+    if winner.repeats_detail is None:
+        return None
+    try:
+        read = read_phase_trials(validate_ledger(experiment), winner.phase)
+    except StudyStorageUnavailableError:
+        return None
+    if read is None:
+        return None
+    trials = {trial.number: trial for trial in read.trials}
+    groups = []
+    for numbers in raw_groups:
+        if not isinstance(numbers, list) or not all(isinstance(n, int) for n in numbers):
+            raise TypeError("validated repeat-group trial numbers are not integer lists")
+        if any(n not in trials or trials[n].value is None for n in numbers):
+            return None
+        members: list[tuple[int, float]] = []
+        for number in numbers:
+            value = trials[number].value
+            if value is None:
+                return None
+            members.append((number, value))
+        groups.append(
+            ranked_group(
+                members,
+                {
+                    k: v
+                    for k, v in trials[numbers[-1]].params.items()
+                    if k != winner.repeats_detail["key"]
+                },
+                winner.repeats["reduce"],
+            )
+        )
+    winning = next((group for group in groups if group.representative == winner.trial_number), None)
+    return None if winning is None else (winning, groups)
+
+
+def winner_tie_groups(
+    experiment: Experiment, winner: PhaseWinnerView
+) -> list[TieGroupComparison] | None:
+    """Compare overlapping configurations from the winner's recorded population.
+
+    :param Experiment experiment: Config locating the retained phase ledger.
+    :param PhaseWinnerView winner: Winner whose ranked groups anchor the comparisons.
+    :return list[TieGroupComparison] | None: Overlapping groups, or null when retained trials are unavailable.
+    """
+    if winner.repeats is None:
+        return []
+    ranking = _winner_ranked_groups(experiment, winner)
+    return None if ranking is None else tie_group_comparisons(*ranking)
+
+
+def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
+    """Compare costs within the population that selected the represented winner.
+
+    :param Experiment experiment: Display config supplying the optional cost key.
     :param PhaseWinnerView winner: Winner whose repeat group anchors the window.
     :return str | None: Advisory text when a cheaper eligible group is in the window.
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
     if phase is None or phase.cost_key is None or winner.repeats is None:
         return None
-    axis = repeat_axis(phase)
-    if axis is None:
-        return None
-    try:
-        read = read_phase_trials(validate_ledger(experiment), phase)
-    except StudyStorageUnavailableError:
-        return None
-    if read is None:
-        return None
-    ranking = _rank_groups(read.trials, experiment, axis)
-    numbers = tuple(winner.repeats["member_trials"])
-    group = next((group for group in ranking.groups if group.numbers == numbers), None)
+    ranking = _winner_ranked_groups(experiment, winner)
     return (
         None
-        if group is None
+        if ranking is None
         else _cost_advisory(
             phase,
-            group,
-            ranking.groups,
+            ranking[0],
+            ranking[1],
             goal=experiment.metric.goal,
         )
     )
@@ -932,6 +1050,47 @@ def _cli_phase_payloads(
             }
         )
     return cli_phases
+
+
+def unpublished_winner_step(experiment: Experiment) -> str | None:
+    """Give one publication remedy from recorded failures, suppressing it during live work.
+
+    :param Experiment experiment: Current config used to inspect durable phase policy.
+    :return str | None: The recorded remedy or rerun instruction; none while busy or if storage is unreadable.
+    """
+    if experiment_is_busy(experiment):
+        return None
+    if experiment.resolved_storage is None:
+        return "Rerun the same config to start the run again; storage: null keeps no completed trials between runs."
+    try:
+        ledger = validate_ledger(experiment)
+        studies = read_phase_studies(ledger)
+    except StudyStorageUnavailableError:
+        return None
+    for phase in experiment.phases:
+        study = studies[phase.name]
+        if study is None:
+            continue
+        trials = study.get_trials(deepcopy=False)
+        abort = _load_phase_policy_state(study).abort
+        if abort is not None and (
+            _awaits_cleanup_recovery(study, abort)
+            or not _config_retires_abort(phase, trials, abort)
+        ):
+            cause = str(abort["cause"]).rstrip(".")
+            advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
+            return f"Phase {phase.name!r}: {cause}. fix: {advice}"
+        if _finished_trial_count(trials) < phase.n_trials:
+            continue
+        axis = repeat_axis(phase)
+        eligible = (
+            any(_eligible(trial, experiment) for trial in trials)
+            if axis is None
+            else bool(_rank_groups(trials, experiment, axis).groups)
+        )
+        if not eligible:
+            return f"Phase {phase.name!r} has no feasible winner. fix: {_no_feasible_remedy(experiment, trials, phase.name)}"
+    return "Rerun the same config to resume and publish; completed trials are kept."
 
 
 def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:

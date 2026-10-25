@@ -16,7 +16,12 @@ import optuna
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import grid_search_space, phase_draws, sampler_search_space
+from phasesweep.config.search import (
+    grid_search_space,
+    phase_draws,
+    retry_target_ceiling,
+    sampler_search_space,
+)
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import (
     _assess_population,
@@ -25,8 +30,14 @@ from phasesweep.engine.confound import (
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
-from phasesweep.engine.optuna import _draw_positions, _trial_count_state
+from phasesweep.engine.optuna import (
+    _draw_positions,
+    _finished_trial_count,
+    _measured_trial_count,
+    _trial_count_state,
+)
 from phasesweep.engine.repeats import (
+    _NOISE_STANDARD_ERRORS,
     RankedGroup,
     RepeatAxis,
     RepeatsRecord,
@@ -49,12 +60,72 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger("phasesweep.engine.selection")
 
 # Grid cells without a successful trial that one advisory spells out before it counts the rest.
 _MAX_LISTED_CELLS = 10
+
+
+class TieGroupComparison(typing.TypedDict):
+    """One configuration compared with the selected repeat group."""
+
+    trial_number: int
+    params: JsonObject
+    gap: float
+    combined_se: float
+    threshold: float
+
+
+def tie_group_comparisons(
+    winner: RankedGroup, groups: Sequence[RankedGroup]
+) -> list[TieGroupComparison]:
+    """Describe other configurations within two combined standard errors.
+
+    :param RankedGroup winner: Selected repeat group.
+    :param Sequence[RankedGroup] groups: Groups from the same ranked population.
+    :return list[TieGroupComparison]: Parameters, objective gap and noise threshold for each overlap.
+    """
+    return [
+        {
+            "trial_number": group.representative,
+            "params": json_object(group.params),
+            "gap": abs(group.aggregate - winner.aggregate),
+            "combined_se": combined_standard_error(winner, group),
+            "threshold": _NOISE_STANDARD_ERRORS * combined_standard_error(winner, group),
+        }
+        for group in groups
+        if dict(group.params) != dict(winner.params) and within_noise(winner, group)
+    ]
+
+
+def _no_feasible_remedy(
+    experiment: Experiment, trials: Sequence[optuna.trial.FrozenTrial], phase_name: str | None
+) -> str:
+    """Name the failed-trial retry or infeasible-bound remedy for the recorded population.
+
+    :param Experiment experiment: Config whose storage controls trial retention.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Recorded phase attempts.
+    :param str | None phase_name: Phase supplying its accepted trial budget, if known.
+    :return str: Operator steps appropriate to failures, bounds, and storage.
+    """
+    evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
+    if experiment.resolved_storage is None:
+        return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
+    infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
+    if infeasible:
+        return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
+    if phase_name is not None:
+        phase = experiment.phase(phase_name)
+        finished = _finished_trial_count(trials)
+        ceiling = retry_target_ceiling(
+            phase, finished=finished, measured=_measured_trial_count(trials)
+        )
+        target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
+        return f"{evidence} Fix the failure, then raise phases[{phase.name}].n_trials {target} in the config and rerun to retry failed attempts. {NEW_STUDY_STEP}"
+    return f"{evidence} Fix the failure, then raise the phase's n_trials and rerun to retry failed attempts. {NEW_STUDY_STEP}"
 
 
 @dataclass
@@ -206,13 +277,15 @@ def select_winner(
             f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
             "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
             "why each failed or infeasible trial finished that way."
-            + _metric_bounds_note(trials, experiment)
+            + _metric_bounds_note(trials, experiment),
+            remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
     if not survivors:
         raise _no_feasible_error_type(trials)(
             "No completed trials in phase. The phase's trials.csv records why each "
             "failed or infeasible trial finished that way; trainer output is in its "
-            "trial_* directory." + _metric_bounds_note(trials, experiment)
+            "trial_* directory." + _metric_bounds_note(trials, experiment),
+            remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
 
     winning: RankedGroup | None = None
@@ -279,6 +352,14 @@ def select_winner(
         incomplete_group=() if ranking is None else ranking.incomplete_group,
     )
     flagged = _describe_flagged(confound)
+    if winning is not None and ranking is not None:
+        for comparison in tie_group_comparisons(winning, ranking.groups):
+            flagged.append(
+                f"group {comparison['trial_number']} params={comparison['params']} versus "
+                f"winner params={dict(winning.params)}, "
+                f"gap={comparison['gap']:.6g}, combined_se={comparison['combined_se']:.6g}, "
+                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se={comparison['threshold']:.6g}"
+            )
     if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
         flagged.append(
             _evaluation_point_remedy(
@@ -286,15 +367,6 @@ def select_winner(
                 axis=confound["checks"]["evaluation_point"]["detail"]["axis"],
             )
         )
-    if winning is not None and ranking is not None:
-        for group in ranking.groups:
-            if dict(group.params) != dict(winning.params) and within_noise(winning, group):
-                flagged.append(
-                    f"group {group.representative} params={dict(group.params)} versus "
-                    f"winner params={dict(winning.params)}, "
-                    f"gap={abs(group.aggregate - winning.aggregate):.6g}, "
-                    f"combined_se={combined_standard_error(winning, group):.6g}"
-                )
     if flagged and emit_advisories:
         log.warning(
             "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "

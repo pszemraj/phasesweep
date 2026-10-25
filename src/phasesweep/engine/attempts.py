@@ -79,10 +79,15 @@ class _PreflightCleanupReport:
     recovered_attempt_generations: dict[str, str] = field(default_factory=dict)
     reaped_running_trials: int = 0
     cleanup_recovered_trials: int = 0
+    retained_results: int = 0
     uncertain_attempt_ids: set[str] = field(default_factory=set)
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
     error: BaseException | None = None
+    process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
+    """Inspected attempts mapped to whether their live group needs termination."""
+    inspection_messages: dict[_AttemptRecord, str] | None = None
+    """Deferred preview messages, replaced when a study requires stricter inspection."""
 
     def mark_uncertain(self, error: BaseException) -> None:
         """Record the first cleanup uncertainty and fail the aggregate closed."""
@@ -699,7 +704,7 @@ def _registry_attempt_fail_stale_trial(
             if study is not None and trial is not None:
                 _record_recovery_interruption(study, trial)
 
-        _resolve_attempt(
+        report.process_actions[record] = _resolve_attempt(
             record,
             context=f"Attempt registry entry {entry_path}",
             evidence_action=OperatorAction.RESTORE_TREE,
@@ -786,6 +791,7 @@ def _registry_attempt_fail_stale_trial(
         trial,
         record=_registry_attempt_record(entry, entry_path),
         artifact_root=entry_path.parent.parent,
+        report=report,
         failure_message=(
             f"Process cleanup completed for registered attempt {entry['attempt_id']}, "
             f"but its stale RUNNING trial {trial.number} in study "
@@ -836,12 +842,14 @@ def _preflight_active_attempts(
             inspected[attempt_id] = entry["generation_id"]
             try:
                 if not confirm:
-                    _resolve_attempt(
-                        _registry_attempt_record(entry, entry_path),
+                    record = _registry_attempt_record(entry, entry_path)
+                    report.process_actions[record] = _resolve_attempt(
+                        record,
                         context=f"Attempt registry entry {entry_path}",
                         evidence_action=OperatorAction.RESTORE_TREE,
                         lifecycle_settles=True,
                         confirm=False,
+                        inspection_messages=report.inspection_messages,
                     )
                     continue
                 outcome = _registry_attempt_fail_stale_trial(entry, entry_path, report)
@@ -907,7 +915,8 @@ def _resolve_attempt(
     lifecycle_settles: bool,
     confirm: bool,
     before_terminate: Callable[[], None] | None = None,
-) -> None:
+    inspection_messages: dict[_AttemptRecord, str] | None = None,
+) -> bool:
     """Inspect or clean one attempt using its durable lifecycle and process identity.
 
     Confirmed exited attempts and allocated attempts without identities need no signal
@@ -920,14 +929,28 @@ def _resolve_attempt(
     :param bool lifecycle_settles: Whether lifecycle evidence can prove cleanup.
     :param bool confirm: Clean the process group; False validates evidence without signalling.
     :param Callable[[], None] | None before_terminate: Preserve the owning trainer outcome before terminating a live group.
+    :param dict[_AttemptRecord, str] | None inspection_messages: Collect one preview message per attempt instead of logging immediately.
     :raises ProcessCleanupUncertainError: Invalid or mismatched lifecycle/identity,
         or unconfirmed process cleanup.
     :raises StudyStorageUnavailableError: Recovery intent could not be recorded durably before signalling.
+    :return bool: Whether inspection would terminate a live group, or confirmation terminated one.
     """
     context = (
         f"{context}: attempt={record.attempt_id} phase={record.phase_name!r} "
         f"trial_dir={record.trial_dir}"
     )
+    label = f"Attempt {record.attempt_id} phase={record.phase_name!r} trial={record.trial_number}"
+
+    def report(message: str) -> None:
+        """Defer a preview until all discovery sources have inspected the attempt.
+
+        :param str message: Operator-facing process or lifecycle decision.
+        """
+        if inspection_messages is None:
+            log.warning(message)
+        else:
+            inspection_messages[record] = message
+
     if lifecycle_settles:
         try:
             lifecycle = read_attempt_lifecycle(
@@ -945,13 +968,11 @@ def _resolve_attempt(
         )
         if resolution != "identity":
             assert lifecycle is not None
-            log.warning(
-                "%s: lifecycle=%s rc=%s confirms cleanup without signalling.",
-                context,
-                lifecycle.state,
-                lifecycle.return_code,
+            report(
+                f"{label}: lifecycle={lifecycle.state} rc={lifecycle.return_code} "
+                "confirms cleanup without signalling."
             )
-            return
+            return False
     try:
         identity = read_stale_process_identity(
             record.trial_dir, expected_attempt_id=record.attempt_id
@@ -969,18 +990,23 @@ def _resolve_attempt(
             "gone": "--confirm will reconcile this attempt without signalling",
             "refuse": "--confirm will refuse cleanup and leave this attempt unresolved",
         }[decision.action]
-        log.warning(
-            "%s: training process group: %s (pid=%s pgid=%s); %s.",
-            context,
-            decision.reason,
-            identity.pid,
-            identity.pgid,
-            action,
+        report(
+            f"{label}: training process group: {decision.reason} "
+            f"(pid={identity.pid} pgid={identity.pgid}); {action}."
         )
-        return
+        return decision.action == "terminate"
+    terminated = False
+
+    def record_termination() -> None:
+        """Preserve interruption intent before marking the group for termination."""
+        nonlocal terminated
+        if before_terminate is not None:
+            before_terminate()
+        terminated = True
+
     if not cleanup_stale_trial_process(
         identity,
-        before_terminate=before_terminate,
+        before_terminate=record_termination,
     ):
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed. "
@@ -989,8 +1015,15 @@ def _resolve_attempt(
         )
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
     log.warning(
-        "%s: confirmed process cleanup (pid=%s pgid=%s).", context, identity.pid, identity.pgid
+        "%s: %s (pid=%s pgid=%s).",
+        label,
+        "terminated training process group; confirmed process cleanup"
+        if terminated
+        else "confirmed process cleanup without signalling",
+        identity.pid,
+        identity.pgid,
     )
+    return terminated
 
 
 def _recover_completed_trial(
@@ -999,6 +1032,7 @@ def _recover_completed_trial(
     *,
     record: _AttemptRecord,
     artifact_root: Path,
+    report: _PreflightCleanupReport | None = None,
 ) -> bool | None:
     """Accept a finished orphan through the producing configuration's extraction path.
 
@@ -1012,6 +1046,7 @@ def _recover_completed_trial(
     :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
     :param _AttemptRecord record: Attempt identity and original trial directory.
     :param Path artifact_root: Owning artifact root containing generation snapshots.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :return bool | None: True for recovered COMPLETE, False for unaccepted evidence, or None when shutdown leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
     :raises StudyStorageUnavailableError: Valid completed evidence could not be committed.
@@ -1111,10 +1146,14 @@ def _recover_completed_trial(
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
-    log.info(
-        "Recovered completed trainer evidence for trial %d in study %s",
+    if report is not None:
+        report.retained_results += 1
+    log.warning(
+        "Kept completed trial result: phase=%r trial=%d value=%g (attempt=%s).",
+        record.phase_name,
         trial.number,
-        study.study_name,
+        result.metric,
+        record.attempt_id,
     )
     return True
 
@@ -1126,6 +1165,7 @@ def _fail_stale_running_trial(
     failure_message: str,
     record: _AttemptRecord | None = None,
     artifact_root: Path | None = None,
+    report: _PreflightCleanupReport | None = None,
 ) -> bool:
     """Settle a resolved RUNNING trial using completed evidence when available.
 
@@ -1138,6 +1178,7 @@ def _fail_stale_running_trial(
         can no longer leak a process.
     :param _AttemptRecord | None record: Attempt record for recovering completed evidence.
     :param Path | None artifact_root: Artifact root containing the producing config snapshot.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
     :return bool: Whether the trial became terminal; False retains completed training during shutdown.
@@ -1154,7 +1195,7 @@ def _fail_stale_running_trial(
         ) from exc
     if record is not None and artifact_root is not None:
         recovered = _recover_completed_trial(
-            study, trial, record=record, artifact_root=artifact_root
+            study, trial, record=record, artifact_root=artifact_root, report=report
         )
         if recovered is None:
             return False

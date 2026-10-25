@@ -100,15 +100,22 @@ def _explain(*args: str) -> tuple[int, str, str]:
 
 
 @pytest.mark.parametrize(
-    ("version", "ref"),
-    [("0.3.11", "v0.3.11"), ("0.3.12.dev4+g123abcd.d20261023", "123abcd")],
+    ("version", "editable", "ref"),
+    [
+        ("0.3.11", False, "v0.3.11"),
+        ("0.3.12.dev4+g123abcd.d20261023", False, "main"),
+        ("0.3.13.dev0", False, "main"),
+        ("0.0.0+unknown", False, "main"),
+        ("0.3.11", True, "main"),
+    ],
 )
 def test_explain_links_pin_installed_release_or_source_revision(
-    monkeypatch: pytest.MonkeyPatch, version: str, ref: str
+    monkeypatch: pytest.MonkeyPatch, version: str, editable: bool, ref: str
 ) -> None:
-    """Installed help opens documentation for its release or exact SCM source revision."""
+    """Release help pins its tag; development and editable installs use main."""
     with monkeypatch.context() as patch:
         patch.setattr(reference, "__version__", version)
+        patch.setattr(reference, "_editable_install", lambda: editable)
         reference._packaged.cache_clear()
         try:
             code, out, err = _explain("metric.extractor")
@@ -117,6 +124,62 @@ def test_explain_links_pin_installed_release_or_source_revision(
             assert "See: docs/" not in out
         finally:
             reference._packaged.cache_clear()
+
+
+@pytest.mark.parametrize("editable", [False, True])
+def test_documentation_links_read_editable_install_metadata(
+    monkeypatch: pytest.MonkeyPatch, editable: bool
+) -> None:
+    """Editable metadata selects main even when the installed version is a release."""
+
+    class InstalledDistribution:
+        def read_text(self, filename: str) -> str:
+            assert filename == "direct_url.json"
+            return '{"dir_info": {"editable": ' + str(editable).lower() + "}}"
+
+    monkeypatch.setattr(reference, "distribution", lambda _name: InstalledDistribution())
+    monkeypatch.setattr(reference, "__version__", "0.3.12")
+    ref = "main" if editable else "v0.3.12"
+    assert (
+        reference.pin_documentation_links(
+            "https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md"
+        )
+        == f"https://github.com/pszemraj/phasesweep/blob/{ref}/docs/mlflow.md"
+    )
+
+
+def test_explain_mlflow_mode_gives_the_native_environment_contract() -> None:
+    """Managed-mode help keeps every log in the supplied native run."""
+    code, out, err = _explain("mlflow.run_mode")
+    assert code == 0 and not err
+    assert "first mlflow.start_run() or mlflow.log_* resumes it" in out
+    assert "mlflow.active_run().info.run_id" in out
+    assert "mlflow.start_run(run_id=...)" in out
+    assert "Do not call mlflow.set_experiment() with another name" in out
+
+
+def test_explain_wandb_gives_the_native_environment_contract() -> None:
+    """W&B help names identity overrides and premature finish as contract violations."""
+    code, out, err = _explain("metric.extractor")
+    assert code == 0 and not err
+    assert "Pass no project, entity or id to wandb.init()" in out
+    assert "wandb.finish() only after the final log" in out
+
+
+@pytest.mark.parametrize(
+    ("entry", "config_key"),
+    [
+        pytest.param("env", "metric.extractor.entity", id="environment"),
+        pytest.param("mlflow.tracking_uri", "metric.extractor.base_url", id="mlflow-target"),
+    ],
+)
+def test_explain_references_are_queryable(entry: str, config_key: str) -> None:
+    """Help references name config keys that explain accepts."""
+    code, out, err = _explain(entry)
+    assert code == 0 and not err
+    assert "WandbTarget" not in out
+    assert config_key in out
+    assert _explain(config_key)[0] == 0
 
 
 def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:

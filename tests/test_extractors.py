@@ -1482,3 +1482,123 @@ def test_log_regex_first_hashes_invalid_utf8_suffix_without_decoding_it(tmp_path
     assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == 1.0
     assert provenance["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
     assert provenance["source"]["size_bytes"] == len(raw)
+
+
+def test_wandb_real_sdk_missing_run_polls_until_the_visibility_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK's wrapped missing-run error remains visible after all allowed polls."""
+    public = pytest.importorskip("wandb.apis.public")
+    from phasesweep.evidence.wandb import WandbRunMissingError
+
+    clock = _fake_wandb_clock(monkeypatch)
+    lookups: list[object] = []
+
+    class Transport:
+        def execute_graphql(
+            self, query: object, variables: object, **kwargs: object
+        ) -> dict[str, None]:
+            lookups.append(variables)
+            return {"project": None}
+
+    def initialize(self, overrides: object = None, timeout: object = None) -> None:
+        self.settings = {"entity": "entity", "project": "project"}
+        self._runs = {}
+        self._service_api = Transport()
+        self.api_key = None
+
+    monkeypatch.setattr(public.Api, "__init__", initialize)
+    with pytest.raises(WandbRunMissingError) as refused:
+        _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=15)
+    assert refused.value.run_id == "attempt"
+    assert clock.now == 15
+    assert len(lookups) == 3
+
+
+@pytest.mark.parametrize(
+    "last_observation", ["missing", "running", "network", "summary", "permission"]
+)
+def test_wandb_missing_run_diagnostic_follows_the_last_observation(
+    monkeypatch: pytest.MonkeyPatch, last_observation: str
+) -> None:
+    """A later successful lookup, transport fault, or denial supersedes an earlier absence."""
+    public = pytest.importorskip("wandb.apis.public")
+    from requests import HTTPError, Response
+    from wandb.errors import CommError
+
+    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError, WandbSetupError
+
+    _fake_wandb_clock(monkeypatch)
+    calls = 0
+
+    class Api:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def run(self, path: str) -> SimpleNamespace:
+            nonlocal calls
+            calls += 1
+            if calls == 1 or last_observation == "missing":
+                raise CommError("private SDK message", exc=ValueError(f"Could not find run {path}"))
+            if last_observation == "network":
+                raise CommError("private SDK message", exc=ConnectionError("private token"))
+            if last_observation == "permission":
+                response = Response()
+                response.status_code = 403
+                raise CommError(
+                    "private SDK message", exc=HTTPError("private token", response=response)
+                )
+            return SimpleNamespace(
+                state="running" if last_observation == "running" else "finished", summary_metrics={}
+            )
+
+    monkeypatch.setattr(public, "Api", Api)
+    expected = (
+        WandbRunMissingError
+        if last_observation == "missing"
+        else WandbSetupError
+        if last_observation == "permission"
+        else WandbPollTimeout
+    )
+    with pytest.raises(expected) as refused:
+        _wandb_poll(required_keys=["loss"], poll_seconds=5, timeout_seconds=15)
+    assert type(refused.value) is expected
+    assert calls >= 2
+    assert "private" not in str(refused.value)
+    if isinstance(refused.value, WandbPollTimeout):
+        detail = str(refused.value.last_error)
+        assert "private" not in detail
+        assert "Could not find run" not in detail
+
+
+@pytest.mark.integration
+def test_wandb_missing_run_worker_names_target_and_init_overrides(
+    wandb_worker_sdk,
+    tmp_path: Path,
+) -> None:
+    """A missing-run deadline crosses the supervised worker with concrete init advice."""
+    wandb_worker_sdk("""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                raise ValueError(f"Could not find run {path}")
+    """)
+    source = WandbExtractor(
+        type="wandb",
+        entity="entity",
+        project="project",
+        metric_key="loss",
+        poll_seconds=0.01,
+        timeout_seconds=2,
+    )
+    context = make_trial_context(tmp_path)
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(context, source)
+    message = str(refused.value)
+    assert f"No W&B run {context.attempt_id!r} was found in entity/project" in message
+    assert "Call wandb.init() in the trainer" in message
+    assert "If it passes its own project, entity or id" in message
+    assert "remove those overrides" in message
+    assert "set the extractor's project and entity to match" in message
+    assert "Last observation: ValueError" not in message
+    assert len(message.splitlines()) == 1

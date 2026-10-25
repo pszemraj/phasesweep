@@ -85,7 +85,9 @@ def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
 
 def native_experiment(tmp_path):
     """Build the complete native example in an isolated artifact namespace."""
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(workdir=str(tmp_path), storage=None)
     return Experiment.model_validate(config)
 
@@ -202,7 +204,9 @@ def leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
 
 def remote_mlflow_example(tmp_path, monkeypatch):
     """Patch the MLflow request operations with in-process answers; return the native example config and the list collecting uploads."""
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(
         workdir=str(tmp_path / "runs"),
         storage=None,

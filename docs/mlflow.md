@@ -15,15 +15,18 @@ mlflow server --host 127.0.0.1 --port 5000 \
   --artifacts-destination /tmp/phasesweep-mlflow-demo/artifacts
 ```
 
-In another terminal, save the [complete configuration](../examples/mlflow.yaml) as `mlflow.yaml` in your working directory, then provision the experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
+In another terminal, generate the packaged MLflow template, provision its experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
 
 ```bash
+phasesweep init --template mlflow
 python -c 'from mlflow import MlflowClient; MlflowClient(tracking_uri="http://127.0.0.1:5000").create_experiment("phasesweep-native")'
 phasesweep validate mlflow.yaml
 phasesweep run mlflow.yaml
 phasesweep show-winners mlflow.yaml
 phasesweep status mlflow.yaml
 ```
+
+When adapting the template to your trainer, replace its command, `trainer_config` and objective metric key, and remove or replace the demo `cost` constraint and `mlflow_required` gates.
 
 This configuration launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
@@ -54,17 +57,20 @@ Controller tracking operations run in supervised workers outside GPU leases. Eac
 
 ## Choose run ownership
 
-In **managed** mode, PhaseSweep writes the trainer input, creates the native MLflow run named after the trial's `PHASESWEEP_RUN_NAME`, and persists its returned ID before acquiring a GPU or launching training. The trainer receives `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID`, and `MLFLOW_RUN_ID`. Resume that supplied run:
+In **managed** mode, PhaseSweep writes the trainer input, creates the native MLflow run named after the trial's `PHASESWEEP_RUN_NAME`, and persists its returned ID before acquiring a GPU or launching training. The trainer receives `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID`, and `MLFLOW_RUN_ID`. Its first `mlflow.start_run()` or `mlflow.log_*` call resumes that supplied run. Log every metric, including the final objective, into that one run. MLflow consumes the environment ID when it resumes and removes it on `end_run()`: if the trainer must close and reopen the run, first save `mlflow.active_run().info.run_id` and pass that saved ID to `mlflow.start_run(run_id=...)`. Do not call `mlflow.set_experiment()` with another name. A trainer that uses the native MLflow API needs no PhaseSweep import:
 
 ```python
-import os
 import mlflow
 
-with mlflow.start_run(run_id=os.environ["MLFLOW_RUN_ID"]):
+with mlflow.start_run():
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-After confirmed cleanup, PhaseSweep finishes a still-running managed run as FINISHED after success, FAILED after a failed trial, or KILLED after an [interruption](runtime.md#interrupted-trials-rerun). Interrupted reruns receive new managed runs. Terminal statuses are preserved; `phasesweep.outcome` records a later trial failure. FAILED and KILLED runs cannot supply accepted evidence.
+Lightning's `MLFlowLogger` needs the supplied run ID passed as its `run_id`; read `MLFLOW_RUN_ID` before any MLflow call, or use `mlflow.active_run().info.run_id` while the run is active.
+
+Transformers' MLflow callback ends its run at the end of training, so call `mlflow.start_run()` before constructing the Trainer to keep its final evaluation in the same active run.
+
+After confirmed cleanup, PhaseSweep marks a failed trial's managed run FAILED even if the trainer left it FINISHED. A still-running managed run becomes FINISHED after success. A SIGINT leaves the managed run RUNNING until `phasesweep sync-tracking CONFIG` delivers KILLED for the [interrupted attempt](runtime.md#interrupted-trials-rerun). Interrupted reruns receive new managed runs. FAILED and KILLED runs cannot supply accepted evidence.
 
 In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
@@ -79,20 +85,7 @@ with mlflow.start_run() as run:
 
 The helper verifies the configured experiment and that the run is still RUNNING, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. A missing, foreign or conflicting binding fails the trial, and so does a bound run that was deleted, lies outside the configured experiment or carries another attempt's identity tags. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification. In either mode, disable autologging and nested-run behavior that starts runs of its own: PhaseSweep reads only the bound run, never a parent or child.
 
-### Transformers Trainer
-
-For native Transformers logging with managed ownership, set `report_to: [mlflow]` in the trainer's arguments and invoke the packaged launcher from `trial_command`:
-
-```yaml
-trial_command: "python -m phasesweep.tracking.mlflow_launch /absolute/path/to/run_seq2seq.py --report_to mlflow {overrides}"
-override_format: argparse
-```
-
-Pass the absolute trainer script path, its normal arguments, and `{overrides}`. The launcher preserves the script's argument parsing, sibling imports and explicit `PYTHONPATH` entries, including under `python -P` or `PYTHONSAFEPATH`. It uses the script directory instead of Python's ordinary cwd import entry. It removes `MLFLOW_RUN_ID` before the Transformers callback starts and keeps the supplied managed run active across the entire script, including final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. A script error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it. The launcher requires `mlflow.run_mode: managed` and the `phasesweep[mlflow]` extra. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
-
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
-
-With `load_best_model_at_end=True`, the logged step does not identify the evaluated checkpoint. Use `json_envelope` when that identity matters; [evaluation positions](config.md#objective-evidence-constraints-and-gates) also covers the `validate` warning for this setting.
 
 ## Select metrics and require evidence
 

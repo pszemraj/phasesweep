@@ -725,6 +725,7 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
         (0, True, "timeout-trainer"),
         (0, True, "terminate"),
         (0, True, "mcp-terminate"),
+        (0, True, "mcp-finished"),
         (0, True, "interrupt-intent"),
         (0, True, "interrupt-termination"),
         (0, True, "interrupt-extraction"),
@@ -741,6 +742,7 @@ def test_completed_orphan_evidence_survives_runner_sigkill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
     return_code: int,
     feasible: bool,
     recovery_stage: str,
@@ -1176,7 +1178,7 @@ else:
                 assert reaper._process_group_alive(orphan_identity.pgid) is (
                     recovery_stage == "interrupt-intent"
                 )
-            if recovery_stage == "mcp-terminate":
+            if recovery_stage in {"mcp-terminate", "mcp-finished"}:
                 from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog
                 from tests.recovery_helpers import recover_run_cli
 
@@ -1192,8 +1194,15 @@ else:
                     registry.state_dir, "orphan-generation", confirm=True
                 )
                 assert recovered_run.exit_code == 0, recovered_run.output
+                assert f"terminated {int(terminated)} live process group(s)" in recovered_run.output
+                expected_kept = 0 if terminated else 1
+                assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
+                if expected_kept:
+                    assert "Kept completed trial result: phase='p' trial=0 value=1" in caplog.text
             else:
-                _reconcile_existing_studies(experiment, cleanup_report=_PreflightCleanupReport())
+                cleanup_report = _PreflightCleanupReport()
+                _reconcile_existing_studies(experiment, cleanup_report=cleanup_report)
+                assert cleanup_report.retained_results == int(return_code == 0 and not terminated)
             (recovered,) = phase_trials(experiment)
             assert recovered.state.name == (
                 "COMPLETE" if return_code == 0 and not terminated else "FAIL"

@@ -406,24 +406,44 @@ def test_cli_tuple_input_keeps_rendered_values_and_recorded_bytes(
     )
 
 
-def test_launch_trial_inherit_env_all_passes_ambient(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("execution", "expected_ambient"),
+    [
+        pytest.param(
+            ExecutionContext(inherit_env="all"),
+            {
+                "PHASESWEEP_TEST_AMBIENT_SECRET": "leak",
+                "PHASESWEEP_TEST_TOKEN": "tok",
+                "PYTHONPATH": "/ambient/src",
+            },
+            id="all",
+        ),
+        pytest.param(None, {}, id="default-no-block"),
+        pytest.param(
+            ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+            {"PHASESWEEP_TEST_TOKEN": "tok"},
+            id="allowlist",
+        ),
+    ],
+)
+def test_launch_trial_inherit_env_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution: ExecutionContext | None,
+    expected_ambient: dict[str, str],
 ) -> None:
-    """``inherit_env: all`` is the explicit opt-in to full-environment inheritance."""
+    """Inheritance selects ambient values while retaining configured and base values."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
-    env = _capture_launch_env(tmp_path, monkeypatch, execution=ExecutionContext(inherit_env="all"))
-    assert env["PHASESWEEP_TEST_AMBIENT_SECRET"] == "leak"
-
-
-def test_launch_trial_default_contract_drops_ambient(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without an execution block the trainer gets the base set and configured ``env`` only."""
-    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
+    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "tok")
     monkeypatch.setenv("PYTHONPATH", "/ambient/src")
-    env = _capture_launch_env(tmp_path, monkeypatch, experiment_env={"KEEP_ME": "explicit"})
-    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
-    assert "PYTHONPATH" not in env
+    env = _capture_launch_env(
+        tmp_path, monkeypatch, execution=execution, experiment_env={"KEEP_ME": "explicit"}
+    )
+    assert {
+        key: env[key]
+        for key in ("PHASESWEEP_TEST_AMBIENT_SECRET", "PHASESWEEP_TEST_TOKEN", "PYTHONPATH")
+        if key in env
+    } == expected_ambient
     assert env["KEEP_ME"] == "explicit"
     assert env["PATH"] == os.environ["PATH"]
 
@@ -822,20 +842,6 @@ def test_stderr_quote_is_none_when_the_file_cannot_be_read(tmp_path: Path) -> No
     assert _stderr_last_line(tmp_path) is None
     (tmp_path / "stderr.log").mkdir()
     assert _stderr_last_line(tmp_path) is None
-
-
-def test_launch_trial_inherit_env_list_adds_exactly_named(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "tok")
-    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
-    env = _capture_launch_env(
-        tmp_path,
-        monkeypatch,
-        execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
-    )
-    assert env["PHASESWEEP_TEST_TOKEN"] == "tok"
-    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
 
 
 def test_launch_trial_execution_cwd_resolved_and_forwarded(

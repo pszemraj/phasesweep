@@ -9,6 +9,7 @@ from phasesweep.engine.read import PhaseWinnerView, ResultContext
 from phasesweep.engine.state import FINISHED_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState, WinnerSnapshot
+from phasesweep.runtime.json import JsonObject, json_object
 
 ResultSource: TypeAlias = Literal[
     "current_shared_study",
@@ -55,6 +56,33 @@ def _visible_winner_params(
         {key: value if key in visible else "<redacted>" for key, value in params.items()},
         any(key not in visible for key in params),
     )
+
+
+def _tie_groups_payload(
+    view: PhaseWinnerView | WinnerSnapshot, policy: VisibleParamsPolicy
+) -> list[JsonObject] | None:
+    """Apply the winner parameter policy to every overlapping configuration.
+
+    :param PhaseWinnerView | WinnerSnapshot view: Live or frozen phase winner.
+    :param VisibleParamsPolicy policy: Catalog parameter visibility.
+    :return list[JsonObject] | None: Redacted comparisons, or null when trial details are unavailable.
+    """
+    if view.tie_groups is None:
+        return None
+    groups = (
+        [group.model_dump(mode="json") for group in view.tie_groups]
+        if isinstance(view, WinnerSnapshot)
+        else [dict(group) for group in view.tie_groups]
+    )
+    public: list[JsonObject] = []
+    for group in groups:
+        payload = json_object(group)
+        params = payload["params"]
+        if not isinstance(params, dict):
+            raise TypeError("tie-group parameters are not a mapping")
+        payload["params"] = json_object(_visible_winner_params(params, policy)[0])
+        public.append(payload)
+    return public
 
 
 def winners_payload(
@@ -144,6 +172,8 @@ def winners_payload(
                     else "A cheaper configuration is within one standard error of the winner; "
                     "the operator can inspect show-winners for its parameters."
                 ),
+                "cost_advisory_status": view.cost_advisory_status,
+                "tie_groups": _tie_groups_payload(view, visible_params),
             }
         )
     return {

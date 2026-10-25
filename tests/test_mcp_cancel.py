@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -12,11 +13,14 @@ import pytest
 
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
+    McpToolError,
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
+from phasesweep.mcp.runner import _cleanup_failure_payload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
 from phasesweep.runtime.reaper import (
     read_boot_id,
@@ -27,6 +31,7 @@ from tests.conftest import (
 )
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
+    call_mcp_tool,
     earlier_boot_id,
     make_dead_run_handle,
     make_mcp_app,
@@ -99,12 +104,12 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     monkeypatch.setattr(store, "observe", complete_launch_after_observation)
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", kill_runner)
 
-    cancelled = app.cancel(pending.run_id)
+    with pytest.raises(McpToolError, match="recover-run"):
+        app.cancel(pending.run_id)
 
     assert store.get(pending.run_id) == spawned
-    assert signalled == [(runner_pid, 111, runner_pid)]
-    assert cancelled["state"] == "running"
-    assert cancelled["recovery_required"] is True
+    assert signalled == []
+    assert store.observe(spawned).recovery_required
 
 
 def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
@@ -169,12 +174,11 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
 
     monkeypatch.setattr(mcp_tools, "kill_stale_group", record_signal)
 
-    result = app.cancel(handle.run_id)
+    with pytest.raises(McpToolError, match="recover-run|PID namespace"):
+        app.cancel(handle.run_id)
 
     assert signalled == []
-    assert result["state"] == "running"
-    assert result["cleanup_confirmed"] is False
-    assert result["recovery_required"] is True
+    assert store.observe(handle).recovery_required
 
 
 @pytest.mark.parametrize(
@@ -303,6 +307,7 @@ def test_cancel_cleanup_confirmation_policy(
     preexisting_marker: bool,
     check_launch_gate: bool,
 ) -> None:
+    """Cancellation confirms cleanup or reserves it with a static remedy every reader retains."""
     config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-cancel-policy"
@@ -310,9 +315,11 @@ def test_cancel_cleanup_confirmation_policy(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
+        config_dir=str(config.parent),
         allow_cancel=True,
     )
     store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     if preexisting_marker:
         store.mark_cleanup_uncertain(handle)
 
@@ -330,21 +337,129 @@ def test_cancel_cleanup_confirmation_policy(
 
     monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
 
-    result = app.cancel(run_id)
-
     cleanup_confirmed = runner_group_gone and status_cleanup_confirmed is True
-    assert result == {
-        "run_id": run_id,
-        "state": "cancelled" if cleanup_confirmed else "running",
-        "cleanup_confirmed": cleanup_confirmed,
-        "recovery_required": not cleanup_confirmed,
-    }
+    if cleanup_confirmed:
+        result = app.cancel(run_id)
+        assert result == {
+            "run_id": run_id,
+            "state": "cancelled",
+            "cleanup_confirmed": True,
+            "recovery_required": False,
+        }
+    else:
+        with pytest.raises(McpToolError, match="recover-run"):
+            app.cancel(run_id)
     assert store.cleanup_uncertain_path(run_id).exists() is not cleanup_confirmed
+    if not runner_group_gone:
+        failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
+        remedy = failure["remediation"]
+        assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
+        assert "If it is still running on the host" in remedy
+        assert "clear the cause" in remedy
+        assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
+        assert "cancel_run" not in remedy
+        assert len(remedy.splitlines()) == 1
+        for visibility in ("observable", "absent", "unobservable"):
+            view = RunnerView(visibility)
+            monkeypatch.setattr(store, "runner_view", lambda _handle, view=view: view)
+            for tool, args in (
+                ("get_run_status", {"run_id": run_id}),
+                ("await_run", {"run_id": run_id, "timeout_seconds": 5}),
+                ("get_run_results", {"run_id": run_id}),
+                ("get_latest_run", {"experiment_id": reg.id}),
+            ):
+                result = call_mcp_tool(app, tool, args)
+                assert not result.isError, result
+                payload = result.structuredContent
+                recorded = payload["run"]["failure"] if "run" in payload else payload["failure"]
+                assert recorded["remediation"] == remedy
     if status_cleanup_confirmed is None:
         assert not store.status_path(run_id).exists()
     if check_launch_gate:
         with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("srv")
+
+
+def test_dead_runner_cancel_retains_the_status_failure_for_other_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation fails with the status remedy and persists it for an unobservable reader."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    handle = stage_dead_run(
+        store, "srv-dead-cancel", config, "srv", cleanup_uncertain=False, allow_cancel=True
+    )
+    failure = app.status(handle.run_id)["run"]["failure"]
+
+    result = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+
+    assert result.isError
+    assert "recover-run" in result.content[0].text
+    assert failure["remediation"] in result.content[0].text
+    marker = json.loads(store.cleanup_uncertain_path(handle.run_id).read_text())
+    assert marker["failure"] == failure
+    monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
+    assert app.status(handle.run_id)["run"]["failure"] == failure
+    again = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+    assert again.isError
+    assert failure["remediation"] in again.content[0].text
+
+
+@pytest.mark.parametrize("unobservable", [False, True], ids=["host", "sandbox"])
+def test_terminal_cleanup_failure_precedes_the_cancellation_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unobservable: bool
+) -> None:
+    """Terminal storage remedies survive an older marker in both cancellation and reads."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    handle = stage_dead_run(
+        store, "srv-terminal-failure", config, "srv", cleanup_uncertain=False, allow_cancel=True
+    )
+    specific = _cleanup_failure_payload(
+        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+    )
+    store.mark_cleanup_uncertain(handle, failure=_cleanup_uncertain_payload([]))
+    write_unsafe_cleanup_status(store, handle.run_id, failure=specific)
+    if unobservable:
+        monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
+
+    cancelled = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+
+    assert cancelled.isError
+    assert specific["remediation"] in cancelled.content[0].text
+    assert app.status(handle.run_id)["run"]["failure"] == specific
+
+
+def test_live_cancellation_reservation_preserves_a_runner_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live cancellation reserves cleanup without masking the runner's eventual diagnosis."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    snapshot = config.read_bytes()
+    handle = make_run_handle(
+        run_id="srv-live-failure",
+        experiment_id="srv",
+        allow_cancel=True,
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        config_dir=str(config.parent),
+    )
+    store.create(handle)
+    store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
+    specific = _cleanup_failure_payload(
+        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+    )
+
+    def record_terminal_failure(*_args: object, **_kwargs: object) -> bool:
+        assert store.cleanup_failure(handle) is None
+        write_unsafe_cleanup_status(store, handle.run_id, failure=specific)
+        return True
+
+    monkeypatch.setattr(mcp_tools, "kill_stale_group", record_terminal_failure)
+
+    cancelled = call_mcp_tool(app, "cancel_run", {"run_id": handle.run_id})
+
+    assert cancelled.isError
+    assert specific["remediation"] in cancelled.content[0].text
+    assert store.cleanup_failure(handle) is None
+    assert app.status(handle.run_id)["run"]["failure"] == specific
 
 
 def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(

@@ -13,7 +13,7 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import StudyContextConflictError
+from phasesweep.engine.errors import StudyContextConflictError, phase_timeout
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
@@ -70,8 +70,10 @@ def _preflight_skipped_winners(
         winners: dict[str, Winner] = {}
         for phase in experiment.phases:
             if run_deadline is not None and time.monotonic() >= run_deadline:
-                raise TimeoutError(
-                    f"Run wallclock deadline reached before phase {phase.name!r} could start."
+                raise phase_timeout(
+                    f"Run wallclock deadline reached before phase {phase.name!r} could start.",
+                    scope="run",
+                    persistent=experiment.resolved_storage is not None,
                 )
             if phase.name == from_phase:
                 break

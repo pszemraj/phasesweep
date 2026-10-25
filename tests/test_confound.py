@@ -390,6 +390,8 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
         "detail": {"tied_trials": [1], "within_noise": None},
     }
     assert "trial(s) 1 matched" in _describe_flagged(block)[0]
+    assert "No noise estimate" in _describe_flagged(block)[0]
+    assert "phases[].repeats" in _describe_flagged(block)[0]
 
 
 @pytest.mark.parametrize("values", [(0.5, 0.5), (0.5, 0.6, 0.7)])

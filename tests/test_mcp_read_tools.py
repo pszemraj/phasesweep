@@ -43,6 +43,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus
 from phasesweep.mcp.server import (
     AwaitRunResult,
@@ -59,6 +60,7 @@ from tests.conftest import (
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
+    call_mcp_tool,
     drift_experiment,
     make_mcp_app,
     make_run_handle,
@@ -1110,3 +1112,47 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
     assert winners["result_source"] == "current_shared_study"
     assert winners["represented_generation_id"] == run_id
     assert awaited["reason"] == "timeout"
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["live", "aborted"])
+@pytest.mark.integration
+def test_unpublished_winner_reads_keep_failure_without_duplicate_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: bool
+) -> None:
+    """Run reads expose state and failure without a redundant continuation field."""
+    app, registry, store, handle, terminal = _published_run_terminal(tmp_path)
+    _remove_the_publication_pointer(registry.get("srv").experiment, handle.run_id)
+    snapshot = RunResultSnapshot.model_validate(terminal["result_snapshot"])
+    snapshot.status.is_published = False
+    snapshot.status.published_generation_id = None
+    snapshot.status.publication_integrity = "absent"
+    failure = FailurePayload(
+        code="trials_failed",
+        stage="execution",
+        retryable=True,
+        actor="agent",
+        remediation="Fix the trainer, then raise phases.b.n_trials before rerunning.",
+    ).model_dump(mode="json", exclude_none=True)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1 if failed else 0,
+        cleanup_confirmed=True,
+        failure=failure if failed else None,
+        result_snapshot_state="complete" if failed else "pending",
+        result_snapshot=snapshot.model_dump(mode="json"),
+    )
+    if not failed:
+        monkeypatch.setattr(store, "runner_may_be_alive", lambda *_args, **_kwargs: True)
+
+    for tool in ("get_run_status", "get_run_results"):
+        result = call_mcp_tool(app, tool, {"run_id": handle.run_id})
+        assert not result.isError, result
+        assert "continuation" not in result.structuredContent
+        payload = result.structuredContent
+        recorded = payload["run"]["failure"] if tool == "get_run_status" else payload["failure"]
+        if failed:
+            assert recorded["code"] == failure["code"]
+            assert recorded["remediation"] == failure["remediation"]
+        else:
+            assert recorded is None

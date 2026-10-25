@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
 
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.engine.read import CostAdvisoryStatus
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
@@ -43,6 +44,7 @@ from phasesweep.mcp.snapshots import (
     McpPublicationState,
     MetricSnapshot,
     RepeatsSpread,
+    TieGroupSnapshot,
 )
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
@@ -637,6 +639,12 @@ class WinnerPhasePayload(_ToolPayload):
         default=None,
         description="Cheaper configuration within the winner's standard error; parameters follow visible_params policy.",
     )
+    cost_advisory_status: CostAdvisoryStatus = Field(
+        description="Whether cost_key is unset, comparison unavailable, no cheaper configuration qualifies, or advice is available."
+    )
+    tie_groups: list[TieGroupSnapshot] | None = Field(
+        description="Other repeat configurations within two combined standard errors, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
+    )
     confound: ConfoundSummary = Field(
         description=(
             "Advisory verdicts on the population this winner was selected from. Report every "
@@ -713,7 +721,7 @@ class LaunchRunResult(_ToolPayload):
 
 
 class CancelRunResult(_ToolPayload):
-    """Structured output for cancel_run."""
+    """Successful cancellation output; unconfirmed cleanup returns an MCP tool error."""
 
     run_id: RunId
     state: RunState
@@ -724,7 +732,7 @@ class CancelRunResult(_ToolPayload):
         ),
     )
     recovery_required: bool = Field(
-        description="Whether this run requires operator attention after the cancellation call."
+        description="Whether successful cancellation still needs operator result repair."
     )
 
 

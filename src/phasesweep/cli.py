@@ -45,6 +45,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _trial_dir_for,
 )
+from phasesweep.engine.preview import validate_grid_targets
 from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import (
     raise_for_unusable_publication,
@@ -56,9 +57,14 @@ from phasesweep.engine.read import (
     experiment_status,
     read_trial_tables,
     require_study,
+    unpublished_winner_step,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+)
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -279,7 +285,8 @@ def _template_purpose(name: str) -> str:
     type=click.Choice(_template_names()),
     default=_DEFAULT_TEMPLATE,
     show_default=True,
-    help="Template to write. Every one runs as written on the packaged toy trainer.",
+    help="Template to write. Local templates use the packaged toy trainer; mlflow needs "
+    "a tracking server and an existing experiment.",
 )
 @click.option("--list", "list_templates", is_flag=True, help="List the templates and exit.")
 @click.option(
@@ -333,7 +340,7 @@ def init(template: str, list_templates: bool, output: str) -> None:
     # different (nonexistent) file than the one just written.
     config_arg = shlex.quote(str(expanded))
     click.echo(f"Wrote the {template} template to {target}")
-    click.echo("\nNext:")
+    click.echo("\nNext: read the template header for prerequisites and trainer adaptation, then:")
     click.echo(f"  phasesweep validate {config_arg}")
     click.echo(f"  phasesweep run {config_arg} --dry-run")
     click.echo(f"  phasesweep run {config_arg}")
@@ -552,8 +559,11 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     :param Path config_path: Experiment YAML whose relative paths anchor to its directory.
     :param tuple[str, ...] settings: Config overrides applied before validation.
     :raises ConfigError: The derived configuration cannot be loaded or validated.
+    :raises TrialTargetRefusedError: A grid target exceeds its recorded retry ceiling.
+    :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised grid target.
     """
     config = _command_config(config_path, settings=settings)
+    validate_grid_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
@@ -795,7 +805,9 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     for source_id, trainer_base in trainer_bases.items():
         source_label = f" for generation {source_id}" if multiple_sources else ""
         click.echo(f"# Producing argparse trainer base{source_label}, before phase overrides.")
-        click.echo(yaml.safe_dump({"trainer_config": trainer_base}, sort_keys=False))
+        click.echo(
+            yaml.dump({"trainer_config": trainer_base}, Dumper=_WinnerDumper, sort_keys=False)
+        )
 
     for name, comment in phase_plan:
         winner = winners.get(name)
@@ -839,6 +851,12 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 "confound": None if winner.confound is None else json_object(winner.confound),
                 "repeats": None if winner.repeats is None else json_object(dict(winner.repeats)),
                 "cost_advisory": winner.cost_advisory,
+                "cost_advisory_status": winner.cost_advisory_status,
+                "tie_groups": (
+                    None
+                    if winner.tie_groups is None
+                    else [json_object(dict(group)) for group in winner.tie_groups]
+                ),
             }
             if winner.repeats_detail is not None:
                 detail = winner.repeats_detail
@@ -860,30 +878,52 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                         }
                         for member in detail["members"]
                     ]
-            click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+            click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
         else:
             click.echo(f"=== {name} === (no winner yet)")
             _render_phase_comment(comment, prefix="# ")
 
 
+def _display_float(value: float) -> str:
+    """Format a displayed float to twelve significant digits without changing storage.
+
+    :param float value: Recorded value to display.
+    :return str: Compact decimal or scientific notation.
+    """
+    return f"{value:.12g}"
+
+
+class _WinnerDumper(yaml.SafeDumper):
+    """Render winner floats with the shared display precision."""
+
+    def represent_float(self, value: float) -> yaml.ScalarNode:
+        """Apply display precision while preserving YAML's float type.
+
+        :param float value: Stored value, left unchanged outside the display.
+        :return yaml.ScalarNode: Safe YAML float scalar.
+        """
+        return super().represent_float(float(_display_float(value)))
+
+
+_WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
+
+
 def _param_text(value: JsonValue) -> str:
-    """Format one sampled param for a trial table, floats to four significant digits.
+    """Format one sampled param using the shared float display precision.
 
     :param JsonValue value: The recorded param value.
     :return str: Terminal text for the value.
     """
     if isinstance(value, float):
-        return f"{value:.4g}"
+        return _display_float(value)
     return str(value)
 
 
-def _trial_cell(column: str, value: JsonValue) -> str:
+def _trial_cell(value: JsonValue) -> str:
     """Format one trial-table cell for the terminal.
 
-    Metric-like numbers print to six significant digits, params to four, and
-    durations to a tenth of a second; a missing value prints as ``-``.
+    All floats use the shared display precision; a missing value prints as ``-``.
 
-    :param str column: Column header the cell sits under.
     :param JsonValue value: The row's value for that column.
     :return str: Terminal text for the cell.
     """
@@ -892,12 +932,12 @@ def _trial_cell(column: str, value: JsonValue) -> str:
     if isinstance(value, dict):
         return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
     if isinstance(value, float):
-        return f"{value:.1f}" if column == "duration_s" else f"{value:.6g}"
+        return _display_float(value)
     return str(value)
 
 
 #: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible"})
+_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible", "reason"})
 
 
 def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
@@ -922,7 +962,7 @@ def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str
     :param Sequence[JsonObject] rows: Rows to display, with every named column present.
     :return list[str]: The header line followed by one line per row, without trailing spaces.
     """
-    cells = [[_trial_cell(column, row[column]) for column in columns] for row in rows]
+    cells = [[_trial_cell(row[column]) for column in columns] for row in rows]
     widths = [
         max(len(column), *(len(row[index]) for row in cells))
         for index, column in enumerate(columns)
@@ -1032,7 +1072,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. ``--trials`` prints the trial tables in its place, from one
+    on stderr. An unpublished winner gets a comment explaining how to resume publication.
+    ``--trials`` prints the trial tables in its place, from one
     publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
@@ -1056,7 +1097,17 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         )
         return
     payload = experiment_status(config)
-    click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+    phases = payload.get("phases")
+    if isinstance(phases, list) and any(
+        isinstance(phase, dict)
+        and phase.get("winner") is not None
+        and phase.get("winner_is_published") is False
+        for phase in phases
+    ):
+        step = unpublished_winner_step(config)
+        if step is not None:
+            click.echo(f"# Winner retained but not published; {step}")
+    click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),
         str(payload["publication_integrity"]),

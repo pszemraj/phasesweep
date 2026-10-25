@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import json
 import os
-import runpy
 import sys
 import time
 from pathlib import Path
@@ -40,10 +40,9 @@ from tests.tracking_helpers import (
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "mlflow", None)
-    path = Path(__file__).parents[1] / "src/phasesweep/examples/mlflow_train.py"
-    namespace = runpy.run_path(str(path))
+    example = importlib.import_module("phasesweep.examples.mlflow_train")
     with pytest.raises(SystemExit) as stopped:
-        namespace["main"](["--help"])
+        example.main(["--help"])
     assert stopped.value.code == 0
     assert "--config" in capsys.readouterr().out
 
@@ -119,7 +118,9 @@ def test_timing_values_must_be_finite(tmp_path, field, value):
 
     from phasesweep.config.io import load_experiment
 
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(workdir=str(tmp_path / "runs"))
     config["mlflow"][field] = value
     path = tmp_path / "experiment.yaml"
@@ -986,6 +987,7 @@ def _capture_request(binding, *, gates=(), timeout_seconds=120, timeout_at=100.0
     return {
         "binding": binding,
         "query": {
+            "objective": spec().model_dump(),
             "selections": {observation_id(spec()): spec().model_dump()},
             "gates": [gate.model_dump() for gate in gates],
         },
@@ -1028,7 +1030,7 @@ def _finished_failure(clock, *, gates=(), metrics=None, params=None, tags=None):
 
 def test_missing_metric_is_not_replaced_by_result_metric(clock):
     message = _finished_failure(clock, metrics={"phasesweep.objective": 1, "accuracy": 0.9})
-    assert message == (
+    assert message.startswith(
         "MLflow run finished without metric 'loss'; "
         "available metric keys: ['accuracy', 'phasesweep.objective']."
     )
@@ -1058,7 +1060,7 @@ def test_finished_run_missing_every_kind_names_each_once(clock):
         clock, gates=gates, metrics={"accuracy": 0.9}, params={"warmup": "1", "seed": "1"}
     )
     tags = sorted(mlflow_run(mlflow_binding()).data.tags)
-    assert message == (
+    assert message.startswith(
         "MLflow run finished without metric 'loss', param 'lr', tag 'dataset'; "
         f"available metric keys: ['accuracy']; param keys: ['seed', 'warmup']; tag keys: {tags}."
     )
@@ -1129,9 +1131,34 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
     monkeypatch.setattr(process, "run_supervised", run_in_process)
     with pytest.raises(ExtractorError) as failure:
         _capture_mlflow(ctx, deadline=None)
-    assert str(failure.value) == (
+    assert str(failure.value).startswith(
         "MLflow run finished without metric 'eval/loss'; "
         "available metric keys: ['accuracy', 'cost']."
+    )
+    assert "logged under another key or logging went to another run" in str(failure.value)
+    assert len(str(failure.value).splitlines()) == 1
+
+
+def test_managed_missing_objective_explains_the_one_run_contract(clock: ManualClock) -> None:
+    """A missing managed objective gives actionable key/run advice on one line."""
+    message = _finished_failure(clock, metrics={"other": 0.9})
+    lines = message.splitlines()
+    assert len(lines) == 1
+    assert "logged under another key or logging went to another run" in message
+    assert "Log the configured metric key" in message
+    assert "resume its saved ID" in message
+    assert "read MLFLOW_RUN_ID before any MLflow call" in message
+    assert "mlflow.active_run().info.run_id" in message
+
+
+def test_trainer_owned_missing_objective_keeps_the_key_diagnostic(clock: ManualClock) -> None:
+    """A trainer-owned run is judged without managed environment advice."""
+    binding = {**mlflow_binding(), "run_mode": "trainer"}
+    client = _states_client(binding, "FINISHED", metrics={"other": 0.9})
+    with pytest.raises(ValueError) as failure:
+        _capture(client, _capture_request(binding))
+    assert str(failure.value) == (
+        "MLflow run finished without metric 'loss'; available metric keys: ['other']."
     )
 
 
@@ -1260,7 +1287,9 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
     from tests.conftest import mark_current_format
     from tests.mcp_helpers import make_mcp_app, make_run_handle, stage_dead_run, write_run_status
 
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'j.journal'}")
     config_path = tmp_path / "exp.yaml"
     config_path.write_text(yaml.safe_dump(config))

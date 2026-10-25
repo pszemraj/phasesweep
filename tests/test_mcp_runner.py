@@ -613,6 +613,8 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     assert status["failure"]["stage"] == "preflight"
     assert status["failure"]["retryable"] is True
     assert status["failure"]["actor"] == "agent"
+    assert "Stop it only if the user wants it stopped" in status["failure"]["remediation"]
+    assert "MCP cannot cancel a CLI operation" in status["failure"]["remediation"]
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
     assert status["result_snapshot_state"] == "complete"
     snapshot = status["result_snapshot"]

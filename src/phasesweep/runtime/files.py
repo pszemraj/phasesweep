@@ -158,7 +158,7 @@ def phasesweep_home() -> Path | None:
     return path
 
 
-def lock_dir() -> Path:
+def lock_dir(*, create: bool = True) -> Path:
     """Return the validated same-host phasesweep lock directory.
 
     The default is ``.cache/phasesweep/locks`` under the effective user's
@@ -168,6 +168,7 @@ def lock_dir() -> Path:
     macOS's root-owned ``/var`` and ``/tmp`` aliases resolve before the
     no-symlink walk; operator-controlled path components still cannot be links.
 
+    :param bool create: Provision a missing default directory; false for read-only probes.
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
@@ -216,6 +217,8 @@ def lock_dir() -> Path:
             action=OperatorAction.FIX_CONFIG,
         )
     path = home / ".cache" / "phasesweep" / "locks"
+    if not create and not path.exists():
+        return path
     try:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:

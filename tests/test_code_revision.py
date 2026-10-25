@@ -117,15 +117,20 @@ def test_code_revision_reports_commit_and_whether_tracked_files_changed(
 def test_code_revision_ignores_a_repository_inherited_from_a_git_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hermetic_git: None
 ) -> None:
-    """A hook's exported ``GIT_DIR`` and ``GIT_INDEX_FILE`` do not redirect the read."""
+    """Hook repository variables redirect neither generation nor fixture provenance."""
+    from tests.fixtures.make_ledger_fixtures import _git_describe
+
     trainer_head = _committed_repo(tmp_path / "trainer")
+    expected_description = _git(tmp_path / "trainer", "describe", "--tags", "--always", "--dirty")
     other = tmp_path / "other"
     _committed_repo(other)
     (other / "tracked.txt").write_text("changed\n")
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
     monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
 
     assert _code_revision(tmp_path / "trainer") == {"commit": trainer_head, "dirty": False}
+    assert _git_describe(tmp_path / "trainer") == expected_description
 
 
 def test_code_revision_is_none_when_git_cannot_answer(

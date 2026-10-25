@@ -1212,6 +1212,7 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
             pytest.param(
                 {
                     **{
+                        "schema_version": mcp_runs.CLEANUP_UNCERTAINTY_SCHEMA_VERSION,
                         "run_id": "exp-1",
                         "config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "cleanup_confirmed": False,
@@ -1343,6 +1344,7 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
         store.cleanup_uncertain_path(handle.run_id),
         json.dumps(
             {
+                "schema_version": mcp_runs.CLEANUP_UNCERTAINTY_SCHEMA_VERSION,
                 "run_id": handle.run_id,
                 "config_sha256": handle.config_sha256,
                 "pid": handle.pid,

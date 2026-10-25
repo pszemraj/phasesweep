@@ -15,6 +15,7 @@ from pathlib import Path
 import optuna
 import pytest
 import yaml
+from pydantic import ValidationError
 
 import phasesweep.mcp.recovery as mcp_recovery
 from phasesweep.config.io import load_experiment
@@ -43,7 +44,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.redaction import winners_payload
-from phasesweep.mcp.snapshots import RunResultSnapshot
+from phasesweep.mcp.snapshots import RunResultSnapshot, capture_pre_generation_result_snapshot
 from tests.conftest import (
     fail_pointer_commit,
     make_experiment,
@@ -67,6 +68,15 @@ from tests.mcp_helpers import (
     write_srv_config,
 )
 from tests.recovery_helpers import write_launched_stale_trial
+
+
+def test_snapshot_requires_its_record_schema_version(tmp_path: Path) -> None:
+    """A frozen result without its own schema marker is refused."""
+    snapshot = capture_pre_generation_result_snapshot(make_experiment(workdir=tmp_path))
+    payload = snapshot.model_dump(mode="json")
+    payload.pop("schema_version")
+    with pytest.raises(ValidationError, match="schema_version"):
+        RunResultSnapshot.model_validate(payload)
 
 
 def _frozen_result_payload(snapshot: RunResultSnapshot) -> dict[str, object]:
@@ -659,10 +669,11 @@ def _engine_winner(
 
 
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
-    """Engine-supplied winners are frozen verbatim, with no second file read."""
+    """Engine winners freeze without rereading files; observed values survive the stored view."""
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     winner = _engine_winner(4)
     winner.gates = [{"type": "g", "passed": True}]
+    winner.observed = {"peak": 7.5, "steps": 3.0}
 
     snapshot = mcp_runner.capture_result_snapshot(
         experiment,
@@ -687,21 +698,6 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         "generation_id": "engine-generation",
         "attempt_id": "engine-attempt",
     }
-
-
-def test_snapshot_freezes_observed_values(tmp_path: Path) -> None:
-    """A winner's report-only values are frozen with it and come back out of the stored view."""
-    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
-    winner = _engine_winner(0)
-    winner.observed = {"peak": 7.5, "steps": 3.0}
-
-    snapshot = mcp_runner.capture_result_snapshot(
-        experiment,
-        generation_id="engine-generation",
-        engine_winners={"p": winner},
-    )
-
-    (frozen,) = snapshot["winners"]
     assert frozen["observed"] == {"peak": 7.5, "steps": 3.0}
     assert frozen["repeats"] is None
     stored = RunResultSnapshot.model_validate(snapshot)

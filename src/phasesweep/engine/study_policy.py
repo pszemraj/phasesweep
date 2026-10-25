@@ -53,7 +53,7 @@ from phasesweep.engine.state import (
     _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import RERUN_CLEANUP_RECOVERY, OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, RERUN_CLEANUP_RECOVERY, OperatorAction
 from phasesweep.runtime.json import JsonObject, json_text_map
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
@@ -450,7 +450,8 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} finished "
             f"trial(s), but the current config requests {phase.n_trials}. Set "
-            f"phases[{phase.name}].n_trials to at least {accepted_target} in the config."
+            f"phases[{phase.name}].n_trials to at least {accepted_target} in the config.",
+            remediation=f"Set phases[{phase.name}].n_trials to at least {accepted_target} and rerun.",
         )
     trials = study.get_trials(deepcopy=False)
     _validate_fixed_configuration_target(
@@ -481,7 +482,8 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     if refusal is None:
         refusal = grid_target_refusal(phase, finished=finished, measured=measured)
     if refusal is not None:
-        raise TrialTargetRefusedError(refusal)
+        message, remediation = refusal
+        raise TrialTargetRefusedError(message, remediation=remediation)
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
@@ -784,12 +786,6 @@ def _retry_remedy(
     )
 
 
-_FRESH_START = (
-    "The recorded trial results stay in the study; if a defect you have since fixed "
-    "produced them, set a new `experiment` name in the config to start fresh."
-)
-
-
 def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
@@ -803,7 +799,18 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     remedies = _recovery_remedies(phase, study, abort)
     if remedies is None:
         return None
-    return f"{remedies} Raising n_trials does not change the study fingerprint. {_FRESH_START}"
+    retained = (
+        "The recorded trial results stay in the study. Raising n_trials does not change "
+        "the study fingerprint."
+    )
+    if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
+        return (
+            "The tripping trials violated metric bounds or constraints. Changing "
+            "metric.min, metric.max, constraints, or the search space changes persistent "
+            f"study identity. {NEW_STUDY_STEP} "
+            f"{retained} For work under unchanged limits: {remedies.removeprefix('Fix the cause, then ')}"
+        )
+    return f"{remedies} {retained} To discard invalid recorded results: {NEW_STUDY_STEP}"
 
 
 def _recovery_remedies(

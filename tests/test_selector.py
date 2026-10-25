@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import optuna
@@ -470,3 +471,55 @@ def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
     assert slotted.confound["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": []}
     with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
         select_winner(study, _make_exp(), repeats=_axis())
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
+def test_crashed_trials_remedy_names_the_next_attempt_budget(
+    tmp_path: Path, persistent: bool
+) -> None:
+    """A crashed population retries with a raised persistent budget or a fresh memory run."""
+    from tests.conftest import make_experiment
+
+    experiment = make_experiment(persistent=tmp_path if persistent else None, n_trials=2)
+    study = optuna.create_study()
+    study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+    study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(study, experiment, phase_name="p")
+    remedy = refused.value.remediation
+    assert remedy is not None
+    if persistent:
+        assert "raise phases[p].n_trials above 2" in remedy
+        assert "Fix the failure" in remedy
+    else:
+        assert "storage: null starts fresh" in remedy
+        assert "raise" not in remedy
+
+
+@pytest.mark.parametrize(
+    ("feasible", "required", "excluded"),
+    [
+        pytest.param(
+            True, "raise phases[p].n_trials above 3", "Changing metric.min", id="crashed-member"
+        ),
+        pytest.param(
+            False, "Changing metric.min", "raise phases[p].n_trials", id="infeasible-members"
+        ),
+    ],
+)
+def test_incomplete_repeats_remedy_uses_recorded_feasibility(
+    tmp_path: Path, feasible: bool, required: str, excluded: str
+) -> None:
+    """Successful repeat members do not turn a crashed group into an infeasible one."""
+    experiment = make_experiment(persistent=tmp_path, n_trials=3)
+    study = _make_study()
+    _add_group(study, 1, [0.5, 0.6], feasible=feasible)
+    _add_failed(study, 1, 2)
+
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(study, experiment, phase_name="p", repeats=_axis())
+
+    remedy = refused.value.remediation
+    assert remedy is not None
+    assert required in remedy
+    assert excluded not in remedy

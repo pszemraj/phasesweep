@@ -298,12 +298,14 @@ def test_create_committing_after_the_controller_gave_up_is_bound_later(
 def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypatch, mode):
     """Both ownership modes publish four trials and replay without the SDK/server."""
     uri, client, experiment_id, process = offline_server
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples" / "mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = (
-        f"{sys.executable} -m phasesweep.examples.mlflow_train --config {{config_path}}"
+        f"{Path(sys.executable).with_name('phasesweep-mlflow-train')} --config {{config_path}}"
     )
     config["mlflow"].update(tracking_uri=uri, run_mode=mode, timeout_seconds=15, poll_seconds=0.05)
     if mode == "trainer":
@@ -455,7 +457,9 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         "    mlflow.log_metric('eval/loss', 0.01, step=500)\n"
         "    raise RuntimeError('failure after logging a tempting score')\n"
     )
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
@@ -514,3 +518,92 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         a.path for a in client.list_artifacts(summaries[0].info.run_id, "phasesweep")
     ]
     assert read_status(experiment)["phases"] == status["phases"]
+
+
+@pytest.mark.parametrize(
+    "trainer_outcome", ["bare_crash", "ended_crash", "no_objective", "ended_then_logged"]
+)
+def test_managed_failed_trial_overrides_the_trainer_run_status(
+    local_server, tmp_path: Path, caplog: pytest.LogCaptureFixture, trainer_outcome: str
+) -> None:
+    """A failed managed trial closes its bound run as FAILED, including a trainer's FINISHED run."""
+    import csv
+
+    from click.testing import CliRunner
+
+    from phasesweep.cli import cli
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.engine.state import FAILURE_REASON_ATTR
+    from phasesweep.tracking.session import read_binding
+    from tests.conftest import phase_trials, write_experiment_config
+
+    uri, client, experiment_id, _process = local_server
+    programs = {
+        "bare_crash": "mlflow.log_metric('loss', 0.01)\nraise RuntimeError('trainer failed')\n",
+        "ended_crash": "mlflow.log_metric('loss', 0.01)\nmlflow.end_run()\nraise RuntimeError('trainer failed')\n",
+        "no_objective": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\n",
+        "ended_then_logged": "with mlflow.start_run():\n    mlflow.log_metric('other', 1.0)\nmlflow.log_metric('loss', 0.01)\n",
+    }
+    trainer = tmp_path / "trainer.py"
+    trainer.write_text("import mlflow\n" + programs[trainer_outcome], encoding="utf-8")
+    experiment = Experiment.model_validate(
+        {
+            "experiment": "managed-contract",
+            "workdir": str(tmp_path / "runs"),
+            "storage": "auto",
+            "provenance": {"revision": "test-contract"},
+            "trial_command": f"{sys.executable} {trainer} {{overrides}}",
+            "override_format": "argparse",
+            "mlflow": {
+                "tracking_uri": uri,
+                "experiment_id": experiment_id,
+                "run_mode": "managed",
+                "timeout_seconds": 15,
+                "poll_seconds": 0.05,
+            },
+            "metric": {
+                "name": "loss",
+                "goal": "minimize",
+                "extractor": {"type": "mlflow", "metric_key": "loss", "select": "last"},
+            },
+            "phases": [
+                {
+                    "name": "p",
+                    "n_trials": 1,
+                    "gpu_policy": "none",
+                    "max_consecutive_failures": 1,
+                    "sampler": {"type": "random", "seed": 0},
+                    "search_space": {"x": {"type": "int", "low": 0, "high": 1}},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    (directory,) = (_experiment_dir(experiment) / "p").glob("trial_*")
+    binding = read_binding(directory)
+    remote = client.get_run(binding["run_id"])
+    assert (remote.info.status, remote.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
+    assert "phasesweep.objective" not in remote.data.metrics
+    assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
+    if trainer_outcome in {"no_objective", "ended_then_logged"}:
+        assert "logged under another key or logging went to another run" in caplog.text
+        assert "read MLFLOW_RUN_ID before any MLflow call" in caplog.text
+        assert "loss" not in remote.data.metrics
+    else:
+        assert remote.data.metrics["loss"] == 0.01
+    reason = phase_trials(experiment, "p")[0].user_attrs[FAILURE_REASON_ATTR]
+    assert isinstance(reason, str) and len(reason.splitlines()) == 1
+    with (_experiment_dir(experiment) / "p" / "trials.csv").open() as handle:
+        (row,) = csv.DictReader(handle)
+    assert row[f"user_attr:{FAILURE_REASON_ATTR}"] == reason
+    config = tmp_path / "sweep.yaml"
+    write_experiment_config(config, experiment)
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert shown.exit_code == 0, shown.output
+    assert shown.output.count(reason) == 1
+    header = next(line for line in shown.output.splitlines() if line.startswith("trial"))
+    assert header.index("reason") < 100

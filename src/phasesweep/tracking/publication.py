@@ -114,7 +114,7 @@ def _save_intent(
     :param str name: Stable projection identity.
     :param RunBinding binding: Verified target run.
     :param Projection projection: Frozen upload payload.
-    :param str | None finish: Terminal status for a still-running managed run.
+    :param str | None finish: Authoritative terminal status for a managed run.
     :return Path: The delivery record, unchanged when it already exists.
     """
     assert experiment.mlflow is not None
@@ -191,7 +191,7 @@ def _unaccepted_projection(binding: RunBinding, status: str) -> Projection:
     """Freeze the end of a managed attempt run that produced no accepted result.
 
     :param RunBinding binding: The attempt's managed run binding.
-    :param str status: Terminal MLflow status for a still-running run.
+    :param str status: Terminal MLflow status from the managed attempt outcome.
     :return Projection: The attempt's outcome projection.
     """
     return _projection(

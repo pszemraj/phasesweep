@@ -1,0 +1,50 @@
+# phasesweep template: native MLflow metrics on the packaged CPU trainer; requires a tracking server and an existing experiment
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+# Run pip install "phasesweep[mlflow]" in the controller and trainer environments.
+# Start a tracking server and create phasesweep-native there before running.
+# Setup: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md#run-the-cpu-example-locally
+experiment: native_mlflow
+storage: auto
+workdir: ./runs
+provenance:
+  trainer: phasesweep-deterministic-mlflow-v1
+execution:
+  cwd: .
+# Replace the command, trainer_config and metric key for your own trainer.
+# Remove or replace the demo cost constraint and mlflow_required gates below.
+# Managed MLflow: the first mlflow.start_run() or mlflow.log_* resumes MLFLOW_RUN_ID; log everything into that one run.
+# To close and reopen it, save mlflow.active_run().info.run_id and resume by that ID; MLflow consumes the environment ID.
+# Do not call mlflow.set_experiment() with another name. phasesweep explain mlflow.run_mode gives the contract.
+trial_command: "phasesweep-mlflow-train --config {config_path}"
+trainer_config:
+  model: {depth: 1}
+  optimizer: {rate: 0}
+mlflow:
+  tracking_uri: http://127.0.0.1:5000
+  experiment_name: phasesweep-native
+  run_mode: managed
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {type: mlflow, metric_key: eval/loss, select: last}
+constraints:
+  - name: cost
+    extractor: {type: mlflow, metric_key: cost, select: last}
+    max: 5
+phases:
+  - name: depth
+    n_trials: 2
+    sampler: {type: grid}
+    search_space:
+      model.depth: {type: categorical, choices: [1, 2]}
+    gates:
+      - type: mlflow_required
+        metrics: [eval/loss, cost]
+        params: [depth, rate]
+        tags: [trainer]
+  - name: rate
+    inherits: [depth]
+    n_trials: 2
+    sampler: {type: grid}
+    search_space:
+      optimizer.rate: {type: categorical, choices: [1, 3]}

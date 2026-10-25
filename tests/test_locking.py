@@ -21,6 +21,7 @@ from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
+    experiment_is_busy,
 )
 from phasesweep.engine.run import run_experiment
 from phasesweep.errors import PhaseSweepError
@@ -30,6 +31,29 @@ from tests.conftest import (
     patch_directory_fsync_failure,
     raise_after_first_successful_call,
 )
+
+
+def test_busy_probe_observes_run_locks_without_creating_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only probe creates nothing and observes the same locks as a live run."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
+    experiment = make_experiment(workdir=str(tmp_path / "runs"))
+    assert not experiment_is_busy(experiment)
+    assert list(home.iterdir()) == []
+    with _experiment_lock(experiment):
+        before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+        assert experiment_is_busy(experiment)
+        assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+        with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
+            pytest.fail("the probe released the live operation's locks")
+        assert "finish, then retry the same command" in str(busy.value.remediation)
+        assert "MCP" not in str(busy.value.remediation)
+        assert "only if the user" not in str(busy.value.remediation)
+    assert not experiment_is_busy(experiment)
 
 
 @pytest.mark.parametrize(

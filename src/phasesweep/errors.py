@@ -91,6 +91,13 @@ RERUN_CLEANUP_RECOVERY = (
 )
 
 
+NEW_STUDY_STEP = (
+    "Set a new `experiment` name in the config to start a fresh "
+    "study (with `storage: auto`, a new `workdir` also works); the old study stays readable "
+    "with its original config."
+)
+
+
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",

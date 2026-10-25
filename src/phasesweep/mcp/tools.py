@@ -79,7 +79,7 @@ from phasesweep.mcp.redaction import (
     winners_payload,
 )
 from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
-from phasesweep.mcp.runner import FailurePayload
+from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -100,7 +100,7 @@ from phasesweep.mcp.snapshots import (
 )
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
-from phasesweep.runtime.json import JsonObject, JsonValue
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 from phasesweep.runtime.process import fd_ready
 from phasesweep.runtime.reaper import (
     kill_stale_group,
@@ -494,7 +494,11 @@ class PhaseSweepMCP:
         if limit < 1 or limit > MAX_LIST_LIMIT:
             raise McpToolError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
         offset = _cursor_offset(cursor)
-        experiments = self._serving_registry().summaries()
+        registry, refusal = self._refresh_registry()
+        experiments = registry.summaries()
+        if refusal is not None:
+            for experiment in experiments:
+                experiment["capabilities"]["launch"] = False
         total_count = len(experiments)
         page = experiments[offset : offset + limit]
         next_offset = offset + len(page)
@@ -578,7 +582,7 @@ class PhaseSweepMCP:
         return {
             "experiment_id": reg.id,
             "metric": reg.metric_payload,
-            "capabilities": reg.capabilities,
+            "capabilities": {**reg.capabilities, "launch": reg.allow_launch and refusal is None},
             "phases": phases,
             "catalog_status": self._catalog_status(),
         }
@@ -647,7 +651,7 @@ class PhaseSweepMCP:
         view: RunnerView | None = None,
         observation: RunObservation | None = None,
         force_snapshot_unavailable: bool = False,
-    ) -> dict[str, Any] | None:
+    ) -> JsonObject | None:
         """Return a validated safe terminal failure, never the raw exception text.
 
         :param RunHandle handle: Run handle whose recorded terminal status
@@ -658,7 +662,7 @@ class PhaseSweepMCP:
             together for this payload; otherwise read a fresh decision here.
         :param bool force_snapshot_unavailable: The result response has already
             refused a non-finalized or missing snapshot even if run state stays live.
-        :return dict[str, Any] | None: The run's ``failure`` payload validated
+        :return JsonObject | None: The run's ``failure`` payload validated
             against :class:`FailurePayload` and dumped to JSON-safe types. A
             terminal run with no usable result snapshot receives a generated
             snapshot-unavailable failure; otherwise returns ``None`` when no
@@ -669,6 +673,19 @@ class PhaseSweepMCP:
         if observation is None:
             observation = self._runs.observe(handle, view=view)
         terminal: Mapping[str, object] = observation.terminal_status or {}
+        persisted: JsonObject | None = None
+        recorded_failure = terminal.get("failure")
+        if recorded_failure is None and observation.terminal_status is None:
+            recorded_failure = self._runs.cleanup_failure(handle)
+        if recorded_failure is not None:
+            with contextlib.suppress(ValidationError):
+                persisted = json_object(
+                    FailurePayload.model_validate(recorded_failure).model_dump(
+                        mode="json", exclude_none=True
+                    )
+                )
+        if persisted is not None and observation.cleanup_recovery_required:
+            return persisted
         runner_ended_with_boot = (
             observation.terminal_status is None
             and handle.launch_state == "spawned"
@@ -717,18 +734,10 @@ class PhaseSweepMCP:
                 "actor": "operator",
                 "remediation": remedy,
             }
-        persisted: dict[str, Any] | None = None
-        try:
-            if terminal.get("failure") is not None:
-                persisted = FailurePayload.model_validate(terminal["failure"]).model_dump(
-                    mode="json", exclude_none=True
-                )
-        except ValidationError:
-            pass
         if force_snapshot_unavailable or (
             observation.state != "running" and parse_result_snapshot(terminal) is None
         ):
-            failure: dict[str, Any] = {
+            failure: JsonObject = {
                 "code": "result_snapshot_unavailable",
                 "stage": "cleanup",
                 "retryable": False,
@@ -1415,6 +1424,7 @@ class PhaseSweepMCP:
             process identity, so there is nothing safe to signal.
         :raises RunNamespaceMismatchError: If the runner was recorded in another
             PID namespace, where its PID and process group cannot be signalled.
+        :raises McpToolError: Cleanup needs operator recovery instead of cancellation.
         """
         args: JsonObject = {"run_id": run_id}
         resolved: JsonObject = {}
@@ -1456,6 +1466,21 @@ class PhaseSweepMCP:
                     if before == "running" and handle.launch_state == "launching":
                         # A pre-spawn handle supplies no process identity to cancel.
                         raise RunLaunchUnsettledError(run_id)
+                    if (
+                        before == "running"
+                        and observation.recovery_required
+                        and (
+                            view.visibility != "observable"
+                            or not self._runs.runner_may_be_alive(handle, view=view)
+                        )
+                    ):
+                        failure = self._run_failure_payload(
+                            handle, view=view, observation=observation
+                        )
+                        if failure is not None:
+                            if observation.terminal_status is None:
+                                self._runs.mark_cleanup_uncertain(handle, failure=failure)
+                            raise McpToolError(str(failure["remediation"]))
                     if before == "running" and view.visibility == "unobservable":
                         # Foreign-namespace numbers cannot be signalled locally.
                         raise RunNamespaceMismatchError(run_id)
@@ -1509,6 +1534,25 @@ class PhaseSweepMCP:
                     observation = self._runs.observe(handle, view=view)
                     after = observation.state
                     recovery_required = observation.recovery_required
+                    if not confirmed:
+                        failure = self._run_failure_payload(
+                            handle, view=view, observation=observation
+                        )
+                        if failure is None:
+                            failure = json_object(_cleanup_uncertain_payload([]))
+                            if self._runs.runner_may_be_alive(handle, view=view):
+                                failure["remediation"] = (
+                                    f"Cancellation could not stop runner PID {identity.pid} "
+                                    f"(process group {identity.pgid}); trial cleanup is unconfirmed. "
+                                    "Stop monitoring and ask the operator: If it is still running "
+                                    "on the host, clear the cause there; a process in "
+                                    "uninterruptible I/O ignores SIGKILL until the I/O ends. "
+                                    "Then run `phasesweep mcp recover-run` from a host shell, "
+                                    "review the preview, and repeat with `--confirm`."
+                                )
+                        if observation.terminal_status is None:
+                            self._runs.mark_cleanup_uncertain(handle, failure=failure)
+                        raise McpToolError(str(failure["remediation"]))
             result = {
                 "run_id": run_id,
                 "state": after,

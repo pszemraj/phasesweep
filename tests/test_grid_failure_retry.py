@@ -19,6 +19,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
+from phasesweep.engine.preview import validate_grid_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -33,6 +34,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     phase_trials,
+    write_experiment_config,
     write_flaky_trainer,
     write_trainer,
 )
@@ -74,6 +76,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert len(calls.read_text().splitlines()) == 2
 
     raised = _grid(tmp_path, trainer, 3, repeats=repeats)
+    validate_grid_targets(raised)
     if repeats:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(raised)
@@ -103,8 +106,9 @@ def test_partly_failed_grid_retries_the_failed_cell_only(tmp_path: Path, repeats
     trainer, calls = write_flaky_trainer(tmp_path, failures=1)
     original = _grid(tmp_path, trainer, 2, repeats=repeats)
     if repeats:
-        with pytest.raises(NoFeasibleTrialError):
+        with pytest.raises(NoFeasibleTrialError) as refused:
             run_experiment(original)
+        assert "raise phases[p].n_trials to 3 in the config" in str(refused.value.remediation)
     else:
         assert run_experiment(original)["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError):
@@ -199,16 +203,16 @@ def _assert_advises_limit(message: str, above: int, left: int, target: int) -> N
     assert "the failure count starts again from zero" in message
 
 
-def _assert_no_fresh_namespace(message: str) -> None:
-    """Assert the message does not send the operator to a new workdir."""
-    assert "namespace" not in message
-    assert "workdir" not in message
+def _assert_fresh_study_remedy(message: str) -> None:
+    """Assert new-workdir advice is conditional on automatic storage."""
+    assert "new `experiment` name" in message
+    assert "with `storage: auto`, a new `workdir` also works" in message
 
 
 def _assert_no_recovery(message: str) -> None:
     """Assert the message offers no setting of phase ``p`` that continues the study."""
     assert "phases[p]" not in message
-    _assert_no_fresh_namespace(message)
+    _assert_fresh_study_remedy(message)
 
 
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
@@ -398,7 +402,7 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     _assert_advises_limit(aborted, 2, 2, 4)
     # The target retries nothing: both measured cells are closed.
     assert "n_trials from" not in aborted
-    _assert_no_fresh_namespace(aborted)
+    _assert_fresh_study_remedy(aborted)
     measured = ran()
     assert sorted(measured) == ["3", "4"]
 
@@ -462,12 +466,6 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     _assert_advises_limit(message, 2, 2, 4)
 
 
-_FRESH_START = (
-    "The recorded trial results stay in the study; if a defect you have since fixed "
-    "produced them, set a new `experiment` name in the config to start fresh."
-)
-
-
 def _out_of_bounds_metric() -> Metric:
     """Return a ``x=<value>`` metric whose upper bound a logged 5.0 exceeds."""
     return Metric(
@@ -496,8 +494,11 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
 
     for message in map(_operational_error_text, (aborted.value, refused.value, at_limit.value)):
         _assert_advises_limit(message, 2, 2, 4)
-        assert message.endswith(_FRESH_START)
-        _assert_no_fresh_namespace(message)
+        assert "The recorded trial results stay in the study." in message
+        assert "new `experiment` name" in message
+        assert message.index("metric.min, metric.max") < message.index(
+            "phases[p].max_consecutive_failures"
+        )
     headline = str(aborted.value)
     assert "stderr" not in headline
     assert (
@@ -517,7 +518,8 @@ def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is
     message = _operational_error_text(aborted.value)
     assert " for stderr logs." in message
     assert "completed outside the metric bounds" not in message
-    assert message.endswith(_FRESH_START)
+    assert "The recorded trial results stay in the study." in message
+    assert "new `experiment` name" in message
 
 
 def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: Path) -> None:
@@ -730,3 +732,25 @@ def test_in_memory_grid_abort_gets_no_recovery_advice(tmp_path: Path) -> None:
     with pytest.raises(NoFeasibleTrialError) as aborted:
         run_experiment(make_experiment(trainer=trainer, phases=[phase]))
     assert str(aborted.value).endswith("for stderr logs.")
+
+
+def test_validate_refuses_an_oversized_fresh_persistent_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Validation applies the launch ceiling before a fresh grid can spend any trials."""
+    experiment = _grid(tmp_path, tmp_path / "trainer.py", 3)
+    path = tmp_path / "grid.yaml"
+    write_experiment_config(path, experiment)
+    assert invoke_cli_boundary(["validate", str(path)], monkeypatch) == 1
+    error = capsys.readouterr().err
+    assert "fix:" in error
+    assert "Set phases[p].n_trials to at most 2" in error
+    assert "To enlarge the grid instead, change the search space" in error
+    diagnosis = error.splitlines()[0].removeprefix("phasesweep: ")
+    remedy = next(
+        line.removeprefix("fix: ") for line in error.splitlines() if line.startswith("fix: ")
+    )
+    assert diagnosis not in remedy
+    assert "correct the experiment configuration" not in error

@@ -61,6 +61,7 @@ dev = [
 [project.scripts]
 phasesweep = "phasesweep.cli:main"
 phasesweep-mcp = "phasesweep.mcp.server:main"
+phasesweep-mlflow-train = "phasesweep.examples.mlflow_train:main"
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/phasesweep"

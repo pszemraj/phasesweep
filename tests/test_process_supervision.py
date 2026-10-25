@@ -1419,6 +1419,7 @@ def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
     assert timeout > supervisor._GROUP_TERM_GRACE_SECONDS
 
 
+@pytest.mark.parametrize("state", ["Z", "X"])
 @pytest.mark.parametrize(
     ("unreadable_pgid", "expected"),
     [
@@ -1428,10 +1429,11 @@ def test_in_band_guardian_wait_reports_uncertainty_instead_of_hanging() -> None:
 )
 def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     monkeypatch: pytest.MonkeyPatch,
+    state: str,
     unreadable_pgid: int,
     expected: tuple[tuple[int, ...], bool, bool],
 ) -> None:
-    """Host-global hidepid failures do not poison an unrelated trainer group."""
+    """Terminal Z/X members stay conclusive despite unreadable unrelated processes."""
     monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
     real_iterdir = Path.iterdir
 
@@ -1442,7 +1444,7 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
 
     def fake_stat(path: Path) -> tuple[_ProcStat | None, bool]:
         if path.name == "11":
-            return _ProcStat(state="Z", pgrp=1234, starttime=1), True
+            return _ProcStat(state=state, pgrp=1234, starttime=1), True
         return None, False
 
     monkeypatch.setattr(Path, "iterdir", fake_iterdir)
@@ -1454,6 +1456,7 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     assert (scan.pids, scan.complete, scan.all_members_terminal) == expected
 
 
+@pytest.mark.parametrize("state", ["Z", "X"])
 @pytest.mark.parametrize(
     ("unreadable_pgid", "expected_alive"),
     [
@@ -1463,17 +1466,18 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
 )
 def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     monkeypatch: pytest.MonkeyPatch,
+    state: str,
     unreadable_pgid: int,
     expected_alive: bool,
 ) -> None:
-    """The stdlib guardian applies the same target-scoped completeness rule."""
+    """The stdlib guardian releases Z/X groups only with target-scoped complete evidence."""
     monkeypatch.setattr(supervisor, "sys", SimpleNamespace(platform="linux"))
 
     real_open = builtins.open
 
     def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object):
         if path == "/proc/11/stat":
-            return io.BytesIO(b"11 (trainer) Z 1 1234 0")
+            return io.BytesIO(f"11 (trainer) {state} 1 1234 0".encode())
         if path == "/proc/22/stat":
             raise PermissionError(path)
         return real_open(path, mode, *args, **kwargs)
