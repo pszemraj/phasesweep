@@ -118,9 +118,10 @@ strict_equality = true
 extra_checks = true
 
 [[tool.mypy.overrides]]
-# Installed numerical stubs use PEP 695 syntax, which mypy cannot parse for a
-# 3.11 target. These transitive imports are outside PhaseSweep's source typing.
-module = ["numpy.*", "jax.*"]
+# numpy's bundled stubs use PEP 695 `type` statements, which mypy refuses to
+# parse for a 3.11 target. PhaseSweep never imports numpy; it arrives through
+# Optuna's stubs. Skipping it keeps the 3.11 floor checkable.
+module = ["numpy.*"]
 follow_imports = "skip"
 follow_imports_for_stubs = true
 
