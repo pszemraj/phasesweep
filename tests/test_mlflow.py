@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import json
 import os
-import runpy
 import sys
 import time
 from pathlib import Path
@@ -40,10 +40,9 @@ from tests.tracking_helpers import (
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "mlflow", None)
-    path = Path(__file__).parents[1] / "src/phasesweep/examples/mlflow_train.py"
-    namespace = runpy.run_path(str(path))
+    example = importlib.import_module("phasesweep.examples.mlflow_train")
     with pytest.raises(SystemExit) as stopped:
-        namespace["main"](["--help"])
+        example.main(["--help"])
     assert stopped.value.code == 0
     assert "--config" in capsys.readouterr().out
 

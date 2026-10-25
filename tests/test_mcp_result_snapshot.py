@@ -669,7 +669,7 @@ def _engine_winner(
 
 
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
-    """Engine-supplied winners are frozen verbatim, with no second file read."""
+    """Engine winners freeze without rereading files; observed values survive the stored view."""
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     winner = _engine_winner(4)
     winner.gates = [{"type": "g", "passed": True}]

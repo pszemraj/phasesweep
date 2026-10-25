@@ -1194,6 +1194,7 @@ else:
                     registry.state_dir, "orphan-generation", confirm=True
                 )
                 assert recovered_run.exit_code == 0, recovered_run.output
+                assert f"terminated {int(terminated)} live process group(s)" in recovered_run.output
                 expected_kept = 0 if terminated else 1
                 assert f"kept {expected_kept} completed trial result(s)" in recovered_run.output
                 if expected_kept:

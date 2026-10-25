@@ -138,10 +138,8 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
 def _trainer_group_alive(pgid: int) -> bool:
     """Return whether ``pgid`` still has a nonterminal member.
 
-    ``killpg(..., 0)`` is the primary existence probe. Linux keeps a process
-    group visible while terminal members remain, though, so a complete procfs
-    scan containing only zombie (Z) or dead (X) members proves that no process
-    capable of holding GPU state remains. Unreadable possible members keep the lease.
+    ``killpg(..., 0)`` is the primary existence probe. On Linux a procfs scan
+    checks for nonterminal group members. Unreadable possible members keep the lease.
 
     :param int pgid: Trainer process-group identifier.
     :return bool: ``True`` while a live member exists or absence is uncertain.
