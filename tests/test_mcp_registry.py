@@ -197,26 +197,8 @@ def test_checked_in_catalog_loads(
     assert entry.id == experiment_id
 
 
-def test_relative_state_dir_resolves_against_catalog_file(tmp_path: Path) -> None:
-    _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    catalog_dir = tmp_path / "catalogs"
-    catalog_dir.mkdir()
-    catalog = _write(
-        catalog_dir / "catalog.yaml",
-        """\
-        state_dir: .mcp
-        experiments:
-          - id: reg_ok
-            config: ../exp.yaml
-        """,
-    )
-
-    registry = Registry.load(catalog)
-
-    assert registry.state_dir == (catalog_dir / ".mcp").resolve()
-
-
-def test_catalog_cwd_resolves_against_catalog_file(tmp_path: Path) -> None:
+def test_catalog_paths_resolve_against_catalog_file(tmp_path: Path) -> None:
+    """State and trainer paths resolve beside the catalog file."""
     _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
     run_cwd = tmp_path / "run-cwd"
     run_cwd.mkdir()
@@ -233,8 +215,10 @@ def test_catalog_cwd_resolves_against_catalog_file(tmp_path: Path) -> None:
         """,
     )
 
-    reg = Registry.load(catalog).get("reg_ok")
+    registry = Registry.load(catalog)
+    reg = registry.get("reg_ok")
 
+    assert registry.state_dir == (catalog_dir / ".mcp").resolve()
     assert reg.cwd == run_cwd.resolve()
     assert reg.experiment.execution.cwd == str(run_cwd.resolve())
 
