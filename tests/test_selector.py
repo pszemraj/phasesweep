@@ -494,3 +494,32 @@ def test_crashed_trials_remedy_names_the_next_attempt_budget(
     else:
         assert "storage: null starts fresh" in remedy
         assert "raise" not in remedy
+
+
+@pytest.mark.parametrize(
+    ("feasible", "required", "excluded"),
+    [
+        pytest.param(
+            True, "raise phases[p].n_trials above 3", "Changing metric.min", id="crashed-member"
+        ),
+        pytest.param(
+            False, "Changing metric.min", "raise phases[p].n_trials", id="infeasible-members"
+        ),
+    ],
+)
+def test_incomplete_repeats_remedy_uses_recorded_feasibility(
+    tmp_path: Path, feasible: bool, required: str, excluded: str
+) -> None:
+    """Successful repeat members do not turn a crashed group into an infeasible one."""
+    experiment = make_experiment(persistent=tmp_path, n_trials=3)
+    study = _make_study()
+    _add_group(study, 1, [0.5, 0.6], feasible=feasible)
+    _add_failed(study, 1, 2)
+
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        select_winner(study, experiment, phase_name="p", repeats=_axis())
+
+    remedy = refused.value.remediation
+    assert remedy is not None
+    assert required in remedy
+    assert excluded not in remedy

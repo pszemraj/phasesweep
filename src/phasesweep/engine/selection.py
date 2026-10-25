@@ -109,7 +109,7 @@ def _no_feasible_remedy(
     evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
     if experiment.resolved_storage is None:
         return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
-    infeasible = any(trial.state == optuna.trial.TrialState.COMPLETE for trial in trials)
+    infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
         return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
     if phase_name is not None:
