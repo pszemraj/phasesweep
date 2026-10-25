@@ -673,6 +673,7 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     winner = _engine_winner(4)
     winner.gates = [{"type": "g", "passed": True}]
+    winner.observed = {"peak": 7.5, "steps": 3.0}
 
     snapshot = mcp_runner.capture_result_snapshot(
         experiment,
@@ -697,21 +698,6 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         "generation_id": "engine-generation",
         "attempt_id": "engine-attempt",
     }
-
-
-def test_snapshot_freezes_observed_values(tmp_path: Path) -> None:
-    """A winner's report-only values are frozen with it and come back out of the stored view."""
-    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
-    winner = _engine_winner(0)
-    winner.observed = {"peak": 7.5, "steps": 3.0}
-
-    snapshot = mcp_runner.capture_result_snapshot(
-        experiment,
-        generation_id="engine-generation",
-        engine_winners={"p": winner},
-    )
-
-    (frozen,) = snapshot["winners"]
     assert frozen["observed"] == {"peak": 7.5, "steps": 3.0}
     assert frozen["repeats"] is None
     stored = RunResultSnapshot.model_validate(snapshot)
