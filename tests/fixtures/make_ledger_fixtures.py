@@ -15,7 +15,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -217,21 +216,16 @@ def _git_describe(path: Path) -> str:
     """Describe the git checkout a path belongs to.
 
     ``--dirty`` marks a checkout with uncommitted changes, whose bytes no
-    commit reproduces.
+    commit reproduces. Repository-local environment variables do not override
+    the requested checkout.
 
     :param Path path: Any path inside the checkout.
     :return str: ``git describe --tags --always --dirty`` output, or ``"unknown"``.
     """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "describe", "--tags", "--always", "--dirty"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    return result.stdout.strip() or "unknown"
+    from phasesweep.engine.provenance import _git_stdout
+
+    result = _git_stdout(path, "describe", "--tags", "--always", "--dirty")
+    return (result or "").strip() or "unknown"
 
 
 def _journal_schema_versions(ledger: Path) -> list[tuple[str, object, bool]]:

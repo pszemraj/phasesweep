@@ -18,7 +18,7 @@ Use `golden_publication` or `materialize` from [`ledger_fixtures.py`](../../ledg
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is validated first. `ledger-only` points the same ledger at a workdir that has never existed, testing the ledger format scan without a binding. The table reports direct-reader format verdicts; CLI `status`, `status --trials` and `show-winners` instead refuse the missing study directory, which the read-path matrix classifies as `study-absent`.
 
-The manifest records the generating toolchain: PhaseSweep Git revision, Optuna, SQLite library version, Python, and working directory.
+The manifest records the generating toolchain: PhaseSweep Git revision, Optuna, SQLite library version, Python, and working directory. The Git revision and dirty marker describe the checkout supplying PhaseSweep, even when the generator inherits another repository's Git hook environment.
 
 ## Regeneration
 
