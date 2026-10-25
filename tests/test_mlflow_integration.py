@@ -527,9 +527,16 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     local_server, tmp_path: Path, caplog: pytest.LogCaptureFixture, trainer_outcome: str
 ) -> None:
     """A failed managed trial closes its bound run as FAILED, including a trainer's FINISHED run."""
+    import csv
+
+    from click.testing import CliRunner
+
+    from phasesweep.cli import cli
     from phasesweep.engine.paths import _experiment_dir
     from phasesweep.engine.selection import NoFeasibleTrialError
+    from phasesweep.engine.state import FAILURE_REASON_ATTR
     from phasesweep.tracking.session import read_binding
+    from tests.conftest import phase_trials, write_experiment_config
 
     uri, client, experiment_id, _process = local_server
     programs = {
@@ -583,8 +590,20 @@ def test_managed_failed_trial_overrides_the_trainer_run_status(
     assert "phasesweep.objective" not in remote.data.metrics
     assert read_status(experiment)["phases"][0]["trials"]["FAIL"] == 1
     if trainer_outcome in {"no_objective", "ended_then_logged"}:
-        assert "probably went to a different MLflow run" in caplog.text
-        assert "pass MLFLOW_RUN_ID to that logger" in caplog.text
+        assert "logged under another key or logging went to another run" in caplog.text
+        assert "read MLFLOW_RUN_ID before any MLflow call" in caplog.text
         assert "loss" not in remote.data.metrics
     else:
         assert remote.data.metrics["loss"] == 0.01
+    reason = phase_trials(experiment, "p")[0].user_attrs[FAILURE_REASON_ATTR]
+    assert isinstance(reason, str) and len(reason.splitlines()) == 1
+    with (_experiment_dir(experiment) / "p" / "trials.csv").open() as handle:
+        (row,) = csv.DictReader(handle)
+    assert row[f"user_attr:{FAILURE_REASON_ATTR}"] == reason
+    config = tmp_path / "sweep.yaml"
+    write_experiment_config(config, experiment)
+    shown = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert shown.exit_code == 0, shown.output
+    assert shown.output.count(reason) == 1
+    header = next(line for line in shown.output.splitlines() if line.startswith("trial"))
+    assert header.index("reason") < 100

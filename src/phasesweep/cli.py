@@ -947,7 +947,7 @@ def _trial_cell(column: str, value: JsonValue) -> str:
 
 
 #: Columns whose text is not a number, which a trial table left-aligns.
-_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible"})
+_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner", "reduce", "eligible", "reason"})
 
 
 def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:

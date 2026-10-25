@@ -635,12 +635,11 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                     not in run.data.metrics
                 ):
                     lacking += (
-                        "\nThe trainer's logging probably went to a different MLflow run. Check:"
-                        "\n- The run was ended and logging continued, or a second start_run() "
-                        "was opened; keep logging in the supplied run or save and resume its ID."
-                        "\n- A logger creates its own run; pass MLFLOW_RUN_ID to that logger."
-                        "\n- The objective was never logged under the configured metric key; "
-                        "log that exact key."
+                        " Check whether the objective was logged under another key or logging "
+                        "went to another run. Log the configured metric key into the supplied "
+                        "run; after end_run() or another start_run(), resume its saved ID. "
+                        "Give a logger the supplied run ID: read MLFLOW_RUN_ID before any "
+                        "MLflow call, or use mlflow.active_run().info.run_id while the run is active."
                     )
                 raise ValueError(lacking)
             observations: dict[str, Observation] = {}
