@@ -342,17 +342,7 @@ def init(template: str, list_templates: bool, output: str) -> None:
     # different (nonexistent) file than the one just written.
     config_arg = shlex.quote(str(expanded))
     click.echo(f"Wrote the {template} template to {target}")
-    if template == "mlflow":
-        click.echo(
-            "\nBefore running: start an MLflow tracking server and create the experiment "
-            "named in mlflow.experiment_name (phasesweep-native in this template)."
-        )
-        click.echo(
-            "When adapting this CPU demo, replace its trainer_config and metric key, and "
-            "remove or replace the demo constraints and gates."
-        )
-        click.echo("Setup: phasesweep explain mlflow")
-    click.echo("\nNext:")
+    click.echo("\nNext: read the template header for prerequisites and trainer adaptation, then:")
     click.echo(f"  phasesweep validate {config_arg}")
     click.echo(f"  phasesweep run {config_arg} --dry-run")
     click.echo(f"  phasesweep run {config_arg}")

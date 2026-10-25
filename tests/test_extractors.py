@@ -1596,7 +1596,9 @@ def test_wandb_missing_run_worker_names_target_and_init_overrides(
         run_extractor(context, source)
     message = str(refused.value)
     assert f"No W&B run {context.attempt_id!r} was found in entity/project" in message
-    assert "trainer probably passes its own project, entity or id to wandb.init" in message
+    assert "Call wandb.init() in the trainer" in message
+    assert "If it passes its own project, entity or id" in message
     assert "remove those overrides" in message
     assert "set the extractor's project and entity to match" in message
     assert "Last observation: ValueError" not in message
+    assert len(message.splitlines()) == 1

@@ -66,7 +66,11 @@ with mlflow.start_run():
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-After confirmed cleanup, PhaseSweep marks a failed trial's managed run FAILED even if the trainer left it FINISHED. A still-running managed run becomes FINISHED after success, or KILLED after an [interruption](runtime.md#interrupted-trials-rerun). Interrupted reruns receive new managed runs. FAILED and KILLED runs cannot supply accepted evidence.
+Lightning's `MLFlowLogger` needs the supplied run ID passed as its `run_id`; read `MLFLOW_RUN_ID` before any MLflow call, or use `mlflow.active_run().info.run_id` while the run is active.
+
+Transformers' MLflow callback ends its run at the end of training, so call `mlflow.start_run()` before constructing the Trainer to keep its final evaluation in the same active run.
+
+After confirmed cleanup, PhaseSweep marks a failed trial's managed run FAILED even if the trainer left it FINISHED. A still-running managed run becomes FINISHED after success. A SIGINT leaves the managed run RUNNING until `phasesweep sync-tracking CONFIG` delivers KILLED for the [interrupted attempt](runtime.md#interrupted-trials-rerun). Interrupted reruns receive new managed runs. FAILED and KILLED runs cannot supply accepted evidence.
 
 In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
@@ -80,10 +84,6 @@ with mlflow.start_run() as run:
 ```
 
 The helper verifies the configured experiment and that the run is still RUNNING, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. A missing, foreign or conflicting binding fails the trial, and so does a bound run that was deleted, lies outside the configured experiment or carries another attempt's identity tags. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification. In either mode, disable autologging and nested-run behavior that starts runs of its own: PhaseSweep reads only the bound run, never a parent or child.
-
-Lightning's `MLFlowLogger` needs the supplied `MLFLOW_RUN_ID` passed as its `run_id`; its default creates a separate run.
-
-Transformers' MLflow callback ends its run at the end of training, so call `mlflow.start_run()` before constructing the Trainer to keep its final evaluation in the same active run.
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 

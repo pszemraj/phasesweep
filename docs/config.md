@@ -322,7 +322,9 @@ These scoring decisions are separate:
 
 For example, in a fixed-token batch-size sweep each trial's optimizer `step` count depends on its batch size, so trials differ by design in both `step` and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting `progress={"tokens": total_tokens}` compares trials on tokens instead: the check stays `ok` when every trial reached the token budget, and flags one that stopped short. The check's 1% tolerance absorbs each batch size stopping within a batch of the budget. Likewise, a trainer that reports its best checkpoint reports a step that differs between trials by nature; report how far it trained on a declared axis instead, such as `progress={"trained_steps": total_steps}` with `evaluation_axis: trained_steps`.
 
-The `evaluation_point` position is the step the metric was logged at, so a trainer that scores a reloaded earlier checkpoint should log the result at that checkpoint's step.
+The `evaluation_point` position is the step the metric was logged at, so a trainer that scores a reloaded earlier checkpoint should log the result at that checkpoint's step (for W&B, log it as the `evaluation_axis` value in the metric's `log()` call, since `wandb.log(step=)` cannot go backwards).
+
+`validate` and `run --dry-run` print an `evaluation_point check:` line that says whether the configured extractor supports this check.
 
 The trainer owns evaluation cadence, early stopping, checkpoint selection, and custom aggregation. PhaseSweep has one experiment-level metric and does not prune training. `validate` and `run --dry-run` display the configured source, key/path/pattern, applicable reduction, ranking goal, and viability bounds when set.
 
@@ -407,11 +409,7 @@ PhaseSweep supplies `WANDB_BASE_URL`, `WANDB_ENTITY`, `WANDB_PROJECT`, `WANDB_RU
 
 Lightning's default `WandbLogger()` honors this environment contract unchanged.
 
-For [managed MLflow](mlflow.md#choose-run-ownership), the trainer receives `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID` and `MLFLOW_RUN_ID`. Its first `mlflow.start_run()` or `mlflow.log_*` call resumes the supplied run; log everything into that run. If the trainer closes and reopens it, save `mlflow.active_run().info.run_id` before closing and resume by that ID, because MLflow consumes the environment ID. Do not call `mlflow.set_experiment()` with another name.
-
 The reader receives the trainer's composed authentication and transport environment. List rotating environment credentials or proxies in `execution.passthrough_env` ([trainer contract](#trainer-contract)). Excluded parent credentials are not reacquired. Supported SDK account authentication also works; an API-key environment variable is not mandatory. Credentials are never serialized in worker requests. Syntax validation and dry runs do not authenticate.
-
-W&B's source is keyed by attempt ID. It only records where in the run's history the objective's value was logged.
 
 ## Trainer contract
 

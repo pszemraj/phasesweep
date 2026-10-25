@@ -443,15 +443,13 @@ def test_init_losing_publish_race_preserves_other_writer(
     assert not list(tmp_path.glob(".starter.yaml.*.tmp"))
 
 
-def test_init_mlflow_names_its_setup_and_demo_replacements(tmp_path: Path) -> None:
-    """MLflow setup precedes launch commands and identifies demo-only evidence requirements."""
+def test_init_points_to_template_prerequisites_and_adaptation(tmp_path: Path) -> None:
+    """The generated header owns setup and adaptation advice before launch commands."""
     result = CliRunner().invoke(cli_main, ["init", "--template", "mlflow", "-o", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "start an MLflow tracking server" in result.output
-    assert "create the experiment" in result.output
-    assert "phasesweep-native" in result.output
-    assert result.output.index("Before running:") < result.output.index("Next:")
-    assert "remove or replace the demo constraints and gates" in result.output
+    assert "read the template header for prerequisites and trainer adaptation" in result.output
+    assert result.output.index("template header") < result.output.index("phasesweep validate")
+    assert "Before running:" not in result.output
     config = (tmp_path / "mlflow.yaml").read_text(encoding="utf-8")
     assert "Remove or replace the demo cost constraint and mlflow_required gates" in config
     assert "first mlflow.start_run() or mlflow.log_* resumes MLFLOW_RUN_ID" in config
