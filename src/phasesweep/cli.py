@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
-import re
 import shlex
 import sys
 import traceback
@@ -886,42 +884,45 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
             _render_phase_comment(comment, prefix="# ")
 
 
+def _display_float(value: float) -> str:
+    """Format a displayed float to twelve significant digits without changing storage.
+
+    :param float value: Recorded value to display.
+    :return str: Compact decimal or scientific notation.
+    """
+    return f"{value:.12g}"
+
+
 class _WinnerDumper(yaml.SafeDumper):
-    """Render every winner float with a shared display-only binary-tail policy."""
+    """Render winner floats with the shared display precision."""
 
     def represent_float(self, value: float) -> yaml.ScalarNode:
-        """Shorten an obvious binary tail only within eight floating-point steps.
+        """Apply display precision while preserving YAML's float type.
 
         :param float value: Stored value, left unchanged outside the display.
-        :return yaml.ScalarNode: Safe YAML scalar retaining other significant digits.
+        :return yaml.ScalarNode: Safe YAML float scalar.
         """
-        fraction = repr(value).partition("e")[0].partition(".")[2]
-        if re.search(r"(?:0{4,}|9{4,})\d{0,2}$", fraction):
-            rounded = float(f"{value:.15g}")
-            if abs(rounded - value) <= 8 * math.ulp(value):
-                value = rounded
-        return super().represent_float(value)
+        return super().represent_float(float(_display_float(value)))
 
 
 _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
 def _param_text(value: JsonValue) -> str:
-    """Format one sampled param for a trial table, floats to four significant digits.
+    """Format one sampled param using the shared float display precision.
 
     :param JsonValue value: The recorded param value.
     :return str: Terminal text for the value.
     """
     if isinstance(value, float):
-        return f"{value:.4g}"
+        return _display_float(value)
     return str(value)
 
 
 def _trial_cell(column: str, value: JsonValue) -> str:
     """Format one trial-table cell for the terminal.
 
-    Metric-like numbers print to six significant digits, params to four, and
-    durations to a tenth of a second; a missing value prints as ``-``.
+    All floats use the shared display precision; a missing value prints as ``-``.
 
     :param str column: Column header the cell sits under.
     :param JsonValue value: The row's value for that column.
@@ -932,7 +933,7 @@ def _trial_cell(column: str, value: JsonValue) -> str:
     if isinstance(value, dict):
         return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
     if isinstance(value, float):
-        return f"{value:.1f}" if column == "duration_s" else f"{value:.6g}"
+        return _display_float(value)
     return str(value)
 
 
@@ -1109,7 +1110,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
                     f"# {phase['name']}: winner retained but not published; "
                     f"{UNPUBLISHED_WINNER_STEP}"
                 )
-    click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+    click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),
         str(payload["publication_integrity"]),

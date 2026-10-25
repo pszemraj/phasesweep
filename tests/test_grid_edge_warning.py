@@ -344,16 +344,17 @@ def test_repeat_advisories_keep_the_selected_population_after_failed_top_up(tmp_
     ("value", "displayed"),
     [
         (4938268.0, 4938268.0),
-        (1.2345678901234567, 1.2345678901234567),
-        (0.10000000012345678, 0.10000000012345678),
+        (1.2345678901234567, 1.23456789012),
+        (0.10000000012345678, 0.100000000123),
         (1.23456789e-9, 1.23456789e-9),
         (0.39999999999999997, 0.4),
+        (0.0299999999999999, 0.03),
     ],
 )
-def test_winner_display_preserves_significant_digits_and_shortens_binary_tails(
+def test_float_displays_share_precision_without_changing_recorded_values(
     tmp_path: Path, value: float, displayed: float
 ) -> None:
-    """Winner YAML shortens obvious arithmetic tails without rounding other stored digits."""
+    """Winner YAML and trial tables share twelve-digit precision; stored values stay exact."""
     trainer = write_trainer(tmp_path / "trainer.py", f"print('x={value!r}')")
     experiment = make_experiment(
         persistent=tmp_path,
@@ -377,6 +378,9 @@ def test_winner_display_preserves_significant_digits_and_shortens_binary_tails(
     assert yaml.safe_load(base_text)["trainer_config"]["precise"] == displayed
     assert winner.metric == value
     assert capture_result_snapshot(experiment)["winners"][0]["metric"] == value
+    table = CliRunner().invoke(cli, ["status", str(config), "--trials"])
+    assert table.exit_code == 0, table.output
+    assert f"{value:.12g}" in table.output
 
 
 @pytest.mark.integration
