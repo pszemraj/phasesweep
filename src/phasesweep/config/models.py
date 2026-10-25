@@ -169,6 +169,13 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
         *(_observation_line(observation) for observation in experiment.observe),
         _environment_contract_line(experiment),
         _trainer_cwd_line(experiment),
+        *(
+            [
+                "MLflow target: unchecked by validate and dry-run; credentials and experiment access are checked before the phase's first trial."
+            ]
+            if experiment.mlflow is not None
+            else []
+        ),
     ]
 
 

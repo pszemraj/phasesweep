@@ -461,6 +461,8 @@ mlflow: object | null = null
   # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(run_id) inside it.
   # Warning: a trainer that starts a different run instead of attaching to the managed ID logs evidence PhaseSweep does not read.
   # Recommended: managed when the trainer can honor MLFLOW_RUN_ID, and trainer for code that must own start_run(). Disable autologging and nested runs either way.
+  # Recommended: for Transformers, trial_command: "python -m phasesweep.tracking.mlflow_launch -m my_project.train --report_to mlflow {overrides}" with override_format: argparse.
+  # The launcher also accepts SCRIPT in place of -m MODULE. In the trainer environment: pip install "phasesweep[mlflow]".
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md#choose-run-ownership
   run_mode: "managed" | "trainer" = "managed"
 
@@ -481,7 +483,7 @@ mlflow: object | null = null
 
 # Explicit trainer environment values, as YAML strings. A name must be nonempty and free of = and NUL, and a value free of NUL.
 # The per-attempt PHASESWEEP_* names, listed in https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract, fail config load.
-# See: the MLflow section rules and WandbTarget for the tracking variables it may set.
+# See: mlflow and metric.extractor.entity (wandb) for the tracking variables it may set.
 # Warning: values are written in plain text to config.snapshot.yaml and with every trial in the study ledger, so rotating secrets belong in passthrough_env.
 # Recommended: set cache variables such as HF_HOME and TORCH_HOME here when the trainer needs them. PhaseSweep does not provision trainer caches.
 env: map[string, string] = {}

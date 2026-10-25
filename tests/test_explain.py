@@ -100,15 +100,22 @@ def _explain(*args: str) -> tuple[int, str, str]:
 
 
 @pytest.mark.parametrize(
-    ("version", "ref"),
-    [("0.3.11", "v0.3.11"), ("0.3.12.dev4+g123abcd.d20261023", "123abcd")],
+    ("version", "editable", "ref"),
+    [
+        ("0.3.11", False, "v0.3.11"),
+        ("0.3.12.dev4+g123abcd.d20261023", False, "main"),
+        ("0.3.13.dev0", False, "main"),
+        ("0.0.0+unknown", False, "main"),
+        ("0.3.11", True, "main"),
+    ],
 )
 def test_explain_links_pin_installed_release_or_source_revision(
-    monkeypatch: pytest.MonkeyPatch, version: str, ref: str
+    monkeypatch: pytest.MonkeyPatch, version: str, editable: bool, ref: str
 ) -> None:
-    """Installed help opens documentation for its release or exact SCM source revision."""
+    """Release help pins its tag; development and editable installs use main."""
     with monkeypatch.context() as patch:
         patch.setattr(reference, "__version__", version)
+        patch.setattr(reference, "_editable_install", lambda: editable)
         reference._packaged.cache_clear()
         try:
             code, out, err = _explain("metric.extractor")
@@ -117,6 +124,46 @@ def test_explain_links_pin_installed_release_or_source_revision(
             assert "See: docs/" not in out
         finally:
             reference._packaged.cache_clear()
+
+
+@pytest.mark.parametrize("editable", [False, True])
+def test_documentation_links_read_editable_install_metadata(
+    monkeypatch: pytest.MonkeyPatch, editable: bool
+) -> None:
+    """Editable metadata selects main even when the installed version is a release."""
+
+    class InstalledDistribution:
+        def read_text(self, filename: str) -> str:
+            assert filename == "direct_url.json"
+            return '{"dir_info": {"editable": ' + str(editable).lower() + "}}"
+
+    monkeypatch.setattr(reference, "distribution", lambda _name: InstalledDistribution())
+    monkeypatch.setattr(reference, "__version__", "0.3.12")
+    ref = "main" if editable else "v0.3.12"
+    assert (
+        reference.pin_documentation_links(
+            "https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md"
+        )
+        == f"https://github.com/pszemraj/phasesweep/blob/{ref}/docs/mlflow.md"
+    )
+
+
+def test_explain_mlflow_mode_gives_an_offline_launcher_command() -> None:
+    """Managed-mode help includes the installed launcher and the trainer's install requirement."""
+    code, out, err = _explain("mlflow.run_mode")
+    assert code == 0 and not err
+    assert 'trial_command: "python -m phasesweep.tracking.mlflow_launch -m my_project.train' in out
+    assert "{overrides}" in out
+    assert 'pip install "phasesweep[mlflow]"' in out
+
+
+def test_explain_environment_points_to_queryable_tracker_keys() -> None:
+    """Environment help points to config keys that explain accepts."""
+    code, out, err = _explain("env")
+    assert code == 0 and not err
+    assert "WandbTarget" not in out
+    assert "metric.extractor.entity" in out
+    assert _explain("metric.extractor.entity")[0] == 0
 
 
 def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:

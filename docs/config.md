@@ -8,7 +8,7 @@ Field types, defaults, and validation constraints are in [config_reference.yaml]
 
 ## Reference lookups
 
-The source reference links to the current development documentation. `phasesweep explain` and MCP `explain_config` pin those links to the installed release tag or source revision, including editable installs; reinstall an editable checkout to refresh its version metadata.
+The source reference links to the current development documentation. `phasesweep explain`, MCP `explain_config` and generated templates pin documentation links to the installed release tag. Development and editable installs use `main`: their metadata may name an unpublished commit or lag behind the checkout.
 
 `phasesweep explain` lists the top-level keys; `phasesweep explain --notes` prints file-wide conventions. Use `phasesweep explain KEY` for a key's types, defaults and constraints, including its nested fields and the shared rules that apply to it. Configuration errors suggest relevant lookups, and an unknown key suggests the closest documented names. MCP offers the same reference through [`explain_config`](mcp.md#tool-workflow).
 
@@ -16,7 +16,7 @@ The source reference links to the current development documentation. `phasesweep
 
 ## Templates
 
-`phasesweep init --template NAME` writes a commented, runnable starting point. `phasesweep init --list` prints the names and purposes below, `-o PATH` names the output file, or a directory that receives `NAME.yaml`: an existing directory, or a path ending in `/`, which is created if needed. An existing file is never overwritten. Every template runs as written on the packaged toy trainer, so `phasesweep init --template NAME && phasesweep run NAME.yaml` finishes in seconds on a CPU-only machine. Comments in each file mark what to replace for a real trainer: the command, the `trainer_config` keys and the metric extractor. Each file opens with a pointer to `phasesweep explain`, and sets `execution.cwd: .` so a run from another directory resumes the same study.
+`phasesweep init --template NAME` writes a commented, runnable starting point. `phasesweep init --list` prints the names and purposes below, `-o PATH` names the output file, or a directory that receives `NAME.yaml`: an existing directory, or a path ending in `/`, which is created if needed. An existing file is never overwritten. The local templates run as written on the packaged toy trainer, so `phasesweep init --template NAME && phasesweep run NAME.yaml` finishes in seconds on a CPU-only machine. The `mlflow` template uses the packaged native MLflow trainer and requires the [tracking server and existing experiment](mlflow.md#run-the-cpu-example-locally). Comments in each file mark what to replace for a real trainer: the command, the `trainer_config` keys and the metric extractor. Each file opens with a pointer to `phasesweep explain`, and sets `execution.cwd: .` so a run from another directory resumes the same study.
 
 | Template | Purpose | Command |
 | --- | --- | --- |
@@ -24,6 +24,7 @@ The source reference links to the current development documentation. `phasesweep
 | `argparse` | A trainer that takes `--key=value` flags: `override_format: argparse`, `trainer_config` as the base, a seeded random learning-rate search. | `phasesweep init --template argparse` |
 | `architectures` | One phase per architecture, none inheriting another, each fixing its model keys and running a small learning-rate grid, so the winners are compared by hand; [handing the best on](#comparing-options-and-handing-the-best-on) needs one categorical key in a single phase. | `phasesweep init --template architectures` |
 | `chained` | A seeded random learning-rate search, then a phase that inherits it and searches a key the first phase only fixed. | `phasesweep init --template chained` |
+| `mlflow` | Native MLflow metrics, managed run ownership and two chained CPU phases; requires a tracking server and existing experiment. | `phasesweep init --template mlflow` |
 | `noisy` | A noisy objective: a grid of eight log-spaced learning rates with one trial each, so neighbors show the trend and the scatter around it, a `metric.max` viability bound and an `observe` entry; [Noisy objectives and small budgets](#noisy-objectives-and-small-budgets) explains each. | `phasesweep init --template noisy` |
 
 ## Experiment YAML

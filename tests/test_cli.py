@@ -364,7 +364,7 @@ def test_help_registers_commands_and_options() -> None:
     init_help = runner.invoke(cli_main, ["init", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "-o, --output PATH" in init_help.output
-    assert "--template [starter|architectures|argparse|chained|noisy]" in init_help.output
+    assert "--template [starter|architectures|argparse|chained|mlflow|noisy]" in init_help.output
     assert "--list" in init_help.output
 
     recovery_help = runner.invoke(cli_main, ["mcp", "recover-run", "--help"], terminal_width=120)

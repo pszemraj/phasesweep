@@ -12,9 +12,11 @@ from __future__ import annotations
 import difflib
 import functools
 import importlib.resources
+import json
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, distribution
 from importlib.resources.abc import Traversable
 from typing import Literal
 
@@ -416,14 +418,32 @@ def reference_notes() -> tuple[str, ...]:
     return _parse_notes(_reference_text())
 
 
+def _editable_install() -> bool:
+    """Return whether installed metadata identifies an editable checkout.
+
+    :return bool: Whether the package was installed from an editable directory.
+    """
+    try:
+        direct_url = distribution("phasesweep").read_text("direct_url.json")
+    except PackageNotFoundError:
+        return False
+    if direct_url is None:
+        return False
+    metadata = json.loads(direct_url)
+    if not isinstance(metadata, dict):
+        return False
+    directory = metadata.get("dir_info")
+    return isinstance(directory, dict) and directory.get("editable") is True
+
+
 def pin_documentation_links(text: str) -> str:
-    """Pin project documentation links to the installed release or source revision.
+    """Pin release documentation; use main for editable and development installs.
 
     :param str text: Packaged text containing project documentation URLs.
-    :return str: Text with release-tag or setuptools-scm revision URLs.
+    :return str: Text with release-tag URLs, or main when no published revision is known.
     """
-    revision = re.search(r"\+g([0-9a-f]+)(?:\.|$)", __version__)
-    ref = revision[1] if revision else f"v{__version__}"
+    released = re.fullmatch(r"\d+\.\d+\.\d+", __version__) is not None
+    ref = f"v{__version__}" if released and not _editable_install() else "main"
     return _DOC_URL.sub(
         f"https://github.com/pszemraj/phasesweep/blob/{ref}/",
         text,
@@ -431,9 +451,9 @@ def pin_documentation_links(text: str) -> str:
 
 
 def _reference_text() -> str:
-    """Read the reference with documentation links pinned to the installed source.
+    """Read the reference with documentation links selected for this installation.
 
-    :return str: Reference text with release-tag or setuptools-scm revision URLs.
+    :return str: Reference text with release-tag or main documentation URLs.
     """
     return pin_documentation_links(_reference_resource().read_text(encoding="utf-8"))
 

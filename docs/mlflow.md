@@ -15,9 +15,10 @@ mlflow server --host 127.0.0.1 --port 5000 \
   --artifacts-destination /tmp/phasesweep-mlflow-demo/artifacts
 ```
 
-In another terminal, save the [complete configuration](../examples/mlflow.yaml) as `mlflow.yaml` in your working directory, then provision the experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
+In another terminal, generate the packaged MLflow template, provision its experiment and run it. Its trainer ships with PhaseSweep, so no repository checkout is needed:
 
 ```bash
+phasesweep init --template mlflow
 python -c 'from mlflow import MlflowClient; MlflowClient(tracking_uri="http://127.0.0.1:5000").create_experiment("phasesweep-native")'
 phasesweep validate mlflow.yaml
 phasesweep run mlflow.yaml
@@ -84,11 +85,11 @@ The helper verifies the configured experiment and that the run is still RUNNING,
 For native Transformers logging with managed ownership, set `report_to: [mlflow]` in the trainer's arguments and invoke the packaged launcher from `trial_command`:
 
 ```yaml
-trial_command: "python -m phasesweep.tracking.mlflow_launch /absolute/path/to/run_seq2seq.py --report_to mlflow {overrides}"
+trial_command: "python -m phasesweep.tracking.mlflow_launch -m my_project.train --report_to mlflow {overrides}"
 override_format: argparse
 ```
 
-Pass the absolute trainer script path, its normal arguments, and `{overrides}`. The launcher preserves the script's argument parsing, sibling imports and explicit `PYTHONPATH` entries, including under `python -P` or `PYTHONSAFEPATH`. It uses the script directory instead of Python's ordinary cwd import entry. It removes `MLFLOW_RUN_ID` before the Transformers callback starts and keeps the supplied managed run active across the entire script, including final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. A script error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it. The launcher requires `mlflow.run_mode: managed` and the `phasesweep[mlflow]` extra. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
+Replace `my_project.train` with an importable trainer module that runs its command-line entry point under `python -m`. The module form preserves package-relative imports and does not add its directory to `sys.path`. If the trainer only provides a script, replace `-m my_project.train` with its script path; this form preserves sibling imports and explicit `PYTHONPATH` entries, including under `python -P` or `PYTHONSAFEPATH`, and uses the script directory instead of Python's ordinary cwd import entry. Either form forwards the trainer's arguments and removes `MLFLOW_RUN_ID` before the Transformers callback starts, keeping the supplied managed run active across training and final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. A script error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it. The Python environment executing the launcher needs a full `pip install "phasesweep[mlflow]"`, in addition to the trainer and its dependencies; installing PhaseSweep only in the controller environment is insufficient. The launcher requires `mlflow.run_mode: managed`. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 
