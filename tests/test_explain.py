@@ -166,13 +166,20 @@ def test_explain_wandb_gives_the_native_environment_contract() -> None:
     assert "wandb.finish() only after the final log" in out
 
 
-def test_explain_environment_points_to_queryable_tracker_keys() -> None:
-    """Environment help points to config keys that explain accepts."""
-    code, out, err = _explain("env")
+@pytest.mark.parametrize(
+    ("entry", "config_key"),
+    [
+        pytest.param("env", "metric.extractor.entity", id="environment"),
+        pytest.param("mlflow.tracking_uri", "metric.extractor.base_url", id="mlflow-target"),
+    ],
+)
+def test_explain_references_are_queryable(entry: str, config_key: str) -> None:
+    """Help references name config keys that explain accepts."""
+    code, out, err = _explain(entry)
     assert code == 0 and not err
     assert "WandbTarget" not in out
-    assert "metric.extractor.entity" in out
-    assert _explain("metric.extractor.entity")[0] == 0
+    assert config_key in out
+    assert _explain(config_key)[0] == 0
 
 
 def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:
@@ -386,12 +393,3 @@ def test_explain_prints_the_packaged_section_rules_and_shared_block_descriptions
         ("section", "Phase gates"),
         ("block", "WandbTarget"),
     ]
-
-
-def test_explain_mlflow_target_uses_a_queryable_wandb_url_reference() -> None:
-    """The normalization reference names a real extractor config key."""
-    code, out, err = _explain("mlflow.tracking_uri")
-    assert code == 0 and not err
-    assert "WandbTarget" not in out
-    assert "metric.extractor.base_url" in out
-    assert _explain("metric.extractor.base_url")[0] == 0
