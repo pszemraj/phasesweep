@@ -30,7 +30,12 @@ from phasesweep.engine.confound import (
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
-from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
+from phasesweep.engine.optuna import (
+    _draw_positions,
+    _finished_trial_count,
+    _measured_trial_count,
+    _trial_count_state,
+)
 from phasesweep.engine.repeats import (
     _NOISE_STANDARD_ERRORS,
     RankedGroup,
@@ -115,7 +120,9 @@ def _no_feasible_remedy(
     if phase_name is not None:
         phase = experiment.phase(phase_name)
         finished = _finished_trial_count(trials)
-        ceiling = retry_target_ceiling(phase, finished=finished, measured=0)
+        ceiling = retry_target_ceiling(
+            phase, finished=finished, measured=_measured_trial_count(trials)
+        )
         target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
         return f"{evidence} Fix the failure, then raise phases[{phase.name}].n_trials {target} in the config and rerun to retry failed attempts. {NEW_STUDY_STEP}"
     return f"{evidence} Fix the failure, then raise the phase's n_trials and rerun to retry failed attempts. {NEW_STUDY_STEP}"

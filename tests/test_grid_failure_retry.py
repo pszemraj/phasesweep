@@ -106,8 +106,9 @@ def test_partly_failed_grid_retries_the_failed_cell_only(tmp_path: Path, repeats
     trainer, calls = write_flaky_trainer(tmp_path, failures=1)
     original = _grid(tmp_path, trainer, 2, repeats=repeats)
     if repeats:
-        with pytest.raises(NoFeasibleTrialError):
+        with pytest.raises(NoFeasibleTrialError) as refused:
             run_experiment(original)
+        assert "raise phases[p].n_trials to 3 in the config" in str(refused.value.remediation)
     else:
         assert run_experiment(original)["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError):
