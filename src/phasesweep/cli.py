@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import shlex
 import sys
 import traceback
@@ -849,7 +851,9 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     for source_id, trainer_base in trainer_bases.items():
         source_label = f" for generation {source_id}" if multiple_sources else ""
         click.echo(f"# Producing argparse trainer base{source_label}, before phase overrides.")
-        click.echo(yaml.safe_dump({"trainer_config": trainer_base}, sort_keys=False))
+        click.echo(
+            yaml.dump({"trainer_config": trainer_base}, Dumper=_WinnerDumper, sort_keys=False)
+        )
 
     for name, comment in phase_plan:
         winner = winners.get(name)
@@ -884,7 +888,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 )
             payload: JsonObject = {
                 "trial_number": winner.trial_number,
-                "metric": {metric_name: float(f"{winner.metric:.6g}")},
+                "metric": {metric_name: winner.metric},
                 "params": json_object(winner.params),
                 "effective_overrides": json_object(winner.effective_overrides),
                 "gates_passed": winner.gates_passed,
@@ -920,10 +924,30 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                         }
                         for member in detail["members"]
                     ]
-            click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
+            click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
         else:
             click.echo(f"=== {name} === (no winner yet)")
             _render_phase_comment(comment, prefix="# ")
+
+
+class _WinnerDumper(yaml.SafeDumper):
+    """Render every winner float with a shared display-only binary-tail policy."""
+
+    def represent_float(self, value: float) -> yaml.ScalarNode:
+        """Shorten an obvious binary tail only within eight floating-point steps.
+
+        :param float value: Stored value, left unchanged outside the display.
+        :return yaml.ScalarNode: Safe YAML scalar retaining other significant digits.
+        """
+        fraction = repr(value).partition("e")[0].partition(".")[2]
+        if re.search(r"(?:0{4,}|9{4,})\d{0,2}$", fraction):
+            rounded = float(f"{value:.15g}")
+            if abs(rounded - value) <= 8 * math.ulp(value):
+                value = rounded
+        return super().represent_float(value)
+
+
+_WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
 def _param_text(value: JsonValue) -> str:

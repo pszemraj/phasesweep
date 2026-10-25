@@ -32,6 +32,7 @@ from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
 from phasesweep.engine.repeats import (
+    _NOISE_STANDARD_ERRORS,
     RankedGroup,
     RepeatAxis,
     RepeatsRecord,
@@ -88,7 +89,7 @@ def tie_group_comparisons(
             "params": json_object(group.params),
             "gap": abs(group.aggregate - winner.aggregate),
             "combined_se": combined_standard_error(winner, group),
-            "threshold": 2 * combined_standard_error(winner, group),
+            "threshold": _NOISE_STANDARD_ERRORS * combined_standard_error(winner, group),
         }
         for group in groups
         if dict(group.params) != dict(winner.params) and within_noise(winner, group)
@@ -350,7 +351,7 @@ def select_winner(
                 f"group {comparison['trial_number']} params={comparison['params']} versus "
                 f"winner params={dict(winning.params)}, "
                 f"gap={comparison['gap']:.6g}, combined_se={comparison['combined_se']:.6g}, "
-                f"threshold=2*combined_se={comparison['threshold']:.6g}"
+                f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se={comparison['threshold']:.6g}"
             )
     if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
         flagged.append(

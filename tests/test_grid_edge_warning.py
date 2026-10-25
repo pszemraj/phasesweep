@@ -8,11 +8,12 @@ from pathlib import Path
 
 import optuna
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
 from phasesweep.cli import cli
-from phasesweep.config.models import Phase, Repeats
+from phasesweep.config.models import Metric, Phase, Repeats
 from phasesweep.config.search import (
     CategoricalParam,
     FloatParam,
@@ -24,8 +25,13 @@ from phasesweep.config.search import (
 )
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.read import read_result
-from phasesweep.engine.repeats import ranked_group
-from phasesweep.engine.selection import _cost_advisory, select_winner
+from phasesweep.engine.repeats import ranked_group, repeat_axis
+from phasesweep.engine.selection import (
+    NoFeasibleTrialError,
+    _cost_advisory,
+    _rank_groups,
+    select_winner,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
@@ -34,11 +40,13 @@ from phasesweep.engine.state import (
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
 )
+from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
     log_regex_provenance,
     make_experiment,
+    phase_trials,
     write_experiment_config,
     write_trainer,
 )
@@ -259,36 +267,180 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
 
 
 @pytest.mark.integration
-def test_repeat_overlap_details_keep_the_selected_population_after_top_up(tmp_path: Path) -> None:
-    """An older winner compares only the repeat groups it ranked before a top-up."""
+def test_repeat_advisories_keep_the_selected_population_after_failed_top_up(tmp_path: Path) -> None:
+    """A new cheap group in an aborted generation cannot enter a published comparison."""
     trainer = write_trainer(
         tmp_path / "trainer.py",
         """
         import argparse
+        import sys
+        from pathlib import Path
         parser = argparse.ArgumentParser()
+        parser.add_argument('--width', type=int)
         parser.add_argument('--seed', type=int)
         args, _ = parser.parse_known_args()
-        print(f'x={0.39 if args.seed == 1 else 0.41}')
+        counter = Path(__file__).with_suffix('.count')
+        if counter.exists():
+            count = int(counter.read_text())
+            counter.write_text(str(count + 1))
+            if count >= 3:
+                sys.exit('injected failure')
+        values = {
+            1: (0.515, 0.525, 0.535), 3: (0.50, 0.52, 0.54),
+            5: (0.53, 0.55, 0.57),
+        }
+        print(f'x={values.get(args.width, (0.60, 0.62, 0.64))[args.seed-1]}')
+        """,
+    )
+    phase = Phase(
+        name="p1",
+        n_trials=6,
+        gpu_policy="none",
+        repeats=Repeats(key="seed", values=[1, 2, 3]),
+        sampler=Sampler(type="random", seed=0),
+        search_space={"width": CategoricalParam(type="categorical", choices=[1, 2, 3, 4, 5, 6])},
+        cost_key="width",
+    )
+    original = make_experiment(
+        experiment="x8", persistent=tmp_path, trainer=trainer, phases=[phase]
+    )
+    run_experiment(original)
+    generation = published_generation_id(original)
+    assert generation is not None
+    _, before = read_result(original)
+    assert before[0].params == {"width": 3}
+    assert before[0].cost_advisory_status == "no_cheaper_configuration"
+    trainer.with_suffix(".count").write_text("0", encoding="utf-8")
+    extended = original.model_copy(
+        update={
+            "phases": [phase.model_copy(update={"n_trials": 30, "max_consecutive_failures": 2})]
+        }
+    )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(extended)
+    trials = phase_trials(extended, "p1")
+    assert [
+        trial.params["width"]
+        for trial in trials[6:]
+        if trial.state == optuna.trial.TrialState.COMPLETE
+    ] == [1, 1, 1]
+    axis = repeat_axis(phase)
+    assert axis is not None
+    live_groups = _rank_groups(trials, extended, axis).groups
+    represented = next(group for group in live_groups if dict(group.params) == {"width": 3})
+    live_advice = _cost_advisory(phase, represented, live_groups, goal="minimize")
+    assert live_advice is not None and "width=1" in live_advice
+    _, historical = read_result(extended)
+    assert historical[0].cost_advisory is None
+    assert historical[0].cost_advisory_status == "no_cheaper_configuration"
+    assert historical[0].tie_groups == before[0].tie_groups
+    snapshot = capture_result_snapshot(extended, generation_id=generation)
+    assert snapshot["winners"][0]["cost_advisory"] is None
+    assert snapshot["winners"][0]["tie_groups"] == before[0].tie_groups
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("value", "displayed"),
+    [
+        (4938268.0, 4938268.0),
+        (1.2345678901234567, 1.2345678901234567),
+        (0.10000000012345678, 0.10000000012345678),
+        (1.23456789e-9, 1.23456789e-9),
+        (0.39999999999999997, 0.4),
+    ],
+)
+def test_winner_display_preserves_significant_digits_and_shortens_binary_tails(
+    tmp_path: Path, value: float, displayed: float
+) -> None:
+    """Winner YAML shortens obvious arithmetic tails without rounding other stored digits."""
+    trainer = write_trainer(tmp_path / "trainer.py", f"print('x={value!r}')")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=1,
+        gpu_policy="none",
+        metric=Metric(
+            name="x",
+            goal="minimize",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>\S+)"),
+        ),
+        trainer_config={"precise": value},
+    )
+    winner = run_experiment(experiment)["p"]
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    result = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert result.exit_code == 0, result.exception
+    base_text, phase_text = result.output.split("=== p ===", 1)
+    payload = yaml.safe_load(phase_text)
+    assert payload["metric"]["x"] == displayed
+    assert yaml.safe_load(base_text)["trainer_config"]["precise"] == displayed
+    assert winner.metric == value
+    assert capture_result_snapshot(experiment)["winners"][0]["metric"] == value
+
+
+@pytest.mark.integration
+def test_overlap_warning_keeps_threshold_with_groups_before_evaluation_remedy(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The two-SE threshold stays beside group gaps, followed by evaluation guidance."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        from phasesweep.reporting import report_objective
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--epochs', type=int)
+        parser.add_argument('--seed', type=int)
+        args, _ = parser.parse_known_args()
+        value = (0.50, 0.52, 0.54)[args.seed-1] + (0.03 if args.epochs == 8 else 0)
+        report_objective(value, name='x', split='validation', policy='synthetic',
+                         checkpoint='test', step=args.epochs)
         """,
     )
     phase = Phase(
         name="epochs",
-        n_trials=4,
+        n_trials=6,
         gpu_policy="none",
-        repeats=Repeats(key="seed", values=[1, 2]),
-        sampler=Sampler(type="random", seed=0),
-        search_space={"epochs": FloatParam(type="float", low=8, high=32)},
+        repeats=Repeats(key="seed", values=[1, 2, 3]),
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"epochs": CategoricalParam(type="categorical", choices=[8, 16])},
+        cost_key="epochs",
     )
-    original = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
-    run_experiment(original)
-    generation = published_generation_id(original)
-    assert generation is not None
-    extended = original.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 6})]})
-    run_experiment(extended)
-    _, historical = read_result(extended, generation_id=generation)
-    _, current = read_result(extended)
-    assert historical[0].tie_groups is not None and len(historical[0].tie_groups) == 1
-    assert current[0].tie_groups is not None and len(current[0].tie_groups) == 2
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[phase],
+        metric=Metric(
+            name="x",
+            goal="minimize",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="r.json",
+                objective_name="x",
+                split="validation",
+                policy="synthetic",
+                checkpoint="test",
+            ),
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        run_experiment(experiment)
+    warning = next(
+        record.getMessage()
+        for record in caplog.records
+        if "potential confounds" in record.getMessage()
+    )
+    assert "threshold=2*combined_se=" in warning
+    assert warning.index("group ") < warning.index("Report progress=")
+    _, views = read_result(experiment)
+    assert views[0].cost_advisory_status == "no_cheaper_configuration"
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    result = CliRunner().invoke(cli, ["show-winners", str(config)])
+    assert result.exit_code == 0, result.exception
+    payload = yaml.safe_load(result.output.split("=== epochs ===", 1)[1])
+    assert payload["repeats"]["sd"] == 0.02
+    assert payload["tie_groups"][0]["gap"] == 0.03
 
 
 @pytest.mark.parametrize("sampler", ["grid", "random"])

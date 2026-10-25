@@ -59,6 +59,7 @@ from phasesweep.engine.provenance import _load_generation_experiment
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import ValidatedWinner, _parse_phase_plan
 from phasesweep.engine.repeats import (
+    RankedGroup,
     ReduceName,
     RepeatsRecord,
     RepeatsSummary,
@@ -465,20 +466,20 @@ def cost_advisory_status(
     return "no_cheaper_configuration" if advisory is None else "available"
 
 
-def winner_tie_groups(
+def _winner_ranked_groups(
     experiment: Experiment, winner: PhaseWinnerView
-) -> list[TieGroupComparison] | None:
-    """Reconstruct overlap details for the winner's frozen repeat-group population.
+) -> tuple[RankedGroup, list[RankedGroup]] | None:
+    """Reconstruct the exact repeat-group population that selected one winner.
 
     :param Experiment experiment: Config locating the retained phase ledger.
     :param PhaseWinnerView winner: Winner carrying its frozen confound population and reducer.
-    :return list[TieGroupComparison] | None: Overlapping groups, or null when retained trials are unavailable.
+    :return tuple[RankedGroup, list[RankedGroup]] | None: Winner and recorded groups, or null when unavailable.
     """
     if winner.repeats is None or winner.confound_detail is None:
-        return []
+        return None
     raw_groups = winner.confound_detail["ranked_groups"]
     if not isinstance(raw_groups, list):
-        return []
+        return None
     if winner.repeats_detail is None:
         return None
     try:
@@ -512,38 +513,42 @@ def winner_tie_groups(
             )
         )
     winning = next((group for group in groups if group.representative == winner.trial_number), None)
-    return None if winning is None else tie_group_comparisons(winning, groups)
+    return None if winning is None else (winning, groups)
+
+
+def winner_tie_groups(
+    experiment: Experiment, winner: PhaseWinnerView
+) -> list[TieGroupComparison] | None:
+    """Compare overlapping configurations from the winner's recorded population.
+
+    :param Experiment experiment: Config locating the retained phase ledger.
+    :param PhaseWinnerView winner: Winner whose ranked groups anchor the comparisons.
+    :return list[TieGroupComparison] | None: Overlapping groups, or null when retained trials are unavailable.
+    """
+    if winner.repeats is None:
+        return []
+    ranking = _winner_ranked_groups(experiment, winner)
+    return None if ranking is None else tie_group_comparisons(*ranking)
 
 
 def winner_cost_advisory(experiment: Experiment, winner: PhaseWinnerView) -> str | None:
-    """Recompute cost advice from retained repeat groups under the current display config.
+    """Compare costs within the population that selected the represented winner.
 
-    :param Experiment experiment: Current selection semantics and optional cost key.
+    :param Experiment experiment: Display config supplying the optional cost key.
     :param PhaseWinnerView winner: Winner whose repeat group anchors the window.
     :return str | None: Advisory text when a cheaper eligible group is in the window.
     """
     phase = next((phase for phase in experiment.phases if phase.name == winner.phase), None)
     if phase is None or phase.cost_key is None or winner.repeats is None:
         return None
-    axis = repeat_axis(phase)
-    if axis is None:
-        return None
-    try:
-        read = read_phase_trials(validate_ledger(experiment), phase)
-    except StudyStorageUnavailableError:
-        return None
-    if read is None:
-        return None
-    ranking = _rank_groups(read.trials, experiment, axis)
-    numbers = tuple(winner.repeats["member_trials"])
-    group = next((group for group in ranking.groups if group.numbers == numbers), None)
+    ranking = _winner_ranked_groups(experiment, winner)
     return (
         None
-        if group is None
+        if ranking is None
         else _cost_advisory(
             phase,
-            group,
-            ranking.groups,
+            ranking[0],
+            ranking[1],
             goal=experiment.metric.goal,
         )
     )
