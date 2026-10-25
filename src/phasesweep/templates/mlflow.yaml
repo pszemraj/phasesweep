@@ -1,4 +1,4 @@
-# phasesweep template: native MLflow metrics on the packaged CPU trainer; requires an existing tracking experiment
+# phasesweep template: native MLflow metrics on the packaged CPU trainer; requires a tracking server and an existing experiment
 # Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
 # Run pip install "phasesweep[mlflow]" in the controller and trainer environments.
 # Start a tracking server and create phasesweep-native there before running.
@@ -11,8 +11,9 @@ provenance:
 execution:
   cwd: .
 # Replace the command, trainer_config and metric key for your own trainer.
+# Remove or replace the demo cost constraint and mlflow_required gates below.
 # For Transformers, explain mlflow.run_mode gives the managed launcher command.
-trial_command: "python -m phasesweep.examples.mlflow_train --config {config_path}"
+trial_command: "phasesweep-mlflow-train --config {config_path}"
 trainer_config:
   model: {depth: 1}
   optimizer: {rate: 0}

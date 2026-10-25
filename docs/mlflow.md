@@ -26,6 +26,8 @@ phasesweep show-winners mlflow.yaml
 phasesweep status mlflow.yaml
 ```
 
+When adapting the template to your trainer, replace `trainer_config` and the objective metric key, and remove or replace the demo `cost` constraint and `mlflow_required` gates.
+
 This configuration launches four deterministic CPU trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
 For real training on a GPU, the [Tiny Decoder MLflow smoke guide](../examples/tiny_decoder_enwik8/README.md#native-mlflow-gpu-smoke) provides a complete two-trial, ten-batch configuration using native final-checkpoint metrics, with both run ownership modes supported.
@@ -85,11 +87,15 @@ The helper verifies the configured experiment and that the run is still RUNNING,
 For native Transformers logging with managed ownership, set `report_to: [mlflow]` in the trainer's arguments and invoke the packaged launcher from `trial_command`:
 
 ```yaml
-trial_command: "python -m phasesweep.tracking.mlflow_launch -m my_project.train --report_to mlflow {overrides}"
+trial_command: "phasesweep mlflow-run dcl train --report_to mlflow {overrides}"
 override_format: argparse
 ```
 
-Replace `my_project.train` with an importable trainer module that runs its command-line entry point under `python -m`. The module form preserves package-relative imports and does not add its directory to `sys.path`. If the trainer only provides a script, replace `-m my_project.train` with its script path; this form preserves sibling imports and explicit `PYTHONPATH` entries, including under `python -P` or `PYTHONSAFEPATH`, and uses the script directory instead of Python's ordinary cwd import entry. Either form forwards the trainer's arguments and removes `MLFLOW_RUN_ID` before the Transformers callback starts, keeping the supplied managed run active across training and final evaluation. This lets the callback log to the active run without taking ownership of closing it when training ends. A script error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it. The Python environment executing the launcher needs a full `pip install "phasesweep[mlflow]"`, in addition to the trainer and its dependencies; installing PhaseSweep only in the controller environment is insufficient. The launcher requires `mlflow.run_mode: managed`. Verify that the example imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
+Replace `dcl train` with your trainer's installed console script and its ordinary arguments, or with a trainer script path. `phasesweep mlflow-run` resolves the console-script entry point and executes it in the current process, so package-relative imports use the installed package without adding its module directory to `sys.path`. Script paths retain sibling imports. Arguments after the command are passed to the trainer unchanged. The launcher removes `MLFLOW_RUN_ID` before the Transformers callback starts and keeps the supplied managed run active across training and final evaluation, so the callback can log to it without closing it at the end of training. A trainer error or nonzero exit marks the run failed; a successful `sys.exit(0)` finishes it.
+
+The active run context exists only in this process. `torchrun`, `accelerate launch`, and trainers that spawn per-seed or per-rank child processes need their own integration: each logging trainer must resume the supplied `MLFLOW_RUN_ID` and close its run. Shell command wrappers cannot transfer an active run to another process.
+
+The environment executing `phasesweep mlflow-run` needs `pip install "phasesweep[mlflow]"`, the trainer, and its dependencies. Installing PhaseSweep only in the controller environment is insufficient. Use `mlflow.run_mode: managed`. Verify that the trainer imports its matching Transformers package using the [trainer environment preflight](config.md#source-checkout-preflight).
 
 Native metrics retain their Trainer names, such as `eval_loss` and `eval_rouge1`; choose the exact final optimizer step when comparing fixed training budgets.
 

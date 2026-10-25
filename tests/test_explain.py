@@ -152,9 +152,11 @@ def test_explain_mlflow_mode_gives_an_offline_launcher_command() -> None:
     """Managed-mode help includes the installed launcher and the trainer's install requirement."""
     code, out, err = _explain("mlflow.run_mode")
     assert code == 0 and not err
-    assert 'trial_command: "python -m phasesweep.tracking.mlflow_launch -m my_project.train' in out
+    assert 'trial_command: "phasesweep mlflow-run dcl train' in out
     assert "{overrides}" in out
     assert 'pip install "phasesweep[mlflow]"' in out
+    assert "child-process trainers must resume MLFLOW_RUN_ID" in out
+    assert "Shell wrappers cannot transfer the active run context" in out
 
 
 def test_explain_environment_points_to_queryable_tracker_keys() -> None:
@@ -377,3 +379,13 @@ def test_explain_prints_the_packaged_section_rules_and_shared_block_descriptions
         ("section", "Phase gates"),
         ("block", "WandbTarget"),
     ]
+
+
+def test_explain_mlflow_target_uses_a_queryable_wandb_url_reference() -> None:
+    """The normalization reference names a real extractor config key."""
+    code, out, err = _explain("mlflow.tracking_uri")
+
+    assert code == 0 and not err
+    assert "WandbTarget" not in out
+    assert "metric.extractor.base_url" in out
+    assert _explain("metric.extractor.base_url")[0] == 0

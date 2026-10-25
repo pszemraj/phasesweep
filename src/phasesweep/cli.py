@@ -135,6 +135,40 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
+@cli.command(
+    "mlflow-run",
+    context_settings={
+        **CONTEXT_SETTINGS,
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+    },
+    help=(
+        "Run COMMAND in-process inside the managed MLFLOW_RUN_ID. COMMAND must be an "
+        "installed console script or a Python script path. Trainer arguments, including "
+        "--help, pass through unchanged. Child processes cannot inherit the active run; "
+        "torchrun, accelerate launch and other spawning trainers must resume MLFLOW_RUN_ID "
+        "and close that run themselves. "
+        'Example trial_command: "phasesweep mlflow-run dcl train --report_to mlflow {overrides}" '
+        "with override_format: argparse and mlflow.run_mode: managed."
+    ),
+    short_help="Run a trainer inside its managed MLflow run.",
+)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
+def mlflow_run(command: tuple[str, ...]) -> int:
+    """Forward an ordinary trainer command into its managed run in this process.
+
+    :param tuple[str, ...] command: Console script or Python script path and trainer arguments.
+    :raises click.UsageError: The command or managed-run prerequisites are invalid.
+    :return int: The trainer's successful exit status.
+    """
+    from phasesweep.tracking.mlflow_launch import TrainerCommandError, run_managed
+
+    try:
+        return run_managed(command)
+    except TrainerCommandError as error:
+        raise click.UsageError(str(error)) from error
+
+
 def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) -> str:
     """Format an operational diagnosis with advice for the requested operation.
 
@@ -280,7 +314,8 @@ def _template_purpose(name: str) -> str:
     type=click.Choice(_template_names()),
     default=_DEFAULT_TEMPLATE,
     show_default=True,
-    help="Template to write. Every one runs as written on the packaged toy trainer.",
+    help="Template to write. Local templates use the packaged toy trainer; mlflow needs "
+    "a tracking server and an existing experiment.",
 )
 @click.option("--list", "list_templates", is_flag=True, help="List the templates and exit.")
 @click.option(
@@ -334,6 +369,16 @@ def init(template: str, list_templates: bool, output: str) -> None:
     # different (nonexistent) file than the one just written.
     config_arg = shlex.quote(str(expanded))
     click.echo(f"Wrote the {template} template to {target}")
+    if template == "mlflow":
+        click.echo(
+            "\nBefore running: start an MLflow tracking server and create the experiment "
+            "named in mlflow.experiment_name (phasesweep-native in this template)."
+        )
+        click.echo(
+            "When adapting this CPU demo, replace its trainer_config and metric key, and "
+            "remove or replace the demo constraints and gates."
+        )
+        click.echo("Setup: phasesweep explain mlflow")
     click.echo("\nNext:")
     click.echo(f"  phasesweep validate {config_arg}")
     click.echo(f"  phasesweep run {config_arg} --dry-run")

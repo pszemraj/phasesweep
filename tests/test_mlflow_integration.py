@@ -29,6 +29,37 @@ from phasesweep.tracking.publication import delivery_status, sync_tracking
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize("exit_code", [0, 2])
+def test_command_wrapper_finishes_the_bound_http_run(
+    local_server, tmp_path: Path, exit_code: int
+) -> None:
+    """The command wrapper keeps final metrics in its supplied run and preserves failure status."""
+    uri, client, experiment_id, _process = local_server
+    run_id = client.create_run(experiment_id).info.run_id
+    trainer = tmp_path / "wrapped.py"
+    trainer.write_text(
+        "import sys, mlflow\n"
+        "assert sys.argv[1:] == ['--help']\n"
+        f"assert mlflow.active_run().info.run_id == {run_id!r}\n"
+        "mlflow.log_metric('training', 1.0, step=1)\n"
+        "mlflow.log_metric('final_evaluation', 0.4, step=2)\n"
+        f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(Path(sys.executable).with_name("phasesweep")), "mlflow-run", str(trainer), "--help"],
+        cwd=tmp_path,
+        env={**os.environ, "MLFLOW_TRACKING_URI": uri, "MLFLOW_RUN_ID": run_id},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == exit_code, result.stderr
+    recorded = client.get_run(run_id)
+    assert recorded.info.status == ("FINISHED" if exit_code == 0 else "FAILED")
+    assert recorded.data.metrics == {"training": 1.0, "final_evaluation": 0.4}
+
+
 @contextmanager
 def _server(tmp_path):
     """Provision explicit SQLite and proxied artifact storage outside the tree."""
@@ -298,12 +329,14 @@ def test_create_committing_after_the_controller_gave_up_is_bound_later(
 def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypatch, mode):
     """Both ownership modes publish four trials and replay without the SDK/server."""
     uri, client, experiment_id, process = offline_server
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples" / "mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src" / "phasesweep" / "templates" / "mlflow.yaml").read_text()
+    )
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = (
-        f"{sys.executable} -m phasesweep.examples.mlflow_train --config {{config_path}}"
+        f"{Path(sys.executable).with_name('phasesweep-mlflow-train')} --config {{config_path}}"
     )
     config["mlflow"].update(tracking_uri=uri, run_mode=mode, timeout_seconds=15, poll_seconds=0.05)
     if mode == "trainer":
@@ -455,7 +488,9 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
         "    mlflow.log_metric('eval/loss', 0.01, step=500)\n"
         "    raise RuntimeError('failure after logging a tempting score')\n"
     )
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )

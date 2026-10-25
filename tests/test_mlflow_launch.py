@@ -1,4 +1,4 @@
-"""Managed MLflow launcher keeps a script's final evaluation in its supplied run."""
+"""Managed MLflow command wrapping preserves trainer execution and run outcomes."""
 
 from __future__ import annotations
 
@@ -7,19 +7,21 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from importlib.metadata import EntryPoint
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
-from phasesweep.tracking.mlflow_launch import main
+from phasesweep.cli import cli
+from phasesweep.tracking import mlflow_launch
+from phasesweep.tracking.mlflow_launch import run_managed
 
 
-@pytest.mark.parametrize("ending", ["complete", "exit_zero", "exit_none", "error", "exit_failure"])
-def test_launcher_keeps_managed_run_active_for_complete_script(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
-) -> None:
-    """The supplied run spans training and evaluation and receives script failures."""
+@pytest.fixture
+def managed_run(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record whether the supplied run spans execution and observes trainer failures."""
     events: list[str] = []
 
     @contextmanager
@@ -38,184 +40,167 @@ def test_launcher_keeps_managed_run_active_for_complete_script(
         sys.modules, "mlflow", SimpleNamespace(start_run=start_run, record=events.append)
     )
     monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
-    monkeypatch.setattr(sys, "argv", sys.argv.copy())
-    script_dir = tmp_path / "scripts"
-    script_dir.mkdir()
-    packages = tmp_path / "packages"
-    packages.mkdir()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path[1:], str(packages)])
-    (tmp_path / "launcher_evaluate.py").write_text(
-        "raise RuntimeError('cwd shadow imported')\n", encoding="utf-8"
-    )
-    (packages / "launcher_evaluate.py").write_text("VALUE = 'package'\n", encoding="utf-8")
-    sibling = script_dir / "launcher_sibling.py"
-    sibling.write_text("VALUE = 'evaluation'\n", encoding="utf-8")
-    script = script_dir / "trainer.py"
-    script.write_text(
+    return events
+
+
+@pytest.mark.parametrize("kind", ["script", "console"])
+@pytest.mark.parametrize("ending", ["complete", "exit_zero", "exit_none", "error", "exit_failure"])
+def test_launcher_runs_trainer_and_final_evaluation_in_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    managed_run: list[str],
+    kind: str,
+    ending: str,
+) -> None:
+    """The active managed run encloses training and evaluation in the caller's process."""
+    original_argv, original_path = sys.argv, sys.path[:]
+    trainer = (
         "import os, sys, mlflow\n"
-        "from launcher_sibling import VALUE\n"
-        "import launcher_evaluate\n"
-        "assert launcher_evaluate.VALUE == 'package'\n"
+        f"assert os.getpid() == {os.getpid()}\n"
         "assert 'MLFLOW_RUN_ID' not in os.environ\n"
-        "assert sys.argv[1:] == ['--learning_rate', '0.1']\n"
+        "assert sys.argv[1:] == ['--help', '--learning_rate=0.1', '-xy']\n"
         "mlflow.record('training')\n"
-        "mlflow.record(VALUE)\n"
+        "mlflow.record('evaluation')\n"
         + {
             "complete": "",
             "exit_zero": "raise SystemExit(0)\n",
             "exit_none": "raise SystemExit()\n",
             "error": "raise RuntimeError('trainer failed')\n",
             "exit_failure": "raise SystemExit(2)\n",
-        }[ending],
-        encoding="utf-8",
+        }[ending]
     )
+    if kind == "script":
+        script = tmp_path / "trainer.py"
+        script.write_text(trainer, encoding="utf-8")
+        target = str(script)
+    else:
+
+        def callback() -> None:
+            exec(trainer, {})
+
+        monkeypatch.setitem(sys.modules, "launcher_trainer", SimpleNamespace(main=callback))
+        monkeypatch.setattr(
+            mlflow_launch,
+            "entry_points",
+            lambda **_filters: [
+                EntryPoint(
+                    name="launcher-train", value="launcher_trainer:main", group="console_scripts"
+                )
+            ],
+        )
+        target = "launcher-train"
+    arguments = [target, "--help", "--learning_rate=0.1", "-xy"]
     if ending == "error":
         with pytest.raises(RuntimeError, match="trainer failed"):
-            main([str(script), "--learning_rate", "0.1"])
+            run_managed(arguments)
     elif ending == "exit_failure":
         with pytest.raises(SystemExit) as raised:
-            main([str(script), "--learning_rate", "0.1"])
+            run_managed(arguments)
         assert raised.value.code == 2
     else:
-        assert main([str(script), "--learning_rate", "0.1"]) == 0
+        assert run_managed(arguments) == 0
     outcome = "failed" if ending in {"error", "exit_failure"} else "finished"
-    assert events == ["start", "training", "evaluation", outcome]
-    sys.modules.pop("launcher_sibling", None)
-    sys.modules.pop("launcher_evaluate", None)
+    assert managed_run == ["start", "training", "evaluation", outcome]
+    assert sys.argv is original_argv
+    assert sys.path == original_path
+    assert os.environ["MLFLOW_RUN_ID"] == "managed-run"
+
+
+def test_console_return_status_marks_the_run_failed(
+    monkeypatch: pytest.MonkeyPatch, managed_run: list[str]
+) -> None:
+    """A nonzero console-entry return has the same effect as a nonzero script exit."""
+    monkeypatch.setitem(sys.modules, "launcher_trainer", SimpleNamespace(main=lambda: 3))
+    monkeypatch.setattr(
+        mlflow_launch,
+        "entry_points",
+        lambda **_filters: [
+            EntryPoint(
+                name="launcher-train", value="launcher_trainer:main", group="console_scripts"
+            )
+        ],
+    )
+    with pytest.raises(SystemExit) as raised:
+        run_managed(["launcher-train"])
+    assert raised.value.code == 3
+    assert managed_run == ["start", "failed"]
+
+
+def test_launcher_help_and_trainer_help_have_separate_owners(
+    tmp_path: Path, managed_run: list[str]
+) -> None:
+    """Wrapper help describes accepted forms; help after COMMAND reaches the trainer."""
+    wrapper = CliRunner().invoke(cli, ["mlflow-run", "--help"])
+    assert wrapper.exit_code == 0
+    assert "mlflow-run [OPTIONS] COMMAND..." in wrapper.output
+    assert "trial_command:" in wrapper.output
+    assert "phasesweep mlflow-run dcl train" in wrapper.output
+    assert "in-process" in wrapper.output and "Child processes" in wrapper.output
+    assert managed_run == []
+    script = tmp_path / "trainer.py"
+    script.write_text(
+        "import sys\nassert sys.argv[1:] == ['--help']\nprint('trainer help')\n",
+        encoding="utf-8",
+    )
+    trainer = CliRunner().invoke(cli, ["mlflow-run", str(script), "--help"])
+    assert trainer.exit_code == 0, trainer.output
+    assert trainer.output == "trainer help\n"
+    assert managed_run == ["start", "finished"]
+
+
+@pytest.mark.parametrize("target", ["missing-trainer", "trainer.module", "python", "missing.py"])
+def test_launcher_invalid_target_is_usage_error_before_importing_sdk(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Unresolvable commands list the supported forms without opening a run or traceback."""
+    monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    result = CliRunner().invoke(cli, ["mlflow-run", target, "--help"])
+    assert result.exit_code == 2
+    assert "installed console script" in result.output and "Python script path" in result.output
+    assert "shell commands and module names are not supported" in result.output
+    assert "Traceback" not in result.output
+    assert os.environ["MLFLOW_RUN_ID"] == "managed-run"
 
 
 def test_launcher_requires_managed_run_before_importing_sdk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A launcher without managed identity reports a usage error without starting a run."""
+    """A resolved trainer without managed identity fails before importing MLflow."""
+    script = tmp_path / "trainer.py"
+    script.write_text("", encoding="utf-8")
     monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
     monkeypatch.setitem(sys.modules, "mlflow", None)
-    with pytest.raises(SystemExit) as raised:
-        main([str(tmp_path / "trainer.py")])
-    assert raised.value.code == 2
-    assert "requires mlflow.run_mode: managed" in capsys.readouterr().err
+    result = CliRunner().invoke(cli, ["mlflow-run", str(script)])
+    assert result.exit_code == 2
+    assert "requires mlflow.run_mode: managed" in result.output
 
 
 def test_launcher_missing_sdk_names_install_extra(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An absent optional MLflow SDK gives the operator its install command."""
-    monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
-    monkeypatch.setitem(sys.modules, "mlflow", None)
+    """An absent optional SDK gives its install command before executing the trainer."""
     script = tmp_path / "trainer.py"
     script.write_text("", encoding="utf-8")
-    with pytest.raises(SystemExit) as raised:
-        main([str(script)])
-    assert raised.value.code == 2
-    assert 'pip install "phasesweep[mlflow]"' in capsys.readouterr().err
+    monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    result = CliRunner().invoke(cli, ["mlflow-run", str(script)])
+    assert result.exit_code == 2
+    assert 'pip install "phasesweep[mlflow]"' in result.output
 
 
-@pytest.mark.parametrize("safe_path", ["normal", "flag", "environment"])
-def test_launcher_keeps_pythonpath_and_excludes_cwd_shadow(tmp_path: Path, safe_path: str) -> None:
-    """Normal and safe-path launches preserve package paths and script sibling imports."""
-    script_dir = tmp_path / "scripts"
-    script_dir.mkdir()
+@pytest.mark.parametrize("kind", ["script", "console"])
+@pytest.mark.parametrize("safe_path", [False, True])
+def test_installed_command_avoids_cwd_shadow_and_preserves_arguments(
+    tmp_path: Path, kind: str, safe_path: bool
+) -> None:
+    """Console imports exclude the working directory; script siblings keep normal semantics."""
     packages = tmp_path / "packages"
     packages.mkdir()
     (tmp_path / "launcher_evaluate.py").write_text(
         "raise RuntimeError('cwd shadow imported')\n", encoding="utf-8"
     )
     (packages / "launcher_evaluate.py").write_text("VALUE = 'package'\n", encoding="utf-8")
-    (packages / "mlflow.py").write_text(
-        "from contextlib import nullcontext\n"
-        "def start_run(*, run_id: str) -> nullcontext[None]:\n"
-        "    assert run_id == 'managed-run'\n"
-        "    return nullcontext()\n",
-        encoding="utf-8",
-    )
-    (script_dir / "launcher_sibling.py").write_text("VALUE = 'sibling'\n", encoding="utf-8")
-    script = script_dir / "trainer.py"
-    script.write_text(
-        "import sys\n"
-        "import launcher_evaluate, launcher_sibling\n"
-        "assert launcher_evaluate.VALUE == 'package'\n"
-        "assert launcher_sibling.VALUE == 'sibling'\n"
-        "assert sys.argv[1:] == ['--learning_rate', '0.1']\n"
-        "print('trainer completed')\n",
-        encoding="utf-8",
-    )
-    env = {
-        **os.environ,
-        "MLFLOW_RUN_ID": "managed-run",
-        "PYTHONPATH": str(packages),
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    env.pop("PYTHONSAFEPATH", None)
-    if safe_path == "environment":
-        env["PYTHONSAFEPATH"] = "1"
-    flags = ["-P"] if safe_path == "flag" else []
-    result = subprocess.run(
-        [
-            sys.executable,
-            *flags,
-            "-m",
-            "phasesweep.tracking.mlflow_launch",
-            str(script),
-            "--learning_rate",
-            "0.1",
-        ],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "trainer completed\n"
-
-
-def test_launcher_missing_script_is_usage_error_before_opening_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A missing script names the path without importing MLflow or opening its run."""
-    monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
-    monkeypatch.setitem(sys.modules, "mlflow", None)
-
-    with pytest.raises(SystemExit) as raised:
-        main([str(tmp_path / "missing.py")])
-
-    assert raised.value.code == 2
-    error = capsys.readouterr().err
-    assert "trainer script does not exist or is not a file:" in error
-    assert str(tmp_path / "missing.py") in error
-    assert "Traceback" not in error
-    assert os.environ["MLFLOW_RUN_ID"] == "managed-run"
-
-
-def test_launcher_help_names_module_invocation_and_trial_command(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Offline help supplies the installed invocation and a complete config command."""
-    with pytest.raises(SystemExit) as raised:
-        main(["--help"])
-
-    assert raised.value.code == 0
-    help_text = capsys.readouterr().out
-    assert "usage: python -m phasesweep.tracking.mlflow_launch" in help_text
-    assert "trial_command:" in help_text
-    assert "my_project.train" in help_text
-    assert "{overrides}" in help_text
-
-
-@pytest.mark.parametrize("target", ["launcher_trainer.train", "launcher_trainer"])
-def test_launcher_module_preserves_relative_imports_and_avoids_sibling_shadow(
-    tmp_path: Path, target: str
-) -> None:
-    """Module and package entry points keep package imports and trainer arguments intact."""
-    packages = tmp_path / "packages"
-    packages.mkdir()
-    package = packages / "launcher_trainer"
-    package.mkdir()
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "score.py").write_text("VALUE = 'relative'\n", encoding="utf-8")
-    (packages / "score.py").write_text("VALUE = 'top-level'\n", encoding="utf-8")
     (packages / "mlflow.py").write_text(
         "from contextlib import contextmanager\n"
         "active = False\n"
@@ -224,48 +209,63 @@ def test_launcher_module_preserves_relative_imports_and_avoids_sibling_shadow(
         "    global active\n"
         "    assert run_id == 'managed-run'\n"
         "    active = True\n"
-        "    print('managed start')\n"
-        "    yield\n"
-        "    print('managed finish')\n",
+        "    yield\n",
         encoding="utf-8",
     )
-    trainer = (
-        "import os, sys, mlflow, score\n"
-        "from .score import VALUE\n"
-        "assert VALUE == 'relative'\n"
-        "assert score.VALUE == 'top-level'\n"
-        "assert mlflow.active\n"
-        "assert 'MLFLOW_RUN_ID' not in os.environ\n"
-        "assert sys.argv[1:] == ['--learning_rate', '0.1']\n"
-        "print('training and final evaluation')\n"
+    body = (
+        "import os, sys, mlflow, launcher_evaluate\n"
+        "assert launcher_evaluate.VALUE == 'package'\n"
+        "assert mlflow.active and 'MLFLOW_RUN_ID' not in os.environ\n"
+        "assert sys.argv[1:] == ['train', '--help', '--learning_rate=0.1']\n"
+        "print('trainer completed')\n"
     )
-    (package / "train.py").write_text(trainer, encoding="utf-8")
-    (package / "__main__.py").write_text(trainer, encoding="utf-8")
+    if kind == "script":
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "sibling.py").write_text("VALUE = 'sibling'\n", encoding="utf-8")
+        script = scripts / "trainer.py"
+        script.write_text(
+            "from sibling import VALUE\nassert VALUE == 'sibling'\n" + body,
+            encoding="utf-8",
+        )
+        target = str(script)
+    else:
+        distribution = packages / "launcher_trainer-0.0.dist-info"
+        distribution.mkdir()
+        (distribution / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: launcher-trainer\nVersion: 0.0\n", encoding="utf-8"
+        )
+        (distribution / "entry_points.txt").write_text(
+            "[console_scripts]\nlauncher-train = launcher_trainer:main\n", encoding="utf-8"
+        )
+        (packages / "launcher_trainer.py").write_text(
+            "def main():\n" + "".join("    " + line + "\n" for line in body.splitlines()),
+            encoding="utf-8",
+        )
+        target = "launcher-train"
+    env = {
+        **os.environ,
+        "MLFLOW_RUN_ID": "managed-run",
+        "PYTHONPATH": str(packages),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    env.pop("PYTHONSAFEPATH", None)
+    if safe_path:
+        env["PYTHONSAFEPATH"] = "1"
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "phasesweep.tracking.mlflow_launch",
-            "-m",
+            str(Path(sys.executable).with_name("phasesweep")),
+            "mlflow-run",
             target,
-            "--learning_rate",
-            "0.1",
+            "train",
+            "--help",
+            "--learning_rate=0.1",
         ],
         cwd=tmp_path,
-        env={
-            **os.environ,
-            "MLFLOW_RUN_ID": "managed-run",
-            "PYTHONPATH": str(packages),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=15,
     )
-
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "managed start",
-        "training and final evaluation",
-        "managed finish",
-    ]
+    assert result.stdout == "trainer completed\n"

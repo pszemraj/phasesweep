@@ -119,7 +119,9 @@ def test_timing_values_must_be_finite(tmp_path, field, value):
 
     from phasesweep.config.io import load_experiment
 
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(workdir=str(tmp_path / "runs"))
     config["mlflow"][field] = value
     path = tmp_path / "experiment.yaml"
@@ -1260,7 +1262,9 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
     from tests.conftest import mark_current_format
     from tests.mcp_helpers import make_mcp_app, make_run_handle, stage_dead_run, write_run_status
 
-    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "src/phasesweep/templates/mlflow.yaml").read_text()
+    )
     config.update(workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'j.journal'}")
     config_path = tmp_path / "exp.yaml"
     config_path.write_text(yaml.safe_dump(config))

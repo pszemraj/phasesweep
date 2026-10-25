@@ -321,3 +321,12 @@ Every trial has a draw position: a trial that is not a rerun takes the number of
 **Held by:** `engine.optuna._draw_positions`, `engine.optuna._position_seed`, `engine.optuna._PositionGridSampler`, `engine.optuna._PositionRandomSampler`, `engine.optuna._PositionTPESampler`, `engine.optuna._PositionCmaEsSampler`
 
 **Tests:** `tests/test_draw_positions.py::test_positions_count_new_draws_and_give_each_rerun_its_source_position`, `tests/test_draw_positions.py::test_grid_covers_every_point_once_across_interruptions`, `tests/test_draw_positions.py::test_seeded_random_draws_the_same_set_however_it_is_interrupted`, `tests/test_draw_positions.py::test_model_samplers_resume_exactly_as_an_uninterrupted_run`, `tests/test_draw_positions.py::test_model_samplers_top_up_exactly_as_one_larger_run`, `tests/test_draw_positions.py::test_model_samplers_resume_under_two_workers_drawing_by_position`, `tests/test_draw_positions.py::test_cmaes_restores_the_newest_generation_not_the_highest_numbered_snapshot`, `tests/test_rerun_real_runs.py::test_model_samplers_resume_real_runs_exactly`, `tests/test_rerun_real_runs.py::test_model_samplers_top_up_real_runs_exactly`
+
+
+#### 30. The managed launcher and trainer share one process
+
+`phasesweep mlflow-run` calls a console-script entry point from its Python environment or executes a Python script inside the supplied managed MLflow run. Trainer arguments pass through unchanged, including `--help`. The active context spans final evaluation and observes nonzero returns and exits; the launcher restores its argument list, import path and managed-run environment afterwards. That active context cannot pass to shell wrappers or child trainers: they must resume `MLFLOW_RUN_ID` and close their own run.
+
+**Held by:** `cli.mlflow_run`, `tracking.mlflow_launch._resolve_trainer` and `tracking.mlflow_launch.run_managed`
+
+**Tests:** `tests/test_mlflow_launch.py::test_launcher_runs_trainer_and_final_evaluation_in_process`, `tests/test_mlflow_launch.py::test_console_return_status_marks_the_run_failed`, `tests/test_mlflow_launch.py::test_launcher_help_and_trainer_help_have_separate_owners`, `tests/test_mlflow_launch.py::test_installed_command_avoids_cwd_shadow_and_preserves_arguments`, `tests/test_mlflow_integration.py::test_command_wrapper_finishes_the_bound_http_run`

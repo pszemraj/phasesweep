@@ -198,8 +198,10 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert experiment.workdir == str(config_path.parent / "runs")
         assert experiment.execution.cwd == str(config_path.parent)
         assert experiment.storage == "auto"
-        trainer = "mlflow_train" if template == "mlflow" else "fake_train"
-        assert f"phasesweep.examples.{trainer}" in experiment.trial_command
+        if template == "mlflow":
+            assert experiment.trial_command == "phasesweep-mlflow-train --config {config_path}"
+        else:
+            assert "phasesweep.examples.fake_train" in experiment.trial_command
 
         validated = runner.invoke(cli_main, ["validate", config])
         assert validated.exit_code == 0, validated.output
@@ -439,3 +441,27 @@ def test_init_losing_publish_race_preserves_other_writer(
     assert "refusing to overwrite" in result.output
     assert output.read_text() == "other process\n"
     assert not list(tmp_path.glob(".starter.yaml.*.tmp"))
+
+
+def test_init_mlflow_names_its_setup_and_demo_replacements(tmp_path: Path) -> None:
+    """MLflow setup appears before run commands and identifies demo-only evidence requirements."""
+    result = CliRunner().invoke(cli_main, ["init", "--template", "mlflow", "-o", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "start an MLflow tracking server" in result.output
+    assert "create the experiment" in result.output
+    assert "phasesweep-native" in result.output
+    assert result.output.index("Before running:") < result.output.index("Next:")
+    assert "remove or replace the demo constraints and gates" in result.output
+    config = (tmp_path / "mlflow.yaml").read_text(encoding="utf-8")
+    assert "Remove or replace the demo cost constraint and mlflow_required gates" in config
+
+
+def test_init_help_identifies_mlflow_prerequisites() -> None:
+    """MLflow is not advertised as a serverless local toy-trainer run."""
+    result = CliRunner().invoke(cli_main, ["init", "--help"])
+
+    assert result.exit_code == 0
+    text = " ".join(result.output.split())
+    assert "mlflow needs a tracking server and an existing experiment" in text
+    assert "Every one runs as written" not in text
