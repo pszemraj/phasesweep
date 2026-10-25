@@ -43,6 +43,13 @@ class WandbPollTimeout(TimeoutError):
 
 
 @dataclass(eq=False)
+class WandbRunMissingError(RuntimeError):
+    """The final run lookup at the visibility deadline found no matching run."""
+
+    run_id: str
+
+
+@dataclass(eq=False)
 class WandbRunTerminalError(RuntimeError):
     """The expected run terminated unsuccessfully."""
 
@@ -165,6 +172,18 @@ def _error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}{suffix}"
 
 
+def _is_missing_run_error(exc: Exception) -> bool:
+    """Recognize the public API's absent-run ValueError through SDK wrappers.
+
+    :param Exception exc: Error raised by an exact ``Api.run`` lookup.
+    :return bool: Whether W&B reported that the requested run could not be found.
+    """
+    return any(
+        isinstance(error, ValueError) and str(error).startswith("Could not find run ")
+        for error in _error_chain(exc)
+    )
+
+
 def poll_wandb_summary(
     *,
     base_url: str,
@@ -194,6 +213,7 @@ def poll_wandb_summary(
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
+    :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: The finished run's summary still lacked
@@ -230,6 +250,7 @@ def poll_wandb_summary(
                 "invalid_evidence",
                 "import_error",
                 "timeout",
+                "run_missing",
             }
         ),
         run_id=run_id,
@@ -242,6 +263,8 @@ def poll_wandb_summary(
         raise WandbSetupError(run_id, json_text(response, "cause"))
     if response.get("status") == "terminal_error":
         raise WandbRunTerminalError(run_id, json_text(response, "state"))
+    if response.get("status") == "run_missing":
+        raise WandbRunMissingError(run_id)
     if response.get("status") == "missing_keys":
         missing = json_text_list(response.get("missing"))
         available = json_text_list(response.get("available"))
@@ -468,6 +491,7 @@ def _poll_wandb_summary(
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
     :raises WandbPollTimeout: The run did not finish with the required keys in time.
+    :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
     :raises WandbMissingKeysError: The finished run's summary still lacked
@@ -508,8 +532,13 @@ def _poll_wandb_summary(
                     and not _is_retryable_setup_error(exc)
                 ):
                     raise WandbSetupError(run_id, _error_detail(exc)) from exc
-                last_error = RuntimeError(_error_detail(exc))
+                last_error = (
+                    WandbRunMissingError(run_id)
+                    if _is_missing_run_error(exc)
+                    else RuntimeError(_error_detail(exc))
+                )
             else:
+                last_error = None
                 if time.monotonic() >= deadline:
                     break
                 if run.state in {"failed", "crashed", "killed", "preempted"}:
@@ -544,6 +573,8 @@ def _poll_wandb_summary(
             raise missing_keys
         wake_by = min(deadline, settle_by)
         time.sleep(min(poll_seconds, max(0.0, wake_by - time.monotonic())))
+    if isinstance(last_error, WandbRunMissingError):
+        raise last_error
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
 
 
@@ -646,6 +677,8 @@ def main(argv: list[str] | None = None) -> int:
         response = {"status": "terminal_error", "state": exc.state}
     except WandbMissingKeysError as exc:
         response = {"status": "missing_keys", "missing": exc.missing, "available": exc.available}
+    except WandbRunMissingError:
+        response = {"status": "run_missing"}
     except WandbPollTimeout as exc:
         response = {"status": "timeout", "cause": str(exc.last_error) if exc.last_error else None}
     except ValueError:

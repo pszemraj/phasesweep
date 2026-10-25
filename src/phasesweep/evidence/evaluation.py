@@ -36,6 +36,7 @@ from phasesweep.evidence.models import (
 from phasesweep.evidence.wandb import (
     WandbMissingKeysError,
     WandbPollTimeout,
+    WandbRunMissingError,
     WandbRunTerminalError,
     WandbSetupError,
     locate_wandb_position,
@@ -461,16 +462,25 @@ def _capture_wandb(
                 environment=ctx.wandb_environment,
                 deadline=poll_deadline,
             )
-        except WandbPollTimeout as exc:
+        except (WandbPollTimeout, WandbRunMissingError) as exc:
             error = (
                 DeadlineExceededError
                 if capped and time.monotonic() >= poll_deadline
                 else ExtractorError
             )
-            raise error(
-                f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
-                + (f" Last observation: {exc.last_error}" if exc.last_error else "")
-            ) from exc
+            if isinstance(exc, WandbRunMissingError):
+                message = (
+                    f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
+                    "at the evidence deadline. The trainer probably passes its own project, "
+                    "entity or id to wandb.init; remove those overrides, or set the extractor's "
+                    "project and entity to match."
+                )
+            else:
+                message = (
+                    f"W&B evidence deadline expired for {target}; required summary keys: {query.numeric_keys!r}."
+                    + (f" Last observation: {exc.last_error}" if exc.last_error else "")
+                )
+            raise error(message) from exc
         except WandbSetupError as exc:
             raise ExtractorError(
                 f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
