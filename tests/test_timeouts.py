@@ -98,7 +98,7 @@ def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_p
 
     assert isinstance(refused.value, PhaseSweepError)
     assert "Raise timeout_seconds_per_phase" in operator_step(refused.value)
-    assert "resume the phase" in operator_step(refused.value)
+    assert "start the phase again; storage: null" in operator_step(refused.value)
     run_log = tmp_path / "runs" / "phase_zero_timeout" / "run.log"
     assert "fix: Raise timeout_seconds_per_phase" in run_log.read_text()
 
@@ -950,3 +950,22 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
 
     assert elapsed < 20.0
     assert not _last_successful_generation_path(exp).exists()
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
+@pytest.mark.parametrize("scope", ["phase", "run"])
+def test_timeout_remedy_matches_storage_and_budget(scope: str, persistent: bool) -> None:
+    """A deadline names its budget and promises resume only when results persist."""
+    from phasesweep.engine.errors import phase_timeout
+    from phasesweep.mcp.runner import _terminal_failure_payload
+
+    error = phase_timeout("budget exhausted", scope=scope, persistent=persistent)
+    remedy = error.remediation
+    assert remedy is not None
+    key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
+    assert f"Raise {key}" in remedy
+    assert ("completed trials are kept" in remedy) is persistent
+    assert ("storage: null keeps no completed trials" in remedy) is not persistent
+    failure = _terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
+    assert failure["code"] == "timeout"
+    assert failure["remediation"] == f"Ask the operator: {remedy}"

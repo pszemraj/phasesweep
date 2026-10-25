@@ -9,6 +9,7 @@ import optuna
 import pytest
 
 from phasesweep import load_experiment, run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.config.search import IntParam
 from phasesweep.engine.errors import StudyFingerprintMismatchError
@@ -21,15 +22,11 @@ from phasesweep.engine.fingerprints import (
 )
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from tests.conftest import make_experiment
 from tests.experiments import anchored_phase, project_directory, write_anchored_config
 
 _CWD_SENTENCE = "The trainer working directory follows the directory phasesweep runs from"
-_NEW_STUDY_STEP = (
-    "To run this config, set a new `experiment` name in the config (with `storage: auto` a new "
-    "`workdir` also works); the old study stays readable under the old name."
-)
 
 
 def _stamped_study(experiment: Experiment, *, populated: bool = True) -> optuna.Study:
@@ -97,7 +94,7 @@ def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_di
     with pytest.raises(StudyFingerprintMismatchError, match="different phase config") as caught:
         run_experiment(load_experiment(config))
 
-    message = str(caught.value)
+    message = _operational_error_text(caught.value)
     # No ";" before the closing quote: the invocation directory is the only change.
     assert re.search(r'Changed: execution\.cwd: [^;]*first" -> [^;]*second"\. ', message)
     assert (
@@ -160,7 +157,8 @@ def test_refusal_gives_the_step_that_runs_the_changed_config() -> None:
     error = _refusal(study, make_experiment(provenance={"revision": "toy-v2"}))
 
     assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2". ' in str(error)
-    assert str(error).endswith(_NEW_STUDY_STEP)
+    assert error.remediation == NEW_STUDY_STEP
+    assert _operational_error_text(error).endswith(NEW_STUDY_STEP)
     assert error.action is OperatorAction.FRESH_NAMESPACE
 
 
@@ -188,9 +186,10 @@ def test_refusal_without_a_stored_payload_keeps_the_hash_only_message() -> None:
     fingerprint = _phase_fingerprint(experiment, experiment.phases[0], {})
     assert message == (
         f"Study {study.study_name!r} was created with a different phase config "
-        f"(fingerprint {'0' * 64} != {fingerprint}). {_NEW_STUDY_STEP}"
+        f"(fingerprint {'0' * 64} != {fingerprint}). "
     )
     assert error.action is OperatorAction.FRESH_NAMESPACE
+    assert error.remediation == NEW_STUDY_STEP
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

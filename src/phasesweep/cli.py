@@ -59,7 +59,12 @@ from phasesweep.engine.read import (
     require_study,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
+from phasesweep.errors import (
+    UNPUBLISHED_WINNER_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    operator_step,
+)
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -1122,7 +1127,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
             ):
                 click.echo(
                     f"# {phase['name']}: winner retained but not published; "
-                    "rerun the same config to resume and publish."
+                    f"{UNPUBLISHED_WINNER_STEP}"
                 )
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     raise_for_unusable_publication(

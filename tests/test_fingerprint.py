@@ -1649,8 +1649,13 @@ def test_from_phase_preflight_consumes_run_deadline(
     monkeypatch.setattr(resume_ops, "time", run_module.time)
     monkeypatch.setattr(artifact_io, "_load_winner", delayed_load_winner)
 
-    with pytest.raises(TimeoutError, match="before phase 'lr' could start"):
+    with pytest.raises(TimeoutError, match="before phase 'lr' could start") as refused:
         run_experiment(resumed, from_phase="lr")
+    from phasesweep.errors import PhaseSweepError, operator_step
+
+    assert isinstance(refused.value, PhaseSweepError)
+    assert "Raise timeout_seconds_per_run" in operator_step(refused.value)
+    assert "completed trials are kept" in operator_step(refused.value)
 
 
 def test_fresh_run_preflight_consumes_run_deadline(

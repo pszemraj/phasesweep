@@ -25,9 +25,12 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
+from phasesweep.config.search import Sampler, grid_cardinality
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
+from phasesweep.engine.preview import validate_grid_targets
 from phasesweep.engine.read import read_result, read_status, read_trial_tables
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -55,6 +58,7 @@ PURE_READ_PATHS = (
     "engine-read_status",
     "engine-read_result",
     "engine-read_trial_tables",
+    "engine-validate_grid_targets",
     "ledger-read_phase_trials",
     "cli-status",
     "cli-status-trials",
@@ -205,6 +209,22 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
             )
         elif read_path == "engine-read_trial_tables":
             read_trial_tables(materialized.experiment)
+        elif read_path == "engine-validate_grid_targets":
+            experiment = materialized.experiment.model_copy(
+                update={
+                    "phases": [
+                        phase.model_copy(
+                            update={
+                                "sampler": Sampler(type="grid"),
+                                "n_trials": phase.n_trials + grid_cardinality(phase),
+                            }
+                        )
+                        for phase in materialized.experiment.phases
+                    ]
+                }
+            )
+            with pytest.raises(TrialTargetRefusedError, match="n_trials"):
+                validate_grid_targets(experiment)
         elif read_path == "ledger-read_phase_trials":
             ledger = validate_ledger(materialized.experiment)
             for phase in materialized.experiment.phases:

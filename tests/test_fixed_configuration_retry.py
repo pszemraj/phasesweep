@@ -229,7 +229,8 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
     for message in (_operational_error_text(aborted.value), _operational_error_text(refused.value)):
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
-        assert "workdir" not in message
+        assert "new `experiment` name" in message
+        assert "with `storage: auto`, a new `workdir` also works" in message
     assert _call_count(calls) == 1
 
 

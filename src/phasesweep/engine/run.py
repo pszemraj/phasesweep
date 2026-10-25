@@ -620,6 +620,7 @@ def _run_experiment_inner(
             raise phase_timeout(
                 f"Run wallclock deadline reached before phase {phase.name!r} could start.",
                 scope="run",
+                persistent=experiment.resolved_storage is not None,
             )
         if (
             using_preloaded_winner

@@ -18,6 +18,7 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
+from phasesweep.errors import NEW_STUDY_STEP
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -537,8 +538,7 @@ def grid_target_refusal(phase: Phase, *, finished: int, measured: int) -> str | 
         f"attempts: {finished} finished attempts and {measured} COMPLETE or INFEASIBLE cells "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
         "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated. "
-        f"Set phases[{phase.name}].n_trials to at most {maximum}, or use a new experiment "
-        "name to run a changed search space or bounds."
+        f"Set phases[{phase.name}].n_trials to at most {maximum}. {NEW_STUDY_STEP}"
     )
 
 

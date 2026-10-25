@@ -91,6 +91,20 @@ RERUN_CLEANUP_RECOVERY = (
 )
 
 
+NEW_STUDY_STEP = (
+    "For persistent storage, set a new `experiment` name in the config to start a fresh "
+    "study (with `storage: auto`, a new `workdir` also works); the old study stays readable "
+    "with its original config. With `storage: null`, rerunning starts fresh."
+)
+
+
+UNPUBLISHED_WINNER_STEP = (
+    "If a PhaseSweep operation is still active, wait for it to finish. If the run failed, "
+    "follow the failing phase's reported remedy before rerunning the same config to "
+    "resume publication."
+)
+
+
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",

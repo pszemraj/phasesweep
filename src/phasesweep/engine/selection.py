@@ -16,7 +16,12 @@ import optuna
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import grid_search_space, phase_draws, sampler_search_space
+from phasesweep.config.search import (
+    grid_search_space,
+    phase_draws,
+    retry_target_ceiling,
+    sampler_search_space,
+)
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import (
     _assess_population,
@@ -25,7 +30,7 @@ from phasesweep.engine.confound import (
 )
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
-from phasesweep.engine.optuna import _draw_positions, _trial_count_state
+from phasesweep.engine.optuna import _draw_positions, _finished_trial_count, _trial_count_state
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -49,7 +54,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger("phasesweep.engine.selection")
@@ -90,16 +95,29 @@ def tie_group_comparisons(
     ]
 
 
-def _no_feasible_remedy() -> str:
-    """Name the trial evidence and the identity change required by different bounds.
+def _no_feasible_remedy(
+    experiment: Experiment, trials: Sequence[optuna.trial.FrozenTrial], phase_name: str | None
+) -> str:
+    """Name the failed-trial retry or infeasible-bound remedy for the recorded population.
 
-    :return str: Operator steps for a phase with no eligible winner.
+    :param Experiment experiment: Config whose storage controls trial retention.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Recorded phase attempts.
+    :param str | None phase_name: Phase supplying its accepted trial budget, if known.
+    :return str: Operator steps appropriate to failures, bounds, and storage.
     """
-    return (
-        "Inspect the phase's trials.csv and trial_* trainer logs for failed or infeasible "
-        "trials. To change metric.min, metric.max or constraints, set a new experiment "
-        "name and rerun: these bounds are part of the study identity."
-    )
+    evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
+    if experiment.resolved_storage is None:
+        return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
+    infeasible = any(trial.state == optuna.trial.TrialState.COMPLETE for trial in trials)
+    if infeasible:
+        return f"{evidence} Changing metric.min, metric.max or constraints changes persistent study identity. {NEW_STUDY_STEP}"
+    if phase_name is not None:
+        phase = experiment.phase(phase_name)
+        finished = _finished_trial_count(trials)
+        ceiling = retry_target_ceiling(phase, finished=finished, measured=0)
+        target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
+        return f"{evidence} Fix the failure, then raise phases[{phase.name}].n_trials {target} in the config and rerun to retry failed attempts. {NEW_STUDY_STEP}"
+    return f"{evidence} Fix the failure, then raise the phase's n_trials and rerun to retry failed attempts. {NEW_STUDY_STEP}"
 
 
 @dataclass
@@ -252,14 +270,14 @@ def select_winner(
             "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
             "why each failed or infeasible trial finished that way."
             + _metric_bounds_note(trials, experiment),
-            remediation=_no_feasible_remedy(),
+            remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
     if not survivors:
         raise _no_feasible_error_type(trials)(
             "No completed trials in phase. The phase's trials.csv records why each "
             "failed or infeasible trial finished that way; trainer output is in its "
             "trial_* directory." + _metric_bounds_note(trials, experiment),
-            remediation=_no_feasible_remedy(),
+            remediation=_no_feasible_remedy(experiment, trials, phase_name),
         )
 
     winning: RankedGroup | None = None

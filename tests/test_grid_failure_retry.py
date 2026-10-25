@@ -202,16 +202,16 @@ def _assert_advises_limit(message: str, above: int, left: int, target: int) -> N
     assert "the failure count starts again from zero" in message
 
 
-def _assert_no_fresh_namespace(message: str) -> None:
-    """Assert the message does not send the operator to a new workdir."""
-    assert "namespace" not in message
-    assert "workdir" not in message
+def _assert_fresh_study_remedy(message: str) -> None:
+    """Assert new-workdir advice is conditional on automatic storage."""
+    assert "new `experiment` name" in message
+    assert "with `storage: auto`, a new `workdir` also works" in message
 
 
 def _assert_no_recovery(message: str) -> None:
     """Assert the message offers no setting of phase ``p`` that continues the study."""
     assert "phases[p]" not in message
-    _assert_no_fresh_namespace(message)
+    _assert_fresh_study_remedy(message)
 
 
 @pytest.mark.parametrize("repeats", [False, True], ids=["grid", "repeat-grid"])
@@ -401,7 +401,7 @@ def test_raised_failure_limit_runs_only_the_cells_an_infeasible_streak_left_unru
     _assert_advises_limit(aborted, 2, 2, 4)
     # The target retries nothing: both measured cells are closed.
     assert "n_trials from" not in aborted
-    _assert_no_fresh_namespace(aborted)
+    _assert_fresh_study_remedy(aborted)
     measured = ran()
     assert sorted(measured) == ["3", "4"]
 
@@ -465,14 +465,6 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     _assert_advises_limit(message, 2, 2, 4)
 
 
-_FRESH_START = (
-    "The recorded trial results stay in the study; if a defect you have since fixed "
-    "produced them, set a new `experiment` name in the config to start fresh. "
-    "Changing metric.min, metric.max, constraints, or the search space changes the study "
-    "identity and requires a new `experiment` name."
-)
-
-
 def _out_of_bounds_metric() -> Metric:
     """Return a ``x=<value>`` metric whose upper bound a logged 5.0 exceeds."""
     return Metric(
@@ -501,8 +493,11 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
 
     for message in map(_operational_error_text, (aborted.value, refused.value, at_limit.value)):
         _assert_advises_limit(message, 2, 2, 4)
-        assert message.endswith(_FRESH_START)
-        _assert_no_fresh_namespace(message)
+        assert "The recorded trial results stay in the study." in message
+        assert "new `experiment` name" in message
+        assert message.index("metric.min, metric.max") < message.index(
+            "phases[p].max_consecutive_failures"
+        )
     headline = str(aborted.value)
     assert "stderr" not in headline
     assert (
@@ -522,7 +517,8 @@ def test_failed_streak_abort_points_at_the_logs_even_when_an_infeasible_trial_is
     message = _operational_error_text(aborted.value)
     assert " for stderr logs." in message
     assert "completed outside the metric bounds" not in message
-    assert message.endswith(_FRESH_START)
+    assert "The recorded trial results stay in the study." in message
+    assert "new `experiment` name" in message
 
 
 def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: Path) -> None:

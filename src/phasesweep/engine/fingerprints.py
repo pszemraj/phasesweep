@@ -14,7 +14,7 @@ import optuna
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)
@@ -212,11 +212,6 @@ _CWD_FOLLOWS_INVOCATION = (
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
     "config (relative paths resolve against the config file)."
 )
-# An explicit storage keeps the same study under a new workdir; only auto storage follows it.
-_NEW_STUDY_STEP = (
-    "To run this config, set a new `experiment` name in the config (with `storage: auto` a new "
-    "`workdir` also works); the old study stays readable under the old name."
-)
 
 
 def _changed_payload_keys(
@@ -342,6 +337,7 @@ def _verify_fingerprint(
             raise StudyFingerprintMismatchError(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
                 "fingerprint. Its populated state is unsupported by this release.",
+                remediation=NEW_STUDY_STEP,
             )
         _stamp_fingerprint(study, fp, payload)
     elif existing != fp:
@@ -365,9 +361,9 @@ def _verify_fingerprint(
         )
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
-            f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}"
-            f"{_CWD_FOLLOWS_INVOCATION if cwd_unset else _NEW_STUDY_STEP}",
+            f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
+            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else NEW_STUDY_STEP,
         )
     return fp

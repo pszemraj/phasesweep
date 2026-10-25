@@ -465,9 +465,10 @@ def test_show_winners_reads_unpublished_phase_results(tmp_path: Path) -> None:
     status = CliRunner().invoke(cli, ["status", str(config_path)])
     assert status.exit_code == 0, status.output
     assert (
-        "winner retained but not published; rerun the same config to resume and publish"
+        "winner retained but not published; If a PhaseSweep operation is still active"
         in status.output
     )
+    assert "follow the failing phase's reported remedy before rerunning" in status.output
     assert yaml.safe_load(status.output)["phases"][0]["winner_is_published"] is False
 
 

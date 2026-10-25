@@ -313,7 +313,12 @@ def experiment_disclosures(
                     [
                         (
                             False,
-                            "grid order: configurations are shuffled by sampler.seed, not listed choice order; repeat values stay consecutive in their listed order.",
+                            "grid order: configurations are shuffled by sampler.seed, not listed choice order."
+                            + (
+                                " Repeat values stay consecutive in their listed order."
+                                if phase.repeats is not None
+                                else ""
+                            ),
                         )
                     ]
                     if phase.sampler.type == "grid" and phase_draws(phase)

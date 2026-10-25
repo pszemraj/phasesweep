@@ -113,8 +113,10 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
                     f"supports one active orchestrator per experiment output "
                     f"namespace and per persistent storage identity.",
                     remediation=(
-                        "Wait for the active sweep using this experiment output or storage "
-                        "namespace to finish, or cancel it before retrying the same command."
+                        "Wait for the other PhaseSweep operation using this experiment output "
+                        "or storage namespace to finish, then retry the same command. Stop it "
+                        "only if the user wants it stopped and through the interface that "
+                        "started it; MCP cannot cancel a CLI operation."
                     ),
                 )
             handles.append(handle)
