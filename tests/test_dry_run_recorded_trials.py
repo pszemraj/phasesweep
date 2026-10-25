@@ -406,31 +406,44 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     assert _PLACEHOLDERS in command
 
 
-def test_running_attempt_without_a_recorded_failure_previews_as_a_rerun(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("recorded_state", "target", "expected_lines"),
+    [
+        pytest.param(
+            _STATE.RUNNING,
+            2,
+            [
+                "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
+                _RUNNING_WARNING.format(name="a"),
+                "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
+            ],
+            id="running-without-outcome",
+        ),
+        pytest.param(
+            _STATE.FAIL,
+            3,
+            [
+                "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
+                "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
+            ],
+            id="interrupted",
+        ),
+    ],
+)
+def test_interrupted_attempts_preview_as_reruns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    recorded_state: optuna.trial.TrialState,
+    target: int,
+    expected_lines: list[str],
 ) -> None:
-    """A RUNNING attempt that recorded no failure recovers as interrupted, so it never counts."""
-    experiment = _persistent(tmp_path, _phase("a", 2))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2)
+    """Unfinished or interrupted attempts are reruns rather than completed budget."""
+    experiment = _persistent(tmp_path, _phase("a", target))
+    _record(
+        experiment, "a", _STATE.COMPLETE, recorded_state, target=target, fail_outcome="interrupted"
+    )
 
-    assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
-        _RUNNING_WARNING.format(name="a"),
-        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun",
-    ]
-
-
-def test_interrupted_trial_previews_as_a_rerun_among_the_launches(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An interrupted trial never counts toward the target, so its rerun is one of the launches."""
-    experiment = _persistent(tmp_path, _phase("a", 3))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=3, fail_outcome="interrupted")
-
-    assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
-        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun",
-    ]
+    assert _preview(experiment, tmp_path, caplog) == expected_lines
 
 
 def test_total_line_sums_the_launches_the_phase_lines_print(
