@@ -307,6 +307,7 @@ def test_cancel_cleanup_confirmation_policy(
     preexisting_marker: bool,
     check_launch_gate: bool,
 ) -> None:
+    """Cancellation confirms cleanup or reserves it with a static remedy every reader retains."""
     config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-cancel-policy"
@@ -351,12 +352,27 @@ def test_cancel_cleanup_confirmation_policy(
     assert store.cleanup_uncertain_path(run_id).exists() is not cleanup_confirmed
     if not runner_group_gone:
         failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
-        assert "Cancellation could not stop the runner" in failure["remediation"]
-        assert "inspect this run's saved runner PID/PGID on the host" in failure["remediation"]
-        assert "Retry cancel_run after it exits" in failure["remediation"]
-        assert app.status(run_id)["run"]["failure"] == failure
-        monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
-        assert app.status(run_id)["run"]["failure"] == failure
+        remedy = failure["remediation"]
+        assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
+        assert "If it is still running on the host" in remedy
+        assert "clear the cause" in remedy
+        assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
+        assert "cancel_run" not in remedy
+        assert len(remedy.splitlines()) == 1
+        for visibility in ("observable", "absent", "unobservable"):
+            view = RunnerView(visibility)
+            monkeypatch.setattr(store, "runner_view", lambda _handle, view=view: view)
+            for tool, args in (
+                ("get_run_status", {"run_id": run_id}),
+                ("await_run", {"run_id": run_id, "timeout_seconds": 5}),
+                ("get_run_results", {"run_id": run_id}),
+                ("get_latest_run", {"experiment_id": reg.id}),
+            ):
+                result = call_mcp_tool(app, tool, args)
+                assert not result.isError, result
+                payload = result.structuredContent
+                recorded = payload["run"]["failure"] if "run" in payload else payload["failure"]
+                assert recorded["remediation"] == remedy
     if status_cleanup_confirmed is None:
         assert not store.status_path(run_id).exists()
     if check_launch_gate:
