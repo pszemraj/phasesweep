@@ -1412,14 +1412,14 @@ ORIGIN_CASES = (
         trigger=_run_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
         action=OperatorAction.FIX_CONFIG,
-        message="finished training, but the tracker gave no answer about its evidence",
+        message="finished training, but the tracker could not be read",
     ),
     RoutingCase(
         id="pending_trial_tracker_unreadable",
         trigger=_resume_while_tracker_unreadable,
         raised=TrackingTargetUnavailableError,
         action=OperatorAction.FIX_CONFIG,
-        message="1 completed trial(s) finished training, but the tracker gave no answer",
+        message="1 completed trial(s) finished training, but the tracker could not be read",
     ),
     RoutingCase(
         id="launch_preflight_program_missing",

@@ -191,14 +191,15 @@ class TrackingTargetUnavailableError(PhaseSweepError):
 
 
 _TRACKER_UNREADABLE_STEP = (
-    "Restore access to the tracker, then run the same config again: the completed training "
-    "is kept and nothing is retrained. If the tracker is gone for good, a fresh study gives "
-    f"up that training. {NEW_STUDY_STEP}"
+    "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
+    "then run the same config again: the completed training is kept and nothing is "
+    "retrained. If the tracker is gone for good, a fresh study gives up that training. "
+    f"{NEW_STUDY_STEP}"
 )
 
 
 def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
-    """Attach the tracker-restoring step to a stop that keeps finished training pending.
+    """Attach the step that fixes the tracker read to a stop that keeps finished training pending.
 
     :param str message: Diagnostic naming the pending trials and the tracker's failure.
     :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.

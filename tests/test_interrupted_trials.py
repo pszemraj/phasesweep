@@ -1352,6 +1352,39 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     assert len(reconciliations) == 1
 
 
+@pytest.mark.integration
+def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """A recovery read that finds the tracker SDK missing says the tracker could not be read and gives a step that installs it."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    tracker.switch("denied")
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    wandb_worker_sdk("raise ImportError('No module named wandb')")
+    with pytest.raises(TrackingTargetUnavailableError) as refused:
+        run_experiment(experiment)
+    assert str(refused.value) == (
+        "1 completed trial(s) finished training, but the tracker could not be read. First "
+        "failure: metric extractor: W&B evidence requires the optional SDK; install "
+        "phasesweep[wandb]. Their training is kept and no new trial was started."
+    )
+    assert refused.value.remediation is not None
+    assert refused.value.remediation.startswith(
+        "Fix the reported cause (restore access to the tracker, or install its missing SDK), "
+        "then run the same config again: the completed training is kept and nothing is "
+        "retrained."
+    )
+    assert "its tracker could not be read: metric extractor: W&B evidence requires" in caplog.text
+    (trial,) = phase_trials(experiment)
+    _assert_evidence_pending(experiment, trial)
+    # With the SDK back, the next run keeps the training.
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+
+
 def _in_memory_wandb_sweep(
     tmp_path: Path, tracker: SwitchableWandb, *, n_trials: int, deny_at_launch: int
 ) -> tuple[Experiment, Path]:

@@ -1132,9 +1132,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         left_running = _TrialLeftRunning(
             tracker_unreadable(
                 f"Trial {trial.number} in phase {phase.name!r} finished training, but the "
-                f"tracker gave no answer about its evidence: "
-                f"{(result.failure_reason or '').rstrip('.')}. The trial stays RUNNING with "
-                "its training kept, and no further trial starts."
+                f"tracker could not be read: {(result.failure_reason or '').rstrip('.')}. "
+                "The trial stays RUNNING with its training kept, and no further trial starts."
             )
         )
         run.record_fatal(left_running)

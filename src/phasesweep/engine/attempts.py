@@ -128,9 +128,8 @@ def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnava
     """
     first = next(iter(pending.values())).rstrip(".")
     return tracker_unreadable(
-        f"{len(pending)} completed trial(s) finished training, but the tracker gave no answer "
-        f"about their evidence. First failure: {first}. Their training is kept and no new "
-        "trial was started."
+        f"{len(pending)} completed trial(s) finished training, but the tracker could not be "
+        f"read. First failure: {first}. Their training is kept and no new trial was started."
     )
 
 
@@ -1215,7 +1214,7 @@ def _recover_completed_trial(
         if report.unreadable_tracker is None:
             report.unreadable_tracker = result.failure_reason
         log.warning(
-            "Completed orphan attempt %s stays pending; its tracker gave no answer: %s",
+            "Completed orphan attempt %s stays pending; its tracker could not be read: %s",
             record.attempt_id,
             result.failure_reason,
         )
