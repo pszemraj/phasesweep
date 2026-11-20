@@ -27,13 +27,13 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import LaunchEnvironmentError, StudyFingerprintMismatchError
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.paths import _artifact_root_binding_path
-from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
 from phasesweep.engine.study_policy import _launch_preflight, _trial_program_refusal
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from tests.conftest import (
     make_experiment,
     phase_trials,
+    study_with_stamped_environment,
     write_constant_trainer,
     write_experiment_config,
 )
@@ -55,23 +55,8 @@ def _with_target(experiment: Experiment, n_trials: int) -> Experiment:
     return experiment.model_copy(update={"phases": phases})
 
 
-def _completed_study(experiment: Experiment) -> optuna.Study:
-    """Return a study holding one trial stamped with this process's trainer environment."""
-    identity = _environment_identity(experiment, "p")
-    study = optuna.create_study(study_name="t::p")
-    study.add_trial(
-        optuna.trial.create_trial(
-            value=1.0,
-            user_attrs={
-                TRAINER_ENV_DIGEST_ATTR: identity.digest,
-                TRAINER_ENV_ATTR: dict(identity.tracked),
-            },
-        )
-    )
-    return study
-
-
 def test_program_on_the_path_is_found(tmp_path: Path) -> None:
+    """A plain first word that an executable on PATH matches passes the program check."""
     _executable(tmp_path / "bin" / "trainer")
 
     assert (
@@ -82,6 +67,7 @@ def test_program_on_the_path_is_found(tmp_path: Path) -> None:
 def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
     tmp_path: Path,
 ) -> None:
+    """The refusal names the PATH it searched and the way to put the program on it."""
     refusal = _trial_program_refusal(
         f"{_MISSING} --lr 1", path="/nowhere:/also/nowhere", cwd=tmp_path
     )
@@ -96,6 +82,7 @@ def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
 
 
 def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Path) -> None:
+    """A relative PATH entry is searched from the trainer's directory, as its shell would."""
     _executable(tmp_path / "tools" / "trainer")
 
     assert _trial_program_refusal("trainer", path="tools", cwd=tmp_path) is None
@@ -105,6 +92,7 @@ def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Pa
 def test_relative_program_resolves_against_the_trainer_directory(
     tmp_path: Path, program: str
 ) -> None:
+    """A program named by a relative path is found from the trainer's directory and nowhere else."""
     _executable(tmp_path / program)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -116,6 +104,7 @@ def test_relative_program_resolves_against_the_trainer_directory(
 
 
 def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
+    """An absolute program that lacks the execute bit or is a directory is refused."""
     script = tmp_path / "train.sh"
     script.write_text("#!/bin/sh\n")
     script.chmod(0o644)
@@ -158,7 +147,7 @@ def test_cohort_refusal_comes_before_the_program_check(monkeypatch: pytest.Monke
     """A changed PATH reads as a cohort change naming both values, not as a missing program."""
     experiment = make_experiment(trial_command=f"{_MISSING} {{overrides}}")
     monkeypatch.setenv("PATH", "/opt/old/bin")
-    study = _completed_study(experiment)
+    study = study_with_stamped_environment(_environment_identity(experiment, "p"))
     monkeypatch.setenv("PATH", "/opt/new/bin")
 
     with pytest.raises(
@@ -168,6 +157,7 @@ def test_cohort_refusal_comes_before_the_program_check(monkeypatch: pytest.Monke
 
 
 def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path: Path) -> None:
+    """A launch whose program PATH lacks is refused before it binds the tree or opens a ledger."""
     experiment = make_experiment(persistent=tmp_path, trial_command=f"{_MISSING} {{overrides}}")
 
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on") as caught:
@@ -183,6 +173,7 @@ def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path:
 def test_fresh_tree_refuses_a_missing_trainer_directory_before_creating_anything(
     tmp_path: Path,
 ) -> None:
+    """A launch whose trainer directory is missing is refused with the fix, before it binds the tree."""
     experiment = make_experiment(
         persistent=tmp_path, execution=ExecutionContext(cwd=str(tmp_path / "gone"))
     )
@@ -307,6 +298,7 @@ def test_dry_run_refuses_a_top_up_under_another_environment_cohort(
 
 
 def test_dry_run_refuses_a_missing_program(tmp_path: Path) -> None:
+    """The dry run refuses the program a launch would refuse, so it previews no doomed trial."""
     experiment = make_experiment(persistent=tmp_path, trial_command=f"{_MISSING} {{overrides}}")
 
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on"):

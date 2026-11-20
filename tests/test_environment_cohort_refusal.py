@@ -39,7 +39,12 @@ from phasesweep.engine.trial import (
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence.models import WandbSummaryRequiredGate
 from phasesweep.tracking.models import MlflowSettings
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import (
+    make_experiment,
+    stamped_environment_attrs,
+    study_with_stamped_environment,
+    write_constant_trainer,
+)
 from tests.ledger_fixtures import published_generation_id
 
 _AMBIENT = {
@@ -67,23 +72,6 @@ def _base_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def _identity(experiment: Experiment) -> EnvironmentIdentity:
     """Compose the identity phase ``p`` would stamp from the current process environment."""
     return _environment_identity(experiment, "p")
-
-
-def _stamped(identity: EnvironmentIdentity, *, mapping: bool = True) -> dict[str, object]:
-    """Return the attributes ``_execute_objective`` stamps on an allocated trial."""
-    attrs: dict[str, object] = {TRAINER_ENV_DIGEST_ATTR: identity.digest}
-    if mapping:
-        attrs[TRAINER_ENV_ATTR] = dict(identity.tracked)
-    return attrs
-
-
-def _record(identity: EnvironmentIdentity, *, mapping: bool = True) -> optuna.Study:
-    """Return a study holding one trial stamped as ``_execute_objective`` stamps it."""
-    study = optuna.create_study(study_name="t::p")
-    study.add_trial(
-        optuna.trial.create_trial(value=1.0, user_attrs=_stamped(identity, mapping=mapping))
-    )
-    return study
 
 
 def _refused(study: optuna.Study, current: EnvironmentIdentity) -> StudyFingerprintMismatchError:
@@ -166,7 +154,7 @@ def test_environment_mutation_names_each_difference(
     )
     for name, value in initial.items():
         monkeypatch.setenv(name, value)
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     for name, value in changes.items():
         if value is None:
             monkeypatch.delenv(name)
@@ -184,7 +172,7 @@ def test_pass_through_names_are_in_neither_the_mapping_nor_the_refusal(
     monkeypatch.setenv("API_TOKEN", "rotating-first")
     monkeypatch.setenv("TMPDIR", "/scratch/first")
     before = _identity(experiment)
-    study = _record(before)
+    study = study_with_stamped_environment(before)
     assert not {"API_TOKEN", "TMPDIR"} & set(before.tracked)
     assert before.values["API_TOKEN"] == "rotating-first"
     monkeypatch.setenv("API_TOKEN", "rotating-second")
@@ -211,7 +199,7 @@ def test_changed_listed_or_configured_value_is_shown(
     else:
         first = second = make_experiment(execution=ExecutionContext(inherit_env=["API_TOKEN"]))
     monkeypatch.setenv("API_TOKEN", "hunter2-first")
-    study = _record(_identity(first))
+    study = study_with_stamped_environment(_identity(first))
     monkeypatch.setenv("API_TOKEN", "hunter2-second")
 
     message = _refusal(study, _identity(second))
@@ -240,7 +228,7 @@ def test_base_value_pinned_under_env_is_shown_like_an_ambient_one() -> None:
     first = make_experiment(env={"TZ": "Europe/Berlin"})
     second = make_experiment(env={"TZ": "Asia/Tokyo"})
 
-    message = _refusal(_record(_identity(first)), _identity(second))
+    message = _refusal(study_with_stamped_environment(_identity(first)), _identity(second))
 
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in message
 
@@ -250,7 +238,7 @@ def test_a_trial_that_recorded_no_mapping_gets_the_generic_sentence(
 ) -> None:
     """An allocation that died after its digest and before its mapping landed has nothing to compare."""
     experiment = make_experiment()
-    study = _record(_identity(experiment), mapping=False)
+    study = study_with_stamped_environment(_identity(experiment), mapping=False)
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
     refusal = _refused(study, _identity(experiment))
@@ -284,10 +272,14 @@ def test_the_latest_trial_that_recorded_a_mapping_is_the_comparison(
     first = _identity(experiment)
     monkeypatch.setenv("TZ", "Asia/Tokyo")
     second = _identity(experiment)
-    study = _record(first)
-    study.add_trial(optuna.trial.create_trial(value=1.0, user_attrs=_stamped(second)))
+    study = study_with_stamped_environment(first)
     study.add_trial(
-        optuna.trial.create_trial(value=1.0, user_attrs=_stamped(second, mapping=False))
+        optuna.trial.create_trial(value=1.0, user_attrs=stamped_environment_attrs(second))
+    )
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=1.0, user_attrs=stamped_environment_attrs(second, mapping=False)
+        )
     )
     monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
 
@@ -301,7 +293,7 @@ def test_the_latest_trial_that_recorded_a_mapping_is_the_comparison(
 def test_a_long_difference_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     names = [f"PS_COHORT_VAR_{index:02d}" for index in range(12)]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     for name in names:
         monkeypatch.setenv(name, "set")
 
@@ -321,7 +313,7 @@ def test_the_refusal_shows_a_long_value_whole_and_the_drift_warning_cuts_it(
     monkeypatch.setenv("PATH", recorded_path)
     experiment = make_experiment()
     recorded = _identity(experiment)
-    study = _record(recorded)
+    study = study_with_stamped_environment(recorded)
     monkeypatch.setenv("PATH", current_path)
     current = _identity(experiment)
 
@@ -339,7 +331,7 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
     """The way back is the recorded values of the differing variables, in the order the message lists them."""
     names = ["PS_COHORT_ADDED"]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("PS_COHORT_ADDED", "new")
     monkeypatch.setenv("TZ", "Asia/Tokyo")
     monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
@@ -361,7 +353,7 @@ def test_the_remediation_for_one_variable_speaks_of_it_in_the_singular(
 ) -> None:
     """One differing variable is restored as ``it``, not ``them``."""
     experiment = make_experiment()
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
     refusal = _refused(study, _identity(experiment))
@@ -379,7 +371,7 @@ def test_the_remediation_names_every_variable_though_the_message_counts_the_rest
     """The cap on shown values never hides a variable the operator must restore."""
     names = [f"PS_COHORT_VAR_{index:02d}" for index in range(12)]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     for name in names:
         monkeypatch.setenv(name, "set")
 
@@ -392,7 +384,9 @@ def test_the_remediation_names_every_variable_though_the_message_counts_the_rest
 
 def test_matching_environment_is_not_refused() -> None:
     experiment = make_experiment()
-    _validate_environment_cohort(_record(_identity(experiment)), _identity(experiment))
+    _validate_environment_cohort(
+        study_with_stamped_environment(_identity(experiment)), _identity(experiment)
+    )
 
 
 def test_inherit_all_does_not_split_the_cohort_on_an_untracked_ambient_variable(
@@ -403,7 +397,7 @@ def test_inherit_all_does_not_split_the_cohort_on_an_untracked_ambient_variable(
     monkeypatch.setenv("SHLVL", "1")
     monkeypatch.setenv("OLDPWD", "/home/alice/earlier")
     before = _identity(experiment)
-    study = _record(before)
+    study = study_with_stamped_environment(before)
     monkeypatch.setenv("SHLVL", "3")
     monkeypatch.setenv("OLDPWD", "/home/alice/later")
     monkeypatch.setenv("PS_COHORT_EXTRA", "only-in-the-second-shell")
@@ -422,7 +416,7 @@ def test_inherit_all_still_refuses_a_differing_base_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     experiment = make_experiment(execution=ExecutionContext(inherit_env="all"))
-    study = _record(_identity(experiment))
+    study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
     monkeypatch.setenv("SHLVL", "9")
 
@@ -473,7 +467,7 @@ def test_inherit_all_has_the_cohort_of_inherit_none(monkeypatch: pytest.MonkeyPa
 def test_trials_csv_carries_the_digest_but_not_the_mapping(tmp_path: Path) -> None:
     """The mapping is ledger provenance, so ``PATH`` is not a column of the results table."""
     identity = _identity(make_experiment())
-    study = _record(identity)
+    study = study_with_stamped_environment(identity)
     destination = tmp_path / "trials.csv"
 
     _write_trials_csv(study, destination)
