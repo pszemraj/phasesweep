@@ -325,14 +325,15 @@ def _save_attempt_intents(
 
     COMPLETE trials receive accepted projections. Unaccepted managed runs finish
     only after cleanup is confirmed by the trial, live controller, or owning
-    study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved.
+    study's recovery ledger. Unreadable trials, uncertain cleanup and RUNNING trials,
+    whose outcome recovery has yet to record, remain unresolved.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
     :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
     :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
         its controller's cleanup confirmation or its study's recovery.
-    :param str | None ended: Status for every unaccepted managed run once the
+    :param str | None ended: Status for every terminal unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
         finish only trials Optuna failed with confirmed cleanup.
     :return list[Path]: The records saved, in attempt order.
@@ -360,7 +361,9 @@ def _save_attempt_intents(
         )
         if settled and _trial_interrupted(trial):
             status = "KILLED"
-        elif ended is not None:
+        elif ended is not None and trial.state.is_finished():
+            # A RUNNING trial has no retained outcome yet: recovery may still accept its
+            # completed training, so its run stays open rather than reading as a verdict.
             status = ended
         elif settled:
             status = "FAILED"

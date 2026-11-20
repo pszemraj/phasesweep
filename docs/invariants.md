@@ -324,8 +324,8 @@ Every trial has a draw position: a trial that is not a rerun takes the number of
 
 #### 30. Managed run status follows the retained attempt outcome
 
-MLflow evidence is read only from the run bound to the attempt; another run's metrics cannot rescue a missing objective or a failed trainer. After confirmed cleanup, a terminal delivery applies the retained outcome to a managed run even when the trainer already ended it with a different status. A failed attempt therefore becomes FAILED remotely. Delivery never terminates a trainer-owned run, and retries use the same retained intent.
+MLflow evidence is read only from the run bound to the attempt; another run's metrics cannot rescue a missing objective or a failed trainer. After confirmed cleanup, a terminal delivery applies the retained outcome to a managed run even when the trainer already ended it with a different status. A failed attempt therefore becomes FAILED remotely. A `RUNNING` trial has no retained outcome, so a failed invocation leaves its managed run open, and the outcome recovery later records is what reaches it. Delivery never terminates a trainer-owned run, and retries use the same retained intent.
 
-**Held by:** `tracking.mlflow._capture`, `tracking.mlflow._publish`, `tracking.publication._unaccepted_projection` and `tracking.publication._save_intent`
+**Held by:** `tracking.mlflow._capture`, `tracking.mlflow._publish`, `tracking.publication._unaccepted_projection`, `tracking.publication._save_attempt_intents`, which applies an ended invocation's status only to a finished trial, and `tracking.publication._save_intent`
 
-**Tests:** `tests/test_mlflow_terminal_delivery.py::test_publish_applies_the_owned_run_outcome`, `tests/test_mlflow_integration.py::test_managed_failed_trial_overrides_the_trainer_run_status`, `tests/test_mlflow_integration.py::test_failed_trainer_http_summary_delivery_and_sync`
+**Tests:** `tests/test_mlflow_terminal_delivery.py::test_publish_applies_the_owned_run_outcome`, `tests/test_mlflow_terminal_delivery.py::test_failed_invocation_leaves_a_pending_trials_managed_run_open`, `tests/test_mlflow_integration.py::test_managed_failed_trial_overrides_the_trainer_run_status`, `tests/test_mlflow_integration.py::test_failed_trainer_http_summary_delivery_and_sync`

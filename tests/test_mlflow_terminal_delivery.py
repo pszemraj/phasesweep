@@ -8,6 +8,7 @@ import signal
 import sys
 from types import SimpleNamespace
 
+import optuna
 import pytest
 import yaml
 from optuna.trial import TrialState, create_trial
@@ -38,6 +39,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
+    RETURN_CODE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_ATTR,
@@ -191,7 +193,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     study = open_phase_study(ledger, experiment.phases[0])
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     attempts = {
-        "1": ("managed", TrialState.RUNNING),  # interrupted before its callback
+        "1": ("managed", TrialState.RUNNING),  # no outcome until recovery records one
         "2": ("managed", TrialState.FAIL),  # its callback already recorded it
         "3": ("trainer", TrialState.FAIL),  # PhaseSweep never ends a trainer's run
         "4": ("managed", TrialState.COMPLETE),  # accepted; its record was never saved
@@ -226,11 +228,10 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     publication.publish_failed_generation(experiment, generation, KeyboardInterrupt(), ledger)
     assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
-        ("1", "KILLED"),
         ("4", None),
         ("a", "KILLED"),
     ]
-    accepted = requests[1]["projection"]
+    accepted = requests[0]["projection"]
     assert accepted["metrics"] == {
         "phasesweep.objective": 0.5,
         "phasesweep.feasible": 1.0,
@@ -239,6 +240,58 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     }
     assert accepted["params"] == {"phasesweep.override.model.depth": "2"}
     assert "phasesweep.outcome" not in accepted["tags"]
+
+
+def test_failed_invocation_leaves_a_pending_trials_managed_run_open(tmp_path, monkeypatch):
+    """A failed run never ends the run of a trial whose completed training awaits recovery.
+
+    Ending it FAILED would read as a verdict when recovery captures the run, discarding
+    the training; left open, recovery's accepted result reaches it instead.
+    """
+    config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    phase = experiment.phases[0]
+    generation = "a" * 32
+    write_record(
+        tracking_root(experiment) / generation / "generation-binding.json",
+        {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
+    )
+    ledger = claim_ledger(validate_ledger(experiment))
+    study = open_phase_study(ledger, phase)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    attempt = "1" * 32
+    directory = _add_bound_attempt(
+        experiment,
+        study,
+        phase.name,
+        generation,
+        attempt,
+        0,
+        trial=create_trial(
+            state=TrialState.RUNNING,
+            user_attrs={
+                OVERRIDES_ATTR: json.dumps({"model.depth": 2}),
+                RETURN_CODE_ATTR: 0,
+                DURATION_ATTR: 3.0,
+            },
+        ),
+    )
+    write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
+    requests = []
+    monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
+    publication.publish_failed_generation(experiment, generation, RuntimeError("outage"), ledger)
+    assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [(generation, "FAILED")]
+    delivery = tracking_root(experiment) / generation / "delivery"
+    assert not (delivery / f"attempt-{attempt}.json").exists()
+    # Recovery later accepts the completed training.
+    (pending,) = study.get_trials()
+    optuna.Trial(study, pending._trial_id).set_user_attr(FEASIBLE_ATTR, True)
+    study.tell(pending.number, 0.5)
+    publication._rebuild_attempt_intents(experiment, [generation])
+    record = read_record(delivery / f"attempt-{attempt}.json")
+    assert record["finish"] is None
+    assert record["projection"]["metrics"]["phasesweep.objective"] == 0.5
 
 
 def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, monkeypatch):
