@@ -496,8 +496,15 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
         _assert_advises_limit(message, 2, 2, 4)
         assert "The recorded trial results stay in the study." in message
         assert "new `experiment` name" in message
+        assert message.index("The recorded trial results stay in the study.") < message.index(
+            "new `experiment` name"
+        )
         assert message.index("metric.min, metric.max") < message.index(
             "phases[p].max_consecutive_failures"
+        )
+        assert "Fix the cause" not in message
+        assert (
+            "For work under unchanged limits: Raise phases[p].max_consecutive_failures" in message
         )
     headline = str(aborted.value)
     assert "stderr" not in headline
@@ -542,6 +549,34 @@ def test_sampling_phase_asks_for_a_higher_target_without_a_retry_rule(tmp_path: 
         assert "the failure count starts again from zero" in message
         # Both trials are spent, so a higher limit would schedule nothing.
         assert "max_consecutive_failures above" not in message
+
+
+def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_limits(
+    tmp_path: Path,
+) -> None:
+    """An infeasible streak leads with the new-study step and keeps the target raise as the unchanged-limits option."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0, value=5.0)
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        max_consecutive_failures=2,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=1, high=9)},
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[phase], metric=_out_of_bounds_metric()
+    )
+    with pytest.raises(NoFeasibleTrialError) as aborted:
+        run_experiment(experiment)
+    message = _operational_error_text(aborted.value)
+    assert (
+        "For work under unchanged limits: raise phases[p].n_trials above 2 in the config" in message
+    )
+    assert "Fix the cause" not in message
+    assert message.index("The recorded trial results stay in the study.") < message.index(
+        "new `experiment` name"
+    )
+    assert message.index("new `experiment` name") < message.index("For work under unchanged limits")
 
 
 def _coverage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

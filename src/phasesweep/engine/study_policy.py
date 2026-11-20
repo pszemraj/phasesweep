@@ -761,10 +761,10 @@ def _retry_remedy(
         allows, above ``phase.n_trials``; it also runs the cells no attempt has reached.
     :param bool restarts: Whether the abort recorded a failure streak, which the recovery
         restarts from zero.
-    :return str: The sentence.
+    :return str: The step, in lower case so a caller can lead into it, ending with a period.
     """
     raise_to = (
-        f"Fix the cause, then raise phases[{phase.name}].n_trials from {phase.n_trials} "
+        f"raise phases[{phase.name}].n_trials from {phase.n_trials} "
         f"to {ceiling} in the config and rerun to"
     )
     restart = f", and {_COUNT_RESTARTS}" if restarts else ""
@@ -796,25 +796,29 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :param Mapping[str, object] abort: The recorded abort.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
-    remedies = _recovery_remedies(phase, study, abort)
-    if remedies is None:
-        return None
-    retained = (
-        "The recorded trial results stay in the study. Raising n_trials does not change "
-        "the study fingerprint."
-    )
+    results_stay = "The recorded trial results stay in the study."
+    fingerprint_kept = "Raising n_trials does not change the study fingerprint."
     if _streak_trials_all_infeasible(study, _load_phase_policy_state(study)):
+        remedies = _recovery_remedies(phase, study, abort, lead_in="")
+        if remedies is None:
+            return None
         return (
             "The tripping trials violated metric bounds or constraints. Changing "
             "metric.min, metric.max, constraints, or the search space changes persistent "
-            f"study identity. {NEW_STUDY_STEP} "
-            f"{retained} For work under unchanged limits: {remedies.removeprefix('Fix the cause, then ')}"
+            f"study identity. {results_stay} {NEW_STUDY_STEP} "
+            f"{fingerprint_kept} For work under unchanged limits: {remedies}"
         )
-    return f"{remedies} {retained} To discard invalid recorded results: {NEW_STUDY_STEP}"
+    remedies = _recovery_remedies(phase, study, abort, lead_in="Fix the cause, then ")
+    if remedies is None:
+        return None
+    return (
+        f"{remedies} {results_stay} {fingerprint_kept} "
+        f"To discard invalid recorded results: {NEW_STUDY_STEP}"
+    )
 
 
 def _recovery_remedies(
-    phase: Phase, study: optuna.Study, abort: Mapping[str, object]
+    phase: Phase, study: optuna.Study, abort: Mapping[str, object], *, lead_in: str
 ) -> str | None:
     """Name the steps that continue a phase whose study recorded ``abort``, or say none does.
 
@@ -829,6 +833,8 @@ def _recovery_remedies(
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
+    :param str lead_in: Words the caller puts before a raised ``n_trials`` step, or empty
+        when its own sentence leads into the step.
     :return str | None: The steps, or ``None`` when no remedy or explanation applies.
     """
     name, target = phase.name, phase.n_trials
@@ -851,11 +857,13 @@ def _recovery_remedies(
     if ceiling is None:
         restart = "" if streak is None else f"; {_COUNT_RESTARTS}"
         remedies.append(
-            f"Fix the cause, then raise phases[{name}].n_trials above {target} in the config "
+            f"{lead_in}raise phases[{name}].n_trials above {target} in the config "
             f"and rerun to schedule new attempts{restart}."
         )
     elif ceiling > target:
-        remedies.append(_retry_remedy(phase, trials, ceiling, restarts=streak is not None))
+        remedies.append(
+            f"{lead_in}{_retry_remedy(phase, trials, ceiling, restarts=streak is not None)}"
+        )
     if streak is not None and finished < target:
         left = target - finished
         remedies.append(
