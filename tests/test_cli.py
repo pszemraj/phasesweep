@@ -1527,7 +1527,7 @@ def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
     :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
     """
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: make_experiment())
 
     def fail(*_args: object, **_kwargs: object) -> None:
         raise error
