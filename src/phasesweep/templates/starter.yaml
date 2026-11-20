@@ -20,9 +20,10 @@ execution:
   # write inherit_env: [PYTHONPATH]; inherit_env: all passes the whole shell.
   inherit_env: none
 
-# This trainer ships inside the installed PhaseSweep package. Replace it with
-# your own command after the local smoke test.
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+# This trainer ships inside the installed PhaseSweep package as the
+# phasesweep-fake-train console script. Replace it with your own command after
+# the local smoke test.
+trial_command: "phasesweep-fake-train --config {config_path}"
 
 # This is the trainer's ordinary base configuration. PhaseSweep copies it for
 # every trial, applies inherited/fixed/sampled dotted-path values, and passes

@@ -9,7 +9,7 @@ storage: journal:///./runs/phases.journal
 provenance:
   revision: "phasesweep-fake-trainer-v1"
 workdir: ./runs
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trial_command: "phasesweep-fake-train --config {config_path}"
 trainer_config:
   model:
     n_layers: 8

@@ -46,7 +46,7 @@ def _prep(tmp_path: Path) -> Path:
     for old, new in (
         ("./runs/phases.journal", str(runs_dir / "phases.journal")),
         ("./runs", str(runs_dir)),
-        ("python -m phasesweep.examples.fake_train", f"python {trainer.resolve()}"),
+        ("phasesweep-fake-train", f"python {trainer.resolve()}"),
     ):
         # A replacement that silently matches nothing would run the sweep in the
         # repository's own ./runs while every assertion below still passes.

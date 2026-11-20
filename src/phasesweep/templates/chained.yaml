@@ -21,7 +21,7 @@ execution:
   # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
   inherit_env: none
 
-trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+trial_command: "phasesweep-fake-train --config {config_path}"
 
 trainer_config:
   model:
