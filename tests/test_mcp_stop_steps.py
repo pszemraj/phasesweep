@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.runner import _cleanup_uncertain_payload
+from phasesweep.mcp.failures import response_failure
+from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime import reaper
+from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.time import utc_now_iso
 from tests.mcp_helpers import (
     claim_runner_handle,
@@ -168,6 +171,47 @@ def test_a_run_that_requires_recovery_names_the_operators_step(
         assert failure is not None
         assert failure["actor"] == "operator"
         assert "phasesweep mcp recover-run" in failure["remediation"]
+
+
+def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause(
+    tmp_path: Path,
+) -> None:
+    """A recorded cleanup failure with its own cause, settled by recovery and left without a snapshot, reads as a schema-valid failure whose cause holds no cause."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    handle = stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
+    recorded = {
+        **_cleanup_uncertain_payload([]),
+        "cause": {
+            "code": "storage_unavailable",
+            "stage": "execution",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": "Ask the operator to restore the storage ledger.",
+        },
+    }
+    write_unsafe_cleanup_status(store, RUN_ID, failure=recorded, result_snapshot_state="failed")
+    private_atomic_write_text(
+        store.cleanup_recovery_path(RUN_ID),
+        json.dumps(
+            {
+                "run_id": RUN_ID,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": [],
+                "reaped_attempt_locations": {},
+            }
+        ),
+    )
+
+    failure = response_failure(store, handle, view=store.runner_view(handle))
+    read_failure = app.status(run_id=RUN_ID)["run"]["failure"]
+
+    assert failure is not None
+    FailurePayload.model_validate(failure)
+    assert failure == read_failure
+    assert failure["code"] == "result_snapshot_unavailable"
+    assert failure["cause"]["code"] == "cleanup_uncertain"
+    assert "cause" not in failure["cause"]
 
 
 def test_a_cancel_that_leaves_recovery_names_the_operators_step(tmp_path: Path) -> None:

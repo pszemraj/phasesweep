@@ -73,7 +73,7 @@ from phasesweep.mcp.errors import (
     UnknownRunError,
     live_runner_step,
 )
-from phasesweep.mcp.failures import response_failure, run_failure_payload
+from phasesweep.mcp.failures import operator_failure, response_failure, run_failure_payload
 from phasesweep.mcp.redaction import (
     ResultSource,
     intersect_visible_params,
@@ -1629,16 +1629,12 @@ class PhaseSweepMCP:
                     "ended_at": utc_now_iso(),
                     "result_snapshot_state": "failed",
                     "result_snapshot_error": "LaunchDidNotProduceSnapshot",
-                    "failure": {
-                        "code": "internal_error",
-                        "stage": "preflight",
-                        "retryable": False,
-                        "actor": "operator",
-                        "remediation": (
-                            "Ask the operator to inspect the PhaseSweep server diagnostics "
-                            "before retrying."
-                        ),
-                    },
+                    "failure": operator_failure(
+                        "internal_error",
+                        "preflight",
+                        "Ask the operator to inspect the PhaseSweep server diagnostics "
+                        "before retrying.",
+                    ),
                 },
             )
         except Exception:
