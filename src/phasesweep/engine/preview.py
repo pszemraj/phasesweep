@@ -274,8 +274,8 @@ def _refuse_as_a_launch_would(
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
-    for study in studies.values():
-        _artifact_root_claim_needed(study, experiment)
+    for bound_study in studies.values():
+        _artifact_root_claim_needed(bound_study, experiment)
     errors: list[Exception] = []
     reached = from_phase is None
     for phase in experiment.phases:
