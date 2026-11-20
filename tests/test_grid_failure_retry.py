@@ -19,7 +19,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
-from phasesweep.engine.preview import validate_grid_targets
+from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -76,7 +76,7 @@ def test_fully_failed_grid_recovers_only_the_raised_target(tmp_path: Path, repea
     assert len(calls.read_text().splitlines()) == 2
 
     raised = _grid(tmp_path, trainer, 3, repeats=repeats)
-    validate_grid_targets(raised)
+    validate_trial_targets(raised)
     if repeats:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(raised)

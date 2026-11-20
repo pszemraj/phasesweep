@@ -31,7 +31,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
-from phasesweep.engine.preview import _placeholder_winner, validate_grid_targets
+from phasesweep.engine.preview import _placeholder_winner, validate_trial_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -803,7 +803,7 @@ def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path
     )
 
     for check in (
-        validate_grid_targets,
+        validate_trial_targets,
         lambda experiment: run_experiment(experiment, dry_run=True),
     ):
         check(_two_cell_grid(tmp_path, 4))
@@ -827,8 +827,8 @@ def test_validate_counts_pending_evidence_as_unfinished_without_refusing(tmp_pat
         )
     )
 
-    validate_grid_targets(_two_cell_grid(tmp_path, 3))
+    validate_trial_targets(_two_cell_grid(tmp_path, 3))
     with pytest.raises(TrialTargetRefusedError, match="allow at most 3"):
-        validate_grid_targets(_two_cell_grid(tmp_path, 4))
+        validate_trial_targets(_two_cell_grid(tmp_path, 4))
     with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
         run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)

@@ -104,7 +104,7 @@ phases: list[object] (required)
 
     # Map from a dotted trainer key, under the fixed_overrides key rules, to the parameter sampled for it. The sampled value reaches the trainer like a fixed one.
     # Empty without repeats: a fixed configuration, which draws nothing and runs fixed_overrides as they are. n_trials above 1 then only retries failed attempts.
-    # validate and run --dry-run warn about such an n_trials above 1, because only a launch can count the failed attempts it would retry.
+    # validate and run --dry-run warn about such an n_trials above 1, and refuse, as a launch does, one above the recorded failed attempts plus one.
     # Empty with repeats: a seed audit, one configuration run once per repeat value.
     # A key whose last component is seed, data_seed or random_state, matched case-sensitively, fails config load, because a searched seed lets noise win.
     search_space: map[string, categorical | float | int] = {}

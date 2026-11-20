@@ -15,7 +15,11 @@ import optuna
 
 import phasesweep.engine.resume as resume_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.search import _placeholder_values_for, grid_cardinality, sampler_search_space
+from phasesweep.config.search import (
+    _placeholder_values_for,
+    retry_target_ceiling,
+    sampler_search_space,
+)
 from phasesweep.engine.artifact_roots import _check_published_phase_studies
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
@@ -199,21 +203,25 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
     return {phase.name: _recorded_phase(phase, studies[phase.name]) for phase in experiment.phases}
 
 
-def validate_grid_targets(experiment: Experiment) -> None:
-    """Check oversized persistent grid targets against their recorded failed cells.
+def validate_trial_targets(experiment: Experiment) -> None:
+    """Refuse a fixed-configuration or grid target that ``run`` refuses over the recorded attempts.
 
+    Only a target above what a fresh study allows (one attempt for a fixed configuration,
+    the matrix size for a grid) needs the ledger, since only recorded failures can justify it.
     The attempts are counted as a launch counts them after its recovery: a RUNNING attempt
     that recovery settles as failed counts as finished. One whose completed trainer evidence
     awaits recovery counts as unfinished, since validation recovers nothing.
 
-    :param Experiment experiment: Config whose grid targets may retry recorded failures.
-    :raises TrialTargetRefusedError: A grid requests more attempts than available cells allow.
+    :param Experiment experiment: Config whose targets may retry recorded failures.
+    :raises TrialTargetRefusedError: A fixed configuration or grid requests more attempts
+        than its recorded attempts let it retry.
     :raises StudyStorageUnavailableError: The ledger cannot be read to justify a raised target.
     """
     phases = [
         phase
         for phase in experiment.phases
-        if phase.sampler.type == "grid" and phase.n_trials > grid_cardinality(phase)
+        if (fresh := retry_target_ceiling(phase, finished=0, measured=0)) is not None
+        and phase.n_trials > fresh
     ]
     if not phases:
         return

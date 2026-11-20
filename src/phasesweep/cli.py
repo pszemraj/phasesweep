@@ -45,7 +45,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _trial_dir_for,
 )
-from phasesweep.engine.preview import validate_grid_targets
+from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.provenance import (
     CodeRevision,
     _load_generation_code_revision,
@@ -574,12 +574,13 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     :raises PhaseSweepError: ``execution.cwd`` is not a directory on this host. The trial
         program is not checked here: a launch judges it on the PATH it starts with, which
         need not be this shell's.
-    :raises TrialTargetRefusedError: A grid target exceeds its recorded retry ceiling.
-    :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised grid target.
+    :raises TrialTargetRefusedError: A fixed-configuration or grid target exceeds its
+        recorded retry ceiling.
+    :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised target.
     """
     config = _command_config(config_path, settings=settings)
     _require_trainer_cwd(config)
-    validate_grid_targets(config)
+    validate_trial_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")

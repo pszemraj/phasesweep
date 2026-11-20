@@ -16,13 +16,14 @@ import optuna
 import pytest
 from click.testing import CliRunner
 
-from phasesweep import run_experiment
+from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler, fixed_configuration_target_refusal
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.selection import (
     NoFeasibleTrialError,
     PhaseAbortRefusedError,
@@ -360,24 +361,34 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
     assert _call_count(calls) == 2
 
 
-def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration(
+def test_dry_run_and_validate_read_the_recorded_attempts_of_a_persistent_fixed_configuration(
     tmp_path: Path,
 ) -> None:
-    """The preview agrees with a launch: a raised target passes after a failure, not after a result."""
+    """Both agree with a launch: a raised target passes after a failure, not after a result."""
     trainer, calls = write_flaky_trainer(tmp_path, failures=1)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_fixed(tmp_path, trainer, 1))
 
-    run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as refused:
-        run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
-    assert refused.value.remediation == "Use n_trials at most 2, not 3."
+    for check in (
+        validate_trial_targets,
+        lambda experiment: run_experiment(experiment, dry_run=True),
+    ):
+        check(_fixed(tmp_path, trainer, 2))
+        with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as refused:
+            check(_fixed(tmp_path, trainer, 3))
+        assert refused.value.remediation == "Use n_trials at most 2, not 3."
     assert _call_count(calls) == 1
 
     run_experiment(_fixed(tmp_path, trainer, 2))
-    run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"):
-        run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
+    for check in (
+        validate_trial_targets,
+        lambda experiment: run_experiment(experiment, dry_run=True),
+    ):
+        check(_fixed(tmp_path, trainer, 2))
+        with pytest.raises(
+            TrialTargetRefusedError, match="already has a COMPLETE or INFEASIBLE trial"
+        ):
+            check(_fixed(tmp_path, trainer, 3))
     assert _call_count(calls) == 2
 
 
@@ -392,20 +403,23 @@ def _fixed_config(tmp_path: Path, n_trials: int) -> Path:
     )
 
 
-def test_validate_warns_and_cli_dry_run_refuses_a_persistent_fixed_target(
+def test_validate_and_cli_dry_run_refuse_a_persistent_fixed_target_alike(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Load accepts it with one warning line, and the CLI dry run then refuses a fresh tree."""
+    """Load accepts it, since recorded failures could justify it, but a fresh tree cannot.
+
+    So validate refuses it as the dry run and the launch do, with the same text.
+    """
     config = _fixed_config(tmp_path, 3)
 
-    validated = CliRunner().invoke(cli_main, ["validate", str(config)])
-    assert validated.exit_code == 0, validated.output
-    warnings = [line.strip() for line in validated.output.splitlines() if "warning:" in line]
-    assert warnings == [f"warning: {_WARNING}"]
+    for command in (["validate", str(config)], ["run", str(config), "--dry-run"]):
+        assert invoke_cli_boundary(command, monkeypatch) != 0
+        error = capsys.readouterr().err
+        assert error.splitlines() == [f"phasesweep: {_FRESH_THREE}", f"fix: {_FRESH_THREE_REMEDY}"]
 
-    assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) != 0
-    error = capsys.readouterr().err
-    assert error.splitlines() == [f"phasesweep: {_FRESH_THREE}", f"fix: {_FRESH_THREE_REMEDY}"]
+    two = _fixed_config(tmp_path, 2)
+    with pytest.raises(TrialTargetRefusedError, match="would run 2 identical trials"):
+        validate_trial_targets(load_experiment(two))
 
     one = _fixed_config(tmp_path, 1)
     clean = CliRunner().invoke(cli_main, ["validate", str(one)])
