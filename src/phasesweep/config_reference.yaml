@@ -1,7 +1,7 @@
 # config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml or a template: phasesweep init --list names them and phasesweep init --template NAME writes one.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
-# explain and MCP explain_config pin links to the installed release tag or source revision at read time; this file links to development docs.
+# explain and MCP explain_config pin links to the installed release tag at read time, or to main for an editable or development install; this file links to development docs.
 # The MCP server rereads an edited config before its next tool call, and a failed reread refuses launches until fixed: https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md#the-catalog.
 # Precedence, lowest to highest: built-in defaults, the YAML, then CLI --set KEY=VALUE (https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#run-time-overrides). No environment variable sets a key.
 # The file is one UTF-8 YAML mapping. An unknown or duplicate key, or a value that breaks a constraint stated here, fails config load with an error naming it.
@@ -65,7 +65,7 @@ metric: object (required)
 # With sampler.type grid, n_trials is at least the grid size, the search_space combinations times the repeat values, unless allow_partial_grid is true.
 # On storage null a grid's n_trials is at most the grid size, and a fixed configuration (empty search_space, no repeats) needs n_trials 1.
 # With repeats under seeded random, n_trials is a multiple of the number of repeat values, and exactly that number when search_space is empty.
-# On persistent storage, launch and dry run refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
+# On persistent storage, validate, the dry run and launch refuse an n_trials above the grid size plus the study's failed attempts. A fixed configuration is a one-cell grid.
 # Run-control keys, outside the fingerprint: n_trials, comment, cost_key, n_jobs, gpu_ids, gpu_devices, max_consecutive_failures, timeout_seconds_per_phase, allow_*.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition
 
@@ -489,7 +489,7 @@ env: map[string, string] = {}
 # Trainer working directory and environment-selection contract. Nested defaults apply when the block is omitted.
 execution: object = {}
   # Working directory of every trainer process. Write . for the config file's directory; "" fails config load.
-  # It is not checked at config load. A missing directory fails each attempt before the trainer starts, and the failures count toward max_consecutive_failures.
+  # validate, run --dry-run and every launch refuse a directory that does not exist, before any trial starts. One that disappears during a run fails each later attempt, and those failures count toward max_consecutive_failures.
   # Unset: the directory phasesweep was started from, or the catalog entry's cwd under MCP. A study with trials then refuses a run from another directory.
   # Recommended: set it, or use absolute interpreter and script paths in trial_command, so the command resolves the same way from every invocation.
   cwd: string | null = null
@@ -574,7 +574,7 @@ LogRegexExtractor:
 
   # Python regular expression whose named group (?P<value>...) captures the number, such as loss=(?P<value>[0-9.eE+-]+). Without that group, config load fails.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
-  # Each match in a line is one observation. float() parsing skips bad captures but accepts nan, inf and 1_0, so a loose capture can select nan or inf and fail the trial: anchor the pattern to digits.
+  # Each match in a line is one observation. float() parsing skips bad captures but accepts nan, inf and 1_0, so a loose capture can select nan or inf and fail the trial: anchor the pattern to digits. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.
