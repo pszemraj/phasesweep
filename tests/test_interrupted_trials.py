@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,13 +25,14 @@ from optuna.distributions import IntDistribution
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.runtime.reaper as reaper
 from phasesweep import run_experiment
+from phasesweep.config.models import Experiment
 from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _PreflightCleanupReport,
     _record_stale_trial_outcome,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import StudyStorageUnavailableError, TrackingTargetUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.optuna import (
@@ -46,13 +48,17 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.preview import _preview_ledger
 from phasesweep.engine.read import read_trial_tables
+from phasesweep.engine.run import TerminalReport
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -84,6 +90,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.recovery_helpers import fabricate_stale_trial, write_trial_identity
+from tests.tracking_helpers import SwitchableWandb, switchable_wandb, wandb_objective_experiment
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
 _UNCOMMITTED_CAUSE = "orchestrator stopped before Optuna committed the terminal trial state"
@@ -1252,6 +1259,119 @@ else:
                         directory, expected_attempt_id=attempt
                     )
                 reaper.cleanup_stale_trial_process(orphan_identity, grace_seconds=0.2)
+
+
+def _assert_evidence_pending(experiment: Experiment, trial: optuna.trial.FrozenTrial) -> None:
+    """Assert that ``trial`` keeps its finished training, unrecorded, for a later extraction.
+
+    :param Experiment experiment: Experiment owning the attempt registry.
+    :param optuna.trial.FrozenTrial trial: Trial whose tracker gave no answer.
+    """
+    assert trial.state.name == "RUNNING"
+    assert trial.user_attrs[RETURN_CODE_ATTR] == 0
+    assert trial.user_attrs[DURATION_ATTR] > 0
+    assert FAILURE_REASON_ATTR not in trial.user_attrs
+    assert TRIAL_OUTCOME_ATTR not in trial.user_attrs
+    assert (_attempts_dir(experiment) / f"{trial.user_attrs[ATTEMPT_ID_ATTR]}.json").is_file()
+    assert _recovered_trial_state(trial, _outcome_sequence_counts([trial])) == "EVIDENCE_PENDING"
+
+
+def _assert_restored_tracker_keeps_training(
+    experiment: Experiment,
+    tracker: SwitchableWandb,
+    launches: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Run again with the tracker answering: every pending result is kept and nothing retrains.
+
+    :param Experiment experiment: Experiment whose trials are all pending.
+    :param SwitchableWandb tracker: The fake W&B server, switched back up here.
+    :param Path launches: Trainer launch log, one line per launch.
+    :param pytest.LogCaptureFixture caplog: Log capture holding the recovery lines.
+    """
+    pending = phase_trials(experiment)
+    tracker.switch("up")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    recovered = phase_trials(experiment)
+    assert [trial.state.name for trial in recovered] == ["COMPLETE"] * len(pending)
+    for trial in pending:
+        assert f"Kept completed trial result: phase='p' trial={trial.number} value=1" in caplog.text
+    assert launches.read_text().splitlines() == ["launch"] * len(pending)
+
+
+_RUN_CONFIG = """
+import sys
+from phasesweep import run_experiment
+from phasesweep.config.io import load_experiment
+run_experiment(load_experiment(sys.argv[1]), generation_id="orphan-generation")
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("recovery", ["run", "mcp-recover-run"])
+def test_recovery_defers_a_killed_runs_finished_trial_while_its_tracker_is_unreadable(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    wandb_worker_sdk: Callable[[str], None],
+    recovery: str,
+) -> None:
+    """Recovery leaves the trial pending after one lookup of the unreadable tracker; the next answer is kept."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    tracker.switch("hang")
+    reader = None
+    with (tmp_path / "runner.log").open("w") as output:
+        runner = subprocess.Popen(
+            [sys.executable, "-c", _RUN_CONFIG, str(config)], stdout=output, stderr=output
+        )
+    try:
+        deadline = time.monotonic() + 30
+        while not tracker.hung.exists() and time.monotonic() < deadline:
+            assert runner.poll() is None, (tmp_path / "runner.log").read_text()
+            time.sleep(0.02)
+        assert tracker.hung.exists()
+        (trial,) = phase_trials(experiment)
+        directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+        reader = reaper.read_stale_process_identity(
+            directory, expected_attempt_id=trial.user_attrs[ATTEMPT_ID_ATTR]
+        )
+        runner.kill()
+        runner.wait(timeout=5)
+        tracker.switch("denied")
+        if recovery == "run":
+            reports: list[TerminalReport] = []
+            with pytest.raises(
+                TrackingTargetUnavailableError, match="1 completed trial"
+            ) as refused:
+                run_experiment(experiment, terminal_callback=reports.append)
+            assert refused.value.remediation is not None
+            assert "nothing is retrained" in refused.value.remediation
+            (report,) = reports
+            assert report.cleanup_confirmed
+            assert report.failure_stage == "preflight"
+        else:
+            from tests.mcp_helpers import make_mcp_app, stage_dead_run, write_srv_catalog
+            from tests.recovery_helpers import recover_run_cli
+
+            _app, registry, store = make_mcp_app(write_srv_catalog(tmp_path, config))
+            stage_dead_run(store, "orphan-generation", config, "srv", cleanup_uncertain=False)
+            recovered_run = recover_run_cli(registry.state_dir, "orphan-generation", confirm=True)
+            assert recovered_run.exit_code == 0, recovered_run.output
+            assert "kept 0 completed trial result(s)" in recovered_run.output
+            assert "Left 1 completed trial(s) pending" in recovered_run.output
+        assert not reaper._process_group_alive(reader.pgid)
+        (trial,) = phase_trials(experiment)
+        _assert_evidence_pending(experiment, trial)
+        assert tracker.lookups("denied") == 1
+        _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+        runner.wait(timeout=5)
+        if reader is not None:
+            reaper.cleanup_stale_trial_process(reader, grace_seconds=0.2)
 
 
 @pytest.mark.parametrize(

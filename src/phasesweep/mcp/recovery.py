@@ -104,6 +104,8 @@ class _CleanupEvidence:
     cleanup_recovered: int = 0
     terminated: int = 0
     retained_results: int = 0
+    # Completed attempts left RUNNING because their tracker gave no answer, with the failure.
+    pending_evidence: dict[str, str] = field(default_factory=dict)
     inspection_messages: dict[_AttemptRecord, str] = field(default_factory=dict)
 
 
@@ -251,6 +253,16 @@ def recover_run(
                     f"settled {evidence.reaped} stale trial(s), kept "
                     f"{evidence.retained_results} completed trial result(s), and confirmed "
                     f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)."
+                )
+            if evidence.pending_evidence:
+                # Cleanup is proven, so recovery succeeds; the next run refuses until
+                # the tracker answers, and nothing here may discard the training.
+                first = next(iter(evidence.pending_evidence.values())).rstrip(".")
+                emit(
+                    f"Left {len(evidence.pending_evidence)} completed trial(s) pending: the "
+                    f"tracker gave no answer about their evidence ({first}). Restore access "
+                    "to the tracker, then start the run again; their training is kept and "
+                    "nothing is retrained."
                 )
     except RunRecoveryError:
         raise
@@ -741,6 +753,7 @@ def _recover_trial_evidence(
             )
         evidence.terminated = sum(active_report.process_actions.values())
         evidence.retained_results = active_report.retained_results
+        evidence.pending_evidence = active_report.unreadable_evidence
         evidence.inspection_messages = active_report.inspection_messages or {}
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:

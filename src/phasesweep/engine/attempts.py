@@ -19,6 +19,8 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
+    tracker_unreadable,
 )
 from phasesweep.engine.ledger import open_registry_study
 from phasesweep.engine.paths import _attempts_dir
@@ -83,6 +85,10 @@ class _PreflightCleanupReport:
     uncertain_attempt_ids: set[str] = field(default_factory=set)
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
+    unreadable_evidence: dict[str, str] = field(default_factory=dict)
+    """Completed attempts left RUNNING because their tracker gave no answer, with the
+    first failure. Any entry stops later extractions in the pass, so an outage costs one
+    read; a run that just met it seeds one under its generation id."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -107,6 +113,20 @@ class _PreflightCleanupReport:
                 if record.generation_id is not None
             }
         )
+
+
+def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnavailableError:
+    """Refuse new work while completed training waits for its tracker to answer.
+
+    :param Mapping[str, str] pending: Pending attempts mapped to their tracker failure.
+    :return TrackingTargetUnavailableError: Refusal naming the count and the first failure.
+    """
+    first = next(iter(pending.values())).rstrip(".")
+    return tracker_unreadable(
+        f"{len(pending)} completed trial(s) finished training, but the tracker gave no answer "
+        f"about their evidence. First failure: {first}. Their training is kept and no new "
+        "trial was started."
+    )
 
 
 def _trial_dir_from_attr(
@@ -672,7 +692,7 @@ def _registry_attempt_fail_stale_trial(
         (which owns no trial, so its resolved process is the recovery
         evidence), ``"terminal"`` when nothing needed to change (trial
         already terminal, study gone, or in-memory storage), or
-        ``"unreachable"`` when the recorded storage could not be read, or ``"pending"`` when shutdown leaves completed training awaiting extraction; both retain the entry for retry.
+        ``"unreachable"`` when the recorded storage could not be read, or ``"pending"`` when shutdown or an unreadable tracker leaves completed training awaiting extraction; both retain the entry for retry.
     :raises StudySchemaMismatchError: The registry and trial record
         conflicting generation identities, or the ledger the entry names
         holds unsupported PhaseSweep study state.
@@ -1046,10 +1066,14 @@ def _recover_completed_trial(
     :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
     :param _AttemptRecord record: Attempt identity and original trial directory.
     :param Path artifact_root: Owning artifact root containing generation snapshots.
-    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
-    :return bool | None: True for recovered COMPLETE, False for unaccepted evidence, or None when shutdown leaves extraction pending.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed
+        results and for evidence the tracker gave no answer about.
+    :return bool | None: True for recovered COMPLETE, False for unaccepted evidence, or None
+        when shutdown or an unreadable tracker leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
     :raises StudyStorageUnavailableError: Valid completed evidence could not be committed.
+    :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
+        collects the pending attempt for a refusal after the pass.
     """
     from phasesweep.engine.trial import (
         ExecutedTrial,
@@ -1076,6 +1100,14 @@ def _recover_completed_trial(
     ):
         return False
     if servicing_shutdown_signal() is not None:
+        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        return None
+    if report is not None and report.unreadable_evidence:
+        # This pass already found a tracker unreadable; keep the training without
+        # spending another read's timeout on it.
+        report.unreadable_evidence.setdefault(
+            record.attempt_id, next(iter(report.unreadable_evidence.values()))
+        )
         _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
         return None
     experiment = _load_generation_experiment(artifact_root, record.generation_id)
@@ -1127,6 +1159,19 @@ def _recover_completed_trial(
         _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
         raise
     if servicing_shutdown_signal() is not None:
+        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        return None
+    if result.evidence_unreadable and result.failure_reason is not None:
+        # No answer says nothing about the training. A pass with a report refuses new
+        # work once it is done, since a raise here would strand the registry loop.
+        if report is None:
+            raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
+        report.unreadable_evidence[record.attempt_id] = result.failure_reason
+        log.warning(
+            "Completed orphan attempt %s stays pending; its tracker gave no answer: %s",
+            record.attempt_id,
+            result.failure_reason,
+        )
         _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
         return None
     if result.failure_reason is not None:
@@ -1181,8 +1226,10 @@ def _fail_stale_running_trial(
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
-    :return bool: Whether the trial became terminal; False retains completed training during shutdown.
+    :return bool: Whether the trial became terminal; False retains completed training during
+        shutdown or while its tracker gives no answer.
     :raises WinnerIntegrityError: Completed trainer evidence requires an unavailable or invalid producing snapshot.
+    :raises TrackingTargetUnavailableError: The tracker gave no answer and no report collects it.
     :raises StudyStorageUnavailableError: The outcome, the recovery ledger, or
         the terminal state could not be recorded; the trial is left RUNNING
         rather than committed without its outcome.

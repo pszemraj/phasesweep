@@ -281,6 +281,8 @@ def _run_experiment_outcome(
         writes to a fresh artifact tree.
     :return Mapping[str, Winner]: This invocation's winners, captured under the lock.
     :raises TrialEvidenceMissingError: Candidate evidence failed preflight or winner validation.
+    :raises TrackingTargetUnavailableError: Recovery left completed training pending because
+        its tracker gave no answer, so no new work starts.
     :raises ProcessCleanupUncertainError: Post-failure cleanup was not confirmed;
         the original failure is chained.
     :raises PhaseSweepShutdown: Shutdown during MLflow mirroring; the exception
@@ -348,6 +350,9 @@ def _run_experiment_outcome(
                 cleanup_report=cleanup,
                 from_phase=from_phase,
             )
+            if cleanup.unreadable_evidence:
+                # New trials would bury finished training the tracker has yet to report.
+                raise attempt_ops._pending_evidence_refusal(cleanup.unreadable_evidence)
             # Validate candidate evidence after recovery and before launching new work.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
             resume_ops._reject_bound_descendant_topups(

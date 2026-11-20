@@ -232,3 +232,120 @@ def remote_mlflow_example(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     return config, uploads
+
+
+@dataclasses.dataclass(frozen=True)
+class SwitchableWandb:
+    """A fake W&B server the real supervised reader polls, switched by a mode file.
+
+    ``up`` answers a finished run whose summary holds ``x=1.0``, ``denied`` rejects the
+    credentials with HTTP 401, and ``hang`` touches ``hung`` and blocks. Every run lookup
+    appends the mode it saw to ``polls``.
+    """
+
+    mode: Path
+    polls: Path
+    hung: Path
+
+    def switch(self, mode: str) -> None:
+        """Answer every later run lookup in ``mode``.
+
+        :param str mode: ``up``, ``denied`` or ``hang``.
+        """
+        self.mode.write_text(mode)
+
+    def lookups(self, mode: str) -> int:
+        """Count the run lookups answered in ``mode`` so far.
+
+        :param str mode: Mode to count.
+        :return int: Lookups that saw ``mode``.
+        """
+        if not self.polls.exists():
+            return 0
+        return self.polls.read_text().splitlines().count(mode)
+
+
+def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
+    """Install a fake ``wandb.apis.public`` for the real reader worker, starting ``up``.
+
+    :param install_sdk: The ``wandb_worker_sdk`` fixture's installer.
+    :param Path tmp_path: Directory holding the mode, lookup and hang files.
+    :return SwitchableWandb: The switch and its lookup log.
+    """
+    tracker = SwitchableWandb(
+        tmp_path / "wandb-mode", tmp_path / "wandb-lookups", tmp_path / "wandb-hung"
+    )
+    tracker.switch("up")
+    install_sdk(f"""
+        import time
+        from pathlib import Path
+
+        class _Denied(Exception):
+            response = type("Response", (), {{"status_code": 401}})()
+
+        class Api:
+            def __init__(self, **kwargs):
+                pass
+
+            def run(self, path):
+                mode = Path({str(tracker.mode)!r}).read_text()
+                with Path({str(tracker.polls)!r}).open("a") as polls:
+                    polls.write(mode + "\\n")
+                if mode == "hang":
+                    Path({str(tracker.hung)!r}).touch()
+                    time.sleep(60)
+                if mode == "denied":
+                    raise _Denied("credentials rejected")
+                return type("Run", (), {{"state": "finished", "summary_metrics": {{"x": 1.0}}}})()
+    """)
+    return tracker
+
+
+def wandb_objective_experiment(
+    tmp_path: Path, *, n_trials: int, n_jobs: int = 1
+) -> tuple[Experiment, Path]:
+    """Build a persistent sweep whose objective W&B reports once its trainer exits cleanly.
+
+    Each trainer launch appends a line to the returned log and waits until ``n_jobs``
+    trainers have launched, so parallel trials finish training together.
+
+    :param Path tmp_path: Directory holding the ledger, workdir, trainer and launch log.
+    :param int n_trials: The phase's trial target.
+    :param int n_jobs: The phase's parallel workers.
+    :return tuple[Experiment, Path]: The experiment and its trainer launch log.
+    """
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
+    from tests.conftest import make_experiment, write_trainer
+
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import time
+        from pathlib import Path
+        launches = Path({str(launches)!r})
+        with launches.open("a") as log:
+            log.write("launch\\n")
+        deadline = time.monotonic() + 15
+        while len(launches.read_text().splitlines()) < {n_jobs} and time.monotonic() < deadline:
+            time.sleep(0.02)
+        """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="x",
+        poll_seconds=0.01,
+        timeout_seconds=30,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        metric=Metric(extractor=remote),
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+    )
+    return experiment, launches

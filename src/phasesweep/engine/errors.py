@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):
@@ -163,9 +163,30 @@ class TrialTargetRefusedError(PhaseSweepError):
 
 
 class TrackingTargetUnavailableError(PhaseSweepError):
-    """Raised before a phase allocates trials when its MLflow target cannot be reached."""
+    """Raised when a tracker gives no answer that new work or completed training needs.
+
+    Before a phase allocates trials, its MLflow target must resolve. A trial that
+    finished training while its tracker could not be read stays RUNNING, its
+    training kept, and the run stops until the tracker answers.
+    """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+_TRACKER_UNREADABLE_STEP = (
+    "Restore access to the tracker, then run the same config again: the completed training "
+    "is kept and nothing is retrained. If the tracker is gone for good, a fresh study gives "
+    f"up that training. {NEW_STUDY_STEP}"
+)
+
+
+def tracker_unreadable(message: str) -> TrackingTargetUnavailableError:
+    """Attach the tracker-restoring step to a stop that keeps finished training pending.
+
+    :param str message: Diagnostic naming the pending trials and the tracker's failure.
+    :return TrackingTargetUnavailableError: Refusal shared by the live run and recovery.
+    """
+    return TrackingTargetUnavailableError(message, remediation=_TRACKER_UNREADABLE_STEP)
 
 
 class TrackingSyncRefusedError(PhaseSweepError):
