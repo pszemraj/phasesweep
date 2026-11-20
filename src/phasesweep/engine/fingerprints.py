@@ -207,6 +207,11 @@ _ABSENT = object()
 _MAX_REPORTED_CHANGES = 10
 _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
+#: The refusal shows each recorded value, so restoring it is the first way out.
+_RESTORE_OR_NEW_STUDY_STEP = (
+    "Restore the recorded value(s) to continue this study, or "
+    f"{NEW_STUDY_STEP[:1].lower()}{NEW_STUDY_STEP[1:]}"
+)
 _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
@@ -365,11 +370,13 @@ def _verify_fingerprint(
         cwd_unset = experiment.execution.cwd is None and any(
             path == "execution.cwd" for path, _old, _new in changes
         )
+        # The message shows the recorded values only when the study kept the payload they came from.
+        way_forward = _RESTORE_OR_NEW_STUDY_STEP if changes else NEW_STUDY_STEP
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}",
             # Running from the original directory keeps the study; a new name does not.
             action=OperatorAction.FIX_CONFIG if cwd_unset else None,
-            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else NEW_STUDY_STEP,
+            remediation=_CWD_FOLLOWS_INVOCATION if cwd_unset else way_forward,
         )
     return fp

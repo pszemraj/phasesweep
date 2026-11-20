@@ -162,16 +162,21 @@ def test_refusal_lists_ten_changed_keys_then_counts_the_rest() -> None:
     assert "env.K10" not in message
 
 
-def test_refusal_gives_the_step_that_runs_the_changed_config() -> None:
-    """A changed input leaves one way forward, so the message names it beside the routing."""
+def test_refusal_leads_with_restoring_the_recorded_value_it_shows() -> None:
+    """The message shows the old value, so restoring it comes before starting a fresh study."""
     study = _stamped_study(make_experiment(provenance={"revision": "toy-v1"}))
 
     error = _refusal(study, make_experiment(provenance={"revision": "toy-v2"}))
 
     assert 'Changed: provenance.revision: "toy-v1" -> "toy-v2".' in str(error)
     assert str(error) == str(error).rstrip()
-    assert error.remediation == NEW_STUDY_STEP
-    assert _operational_error_text(error).endswith(NEW_STUDY_STEP)
+    assert error.remediation == (
+        "Restore the recorded value(s) to continue this study, or set a new `experiment` name "
+        "in the config to start a fresh study (with `storage: auto`, a new `workdir` also "
+        "works); the old study stays readable with its original config."
+    )
+    assert NEW_STUDY_STEP[1:] in error.remediation
+    assert _operational_error_text(error).endswith(error.remediation)
     assert error.action is OperatorAction.FRESH_NAMESPACE
 
 
