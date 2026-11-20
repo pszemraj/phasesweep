@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_OUTCOME_ATTR,
+    _trial_interrupted,
     constraint_attr,
 )
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
@@ -892,6 +893,87 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     assert [r["finish"] for r in uploads if r["binding"]["run_id"] == "late-run"] == (
         [] if reply == "ok" else ["FAILED"]
     )
+
+
+@pytest.mark.parametrize(
+    "answer,upload",
+    [("accepted", "up"), ("objective-missing", "up"), ("accepted", "offline")],
+    ids=["accepted", "objective-missing", "upload-offline"],
+)
+def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
+    tmp_path, monkeypatch, caplog, answer, upload
+):
+    """A pending trial's managed run receives the outcome recovery commits.
+
+    Accepted evidence sends its accepted projection. Evidence the tracker refuses leaves the
+    unproven success recorded as an interruption, which ends the run KILLED and reruns. An
+    upload that fails leaves its record pending for sync-tracking and the run goes on.
+    """
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+    from phasesweep.tracking.mlflow import OperationUnavailableError
+
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    experiment = Experiment.model_validate(config)
+    respond = session.request_operation
+    reachable = {"capture": False}
+    refused_upload: dict[str, str] = {}
+
+    def capture_after_outage(request, **kwargs):
+        if request["action"] == "capture":
+            if not reachable["capture"]:
+                raise OperationUnavailableError("tracking server unreachable")
+            if answer == "objective-missing":
+                run = mlflow_run(request["binding"], metrics={"cost": 1.0})
+                return worker._capture(SimpleNamespace(get_run=lambda _: run), request)
+        if request["action"] == "publish" and request["name"] == refused_upload.get("name"):
+            raise OSError("upload refused")
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", capture_after_outage)
+    monkeypatch.setattr(worker, "request_operation", capture_after_outage)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    (pending,) = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert pending.state == TrialState.RUNNING
+    attempt = pending.user_attrs[ATTEMPT_ID_ATTR]
+    generation = pending.user_attrs[GENERATION_ID_ATTR]
+
+    reachable["capture"] = True
+    if upload == "offline":
+        refused_upload["name"] = f"attempt-{attempt}"
+    uploads.clear()
+    if answer == "accepted":
+        run_experiment(experiment)
+    else:
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(experiment)
+    recovered = read_phase_trials(validate_ledger(experiment), "depth").trials[0]
+    assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
+    record_path = tracking_root(experiment) / generation / "delivery" / f"attempt-{attempt}.json"
+    if upload == "offline":
+        assert read_record(record_path)["state"] == "pending"
+        assert "Retry with sync-tracking" in caplog.text
+        refused_upload.clear()
+        uploads.clear()
+        publication.sync_tracking(experiment)
+    [delivered] = [r for r in uploads if r["name"] == f"attempt-{attempt}"]
+    record = read_record(record_path)
+    assert record["state"] == "delivered"
+    assert delivered["projection"] == record["projection"]
+    if answer == "accepted":
+        assert delivered["finish"] is None
+        assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
+    else:
+        assert _trial_interrupted(recovered)
+        assert delivered["finish"] == "KILLED"
+        assert delivered["projection"]["tags"] == {"phasesweep.outcome": "KILLED"}
+    # Nothing is left for sync-tracking to send again for that attempt.
+    uploads.clear()
+    publication.sync_tracking(experiment)
+    assert [r for r in uploads if r["name"] == f"attempt-{attempt}"] == []
 
 
 def _tree_listing(root):
