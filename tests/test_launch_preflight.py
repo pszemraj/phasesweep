@@ -27,7 +27,11 @@ from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import LaunchEnvironmentError, StudyFingerprintMismatchError
 from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.paths import _artifact_root_binding_path
-from phasesweep.engine.study_policy import _launch_preflight, _trial_program_refusal
+from phasesweep.engine.study_policy import (
+    _launch_preflight,
+    _require_trainer_cwd,
+    _trial_program_refusal,
+)
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from tests.conftest import (
@@ -341,3 +345,45 @@ def test_launch_judges_the_program_on_the_trainer_path_not_the_shell_path(
     assert _launch_preflight(pinned, "p", None).values["PATH"] == str(tmp_path / "bin")
     with pytest.raises(PhaseSweepError, match="program 'trainer' is not on"):
         _launch_preflight(make_experiment(trial_command="trainer {overrides}"), "p", None)
+
+
+@pytest.mark.parametrize("program", ["/opt/nonexistent/venv/bin/python", "./train.sh"])
+def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
+    tmp_path: Path, program: str
+) -> None:
+    """No PATH changes the answer for a program with a ``/``, so ``validate`` refuses it as a launch does."""
+    config = tmp_path / "experiment.yaml"
+    write_experiment_config(
+        config,
+        make_experiment(
+            workdir=tmp_path / "runs",
+            trial_command=f"{program} train.py {{overrides}}",
+            execution=ExecutionContext(cwd=str(tmp_path)),
+        ),
+    )
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, PhaseSweepError)
+    assert f"program {program!r} resolves to" in str(result.exception)
+    assert "which is not an executable file" in str(result.exception)
+
+    _executable(tmp_path / "train.sh")
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    assert (result.exit_code == 0) == (program == "./train.sh"), result.output
+
+
+def test_require_trainer_cwd_leaves_a_program_found_through_path_to_the_launch(
+    tmp_path: Path,
+) -> None:
+    """The shared directory-and-slash check never judges a PATH program; the launch preflight does."""
+    experiment = make_experiment(
+        trial_command=f"{_MISSING} {{overrides}}",
+        execution=ExecutionContext(cwd=str(tmp_path)),
+        env={"PATH": "/nowhere"},
+    )
+
+    _require_trainer_cwd(experiment)
+    with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on"):
+        _launch_preflight(experiment, "p", None)

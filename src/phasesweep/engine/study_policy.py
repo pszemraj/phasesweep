@@ -1251,20 +1251,46 @@ _SHELL_OWN_WORDS = frozenset(
 _PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
 
 
-def _require_trainer_cwd(experiment: Experiment) -> None:
-    """Refuse a configured trainer directory that does not exist.
+def _require_launch_target(experiment: Experiment, *, path: str | None) -> None:
+    """Refuse a trainer directory that does not exist or a trial program the shell cannot run.
 
-    The answer is the same from any shell, so ``validate`` runs this check as well as every
-    launch, which runs it in :func:`_launch_preflight`.
-
-    :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
-    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host.
+    :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
+    :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
+        written with a ``/``, which no ``PATH`` changes.
+    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host, or the
+        trial command's program cannot be found.
     """
     missing = _missing_trainer_cwd(experiment)
     if missing is not None:
         raise LaunchEnvironmentError(
             missing, remediation="Create that directory, or set execution.cwd to an existing one."
         )
+    refusal = _trial_program_refusal(
+        experiment.trial_command,
+        path=path,
+        cwd=experiment.execution.resolved_cwd() or Path.cwd(),
+    )
+    if refusal is not None:
+        message, remediation = refusal
+        raise LaunchEnvironmentError(
+            f"{message} Every trial would fail before its trainer started, so none was allocated.",
+            remediation=remediation,
+        )
+
+
+def _require_trainer_cwd(experiment: Experiment) -> None:
+    """Refuse a trainer directory or a slash-written trial program that no shell could use.
+
+    The answer is the same from any shell, so ``validate`` and the MCP catalog check run this
+    as well as every launch, which runs it with the trainer's ``PATH`` in
+    :func:`_launch_preflight`. A program found through ``PATH`` is left to a launch, because
+    the ``PATH`` that counts is the one the run starts with.
+
+    :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
+    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host, or the
+        trial command's program is written with a ``/`` and is not an executable file.
+    """
+    _require_launch_target(experiment, path=None)
 
 
 def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tuple[str, str] | None:
@@ -1275,7 +1301,8 @@ def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tupl
     itself. Anything else is left to the shell, never refused.
 
     :param str command: The trial command template.
-    :param str | None path: ``PATH`` the trainer receives, or ``None`` when it receives none.
+    :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
+        written with a ``/``.
     :param Path cwd: Directory the trainer starts in, which relative paths resolve against.
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
@@ -1335,16 +1362,5 @@ def _launch_preflight(
     identity = _environment_identity(experiment, phase_name)
     if study is not None:
         _validate_environment_cohort(study, identity)
-    _require_trainer_cwd(experiment)
-    refusal = _trial_program_refusal(
-        experiment.trial_command,
-        path=identity.values.get("PATH"),
-        cwd=experiment.execution.resolved_cwd() or Path.cwd(),
-    )
-    if refusal is not None:
-        message, remediation = refusal
-        raise LaunchEnvironmentError(
-            f"{message} Every trial would fail before its trainer started, so none was allocated.",
-            remediation=remediation,
-        )
+    _require_launch_target(experiment, path=identity.values.get("PATH"))
     return identity

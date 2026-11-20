@@ -561,9 +561,9 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     :param Path config_path: Experiment YAML whose relative paths anchor to its directory.
     :param tuple[str, ...] settings: Config overrides applied before validation.
     :raises ConfigError: The derived configuration cannot be loaded or validated.
-    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host. The trial
-        program is not checked here: a launch judges it on the PATH it starts with, which
-        need not be this shell's.
+    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host, or the
+        trial command's program is written with a ``/`` and is not an executable file. A program
+        found through ``PATH`` is left to a launch, which judges it on the PATH it starts with.
     :raises TrialTargetRefusedError: A fixed-configuration or grid target exceeds its
         recorded retry ceiling.
     :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised target.
