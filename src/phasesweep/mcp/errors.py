@@ -279,8 +279,7 @@ class ExperimentBusyError(McpToolError):
         else:
             advice = (
                 "If you just launched and lost the response, this is likely that run; "
-                f"monitor it with await_run using run_id {run_id!r}. "
-                "Cancel it only if the user wants to stop it."
+                f"monitor it with await_run using run_id {run_id!r}."
             )
             if not runner_observable:
                 advice += (

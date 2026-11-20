@@ -274,8 +274,8 @@ def _base_failure_payload(
     steps = _routed_next_steps(error)
     if code == "experiment_busy":
         steps["remediation"] = (
-            f"{steps['remediation']} Stop it only if the user wants it stopped and through "
-            "the interface that started it; MCP cannot cancel a CLI operation."
+            f"{steps['remediation']} MCP cannot cancel a CLI operation: only the interface "
+            "that started it can stop it."
         )
     return {"code": code, "stage": failure_stage, **steps}
 

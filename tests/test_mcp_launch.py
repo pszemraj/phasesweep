@@ -1291,7 +1291,6 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     assert launched["run_id"] in busy_message
     assert "lost the response" in busy_message
     assert "await_run" in busy_message
-    assert "Cancel it only if the user wants" in busy_message
 
     records = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert [record["tool"] for record in records] == [
