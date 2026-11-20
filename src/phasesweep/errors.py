@@ -101,8 +101,9 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
-#: The way out of data another PhaseSweep version wrote, for an artifact root or a study.
-#: "Version" covers a source checkout between releases, which no release can stand in for.
+#: The way out of data another PhaseSweep version wrote that a new `experiment` name leaves
+#: behind: an artifact root whose studies are in memory or in the root's own `storage: auto`
+#: ledger. "Version" covers a source checkout between releases, which no release can stand in for.
 OTHER_FORMAT_STEP = (
     f"Set{_FRESH_STUDY_TAIL}. The PhaseSweep version that wrote the old data still reads it."
 )
@@ -115,6 +116,19 @@ OTHER_FORMAT_LEDGER_STEP = (
     "study (with `storage: auto`, a new `experiment` name or `workdir` alone is enough). "
     "The PhaseSweep version that wrote the old data still reads it."
 )
+
+
+def other_format_step(storage: str | None) -> str:
+    """Pick the step out of artifact-root data another PhaseSweep version wrote.
+
+    An explicit ``storage`` ledger outlives a new ``experiment`` name and holds the old studies
+    the artifact root's binding names, so the step that works there changes both.
+
+    :param str | None storage: The config's ``storage``: ``None``, ``"auto"`` or a journal URL.
+    :return str: :data:`OTHER_FORMAT_LEDGER_STEP` for a journal the config names, otherwise
+        :data:`OTHER_FORMAT_STEP`.
+    """
+    return OTHER_FORMAT_STEP if storage in (None, "auto") else OTHER_FORMAT_LEDGER_STEP
 
 
 def format_found(version: object) -> str:

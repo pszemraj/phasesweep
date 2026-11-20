@@ -138,8 +138,63 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert excinfo.value.remediation == OTHER_FORMAT_STEP
+    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
     assert tree_snapshot(materialized.root) == before
+
+
+def _downgrade_binding(experiment: Experiment) -> None:
+    """Rewrite an artifact-root binding as the previous format left it."""
+    binding_path = _artifact_root_binding_path(experiment)
+    binding = json.loads(binding_path.read_text())
+    binding["schema_version"] -= 1
+    binding_path.write_text(json.dumps(binding) + "\n")
+
+
+def _downgrade_study_stamps(journal: Path) -> None:
+    """Rewrite every study's schema stamp in a journal as the previous format left it."""
+    records = [json.loads(line) for line in journal.read_text().splitlines()]
+    changed = False
+    for record in records:
+        attrs = record.get("user_attr", {})
+        if STUDY_SCHEMA_ATTR in attrs:
+            attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
+            changed = True
+    assert changed
+    journal.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("storage_kind", ["explicit", "auto"])
+def test_artifact_root_format_refusal_names_a_step_that_is_accepted(
+    tmp_path: Path, storage_kind: str
+) -> None:
+    """One pass of the old-format fix line is a fresh start, whichever ledger the config names.
+
+    An explicit ledger keeps the old studies when only the experiment name changes, so its line
+    also names a new ledger. Under ``storage: auto`` the ledger lives in the artifact root, so
+    a new experiment name alone starts fresh.
+    """
+    explicit = storage_kind == "explicit"
+    journal = tmp_path / "old.journal"
+    old = _experiment(tmp_path, storage=f"journal:///{journal}" if explicit else "auto")
+    run_experiment(old)
+    _downgrade_binding(old)
+    _downgrade_study_stamps(journal if explicit else _experiment_dir(old) / "study.journal")
+
+    with pytest.raises(ArtifactRootConflictError, match="uses format") as refused:
+        run_experiment(old)
+
+    assert refused.value.remediation == (
+        OTHER_FORMAT_LEDGER_STEP if explicit else OTHER_FORMAT_STEP
+    )
+    if explicit:
+        with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
+            run_experiment(old.model_copy(update={"experiment": "fresh"}))
+    followed = {"experiment": "fresh"}
+    if explicit:
+        followed["storage"] = f"journal:///{tmp_path / 'fresh.journal'}"
+
+    run_experiment(old.model_copy(update=followed))
 
 
 def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: Path) -> None:
@@ -162,7 +217,7 @@ def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: 
 
 @pytest.mark.parametrize(
     "format_record, step",
-    [("artifact-root", OTHER_FORMAT_STEP), ("study", OTHER_FORMAT_LEDGER_STEP)],
+    [("artifact-root", OTHER_FORMAT_LEDGER_STEP), ("study", OTHER_FORMAT_LEDGER_STEP)],
 )
 @pytest.mark.parametrize(
     "command, options",
@@ -187,22 +242,9 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     """Data in another format ends in one fix line whichever command meets it, before any preview."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     if format_record == "artifact-root":
-        binding_path = _artifact_root_binding_path(materialized.experiment)
-        binding = json.loads(binding_path.read_text())
-        binding["schema_version"] -= 1
-        binding_path.write_text(json.dumps(binding) + "\n")
+        _downgrade_binding(materialized.experiment)
     else:
-        records = [json.loads(line) for line in materialized.ledger_path.read_text().splitlines()]
-        changed = False
-        for record in records:
-            attrs = record.get("user_attr", {})
-            if STUDY_SCHEMA_ATTR in attrs:
-                attrs[STUDY_SCHEMA_ATTR] = STUDY_SCHEMA_VERSION - 1
-                changed = True
-        assert changed
-        materialized.ledger_path.write_text(
-            "".join(json.dumps(record) + "\n" for record in records)
-        )
+        _downgrade_study_stamps(materialized.ledger_path)
     before = tree_snapshot(materialized.root)
 
     code = invoke_cli_boundary([command, str(materialized.config_path), *options], monkeypatch)

@@ -75,6 +75,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
+    OTHER_FORMAT_LEDGER_STEP,
     ForeignPidNamespaceError,
     OperatorAction,
     PhaseSweepError,
@@ -262,6 +263,14 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
         call()
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
     assert _UNMARKED_STUDY_DIAGNOSTIC_MARKERS[label] in str(excinfo.value), label
+
+
+def test_live_study_schema_refusal_gives_the_ledger_step():
+    """A study in another format sits in a ledger, so its fix line is the one the ledger scan gives."""
+    with pytest.raises(StudySchemaMismatchError) as excinfo:
+        study_policy._validate_study_schema(_populated_study())
+
+    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
 
 
 def _collected(*errors: PhaseSweepError) -> PhaseSweepError:
