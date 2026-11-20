@@ -13,20 +13,16 @@ import os
 import pkgutil
 import pwd
 import sys
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import Any
 
 import optuna
 import pytest
-import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import fingerprints, guards, study_policy, trial
@@ -35,7 +31,6 @@ from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.attempts import (
     _preflight_active_attempts,
     _PreflightCleanupReport,
-    _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncertain_trials
 from phasesweep.engine.errors import (
@@ -47,11 +42,9 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.generation import InvocationGeneration
-from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
-    _generation_summary_path,
 )
 from phasesweep.engine.phase import _abort_record, _failure_policy_abort_record, _finish_phase
 from phasesweep.engine.resume import _published_for_resume
@@ -85,16 +78,6 @@ from phasesweep.errors import (
 from phasesweep.evidence.models import LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
-from phasesweep.mcp.recovery import (
-    RunRecoveryError,
-    _cleanup_runner,
-    _finalize_stored_terminal_result_snapshot,
-    _load_recovery_studies,
-    _publication_recovery_action,
-    recover_run,
-)
-from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
-from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime import files as runtime_files
 from phasesweep.runtime.files import (
     UnsafeLockPathError,
@@ -118,15 +101,24 @@ from tests.conftest import (
     trial_outcome,
     write_trainer,
 )
+from tests.error_routing_helpers import (
+    RoutingCase,
+    Trigger,
+    assert_payload_follows,
+    assert_routes_declared_action,
+    assert_runner_payload_follows_routing,
+    garbage,
+    materialize_damaged,
+    raiser,
+    read_only_once_locked,
+    registered_entry,
+    truncated,
+)
 from tests.ledger_fixtures import (
-    Materialized,
     materialize,
     pin_fixture_environment,
-    published_generation_id,
     republish_as_incomplete,
 )
-from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
-from tests.recovery_helpers import load_only_recovery_needs
 
 pytestmark = pytest.mark.contract
 
@@ -288,34 +280,6 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     )
 
 
-Trigger = Callable[[Path, pytest.MonkeyPatch], object]
-
-
-@dataclass(frozen=True)
-class RoutingCase:
-    """One real raise site and the routing an operator must receive from it."""
-
-    id: str
-    #: Drives the real entry point until the raise under test.
-    trigger: Trigger
-    raised: type[PhaseSweepError]
-    action: OperatorAction
-    #: Stable substring of the operator text the site raises today.
-    message: str
-    #: Exact ``__cause__`` type, pinned only where the runner routes by it.
-    cause: type[BaseException] | None = None
-    marks: tuple[pytest.MarkDecorator, ...] = ()
-
-
-def _raiser(error: BaseException) -> Callable[..., object]:
-    """Return a stand-in that raises ``error`` however it is called."""
-
-    def fail(*_args: object, **_kwargs: object) -> object:
-        raise error
-
-    return fail
-
-
 def _storage_gone() -> Exception:
     """Return the backend failure a vanished ledger surfaces as."""
     return RuntimeError("storage went away")
@@ -328,59 +292,12 @@ def _ledger_busy() -> Exception:
     )
 
 
-def _garbage(path: Path) -> None:
-    """Overwrite a ledger file with bytes that fail to parse as journal records."""
-    path.write_bytes(b"this is not a journal record\n" * 64)
-
-
-def _truncated(path: Path) -> None:
-    """Cut the journal's last record short, as an interrupted append leaves it."""
-    path.write_bytes(path.read_bytes()[:-8])
-
-
-def _trials_deleted(path: Path) -> None:
-    """Drop every trial while the journal keeps its study-level records intact.
-
-    Every trial-scoped journal record (``CREATE_TRIAL`` and later) carries an
-    ``op_code`` of 4 or above; study-level records (create study, study user
-    attrs) are 0-3. Keeping only the low op codes preserves the study, its
-    schema stamp, and its other attributes while deleting every trial.
-    """
-    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    kept = [line for line in lines if json.loads(line).get("op_code", 0) < 4]
-    path.write_text("".join(kept), encoding="utf-8")
-
-
-def _materialize_damaged(
-    tmp_path: Path, fixture: str, mode: str, damage: Callable[[Path], None]
-) -> Materialized:
-    """Copy a current golden ledger and apply ``damage`` to its ledger file."""
-    materialized = materialize(fixture, tmp_path, mode=mode)
-    damage(materialized.ledger_path)
-    return materialized
-
-
-def _dead_uncertain_run(
-    materialized: Materialized, tmp_path: Path, config: Path | None = None
-) -> tuple[Path, str]:
-    """Record a dead, cleanup-uncertain MCP run of ``config``, by default the fixture's own."""
-    state_dir = tmp_path / "mcp-state"
-    stage_dead_run(
-        RunStore(state_dir),
-        "wrap-recover",
-        config or materialized.config_path,
-        materialized.experiment.experiment,
-        cleanup_uncertain=True,
-    )
-    return state_dir, "wrap-recover"
-
-
 def _claim_while(owner: object, name: str, inbound: Callable[[], Exception]) -> Trigger:
     """Claim the current golden ledger while ``owner.name`` raises."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         materialized = materialize("current-journal", tmp_path, mode="tree")
-        monkeypatch.setattr(owner, name, _raiser(inbound()))
+        monkeypatch.setattr(owner, name, raiser(inbound()))
         return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
     return trigger
@@ -405,27 +322,8 @@ def _validate_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
     """Validate an unbound current golden ledger after damaging its file."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = _materialize_damaged(tmp_path, fixture, "ledger-only", damage)
+        materialized = materialize_damaged(tmp_path, fixture, "ledger-only", damage)
         return engine_ledger.validate_ledger(materialized.experiment)
-
-    return trigger
-
-
-def _recovery_studies_damaged(
-    mode: str,
-    damage: Callable[[Path], None],
-    *,
-    ownership_storage_unavailable: bool = False,
-    fixture: str = "current-journal",
-) -> Trigger:
-    """Load recovery's studies from a current golden ledger after damage."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = _materialize_damaged(tmp_path, fixture, mode, damage)
-        needs = load_only_recovery_needs(
-            ownership_storage_unavailable=ownership_storage_unavailable
-        )
-        return _load_recovery_studies(materialized.experiment, needs)
 
     return trigger
 
@@ -433,49 +331,15 @@ def _recovery_studies_damaged(
 def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run over the current golden ledger whose phase study cannot be read."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    monkeypatch.setattr(engine_ledger, "open_existing_study", _raiser(_storage_gone()))
+    monkeypatch.setattr(engine_ledger, "open_existing_study", raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
-
-
-@contextmanager
-def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Acquire the journal inode, then deny creation of its repair backup.
-
-    Restore the directory mode on exit so the tree can be cleaned up.
-    """
-    real_acquire = engine_ledger._JournalLock.acquire
-    mode = journal.parent.stat().st_mode
-
-    def acquire_then_deny(lock: engine_ledger._JournalLock) -> bool:
-        result = real_acquire(lock)
-        journal.parent.chmod(0o555)
-        return result
-
-    monkeypatch.setattr(engine_ledger._JournalLock, "acquire", acquire_then_deny)
-    try:
-        yield
-    finally:
-        journal.parent.chmod(mode)
 
 
 def _run_over_unbackuppable_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run whose journal repair can lock its torn record but not back it up."""
-    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
-    with _read_only_once_locked(materialized.ledger_path, monkeypatch):
+    materialized = materialize_damaged(tmp_path, "current-journal", "tree", truncated)
+    with read_only_once_locked(materialized.ledger_path, monkeypatch):
         return run_experiment(materialized.experiment)
-
-
-def _recovery_studies_confirmed_over_unbackuppable_repair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Confirm recovery over a torn journal whose repair can lock but not back up."""
-    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
-    needs = load_only_recovery_needs()
-    with (
-        _experiment_lock(materialized.experiment),
-        _read_only_once_locked(materialized.ledger_path, monkeypatch),
-    ):
-        return _load_recovery_studies(materialized.experiment, needs, confirm=True)
 
 
 def _claim_ledger_under(parent: Callable[[Path], Path]) -> Trigger:
@@ -502,7 +366,7 @@ def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.Monk
 
     def fail_run(*_args: object, generation: InvocationGeneration, **_kwargs: object) -> None:
         generation.claim()
-        monkeypatch.setattr(guards, "validate_ledger", _raiser(OSError("root is gone")))
+        monkeypatch.setattr(guards, "validate_ledger", raiser(OSError("root is gone")))
         raise PhaseTrialsFailedError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
@@ -529,110 +393,8 @@ def _run_fails_then_registry_turns_shared(
 def _reap_unreadable_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Reap stale trials from a study whose trial list cannot be read."""
     study = optuna.create_study(study_name="t::p")
-    monkeypatch.setattr(optuna.Study, "get_trials", _raiser(_storage_gone()))
+    monkeypatch.setattr(optuna.Study, "get_trials", raiser(_storage_gone()))
     return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p", confirm=True)
-
-
-def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Confirm recovery while another orchestrator holds the experiment lock."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    with _experiment_lock(materialized.experiment):
-        return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
-
-
-def _recover_over_unmarked_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from a state directory holding run handles but no format marker."""
-    state_dir = tmp_path / "mcp-state"
-    RunStore(state_dir).create(make_run_handle(run_id="wrap-recover"))
-    (state_dir / _STATE_FORMAT_MARKER_NAME).unlink()
-    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
-
-
-def _recover_from_mistyped_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from an ordinary shared directory that holds no run-store layout."""
-    not_state = tmp_path / "project"
-    not_state.mkdir(mode=0o755)
-    not_state.chmod(0o755)
-    return recover_run(not_state, "wrap-recover", confirm=False, emit=lambda _message: None)
-
-
-def _recover_from_shared_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from a complete run-store layout whose runs directory lost its privacy."""
-    state_dir = tmp_path / "mcp-state"
-    RunStore(state_dir)
-    (state_dir / "runs").chmod(0o755)
-    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
-
-
-def _recover_pending_snapshot_while(failing: str, error: Exception) -> Trigger:
-    """Confirm recovery of an orphaned pending snapshot while ``failing`` raises ``error``."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = materialize("current-journal", tmp_path, mode="tree")
-        state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-        write_run_status(
-            RunStore.open_existing(state_dir),
-            run_id,
-            returncode=1,
-            result_snapshot=capture_pre_generation_result_snapshot(
-                materialized.experiment
-            ).model_dump(mode="json"),
-            result_snapshot_state="pending",
-        )
-        monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
-        return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
-
-    return trigger
-
-
-def _finalize_complete_snapshot_while(failing: str, error: Exception) -> Trigger:
-    """Finalize a complete stored snapshot while ``failing`` raises ``error``."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        terminal_status = {
-            "run_id": "wrap-recover",
-            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()).model_dump(
-                mode="json"
-            ),
-            "result_snapshot_state": "complete",
-        }
-        monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
-        return _finalize_stored_terminal_result_snapshot(
-            RunStore(tmp_path / "mcp-state"),
-            "wrap-recover",
-            terminal_status,
-            confirmed_attempt_ids=set(),
-            confirmed_attempt_locations={},
-        )
-
-    return trigger
-
-
-def _registered_entry(experiment: Experiment, trial_dir: Path) -> Path:
-    """Register one attempt of phase ``p`` and return its registry entry file."""
-    _register_active_attempt(
-        experiment,
-        attempt_id="attempt",
-        phase_name="p",
-        study_name="t::p",
-        trial_number=0,
-        trial_dir=trial_dir,
-        generation_id="generation",
-    )
-    return _attempts_dir(experiment) / "attempt.json"
-
-
-def _recover_over_malformed_registry_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Inspect recovery while an attempt registry entry no longer parses."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    trial_dir = tmp_path / "attempt"
-    trial_dir.mkdir()
-    _garbage(_registered_entry(materialized.experiment, trial_dir))
-    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
 def _scan_registry(
@@ -649,31 +411,11 @@ def _scan_registry(
         experiment = make_experiment(workdir=tmp_path / "runs")
         trial_dir = tmp_path / "attempt"
         trial_dir.mkdir()
-        damage(_registered_entry(experiment, trial_dir))
+        damage(registered_entry(experiment, trial_dir))
         patch(monkeypatch)
         return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     return trigger
-
-
-def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery after the symlink a run's pinned workdir names was retargeted.
-
-    recover-run reads the run's digest-pinned config snapshot, so the workdir can stop resolving to
-    the studies' root only through the filesystem, as when a volume behind a symlink moves.
-    """
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    link = tmp_path / "data"
-    link.symlink_to(materialized.experiment.workdir)
-    config = yaml.safe_load(materialized.config_path.read_text())
-    config["workdir"] = str(link)
-    pinned = tmp_path / "pinned.yaml"
-    pinned.write_text(yaml.safe_dump(config))
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path, pinned)
-    link.unlink()
-    (tmp_path / "new-volume").mkdir()
-    link.symlink_to(tmp_path / "new-volume")
-    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
 def _refuse_mixed_types_same_remedy(study: optuna.Study) -> None:
@@ -741,7 +483,7 @@ def _preflight_shared_registry_and_lost_ledger(
     monkeypatch.setattr(
         guards,
         "_reap_stale_trials",
-        _raiser(StudyStorageUnavailableError("t::a could not be marked FAIL.")),
+        raiser(StudyStorageUnavailableError("t::a could not be marked FAIL.")),
     )
     trigger = _preflight(lambda: {"a": _populated_study("t::a")}, after_claim=_share_registry)
     return trigger(tmp_path, monkeypatch)
@@ -799,107 +541,11 @@ WRAP_CASES = (
         message="The run failed and subsequent process cleanup could not be confirmed.",
     ),
     RoutingCase(
-        id="recovery_studies_storage_bound",
-        trigger=_recovery_studies_damaged("tree", _garbage),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_LEDGER,
-        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
-    ),
-    RoutingCase(
-        id="recovery_published_missing",
-        trigger=_recovery_studies_damaged(
-            "tree", _trials_deleted, ownership_storage_unavailable=True
-        ),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_LEDGER,
-        message="Retry phasesweep mcp recover-run after repairing the storage ledger.",
-    ),
-    RoutingCase(
-        id="recover_run_lock_busy",
-        trigger=_recover_while_locked,
-        raised=RunRecoveryError,
-        action=OperatorAction.RETRY,
-        message="Another phasesweep process appears to be using the same experiment backend",
-    ),
-    RoutingCase(
-        # Composed: the inbound refusal is a ValueError carrying no action, so the
-        # site supplies the one its message names.
-        id="recover_run_unmarked_state",
-        trigger=_recover_over_unmarked_state,
-        raised=RunRecoveryError,
-        action=OperatorAction.FRESH_NAMESPACE,
-        message="use a fresh MCP state directory",
-    ),
-    RoutingCase(
-        # Composed: a path with no run-store layout is a wrong argument, even
-        # when it names some other existing, shared directory.
-        id="recover_run_mistyped_state_dir",
-        trigger=_recover_from_mistyped_state_dir,
-        raised=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
-        message="Pass the state_dir from the catalog the MCP server runs with.",
-    ),
-    RoutingCase(
-        id="recover_run_shared_state_dir",
-        trigger=_recover_from_shared_state_dir,
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="must be owned by uid",
-    ),
-    RoutingCase(
-        id="recover_run_pending_snapshot_unsafe_path",
-        trigger=_recover_pending_snapshot_while(
-            "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
-        ),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="failed to finalize terminal result snapshot for wrap-recover: "
-        "UnsafePrivatePathError",
-    ),
-    RoutingCase(
-        id="finalize_snapshot_unsafe_path",
-        trigger=_finalize_complete_snapshot_while(
-            "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
-        ),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="failed to finalize terminal result snapshot for wrap-recover: "
-        "UnsafePrivatePathError",
-    ),
-    RoutingCase(
-        # recover-run reads the same entry, so routing it back to recover-run
-        # would loop; the entry itself is what the operator repairs.
-        id="recover_run_malformed_registry_entry",
-        trigger=_recover_over_malformed_registry_entry,
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="Investigate the attempt's trial directory.",
-    ),
-    RoutingCase(
-        # Composed: the claim path routes this refusal to fixing the config,
-        # but recovery's config is pinned, so only the tree can be restored.
-        id="recovery_studies_root_moved",
-        trigger=_recover_through_retargeted_workdir,
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="publishes into artifact root",
-    ),
-    RoutingCase(
         id="journal_garbage",
-        trigger=_validate_damaged("current-journal", _garbage),
+        trigger=_validate_damaged("current-journal", garbage),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RESTORE_LEDGER,
         message="could not be completely read while checking for the PhaseSweep format boundary.",
-    ),
-    RoutingCase(
-        # A confirmed recovery repairs a cut-short last record itself; its own
-        # refusal names the remedy, not recover-run's usual restore-ledger text.
-        id="recovery_studies_journal_incomplete_record",
-        trigger=_recovery_studies_confirmed_over_unbackuppable_repair,
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_LEDGER,
-        message="could not be repaired",
-        marks=(requires_nonroot,),
     ),
     RoutingCase(
         # recover-run reaps through the same read, so the ledger comes back first.
@@ -951,21 +597,6 @@ def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return engine_ledger.claim_ledger(validated)
 
 
-def _reconcile_prepared_over_damaged_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Reconcile a prepared publication after the last-success target lost its summary."""
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    published = published_generation_id(experiment)
-    assert published is not None
-    _generation_summary_path(experiment, published).unlink()
-    needs = replace(
-        load_only_recovery_needs(),
-        prepared_publication_generation="prepared-generation",
-    )
-    return _publication_recovery_action(experiment, needs)
-
-
 def _preflight_registered_trial_without_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
@@ -976,7 +607,7 @@ def _preflight_registered_trial_without_attempt(
     attempt_dir = tmp_path / "attempt"
     attempt_dir.mkdir()
     write_attempt_lifecycle(attempt_dir, attempt_id="attempt", state="allocated")
-    _registered_entry(experiment, attempt_dir)
+    registered_entry(experiment, attempt_dir)
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="t::p", storage=storage)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
@@ -1014,7 +645,7 @@ def _inspect_uncertain(*kept: str) -> Trigger:
 def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resolve the lock directory for a uid the account database does not know."""
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
-    monkeypatch.setattr(pwd, "getpwuid", _raiser(KeyError("uid")))
+    monkeypatch.setattr(pwd, "getpwuid", raiser(KeyError("uid")))
     return lock_dir()
 
 
@@ -1022,7 +653,7 @@ def _lock_dir_override_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     """Resolve an explicit lock directory the OS refuses to open."""
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(tmp_path / "locks"))
     monkeypatch.setattr(
-        runtime_files, "open_directory_fd", _raiser(PermissionError(13, "Permission denied"))
+        runtime_files, "open_directory_fd", raiser(PermissionError(13, "Permission denied"))
     )
     return lock_dir()
 
@@ -1032,7 +663,7 @@ def _lock_dir_default_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
     monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path)))
     monkeypatch.setattr(
-        runtime_files, "ensure_private_dir", _raiser(PermissionError(13, "Permission denied"))
+        runtime_files, "ensure_private_dir", raiser(PermissionError(13, "Permission denied"))
     )
     return lock_dir()
 
@@ -1046,7 +677,7 @@ def _lock_dir_override_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 def _lock_file_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Take a lock file the OS refuses to open."""
     monkeypatch.setattr(
-        runtime_files, "_open_lock_file", _raiser(PermissionError(13, "Permission denied"))
+        runtime_files, "_open_lock_file", raiser(PermissionError(13, "Permission denied"))
     )
     return runtime_files.try_lock_file(tmp_path / "blocked.lock")
 
@@ -1133,97 +764,6 @@ def _reap_trial_with_foreign_lifecycle(tmp_path: Path, monkeypatch: pytest.Monke
     return _reap_running_trial(
         tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir), ATTEMPT_ID_ATTR: "attempt"}
     )
-
-
-def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover a run id while another MCP launch holds the launch lock."""
-    state_dir = tmp_path / "mcp-state"
-    with RunStore(state_dir).launch_lock() as acquired:
-        assert acquired
-        return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
-
-
-def _recover_unsettled_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover a launch whose preparation still holds its lease."""
-    state_dir = tmp_path / "mcp-state"
-    pending = make_run_handle(run_id="wrap-recover", launch_state="launching")
-    preparation = RunStore(state_dir).prepare_launch(pending, b"experiment: t\n")
-    try:
-        return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
-    finally:
-        preparation.close()
-
-
-def _recover_unknown_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery of a run id the state directory never recorded."""
-    state_dir = tmp_path / "mcp-state"
-    RunStore(state_dir)
-    return recover_run(state_dir, "typo", confirm=False, emit=lambda _message: None)
-
-
-def _recover_with_config_snapshot(change: Callable[[Path], None]) -> Trigger:
-    """Inspect recovery of a dead uncertain run after ``change`` hits its config snapshot."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = materialize("current-journal", tmp_path, mode="tree")
-        state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-        change(RunStore.open_existing(state_dir).config_snapshot_path(run_id))
-        return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
-
-    return trigger
-
-
-def _recover_without_boot_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery on a host whose boot id cannot be read."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    monkeypatch.setattr("phasesweep.mcp.recovery.read_boot_id", lambda: None)
-    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
-
-
-def _live_uncertain_run(state_dir: Path) -> tuple[RunStore, RunHandle]:
-    """Record a cleanup-uncertain run whose runner is this live test process.
-
-    A regressed liveness check would signal pytest's real group; conftest's
-    ``guard_runner_signals`` fails the test instead of delivering it.
-    """
-    store = RunStore(state_dir)
-    handle = make_run_handle(run_id="wrap-recover")
-    store.create(handle)
-    store.mark_cleanup_uncertain(handle)
-    return store, handle
-
-
-def _recover_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery of a run whose runner is still alive."""
-    state_dir = tmp_path / "mcp-state"
-    _live_uncertain_run(state_dir)
-    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
-
-
-def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Re-check, as confirmed recovery does under its lock, a runner that is alive."""
-    store, handle = _live_uncertain_run(tmp_path / "mcp-state")
-    return _cleanup_runner(
-        store.cleanup_identity(handle),
-        load_only_recovery_needs(),
-        confirm=True,
-        view=RunnerView("observable"),
-        cleanup_recorded=False,
-    )
-
-
-def _recover_run_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover a run whose runner was recorded in a PID namespace this process cannot observe."""
-    state_dir = tmp_path / "mcp-state"
-    store = RunStore(state_dir)
-    handle = make_run_handle(run_id="wrap-recover", pid_namespace="pid:[4026539001]@100")
-    store.create(handle)
-    store.mark_cleanup_uncertain(handle)
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]@100"
-    )
-    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
 def _append_failure_outcomes(
@@ -1483,13 +1023,6 @@ ORIGIN_CASES = (
         message="Stop that process before retrying.",
     ),
     RoutingCase(
-        id="prepared_publication_unreadable",
-        trigger=_reconcile_prepared_over_damaged_publication,
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="last-success publication is invalid or unreadable.",
-    ),
-    RoutingCase(
         id="registry_terminal_identity_missing",
         trigger=_preflight_registered_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
@@ -1627,73 +1160,6 @@ ORIGIN_CASES = (
         message="missing or invalid 'phasesweep_trial_dir'",
     ),
     RoutingCase(
-        id="recover_during_launch",
-        trigger=_recover_during_launch,
-        raised=RunRecoveryError,
-        action=OperatorAction.RETRY,
-        message="another MCP launch is in progress",
-    ),
-    RoutingCase(
-        id="recover_unsettled_launch",
-        trigger=_recover_unsettled_launch,
-        raised=RunRecoveryError,
-        action=OperatorAction.RETRY,
-        message="The run remains reserved.",
-    ),
-    # recover-run raises every RunRecoveryError itself, so none may route back
-    # to it by default; only a confirmed run's own remedy names it.
-    RoutingCase(
-        id="recover_unknown_run_id",
-        trigger=_recover_unknown_run,
-        raised=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
-        message="pass a run id this MCP state directory records.",
-    ),
-    RoutingCase(
-        id="recover_config_snapshot_missing",
-        trigger=_recover_with_config_snapshot(Path.unlink),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="run config snapshot is missing:",
-    ),
-    RoutingCase(
-        id="recover_config_snapshot_unreadable",
-        trigger=_recover_with_config_snapshot(lambda path: path.chmod(0o000)),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="cannot read run config snapshot:",
-        marks=(requires_nonroot,),
-    ),
-    RoutingCase(
-        # No mechanical remedy: the host cannot rule out PID reuse.
-        id="recover_boot_id_unavailable",
-        trigger=_recover_without_boot_id,
-        raised=RunRecoveryError,
-        action=OperatorAction.INSPECT_LOGS,
-        message="runner boot id is unavailable",
-    ),
-    RoutingCase(
-        id="recover_live_runner",
-        trigger=_recover_live_runner,
-        raised=RunRecoveryError,
-        action=OperatorAction.RETRY,
-        message="runner still appears live; use cancel_run first",
-    ),
-    RoutingCase(
-        id="recover_recheck_live_runner",
-        trigger=_recheck_live_runner,
-        raised=RunRecoveryError,
-        action=OperatorAction.RETRY,
-        message="runner still appears live; use cancel_run first",
-    ),
-    RoutingCase(
-        id="recover_runner_in_foreign_pid_namespace",
-        trigger=_recover_run_from_foreign_namespace,
-        raised=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
-        message="only the host's initial PID namespace can see another namespace's processes",
-    ),
-    RoutingCase(
         id="prior_phase_abort",
         trigger=_rerun_aborted_phase,
         raised=PhaseAbortRefusedError,
@@ -1793,129 +1259,7 @@ def test_raise_sites_route_their_declared_action(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with pytest.raises(case.raised) as excinfo:
-        case.trigger(tmp_path, monkeypatch)
-
-    error = excinfo.value
-    assert type(error) is case.raised
-    assert error.action is case.action
-    if case.cause is not None:
-        assert type(error.__cause__) is case.cause
-    assert case.message in _operational_error_text(error)
-    if error.remediation is not None:
-        rendered = _operational_error_text(error)
-        assert rendered.split("\nfix: ", 1)[1] == error.remediation
-        assert "correct the experiment configuration" not in rendered
-        assert rendered.count(error.remediation) == 1
-        assert error.remediation not in str(error)
-        assert error.remediation not in caplog.text
-        failure = mcp_runner._terminal_failure_payload(
-            error, stage="execution", cleanup_confirmed=True
-        )
-        expected = (
-            error.remediation
-            if error.action is OperatorAction.RETRY
-            else f"Ask the operator: {error.remediation}"
-        )
-        assert failure["remediation"] == expected
-        if case.id.startswith("live_abort_with_"):
-            run_log = tmp_path / "runs" / "t" / "run.log"
-            assert run_log.read_text(encoding="utf-8").count(error.remediation) == 1
-    if case.action is OperatorAction.RETRY:
-        rendered = _operational_error_text(error)
-        if error.remediation is None:
-            assert "retry the same operation once the reported blocker is resolved" in rendered
-        else:
-            assert error.remediation in rendered
-        assert "start a new run" not in rendered
-
-
-def _defect_while_inspecting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery while one of its own steps has a bug."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    monkeypatch.setattr(
-        "phasesweep.mcp.recovery._publication_recovery_action",
-        _raiser(NotImplementedError("unfinished branch")),
-    )
-    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
-
-
-@pytest.mark.parametrize(
-    ("trigger", "defect"),
-    [
-        (_defect_while_inspecting, NotImplementedError),
-        (
-            _recover_pending_snapshot_while(
-                "write_status_file", TypeError("Object of type set is not JSON serializable")
-            ),
-            TypeError,
-        ),
-        (
-            _finalize_complete_snapshot_while(
-                "finalize_result_snapshot",
-                RuntimeError("cleanup report identifies more attempts than the snapshot records"),
-            ),
-            RuntimeError,
-        ),
-    ],
-    ids=["inspection", "snapshot_reservation", "snapshot_finalization"],
-)
-def test_recover_run_lets_a_defect_keep_its_traceback(
-    trigger: Trigger,
-    defect: type[Exception],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A bug inside recovery is not an operator refusal with a remedy to route.
-
-    Only a PhaseSweepError, or an OSError from recovery's own filesystem writes, becomes a
-    RunRecoveryError; anything else reaches the CLI's internal-error boundary as itself.
-    """
-    with pytest.raises(defect) as excinfo:
-        trigger(tmp_path, monkeypatch)
-    assert type(excinfo.value) is defect
-    assert not isinstance(excinfo.value, PhaseSweepError)
-
-
-_STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
-    {
-        OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
-        OperatorAction.RESTORE_LEDGER: "storage ledger",
-        OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
-        OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",
-        OperatorAction.RUN_RECOVER_RUN: "recover-run",
-        OperatorAction.FIX_CONFIG: "correct the experiment configuration",
-        OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
-    }
-)
-
-
-def _assert_payload_follows(failure: Mapping[str, Any], routed: list[OperatorAction]) -> None:
-    """Assert a runner failure payload says exactly the ``routed`` steps, in order."""
-    remediation = failure["remediation"]
-    steps = [step for step in routed if step is not OperatorAction.RETRY]
-    if failure["code"] == "cleanup_uncertain":
-        # The server launches nothing more for such a run until recover-run
-        # confirms it, so recover-run is how it is retried.
-        last = OperatorAction.RUN_RECOVER_RUN
-        steps = [*(step for step in steps if step is not last), last]
-    if steps:
-        assert (failure["retryable"], failure["actor"]) == (False, "operator")
-    else:
-        assert (failure["retryable"], failure["actor"]) == (True, "agent")
-    positions = [remediation.find(_STEP_MARKERS[step]) for step in steps]
-    assert -1 not in positions, remediation
-    assert positions == sorted(positions), remediation
-    unrouted = [marker for action, marker in _STEP_MARKERS.items() if action not in steps]
-    assert not [marker for marker in unrouted if marker in remediation], remediation
-    if OperatorAction.RESTORE_TREE in steps:
-        # The payload carries no message, so it keeps the safety condition.
-        assert "only if certain nothing is running" in remediation
-    # A step whose specifics are in the message points at the run log holding it.
-    self_contained = {OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS}
-    points_at_log = remediation.endswith("The error in the PhaseSweep run log gives the details.")
-    assert points_at_log is not self_contained.issuperset(steps), remediation
+    assert_routes_declared_action(case, tmp_path, monkeypatch, caplog)
 
 
 def _cleanup_refusal(action: OperatorAction | None, cause: BaseException | None) -> Exception:
@@ -1949,11 +1293,7 @@ _UNCONFIRMED_CLEANUPS = (
 def test_runner_payload_follows_the_routed_steps() -> None:
     errors = [cls("boom") for cls in _operator_error_classes()]
     errors += [case.raised("boom", action=case.action) for case in CASES]
-    for error in errors:
-        failure = mcp_runner._terminal_failure_payload(
-            error, stage="preflight", cleanup_confirmed=True
-        )
-        _assert_payload_follows(failure, [error.action])
+    assert_runner_payload_follows_routing(errors)
     for primary, recorded, routed in _UNCONFIRMED_CLEANUPS:
         failure = mcp_runner._terminal_failure_payload(
             primary, stage="execution", cleanup_confirmed=False, cleanup_error=recorded
@@ -1961,7 +1301,7 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         assert failure["code"] == "cleanup_uncertain"
         # The durable payload schema is unchanged: the action routes, it is not stored.
         assert "action" not in failure
-        _assert_payload_follows(failure, routed)
+        assert_payload_follows(failure, routed)
     # A ledger failure with a shared-registry cleanup error composes both repairs, word for word.
     composed = mcp_runner._terminal_failure_payload(
         _LEDGER_LOST, stage="execution", cleanup_confirmed=False, cleanup_error=_SHARED_REGISTRY

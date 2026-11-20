@@ -67,6 +67,10 @@ REPO = Path(__file__).resolve().parent.parent
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+# A support module's asserts keep pytest's failure introspection only when registered here, before
+# any test module imports it.
+pytest.register_assert_rewrite("tests.error_routing_helpers")
+
 #: Skip marker for a test or parametrized case that needs the kernel to deny a
 #: permission. Root bypasses file modes, so there the denial never happens.
 requires_nonroot = pytest.mark.skipif(
