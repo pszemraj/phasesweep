@@ -191,7 +191,7 @@ def recover_run(
             "runner boot id is unavailable; refusing automated process-group cleanup "
             "because PID reuse after reboot cannot be ruled out"
         )
-    _require_dead_runner(identity, view=view, cleanup_needed=needs.cleanup_needed)
+    _require_dead_runner(identity, run_id, view=view, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
@@ -199,6 +199,7 @@ def recover_run(
         with recovery_lock, transition_lock:
             _cleanup_runner(
                 identity,
+                run_id,
                 needs,
                 confirm=confirm,
                 view=view,
@@ -499,36 +500,38 @@ def _recovery_needs(
     )
 
 
-def _surviving_runner_step(identity: ProcessIdentity, *, lead: str = "") -> str:
+def _surviving_runner_step(identity: ProcessIdentity, run_id: str, *, lead: str = "") -> str:
     """Return the operator step for a runner recovery found alive, naming its PID and group.
 
     :param ProcessIdentity identity: Recorded runner PID and process group.
+    :param str run_id: The run, which names the runner when the identity records no PID.
     :param str lead: Step to take before the shared host step, ending in a space.
     :return str: The step, ending in the instruction to repeat the command.
     """
     return (
-        f"{lead}{live_runner_step(identity.pid, identity.pgid)} "
+        f"{lead}{live_runner_step(identity.pid, identity.pgid, run_id)} "
         "Then repeat this recover-run command."
     )
 
 
-def _live_runner_refusal(identity: ProcessIdentity) -> RunRecoveryError:
+def _live_runner_refusal(identity: ProcessIdentity, run_id: str) -> RunRecoveryError:
     """Build the refusal for a runner that is still alive.
 
     :param ProcessIdentity identity: Recorded runner PID and process group.
+    :param str run_id: The run whose runner is alive.
     :return RunRecoveryError: The refusal, for the caller to raise.
     """
     return RunRecoveryError(
         "runner still appears live",
         action=OperatorAction.RETRY,
         remediation=_surviving_runner_step(
-            identity, lead="Stop it with cancel_run if the run should end. "
+            identity, run_id, lead="Stop it with cancel_run if the run should end. "
         ),
     )
 
 
 def _require_dead_runner(
-    identity: ProcessIdentity, *, view: RunnerView, cleanup_needed: bool
+    identity: ProcessIdentity, run_id: str, *, view: RunnerView, cleanup_needed: bool
 ) -> None:
     """Reject live runners and identities without a safe process-visibility proof.
 
@@ -536,6 +539,7 @@ def _require_dead_runner(
     requires a recorded native process start time before checking liveness.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
+    :param str run_id: The run being recovered, named in a refusal.
     :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
@@ -552,7 +556,7 @@ def _require_dead_runner(
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
     if is_same_live_process(identity.pid, identity.pid_starttime):
-        raise _live_runner_refusal(identity)
+        raise _live_runner_refusal(identity, run_id)
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
@@ -592,6 +596,7 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
 
 def _cleanup_runner(
     identity: ProcessIdentity,
+    run_id: str,
     needs: _RecoveryNeeds,
     *,
     confirm: bool,
@@ -603,6 +608,7 @@ def _cleanup_runner(
     Ended boots and host-proven absent groups are neither probed nor signalled.
 
     :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
+    :param str run_id: The run being recovered, named in a refusal.
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
     :param bool confirm: Enable liveness checks and any required process-group cleanup.
     :param RunnerView view: This recovery's one derivation of the runner.
@@ -614,7 +620,7 @@ def _cleanup_runner(
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise _live_runner_refusal(identity)
+        raise _live_runner_refusal(identity, run_id)
     if (
         needs.cleanup_needed
         and confirm
@@ -625,7 +631,7 @@ def _cleanup_runner(
     ):
         raise RunRecoveryError(
             "runner process-group cleanup is still uncertain",
-            remediation=_surviving_runner_step(identity),
+            remediation=_surviving_runner_step(identity, run_id),
         )
 
 

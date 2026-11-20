@@ -311,6 +311,7 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     store, handle = _live_uncertain_run(tmp_path / "mcp-state")
     return _cleanup_runner(
         store.cleanup_identity(handle),
+        handle.run_id,
         load_only_recovery_needs(),
         confirm=True,
         view=RunnerView("observable"),
@@ -329,6 +330,7 @@ def _recheck_runner_group_that_survives_the_kill(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *_a, **_k: False)
     return _cleanup_runner(
         store.cleanup_identity(handle),
+        handle.run_id,
         replace(load_only_recovery_needs(), cleanup_needed=True),
         confirm=True,
         view=RunnerView("observable"),

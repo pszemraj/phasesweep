@@ -74,7 +74,7 @@ def host_runner_numbers(pid: int | None, pgid: int | None) -> tuple[int | None, 
     return (pid, pgid) if in_initial_pid_namespace() else (None, None)
 
 
-def live_runner_step(pid: int | None, pgid: int | None, run_id: str = "<run-id>") -> str:
+def live_runner_step(pid: int | None, pgid: int | None, run_id: str) -> str:
     """Return the host step for a runner that cancellation or recovery found still alive.
 
     ``cancel_run`` and ``recover-run`` give the operator this one step, so neither refusal
@@ -82,7 +82,7 @@ def live_runner_step(pid: int | None, pgid: int | None, run_id: str = "<run-id>"
 
     :param int | None pid: The runner's PID when the operator's shell reads it as recorded, else ``None``.
     :param int | None pgid: The runner's process group when the operator's shell reads it as recorded.
-    :param str run_id: The run, to find the runner by when no PID is given, defaults to ``<run-id>``.
+    :param str run_id: The run, to find the runner by when no PID is given.
     :return str: One sentence naming the runner and what to clear on the host.
     """
     if pid is not None and pgid is not None:
