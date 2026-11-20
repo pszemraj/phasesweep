@@ -283,8 +283,8 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.server_name == "phasesweep"
     assert initialization.server_version == __version__
-    # Clients load the instructions into every session, and some show only the first line,
-    # cut at 250 characters, so one short line carries the opt-in gate and the guide pointer.
+    # Some clients load the instructions into every session, and some show only the first
+    # line, cut at 250 characters, so one short line carries the gate and the guide pointer.
     instructions = initialization.instructions
     assert instructions is not None
     assert len(instructions) <= 250

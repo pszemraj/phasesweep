@@ -75,8 +75,8 @@ SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
-# A client puts these instructions into every session the server is connected to, whether or
-# not a tool is used, and some show only the first line, cut at 250 characters. They are
+# Some clients put these instructions into every session the server is connected to, whether
+# or not a tool is used, and some show only the first line, cut at 250 characters. They are
 # therefore one short line holding what an agent needs before it touches PhaseSweep; the
 # workflow rules load on demand through get_guide.
 SERVER_INSTRUCTIONS = (
