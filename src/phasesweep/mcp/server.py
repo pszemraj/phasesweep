@@ -505,6 +505,9 @@ class TrackingDeliveryPayload(_ToolPayload):
 
     pending: int
     delivered: int
+    remedy: str | None = Field(
+        description="The operator's retry step once the run has ended with uploads pending; otherwise null."
+    )
 
 
 class GetRunStatusResult(_ToolPayload):
@@ -568,9 +571,9 @@ class GetRunStatusResult(_ToolPayload):
     tracking_delivery: TrackingDeliveryPayload | None = Field(
         default=None,
         description=(
-            "This run's live MLflow upload counts, including after termination; null without "
-            "MLflow or launch config. Pending uploads do not change scores or winners: "
-            "report them to the operator instead of launching another run."
+            "This run's live MLflow upload counts, including after termination; pending uploads "
+            "never change scores or winners. Null when the run's launch config has no mlflow "
+            "block or can no longer be read."
         ),
     )
     elapsed_seconds: int | None = Field(

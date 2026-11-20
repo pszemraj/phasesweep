@@ -1343,7 +1343,14 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
             {"schema_version": 1, "generation_id": generation, "state": "pending"},
         )
 
-    assert app.status(run_id)["tracking_delivery"] == {"pending": 1, "delivered": 0}
+    delivery = app.status(run_id)["tracking_delivery"]
+    assert (delivery["pending"], delivery["delivered"]) == (1, 0)
+    # While the run holds the experiment lock, a retry cannot run; once it has ended, the
+    # operator's retry step arrives with the counts.
+    if terminal:
+        assert f"`phasesweep sync-tracking CONFIG --generation {run_id}`" in delivery["remedy"]
+    else:
+        assert delivery["remedy"] is None
     assert experiment_status(experiment)["tracking_delivery"] == {"pending": 3, "delivered": 0}
     assert "tracking_delivery" not in read_status(experiment)
     (tracking_root(experiment) / run_id / "delivery" / "own.json").write_text("{")

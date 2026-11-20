@@ -178,7 +178,7 @@ With a configured [`cost_key`](config.md#repeats), a non-null `cost_advisory` id
 
 Frozen scientific reads need no tracking SDK, credentials, or remote access.
 
-For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Missing or null delivery information does not establish successful delivery. [Result delivery and recovery](mlflow.md#result-delivery-and-recovery) covers pending uploads and the operator's retry.
+For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Once the run has ended with uploads pending, `tracking_delivery.remedy` names the operator's retry, `phasesweep sync-tracking CONFIG --generation RUN_ID` with the config the run launched with; while it runs, it holds the experiment lock that retry needs. `tracking_delivery` is null when the run's launch config has no `mlflow` block or can no longer be read, so null does not establish delivery. [Result delivery and recovery](mlflow.md#result-delivery-and-recovery) covers pending uploads and the operator's retry.
 
 ## Run state and recovery
 

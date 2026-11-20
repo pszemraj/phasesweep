@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine.read import PhaseWinnerView, ResultContext
@@ -193,6 +193,28 @@ def winners_payload(
     }
 
 
+def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, object]) -> JsonObject:
+    """Attach the operator's retry step to a run's upload counts once retrying can work.
+
+    ``sync-tracking`` holds the experiment lock, so it cannot retry a running run's uploads.
+
+    :param Mapping[str, int] counts: The run's pending and delivered upload counts.
+    :param Mapping[str, object] run: Path-free detached-run state.
+    :return JsonObject: Counts plus ``remedy``, the retry step when uploads are pending after
+        the run ended, otherwise ``None``.
+    """
+    pending = counts["pending"]
+    remedy = None
+    if pending and run["state"] != "running":
+        remedy = (
+            f"{pending} MLflow result upload(s) of this run are pending; its scores and winners "
+            "are unaffected. Ask the operator to retry them with `phasesweep sync-tracking "
+            f"CONFIG --generation {run['run_id']}` using the config this run launched with; "
+            "delivery never retrains."
+        )
+    return {"pending": pending, "delivered": counts["delivered"], "remedy": remedy}
+
+
 def status_payload(
     experiment_id: str,
     status: dict[str, Any],
@@ -252,7 +274,7 @@ def status_payload(
         "experiment_id": experiment_id,
         "result_source": result_source,
         **(
-            {"tracking_delivery": status["tracking_delivery"]}
+            {"tracking_delivery": _tracking_delivery_payload(status["tracking_delivery"], run)}
             if "tracking_delivery" in status
             else {}
         ),
