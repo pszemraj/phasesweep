@@ -1810,3 +1810,53 @@ def test_wandb_missing_run_worker_names_target_and_init_overrides(
     assert "set the extractor's project and entity to match" in message
     assert "Last observation: ValueError" not in message
     assert len(message.splitlines()) == 1
+
+
+@pytest.mark.integration
+def test_wandb_worker_reports_a_missing_run_before_the_supervisor_stops_it(
+    wandb_worker_sdk,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lookup still in flight at the worker's polling deadline leaves time to report the missing run."""
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    # The client's timeout is the whole seconds left to the polling deadline, so a lookup that
+    # begins in the last second is the one a slow link leaves in flight when the deadline passes.
+    wandb_worker_sdk("""
+        import time
+        class Api:
+            def __init__(self, overrides=None, timeout=None):
+                self.slow = timeout <= 1
+            def run(self, path):
+                if self.slow:
+                    time.sleep(1.5)
+                raise ValueError(f"Could not find run {path}")
+    """)
+    launched = []
+    run_worker = wandb_evidence.run_worker
+
+    def recording_worker(*args, **kwargs):
+        outcome = run_worker(*args, **kwargs)
+        launched.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(wandb_evidence, "run_worker", recording_worker)
+    with (
+        caplog.at_level("WARNING", logger="phasesweep.runtime.process"),
+        pytest.raises(wandb_evidence.WandbRunMissingError),
+    ):
+        wandb_evidence.poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
+        )
+    ((result, response, _),) = launched
+    assert response == {"status": "run_missing"}
+    assert not result.timed_out
+    assert "terminating group" not in caplog.text

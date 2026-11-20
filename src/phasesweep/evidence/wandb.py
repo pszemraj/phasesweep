@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from phasesweep.runtime.json import json_text, json_text_list, progress_position
-from phasesweep.runtime.remote_worker import run_worker
+from phasesweep.runtime.remote_worker import report_reserve, run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
 """How one history read ended: an answer, history behind the summary, or a
@@ -681,9 +681,10 @@ def main(argv: list[str] | None = None) -> int:
         if task == "position":
             response = {"status": "position", "value": _locate_wandb_position(**request)}
         else:
-            # Leave time to report missing keys before the supervisor's deadline.
+            # Stop polling early enough that a lookup in flight and the report of a missing run,
+            # missing keys or a timeout finish before the supervisor's deadline.
             remaining = max(0.0, request["deadline"] - time.monotonic())
-            request["deadline"] -= min(0.1, remaining / 2)
+            request["deadline"] -= report_reserve(remaining)
             response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}

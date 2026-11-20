@@ -23,7 +23,7 @@ from phasesweep.runtime.json import (
     json_text,
     json_text_map,
 )
-from phasesweep.runtime.remote_worker import run_worker
+from phasesweep.runtime.remote_worker import report_reserve, run_worker
 from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -44,8 +44,6 @@ if TYPE_CHECKING:
     )
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
-# Time a capture or find keeps for its last poll and its report before the parent stops it.
-_REPORT_SECONDS = 5.0
 # Worker response statuses; "unavailable" reports a request the tracker gave no answer to,
 # "unknown" a creation that may have taken effect, and "objective_missing" a finished managed
 # run without the configured objective metric.
@@ -572,7 +570,7 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
     """
     experiment_id = _resolve(client, request["settings"])
     identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
-    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    reserve = report_reserve(request["settings"]["timeout_seconds"])
     stop = request["timeout_at"] - reserve
     while True:
         run = _identity_run(client, identity)
@@ -632,7 +630,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     binding, query = request["binding"], request["query"]
     # Stop just before timeout_at, a shared monotonic instant, so the worker can report
     # the run's state; a nearer phase or run deadline still stops it first.
-    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    reserve = report_reserve(request["settings"]["timeout_seconds"])
     stop = request["timeout_at"] - reserve
     while True:
         run = client.get_run(binding["run_id"])
