@@ -43,7 +43,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runner import FailurePayload
+from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus
 from phasesweep.mcp.server import (
     AwaitRunResult,
@@ -72,6 +72,7 @@ from tests.mcp_helpers import (
     write_run_status,
     write_srv_catalog,
     write_srv_config,
+    write_unsafe_cleanup_status,
 )
 
 
@@ -728,6 +729,57 @@ def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
         assert settled["run"]["state"] == "succeeded"
         assert settled["run"]["recovery_required"] is False
         assert settled["run"]["failure"] is None
+
+
+@pytest.mark.parametrize("snapshot", ["frozen", "unavailable"])
+@pytest.mark.integration
+def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_confirmed(
+    tmp_path: Path,
+    snapshot: str,
+) -> None:
+    """A recorded cleanup_uncertain failure asks for recover-run until recovery is confirmed, then says cleanup is settled, in the failure or beneath its snapshot refusal."""
+    failure = _cleanup_uncertain_payload([])
+    if snapshot == "frozen":
+        app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+        write_run_status(
+            store,
+            **{
+                **terminal,
+                "returncode": 1,
+                "error_class": "UnsafeProcessCleanupError",
+                "cleanup_confirmed": False,
+                "failure": failure,
+            },
+        )
+    else:
+        config, app, registry, store = side_effect_app(tmp_path)
+        handle = stage_dead_run(
+            store, "srv-recorded-cleanup", config, registry.get("srv").id, cleanup_uncertain=False
+        )
+        write_unsafe_cleanup_status(store, handle.run_id, failure=failure)
+    run_id = handle.run_id
+    stored_status = store.status_path(run_id).read_bytes()
+
+    before = app.status(run_id=run_id)["run"]
+
+    assert before["recovery_required"] is True
+    assert before["failure"] == failure
+    assert "recover-run before another launch" in before["failure"]["remediation"]
+
+    _record_confirmed_recovery(store, handle)
+
+    after = app.status(run_id=run_id)["run"]
+
+    assert after["state"] == "failed"
+    assert after["recovery_required"] is False
+    recorded = after["failure"] if snapshot == "frozen" else after["failure"]["cause"]
+    assert recorded["code"] == "cleanup_uncertain"
+    assert recorded["remediation"] != failure["remediation"]
+    assert "settled this run's process cleanup" in recorded["remediation"]
+    assert "before another launch" not in recorded["remediation"]
+    if snapshot == "unavailable":
+        assert after["failure"]["code"] == "result_snapshot_unavailable"
+    assert store.status_path(run_id).read_bytes() == stored_status
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])

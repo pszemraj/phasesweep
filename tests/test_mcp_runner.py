@@ -541,7 +541,13 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
     assert recovered_status["run"]["recovery_required"] is False
-    assert recovered_status["run"]["failure"] == status["failure"]
+    recovered_failure = recovered_status["run"]["failure"]
+    assert recovered_failure == {
+        **status["failure"],
+        "remediation": recovered_failure["remediation"],
+    }
+    assert "settled this run's process cleanup" in recovered_failure["remediation"]
+    assert "before another launch" not in recovered_failure["remediation"]
     assert store.status_path(run_id).read_bytes() == terminal_before
     assert (
         _generation_path(experiment).read_bytes() if _generation_path(experiment).exists() else None

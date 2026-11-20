@@ -18,6 +18,12 @@ from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation, RunStore
 from phasesweep.mcp.snapshots import parse_result_snapshot
 from phasesweep.runtime.json import JsonObject, json_object
 
+_CLEANUP_SETTLED_REMEDIATION = (
+    "Operator recovery settled this run's process cleanup, so no recover-run step remains. The "
+    "run itself still ended without completing; start a new run only if the user still wants "
+    "the sweep to continue."
+)
+
 
 def run_failure_payload(
     runs: RunStore,
@@ -79,6 +85,9 @@ def run_failure_payload(
                 "launch."
             ),
         }
+    if persisted is not None and persisted["code"] == "cleanup_uncertain":
+        # The recorded step was recover-run, and cleanup recovery is no longer required.
+        persisted = {**persisted, "remediation": _CLEANUP_SETTLED_REMEDIATION}
     runner_ended_with_boot = (
         observation.terminal_status is None
         and handle.launch_state == "spawned"
@@ -142,6 +151,6 @@ def run_failure_payload(
         if persisted is not None:
             failure["cause"] = persisted
         return failure
-    # Preserve the terminal diagnosis and remediation after operator recovery;
-    # the live recovery_required field says whether recovery is still needed.
+    # Other terminal diagnoses and remediations survive operator recovery; the live
+    # recovery_required field says whether recovery is still needed.
     return persisted
