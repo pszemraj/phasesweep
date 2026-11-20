@@ -47,7 +47,6 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
 )
-from phasesweep.errors import OPERATOR_STEPS, OperatorAction
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
@@ -96,7 +95,7 @@ from tests.recovery_helpers import (
 
 
 def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
-    """An unsupported MCP store calls for a fresh state directory."""
+    """An unsupported MCP store calls for pointing the catalog's state_dir at a new directory."""
     write_srv_config, _app, registry, store = side_effect_app(tmp_path)
     marker = store._format_marker_path
     marker.write_text(json.dumps({"schema_version": MCP_STATE_FORMAT_VERSION + 1}))
@@ -106,7 +105,10 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "use a fresh MCP state directory" in result.output
-    assert f"fix: {OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE]}." in result.output
+    assert (
+        "fix: Point the catalog's `state_dir` at a new directory; the PhaseSweep release that "
+        "wrote this one still reads it."
+    ) in result.output
     assert "artifact root" not in result.output
     assert marker.read_bytes() == before
 

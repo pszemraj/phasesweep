@@ -128,7 +128,14 @@ def recover_run(
     try:
         store = RunStore.open_existing(state_dir)
     except UnsupportedStateFormatError as exc:
-        raise RunRecoveryError(str(exc), action=OperatorAction.FRESH_NAMESPACE) from None
+        raise RunRecoveryError(
+            str(exc),
+            action=OperatorAction.FRESH_NAMESPACE,
+            remediation=(
+                "Point the catalog's `state_dir` at a new directory; the PhaseSweep release "
+                "that wrote this one still reads it."
+            ),
+        ) from None
     except ValueError as exc:
         # Not a state directory at all: the path given is what needs fixing.
         raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
@@ -261,7 +268,7 @@ def recover_run(
                 first = next(iter(evidence.pending_evidence.values())).rstrip(".")
                 emit(
                     f"Left {len(evidence.pending_evidence)} completed trial(s) pending: the "
-                    f"tracker gave no answer about their evidence ({first}). Restore access "
+                    f"tracker could not be read for their evidence ({first}). Restore access "
                     "to the tracker, then start the run again; their training is kept and "
                     "nothing is retrained."
                 )
