@@ -356,8 +356,14 @@ def _run_experiment_outcome(
                 from_phase=from_phase,
             )
             if experiment.mlflow is not None:
-                from phasesweep.tracking.publication import save_recovered_attempts
+                from phasesweep.tracking.publication import (
+                    generations_left_open,
+                    save_recovered_attempts,
+                )
 
+                # The experiment lock rules out a live invocation and this run has bound no
+                # summary run yet, so each generation left open was killed outright.
+                cleanup.settled_generations.update(generations_left_open(experiment))
                 # Recovery sends nothing; what it settled waits as pending records until the
                 # run has reached the tracker.
                 save_recovered_attempts(experiment, claimed, cleanup.settled_generations)

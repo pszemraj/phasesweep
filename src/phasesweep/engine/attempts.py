@@ -100,9 +100,9 @@ class _PreflightCleanupReport:
     that just stopped on it. Once set, later extractions in the pass skip their read, so an
     outage costs one read."""
     settled_generations: set[str] = field(default_factory=set)
-    """Generations whose trials this pass made terminal or confirmed clean. Recovery sends
-    nothing to a tracker; the run delivers those attempts' MLflow outcomes once it has reached
-    it."""
+    """Generations whose trials this pass made terminal or confirmed clean, and those a run found
+    left open by an invocation killed outright. Recovery sends nothing to a tracker; the run
+    delivers those generations' MLflow outcomes once it has reached it."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""

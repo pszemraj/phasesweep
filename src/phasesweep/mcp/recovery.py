@@ -110,8 +110,8 @@ class _CleanupEvidence:
     # Completed attempts left RUNNING because their tracker gave no answer, with the failure.
     pending_evidence: dict[str, str] = field(default_factory=dict)
     inspection_messages: dict[_AttemptRecord, str] = field(default_factory=dict)
-    # Generations whose trials a confirmed pass settled, and the ledger holding them, so their
-    # MLflow outcomes go out once the recovery is committed.
+    # Generations whose trials a confirmed pass settled, with the recovered run's own, and the
+    # ledger holding them, so their MLflow outcomes go out once the recovery is committed.
     settled_generations: set[str] = field(default_factory=set)
     ledger: ValidatedLedger | None = None
 
@@ -846,7 +846,9 @@ def _recover_trial_evidence(
         evidence.inspection_messages = active_report.inspection_messages or {}
         if confirm:
             active_report.record_generations(inspected_attempts)
-            evidence.settled_generations = active_report.settled_generations
+            # The runner is proven dead, so its own generation has ended even when this pass
+            # settled none of its trials.
+            evidence.settled_generations = active_report.settled_generations | {run_id}
             evidence.ledger = ledger
             if config.mlflow is not None:
                 from phasesweep.tracking.publication import save_recovered_attempts

@@ -350,14 +350,18 @@ class RunnerKilled(BaseException):
     """Stands in for the orchestrator dying, which no handler of the run may observe."""
 
 
-def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
-    """Leave ``n_jobs`` managed attempts RUNNING, as a runner killed with them in flight does.
+def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight=True):
+    """Kill a sweep of ``n_jobs`` managed attempts outright, by default with all of them in flight.
 
-    Each attempt's managed run and the generation's summary run exist; the trainers never
-    start, no outcome is recorded and no reconciliation runs. None of the run's failure
-    handling runs either, so it records no failed state and finishes no MLflow run.
+    Each attempt's managed run and the generation's summary run exist. With the attempts in
+    flight, the trainers never start, no outcome is recorded and every trial stays RUNNING.
+    None of the run's failure handling or reconciliation runs, so it records no failed state
+    and finishes no MLflow run of its own failure.
 
     :param str | None generation_id: The killed run's generation, as an MCP runner names it.
+    :param bool in_flight: Kill the run with its trials in flight; ``False`` lets every trial
+        finish, its accepted outcome sent, and kills the run before it publishes, so no trial is
+        left for recovery to settle.
     :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
     """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
@@ -371,15 +375,21 @@ def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
         search_space={"model.depth": {"type": "categorical", "choices": [1, 2, 3]}},
     )
     experiment = Experiment.model_validate(config)
-    in_flight = threading.Barrier(n_jobs)
+    launched = threading.Barrier(n_jobs)
 
     def dies(*args, **kwargs):
-        in_flight.wait(10)
+        launched.wait(10)
+        raise RunnerKilled()
+
+    def dies_unpublished(*args, **kwargs):
         raise RunnerKilled()
 
     with monkeypatch.context() as patch:
-        patch.setattr(phase_module, "launch_trial", dies)
-        patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        if in_flight:
+            patch.setattr(phase_module, "launch_trial", dies)
+            patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        else:
+            patch.setattr(generation_module, "_publish_generation", dies_unpublished)
         patch.setattr(guards_module, "_reconcile_existing_studies", lambda *args, **kwargs: None)
         patch.setattr(
             generation_module, "_persist_failed_state_unless_recorded", lambda *args: None
@@ -390,7 +400,8 @@ def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
     trials = read_phase_trials(validate_ledger(experiment), "depth").trials
-    assert [trial.state for trial in trials] == [TrialState.RUNNING] * n_jobs
+    state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
+    assert [trial.state for trial in trials] == [state] * n_jobs
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
 
 

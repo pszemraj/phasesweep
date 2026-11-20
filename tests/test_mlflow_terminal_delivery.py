@@ -778,8 +778,8 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
     The first invocation dies before it writes the lifecycle record and before
     the in-process mirror. The pointer alone keeps the generation published, a
-    later no-work replay leaves it there, and ``sync-tracking`` rebuilds its
-    winner and summary uploads.
+    later no-work replay leaves it there and never ends its summary run as a
+    killed run's, and ``sync-tracking`` rebuilds its winner and summary uploads.
     """
     from phasesweep.engine.paths import _last_successful_generation_path
 
@@ -799,6 +799,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     assert len(list(first_delivery.glob("attempt-*.json"))) == 4
     assert not any((first_delivery / name).exists() for name in intents)
     uploads.clear()  # the attempt uploads are already delivered; only sync's remain to count
+    assert publication.generations_left_open(experiment) == set()
 
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
@@ -1013,16 +1014,21 @@ def _summaries(uploads):
     ]
 
 
-@pytest.mark.parametrize("caller", ["own-run", "recover-run", "sync-tracking"])
+@pytest.mark.parametrize("in_flight", [True, False], ids=["in-flight", "between-trials"])
+@pytest.mark.parametrize("caller", ["own-run", "next-run", "recover-run", "sync-tracking"])
 def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
-    tmp_path, monkeypatch, caller
+    tmp_path, monkeypatch, caller, in_flight
 ):
-    """A run killed outright leaves its summary run open until recover-run or sync-tracking handles it.
+    """A run killed outright leaves its summary run open until the next run, recover-run or sync-tracking handles it.
 
-    It ends KILLED, as its run recorded no failure, and is sent once. A run's recovered delivery
-    never finishes that run's own summary run, which its terminal delivery owns.
+    It ends KILLED, as its run recorded no failure, and is sent once, whether the run was
+    killed with its trials in flight or between them, with no trial left to settle. A run's
+    recovered delivery never finishes that run's own summary run, which its terminal delivery
+    owns, and a dry run writes and sends nothing.
     """
-    experiment, uploads, _attempts = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+    experiment, uploads, _attempts = killed_sweep(
+        tmp_path, monkeypatch, n_jobs=1, in_flight=in_flight
+    )
     [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
     record = tracking_root(experiment) / generation / "delivery" / "generation.json"
     ledger = validate_ledger(experiment)
@@ -1033,15 +1039,31 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
         assert not record.exists()
         assert uploads == []
         return
-    if caller == "recover-run":
-        sent = publication.deliver_recovered_attempts(
-            experiment, ledger, generation, [generation], recovering=True
-        )
-        assert sent == {"delivered": 1, "pending": 0}
+    if caller == "next-run":
+        tree = sorted(tracking_root(experiment).rglob("*"))
+        run_experiment(experiment, dry_run=True)
+        assert (sorted(tracking_root(experiment).rglob("*")), uploads) == (tree, [])
+        reports = []
+        run_experiment(experiment, terminal_callback=reports.append)
+        # Only a trial killed in flight is rerun, so only then does the run bind its own
+        # summary run, which its publication finishes.
+        own = [(reports[0].generation_id, "FINISHED")] if in_flight else []
+        assert sorted(_summaries(uploads)) == sorted([(generation, "KILLED"), *own])
+        uploads.clear()
+        run_experiment(experiment)
+        assert uploads == []
     else:
-        assert publication.sync_tracking(experiment) == {"delivered": 1, "pending": 0}
-    publication.sync_tracking(experiment)
-    assert _summaries(uploads) == [(generation, "KILLED")]
+        if caller == "recover-run":
+            sent = publication.deliver_recovered_attempts(
+                experiment, ledger, generation, [generation], recovering=True
+            )
+            assert sent == {"delivered": 1, "pending": 0}
+        else:
+            # A finished attempt's accepted outcome was delivered before the kill.
+            delivered = 1 if in_flight else 2
+            assert publication.sync_tracking(experiment) == {"delivered": delivered, "pending": 0}
+        publication.sync_tracking(experiment)
+        assert _summaries(uploads) == [(generation, "KILLED")]
     assert read_record(record)["projection"]["summary"]["error_class"] is None
 
 

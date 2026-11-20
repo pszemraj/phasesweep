@@ -619,7 +619,8 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
     the status the failure in the generation's lifecycle record maps to, or KILLED when the
     invocation recorded no failure. A published generation's record is built from its committed
     artifacts instead, and a record already saved is kept as it is. Callers hold the experiment
-    lock and never pass their own generation, so no live invocation's summary run is ended here.
+    lock and pass no live invocation's generation: a run never passes its own, and recover-run
+    passes the run whose runner it proved dead.
 
     :param Experiment experiment: Configured experiment.
     :param Iterable[str] generation_ids: Ended generations to check.
@@ -649,22 +650,39 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
     return paths
 
 
+def generations_left_open(experiment: Experiment) -> set[str]:
+    """Name the generations whose summary run is bound but no saved record ends it.
+
+    A published generation is left out, as its record is built from its committed artifacts.
+
+    :param Experiment experiment: Configured experiment.
+    :return set[str]: Each bound, unpublished generation without a summary-run record.
+    """
+    return {
+        parent.parent.name
+        for parent in tracking_root(experiment).glob("*/generation-binding.json")
+        if not (parent.parent / "delivery" / "generation.json").exists()
+        and not _published(experiment, parent.parent.name)
+    }
+
+
 def save_recovered_attempts(
     experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
 ) -> list[Path]:
     """Save the records of attempts whose outcomes recovery committed, sending nothing.
 
     As for sync-tracking, only a generation whose summary run is bound has attempt runs to
-    finish, and a record already saved is kept as it is. A settled generation that is not
-    published also gets the record that ends its summary run, as its invocation is over. The
+    finish, and a record already saved is kept as it is. A generation that is not published
+    also gets the record that ends its summary run, as its invocation is over. The
     outcomes are already in the ledger and lifecycle records, from which sync-tracking rebuilds
     any record left unsaved, so a record that cannot be written or read costs a warning, never
     the caller's run or recovery.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
-    :param Iterable[str] generation_ids: Generations whose trials recovery settled, never the
-        caller's own.
+    :param Iterable[str] generation_ids: Ended generations: those whose trials recovery settled,
+        those left open by an invocation killed outright, and for recover-run the run it
+        recovers; never the caller's own.
     :return list[Path]: Those generations' attempt and summary-run records not yet delivered, in
         generation order, or none when they could not all be saved and read.
     """
@@ -716,7 +734,8 @@ def deliver_recovered_attempts(
     :param ValidatedLedger ledger: The ledger holding the settled trials.
     :param str generation_id: The calling run's generation, whose own attempts its terminal
         delivery sends, or for ``recover-run`` the run it recovers.
-    :param Iterable[str] generation_ids: Generations whose trials the recovery settled.
+    :param Iterable[str] generation_ids: Ended generations, as for
+        :func:`save_recovered_attempts`.
     :param bool recovering: The caller is ``recover-run``, so ``generation_id`` is the run it
         recovers rather than its own invocation: that run's records are sent with the rest, and
         the target is resolved here, as no check in this process covered it.
