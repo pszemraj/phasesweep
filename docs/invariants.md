@@ -16,8 +16,8 @@ Every path into the ledger passes through `engine.ledger`, and for the configure
 flowchart TD
     run["run: CLI or MCP runner"] --> lock["experiment lock"]
     recover["recover-run"] -->|"confirmed"| lock
-    recover -->|"inspection, no lock"| check
-    reads["status, show-winners, MCP reads"] -->|"no lock"| check
+    recover -->|"inspection, holds no lock"| check
+    reads["status, show-winners, MCP reads"] -->|"holds no lock"| check
     lock --> check
     subgraph validate["validate_ledger: writes nothing"]
         check["artifact-root binding check"] --> scan["ledger format scan<br/>unreadable is tolerated only on a bound tree"]
