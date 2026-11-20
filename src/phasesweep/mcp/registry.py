@@ -33,7 +33,7 @@ from phasesweep.config.io import (
 from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.paths import _artifact_root_identity
-from phasesweep.engine.study_policy import _require_trainer_cwd
+from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import operator_step
 from phasesweep.mcp.errors import (
     CatalogEntryInvalidError,
@@ -376,7 +376,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         )
     try:
         # The check validate runs, so an entry that loads is one validate accepts.
-        _require_trainer_cwd(config)
+        _require_launch_target(config)
     except LaunchEnvironmentError as exc:
         raise CatalogError(f"{entry.id!r}: {exc}", suggestion=operator_step(exc)) from exc
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()

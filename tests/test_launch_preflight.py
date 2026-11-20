@@ -29,7 +29,7 @@ from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.paths import _artifact_root_binding_path
 from phasesweep.engine.study_policy import (
     _launch_preflight,
-    _require_trainer_cwd,
+    _require_launch_target,
     _trial_program_refusal,
 )
 from phasesweep.engine.trial import _environment_identity, _missing_trainer_cwd
@@ -374,17 +374,17 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
     assert (result.exit_code == 0) == (program == "./train.sh"), result.output
 
 
-def test_require_trainer_cwd_leaves_a_program_found_through_path_to_the_launch(
+def test_the_any_shell_check_leaves_a_program_found_through_path_to_the_launch(
     tmp_path: Path,
 ) -> None:
-    """The shared directory-and-slash check never judges a PATH program; the launch preflight does."""
+    """Asked without a PATH, the check never judges a PATH program; the launch preflight does."""
     experiment = make_experiment(
         trial_command=f"{_MISSING} {{overrides}}",
         execution=ExecutionContext(cwd=str(tmp_path)),
         env={"PATH": "/nowhere"},
     )
 
-    _require_trainer_cwd(experiment)
+    _require_launch_target(experiment)
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on"):
         _launch_preflight(experiment, "p", None)
 

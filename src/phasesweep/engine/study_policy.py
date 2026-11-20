@@ -1251,8 +1251,12 @@ _SHELL_OWN_WORDS = frozenset(
 _PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
 
 
-def _require_launch_target(experiment: Experiment, *, path: str | None) -> None:
+def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
     """Refuse a trainer directory that does not exist or a trial program the shell cannot run.
+
+    Without ``path`` the answer is the same from any shell, so ``validate`` and the MCP
+    catalog load ask it that way. A launch passes the trainer's ``PATH`` in
+    :func:`_launch_preflight`, because the ``PATH`` that counts is the one the run starts with.
 
     :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1276,21 +1280,6 @@ def _require_launch_target(experiment: Experiment, *, path: str | None) -> None:
             f"{message} Every trial would fail before its trainer started, so none was allocated.",
             remediation=remediation,
         )
-
-
-def _require_trainer_cwd(experiment: Experiment) -> None:
-    """Refuse a trainer directory or a slash-written trial program that no shell could use.
-
-    The answer is the same from any shell, so ``validate`` and the MCP catalog check run this
-    as well as every launch, which runs it with the trainer's ``PATH`` in
-    :func:`_launch_preflight`. A program found through ``PATH`` is left to a launch, because
-    the ``PATH`` that counts is the one the run starts with.
-
-    :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
-    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host, or the
-        trial command's program is written with a ``/`` and is not an executable file.
-    """
-    _require_launch_target(experiment, path=None)
 
 
 def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tuple[str, str] | None:

@@ -67,7 +67,7 @@ from phasesweep.engine.read import (
     unpublished_winner_step,
 )
 from phasesweep.engine.run import run_experiment
-from phasesweep.engine.study_policy import _require_trainer_cwd
+from phasesweep.engine.study_policy import _require_launch_target
 from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
@@ -591,7 +591,7 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     :raises StudyStorageUnavailableError: The ledger cannot be read to check a raised target.
     """
     config = _command_config(config_path, settings=settings)
-    _require_trainer_cwd(config)
+    _require_launch_target(config)
     validate_trial_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
