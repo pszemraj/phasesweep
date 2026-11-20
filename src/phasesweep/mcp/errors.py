@@ -510,9 +510,10 @@ class RunCapacityUnknownError(McpToolError):
             )
             remaining = (
                 f" Unreadable or orphaned: {shown}{more_note}. Ask the operator to run "
-                "`pgrep -af <run-id>` on the server host for each run id and, where no runner "
-                "is alive, move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
-                f"directory{file_note}."
+                "`pgrep -af <run-id>` on the server host for each run id and, where it lists no "
+                "process of that run, runner or trial, move `runs/<run-id>.json` and "
+                f"`logs/<run-id>.*` out of the state directory{file_note}; a trial process it "
+                "still lists is settled by the next run of that experiment's config."
             )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
