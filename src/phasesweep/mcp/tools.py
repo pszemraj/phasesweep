@@ -73,6 +73,7 @@ from phasesweep.mcp.errors import (
     UnknownRunError,
     live_runner_step,
     recover_run_step,
+    runner_stop_step,
 )
 from phasesweep.mcp.failures import operator_failure, response_failure, run_failure_payload
 from phasesweep.mcp.redaction import (
@@ -1386,7 +1387,9 @@ class PhaseSweepMCP:
                 raise UnknownRunError(run_id)
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             if not self._cancel_allowed(handle):
-                raise PermissionDeniedError("cancel", handle.experiment_id)
+                raise PermissionDeniedError(
+                    "cancel", handle.experiment_id, stop_step=self._runner_stop_step(handle)
+                )
             view = self._runs.runner_view(handle)
             observation = self._runs.observe(handle, view=view)
             before = observation.state
@@ -1896,6 +1899,20 @@ class PhaseSweepMCP:
                         os.close(fd)
         assert handle is not None
         return handle
+
+    def _runner_stop_step(self, handle: RunHandle) -> str | None:
+        """Name the operator's route to stop a running run that cancel_run refuses.
+
+        :param RunHandle handle: Run whose cancellation was refused.
+        :return str | None: The route, naming the runner's PID and group when this server
+            can probe them, or ``None`` when the run is not running.
+        """
+        view = self._runs.runner_view(handle)
+        if self._runs.observe(handle, view=view).state != "running":
+            return None
+        if view.visibility == "observable":
+            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
+        return runner_stop_step(handle.run_id, None, None)
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Require both launch-time and current cancellation permission.

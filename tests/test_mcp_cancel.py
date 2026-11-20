@@ -22,6 +22,7 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.runner import _cleanup_failure_payload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
+from phasesweep.runtime import reaper
 from phasesweep.runtime.reaper import (
     read_boot_id,
     read_pid_namespace,
@@ -203,17 +204,60 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     )
     reg = registry.get("srv")
     run_id = "srv-denied"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        allow_cancel=run_allows_cancel,
+    )
+    store.create(handle)
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(run_id)
+    assert (
+        f"To stop this run, the operator can run `kill -TERM -- -{handle.pgid}` from a host "
+        f"shell, which signals runner PID {handle.pid} and its process group {handle.pgid}; "
+        "the runner handles SIGTERM as cancellation. Do not retry."
+    ) in str(denied.value)
+
+
+@pytest.mark.parametrize("runner", ["foreign_namespace", "finished"])
+def test_cancel_refusal_names_a_stop_route_only_it_can_give(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
+) -> None:
+    """A runner whose PID cannot be read here is found with pgrep; a finished run gets no stop route."""
+    config = write_srv_config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    reg = registry.get("srv")
+    run_id = "srv-denied"
+    if runner == "foreign_namespace":
+        monkeypatch.setattr(reaper, "read_pid_namespace", lambda: "pid:[4026539333]@100")
     store.create(
         make_run_handle(
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
-            allow_cancel=run_allows_cancel,
+            pid_namespace="pid:[4026539001]@100" if runner == "foreign_namespace" else None,
         )
     )
+    if runner == "finished":
+        write_run_status(store, run_id, returncode=0, result_snapshot_state="failed")
 
-    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
         app.cancel(run_id)
+
+    message = str(denied.value)
+    if runner == "finished":
+        assert "To stop this run" not in message
+    else:
+        assert (
+            f"To stop this run, the operator can run `pgrep -af {run_id}` from a host shell, take "
+            f"the PID of its `runner.py --run-id {run_id}` line and run `kill -TERM -- -<that "
+            "PID>`, since the runner leads its own process group; the runner handles SIGTERM as "
+            "cancellation. Do not retry."
+        ) in message
 
 
 def test_cancel_decataloged_run_uses_launch_time_permission(

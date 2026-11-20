@@ -64,6 +64,33 @@ def live_runner_step(pid: int | None, pgid: int | None) -> str:
     )
 
 
+def runner_stop_step(run_id: str, pid: int | None, pgid: int | None) -> str:
+    """Return the operator's route to stop a running run that ``cancel_run`` may not stop.
+
+    The runner leads its own process group and handles SIGTERM as cancellation, so a
+    group SIGTERM ends the run ``cancelled`` with its trials cleaned up.
+
+    :param str run_id: The run to stop.
+    :param int | None pid: The runner's PID when this server can probe it, else ``None``.
+    :param int | None pgid: The runner's process group when this server can probe it.
+    :return str: One sentence naming the host command.
+    """
+    if pid is not None and pgid is not None:
+        found = (
+            f"run `kill -TERM -- -{pgid}` from a host shell, which signals runner PID {pid} and "
+            f"its process group {pgid}"
+        )
+    else:
+        found = (
+            f"run `pgrep -af {run_id}` from a host shell, take the PID of its "
+            f"`runner.py --run-id {run_id}` line and run `kill -TERM -- -<that PID>`, since the "
+            "runner leads its own process group"
+        )
+    return (
+        f"To stop this run, the operator can {found}; the runner handles SIGTERM as cancellation."
+    )
+
+
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Operator-facing.
 
@@ -170,11 +197,13 @@ class InvalidPhaseError(McpToolError):
 class PermissionDeniedError(McpToolError):
     """Raised when the catalog forbids an action (launch/cancel/from_phase)."""
 
-    def __init__(self, action: str, experiment_id: str) -> None:
+    def __init__(self, action: str, experiment_id: str, *, stop_step: str | None = None) -> None:
         """Create a permission-denied tool error.
 
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
+        :param str | None stop_step: For a refused cancel of a running run, the operator's
+            route to stop it from :func:`runner_stop_step`.
         """
         # Launch-time permission caps cancellation, so a later catalog grant cannot reach
         # a run launched without it.
@@ -183,10 +212,11 @@ class PermissionDeniedError(McpToolError):
             if action == "cancel"
             else "which applies on the next call"
         )
+        stop = f" {stop_step}" if stop_step is not None else ""
         super().__init__(
             f"action {action!r} is not permitted for experiment {experiment_id!r}; "
             "this is deliberate catalog policy. Report it to the user - only the "
-            f"operator can enable it (allow.{action}: true in the catalog), {applies}. "
+            f"operator can enable it (allow.{action}: true in the catalog), {applies}.{stop} "
             "Do not retry."
         )
 
