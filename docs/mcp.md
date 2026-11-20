@@ -182,7 +182,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, heartbeat, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials`; tools do not return raw logs, and the guide points an agent with a shell on the host to these CLI reads when the user asks for per-trial data.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, heartbeat, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials` from the entry's `cwd`, with its `config` as CONFIG, since the trainer's directory is part of the study fingerprint; tools do not return raw logs, and the guide points an agent with a shell on the host to these CLI reads when the user asks for per-trial data.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
