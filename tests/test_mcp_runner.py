@@ -1574,7 +1574,8 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
             "actor": "agent",
             "remediation": (
                 "Report that recovery could not confirm this run as the current published "
-                "result. Start a new run only if the user still wants a published result."
+                "result. A new run of this experiment reuses its finished trials and "
+                "publishes their winners without training them again."
             ),
         }
 

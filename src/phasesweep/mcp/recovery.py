@@ -993,7 +993,8 @@ def _finish_result_recovery(
                 actor="agent",
                 remediation=(
                     "Report that recovery could not confirm this run as the current published "
-                    "result. Start a new run only if the user still wants a published result."
+                    "result. A new run of this experiment reuses its finished trials and "
+                    "publishes their winners without training them again."
                 ),
             ).model_dump(mode="json", exclude_none=True)
             terminal_status.pop("result_publication_state", None)

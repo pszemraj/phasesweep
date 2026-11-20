@@ -232,7 +232,10 @@ def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, 
             code="cancelled",
             retryable=True,
             actor="agent",
-            remediation="Start a new run only if the user still wants the sweep to continue.",
+            remediation=(
+                "A new run of this experiment keeps its finished trials and reruns the "
+                "interrupted ones first."
+            ),
         )
     return payload
 

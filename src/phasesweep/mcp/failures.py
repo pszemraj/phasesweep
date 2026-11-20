@@ -25,8 +25,8 @@ from phasesweep.runtime.json import JsonObject, json_object
 
 _CLEANUP_SETTLED_REMEDIATION = (
     "Operator recovery settled this run's process cleanup, so no recover-run step remains. The "
-    "run itself still ended without completing; start a new run only if the user still wants "
-    "the sweep to continue."
+    "run itself still ended without completing; a new run of this experiment keeps its finished "
+    "trials and reruns its interrupted ones first."
 )
 _RECOVER_RUN_STEP = (
     "Stop monitoring and ask the operator to run `phasesweep mcp recover-run` from a host shell, "
