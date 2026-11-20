@@ -19,6 +19,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
     ResumeWinnerMissingError,
@@ -700,6 +701,21 @@ def test_flipped_goal_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
         StudySchemaMismatchError,
         "optimizes minimize, but the current config requires maximize",
     )
+
+
+def test_study_that_publishes_into_another_workdir_is_refused_as_a_run_refuses(
+    tmp_path: Path,
+) -> None:
+    """A changed ``workdir`` over an explicit ledger is refused, not previewed as a replay."""
+    _record(_persistent(tmp_path, _phase("a", 2)), "a", _STATE.COMPLETE, _STATE.COMPLETE, target=2)
+    moved = make_experiment(
+        persistent=tmp_path,
+        workdir=tmp_path / "elsewhere",
+        phases=[_phase("a", 2)],
+        metric=bounded_metric(),
+    )
+
+    _refusals_match(moved, tmp_path, ArtifactRootConflictError, "publishes into artifact root")
 
 
 def test_malformed_failure_policy_state_in_a_skipped_phase_is_refused_as_a_run_refuses(

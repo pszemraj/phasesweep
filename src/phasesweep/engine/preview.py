@@ -20,7 +20,10 @@ from phasesweep.config.search import (
     retry_target_ceiling,
     sampler_search_space,
 )
-from phasesweep.engine.artifact_roots import _check_published_phase_studies
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_claim_needed,
+    _check_published_phase_studies,
+)
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint, _verify_fingerprint
 from phasesweep.engine.guards import _raise_collected_errors
@@ -248,9 +251,9 @@ def _refuse_as_a_launch_would(
 
     Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
     schema, and fixed-target checks using predicted recovery counts; defer target
-    and descendant checks requiring actual recovery. Preview does not verify evidence or
-    per-study artifact-root claims; :func:`_preview_phase` runs each launching phase's
-    launch preflight.
+    and descendant checks requiring actual recovery. Preview inspects each study's
+    artifact-root claim without making it, and does not verify evidence;
+    :func:`_preview_phase` runs each launching phase's launch preflight.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -259,6 +262,8 @@ def _refuse_as_a_launch_would(
         whose trial is missing from, or below the history boundary of, its study.
     :raises PublicationAccessError: The last publication cannot be read.
     :raises PublicationIntegrityError: The last publication no longer validates.
+    :raises ArtifactRootConflictError: A study publishes into another artifact root, or
+        holds trials without recording one.
     :raises StudySchemaMismatchError: A study's direction differs from the
         config's, or its failure-policy state is malformed.
     :raises TrialTargetRefusedError: A study already accepted a higher target
@@ -269,6 +274,8 @@ def _refuse_as_a_launch_would(
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
     _check_published_phase_studies(experiment, studies, from_phase=from_phase)
+    for study in studies.values():
+        _artifact_root_claim_needed(study, experiment)
     errors: list[Exception] = []
     reached = from_phase is None
     for phase in experiment.phases:

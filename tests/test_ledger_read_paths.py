@@ -27,7 +27,7 @@ import yaml
 from phasesweep import run_experiment
 from phasesweep.config.search import Sampler, grid_cardinality
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-from phasesweep.engine.errors import TrialTargetRefusedError
+from phasesweep.engine.errors import ArtifactRootConflictError, TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.preview import validate_trial_targets
@@ -81,12 +81,12 @@ READ_PATHS = (*PURE_READ_PATHS, RECOVERY_READ_PATH)
 #: text-only surface.
 _STUDY_OWNED_ELSEWHERE_PHRASE = "publishes into artifact root"
 
-#: The verdict recovery owes a ``ledger-only`` cell that every pure read path
-#: accepts. Recovery alone checks which artifact root owns each study it opens,
-#: because it reaps through them. A ``ledger-only`` read points the ledger at a
-#: workdir that never existed, so each study the ledger's own run bound belongs
-#: to another root, and recovering from there must refuse to touch it.
-_RECOVERY_LEDGER_ONLY_VERDICTS = {"ok": "study-owned-elsewhere"}
+#: The verdict a ``ledger-only`` cell owes on the paths that act for a launch: recovery,
+#: which reaps through the studies it opens, and the dry run, which refuses what a launch
+#: refuses. A ``ledger-only`` read points the ledger at a workdir that never existed, so
+#: each study the ledger's own run bound belongs to another root. Every other read path
+#: accepts the cell.
+_LAUNCH_LEDGER_ONLY_VERDICTS = {"ok": "study-owned-elsewhere"}
 
 
 def _classify_message(message: str) -> str:
@@ -190,12 +190,12 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         "cli-show-winners",
     }:
         expected = "study-absent"
+    if mode == "ledger-only" and read_path in {RECOVERY_READ_PATH, *DRY_RUN_READ_PATHS}:
+        expected = _LAUNCH_LEDGER_ONLY_VERDICTS.get(expected, expected)
     materialized = materialize(fixture_name, tmp_path, mode=mode)
     state_changes: dict[str, str] = {}
 
     if read_path == RECOVERY_READ_PATH:
-        if mode == "ledger-only":
-            expected = _RECOVERY_LEDGER_ONLY_VERDICTS.get(expected, expected)
         verdict, state_changes = _recover_inspect(materialized, tmp_path)
     else:
         attempts = forbid_file_backed_storage(
@@ -244,7 +244,10 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
                 ["show-winners", str(materialized.config_path)], monkeypatch, capsys
             )
         elif read_path == "engine-run_dry_run":
-            run_experiment(materialized.experiment, dry_run=True)
+            try:
+                run_experiment(materialized.experiment, dry_run=True)
+            except ArtifactRootConflictError as exc:
+                verdict = _classify_message(str(exc))
         elif read_path == "cli-run-dry-run":
             verdict = _cli_verdict(
                 ["run", str(materialized.config_path), "--dry-run"], monkeypatch, capsys
@@ -260,12 +263,11 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     assert state_changes == {}, f"{read_path} changed the MCP state directory: {state_changes}"
 
 
-@pytest.mark.parametrize("mode", LEDGER_MODES)
 def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
-    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The dry run replays the fixture's finished phase and hands out its real winner."""
-    materialized = materialize("current-journal", tmp_path, mode=mode)
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     attempts = forbid_file_backed_storage(monkeypatch, allow_memory_studies=True)
 
     winners = run_experiment(materialized.experiment, dry_run=True)
