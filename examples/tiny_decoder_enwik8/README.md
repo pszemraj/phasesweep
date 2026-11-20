@@ -146,6 +146,7 @@ phasesweep mcp init-catalog --from /tmp/phasesweep-tiny-decoder-mcp-smoke/experi
 ```
 
 Review the generated catalog, enable `allow.launch`, and set `visible_params: all` if the agent should report the winning learning rate. Follow the [MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke, then use the [status response workflow](../../docs/mcp.md#reading-status-responses). A completed persistent smoke is reused on a later launch; choose a new experiment name and scratch directory when you want two fresh trials.
+
 ## MCP full sweep
 
 Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp_experiment.yaml`](mcp_experiment.yaml) with the PhaseSweep repo root as its runner `cwd`:
