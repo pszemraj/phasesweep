@@ -25,8 +25,7 @@ NOT_INSTALLED_REMEDY = (
 )
 OTHER_SOURCE_REMEDY = (
     "The hooks would check that other source. Activate the environment this checkout is "
-    'installed in, or install this checkout into the active one (pip install -e ".[dev]"). '
-    "For a temporary worktree, PYTHONPATH set to its src/ selects it."
+    'installed in, or install this checkout into the active one (pip install -e ".[dev]").'
 )
 
 
