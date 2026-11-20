@@ -14,6 +14,7 @@ import yaml
 
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Constraint, ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialEvidenceMissingError
@@ -33,7 +34,7 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
@@ -633,6 +634,7 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
 def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A changed evaluator revision refuses the resume and sends the reader to a new study."""
     import phasesweep.evidence.evaluation as evaluation_ops
 
     experiment = _evidence_experiment(tmp_path)
@@ -647,9 +649,11 @@ def test_log_regex_evaluation_revision_change_blocks_study_reuse(
     with pytest.raises(
         TrialEvidenceMissingError,
         match="extractor evaluation contract.*evaluator revision",
-    ):
+    ) as excinfo:
         run_experiment(_evidence_experiment(tmp_path, n_trials=2))
 
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert _operational_error_text(excinfo.value).endswith(f"\nfix: {NEW_STUDY_STEP}")
     assert len(phase_trials(experiment)) == 1
     assert _pointer_bytes(experiment) == pointer_before
 

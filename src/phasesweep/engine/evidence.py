@@ -28,7 +28,7 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
@@ -489,7 +489,9 @@ def _verify_trial_evidence_dir(
         raise TrialEvidenceMissingError(
             f"{subject} objective evidence no longer matches its configured extractor "
             "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered."
+            "changed after this trial ran, or the saved provenance was altered.",
+            action=OperatorAction.FRESH_NAMESPACE,
+            remediation=NEW_STUDY_STEP,
         )
     capture = provenance.get("remote_capture")
     if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
