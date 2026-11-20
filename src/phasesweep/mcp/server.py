@@ -78,7 +78,7 @@ PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 # Clients may load this into every session and may show only its first line, cut at 250
 # characters, so it is one short line; the workflow rules load on demand through get_guide.
 SERVER_INSTRUCTIONS = (
-    "PhaseSweep runs hyperparameter sweeps on this machine. "
+    "PhaseSweep runs hyperparameter sweeps on the MCP server host. "
     "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
     "PhaseSweep or offer it as an option otherwise. "
     f"Call {TOOL_GET_GUIDE} before any other PhaseSweep tool."
