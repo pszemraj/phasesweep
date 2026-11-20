@@ -371,6 +371,24 @@ class LaunchInProgressError(McpToolError):
         super().__init__("another launch is in progress on this server; retry in a moment")
 
 
+class RunnerExitedBeforeReceiptError(McpToolError):
+    """Raised when the detached runner exits before it records its launch receipt."""
+
+    def __init__(self, run_id: str, returncode: int) -> None:
+        """Create a path-free launch error naming the runner's exit code.
+
+        :param str run_id: Run id whose runner exited.
+        :param int returncode: The runner's exit code, negative for the signal that ended it.
+        """
+        super().__init__(
+            f"run {run_id!r} did not start: its detached runner exited with code {returncode} "
+            "before it recorded its launch receipt, so no trial ran. Do not retry the launch. "
+            f"Ask the operator to read the runner log {run_id}.log under the MCP state "
+            "directory's logs/ and fix what it reports, often a PhaseSweep the server imports "
+            "only through PYTHONPATH, which the runner does not inherit."
+        )
+
+
 class RunLaunchUnsettledError(McpToolError):
     """Raised when cancellation has no verified runner identity to target."""
 

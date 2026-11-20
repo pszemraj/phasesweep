@@ -37,6 +37,7 @@ from phasesweep.mcp.errors import (
     ResumeNotReadyError,
     ResumePublicationUnusableError,
     RunCapacityUnknownError,
+    RunnerExitedBeforeReceiptError,
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
@@ -857,6 +858,10 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     class UnreadyProc:
         pid = os.getppid()
 
+        def wait(self, timeout: float | None = None) -> int:
+            """Stay alive: this child sends no receipt, yet has not exited."""
+            raise subprocess.TimeoutExpired("runner", timeout or 0.0)
+
     monkeypatch.setattr(mcp_tools.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
     monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
 
@@ -1174,6 +1179,39 @@ def test_launch_records_the_spawned_process_identity(
     assert handle is not None
     assert handle.boot_id == read_boot_id()
     assert handle.pid_namespace == read_pid_namespace()
+
+
+def test_runner_that_exits_before_its_receipt_names_its_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that dies at startup fails the launch with its exit code and the log to read.
+
+    The child here exits as a runner whose interpreter cannot import PhaseSweep would, before
+    it writes the ready byte; the tool error stays path-free, and the launch is recorded as
+    failed with its cleanup confirmed.
+    """
+    _config, app, _registry, store = side_effect_app(tmp_path)
+    real_popen = subprocess.Popen
+    run_ids: list[str] = []
+
+    def exiting_runner(cmd: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        run_ids.append(cmd[cmd.index("--run-id") + 1])
+        return real_popen([sys.executable, "-c", "raise SystemExit(3)"], **kwargs)
+
+    monkeypatch.setattr("phasesweep.mcp.tools.subprocess.Popen", exiting_runner)
+
+    with pytest.raises(RunnerExitedBeforeReceiptError, match="exited with code 3") as caught:
+        app.launch("srv")
+
+    (run_id,) = run_ids
+    message = str(caught.value)
+    assert f"runner log {run_id}.log under the MCP state directory's logs/" in message
+    assert str(tmp_path) not in message
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["returncode"] == 1
+    assert terminal["cleanup_confirmed"] is True
+    assert terminal["error_class"] == "RunnerExitedBeforeReceiptError"
 
 
 def test_launch_refuses_a_runner_receipt_without_boot_identity(

@@ -64,6 +64,7 @@ from phasesweep.mcp.errors import (
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     RunNamespaceMismatchError,
+    RunnerExitedBeforeReceiptError,
     RunPersistentStateUnavailableError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
@@ -1153,6 +1154,8 @@ class PhaseSweepMCP:
         :raises ExperimentBusyError: If this experiment already has a live run.
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
         :raises ConfigChangedError: If the cataloged config changed after this call's reread.
+        :raises RunnerExitedBeforeReceiptError: If the spawned runner exited before it
+            recorded its launch receipt.
         :raises RuntimeError: If no unused run id could be minted, or the spawned
             runner has no kernel process start time to make cancellation PID-reuse safe.
         """
@@ -1804,6 +1807,14 @@ class PhaseSweepMCP:
                     )
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
+                if ready == b"" and readable:
+                    # End of file before the ready byte: the runner is exiting without a receipt.
+                    try:
+                        returncode: int | None = proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = None
+                    if returncode is not None:
+                        raise RunnerExitedBeforeReceiptError(run_id, returncode)
                 if ready != LAUNCH_READY_BYTE:
                     raise RuntimeError(
                         "detached runner did not persist its launch receipt before launch"
