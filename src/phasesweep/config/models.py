@@ -57,7 +57,6 @@ from phasesweep.evidence.models import (
     WandbSummaryRequiredGate,
     _WandbSummarySource,
     compose_wandb_environment,
-    objective_evidence_assurance,
     wandb_gate_identity,
 )
 from phasesweep.runtime.commands import (
@@ -74,6 +73,7 @@ from phasesweep.runtime.files import (
     file_url_path,
     local_storage_url,
 )
+from phasesweep.runtime.json import JsonObject
 from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -127,16 +127,16 @@ class Metric(_Frozen):
         return value
 
 
-def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
+def _metric_semantics_payload(metric: Metric) -> JsonObject:
     """Return the persisted and agent-visible semantics of one metric.
 
     :param Metric metric: Configured optimization metric.
-    :return dict[str, Any]: Metric name, goal, and objective-evidence assurance.
+    :return JsonObject: Metric name, goal, and the extractor kind under ``objective_evidence``.
     """
     return {
         "name": metric.name,
         "goal": metric.goal,
-        "objective_evidence": objective_evidence_assurance(metric.extractor),
+        "objective_evidence": {"kind": metric.extractor.type},
     }
 
 

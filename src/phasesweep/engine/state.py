@@ -556,7 +556,7 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 5
+GENERATION_SUMMARY_SCHEMA_VERSION = 6
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Configuration and reproducibility files frozen into every generation namespace at claim time.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"

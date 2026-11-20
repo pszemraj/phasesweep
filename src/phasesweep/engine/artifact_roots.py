@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 14
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 15
 
 
 def _artifact_root_storage_key(experiment: Experiment) -> str | None:

@@ -1169,10 +1169,9 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         summary["metric"]["goal"] = "maximize"
         semantic_error = "metric semantics"
     elif tamper == "objective_evidence":
-        evidence = summary["metric"]["objective_evidence"]
-        flag = next(key for key, value in evidence.items() if type(value) is bool)
-        evidence[flag] = not evidence[flag]
-        semantic_error = "metric semantics"
+        assert summary["metric"]["objective_evidence"] == {"kind": "log_regex"}
+        summary["metric"]["objective_evidence"]["kind"] = "json"
+        semantic_error = "summary metric semantics disagree with the config_snapshot artifact"
     elif tamper == "config_fingerprint":
         summary["config_fingerprint"] = "0" * 64
         semantic_error = "config fingerprint"

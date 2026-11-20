@@ -195,10 +195,7 @@ ResultContext = Annotated[
             "config has since been edited. 'current_config': the represented result "
             "recorded no semantics of its own - nothing has published yet, or the "
             "represented generation's summary is absent or records another summary "
-            "schema version - so the currently loaded config describes it. Under "
-            "'represented_generation', objective_evidence still "
-            "falls back to the current extractor's assurance when the recorded summary "
-            "carries none: treat evidence flags as unproven for such a result."
+            "schema version - so the currently loaded config describes it."
         )
     ),
 ]

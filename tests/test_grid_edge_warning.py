@@ -41,7 +41,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import RESULT_SNAPSHOT_SCHEMA_VERSION, capture_result_snapshot
 from phasesweep.runtime.json import JsonValue
 from tests.conftest import (
     log_regex_provenance,
@@ -260,7 +260,7 @@ def test_cost_key_added_after_publication_is_visible_on_reads_and_replay(
         changed, generation_id=generation, engine_winners={"epochs": replayed}
     )
     assert "epochs=8" in snapshot["winners"][0]["cost_advisory"]
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == RESULT_SNAPSHOT_SCHEMA_VERSION
     assert snapshot["winners"][0]["tie_groups"][0]["params"] == {"epochs": 8}
     assert snapshot["winners"][0]["cost_advisory_status"] == "available"
     assert path.read_bytes() == saved

@@ -40,7 +40,7 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSourceKind,
 )
-from phasesweep.evidence.models import _ObjectiveEvidenceFields
+from phasesweep.evidence.models import ExtractorKind
 from phasesweep.runtime.json import JsonObject, dump_json
 
 log = logging.getLogger("phasesweep.mcp.snapshots")
@@ -50,7 +50,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[1] = 1
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[2] = 2
 
 
 class _SnapshotModel(BaseModel):
@@ -59,23 +59,21 @@ class _SnapshotModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
-class ObjectiveEvidenceSnapshot(_SnapshotModel, _ObjectiveEvidenceFields):
-    """Identity checks enforced by the configured objective extractor.
+class ObjectiveEvidenceSnapshot(_SnapshotModel):
+    """The objective extractor kind a result was produced with."""
 
-    False means unenforced. ``*_declared`` marks configured expectations;
-    ``*_value_bound`` marks enforced equality with those expectations.
-    """
+    kind: ExtractorKind
 
 
 class MetricSnapshot(_SnapshotModel):
-    """Optimization metric and objective-evidence assurance."""
+    """Optimization metric and the extractor kind that produced it."""
 
     name: str = Field(description="Metric key extracted from trial output.")
     goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
     objective_evidence: ObjectiveEvidenceSnapshot = Field(
         description=(
-            "False flags mean the identity is not enforced, not that it failed. kind names the "
-            "extractor. Only json_envelope, wandb and mlflow bind an evaluation position."
+            "kind names the extractor that produced the objective. Only json_envelope, wandb "
+            "and mlflow bind an evaluation position."
         )
     )
 
@@ -381,7 +379,7 @@ def _winner_snapshot(
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None

@@ -34,7 +34,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.evidence.models import JsonEnvelopeExtractor, objective_evidence_assurance
+from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.mcp.errors import (
     McpToolError,
     RunPersistentStateUnavailableError,
@@ -482,8 +482,6 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
     assert results.publication_integrity == "ok"
     assert results.winner_count == 1
     assert results.metric.objective_evidence.kind == kind
-    assert results.metric.objective_evidence.source_identity_keyed == (kind == "wandb")
-    assert not results.metric.objective_evidence.evaluation_policy_bound
     assert status.metric == results.metric
 
 
@@ -987,16 +985,13 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
-    """A log-scraped number must not inherit a structured extractor's guarantees.
+    """A published result reports the extractor kind it was produced with, not the current one.
 
-    Reporting the current extractor's assurance beside a historical winner
-    claims evidence properties that run never had - the one field an agent is
-    told to use when deciding how far to trust a metric.
+    A log-scraped winner labeled json_envelope after a config swap would claim a
+    reader that run never used.
     """
     run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    published_assurance = objective_evidence_assurance(
-        drift_experiment(tmp_path, trainer).metric.extractor
-    )
+    assert drift_experiment(tmp_path, trainer).metric.extractor.type == "log_regex"
 
     write_experiment_config(
         config,
@@ -1015,15 +1010,8 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     app, _registry, _store = make_mcp_app(catalog)
 
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
-    evidence = results.metric.objective_evidence.model_dump()
 
-    assert evidence == published_assurance
-    assert evidence["kind"] == "log_regex"
-    # The four guarantees the swapped-in extractor would have asserted.
-    assert evidence["objective_name_bound"] is False
-    assert evidence["split_bound"] is False
-    assert evidence["evaluation_policy_bound"] is False
-    assert evidence["source_identity_keyed"] is False
+    assert results.metric.objective_evidence.model_dump() == {"kind": "log_regex"}
     assert results.published_config_matches_current is False
 
 

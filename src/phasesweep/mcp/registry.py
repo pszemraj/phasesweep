@@ -44,6 +44,7 @@ from phasesweep.runtime.files import (
     file_sha256,
     require_supported_runtime,
 )
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
@@ -174,8 +175,11 @@ class RegisteredExperiment:
         return [phase.name for phase in self.experiment.phases]
 
     @property
-    def metric_payload(self) -> dict[str, Any]:
-        """Return the agent-visible optimization metric descriptor."""
+    def metric_payload(self) -> JsonObject:
+        """Return the agent-visible optimization metric descriptor.
+
+        :return JsonObject: Metric name, goal, and the extractor kind under ``objective_evidence``.
+        """
         return _metric_semantics_payload(self.experiment.metric)
 
     @property

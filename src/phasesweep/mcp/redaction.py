@@ -108,7 +108,7 @@ def winners_payload(
     :param Sequence[PhaseWinnerView | WinnerSnapshot] views: Live engine views or
         validated frozen winners.
     :param dict[str, Any] metric: Optimization metric and objective-evidence
-        assurance the represented generation recorded.
+        kind the represented generation recorded.
     :param list[str] declared_phases: Phase plan the represented generation
         published under, in execution order.
     :param ResultSource result_source: Whether results came from current shared

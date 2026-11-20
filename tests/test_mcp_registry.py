@@ -101,21 +101,7 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     assert summary["metric"] == {
         "name": "loss",
         "goal": "minimize",
-        "objective_evidence": {
-            "kind": "json_envelope",
-            "attempt_location_scoped": True,
-            "attempt_identity_bound": True,
-            "source_identity_keyed": False,
-            "objective_name_bound": True,
-            "split_bound": True,
-            "evaluation_policy_bound": True,
-            # mcp_experiment_config_text's json_envelope extractor declares
-            # neither checkpoint nor expected_step, so neither is value-bound.
-            "checkpoint_declared": False,
-            "checkpoint_value_bound": False,
-            "expected_step_declared": False,
-            "expected_step_value_bound": False,
-        },
+        "objective_evidence": {"kind": "json_envelope"},
     }
     assert summary["capabilities"] == {
         "launch": False,

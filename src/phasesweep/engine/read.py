@@ -102,7 +102,7 @@ from phasesweep.engine.study_policy import (
     _recovery_advice,
 )
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
-from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
+from phasesweep.evidence.models import EXTRACTOR_KINDS
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 
 log = logging.getLogger(__name__)
@@ -607,25 +607,6 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return None if plan is None else [phase.name for phase in plan]
 
 
-_OBJECTIVE_EVIDENCE_KEYS = frozenset(_ObjectiveEvidenceFields.model_fields)
-"""The ``objective_evidence`` keys, taken from the model its writers declare."""
-
-
-def _recorded_objective_evidence(candidate: object) -> JsonObject | None:
-    """Return a complete current-format assurance payload, if present.
-
-    :param object candidate: Summary ``objective_evidence`` value.
-    :return JsonObject | None: Complete recorded flags, or ``None``.
-    """
-    if not isinstance(candidate, Mapping) or set(candidate) != _OBJECTIVE_EVIDENCE_KEYS:
-        return None
-    if candidate.get("kind") not in EXTRACTOR_KINDS:
-        return None
-    if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
-        return None
-    return dict(candidate)
-
-
 def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """Read the mutable current-generation pointer's own id, or ``None``.
 
@@ -876,19 +857,22 @@ def _read_status(
         if stored_plan is not None:
             result_phase_plan = stored_plan
         stored_metric = None if summary_payload is None else summary_payload.get("metric")
+        stored_evidence = (
+            stored_metric.get("objective_evidence") if isinstance(stored_metric, Mapping) else None
+        )
         if (
             isinstance(stored_metric, Mapping)
             and isinstance(stored_metric.get("name"), str)
             and stored_metric.get("goal") in ("minimize", "maximize")
+            and isinstance(stored_evidence, Mapping)
+            and stored_evidence.get("kind") in EXTRACTOR_KINDS
         ):
-            stored_evidence = _recorded_objective_evidence(stored_metric.get("objective_evidence"))
-            if stored_evidence is not None:
-                metric_payload = {
-                    "name": stored_metric["name"],
-                    "goal": stored_metric["goal"],
-                    "objective_evidence": stored_evidence,
-                }
-                result_context = "represented_generation"
+            metric_payload = {
+                "name": stored_metric["name"],
+                "goal": stored_metric["goal"],
+                "objective_evidence": {"kind": stored_evidence["kind"]},
+            }
+            result_context = "represented_generation"
     stored_fingerprint = (
         None if summary_payload is None else summary_payload.get("config_fingerprint")
     )

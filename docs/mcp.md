@@ -176,7 +176,7 @@ With a configured [`cost_key`](config.md#repeats), a non-null `cost_advisory` id
 
 `runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone; [PID namespaces](#pid-namespaces) explains the consequences and the heartbeat.
 
-Frozen scientific reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. Interpret those fields using the [objective evidence contract](config.md#objective-evidence-constraints-and-gates).
+Frozen scientific reads need no tracking SDK, credentials, or remote access.
 
 For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Missing or null delivery information does not establish successful delivery. [Result delivery and recovery](mlflow.md#result-delivery-and-recovery) covers pending uploads and the operator's retry.
 
