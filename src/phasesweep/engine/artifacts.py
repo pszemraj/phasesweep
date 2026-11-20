@@ -72,7 +72,7 @@ def _write_yaml_atomic(path: Path, payload: Any) -> None:
 
 @contextlib.contextmanager
 def _file_log_handler(path: Path) -> Iterator[None]:
-    """Capture phasesweep logs and a routed failure's advice in the run log.
+    """Capture phasesweep logs, and a routed failure with its advice, in the run log.
 
     :param Path path: Log file path to append to.
     :raises PhaseSweepError: The operational failure raised inside the context.
@@ -95,11 +95,11 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     try:
         yield
     except PhaseSweepError as exc:
-        handler.handle(
-            logger.makeRecord(
-                logger.name, logging.ERROR, __file__, 0, "fix: %s", (operator_step(exc),), None
+        # The caller prints the error to its own stderr, so the log records it with its step.
+        for line in (str(exc), f"fix: {operator_step(exc)}"):
+            handler.handle(
+                logger.makeRecord(logger.name, logging.ERROR, __file__, 0, "%s", (line,), None)
             )
-        )
         raise
     finally:
         logger.removeHandler(handler)

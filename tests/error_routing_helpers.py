@@ -149,8 +149,10 @@ def assert_routes_declared_action(
             )
             assert failure["remediation"] == expected
         if case.id.startswith("live_abort_with_"):
-            run_log = tmp_path / "runs" / "t" / "run.log"
-            assert run_log.read_text(encoding="utf-8").count(error.remediation) == 1
+            # The run log records the failure itself and then its step, once.
+            logged = (tmp_path / "runs" / "t" / "run.log").read_text(encoding="utf-8")
+            assert logged.count(error.remediation) == 1
+            assert logged.index(str(error)) < logged.index(f"fix: {error.remediation}")
     if case.action is OperatorAction.RETRY:
         rendered = _operational_error_text(error)
         if error.remediation is None:
