@@ -497,7 +497,7 @@ def _published(experiment: Experiment, generation_id: str) -> bool:
     :param str generation_id: Generation to check.
     :return bool: Whether its lifecycle record or the last-success pointer names it published.
     """
-    from phasesweep.engine.generation import _recorded_generation_state
+    from phasesweep.engine.generation import _recorded_generation
     from phasesweep.engine.paths import _generation_record_path, _last_successful_generation_path
     from phasesweep.engine.publication_validation import _read_pointer_target
 
@@ -506,8 +506,53 @@ def _published(experiment: Experiment, generation_id: str) -> bool:
         _last_successful_generation_path(experiment), experiment_name=experiment.experiment
     )
     return (target is not None and target.generation_id == generation_id) or (
-        _recorded_generation_state(_generation_record_path(experiment, generation_id))
+        _recorded_generation(_generation_record_path(experiment, generation_id)).state
         == "published"
+    )
+
+
+def _failure_status(error_class: str | None) -> str:
+    """Name the MLflow status that ends a failed invocation's summary run.
+
+    Shutdown and keyboard interruption end it KILLED and any other failure FAILED. The class is
+    matched by name, which is all a generation's lifecycle record keeps of it.
+
+    :param str | None error_class: Class name of the invocation's failure, if it recorded one.
+    :return str: ``KILLED`` or ``FAILED``.
+    """
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown
+
+    return (
+        "KILLED"
+        if error_class in {PhaseSweepShutdown.__name__, KeyboardInterrupt.__name__}
+        else "FAILED"
+    )
+
+
+def _save_failure_summary(
+    experiment: Experiment, generation_id: str, status: str, error_class: str | None
+) -> Path:
+    """Save the record that ends an unpublished generation's summary run with ``status``.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Generation whose summary run is bound.
+    :param str status: ``FAILED`` or ``KILLED``.
+    :param str | None error_class: Class name of the invocation's failure, or ``None`` when it
+        recorded none.
+    :return Path: The summary run's delivery record, unchanged when it already exists.
+    """
+    return _save_intent(
+        experiment,
+        generation_id,
+        "generation",
+        read_binding(tracking_root(experiment) / generation_id, "generation-binding.json"),
+        _projection(
+            metrics={},
+            params={},
+            tags={"phasesweep.outcome": status},
+            summary={"generation_id": generation_id, "status": status, "error_class": error_class},
+        ),
+        finish=status,
     )
 
 
@@ -528,37 +573,19 @@ def publish_failed_generation(
     :param ValidatedLedger ledger: The invocation's ledger, holding its trials.
     """
     from phasesweep.engine.trial import _environment_identity
-    from phasesweep.runtime.shutdown import PhaseSweepShutdown
 
     parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
     if not parent_path.exists():
         return
     if _published(experiment, generation_id):
         return
-    status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
+    error_class = type(error).__name__
+    status = _failure_status(error_class)
     environment = _environment_identity(experiment, experiment.phases[0].name).values
     attempts = _unrecorded_attempts(experiment, generation_id)
     trials = _attempt_trials(ledger, {binding["phase"] for _, binding in attempts})
     paths = _save_attempt_intents(experiment, generation_id, attempts, trials, ended=status)
-    paths.append(
-        _save_intent(
-            experiment,
-            generation_id,
-            "generation",
-            read_binding(parent_path.parent, parent_path.name),
-            _projection(
-                metrics={},
-                params={},
-                tags={"phasesweep.outcome": status},
-                summary={
-                    "generation_id": generation_id,
-                    "status": status,
-                    "error_class": type(error).__name__,
-                },
-            ),
-            finish=status,
-        )
-    )
+    paths.append(_save_failure_summary(experiment, generation_id, status, error_class))
     for path in paths:
         _deliver(experiment, path, environment)
 
@@ -585,21 +612,61 @@ def _rebuild_attempt_intents(
         _save_attempt_intents(experiment, generation_id, attempts, trials, ended=None)
 
 
+def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str]) -> list[Path]:
+    """Save the summary-run record each ended, unpublished generation's invocation never saved.
+
+    An invocation killed outright saves none, so its summary run would stay open. It ends with
+    the status the failure in the generation's lifecycle record maps to, or KILLED when the
+    invocation recorded no failure. A published generation's record is built from its committed
+    artifacts instead, and a record already saved is kept as it is. Callers hold the experiment
+    lock and never pass their own generation, so no live invocation's summary run is ended here.
+
+    :param Experiment experiment: Configured experiment.
+    :param Iterable[str] generation_ids: Ended generations to check.
+    :raises OSError: A record or binding cannot be read or written.
+    :return list[Path]: The summary-run record of each of those generations that is unpublished
+        and has a bound summary run, whether saved here or before.
+    """
+    from phasesweep.engine.generation import _recorded_generation
+    from phasesweep.engine.paths import _generation_record_path
+
+    paths = []
+    for generation_id in sorted(set(generation_ids)):
+        root = tracking_root(experiment) / generation_id
+        if not (root / "generation-binding.json").is_file() or _published(
+            experiment, generation_id
+        ):
+            continue
+        path = root / "delivery" / "generation.json"
+        if not path.exists():
+            recorded = _recorded_generation(_generation_record_path(experiment, generation_id))
+            if recorded.state in {"failed", "publication_failed"}:
+                status, error_class = _failure_status(recorded.error_class), recorded.error_class
+            else:
+                status, error_class = "KILLED", None
+            _save_failure_summary(experiment, generation_id, status, error_class)
+        paths.append(path)
+    return paths
+
+
 def save_recovered_attempts(
     experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
 ) -> list[Path]:
     """Save the records of attempts whose outcomes recovery committed, sending nothing.
 
     As for sync-tracking, only a generation whose summary run is bound has attempt runs to
-    finish, and a record already saved is kept as it is. The outcomes are already in the
-    ledger, from which sync-tracking rebuilds any record left unsaved, so a record that cannot
-    be written or read costs a warning, never the caller's run or recovery.
+    finish, and a record already saved is kept as it is. A settled generation that is not
+    published also gets the record that ends its summary run, as its invocation is over. The
+    outcomes are already in the ledger and lifecycle records, from which sync-tracking rebuilds
+    any record left unsaved, so a record that cannot be written or read costs a warning, never
+    the caller's run or recovery.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
-    :param Iterable[str] generation_ids: Generations whose trials recovery settled.
-    :return list[Path]: Those generations' attempt records not yet delivered, in generation order,
-        or none when they could not all be saved and read.
+    :param Iterable[str] generation_ids: Generations whose trials recovery settled, never the
+        caller's own.
+    :return list[Path]: Those generations' attempt and summary-run records not yet delivered, in
+        generation order, or none when they could not all be saved and read.
     """
     root = tracking_root(experiment)
     generations = sorted(
@@ -609,12 +676,13 @@ def save_recovered_attempts(
     )
     try:
         _rebuild_attempt_intents(experiment, ledger, generations)
-        return [
-            path
-            for generation_id in generations
-            for path in sorted((root / generation_id / "delivery").glob("attempt-*.json"))
-            if read_record(path)["state"] != "delivered"
-        ]
+        summaries = set(_save_ended_summaries(experiment, generations))
+        records: list[Path] = []
+        for generation_id in generations:
+            delivery = root / generation_id / "delivery"
+            records += sorted(delivery.glob("attempt-*.json"))
+            records += [path for path in [delivery / "generation.json"] if path in summaries]
+        return [path for path in records if read_record(path)["state"] != "delivered"]
     except (OSError, ValueError, UnsafePrivatePathError) as exc:
         log.warning(
             "The MLflow outcomes of recovered attempts were not all saved (%s); run phasesweep "
@@ -633,9 +701,11 @@ def deliver_recovered_attempts(
     recovering: bool = False,
     tracker_unreachable: bool = False,
 ) -> dict[str, int]:
-    """Send the MLflow outcomes a recovery committed for earlier generations' attempts.
+    """Send the MLflow outcomes a recovery committed for earlier generations' attempts and runs.
 
-    Recovery itself sends nothing, so an unreachable tracker costs it no request. The records
+    Each such generation's records are its settled attempts' outcomes and, when it is not
+    published, the end of its summary run, from :func:`save_recovered_attempts`. Recovery
+    itself sends nothing, so an unreachable tracker costs it no request. The records
     go only after a target check: the one :func:`require_tracking_target` made when the calling
     run bound its own summary run, or else a resolve made here, which binds no summary run. A
     failed check or upload leaves the rest pending for sync-tracking. Every worker this starts
@@ -653,20 +723,21 @@ def deliver_recovered_attempts(
     :param bool tracker_unreachable: The caller found a tracker it could not read, so the
         records are only saved.
     :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
-    :return dict[str, int]: How many of the settled attempts' outcomes were ``delivered`` here
-        and how many stay ``pending``.
+    :return dict[str, int]: How many of those records were ``delivered`` here and how many stay
+        ``pending``.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.engine.trial import _environment_identity
 
+    # A run's own records are its terminal delivery's, which knows how the run ended.
     own = set() if recovering else {generation_id}
     paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - own)
     unsent = {"delivered": 0, "pending": len(paths)}
     if not paths:
         return unsent
     pending = (
-        f"The MLflow outcomes of {len(paths)} recovered attempt(s) stay pending; run phasesweep "
-        "sync-tracking with the same config to deliver them."
+        f"{len(paths)} MLflow outcome(s) of the recovered trials and generations stay pending; "
+        "run phasesweep sync-tracking with the same config to deliver them."
     )
     if tracker_unreachable:
         log.warning(pending)
@@ -716,8 +787,9 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     """Retry pending result projections without selecting or training.
 
     Check the artifact-root binding and ledger format as every writer does, then
-    reconcile unresolved creations, rebuild missing attempt records from Optuna
-    and winner records from committed generation artifacts.
+    reconcile unresolved creations, rebuild missing attempt records from Optuna,
+    the summary-run record of each ended unpublished generation from its lifecycle
+    record, and winner records from committed generation artifacts.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -771,7 +843,10 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
         parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
-        _rebuild_attempt_intents(experiment, ledger, [parent.parent.name for parent in parents])
+        # The lock rules out a live invocation, so every unpublished generation here has ended.
+        generations = [parent.parent.name for parent in parents]
+        _rebuild_attempt_intents(experiment, ledger, generations)
+        _save_ended_summaries(experiment, generations)
         for parent in parents:
             if (parent.parent / "delivery" / "generation.json").exists() or not _published(
                 experiment, parent.parent.name

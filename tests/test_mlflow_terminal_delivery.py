@@ -14,8 +14,7 @@ import yaml
 from optuna.trial import TrialState, create_trial
 
 from phasesweep.config.models import Experiment
-from phasesweep.engine.errors import TrackingSyncRefusedError
-from phasesweep.engine.generation import _recorded_generation_state
+from phasesweep.engine.generation import _recorded_generation
 from phasesweep.engine.ledger import (
     claim_ledger,
     open_phase_study,
@@ -430,12 +429,12 @@ def test_the_run_that_confirms_an_attempts_cleanup_finishes_its_managed_run(tmp_
     journal = tmp_path / "study.journal"
     before = journal.read_bytes()
 
-    # While its cleanup is unresolved, the attempt reports nothing: there is nothing to deliver.
+    # While its cleanup is unresolved, the attempt reports nothing; only the failed run's summary
+    # run is finished, as that run recorded.
     uploads.clear()
-    with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
-        publication.sync_tracking(experiment)
+    assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 1}
     assert not record.exists()
-    assert uploads == []
+    assert [(r["name"], r["finish"]) for r in uploads] == [("generation", "FAILED")]
     assert journal.read_bytes() == before
 
     run_experiment(experiment)
@@ -507,6 +506,8 @@ def test_failure_projection_outage_preserves_error_and_retries(tmp_path, monkeyp
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 1}
     assert requests[0] == requests[1]
+    # sync-tracking sends the saved summary record as it is and never rebuilds it.
+    assert read_record(record_path) == {**record, "state": "delivered"}
 
 
 def test_uncertain_cleanup_never_enqueues_terminal_projection(tmp_path, monkeypatch):
@@ -602,7 +603,7 @@ def test_failure_publisher_preserves_historical_generation_outcome(
     assert pointer.read_bytes() == pointer_before
     assert published_generation_id(experiment) == newer_generation
     assert (
-        _recorded_generation_state(_generation_record_path(experiment, generation))
+        _recorded_generation(_generation_record_path(experiment, generation)).state
         == recorded_state
     )
     if recorded_state == "published":
@@ -676,7 +677,7 @@ def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch
     assert report.cleanup_confirmed is (failure != "worker")
     assert report.cleanup_error is (error if failure == "worker" else None)
     assert read_status(experiment)["published_generation_id"] == generation
-    assert _recorded_generation_state(_generation_record_path(experiment, generation)) == (
+    assert _recorded_generation(_generation_record_path(experiment, generation)).state == (
         "published"
     )
     assert (
@@ -808,6 +809,7 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
 
     assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 7}
     assert all((first_delivery / name).exists() for name in intents)
+    assert read_record(first_delivery / "generation.json")["finish"] == "FINISHED"
     assert sorted(request["name"] for request in uploads) == [
         "generation",
         "winner-depth",
@@ -1002,11 +1004,53 @@ def _sent(uploads, attempts):
     return [request["finish"] for request in uploads if request["name"] in names]
 
 
+def _summaries(uploads):
+    """Return the generation and finish status of each summary-run upload, in upload order."""
+    return [
+        (request["projection"]["summary"]["generation_id"], request["finish"])
+        for request in uploads
+        if request["name"] == "generation"
+    ]
+
+
+@pytest.mark.parametrize("caller", ["own-run", "recover-run", "sync-tracking"])
+def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
+    tmp_path, monkeypatch, caller
+):
+    """A run killed outright leaves its summary run open until recover-run or sync-tracking handles it.
+
+    It ends KILLED, as its run recorded no failure, and is sent once. A run's recovered delivery
+    never finishes that run's own summary run, which its terminal delivery owns.
+    """
+    experiment, uploads, _attempts = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+    [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
+    record = tracking_root(experiment) / generation / "delivery" / "generation.json"
+    ledger = validate_ledger(experiment)
+    uploads.clear()
+    if caller == "own-run":
+        sent = publication.deliver_recovered_attempts(experiment, ledger, generation, [generation])
+        assert sent == {"delivered": 0, "pending": 0}
+        assert not record.exists()
+        assert uploads == []
+        return
+    if caller == "recover-run":
+        sent = publication.deliver_recovered_attempts(
+            experiment, ledger, generation, [generation], recovering=True
+        )
+        assert sent == {"delivered": 1, "pending": 0}
+    else:
+        assert publication.sync_tracking(experiment) == {"delivered": 1, "pending": 0}
+    publication.sync_tracking(experiment)
+    assert _summaries(uploads) == [(generation, "KILLED")]
+    assert read_record(record)["projection"]["summary"]["error_class"] is None
+
+
 def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch):
     """Recovery commits what a killed run left RUNNING without contacting the tracker.
 
     While MLflow is down the next run makes one request, its target check, and leaves each
-    settled attempt's record pending; sync-tracking then sends each exactly once.
+    settled attempt's record pending, and the killed run's summary-run record; sync-tracking
+    then sends each exactly once.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -1031,20 +1075,27 @@ def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch)
     assert [read_record(delivery / f"attempt-{a}.json")["state"] for a in attempts] == [
         "pending"
     ] * 3
+    assert read_record(delivery / "generation.json")["state"] == "pending"
 
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     uploads.clear()
     publication.sync_tracking(experiment)
     assert _sent(uploads, attempts) == ["KILLED"] * 3
+    assert _summaries(uploads) == [(generation, "KILLED")]
     uploads.clear()
     publication.sync_tracking(experiment)
-    assert _sent(uploads, attempts) == []
+    assert uploads == []
 
 
 def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_path, monkeypatch):
-    """A run that reaches MLflow sends each outcome its recovery committed once, after the target check."""
+    """A run that reaches MLflow sends each outcome its recovery committed once, after the target check.
+
+    The killed run's summary run ends KILLED with them, and the run's own summary run still ends
+    as its own publication does.
+    """
     experiment, uploads, attempts = killed_sweep(tmp_path, monkeypatch, n_jobs=3)
+    [killed] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
     respond = session.request_operation
     requests = []
 
@@ -1055,13 +1106,17 @@ def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_pat
     monkeypatch.setattr(session, "request_operation", logged)
     monkeypatch.setattr(worker, "request_operation", logged)
     uploads.clear()
-    run_experiment(experiment)
+    reports = []
+    run_experiment(experiment, terminal_callback=reports.append)
     assert _sent(uploads, attempts) == ["KILLED"] * 3
     first_send = min(requests.index(f"publish:attempt-{attempt}") for attempt in attempts)
     assert requests.index("resolve:") < first_send
+    assert sorted(_summaries(uploads)) == sorted(
+        [(killed, "KILLED"), (reports[0].generation_id, "FINISHED")]
+    )
     uploads.clear()
     publication.sync_tracking(experiment)
-    assert _sent(uploads, attempts) == []
+    assert uploads == []
 
 
 def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_attempt(

@@ -18,6 +18,7 @@ from optuna.trial import TrialState
 
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.engine.cleanup as cleanup_module
+import phasesweep.engine.generation as generation_module
 import phasesweep.engine.guards as guards_module
 import phasesweep.engine.phase as phase_module
 from phasesweep.config.models import Experiment
@@ -29,7 +30,7 @@ from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.mlflow import compile_query
 from phasesweep.runtime import process
 from phasesweep.tracking import mlflow as worker
-from phasesweep.tracking import session
+from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import _capture
 
 
@@ -352,8 +353,9 @@ class RunnerKilled(BaseException):
 def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
     """Leave ``n_jobs`` managed attempts RUNNING, as a runner killed with them in flight does.
 
-    Each attempt's managed run exists; the trainers never start, no outcome is recorded and no
-    reconciliation runs.
+    Each attempt's managed run and the generation's summary run exist; the trainers never
+    start, no outcome is recorded and no reconciliation runs. None of the run's failure
+    handling runs either, so it records no failed state and finishes no MLflow run.
 
     :param str | None generation_id: The killed run's generation, as an MCP runner names it.
     :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
@@ -379,8 +381,14 @@ def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
         patch.setattr(phase_module, "launch_trial", dies)
         patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
         patch.setattr(guards_module, "_reconcile_existing_studies", lambda *args, **kwargs: None)
+        patch.setattr(
+            generation_module, "_persist_failed_state_unless_recorded", lambda *args: None
+        )
+        patch.setattr(publication, "publish_failed_generation", lambda *args: None)
+        patch.setattr(publication, "deliver_recovered_attempts", lambda *args, **kwargs: None)
         with pytest.raises(RunnerKilled):
             run_experiment(experiment, generation_id=generation_id)
+    assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
     trials = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert [trial.state for trial in trials] == [TrialState.RUNNING] * n_jobs
     return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]

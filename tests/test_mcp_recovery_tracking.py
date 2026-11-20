@@ -9,7 +9,6 @@ from click.testing import Result
 
 from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _retire_active_attempt
-from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
@@ -69,9 +68,9 @@ class _RecoveredRun:
         write_unsafe_cleanup_status(store, _RUN_ID)
         monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
 
-    def recover(self) -> Result:
-        """Run a confirmed recover-run on the run."""
-        return recover_run_cli(self.state_dir, _RUN_ID, confirm=True)
+    def recover(self, *, confirm: bool = True) -> Result:
+        """Run recover-run on the run, confirmed unless ``confirm`` is False."""
+        return recover_run_cli(self.state_dir, _RUN_ID, confirm=confirm)
 
     @property
     def record(self) -> Path:
@@ -83,6 +82,10 @@ class _RecoveredRun:
     def sent(self) -> list[object]:
         """Return the finish status of each upload of the attempt so far."""
         return [r["finish"] for r in self.uploads if r["name"] == f"attempt-{self.attempt}"]
+
+    def summaries(self) -> list[object]:
+        """Return the finish status of each upload of the run's summary run so far."""
+        return [r["finish"] for r in self.uploads if r["name"] == "generation"]
 
 
 def _killed_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RecoveredRun:
@@ -148,30 +151,40 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
 ) -> None:
     """A confirmed recover-run sends each settled attempt's outcome once, after one target check, and counts it.
 
-    A RUNNING attempt ends KILLED. A failed attempt whose cleanup recovery confirms ends FAILED,
-    whether its registry entry or only its trial is left to confirm it. That confirmation lives
-    in the study's cleanup ledger, never in a rewritten trial, and nothing is sent before it.
+    A RUNNING attempt ends KILLED, and so does the summary run of the run killed with it. A
+    failed attempt whose cleanup recovery confirms ends FAILED, whether its registry entry or
+    only its trial is left to confirm it. That confirmation lives in the study's cleanup ledger,
+    never in a rewritten trial, and nothing of the attempt is sent before it; sync-tracking
+    can finish the failed run's summary run FAILED before. A preview writes and sends nothing.
     """
     if source == "running":
         run = _killed_run(tmp_path, monkeypatch)
         finish = "KILLED"
+        run.uploads.clear()
     else:
         run = _uncertain_run(tmp_path, monkeypatch, retired=source == "uncertain-retired")
         finish = "FAILED"
         run.uploads.clear()
-        with pytest.raises(TrackingSyncRefusedError, match="No tracking deliveries exist"):
-            publication.sync_tracking(run.experiment, _RUN_ID)
-        assert run.sent() == []
+        assert publication.sync_tracking(run.experiment, _RUN_ID) == {"pending": 0, "delivered": 1}
+        assert (run.sent(), run.summaries()) == ([], [finish])
     requests = _logged_requests(monkeypatch, down=False)
-    run.uploads.clear()
+    root = tracking_root(run.experiment)
+    before = sorted(root.rglob("*"))
+
+    preview = run.recover(confirm=False)
+
+    assert preview.exit_code == 0, preview.output
+    assert (requests, sorted(root.rglob("*"))) == ([], before)
 
     confirmed = run.recover()
 
     assert confirmed.exit_code == 0, confirmed.output
-    assert requests == ["resolve", "publish"]
-    assert run.sent() == [finish]
-    assert "Delivered 1 MLflow outcome(s) of the recovered trials; none stay pending." in (
-        confirmed.output
+    sends = 2 if source == "running" else 1
+    assert requests == ["resolve"] + ["publish"] * sends
+    assert (run.sent(), run.summaries()) == ([finish], [finish])
+    assert (
+        f"Delivered {sends} MLflow outcome(s) of the recovered trials and generations; none stay "
+        "pending." in confirmed.output
     )
     assert _PENDING_STEP not in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
@@ -185,7 +198,7 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
     journal = tmp_path / "study.journal"
     before = journal.read_bytes()
     publication.sync_tracking(run.experiment)
-    assert run.sent() == [finish]
+    assert (run.sent(), run.summaries()) == ([finish], [finish])
     assert journal.read_bytes() == before
 
 
@@ -209,20 +222,21 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert "Delivered 0 MLflow outcome(s) of the recovered trials; 1 stay pending." in (
-        confirmed.output
+    assert (
+        "Delivered 0 MLflow outcome(s) of the recovered trials and generations; 2 stay pending."
+        in confirmed.output
     )
     assert _PENDING_STEP in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
-    assert delivery["pending"] == 1
+    assert delivery["pending"] == 2
     assert f"`phasesweep sync-tracking CONFIG --generation {_RUN_ID}`" in delivery["remedy"]
 
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     publication.sync_tracking(run.experiment)
     publication.sync_tracking(run.experiment)
-    assert run.sent() == ["KILLED"]
+    assert (run.sent(), run.summaries()) == (["KILLED"], ["KILLED"])
 
 
 @pytest.mark.integration

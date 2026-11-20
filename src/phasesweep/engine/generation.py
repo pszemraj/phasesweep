@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -194,18 +195,29 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
         log.exception(message)
 
 
-def _recorded_generation_state(record_path: Path) -> str | None:
-    """Read one lifecycle record's state label, or ``None`` when unreadable.
+@dataclass(frozen=True)
+class _RecordedGeneration:
+    """The state label and failure class one lifecycle record holds, each ``None`` if absent."""
+
+    state: str | None
+    error_class: str | None
+
+
+def _recorded_generation(record_path: Path) -> _RecordedGeneration:
+    """Read one lifecycle record's state label and failure class.
 
     :param Path record_path: Immutable lifecycle record YAML path.
-    :return str | None: The recorded ``state`` string, or ``None`` when the
-        record is missing, unreadable, or malformed.
+    :return _RecordedGeneration: The recorded ``state`` and ``error_class`` strings, each
+        ``None`` when the record is missing, unreadable, or malformed, or lacks it.
     """
     payload = artifact_io.read_yaml_or_none(record_path)
     if not isinstance(payload, dict):
-        return None
-    state = payload.get("state")
-    return state if isinstance(state, str) else None
+        return _RecordedGeneration(None, None)
+    state, error_class = payload.get("state"), payload.get("error_class")
+    return _RecordedGeneration(
+        state if isinstance(state, str) else None,
+        error_class if isinstance(error_class, str) else None,
+    )
 
 
 def _write_generation_state(
@@ -250,7 +262,7 @@ def _write_generation_state(
             log.warning(
                 "Refusing to rewrite terminal generation %s record (existing state %r, attempted %r)",
                 generation_id,
-                _recorded_generation_state(record_path),
+                _recorded_generation(record_path).state,
                 state,
             )
     if publish_current:

@@ -307,7 +307,7 @@ def recover_run(
                 pending = delivery["pending"]
                 emit(
                     f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered "
-                    "trials; "
+                    "trials and generations; "
                     + (
                         f"{pending} stay pending. Once the tracker is reachable, run "
                         "`phasesweep sync-tracking CONFIG` with the config this run launched "
