@@ -251,7 +251,7 @@ def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
 def _registered_nested_config(tmp_path: Path, body: str) -> tuple[RegisteredExperiment, Path]:
     """Register an experiment whose configuration lives below the catalog directory."""
     config_dir = tmp_path / "configs"
-    config_dir.mkdir()
+    config_dir.mkdir(exist_ok=True)
     config = _write(config_dir / "exp.yaml", body)
     return Registry.load(_catalog(tmp_path, config)).get("reg_ok"), config_dir
 
@@ -266,6 +266,7 @@ def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) ->
 
 def test_relative_execution_cwd_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
     """A relative trainer cwd names one directory for the CLI and the detached runner."""
+    (tmp_path / "configs" / "trainer").mkdir(parents=True)
     registered, config_dir = _registered_nested_config(
         tmp_path,
         _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
@@ -285,7 +286,9 @@ def test_relative_journal_resolves_against_the_config_for_mcp(tmp_path: Path) ->
 
 
 def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
+    """An absolute execution.cwd that exists is kept as the trainer's directory."""
     trainer_cwd = tmp_path / "trainer"
+    trainer_cwd.mkdir()
     config = _write(
         tmp_path / "exp.yaml",
         _experiment_yaml(tmp_path) + f"execution:\n  cwd: {trainer_cwd}\n",

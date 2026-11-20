@@ -114,7 +114,7 @@ def test_init_catalog_leaves_cwd_to_each_config_outside_the_catalog_directory(
     registry = Registry.load(output)
     for project in projects:
         assert registry.get(project.name).cwd == project.resolve()
-        assert f"ok    (read-only)  cwd {project.resolve()}\n" in result.output
+        assert f"ok    (read-only)  trainer cwd {project.resolve()}\n" in result.output
 
 
 def test_init_catalog_honors_umask(tmp_path: Path) -> None:

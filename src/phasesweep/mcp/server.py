@@ -1116,7 +1116,8 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
 
     An entry that fails to load does not stop startup: it is reported on stderr and the
     server serves the entries that load, with launches refused until the catalog fully
-    validates. A catalog-level failure stops startup.
+    validates. Each served entry's trainer directory is logged at info level, so ``serve``
+    shows it and ``call`` stays quiet. A catalog-level failure stops startup.
 
     :param Path catalog: Operator-authored catalog file.
     :param int log_level: Logging level for the selected server transport.
@@ -1144,6 +1145,12 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
         return None
     for failure in registry.failures:
         _report_startup_failure(failure.error or "", failure.suggestion)
+    for experiment in registry:
+        log.info(
+            "serving experiment %s: trainer cwd %s",
+            experiment.id,
+            experiment.experiment.execution.resolved_cwd(),
+        )
     return registry
 
 

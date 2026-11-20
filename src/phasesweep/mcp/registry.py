@@ -16,6 +16,7 @@ import os
 import shlex
 import stat
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -30,7 +31,10 @@ from phasesweep.config.io import (
     load_experiment_bytes,
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
+from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.paths import _artifact_root_identity
+from phasesweep.engine.study_policy import _require_trainer_cwd
+from phasesweep.errors import operator_step
 from phasesweep.mcp.errors import (
     CatalogEntryInvalidError,
     CatalogError,
@@ -328,7 +332,8 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
-        config cannot be parsed, or its storage is not persistent.
+        config cannot be parsed, its storage is not persistent, or ``phasesweep validate``
+        would refuse its trainer directory.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -365,6 +370,11 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         config = config.model_copy(
             update={"execution": config.execution.model_copy(update={"cwd": str(cwd)})}
         )
+    try:
+        # The check validate runs, so an entry that loads is one validate accepts.
+        _require_trainer_cwd(config)
+    except LaunchEnvironmentError as exc:
+        raise CatalogError(f"{entry.id!r}: {exc}", suggestion=operator_step(exc)) from exc
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     return RegisteredExperiment(
         id=entry.id,
@@ -427,15 +437,16 @@ def _claim_catalog_entry_identity(
 class CatalogCheckEntry:
     """Operator-facing validation verdict for one catalog entry.
 
-    ``cwd`` is the resolved directory the entry's runner and trainer start in; it is set
-    for entries that loaded.
+    ``trainer_cwd`` is the resolved directory the entry's trainer starts in: its
+    ``execution.cwd``, or the entry's runner ``cwd`` when that is unset. It is set for
+    entries that loaded.
     """
 
     experiment_id: str
     error: str | None = None
     suggestion: str | None = None
     actions: tuple[str, ...] = ()
-    cwd: Path | None = None
+    trainer_cwd: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -510,7 +521,13 @@ def _load_catalog_entries(
                 )
                 if allowed
             )
-            verdicts.append(CatalogCheckEntry(entry.id, actions=actions, cwd=registered.cwd))
+            verdicts.append(
+                CatalogCheckEntry(
+                    entry.id,
+                    actions=actions,
+                    trainer_cwd=registered.experiment.execution.resolved_cwd(),
+                )
+            )
     return items, tuple(verdicts)
 
 
@@ -568,6 +585,13 @@ class Registry:
         :return int: Number of catalog entries.
         """
         return len(self._items)
+
+    def __iter__(self) -> Iterator[RegisteredExperiment]:
+        """Iterate the registered experiments in catalog order.
+
+        :return Iterator[RegisteredExperiment]: Entries that loaded.
+        """
+        return iter(self._items.values())
 
     @classmethod
     def load(

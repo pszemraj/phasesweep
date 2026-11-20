@@ -1369,7 +1369,8 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     """Print a per-experiment ok/FAIL table for an MCP catalog check.
 
     Operator-facing: messages and suggestions may include paths. Each ok line ends with the
-    directory that entry's runner starts in.
+    directory that entry's trainer starts in: its ``execution.cwd``, or the entry's ``cwd``
+    when that is unset.
 
     :param CatalogCheckReport report: Collected per-entry catalog verdicts.
     """
@@ -1377,7 +1378,9 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     for entry in report.entries:
         if entry.ok:
             actions = f"({', '.join(entry.actions)})" if entry.actions else "(read-only)"
-            click.echo(f"{entry.experiment_id:<{width}}  ok    {actions}  cwd {entry.cwd}")
+            click.echo(
+                f"{entry.experiment_id:<{width}}  ok    {actions}  trainer cwd {entry.trainer_cwd}"
+            )
             continue
         message = (entry.error or "").removeprefix(f"{entry.experiment_id!r}: ")
         click.echo(f"{entry.experiment_id:<{width}}  FAIL  {message}")

@@ -38,7 +38,7 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert report.ok
     assert [entry.experiment_id for entry in report.entries] == ["alpha", "beta"]
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
-    assert all(entry.cwd == tmp_path.resolve() for entry in report.entries)
+    assert all(entry.trainer_cwd == tmp_path.resolve() for entry in report.entries)
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
     Registry.load(catalog)
@@ -331,7 +331,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
     assert "(launch)" in ok_result.output
-    assert f"cwd {tmp_path.resolve()}" in ok_result.output
+    assert f"trainer cwd {tmp_path.resolve()}" in ok_result.output
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
 
@@ -349,6 +349,29 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "fix:" in fail_result.output
     # The good entry is still reported ok even though a sibling failed.
     assert "tiny2" in fail_result.output
+
+
+def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_path: Path) -> None:
+    """The ok line shows where the trainer starts, its execution.cwd when set, and an entry whose execution.cwd is missing fails with validate's fix."""
+    (tmp_path / "trainer").mkdir()
+    pinned = mcp_experiment_config_text(tmp_path, name="pinned") + "execution:\n  cwd: ./trainer\n"
+    missing = mcp_experiment_config_text(tmp_path, name="missing") + "execution:\n  cwd: ./nope\n"
+    catalog = write_mcp_config_catalog(tmp_path, {"pinned": pinned, "missing": missing})
+
+    report = check_catalog(catalog)
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+
+    pinned_entry, missing_entry = report.entries
+    assert pinned_entry.trainer_cwd == (tmp_path / "trainer").resolve()
+    assert f"trainer cwd {(tmp_path / 'trainer').resolve()}" in result.output
+    assert not missing_entry.ok
+    assert "which is not a directory on this host" in (missing_entry.error or "")
+    assert (
+        missing_entry.suggestion
+        == "Create that directory, or set execution.cwd to an existing one."
+    )
+    assert "fix: Create that directory, or set execution.cwd to an existing one." in result.output
+    assert result.exit_code == 2
 
 
 def test_mcp_check_prints_a_fix_for_every_failing_entry(tmp_path: Path) -> None:
