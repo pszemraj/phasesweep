@@ -976,6 +976,190 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     assert [r for r in uploads if r["name"] == f"attempt-{attempt}"] == []
 
 
+class _RunnerKilled(BaseException):
+    """Stands in for the orchestrator dying, which no handler of the run may observe."""
+
+
+def _killed_sweep(tmp_path, monkeypatch, *, n_jobs):
+    """Leave ``n_jobs`` managed attempts RUNNING, as a runner killed with them in flight does.
+
+    Each attempt's managed run exists; the trainers never start, no outcome is recorded and no
+    reconciliation runs.
+
+    :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
+    """
+    import threading
+
+    from phasesweep.engine import guards as guards_module
+    from phasesweep.engine import phase as phase_module
+
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(
+        n_trials=n_jobs,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        sampler={"type": "random", "seed": 1},
+        search_space={"model.depth": {"type": "categorical", "choices": [1, 2, 3]}},
+    )
+    experiment = Experiment.model_validate(config)
+    in_flight = threading.Barrier(n_jobs)
+
+    def dies(*args, **kwargs):
+        in_flight.wait(10)
+        raise _RunnerKilled()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(phase_module, "launch_trial", dies)
+        patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        patch.setattr(guards_module, "_reconcile_existing_studies", lambda *args, **kwargs: None)
+        with pytest.raises(_RunnerKilled):
+            run_experiment(experiment)
+    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert [trial.state for trial in trials] == [TrialState.RUNNING] * n_jobs
+    return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
+
+
+def _sent(uploads, attempts):
+    """Return the finish status of each upload to one of ``attempts``, in upload order."""
+    names = {f"attempt-{attempt}" for attempt in attempts}
+    return [request["finish"] for request in uploads if request["name"] in names]
+
+
+def test_recovery_sends_nothing_to_a_tracker_that_is_down(tmp_path, monkeypatch):
+    """Recovery commits what a killed run left RUNNING without contacting the tracker.
+
+    While MLflow is down the next run makes one request, its target check, and leaves each
+    settled attempt's record pending; sync-tracking then sends each exactly once.
+    """
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+    from phasesweep.tracking.mlflow import OperationUnavailableError
+
+    experiment, uploads, attempts = _killed_sweep(tmp_path, monkeypatch, n_jobs=3)
+    respond = session.request_operation
+    requests = []
+
+    def down(request, **kwargs):
+        requests.append(request["action"])
+        raise OperationUnavailableError("tracking server unreachable")
+
+    monkeypatch.setattr(session, "request_operation", down)
+    monkeypatch.setattr(worker, "request_operation", down)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    assert requests == ["resolve"]
+    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert all(_trial_interrupted(trial) for trial in trials)
+    [generation] = {trial.user_attrs[GENERATION_ID_ATTR] for trial in trials}
+    delivery = tracking_root(experiment) / generation / "delivery"
+    assert [read_record(delivery / f"attempt-{a}.json")["state"] for a in attempts] == [
+        "pending"
+    ] * 3
+
+    monkeypatch.setattr(session, "request_operation", respond)
+    monkeypatch.setattr(worker, "request_operation", respond)
+    uploads.clear()
+    publication.sync_tracking(experiment)
+    assert _sent(uploads, attempts) == ["KILLED"] * 3
+    uploads.clear()
+    publication.sync_tracking(experiment)
+    assert _sent(uploads, attempts) == []
+
+
+def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_path, monkeypatch):
+    """A run that reaches MLflow sends each outcome its recovery committed once, after the target check."""
+    experiment, uploads, attempts = _killed_sweep(tmp_path, monkeypatch, n_jobs=3)
+    respond = session.request_operation
+    requests = []
+
+    def logged(request, **kwargs):
+        requests.append(request["action"] + ":" + request.get("name", ""))
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", logged)
+    monkeypatch.setattr(worker, "request_operation", logged)
+    uploads.clear()
+    run_experiment(experiment)
+    assert _sent(uploads, attempts) == ["KILLED"] * 3
+    first_send = min(requests.index(f"publish:attempt-{attempt}") for attempt in attempts)
+    assert requests.index("resolve:") < first_send
+    uploads.clear()
+    publication.sync_tracking(experiment)
+    assert _sent(uploads, attempts) == []
+
+
+def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_attempt(
+    tmp_path, monkeypatch
+):
+    """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports."""
+    experiment, _uploads, [attempt] = _killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+    deliver = publication.call_tracking
+
+    def leaked(*args, **kwargs):
+        if args[2].get("name") == f"attempt-{attempt}":
+            raise UnsafeProcessCleanupError("upload worker may still be alive")
+        return deliver(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "call_tracking", leaked)
+    reports = []
+    run_experiment(experiment, terminal_callback=reports.append)
+    [report] = reports
+    assert not report.cleanup_confirmed
+    assert attempt not in report.uncertain_attempt_ids
+    [recovered] = [
+        trial
+        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
+    ]
+    assert recovered.state == TrialState.FAIL
+
+
+@pytest.mark.parametrize("stage", ["before-saving", "before-sending"])
+def test_a_run_killed_before_delivering_a_recovered_outcome_leaves_it_for_sync(
+    tmp_path, monkeypatch, stage
+):
+    """A runner killed between recovery's commit and the upload loses no outcome and sends none twice."""
+    experiment, uploads, [attempt] = _killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+    with monkeypatch.context() as patch:
+        if stage == "before-saving":
+            patch.setattr(
+                publication,
+                "_rebuild_attempt_intents",
+                lambda *args, **kwargs: (_ for _ in ()).throw(_RunnerKilled()),
+            )
+        else:
+            deliver = publication._deliver
+
+            def killed_at_send(experiment, path, environment):
+                if path.stem == f"attempt-{attempt}":
+                    raise _RunnerKilled()
+                return deliver(experiment, path, environment)
+
+            patch.setattr(publication, "_deliver", killed_at_send)
+        with pytest.raises(_RunnerKilled):
+            run_experiment(experiment)
+    [recovered] = [
+        trial
+        for trial in read_phase_trials(validate_ledger(experiment), "depth").trials
+        if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt
+    ]
+    assert _trial_interrupted(recovered)
+    record = (
+        tracking_root(experiment)
+        / recovered.user_attrs[GENERATION_ID_ATTR]
+        / "delivery"
+        / f"attempt-{attempt}.json"
+    )
+    assert record.exists() is (stage == "before-sending")
+    uploads.clear()
+    run_experiment(experiment)
+    publication.sync_tracking(experiment)
+    publication.sync_tracking(experiment)
+    assert _sent(uploads, [attempt]) == ["KILLED"]
+    assert read_record(record)["state"] == "delivered"
+
+
 def _tree_listing(root):
     """List every entry below ``root`` with its size and modification time."""
     return {

@@ -520,10 +520,13 @@ def require_tracking_target(
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> None:
-    """Resolve the MLflow target before allocating a phase's trials.
+    """Resolve the MLflow target before a phase allocates trials or a run sends to it.
+
+    A generation whose summary run is bound only resolves the target, so a run that launches
+    nothing checks it under such a generation before sending recovered outcomes.
 
     :param Experiment experiment: MLflow-backed experiment.
-    :param str generation_id: Current invocation identity.
+    :param str generation_id: Generation whose summary run is bound first unless it already is.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Phase/run deadline; reaching it stays a timeout.
     :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.

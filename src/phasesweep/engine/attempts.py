@@ -48,7 +48,6 @@ from phasesweep.engine.state import (
 from phasesweep.errors import (
     OperatorAction,
     ProcessCleanupUncertainError,
-    UnsafeProcessCleanupError,
     format_mismatch,
 )
 from phasesweep.runtime.files import (
@@ -99,6 +98,9 @@ class _PreflightCleanupReport:
     """First reason a tracker could not be read in this pass, from an extraction or the run
     that just stopped on it. Once set, later extractions in the pass skip their read, so an
     outage costs one read."""
+    settled_generations: set[str] = field(default_factory=set)
+    """Generations whose stale trials this pass made terminal. Recovery sends nothing to a
+    tracker; the run delivers those attempts' MLflow outcomes once it has reached it."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -1269,15 +1271,17 @@ def _fail_stale_running_trial(
 
     Re-extract a confirmed successful trainer through its producing configuration.
     Otherwise preserve failures or record an interruption. The outcome and cleanup
-    ledger precede Optuna's terminal transition, which then reaches the attempt's
-    MLflow run as a live trial's outcome does.
+    ledger precede Optuna's terminal transition. Recovery contacts no tracker: the
+    settled generation goes on ``report``, and the run delivers its attempts' MLflow
+    outcomes from the ledger once it has reached the tracker.
 
     :param optuna.Study study: Study containing ``trial``.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial whose attempt
         can no longer leak a process.
     :param _AttemptRecord | None record: Attempt record for recovering completed evidence.
     :param Path | None artifact_root: Artifact root containing the producing config snapshot.
-    :param _PreflightCleanupReport | None report: Collector for newly recovered completed results.
+    :param _PreflightCleanupReport | None report: Collector for newly recovered completed
+        results and for the generations whose trials were settled.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
     :return bool: Whether the trial became terminal; False retains completed training during
@@ -1287,8 +1291,6 @@ def _fail_stale_running_trial(
     :raises StudyStorageUnavailableError: The outcome, the recovery ledger, or
         the terminal state could not be recorded; the trial is left RUNNING
         rather than committed without its outcome.
-    :raises UnsafeProcessCleanupError: The worker delivering the committed outcome to MLflow
-        may still be alive.
     """
     try:
         trial = study._storage.get_trial(trial._trial_id)
@@ -1296,71 +1298,24 @@ def _fail_stale_running_trial(
         raise StudyStorageUnavailableError(
             f"Recovery of stale RUNNING trial {trial.number} in study {study.study_name!r} could not reload its durable outcome before settlement. The trial remains RUNNING for retry."
         ) from exc
+    recovered = False
     if record is not None and artifact_root is not None:
-        recovered = _recover_completed_trial(
+        extracted = _recover_completed_trial(
             study, trial, record=record, artifact_root=artifact_root, report=report
         )
-        if recovered is None:
+        if extracted is None:
             return False
-        if recovered:
-            _publish_recovered_outcome(study, trial, record=record, artifact_root=artifact_root)
-            return True
-    _record_stale_trial_outcome(study, trial)
-    _record_cleanup_recovery(study, trial)
-    try:
-        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-    except Exception as exc:
-        raise StudyStorageUnavailableError(failure_message) from exc
-    if record is not None and artifact_root is not None:
-        _publish_recovered_outcome(study, trial, record=record, artifact_root=artifact_root)
+        recovered = extracted
+    if not recovered:
+        _record_stale_trial_outcome(study, trial)
+        _record_cleanup_recovery(study, trial)
+        try:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        except Exception as exc:
+            raise StudyStorageUnavailableError(failure_message) from exc
+    if report is not None and record is not None and record.generation_id is not None:
+        report.settled_generations.add(record.generation_id)
     return True
-
-
-def _publish_recovered_outcome(
-    study: optuna.Study,
-    trial: optuna.trial.FrozenTrial,
-    *,
-    record: _AttemptRecord,
-    artifact_root: Path,
-) -> None:
-    """Mirror the outcome recovery just committed to the attempt's MLflow run.
-
-    The producing configuration names the target, as for extraction. A delivery that
-    fails keeps its record pending, or leaves it for sync-tracking to rebuild from the
-    ledger; it never fails the recovery, whose outcome is already committed.
-
-    :param optuna.Study study: Study whose trial recovery just made terminal.
-    :param optuna.trial.FrozenTrial trial: That trial, as it was before settlement.
-    :param _AttemptRecord record: The trial's attempt identity and directory.
-    :param Path artifact_root: Owning artifact root containing generation snapshots.
-    :raises UnsafeProcessCleanupError: The upload worker may still be alive.
-    """
-    from phasesweep.engine.trial import _environment_identity
-    from phasesweep.tracking.publication import publish_trial
-    from phasesweep.tracking.session import BINDING_FILE
-
-    if record.generation_id is None or not (record.trial_dir / BINDING_FILE).is_file():
-        return
-    try:
-        experiment = _load_generation_experiment(artifact_root, record.generation_id)
-        if experiment.mlflow is None:
-            return
-        environment = _environment_identity(
-            experiment, record.phase_name, require_wandb_online=False
-        ).values
-        settled = study._storage.get_trial(trial._trial_id)
-        publish_trial(experiment, record.generation_id, settled, environment)
-    except UnsafeProcessCleanupError:
-        raise
-    except Exception as exc:
-        # The outcome is committed and sync-tracking rebuilds a missing record from the
-        # ledger, so a failed mirror is reported, never raised.
-        log.warning(
-            "MLflow outcome of recovered attempt %s was not delivered (%s). "
-            "Run phasesweep sync-tracking with the same config to deliver it.",
-            record.attempt_id,
-            exc,
-        )
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:

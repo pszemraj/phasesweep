@@ -24,6 +24,7 @@ from phasesweep.tracking.session import (
     read_binding,
     read_inherits,
     read_record,
+    require_tracking_target,
     resolve_pending_creations,
     tracking_root,
     write_record,
@@ -568,6 +569,88 @@ def _rebuild_attempt_intents(
     trials = _attempt_trials(ledger, phases)
     for generation_id, attempts in unrecorded.items():
         _save_attempt_intents(experiment, generation_id, attempts, trials, ended=None)
+
+
+def save_recovered_attempts(
+    experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
+) -> list[Path]:
+    """Save the records of attempts whose outcomes recovery committed, sending nothing.
+
+    As for sync-tracking, only a generation whose summary run is bound has attempt runs to
+    finish, and a record already saved is kept as it is.
+
+    :param Experiment experiment: Configured experiment.
+    :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
+    :param Iterable[str] generation_ids: Generations whose trials recovery settled.
+    :return list[Path]: Those generations' attempt records not yet delivered, in generation order.
+    """
+    root = tracking_root(experiment)
+    generations = sorted(
+        generation_id
+        for generation_id in set(generation_ids)
+        if (root / generation_id / "generation-binding.json").is_file()
+    )
+    _rebuild_attempt_intents(experiment, ledger, generations)
+    return [
+        path
+        for generation_id in generations
+        for path in sorted((root / generation_id / "delivery").glob("attempt-*.json"))
+        if read_record(path)["state"] != "delivered"
+    ]
+
+
+def deliver_recovered_attempts(
+    experiment: Experiment,
+    ledger: ValidatedLedger,
+    generation_id: str,
+    generation_ids: Iterable[str],
+    *,
+    tracker_unreachable: bool = False,
+) -> None:
+    """Send the MLflow outcomes this run's recovery committed for earlier generations' attempts.
+
+    Recovery itself sends nothing, so an unreachable tracker costs it no request. The records
+    go only after a target check: the one :func:`require_tracking_target` made when this run
+    bound its own summary run, or else one made here under a settled generation whose summary
+    run is bound, which only resolves the target. A failed check or upload leaves the rest
+    pending for sync-tracking.
+
+    :param Experiment experiment: Configured experiment.
+    :param ValidatedLedger ledger: The run's ledger, holding the settled trials.
+    :param str generation_id: This run's generation, whose own attempts its terminal delivery sends.
+    :param Iterable[str] generation_ids: Generations whose trials this run's recovery settled.
+    :param bool tracker_unreachable: The run stopped because a tracker could not be read, so
+        the records are only saved.
+    :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
+    """
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+    from phasesweep.engine.trial import _environment_identity
+
+    paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - {generation_id})
+    if not paths:
+        return
+    pending = (
+        f"The MLflow outcomes of {len(paths)} recovered attempt(s) stay pending; run phasesweep "
+        "sync-tracking with the same config to deliver them."
+    )
+    if tracker_unreachable:
+        log.warning(pending)
+        return
+    environment = _environment_identity(experiment, experiment.phases[0].name).values
+    if not (tracking_root(experiment) / generation_id / "generation-binding.json").is_file():
+        try:
+            require_tracking_target(
+                experiment,
+                generation_id=paths[0].parent.parent.name,
+                environment=environment,
+                deadline=None,
+            )
+        except TrackingTargetUnavailableError as exc:
+            log.warning("%s %s", exc, pending)
+            return
+    for path in paths:
+        if not _deliver(experiment, path, environment):
+            return
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
