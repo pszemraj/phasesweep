@@ -245,11 +245,31 @@ def test_mcp_call_requires_mcp_extra(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert not (tmp_path / "state").exists()
 
 
-def test_mcp_call_catalog_error_exits_2(tmp_path: Path) -> None:
-    """A catalog entry that fails startup validation exits 2, as ``serve`` does."""
+def test_mcp_call_serves_the_entries_that_load_when_one_fails(tmp_path: Path) -> None:
+    """A failing entry is reported with its fix on stderr and marks the catalog stale; the rest is served."""
     catalog = write_mcp_config_catalog(
-        tmp_path, {"srv": mcp_experiment_config_text(tmp_path, with_storage=False)}
+        tmp_path,
+        {
+            "srv": mcp_experiment_config_text(tmp_path, with_storage=False),
+            "other": mcp_experiment_config_text(tmp_path, name="other"),
+        },
     )
+
+    result = _mcp_call(catalog, TOOL_LIST_EXPERIMENTS)
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert [entry["id"] for entry in payload["experiments"]] == ["other"]
+    assert payload["catalog_status"]["stale"] is True
+    assert payload["catalog_status"]["reload_refusal"] == "invalid"
+    assert result.stderr.startswith("phasesweep mcp: 'srv': storage must be persistent")
+    assert "\nfix: use a persistent local ledger" in result.stderr
+
+
+def test_mcp_call_catalog_level_error_exits_2(tmp_path: Path) -> None:
+    """A catalog that cannot be parsed exits 2 before any tool exists, as ``serve`` does."""
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text("not: [valid catalog\n")
 
     result = _mcp_call(catalog, TOOL_LIST_EXPERIMENTS)
 

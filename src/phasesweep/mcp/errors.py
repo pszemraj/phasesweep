@@ -17,8 +17,11 @@ CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Operator-facing.
 
-    Fatal at startup; a running server that cannot reload an edited catalog keeps
-    serving reads from the last valid one and refuses launches.
+    A catalog-level error (unreadable or malformed catalog, unusable ``state_dir``,
+    unsupported host) is fatal at startup. An entry error fails only that entry: the
+    server starts on the entries that load and refuses launches, and a running server
+    that cannot reload an edited catalog keeps serving reads from the last valid one and
+    refuses launches.
     """
 
     def __init__(self, message: str, *, suggestion: str | None = None) -> None:
@@ -50,6 +53,27 @@ class UnknownExperimentError(McpToolError):
         super().__init__(
             f"unknown experiment id {experiment_id!r}; call "
             "list_experiments and use an id from its response"
+        )
+
+
+class CatalogEntryInvalidError(UnknownExperimentError):
+    """Raised when a tool references a catalog entry that failed to load.
+
+    A subclass of :class:`UnknownExperimentError` so run reads that fall back to a saved
+    snapshot when an id is not served treat a failed entry the same way.
+    """
+
+    def __init__(self, experiment_id: str) -> None:
+        """Create a failed-entry tool error without paths or validation detail.
+
+        :param str experiment_id: Agent-supplied catalog id whose entry failed to load.
+        """
+        McpToolError.__init__(
+            self,
+            f"experiment {experiment_id!r} is in the catalog but its entry failed to load, so "
+            "this server cannot serve it. Ask the operator to run `phasesweep mcp check` and "
+            "fix it; the server rereads the catalog on the next call. Do not retry until the "
+            "operator reports the fix.",
         )
 
 
@@ -124,13 +148,17 @@ class ConfigChangedError(McpToolError):
 
 
 class CatalogReloadRefusedError(McpToolError):
-    """Raised by launch while the server's latest reread of an edited catalog was refused."""
+    """Raised by launch while the catalog or a config it lists does not fully validate.
+
+    That is the case for the latest refused reread of an edited catalog, and from startup
+    when an entry failed to load.
+    """
 
     def __init__(self, reason: CatalogReloadRefusal) -> None:
         """Create a refused-reload tool error.
 
-        :param CatalogReloadRefusal reason: ``invalid`` when the edited catalog or a config
-            it lists failed validation; ``state_dir_changed`` when it names another state
+        :param CatalogReloadRefusal reason: ``invalid`` when the catalog or a config it
+            lists fails validation; ``state_dir_changed`` when it names another state
             directory than the one this server was started with.
         """
         if reason == "state_dir_changed":
@@ -143,12 +171,12 @@ class CatalogReloadRefusedError(McpToolError):
             )
         else:
             message = (
-                "the catalog or an experiment config it lists was edited and no longer "
-                "validates, so this server refuses launches and inspection of changed configs "
-                "until it is fixed; other reads keep using the last valid catalog and saved "
-                "run snapshots. Ask the operator to fix it; `phasesweep mcp "
-                "check` shows what fails. The server rereads the catalog on the next call. "
-                "Do not retry until the operator reports the fix."
+                "the catalog or an experiment config it lists does not validate, so this server "
+                "refuses launches and inspection of changed configs until it is fixed; other "
+                "reads keep using the entries that loaded and saved run snapshots. Ask the "
+                "operator to fix it; `phasesweep mcp check` shows what fails. The server "
+                "rereads the catalog on the next call. Do not retry until the operator "
+                "reports the fix."
             )
         super().__init__(message)
 

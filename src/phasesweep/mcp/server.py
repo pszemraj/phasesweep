@@ -1106,8 +1106,23 @@ def _open_app(registry: Registry, transport: AuditTransport) -> PhaseSweepMCP:
     return PhaseSweepMCP(registry, RunStore(registry.state_dir), audit=audit)
 
 
+def _report_startup_failure(error: str, suggestion: str | None) -> None:
+    """Print one catalog failure for the operator, with its fix when there is one.
+
+    :param str error: Failure description; may reference paths.
+    :param str | None suggestion: Concrete fix, printed on its own ``fix:`` line.
+    """
+    print(f"phasesweep mcp: {error}", file=sys.stderr)
+    if suggestion:
+        print(f"fix: {suggestion}", file=sys.stderr)
+
+
 def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
     """Configure stderr logging and load a catalog when MCP support is installed.
+
+    An entry that fails to load does not stop startup: it is reported on stderr and the
+    server serves the entries that load, with launches refused until the catalog fully
+    validates. A catalog-level failure stops startup.
 
     :param Path catalog: Operator-authored catalog file.
     :param int log_level: Logging level for the selected server transport.
@@ -1129,10 +1144,13 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
         return None
 
     try:
-        return Registry.load(catalog)
+        registry = Registry.load(catalog, collect_errors=True)
     except CatalogError as exc:
-        print(f"phasesweep mcp: {exc}", file=sys.stderr)
+        _report_startup_failure(str(exc), exc.suggestion)
         return None
+    for failure in registry.failures:
+        _report_startup_failure(failure.error or "", failure.suggestion)
+    return registry
 
 
 def serve(catalog: Path) -> int:
@@ -1143,7 +1161,7 @@ def serve(catalog: Path) -> int:
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or
-        catalog validation failed before the server could run.
+        catalog-level validation failed before the server could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.INFO)
     if registry is None:
@@ -1161,7 +1179,7 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     :param JsonObject arguments: Tool arguments, validated by the tool's own schema.
     :return int: Process exit code: 0 after the result is printed on stdout (JSON, or
         the text of ``get_guide``), 1 after a tool error is printed on stderr, and 2 when
-        a startup prerequisite or the catalog failed before the tool could run.
+        a startup prerequisite or the catalog as a whole failed before the tool could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.WARNING)
     if registry is None:

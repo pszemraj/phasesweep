@@ -48,6 +48,7 @@ from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
+    CatalogEntryInvalidError,
     CatalogError,
     CatalogReloadRefusal,
     CatalogReloadRefusedError,
@@ -310,7 +311,10 @@ def _phase_gained_winner(baseline: tuple[Any, ...], snapshot: tuple[Any, ...]) -
 
 @dataclass(frozen=True)
 class _CatalogReloadRefusal:
-    """The latest refused reread of an edited catalog, kept until a reread succeeds."""
+    """Why launches are refused: a refused reread of an edited catalog, or a start with failed entries.
+
+    Kept until a reread succeeds.
+    """
 
     reason: CatalogReloadRefusal
     detail: str
@@ -336,7 +340,13 @@ class PhaseSweepMCP:
         self._state_dir = registry.state_dir
         # Tool calls run on worker threads; one lock serializes the edit check and swap.
         self._registry_lock = threading.Lock()
-        self._reload_refusal: _CatalogReloadRefusal | None = None
+        # A registry started with failed entries is the refused state: launches stay refused
+        # until a reload validates every entry.
+        self._reload_refusal: _CatalogReloadRefusal | None = (
+            _CatalogReloadRefusal("invalid", registry.failures[0].error or "")
+            if registry.failures
+            else None
+        )
         self._runs = runs
         self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
 
@@ -344,12 +354,13 @@ class PhaseSweepMCP:
         """Reread the catalog when its file or a listed config changed, and return what to serve.
 
         The check hashes the catalog file and every config the held registry lists. An
-        unchanged catalog keeps the held registry. A changed one is reloaded through
-        :meth:`Registry.load`, bound to this server's state directory, and swapped in
-        whole. A reload that fails keeps the held registry, which reads keep serving,
-        and returns the refusal that launch reports. A reload writes nothing, and its
-        failure never escapes this method. Each new refusal and each reload is logged
-        once for the operator, with paths.
+        unchanged catalog keeps the held registry; a registry that started with failed
+        entries is never unchanged, so each call retries the reload. A changed one is
+        reloaded through :meth:`Registry.load`, failing fast and bound to this server's
+        state directory, and swapped in whole. A reload that fails keeps the held
+        registry, which reads keep serving, and returns the refusal that launch reports.
+        A reload writes nothing, and its failure never escapes this method. Each new
+        refusal and each reload is logged once for the operator, with paths.
 
         :return tuple[Registry, _CatalogReloadRefusal | None]: Registry to serve, and
             the refusal of the latest reread or ``None`` when the registry is current.
@@ -373,8 +384,8 @@ class PhaseSweepMCP:
                 )
                 if refusal != self._reload_refusal:
                     log.warning(
-                        "catalog reload refused; reads keep the last valid catalog and launches "
-                        "are refused until %s: %s",
+                        "catalog reload refused; reads keep the entries already loaded and "
+                        "launches are refused until %s: %s",
                         "the MCP server restarts"
                         if refusal.reason == "state_dir_changed"
                         else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
@@ -590,12 +601,15 @@ class PhaseSweepMCP:
 
         :param str experiment_id: Catalog id whose latest run should be resolved.
         :return dict[str, Any]: Path-free result with one computed run or ``found=false``.
+        :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
         """
-        reg = self._serving_registry().get(experiment_id)
-        handle = self._runs.latest_run_for(reg.id)
+        # Only the id and the run store are needed, so an entry that failed to load still answers.
+        with contextlib.suppress(CatalogEntryInvalidError):
+            self._serving_registry().get(experiment_id)
+        handle = self._runs.latest_run_for(experiment_id)
         run = self._run_payload(handle) if handle is not None else None
         return {
-            "experiment_id": reg.id,
+            "experiment_id": experiment_id,
             "found": run is not None,
             "run": run,
             "catalog_status": self._catalog_status(),
@@ -1838,11 +1852,13 @@ class PhaseSweepMCP:
         """Require both launch-time and current cancellation permission.
 
         A catalog edit may revoke permission but cannot grant it. Decataloged runs retain their
-        launch-time permission.
+        launch-time permission, and so do runs of an entry that failed to load: its current
+        permission is unknown, so it counts as removed.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
         :return bool: Whether both launch-time and current permission are true,
-            or the launch-time permission alone when the id is no longer cataloged.
+            or the launch-time permission alone when the id is no longer cataloged or its
+            entry failed to load.
         """
         if not handle.allow_cancel:
             return False

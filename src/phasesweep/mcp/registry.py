@@ -1,8 +1,11 @@
 """Load an operator-authored experiment catalog.
 
-Experiment IDs map to validated configs and absolute paths resolved at load. Invalid
-entries refuse server startup. A running server reloads the catalog through
-:meth:`Registry.load` when the catalog file or a listed config changes on disk.
+Experiment IDs map to validated configs and absolute paths resolved at load. A server
+starts through :meth:`Registry.load` with ``collect_errors=True``, so an invalid entry
+fails alone: the entries that load are served, the failed ones are kept in
+:attr:`Registry.failures`, and launches stay refused until every entry validates. A
+running server reloads the catalog through :meth:`Registry.load`, failing fast, when
+the catalog file or a listed config changes on disk, or while any entry has failed.
 """
 
 from __future__ import annotations
@@ -27,7 +30,12 @@ from phasesweep.config.io import (
 )
 from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.paths import _artifact_root_identity
-from phasesweep.mcp.errors import CatalogError, StateDirChangedError, UnknownExperimentError
+from phasesweep.mcp.errors import (
+    CatalogEntryInvalidError,
+    CatalogError,
+    StateDirChangedError,
+    UnknownExperimentError,
+)
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -495,7 +503,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
 
 
 class Registry:
-    """Immutable id -> RegisteredExperiment map, the server state dir, and the catalog it came from."""
+    """Immutable id -> RegisteredExperiment map with the failed entries, state dir and source catalog."""
 
     def __init__(
         self,
@@ -505,6 +513,7 @@ class Registry:
         *,
         catalog_path: Path,
         catalog_sha256: str,
+        failures: tuple[CatalogCheckEntry, ...] = (),
     ) -> None:
         """Create an immutable registry from already validated entries.
 
@@ -513,11 +522,14 @@ class Registry:
         :param int max_concurrent_runs: Maximum live sweeps allowed across all entries.
         :param Path catalog_path: Absolute catalog file the entries were loaded from.
         :param str catalog_sha256: SHA-256 of the catalog bytes the entries were loaded from.
+        :param tuple[CatalogCheckEntry, ...] failures: Verdicts of the entries that failed to
+            load, none of whose ids are in ``items``.
         """
         self.state_dir = state_dir
         self.max_concurrent_runs = max_concurrent_runs
         self.catalog_path = catalog_path
         self.catalog_sha256 = catalog_sha256
+        self.failures = failures
         self._items = items
 
     def __len__(self) -> int:
@@ -528,7 +540,13 @@ class Registry:
         return len(self._items)
 
     @classmethod
-    def load(cls, catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
+    def load(
+        cls,
+        catalog_path: Path,
+        *,
+        bound_state_dir: Path | None = None,
+        collect_errors: bool = False,
+    ) -> Registry:
         """Load validated experiments with persistent local journal storage.
 
         A running server reloads an edited catalog by passing the state directory its
@@ -538,13 +556,15 @@ class Registry:
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :param Path | None bound_state_dir: State directory a running server is bound
             to, or ``None`` at startup, which provisions the catalog's own.
+        :param bool collect_errors: Keep an entry that fails validation in ``failures``
+            and load the others, instead of raising the first entry error.
         :return Registry: Immutable registry of validated catalog entries.
         :raises StateDirChangedError: If ``bound_state_dir`` is given and the catalog
             resolves ``state_dir`` to another directory.
         :raises CatalogError: If the host is not a supported Linux or macOS MCP host, the
-            catalog cannot be parsed, an id is duplicated, an entry fails
-            validation, two entries claim one engine namespace, or the state
-            directory cannot be prepared.
+            catalog cannot be parsed, the state directory cannot be prepared, or, unless
+            ``collect_errors``, an id is duplicated, an entry fails validation, or two
+            entries claim one engine namespace.
         """
         require_supported_mcp_host()
         catalog, base, catalog_sha256 = _parse_catalog(catalog_path)
@@ -556,7 +576,11 @@ class Registry:
                     f"server keeps its runs in {bound_state_dir}; restart the MCP server to "
                     "serve the new state_dir"
                 )
-        items, _ = _load_catalog_entries(catalog, base, collect_errors=False)
+        items, verdicts = _load_catalog_entries(catalog, base, collect_errors=collect_errors)
+        failures = tuple(verdict for verdict in verdicts if not verdict.ok)
+        for failure in failures:
+            # A repeated id fails its second entry; the id is then served by neither.
+            items.pop(failure.experiment_id, None)
         if bound_state_dir is None:
             state_dir = _prepare_state_dir(base, catalog.state_dir)
         return cls(
@@ -565,15 +589,22 @@ class Registry:
             max_concurrent_runs=catalog.max_concurrent_runs,
             catalog_path=catalog_path.absolute(),
             catalog_sha256=catalog_sha256,
+            failures=failures,
         )
 
     def unchanged_on_disk(self) -> bool:
         """Whether the catalog file and every config it lists still hold the loaded bytes.
 
-        A file that can no longer be read counts as changed, so a reload reports why.
+        A file that can no longer be read counts as changed, so a reload reports why. A
+        registry with failed entries is never unchanged: a failed entry's config is not
+        hashed, and a fix that changes no file, such as creating a missing ``cwd``
+        directory, must still be noticed.
 
-        :return bool: True when no current digest differs from the one recorded at load.
+        :return bool: True when every entry loaded and no current digest differs from the
+            one recorded at load.
         """
+        if self.failures:
+            return False
         if _current_sha256(self.catalog_path) != self.catalog_sha256:
             return False
         return all(
@@ -585,8 +616,12 @@ class Registry:
 
         :param str experiment_id: Agent-visible catalog id.
         :return RegisteredExperiment: Validated registry entry for the id.
+        :raises CatalogEntryInvalidError: If the catalog has an entry with that id that failed
+            to load.
         :raises UnknownExperimentError: If no catalog entry has that id.
         """
+        if any(failure.experiment_id == experiment_id for failure in self.failures):
+            raise CatalogEntryInvalidError(experiment_id)
         try:
             return self._items[experiment_id]
         except KeyError:

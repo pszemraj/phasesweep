@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
+from phasesweep.mcp.errors import CatalogEntryInvalidError, CatalogError, UnknownExperimentError
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from tests.conftest import REPO
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
@@ -405,6 +405,41 @@ def test_unknown_id_raises(tmp_path: Path) -> None:
     registry = Registry.load(_catalog(tmp_path, config))
     with pytest.raises(UnknownExperimentError):
         registry.get("does-not-exist")
+
+
+def test_collecting_load_records_failed_entries_and_serves_the_rest(tmp_path: Path) -> None:
+    """A failing entry is recorded and refused by id while the others load; it is never unchanged."""
+    good = _write(tmp_path / "good.yaml", _experiment_yaml(tmp_path, name="good"))
+    bad = _write(tmp_path / "bad.yaml", _experiment_yaml(tmp_path, name="bad", with_storage=False))
+    catalog = write_mcp_catalog(tmp_path, {"good": good, "bad": bad})
+    with pytest.raises(CatalogError, match="storage must be persistent"):
+        Registry.load(catalog)
+
+    registry = Registry.load(catalog, collect_errors=True)
+
+    assert [failure.experiment_id for failure in registry.failures] == ["bad"]
+    assert "storage must be persistent" in (registry.failures[0].error or "")
+    assert [summary["id"] for summary in registry.summaries()] == ["good"]
+    assert registry.get("good").id == "good"
+    with pytest.raises(CatalogEntryInvalidError, match="failed to load") as caught:
+        registry.get("bad")
+    assert str(tmp_path) not in str(caught.value)
+    assert registry.unchanged_on_disk() is False
+    assert Registry.load(write_mcp_catalog(tmp_path, {"good": good})).unchanged_on_disk()
+
+
+def test_collecting_load_serves_neither_entry_of_a_repeated_id(tmp_path: Path) -> None:
+    good = _write(tmp_path / "good.yaml", _experiment_yaml(tmp_path, name="good"))
+    catalog = write_mcp_catalog(tmp_path, {"good": good})
+    catalog.write_text(catalog.read_text() + f"  - id: good\n    config: {good}\n")
+
+    registry = Registry.load(catalog, collect_errors=True)
+
+    assert [failure.experiment_id for failure in registry.failures] == ["good"]
+    assert "duplicate catalog id" in (registry.failures[0].error or "")
+    assert len(registry) == 0
+    with pytest.raises(CatalogEntryInvalidError):
+        registry.get("good")
 
 
 @pytest.mark.parametrize(
