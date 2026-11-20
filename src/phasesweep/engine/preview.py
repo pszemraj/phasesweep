@@ -213,7 +213,10 @@ def validate_trial_targets(experiment: Experiment) -> None:
     the matrix size for a grid) needs the ledger, since only recorded failures can justify it.
     The attempts are counted as a launch counts them after its recovery: a RUNNING attempt
     that recovery settles as failed counts as finished. One whose completed trainer evidence
-    awaits recovery counts as unfinished, since validation recovers nothing.
+    awaits recovery also counts as a failure, the verdict that allows the most retries,
+    because validation recovers nothing and a launch's extraction may still record one. So a
+    target is refused only when a launch refuses it whatever those verdicts turn out to be,
+    and a launch enforces the real ceiling once it has recovered the evidence.
 
     :param Experiment experiment: Config whose targets may retry recorded failures.
     :raises TrialTargetRefusedError: A fixed configuration or grid requests more attempts
@@ -232,10 +235,12 @@ def validate_trial_targets(experiment: Experiment) -> None:
     for phase in phases:
         study = studies[phase.name]
         trials = [] if study is None else study.get_trials(deepcopy=False)
+        recovered = _recovered_running_states(trials)
         _validate_fixed_configuration_target(
             phase,
             finished=_finished_trial_count(trials)
-            + _recovered_running_states(trials).count("FAIL"),
+            + recovered.count("FAIL")
+            + recovered.count("EVIDENCE_PENDING"),
             measured=_measured_trial_count(trials),
             has_study=study is not None,
         )

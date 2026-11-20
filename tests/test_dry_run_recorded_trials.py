@@ -827,24 +827,47 @@ def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path
             check(_two_cell_grid(tmp_path, 5))
 
 
-def test_validate_counts_pending_evidence_as_unfinished_without_refusing(tmp_path: Path) -> None:
-    """Validation recovers nothing, so completed evidence awaiting extraction is not counted yet."""
-    experiment = _two_cell_grid(tmp_path, 2)
-    _record(experiment, "g", _STATE.FAIL, target=2)
-    directory = tmp_path / "pending"
+def _add_pending_evidence(experiment: Experiment, phase: str, directory: Path) -> None:
+    """Add a RUNNING trial whose trainer exited cleanly, so its evidence awaits extraction."""
     directory.mkdir()
     write_attempt_lifecycle(
         directory, attempt_id="pending", state="exited", return_code=0, duration_seconds=1.0
     )
-    phase_study(experiment, "g").add_trial(
+    phase_study(experiment, phase).add_trial(
         optuna.trial.create_trial(
             state=_STATE.RUNNING,
             user_attrs={ATTEMPT_ID_ATTR: "pending", TRIAL_DIR_ATTR: str(directory)},
         )
     )
 
-    validate_trial_targets(_two_cell_grid(tmp_path, 3))
-    with pytest.raises(TrialTargetRefusedError, match="allow at most 3"):
-        validate_trial_targets(_two_cell_grid(tmp_path, 4))
+
+def test_validate_counts_pending_evidence_as_the_failure_a_run_may_record(tmp_path: Path) -> None:
+    """A grid's pending evidence may settle as a failure, which buys a retry, so validate allows it."""
+    experiment = _two_cell_grid(tmp_path, 2)
+    _record(experiment, "g", _STATE.FAIL, target=2)
+    _add_pending_evidence(experiment, "g", tmp_path / "pending")
+
+    validate_trial_targets(_two_cell_grid(tmp_path, 4))
+    with pytest.raises(TrialTargetRefusedError, match="allow at most 4"):
+        validate_trial_targets(_two_cell_grid(tmp_path, 5))
     with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
         run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
+
+
+def test_validate_allows_the_retry_a_fixed_configurations_pending_evidence_may_justify(
+    tmp_path: Path,
+) -> None:
+    """A run recovers the evidence first, and a failure there allows the retry validate must not refuse."""
+
+    def fixed(n_trials: int) -> Experiment:
+        return _persistent(tmp_path, _phase("f", n_trials, fixed=True))
+
+    _record(fixed(1), "f", target=1)
+    _add_pending_evidence(fixed(1), "f", tmp_path / "pending")
+
+    validate_trial_targets(fixed(2))
+    with pytest.raises(TrialTargetRefusedError, match="1 failed attempt") as caught:
+        validate_trial_targets(fixed(3))
+    assert caught.value.remediation == "Use n_trials at most 2, not 3."
+    with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
+        run_experiment(fixed(2), dry_run=True)
