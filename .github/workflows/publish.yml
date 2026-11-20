@@ -65,9 +65,9 @@ jobs:
             {scm.git.describe_command = ["git", "describe", "--dirty", "--tags",
             "--long", "--abbrev=40", "--exact-match", "--match",
             "${{ github.event.release.tag_name }}"]}
-        run: python -m build
+        run: pyproject-build
       - name: Check distribution metadata
-        run: python -m twine check --strict dist/*
+        run: twine check --strict dist/*
       - name: Verify distribution versions
         env:
           EXPECTED_VERSION: ${{ steps.release.outputs.version }}
