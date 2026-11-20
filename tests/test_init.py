@@ -190,7 +190,7 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert f"phasesweep run {config} --dry-run" in result.output
         assert f"phasesweep status {config} --trials" in result.output
         assert f"phasesweep mcp init-catalog --from {config}" in result.output
-        assert "phasesweep explain" in result.output
+        assert "phasesweep explain lists the top-level config keys" in result.output
 
         config_path = Path(config).resolve()
         experiment = load_experiment(config_path)

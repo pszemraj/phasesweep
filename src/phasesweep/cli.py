@@ -350,7 +350,9 @@ def init(template: str, list_templates: bool, output: str) -> None:
     click.echo(f"  phasesweep run {config_arg}")
     click.echo(f"  phasesweep status {config_arg} --trials")
     click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
-    click.echo("\nphasesweep explain lists every config key; phasesweep explain KEY describes one.")
+    click.echo(
+        "\nphasesweep explain lists the top-level config keys; phasesweep explain KEY describes one."
+    )
     click.echo("phasesweep init --list describes the other templates.")
 
 
