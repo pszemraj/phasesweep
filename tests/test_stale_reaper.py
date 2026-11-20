@@ -1155,10 +1155,10 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
     text = _operational_error_text(excinfo.value)
     assert "pid=99999 pgid=99998" in text
     assert (
-        "Inspect them with `ps -o pid,pgid,sid,cmd -p 99999,99998` "
+        "List the members of process group 99998 with `pgrep -a -g 99998` "
         "and check GPU processes before retrying recovery"
     ) in text
-    assert text.index("`ps -o") < text.index("fix:")
+    assert text.index("`pgrep") < text.index("fix:")
     assert "recover-run" in text
     assert uncertain == {"uncertain-attempt"}
     assert stale.study.trials[stale.number].state == optuna.trial.TrialState.RUNNING

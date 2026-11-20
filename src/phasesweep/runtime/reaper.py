@@ -157,12 +157,24 @@ def same_pid_namespace(pid_namespace: str) -> bool:
 
 
 def ps_inspect_command(pids: str) -> str:
-    """Render the ``ps`` command that lists processes with their groups and sessions.
+    """Render the ``ps`` command that lists named processes with their groups and sessions.
 
-    :param str pids: Comma-separated PIDs, or placeholders for the reader to fill in.
+    :param str pids: Comma-separated PIDs of processes that were seen alive.
     :return str: The command, in backticks, for a refusal's remedy.
     """
     return f"`ps -o pid,pgid,sid,cmd -p {pids}`"
+
+
+def group_members_command(pgid: str) -> str:
+    """Render the ``pgrep`` command that lists every live member of a process group.
+
+    A group outlives its leader while any child remains, and ``ps -p`` on the leader's PID
+    and the group number then prints nothing, so the group is listed by its number.
+
+    :param str pgid: The recorded process group, or a placeholder for the reader to fill in.
+    :return str: The command, in backticks, for a refusal's remedy.
+    """
+    return f"`pgrep -a -g {pgid}`"
 
 
 def recorded_process_check(identity_location: str) -> str:
@@ -171,11 +183,11 @@ def recorded_process_check(identity_location: str) -> str:
     :param str identity_location: Where the ``process_identity.json`` to read is, as a
         path or a description of the directory holding it.
     :return str: A sentence, without its final period, naming the file to read and the
-        ``ps`` check to run on its PID and PGID.
+        command that lists every member of the recorded process group.
     """
     return (
-        f"Look up pid and pgid in {identity_location} and inspect them with "
-        f"{ps_inspect_command('<pid>,<pgid>')}"
+        f"Look up pid and pgid in {identity_location} and list the members of that process "
+        f"group with {group_members_command('<pgid>')}"
     )
 
 

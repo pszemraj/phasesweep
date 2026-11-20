@@ -69,7 +69,7 @@ from phasesweep.runtime.process import (
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     cleanup_stale_trial_process,
-    ps_inspect_command,
+    group_members_command,
     read_stale_process_identity,
     recorded_process_check,
     stale_trial_process_decision,
@@ -1088,7 +1088,8 @@ def _resolve_attempt(
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed. "
             f"pid={identity.pid} pgid={identity.pgid}. "
-            f"Inspect them with {ps_inspect_command(f'{identity.pid},{identity.pgid}')} "
+            f"List the members of process group {identity.pgid} with "
+            f"{group_members_command(str(identity.pgid))} "
             "and check GPU processes before retrying recovery."
         )
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)

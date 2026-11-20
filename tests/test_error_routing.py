@@ -860,7 +860,7 @@ def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
     assert "Recovery cannot prove whether a process from this attempt is still alive." in str(error)
     assert error.remediation is not None
     assert error.remediation.startswith("Look up pid and pgid in the process_identity.json")
-    assert "`ps -o pid,pgid,sid,cmd -p <pid>,<pgid>`" in error.remediation
+    assert "list the members of that process group with `pgrep -a -g <pgid>`" in error.remediation
     assert error.remediation.endswith("; once none is alive, delete the entry file.")
     assert error.remediation not in str(error)
     assert _operational_error_text(error).endswith(f"\nfix: {error.remediation}")
