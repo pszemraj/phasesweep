@@ -102,6 +102,25 @@ def test_from_phase_into_a_workdir_without_results_refuses_before_creating_it(
     assert not workdir.exists()
 
 
+def test_from_phase_without_publication_in_memory_does_not_promise_reused_trials(
+    tmp_path: Path,
+) -> None:
+    """With storage: null nothing is reused, so the remedy says the whole run starts again."""
+    experiment = _chained_experiment(tmp_path / "runs").model_copy(update={"storage": None})
+    assert experiment.resolved_storage is None
+
+    with pytest.raises(ResumeWinnerMissingError) as refused:
+        run_experiment(experiment, from_phase="child")
+
+    message = _operational_error_text(refused.value)
+    assert "Winner file missing for phase 'parent'" in message
+    assert "reuse completed trials" not in message
+    assert (
+        "fix: Run without --from-phase to start every phase again, because storage: null keeps "
+        "no completed trials, or use the workdir that holds the publication."
+    ) in message
+
+
 def test_from_phase_names_the_phase_a_published_generation_lacks(tmp_path: Path) -> None:
     """A publication that holds other phases' winners still routes the missing one to a fix."""
     workdir = tmp_path / "runs"

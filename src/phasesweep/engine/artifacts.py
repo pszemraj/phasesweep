@@ -299,14 +299,17 @@ def _load_winner(
             if publication is None
             else "The last published generation holds no winner for it."
         )
+        rerun = (
+            "Resume without --from-phase to reuse completed trials"
+            if experiment.resolved_storage is not None
+            else "Run without --from-phase to start every phase again, because storage: null "
+            "keeps no completed trials"
+        )
         raise ResumeWinnerMissingError(
             f"Winner file missing for phase {phase.name!r}: {absent} "
             "Unpublished phase winners can be inspected, but --from-phase requires published "
             "predecessors.",
-            remediation=(
-                "Resume without --from-phase to reuse completed trials, or use the workdir "
-                "that holds the publication."
-            ),
+            remediation=f"{rerun}, or use the workdir that holds the publication.",
         )
     path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
     validated = publication.winners[phase.name]
