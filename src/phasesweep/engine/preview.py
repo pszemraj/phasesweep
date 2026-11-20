@@ -38,6 +38,7 @@ from phasesweep.engine.phase import (
 )
 from phasesweep.engine.progress import _log_phase_header
 from phasesweep.engine.state import (
+    RecoveredTrialState,
     Winner,
     _outcome_sequence_counts,
     _recovered_trial_state,
@@ -122,22 +123,37 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     return line
 
 
+def _recovered_running_states(
+    trials: Sequence[optuna.trial.FrozenTrial],
+) -> list[RecoveredTrialState]:
+    """Predict what a launch's recovery settles each RUNNING attempt as.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: A phase study's trials.
+    :return list[RecoveredTrialState]: One prediction per RUNNING trial, in trial order.
+    """
+    sequence_counts = _outcome_sequence_counts(trials)
+    return [
+        _recovered_trial_state(trial, sequence_counts)
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.RUNNING
+    ]
+
+
 def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     """Count one phase's snapshot study the way a launch counts it.
 
     :param Phase phase: The configured phase the study belongs to.
     :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
         the ledger holds no such study, which counts zero attempts.
+    :raises PhaseSweepError: A RUNNING attempt's completed trainer evidence awaits recovery,
+        whose extraction decides the counts.
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
         return RecordedPhase(finished=0, measured=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
-    running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
-    sequence_counts = _outcome_sequence_counts(trials)
-    if any(
-        _recovered_trial_state(trial, sequence_counts) == "EVIDENCE_PENDING" for trial in running
-    ):
+    recovered = _recovered_running_states(trials)
+    if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
             f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
             "the trial and rerun counts depend on its extraction.",
@@ -147,15 +163,13 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
                 "completed trainer evidence before requesting a dry-run plan."
             ),
         )
-    recovered_as_failed = sum(
-        1 for trial in running if _recovered_trial_state(trial, sequence_counts) == "FAIL"
-    )
+    recovered_as_failed = recovered.count("FAIL")
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
         measured=_measured_trial_count(trials),
-        running=len(running),
-        reruns=_pending_rerun_count(trials, None if running else phase)
-        + len(running)
+        running=len(recovered),
+        reruns=_pending_rerun_count(trials, None if recovered else phase)
+        + len(recovered)
         - recovered_as_failed,
         study=study,
     )
@@ -188,6 +202,10 @@ def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | N
 def validate_grid_targets(experiment: Experiment) -> None:
     """Check oversized persistent grid targets against their recorded failed cells.
 
+    The attempts are counted as a launch counts them after its recovery: a RUNNING attempt
+    that recovery settles as failed counts as finished. One whose completed trainer evidence
+    awaits recovery counts as unfinished, since validation recovers nothing.
+
     :param Experiment experiment: Config whose grid targets may retry recorded failures.
     :raises TrialTargetRefusedError: A grid requests more attempts than available cells allow.
     :raises StudyStorageUnavailableError: The ledger cannot be read to justify a raised target.
@@ -205,7 +223,8 @@ def validate_grid_targets(experiment: Experiment) -> None:
         trials = [] if study is None else study.get_trials(deepcopy=False)
         _validate_fixed_configuration_target(
             phase,
-            finished=_finished_trial_count(trials),
+            finished=_finished_trial_count(trials)
+            + _recovered_running_states(trials).count("FAIL"),
             measured=_measured_trial_count(trials),
             has_study=study is not None,
         )

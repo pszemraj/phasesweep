@@ -31,17 +31,21 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
-from phasesweep.engine.preview import _placeholder_winner
+from phasesweep.engine.preview import _placeholder_winner, validate_grid_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
 )
 from phasesweep.engine.trial import _environment_identity
+from phasesweep.errors import PhaseSweepError
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     bounded_metric,
     make_experiment,
@@ -777,3 +781,54 @@ def test_empty_unstamped_study_previews_as_a_fresh_phase(
         "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
+
+
+def _two_cell_grid(tmp_path: Path, n_trials: int) -> Experiment:
+    """Build a persistent two-cell grid phase ``g`` with the given trial target."""
+    phase = _phase("g", n_trials, sampler=Sampler(type="grid", seed=0)).model_copy(
+        update={"search_space": {"g_x": IntParam(type="int", low=0, high=1)}}
+    )
+    return _persistent(tmp_path, phase)
+
+
+def test_validate_counts_a_running_failure_as_finished_as_a_launch_does(tmp_path: Path) -> None:
+    """A RUNNING attempt that recovery settles as failed buys one more grid retry, in validate too."""
+    _record(
+        _two_cell_grid(tmp_path, 2),
+        "g",
+        _STATE.FAIL,
+        _STATE.RUNNING,
+        target=2,
+        running_outcome="failure",
+    )
+
+    for check in (
+        validate_grid_targets,
+        lambda experiment: run_experiment(experiment, dry_run=True),
+    ):
+        check(_two_cell_grid(tmp_path, 4))
+        with pytest.raises(TrialTargetRefusedError, match="allow at most 4"):
+            check(_two_cell_grid(tmp_path, 5))
+
+
+def test_validate_counts_pending_evidence_as_unfinished_without_refusing(tmp_path: Path) -> None:
+    """Validation recovers nothing, so completed evidence awaiting extraction is not counted yet."""
+    experiment = _two_cell_grid(tmp_path, 2)
+    _record(experiment, "g", _STATE.FAIL, target=2)
+    directory = tmp_path / "pending"
+    directory.mkdir()
+    write_attempt_lifecycle(
+        directory, attempt_id="pending", state="exited", return_code=0, duration_seconds=1.0
+    )
+    phase_study(experiment, "g").add_trial(
+        optuna.trial.create_trial(
+            state=_STATE.RUNNING,
+            user_attrs={ATTEMPT_ID_ATTR: "pending", TRIAL_DIR_ATTR: str(directory)},
+        )
+    )
+
+    validate_grid_targets(_two_cell_grid(tmp_path, 3))
+    with pytest.raises(TrialTargetRefusedError, match="allow at most 3"):
+        validate_grid_targets(_two_cell_grid(tmp_path, 4))
+    with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
+        run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
