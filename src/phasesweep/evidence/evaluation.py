@@ -390,8 +390,12 @@ def _extract_log_regex(
                     if cfg.select in ("first", "last"):
                         result = v
                         result_line = line_no
-                    elif result is None or (v < result if cfg.select == "min" else v > result):
-                        result, result_line = v, line_no
+                    elif cfg.select == "min":
+                        if result is None or v < result:
+                            result, result_line = v, line_no
+                    elif cfg.select == "max":
+                        if result is None or v > result:
+                            result, result_line = v, line_no
                     if cfg.select == "first":
                         break
     except UnicodeError as exc:
