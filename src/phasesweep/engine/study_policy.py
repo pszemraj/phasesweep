@@ -1334,8 +1334,8 @@ def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tupl
         return None
     return (
         f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",
-        "Put the program on the PATH the run starts with, or name it by absolute path in "
-        "trial_command.",
+        "Put the program on the PATH the run starts with (for an MCP run, the PATH in the "
+        "client's server entry), or name it by absolute path in trial_command.",
     )
 
 

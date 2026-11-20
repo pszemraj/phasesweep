@@ -80,8 +80,8 @@ def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
     message, remediation = refusal
     assert f"program {_MISSING!r} is not on the trainer's PATH (/nowhere:/also/nowhere)" in message
     assert remediation == (
-        "Put the program on the PATH the run starts with, or name it by absolute path in "
-        "trial_command."
+        "Put the program on the PATH the run starts with (for an MCP run, the PATH in the "
+        "client's server entry), or name it by absolute path in trial_command."
     )
 
 
