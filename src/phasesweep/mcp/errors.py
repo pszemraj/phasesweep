@@ -262,7 +262,8 @@ class CatalogReloadRefusedError(McpToolError):
             message = (
                 "the catalog was edited to name a different state_dir than the one this server "
                 "was started with. A running server keeps its run records in one state "
-                "directory, so it refuses launches until the operator restarts it; reads keep "
+                "directory, so it refuses launches, showing `launch: false` for every "
+                "experiment, until the operator restarts it; reads keep "
                 "using the original state directory and the last catalog loaded with it. "
                 "Report this to the operator. Do not retry."
             )
@@ -278,8 +279,9 @@ class CatalogReloadRefusedError(McpToolError):
             else:
                 failing, them = "the catalog file does not validate", "it"
             message = (
-                f"{failing}, so this server refuses launches of every experiment, and "
-                f"inspection of a changed config, until the operator fixes {them}; "
+                f"{failing}, so this server refuses launches of every experiment, showing "
+                "`launch: false` for each, and inspection of a changed config, until the "
+                f"operator fixes {them}; "
                 "`phasesweep mcp check` shows why. Other reads keep using the entries that "
                 "loaded and saved run snapshots, and the server rereads the catalog on the "
                 "next call. Do not retry until the operator reports the fix."

@@ -246,7 +246,7 @@ def test_mcp_call_requires_mcp_extra(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_mcp_call_serves_the_entries_that_load_when_one_fails(tmp_path: Path) -> None:
-    """A failing entry is reported with its fix on stderr and marks the catalog stale with a remedy naming it; the rest is served."""
+    """A failing entry is reported with its fix on stderr and marks the catalog stale with a remedy naming it and the launch flag it forces off; the rest is served."""
     catalog = write_mcp_config_catalog(
         tmp_path,
         {
@@ -262,8 +262,10 @@ def test_mcp_call_serves_the_entries_that_load_when_one_fails(tmp_path: Path) ->
     assert [entry["id"] for entry in payload["experiments"]] == ["other"]
     assert payload["catalog_status"]["stale"] is True
     assert payload["catalog_status"]["reload_refusal"] == "invalid"
+    assert payload["experiments"][0]["capabilities"]["launch"] is False
     assert payload["catalog_status"]["remediation"].startswith(
-        "catalog entry 'srv' failed to load, so this server refuses launches of every experiment"
+        "catalog entry 'srv' failed to load, so this server refuses launches of every experiment, "
+        "showing `launch: false` for each,"
     )
     assert result.stderr.startswith("phasesweep mcp: 'srv': storage must be persistent")
     assert "\nfix: use a persistent local ledger" in result.stderr
