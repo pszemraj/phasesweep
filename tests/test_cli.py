@@ -85,7 +85,7 @@ from tests.recovery_helpers import recover_run_cli
                 "eval/loss",
                 "api.wandb.ai",
                 "evaluation_point check: supported (axis '_step' located in W&B run history; "
-                "advisory, n/a when no position is found)",
+                "n/a when the history lookup finds no position)",
             ],
         ),
         (
@@ -1747,7 +1747,7 @@ def test_cli_boundary_reports_expected_run_failure(
     [
         (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
-        (OperatorAction.RESTORE_TREE, "only if certain nothing is running"),
+        (OperatorAction.RESTORE_TREE, "restore the files and permissions identified in the error"),
         (
             OperatorAction.PROVISION_LOCK_DIR,
             "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "

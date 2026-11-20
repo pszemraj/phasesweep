@@ -303,9 +303,8 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
-        "Ask the operator to restore the files and permissions identified in the error, deleting a "
-        "file only if certain nothing is running. The error in the PhaseSweep run log gives "
-        "the details."
+        "Ask the operator to restore the files and permissions identified in the error. The "
+        "error in the PhaseSweep run log gives the details."
     )
 
 

@@ -191,9 +191,6 @@ def assert_payload_follows(failure: Mapping[str, object], routed: list[OperatorA
     assert positions == sorted(positions), remediation
     unrouted = [marker for action, marker in _STEP_MARKERS.items() if action not in steps]
     assert not [marker for marker in unrouted if marker in remediation], remediation
-    if OperatorAction.RESTORE_TREE in steps:
-        # The payload carries no message, so it keeps the safety condition.
-        assert "only if certain nothing is running" in remediation
     # A step whose specifics are in the message points at the run log holding it.
     self_contained = {OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS}
     points_at_log = remediation.endswith("The error in the PhaseSweep run log gives the details.")

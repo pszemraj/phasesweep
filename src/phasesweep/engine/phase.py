@@ -1430,7 +1430,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             f"after {finished_after}/{phase.n_trials} finished trials "
             f"({completed_after} completed). "
             "Refusing to select a winner from an incomplete phase; set "
-            "allow_incomplete_on_timeout: true only when a partial decision is intentional.",
+            "allow_incomplete_on_timeout: true to publish the winner of the trials that finished.",
             scope=run.timeout_source,
             experiment=experiment,
         )

@@ -64,7 +64,9 @@ from phasesweep.runtime.process import (
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     cleanup_stale_trial_process,
+    ps_inspect_command,
     read_stale_process_identity,
+    recorded_process_check,
     stale_trial_process_decision,
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
@@ -465,8 +467,12 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     except (OSError, UnsafePrivatePathError, ValueError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
-            "Recovery cannot prove whether a process from this attempt is still "
-            "alive. Investigate the attempt's trial directory.",
+            "Recovery cannot prove whether a process from this attempt is still alive. "
+            + recorded_process_check(
+                f"the {PROCESS_IDENTITY_FILE} in the directory under {entry_path.parent.parent} "
+                f"whose name ends in {entry_path.stem}"
+            )
+            + ".",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
@@ -1031,7 +1037,8 @@ def _resolve_attempt(
         raise ProcessCleanupUncertainError(
             f"{context}: process cleanup could not be confirmed. "
             f"pid={identity.pid} pgid={identity.pgid}. "
-            "Inspect the recorded PID/PGID with ps and check GPU processes before retrying recovery."
+            f"Inspect them with {ps_inspect_command(f'{identity.pid},{identity.pgid}')} "
+            "and check GPU processes before retrying recovery."
         )
     _record_attempt_exited(record.trial_dir, attempt_id=record.attempt_id, return_code=None)
     log.warning(

@@ -602,7 +602,7 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
     trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
     expected = (
-        "[p] only 1 of 2 grid cells succeeded (advisory); the winner was chosen without a "
+        "[p] only 1 of 2 grid cells succeeded; the winner was chosen without a "
         f"successful trial for: {trials[1].params}."
     )
     assert _coverage_warnings(caplog) == [expected]
@@ -629,7 +629,7 @@ def test_grid_winner_warns_about_cells_the_abort_never_reached(
     }
     (missing,) = {1, 2, 3, 4} - succeeded
     assert _coverage_warnings(caplog) == [
-        "[p] only 3 of 4 grid cells succeeded (advisory); the winner was chosen without a "
+        "[p] only 3 of 4 grid cells succeeded; the winner was chosen without a "
         f"successful trial for: {{'x': {missing}}}."
     ]
 
@@ -652,7 +652,7 @@ def test_repeat_grid_winner_warns_about_the_failed_member(
         assert run_experiment(experiment)["p"].metric == 1.0
     (failed,) = (trial for trial in phase_trials(experiment) if trial.state.name == "FAIL")
     (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 3 of 4 grid cells succeeded (advisory); ")
+    assert warning.startswith("[p] only 3 of 4 grid cells succeeded; ")
     assert f"'x': {failed.params['x']}" in warning and f"'seed': {failed.params['seed']}" in warning
 
 
@@ -749,7 +749,7 @@ def test_cell_advisory_spells_out_ten_cells_and_counts_the_rest(
         _warn_unsuccessful_grid_cells(phase, [trial])
 
     (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 1 of 15 grid cells succeeded (advisory); ")
+    assert warning.startswith("[p] only 1 of 15 grid cells succeeded; ")
     assert "{'x': 10}" in warning and "{'x': 11}" not in warning
     assert warning.endswith("; and 4 more.")
 

@@ -1389,7 +1389,6 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     )
     assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
-        "the files and permissions identified in the error, deleting a file only if certain nothing "
-        "is running, then run phasesweep mcp recover-run before another launch. The error in "
-        "the PhaseSweep run log gives the details."
+        "the files and permissions identified in the error, then run phasesweep mcp recover-run "
+        "before another launch. The error in the PhaseSweep run log gives the details."
     )

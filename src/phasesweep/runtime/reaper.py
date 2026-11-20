@@ -156,6 +156,29 @@ def same_pid_namespace(pid_namespace: str) -> bool:
     return current is not None and current == pid_namespace
 
 
+def ps_inspect_command(pids: str) -> str:
+    """Render the ``ps`` command that lists processes with their groups and sessions.
+
+    :param str pids: Comma-separated PIDs, or placeholders for the reader to fill in.
+    :return str: The command, in backticks, for a refusal's remedy.
+    """
+    return f"`ps -o pid,pgid,sid,cmd -p {pids}`"
+
+
+def recorded_process_check(identity_location: str) -> str:
+    """Word the manual check of a recorded trial process, for a refusal's remedy.
+
+    :param str identity_location: Where the ``process_identity.json`` to read is, as a
+        path or a description of the directory holding it.
+    :return str: A sentence, without its final period, naming the file to read and the
+        ``ps`` check to run on its PID and PGID.
+    """
+    return (
+        f"Look up pid and pgid in {identity_location} and inspect them with "
+        f"{ps_inspect_command('<pid>,<pgid>')}"
+    )
+
+
 def recorded_process_blocker(
     pid_namespace: str, *, pids: Collection[int], pgids: Collection[int]
 ) -> str | None:
@@ -198,7 +221,7 @@ def recorded_process_blocker(
     named = ",".join(sorted(blockers, key=int))
     return (
         f"host process(es) {named} may be among its recorded processes; inspect them with "
-        f"`ps -o pid,pgid,sid,cmd -p {named}` and retry once they have exited"
+        f"{ps_inspect_command(named)} and retry once they have exited"
     )
 
 

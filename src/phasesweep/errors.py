@@ -102,10 +102,7 @@ NEW_STUDY_STEP = (
 OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
     OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
-    OperatorAction.RESTORE_TREE: (
-        "restore the files and permissions identified in the error, deleting a file only if "
-        "certain nothing is running"
-    ),
+    OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
     OperatorAction.PROVISION_LOCK_DIR: (
         "point PHASESWEEP_LOCK_DIR at an existing writable directory shared by every shell, "
         "MCP server, and sandbox on the host, or run on the host"

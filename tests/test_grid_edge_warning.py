@@ -116,7 +116,7 @@ def test_grid_endpoint_warning_uses_the_concrete_numeric_axis(
     else:
         assert len(warnings) == 1
         assert "[p]" in warnings[0] and "x" in warnings[0] and edge in warnings[0]
-        assert str(value) in warnings[0] and "expand" in warnings[0].lower()
+        assert str(value) in warnings[0] and "widen the range" in warnings[0]
 
 
 @pytest.mark.parametrize(

@@ -283,7 +283,7 @@ def _restore_host_signal_state(
     restoration_error: Exception | None = None
     for sig, handler in prior_handlers.items():
         if handler is None:
-            log.warning(
+            log.debug(
                 "Signal %d had no Python-level handler before this scope "
                 "(a C-level default phasesweep cannot reinstall); leaving "
                 "phasesweep's shutdown handler installed for it.",

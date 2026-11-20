@@ -369,7 +369,7 @@ def select_winner(
         )
     if flagged and emit_advisories:
         log.warning(
-            "[%s] potential confounds in the %d ranked trials (advisory; verdicts recorded in the "
+            "[%s] potential confounds in the %d ranked trials (verdicts recorded in the "
             "winner's confound block): %s.",
             phase_name or study.study_name,
             len(survivors),
@@ -485,7 +485,7 @@ def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
         if edge is not None:
             log.warning(
                 "[%s] winner is at the %s numeric grid boundary for %s=%s (grid %s..%s); "
-                "consider expanding this range if feasible (advisory).",
+                "widen the range to check for a better value beyond it.",
                 phase.name,
                 edge,
                 name,
@@ -522,7 +522,7 @@ def _warn_unsuccessful_grid_cells(phase: Phase, trials: Sequence[optuna.trial.Fr
     if len(missing) > _MAX_LISTED_CELLS:
         listed += f"; and {len(missing) - _MAX_LISTED_CELLS} more"
     log.warning(
-        "[%s] only %d of %d grid cells succeeded (advisory); the winner was chosen without a "
+        "[%s] only %d of %d grid cells succeeded; the winner was chosen without a "
         "successful trial for: %s.",
         phase.name,
         len(cells) - len(missing),

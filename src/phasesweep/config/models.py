@@ -342,7 +342,7 @@ def _evaluation_point_line(metric: Metric) -> str:
     if isinstance(extractor, WandbExtractor):
         return (
             f"{prefix} supported (axis {extractor.evaluation_axis!r} located in W&B run history; "
-            "advisory, n/a when no position is found)"
+            "n/a when the history lookup finds no position)"
         )
     return f"{prefix} supported (position is the step of the selected observation)"
 
@@ -682,8 +682,8 @@ class Phase(_Frozen):
             if self.n_jobs > 1 and not self.allow_no_gpu_isolation:
                 raise ValueError(
                     "gpu_policy='none' with n_jobs > 1 can oversubscribe the host. "
-                    "Set allow_no_gpu_isolation=true only when CPU-only or external "
-                    "isolation is intentional."
+                    "Set allow_no_gpu_isolation=true for CPU-only work or isolation "
+                    "handled outside PhaseSweep."
                 )
         return self
 
@@ -700,8 +700,7 @@ class Phase(_Frozen):
         default=False,
         description=(
             "When GPU isolation cannot be established, phasesweep fails by default "
-            "for parallel sweeps. Set True for intentional CPU-only or "
-            "externally-isolated runs."
+            "for parallel sweeps. Set True for CPU-only or externally isolated runs."
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
@@ -709,8 +708,7 @@ class Phase(_Frozen):
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(
-            "Set true only when an intentionally unbounded trial is acceptable. "
-            "Otherwise timeout_seconds_per_trial must be finite."
+            "Set true to allow timeout_seconds_per_trial: null; otherwise it must be finite."
         ),
     )
     timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, gt=0)

@@ -22,6 +22,7 @@ from phasesweep.runtime.json import (
     json_text_map,
     strict_json_loads,
 )
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, recorded_process_check
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
@@ -174,6 +175,7 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
     :return Iterator[tuple[str, Path]]: Operation identity and process directory.
     """
     from phasesweep.engine.attempts import _register_tracking_operation, _retire_active_attempt
+    from phasesweep.engine.paths import _attempts_dir
     from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 
     operation_id = uuid4().hex
@@ -195,11 +197,13 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
         except ValueError as exc:
             # The body's own failure may already say the worker is unresolved, so it wins.
             if not body_raised:
+                entry_path = _attempts_dir(experiment) / f"{operation_id}.json"
                 raise ProcessCleanupUncertainError(
                     f"Tracking operation {operation_id} has an unreadable lifecycle record in "
                     f"{directory} ({exc}), so its worker may still be running. Its attempt "
-                    "registry entry is kept. Delete the entry file only if you are certain "
-                    "nothing is running.",
+                    f"registry entry {entry_path} is kept. "
+                    + recorded_process_check(str(directory / PROCESS_IDENTITY_FILE))
+                    + "; once none is alive, delete the entry file.",
                     action=OperatorAction.RESTORE_TREE,
                 ) from exc
             log.warning(
