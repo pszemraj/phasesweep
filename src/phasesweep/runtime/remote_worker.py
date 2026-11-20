@@ -1,4 +1,14 @@
-"""Shared supervised launch mechanics for remote SDK workers."""
+"""Shared supervised launch mechanics for remote SDK workers.
+
+W&B evidence reads and every MLflow operation the controller performs, writes included, run the
+tracker SDK in a separate process instead of in the controller. The engine promises one absolute
+deadline over SDK construction, requests and retries. A call blocked in an SDK's HTTP layer cannot
+be cancelled from the process that made it, and the SDKs retry on their own, so no timeout the
+code can hand an SDK is that deadline. A process the supervisor can kill is: it stops at the
+deadline and takes its descendants with it, where an in-process call would run past the trial,
+phase or run budget. The worker also runs in the attempt's durable process slot, so recovery can
+find and clean it up after the controller dies.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +43,10 @@ def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
         orchestrator sets.
     """
     worker_environment = dict(os.environ if environment is None else environment)
+    # The worker runs the controller's interpreter and must import the SDK installation the
+    # controller checked for. The composed trainer environment can differ, say by naming a
+    # source checkout in PYTHONPATH, so each PYTHON* variable takes the controller's value, and
+    # one the controller does not set is dropped.
     for name in set(worker_environment) | set(os.environ):
         if name.startswith("PYTHON"):
             if name in os.environ:
