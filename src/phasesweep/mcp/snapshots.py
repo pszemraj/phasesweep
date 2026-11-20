@@ -220,8 +220,7 @@ class TieSummary(_SnapshotModel):
     within_noise: NonNegativeInt | None = Field(
         description=(
             "Repeat groups whose aggregate is within two standard errors of the winning "
-            "group's, exact ties included: an advisory heuristic, not a significance test. "
-            "Null without repeats or when not checked."
+            "group's, exact ties included. Null without repeats or when not checked."
         )
     )
 
