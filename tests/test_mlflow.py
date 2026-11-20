@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from phasesweep.config.models import Experiment
 from phasesweep.errors import UnsafeProcessCleanupError
-from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
+from phasesweep.evidence.mlflow import observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.tracking.mlflow import (
     ManagedObjectiveMissingError,
@@ -32,10 +32,13 @@ from tests.tracking_helpers import (
     FakeWorkerProcess,
     ManualClock,
     attempt_identity,
+    bind_mlflow_attempt,
     mlflow_binder,
     mlflow_binding,
     mlflow_run,
+    mlflow_trial_context,
     native_experiment,
+    run_mlflow_worker_in_process,
     scripted_response,
 )
 
@@ -923,7 +926,7 @@ def test_sync_keeps_a_record_whose_search_fails(tmp_path, monkeypatch, caplog, e
 
 @pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id", "unbound"])
 def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, field):
-    from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
+    from phasesweep.evidence.evaluation import ExtractorError, _capture_mlflow
     from phasesweep.tracking import session
 
     binding = mlflow_binding()
@@ -935,21 +938,7 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
     session.write_record(tmp_path / "mlflow-expected.json", expected)
     if field != "unbound":
         session.write_record(tmp_path / "mlflow-binding.json", binding)
-    experiment = native_experiment(tmp_path)
-    ctx = TrialContext(
-        experiment="test",
-        phase="p",
-        trial_id=0,
-        generation_id="a" * 32,
-        attempt_id="b" * 32,
-        overrides_sha256="c" * 64,
-        trial_dir=tmp_path,
-        run_name="test",
-        return_code=0,
-        duration_seconds=1,
-        mlflow_settings=experiment.mlflow.model_dump(),
-        mlflow_query=compile_query(experiment, []),
-    )
+    ctx = mlflow_trial_context(tmp_path)
 
     def remote(*args, **kwargs):
         pytest.fail("A foreign binding must not contact MLflow")
@@ -1091,50 +1080,16 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
     tmp_path, monkeypatch
 ):
     """The worker's report crosses the real entry point and response reader unchanged."""
-    import shlex
-
     import mlflow
 
-    from phasesweep.evidence.evaluation import (
-        MlflowObjectiveMissingError,
-        TrialContext,
-        _capture_mlflow,
-    )
-    from phasesweep.runtime import process
-    from phasesweep.tracking import mlflow as worker
-    from phasesweep.tracking import session
+    from phasesweep.evidence.evaluation import MlflowObjectiveMissingError, _capture_mlflow
 
-    binding = mlflow_binding()
-    session.write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
-    )
-    session.write_record(tmp_path / "mlflow-binding.json", binding)
-    experiment = native_experiment(tmp_path)
-    ctx = TrialContext(
-        experiment="test",
-        phase="p",
-        trial_id=0,
-        generation_id="a" * 32,
-        attempt_id="b" * 32,
-        overrides_sha256="c" * 64,
-        trial_dir=tmp_path,
-        run_name="test",
-        return_code=0,
-        duration_seconds=1,
-        mlflow_settings=experiment.mlflow.model_dump(),
-        mlflow_query=compile_query(experiment, []),
-    )
+    binding, ctx = bind_mlflow_attempt(tmp_path)
     run = mlflow_run(binding, metrics={"cost": 1.0, "accuracy": 0.9})
     monkeypatch.setattr(
         mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=lambda _: run)
     )
-
-    def run_in_process(command, **kwargs):
-        request_path, response_path = shlex.split(command)[-2:]
-        assert worker.main([request_path, response_path]) == 0
-        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
-
-    monkeypatch.setattr(process, "run_supervised", run_in_process)
+    run_mlflow_worker_in_process(monkeypatch)
     with pytest.raises(MlflowObjectiveMissingError) as failure:
         _capture_mlflow(ctx, deadline=None)
     assert str(failure.value) == (

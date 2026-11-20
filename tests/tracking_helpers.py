@@ -22,6 +22,8 @@ from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
+from phasesweep.evidence.evaluation import TrialContext
+from phasesweep.evidence.mlflow import compile_query
 from phasesweep.runtime import process
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import session
@@ -90,6 +92,57 @@ def native_experiment(tmp_path):
     )
     config.update(workdir=str(tmp_path), storage=None)
     return Experiment.model_validate(config)
+
+
+def mlflow_trial_context(tmp_path: Path) -> TrialContext:
+    """Build the context of the native example's one attempt, with its directory at ``tmp_path``.
+
+    :param Path tmp_path: The attempt directory, also the example's workdir.
+    :return TrialContext: Context carrying the MLflow settings and compiled query of a capture.
+    """
+    experiment = native_experiment(tmp_path)
+    return TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=0,
+        duration_seconds=1,
+        mlflow_settings=experiment.mlflow.model_dump(),
+        mlflow_query=compile_query(experiment, []),
+    )
+
+
+def bind_mlflow_attempt(tmp_path: Path) -> tuple[dict[str, str | int], TrialContext]:
+    """Write the expected record and the binding of the native example's attempt.
+
+    :param Path tmp_path: The attempt directory.
+    :return tuple[dict[str, str | int], TrialContext]: The binding and the attempt's context.
+    """
+    binding = mlflow_binding()
+    session.write_record(
+        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+    )
+    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    return binding, mlflow_trial_context(tmp_path)
+
+
+def run_mlflow_worker_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer each supervised MLflow worker launch by running its entry point in this process.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces ``process.run_supervised`` for the test.
+    """
+
+    def run_in_process(command, **kwargs):
+        request_path, response_path = shlex.split(command)[-2:]
+        assert worker.main([request_path, response_path]) == 0
+        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+    monkeypatch.setattr(process, "run_supervised", run_in_process)
 
 
 def scripted_response(script, request):

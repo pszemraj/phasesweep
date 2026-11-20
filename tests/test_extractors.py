@@ -699,39 +699,15 @@ def test_mlflow_capture_is_unreadable_only_when_mlflow_gave_no_answer(
 ):
     """A refused connection or denied access leaves the evidence unreadable; a FAILED or deleted run fails it."""
     import errno
-    import shlex
 
     import mlflow
     from mlflow.exceptions import MlflowException
     from mlflow.protos import databricks_pb2
 
-    from phasesweep.evidence.evaluation import TrialContext, _capture_mlflow
-    from phasesweep.evidence.mlflow import compile_query
-    from phasesweep.runtime import process
-    from phasesweep.tracking import mlflow as worker
-    from phasesweep.tracking import session
-    from tests.tracking_helpers import mlflow_binding, mlflow_run, native_experiment
+    from phasesweep.evidence.evaluation import _capture_mlflow
+    from tests.tracking_helpers import bind_mlflow_attempt, mlflow_run, run_mlflow_worker_in_process
 
-    binding = mlflow_binding()
-    session.write_record(
-        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
-    )
-    session.write_record(tmp_path / "mlflow-binding.json", binding)
-    experiment = native_experiment(tmp_path)
-    ctx = TrialContext(
-        experiment="test",
-        phase="p",
-        trial_id=0,
-        generation_id="a" * 32,
-        attempt_id="b" * 32,
-        overrides_sha256="c" * 64,
-        trial_dir=tmp_path,
-        run_name="test",
-        return_code=0,
-        duration_seconds=1,
-        mlflow_settings=experiment.mlflow.model_dump(),
-        mlflow_query=compile_query(experiment, []),
-    )
+    binding, ctx = bind_mlflow_attempt(tmp_path)
 
     def get_run(_run_id):
         if server == "refused":
@@ -748,12 +724,7 @@ def test_mlflow_capture_is_unreadable_only_when_mlflow_gave_no_answer(
         mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=get_run)
     )
 
-    def run_in_process(command, **kwargs):
-        request_path, response_path = shlex.split(command)[-2:]
-        assert worker.main([request_path, response_path]) == 0
-        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
-
-    monkeypatch.setattr(process, "run_supervised", run_in_process)
+    run_mlflow_worker_in_process(monkeypatch)
     with pytest.raises(ExtractorError) as refused:
         _capture_mlflow(ctx, deadline=None)
     assert isinstance(refused.value, EvidenceUnreadableError) is unreadable
