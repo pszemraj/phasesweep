@@ -488,9 +488,9 @@ def _capture_wandb(
             if isinstance(exc, WandbRunMissingError):
                 message = (
                     f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
-                    "at the evidence deadline. Call wandb.init() in the trainer. If it passes "
-                    "its own project, entity or id, remove those overrides, or set the "
-                    "extractor's project and entity to match."
+                    "at the evidence deadline. Check that the trainer calls wandb.init() and "
+                    "passes no project, entity or id of its own, or set the extractor's "
+                    "project and entity to match."
                 )
             else:
                 expired = (
