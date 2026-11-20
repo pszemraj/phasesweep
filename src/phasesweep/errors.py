@@ -101,9 +101,10 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
-#: The way out of data another PhaseSweep release wrote, for an artifact root or a study.
+#: The way out of data another PhaseSweep version wrote, for an artifact root or a study.
+#: "Version" covers a source checkout between releases, which no release can stand in for.
 OTHER_FORMAT_STEP = (
-    f"Set{_FRESH_STUDY_TAIL}. The PhaseSweep release that wrote the old data still reads it."
+    f"Set{_FRESH_STUDY_TAIL}. The PhaseSweep version that wrote the old data still reads it."
 )
 
 #: The same for a ledger, which holds every experiment's studies: under an explicit `storage` a
@@ -112,7 +113,7 @@ OTHER_FORMAT_STEP = (
 OTHER_FORMAT_LEDGER_STEP = (
     "Set a new `experiment` name and a new `storage` ledger in the config to start a fresh "
     "study (with `storage: auto`, a new `experiment` name or `workdir` alone is enough). "
-    "The PhaseSweep release that wrote the old data still reads it."
+    "The PhaseSweep version that wrote the old data still reads it."
 )
 
 
