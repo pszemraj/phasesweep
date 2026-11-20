@@ -18,13 +18,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NoReturn
-
-from pydantic import ValidationError
 
 from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
@@ -72,6 +70,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
     UnknownRunError,
 )
+from phasesweep.mcp.failures import run_failure_payload
 from phasesweep.mcp.redaction import (
     ResultSource,
     intersect_visible_params,
@@ -79,14 +78,13 @@ from phasesweep.mcp.redaction import (
     winners_payload,
 )
 from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
-from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
+from phasesweep.mcp.runner import _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
     PreparedRun,
     RunHandle,
     RunnerView,
-    RunObservation,
     RunState,
     RunStore,
     write_status_file_if_absent,
@@ -636,124 +634,14 @@ class PhaseSweepMCP:
                 observation.recovery_required or observation.runner_heartbeat_stale
             ),
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
-            "failure": self._run_failure_payload(
+            "failure": run_failure_payload(
+                self._runs,
                 handle,
                 view=view,
                 observation=observation,
                 force_snapshot_unavailable=force_snapshot_unavailable,
             ),
         }
-
-    def _run_failure_payload(
-        self,
-        handle: RunHandle,
-        *,
-        view: RunnerView | None = None,
-        observation: RunObservation | None = None,
-        force_snapshot_unavailable: bool = False,
-    ) -> JsonObject | None:
-        """Return a validated safe terminal failure, never the raw exception text.
-
-        :param RunHandle handle: Run handle whose recorded terminal status
-            should be inspected.
-        :param RunnerView | None view: The read's derivation of the runner, used
-            when a fresh observation must be derived here.
-        :param RunObservation | None observation: State and terminal evidence already read
-            together for this payload; otherwise read a fresh decision here.
-        :param bool force_snapshot_unavailable: The result response has already
-            refused a non-finalized or missing snapshot even if run state stays live.
-        :return JsonObject | None: The run's ``failure`` payload validated
-            against :class:`FailurePayload` and dumped to JSON-safe types. A
-            terminal run with no usable result snapshot receives a generated
-            snapshot-unavailable failure; otherwise returns ``None`` when no
-            valid failure was recorded.
-        """
-        if view is None:
-            view = self._runs.runner_view(handle)
-        if observation is None:
-            observation = self._runs.observe(handle, view=view)
-        terminal: Mapping[str, object] = observation.terminal_status or {}
-        persisted: JsonObject | None = None
-        recorded_failure = terminal.get("failure")
-        if recorded_failure is None and observation.terminal_status is None:
-            recorded_failure = self._runs.cleanup_failure(handle)
-        if recorded_failure is not None:
-            with contextlib.suppress(ValidationError):
-                persisted = json_object(
-                    FailurePayload.model_validate(recorded_failure).model_dump(
-                        mode="json", exclude_none=True
-                    )
-                )
-        if persisted is not None and observation.cleanup_recovery_required:
-            return persisted
-        runner_ended_with_boot = (
-            observation.terminal_status is None
-            and handle.launch_state == "spawned"
-            and view.visibility == "gone"
-        )
-        runner_exited = terminal.get("error_class") == "RunnerExitedWithoutStatus" or (
-            observation.terminal_status is None
-            and handle.launch_state == "spawned"
-            and observation.recovery_required
-            and not observation.runner_heartbeat_stale
-            and not self._runs.runner_may_be_alive(handle, view=view)
-        )
-        if runner_exited or runner_ended_with_boot or observation.runner_heartbeat_stale:
-            recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
-            if runner_ended_with_boot:
-                remedy = (
-                    "The runner ended with an earlier host boot. No process from that boot "
-                    "remains, so process cleanup and recover-run are not required. This "
-                    "run's historical results are unavailable; do not substitute mutable "
-                    "experiment-level results."
-                )
-            elif observation.runner_heartbeat_stale:
-                remedy = (
-                    "The runner is in another PID namespace and its heartbeat is stale; "
-                    "it may have stopped. Stop monitoring and ask the operator to inspect "
-                    "this run with `phasesweep mcp recover-run` from a host shell outside "
-                    "the sandbox. Liveness and trial cleanup must be checked there."
-                )
-            else:
-                remedy = (
-                    "The runner exited without writing a final status; its trial processes may "
-                    "still be alive. Stop monitoring and ask the operator to inspect this run "
-                    "with `phasesweep mcp recover-run` from a host shell, then repeat with "
-                    "`--confirm` after reviewing the process cleanup preview."
-                    if recovery_required
-                    else "The runner exited without writing a final status. Operator recovery "
-                    "settled process cleanup; this run's historical results remain unavailable. "
-                    "Do not substitute mutable experiment-level results."
-                )
-            return {
-                "code": (
-                    "cleanup_uncertain" if recovery_required else "result_snapshot_unavailable"
-                ),
-                "stage": "cleanup",
-                "retryable": False,
-                "actor": "operator",
-                "remediation": remedy,
-            }
-        if force_snapshot_unavailable or (
-            observation.state != "running" and parse_result_snapshot(terminal) is None
-        ):
-            failure: JsonObject = {
-                "code": "result_snapshot_unavailable",
-                "stage": "cleanup",
-                "retryable": False,
-                "actor": "operator",
-                "remediation": (
-                    "Report that this run's historical results are unavailable and ask "
-                    "the operator to inspect the PhaseSweep run or server diagnostics; "
-                    "do not substitute mutable experiment-level results."
-                ),
-            }
-            if persisted is not None:
-                failure["cause"] = persisted
-            return failure
-        # Preserve the terminal diagnosis and remediation after operator recovery;
-        # the live recovery_required field says whether recovery is still needed.
-        return persisted
 
     def status(self, run_id: str) -> dict[str, Any]:
         """Per-phase trial counts and winner presence plus the run process state.
@@ -1116,7 +1004,8 @@ class PhaseSweepMCP:
             result_context=status["result_context"],
             published_config_matches_current=status["published_config_matches_current"],
         )
-        result["failure"] = self._run_failure_payload(
+        result["failure"] = run_failure_payload(
+            self._runs,
             handle,
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
@@ -1474,8 +1363,8 @@ class PhaseSweepMCP:
                             or not self._runs.runner_may_be_alive(handle, view=view)
                         )
                     ):
-                        failure = self._run_failure_payload(
-                            handle, view=view, observation=observation
+                        failure = run_failure_payload(
+                            self._runs, handle, view=view, observation=observation
                         )
                         if failure is not None:
                             if observation.terminal_status is None:
@@ -1535,8 +1424,8 @@ class PhaseSweepMCP:
                     after = observation.state
                     recovery_required = observation.recovery_required
                     if not confirmed:
-                        failure = self._run_failure_payload(
-                            handle, view=view, observation=observation
+                        failure = run_failure_payload(
+                            self._runs, handle, view=view, observation=observation
                         )
                         if failure is None:
                             failure = json_object(_cleanup_uncertain_payload([]))
