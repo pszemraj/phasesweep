@@ -954,12 +954,16 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["memory", "persistent"])
 @pytest.mark.parametrize("scope", ["phase", "run"])
-def test_timeout_remedy_matches_storage_and_budget(scope: str, persistent: bool) -> None:
+def test_timeout_remedy_matches_storage_and_budget(
+    tmp_path: Path, scope: str, persistent: bool
+) -> None:
     """A deadline names its budget and promises resume only when results persist."""
     from phasesweep.engine.errors import phase_timeout
     from phasesweep.mcp.runner import _terminal_failure_payload
 
-    error = phase_timeout("budget exhausted", scope=scope, persistent=persistent)
+    experiment = make_experiment(persistent=tmp_path if persistent else None)
+    assert experiment.persistent is persistent
+    error = phase_timeout("budget exhausted", scope=scope, experiment=experiment)
     remedy = error.remediation
     assert remedy is not None
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"

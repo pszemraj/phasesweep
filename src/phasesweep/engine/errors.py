@@ -1,8 +1,13 @@
 """Typed engine failures used for safe orchestration decisions."""
 
-from typing import ClassVar
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, ClassVar
 
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+
+if TYPE_CHECKING:
+    from phasesweep.config.models import Experiment
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):
@@ -128,18 +133,19 @@ class PhaseTimeoutError(PhaseSweepError, TimeoutError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
-def phase_timeout(message: str, *, scope: str | None, persistent: bool) -> PhaseTimeoutError:
+def phase_timeout(message: str, *, scope: str | None, experiment: Experiment) -> PhaseTimeoutError:
     """Attach the budget edit and the storage-appropriate rerun behavior.
 
     :param str message: Diagnostic describing where the deadline stopped work.
     :param str | None scope: ``run`` for the run guard, otherwise the phase guard.
-    :param bool persistent: Whether completed trials persist for the next invocation.
+    :param Experiment experiment: Experiment whose storage decides whether completed trials
+        persist for the next invocation.
     :return PhaseTimeoutError: Routed timeout shared by CLI, run logs, and MCP failures.
     """
     key = "timeout_seconds_per_run" if scope == "run" else "timeout_seconds_per_phase"
     continuation = (
         "resume the phase; completed trials are kept."
-        if persistent
+        if experiment.persistent
         else "start the run again; storage: null keeps no completed trials between runs."
     )
     return PhaseTimeoutError(

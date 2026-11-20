@@ -49,17 +49,6 @@ log = logging.getLogger(__name__)
 BindingState = Literal["bound", "unbound"]
 
 
-def _artifact_root_binding_applies(experiment: Experiment) -> bool:
-    """Return whether the ledger can carry the reverse artifact-root binding.
-
-    :param Experiment experiment: Parsed experiment whose storage is inspected.
-    :return bool: ``True`` only for persistent storage. Every artifact root has
-        its own format record; only a persistent ledger also needs to record
-        the root that owns it across invocations.
-    """
-    return experiment.resolved_storage is not None
-
-
 ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 14
 
 
@@ -281,7 +270,8 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     :raises ArtifactRootConflictError: The study is already bound to a different
         artifact root, or carries a binding that is not a string.
     """
-    if not _artifact_root_binding_applies(experiment):
+    # Only a persistent ledger records the artifact root that owns it across invocations.
+    if not experiment.persistent:
         return
     if not _artifact_root_claim_needed(study, experiment):
         return
@@ -313,7 +303,7 @@ def _check_published_phase_studies(
     raise_for_unusable_publication(
         experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
     )
-    if not _artifact_root_binding_applies(experiment):
+    if not experiment.persistent:
         return
     published_trials = _published_phase_trial_refs(
         None if publication.validated is None else publication.validated.summary

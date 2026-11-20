@@ -284,20 +284,19 @@ def phase_draws(phase: Phase) -> bool:
     return bool(sampler_search_space(phase))
 
 
-def sampler_capability_line(phase: Phase, storage: str | None) -> str:
+def sampler_capability_line(phase: Phase, *, persistent: bool) -> str:
     """Describe a phase's resume and reproduction contract.
 
     Resuming requires persistent storage. Grid and seeded draws are reproducible;
     parallel TPE and CMA-ES draws also depend on trial completion order.
 
     :param Phase phase: Phase whose sampler capability is described.
-    :param str | None storage: The experiment's resolved storage, ``None`` for
-        an in-memory study.
+    :param bool persistent: Whether the experiment's trials outlive the run.
     :return str: One line naming the phase and either its sampler type, seed,
         capability and repeat axis, or that it is a fixed configuration with no
         sampler draws.
     """
-    resume = "not resumable: in-memory storage" if storage is None else "resumable"
+    resume = "resumable" if persistent else "not resumable: in-memory storage"
     if not phase_draws(phase):
         return f"phase {phase.name!r}: fixed configuration, no sampler draws ({resume})"
     sampler = phase.sampler
@@ -307,7 +306,7 @@ def sampler_capability_line(phase: Phase, storage: str | None) -> str:
     )
     if not reproducible:
         capability = resume
-    elif storage is None:
+    elif not persistent:
         capability = f"reproducible, {resume}"
     else:
         capability = f"{resume}, reproducible"

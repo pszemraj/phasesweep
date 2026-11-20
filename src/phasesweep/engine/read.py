@@ -22,7 +22,6 @@ import optuna
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import Experiment, Phase, _metric_semantics_payload
-from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.artifacts import read_yaml_or_none
 from phasesweep.engine.confound import (
     _confound_summary,
@@ -829,7 +828,7 @@ def _read_status(
         _published_phase_trial_refs(
             None if publication.validated is None else publication.validated.summary
         )
-        if _artifact_root_binding_applies(experiment)
+        if experiment.persistent
         else {}
     )
     # Captured after the pointer is resolved: a publication tells its trials
@@ -1075,7 +1074,7 @@ def unpublished_winner_step(
     """
     if experiment_is_busy(experiment):
         return None
-    if experiment.resolved_storage is None:
+    if not experiment.persistent:
         return UnpublishedWinnerStep(
             None,
             "Rerun the same config to start the run again; storage: null keeps no completed trials between runs.",

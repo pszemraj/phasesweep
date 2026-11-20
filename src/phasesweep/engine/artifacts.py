@@ -306,7 +306,7 @@ def _load_winner(
         )
         rerun = (
             "Resume without --from-phase to reuse completed trials"
-            if experiment.resolved_storage is not None
+            if experiment.persistent
             else "Run without --from-phase to start every phase again, because storage: null "
             "keeps no completed trials"
         )

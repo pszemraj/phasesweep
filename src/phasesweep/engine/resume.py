@@ -73,7 +73,7 @@ def _preflight_skipped_winners(
                 raise phase_timeout(
                     f"Run wallclock deadline reached before phase {phase.name!r} could start.",
                     scope="run",
-                    persistent=experiment.resolved_storage is not None,
+                    experiment=experiment,
                 )
             if phase.name == from_phase:
                 break

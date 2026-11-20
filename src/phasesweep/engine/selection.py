@@ -112,7 +112,7 @@ def _no_feasible_remedy(
     :return str: Operator steps appropriate to failures, bounds, and storage.
     """
     evidence = "Inspect the phase's trials.csv and trial_* trainer logs."
-    if experiment.resolved_storage is None:
+    if not experiment.persistent:
         return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:

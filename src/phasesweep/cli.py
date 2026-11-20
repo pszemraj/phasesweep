@@ -1125,7 +1125,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     require_study(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
-        click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
+        click.echo(_render_trial_tables(tables, persisted=config.persistent))
         raise_for_unusable_publication(
             tables.experiment,
             tables.publication_integrity,

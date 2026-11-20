@@ -269,7 +269,7 @@ def _require_persistent_storage(experiment_id: str, experiment: Experiment) -> N
     :param Experiment experiment: Parsed experiment config registered for MCP access.
     :raises CatalogError: If storage is absent or in-memory.
     """
-    if experiment.resolved_storage is None:
+    if not experiment.persistent:
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
             "in-memory storage cannot be monitored or resumed across processes",

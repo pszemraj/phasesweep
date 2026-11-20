@@ -505,13 +505,13 @@ def _resume_phase(
 
 
 def _no_feasible_before_deadline(
-    phase_name: str, timeout_scope: str, *, persistent: bool
+    experiment: Experiment, phase_name: str, timeout_scope: str
 ) -> PhaseTimeoutError:
     """Describe a deadline that prevented the phase from producing a feasible winner.
 
+    :param Experiment experiment: Experiment whose storage decides what a rerun keeps.
     :param str phase_name: Phase whose winner cannot be selected.
     :param str timeout_scope: Deadline responsible for exhausting feasible work.
-    :param bool persistent: Whether completed trials survive the next invocation.
     :return PhaseTimeoutError: Refusal shared by live completion and recorded-result replay.
     """
     return phase_timeout(
@@ -519,7 +519,7 @@ def _no_feasible_before_deadline(
         "before any trial completed inside the metric bounds and constraints; no winner can "
         "be selected.",
         scope=timeout_scope,
-        persistent=persistent,
+        experiment=experiment,
     )
 
 
@@ -596,9 +596,7 @@ def _judge_recorded_phase(
             )
         except NoFeasibleTrialError as exc:
             raise _no_feasible_before_deadline(
-                phase.name,
-                partial_decision.timeout_scope,
-                persistent=experiment.resolved_storage is not None,
+                experiment, phase.name, partial_decision.timeout_scope
             ) from exc
     # A later success or a lowered failure limit does not clear a recorded abort.
     active_abort = policy_state.abort
@@ -640,13 +638,13 @@ class _PhaseBudget(NamedTuple):
     source: str | None
 
 
-def _phase_budget(phase: Phase, run_deadline: float | None, *, persistent: bool) -> _PhaseBudget:
+def _phase_budget(experiment: Experiment, phase: Phase, run_deadline: float | None) -> _PhaseBudget:
     """Combine the phase timeout and the remaining run wallclock into one budget.
 
+    :param Experiment experiment: Experiment whose storage decides what a rerun keeps.
     :param Phase phase: Phase supplying ``timeout_seconds_per_phase``.
     :param float | None run_deadline: Whole-run ``time.monotonic()`` deadline,
         when configured.
-    :param bool persistent: Whether completed trials survive the next invocation.
     :raises TimeoutError: The run deadline has already passed.
     :return _PhaseBudget: The optimize timeout in seconds, its monotonic
         deadline, and which guard (``"phase"`` or ``"run"``) sets it.
@@ -668,7 +666,7 @@ def _phase_budget(phase: Phase, run_deadline: float | None, *, persistent: bool)
         raise phase_timeout(
             f"Run wallclock deadline reached before phase {phase.name!r} could launch.",
             scope="run",
-            persistent=persistent,
+            experiment=experiment,
         )
     optimize_deadline = None if optimize_timeout is None else time.monotonic() + optimize_timeout
     return _PhaseBudget(optimize_timeout, optimize_deadline, timeout_source)
@@ -1376,8 +1374,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so only the logs are left to read.
-        persistent = experiment.storage is not None
-        advice = _recovery_advice(phase, study, abort) if persistent else None
+        advice = _recovery_advice(phase, study, abort) if experiment.persistent else None
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."
@@ -1387,7 +1384,11 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         abort_error = PhaseTrialsInfeasibleError if all_infeasible else PhaseTrialsFailedError
         raise abort_error(
             f"Phase {phase.name!r} aborted: {_as_sentence(abort['cause'])} {evidence}",
-            action=_recovery_action(study, abort) if persistent else OperatorAction.INSPECT_LOGS,
+            action=(
+                _recovery_action(study, abort)
+                if experiment.persistent
+                else OperatorAction.INSPECT_LOGS
+            ),
             remediation=advice,
         )
     if (
@@ -1431,7 +1432,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             "Refusing to select a winner from an incomplete phase; set "
             "allow_incomplete_on_timeout: true only when a partial decision is intentional.",
             scope=run.timeout_source,
-            persistent=experiment.resolved_storage is not None,
+            experiment=experiment,
         )
     try:
         return _select_phase_winner(
@@ -1452,9 +1453,7 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
     except NoFeasibleTrialError as exc:
         if run.deadline_exhausted:
             raise _no_feasible_before_deadline(
-                phase.name,
-                run.timeout_source or "wallclock",
-                persistent=experiment.resolved_storage is not None,
+                experiment, phase.name, run.timeout_source or "wallclock"
             ) from exc
         raise
 
@@ -1551,7 +1550,7 @@ def _run_phase(
         phase,
         cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"),
     )
-    budget = _phase_budget(phase, run_deadline, persistent=experiment.resolved_storage is not None)
+    budget = _phase_budget(experiment, phase, run_deadline)
     if experiment.mlflow is not None:
         from phasesweep.tracking.session import require_tracking_target
 
