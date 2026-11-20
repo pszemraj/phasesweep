@@ -110,9 +110,11 @@ def test_init_catalog_leaves_cwd_to_each_config_outside_the_catalog_directory(
     text = output.read_text()
     assert "\n    cwd:" not in text
     assert text.count("# cwd unset: the detached runner starts in the config's directory") == 2
+    assert text.count("# absolute; a relative path resolves against this catalog file") == 2
     registry = Registry.load(output)
     for project in projects:
         assert registry.get(project.name).cwd == project.resolve()
+        assert f"ok    (read-only)  cwd {project.resolve()}\n" in result.output
 
 
 def test_init_catalog_honors_umask(tmp_path: Path) -> None:

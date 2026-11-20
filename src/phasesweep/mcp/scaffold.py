@@ -89,12 +89,14 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         if beneath is None:
             # A project outside the catalog's directory keeps the registry's default, its own directory.
             config_ref = str(config.resolve())
+            config_note = "absolute; a relative path resolves against this catalog file"
             cwd_line = (
                 "# cwd unset: the detached runner starts in the config's directory "
                 "(the trainer too, unless execution.cwd is set)"
             )
         else:
             config_ref = f"./{beneath}"
+            config_note = "resolved relative to this catalog file"
             cwd_line = (
                 'cwd: "."                     # detached runner cwd, relative to this catalog; '
                 "the trainer's only when execution.cwd is unset"
@@ -103,7 +105,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         entries.append(
             f"""\
   - id: {experiment_id_scalar}          # catalog experiment identifier for inspection and launch
-    config: {config_path}   # resolved relative to this catalog file
+    config: {config_path}   # {config_note}
     {cwd_line}
     # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose

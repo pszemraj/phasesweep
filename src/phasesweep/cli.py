@@ -1419,6 +1419,8 @@ def init_catalog(ctx: click.Context, from_configs: tuple[Path, ...], output: Pat
     """
     if not _write_catalog_scaffold(output, from_configs):
         ctx.exit(2)
+    # Show where each trainer will start before the operator grants anything.
+    _echo_catalog_report(check_catalog(output))
     click.echo(
         "next: fill in each description, decide allow/visible_params, then run "
         f"`phasesweep mcp check --catalog {output.resolve()}`"
