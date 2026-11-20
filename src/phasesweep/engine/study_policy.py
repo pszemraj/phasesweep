@@ -1286,9 +1286,11 @@ _NON_RESCUING_OPERATOR = re.compile(r"&&|[<>]+&?")
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
     """Refuse a trainer directory that does not exist or a trial program the shell cannot run.
 
-    Without ``path`` the answer is the same from any shell, so ``validate`` and the MCP
+    Without ``path`` no shell's ``PATH`` changes the answer, so ``validate`` and the MCP
     catalog load ask it that way. A launch passes the trainer's ``PATH`` in
     :func:`_launch_preflight`, because the ``PATH`` that counts is the one the run starts with.
+    With ``execution.cwd`` unset the trainer starts where PhaseSweep was started, so a relative
+    program is judged against that directory, as a run started there would resolve it.
 
     :param Experiment experiment: Experiment whose ``execution.cwd`` and trial command are checked.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1325,8 +1327,12 @@ def _trial_program_refusal(
     itself. A missing first program fails the whole command only when nothing after it can
     rescue it, so a command is judged only when it is one simple command or commands joined
     by ``&&``. Any other operator outside quotes (``||``, ``;``, ``|``, ``&``, a subshell or a
-    newline between commands) can run something else after the failure. Anything the check
-    cannot judge is left to the shell, never refused.
+    newline between commands) can run something else after the failure. A backslash at a line
+    end continues the command, so the two lines are joined before the words are read; two
+    backslashes there may be an escaped backslash before a real line end, which leaves the
+    command unjudged. So does a ``#`` anywhere: a comment runs to its line end whatever
+    quotes it holds, which this lexer cannot follow. Anything the check cannot judge is left
+    to the shell, never refused.
 
     :param str command: The trial command template.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1338,6 +1344,9 @@ def _trial_program_refusal(
         is found or cannot be judged.
     """
     text = command.strip()
+    if "#" in text or "\\\\\n" in text:
+        return None
+    text = text.replace("\\\n", "")
     try:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_OPERATOR_CHARS)
         lexer.whitespace = " \t\r"

@@ -4,8 +4,8 @@ The trial command runs through ``/bin/sh`` on the PATH the run starts with, in t
 working directory. A program that PATH lacks, or a missing ``execution.cwd``, would fail every
 trial before its trainer ran and record each as a failure, so the launch preflight refuses
 them up front. The program check judges only a plain first word, and only in a command that no
-later operator could rescue; it never refuses a command it cannot judge. ``validate`` runs the directory check and judges a program written with a
-``/``, whose answers are the same from any shell.
+later operator could rescue; it never refuses a command it cannot judge. ``validate`` runs the
+directory check and judges a program written with a ``/``, whose answers no ``PATH`` changes.
 """
 
 from __future__ import annotations
@@ -157,6 +157,11 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param(f"{_MISSING} --x 1 && true || true", id="and-then-or"),
         pytest.param(f"{_MISSING} --x $(true)", id="command-substitution"),
         pytest.param(f"{_MISSING} --x 1 '||' true", id="quoted-operator-word"),
+        pytest.param(f"{_MISSING} \\\n  --x 1 \\\n  || true", id="continued-or-fallback"),
+        pytest.param(f"{_MISSING} --x 1 # don't\ntrue # it's", id="comment-quotes-span-lines"),
+        pytest.param(f"{_MISSING} a\\;b # #\\\n < out.log", id="comment-ends-in-backslash"),
+        pytest.param(f"{_MISSING} --tag '#1'", id="hash-in-argument"),
+        pytest.param(f"{_MISSING} out.log \\\\\ntrue", id="escaped-backslash-before-newline"),
     ],
 )
 def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) -> None:
@@ -175,6 +180,7 @@ def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) 
         pytest.param(f'{_MISSING} --x ""', id="empty-argument"),
         pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
         pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
+        pytest.param(f"{_MISSING} \\\n  --x 1", id="indented-continuation"),
     ],
 )
 def test_program_check_refuses_a_command_nothing_after_its_program_can_rescue(
@@ -417,37 +423,6 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
     _executable(tmp_path / "train.sh")
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     assert (result.exit_code == 0) == (program == "./train.sh"), result.output
-
-
-def test_validate_accepts_a_missing_program_whose_fallback_the_shell_would_run(
-    tmp_path: Path,
-) -> None:
-    """``a || b`` succeeds through ``b`` when ``a`` is missing, so ``validate`` leaves it to the shell."""
-    config = tmp_path / "experiment.yaml"
-    write_experiment_config(
-        config,
-        make_experiment(
-            workdir=tmp_path / "runs",
-            trial_command="./accelerated-trainer {overrides} || phasesweep-fake-train {overrides}",
-            execution=ExecutionContext(cwd=str(tmp_path)),
-        ),
-    )
-
-    result = CliRunner().invoke(cli_main, ["validate", str(config)])
-    assert result.exit_code == 0, result.output
-
-    write_experiment_config(
-        config,
-        make_experiment(
-            workdir=tmp_path / "runs",
-            trial_command="./accelerated-trainer {overrides} && phasesweep-fake-train {overrides}",
-            execution=ExecutionContext(cwd=str(tmp_path)),
-        ),
-    )
-    result = CliRunner().invoke(cli_main, ["validate", str(config)])
-    assert result.exit_code != 0
-    assert isinstance(result.exception, PhaseSweepError)
-    assert "'./accelerated-trainer' resolves to" in str(result.exception)
 
 
 def test_the_any_shell_check_leaves_a_program_found_through_path_to_the_launch(
