@@ -692,20 +692,23 @@ def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tm
 
 @pytest.mark.integration
 def test_wandb_worker_polls_until_shortly_before_its_deadline(wandb_worker_sdk, tmp_path):
-    """A run that finishes four seconds inside a ten-second budget is captured, not timed out."""
-    wandb_worker_sdk("""
+    """A run that finishes 3.5 seconds inside a ten-second budget is captured, not timed out.
+
+    The run finishes 6.5 seconds after the extraction starts, timed from the parent rather than
+    from the worker's first lookup, so the worker's start-up time cannot push it past the
+    polling deadline; a five-second reserve stops polling before it.
+    """
+    started = time.monotonic()
+    wandb_worker_sdk(f"""
         import time
-        _first_lookup = []
         class Api:
             def __init__(self, **kwargs): pass
             def run(self, path):
-                if not _first_lookup:
-                    _first_lookup.append(time.monotonic())
-                finished = time.monotonic() - _first_lookup[0] >= 6
-                return type("Run", (), {
+                finished = time.monotonic() - {started!r} >= 6.5
+                return type("Run", (), {{
                     "state": "finished" if finished else "running",
-                    "summary_metrics": {"loss": 0.25},
-                })()
+                    "summary_metrics": {{"loss": 0.25}},
+                }})()
     """)
     source = WandbExtractor(
         type="wandb",
