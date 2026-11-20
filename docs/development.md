@@ -21,8 +21,7 @@ pip install git+https://github.com/pszemraj/phasesweep.git
 During iteration, run the mandatory checks and tests for the changed subsystem. Complete qualification uses [both non-live lanes](#test-tiers). Run the repository checks sequentially:
 
 ```bash
-pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_ledger_read_paths.py
-pytest --collect-only
+pytest -m "contract and not live"
 ruff check .
 ruff format --check .
 mypy src
@@ -48,8 +47,7 @@ pre-commit install
 | module size | pre-commit | changed `src/` and `tests/` Python files |
 | typing escapes | pre-commit | lines the commit adds to `src/` and `tests/` Python files |
 | review-provenance tags | pre-commit | changed `src/` and `tests/` Python files |
-| contract tests | pre-commit | every commit |
-| whole-suite collection | pre-commit | every commit, collecting the whole suite |
+| contract tests | pre-commit | every commit, collecting the whole suite and running the tests marked `contract` |
 | `mypy src` | pre-push | the whole package |
 
 The development environment hook stops the run when the `python` first on `PATH` has no `phasesweep` installed, which means another environment is active.
@@ -91,7 +89,7 @@ Both lanes run on Linux and macOS. Tests that require real Linux procfs or PID n
 If tests fail under contention, wait for an idle machine and rerun only the failing node IDs serially. Do not rerun the whole suite. Add the duration-report options shown above to either lane to inspect its runtime.
 
 > [!NOTE]
-> A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why both commands above spell out `not live`.
+> A `-m` on the command line *replaces* the `-m 'not live'` in `addopts` rather than adding to it, which is why every marker command on this page spells out `not live`.
 
 `@pytest.mark.live` tests use real host hardware or a live external service, so every run leaves them out unless `-m live` selects them. The W&B round trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a pure-Python trainer. It checks the attempt-keyed remote captures, publication, inherited parameters, and a replay that reads no W&B state. It needs the W&B SDK installed and credentials that may write to the project you name, and skips when `PHASESWEEP_WANDB_ENTITY` or `PHASESWEEP_WANDB_PROJECT` is unset; `PHASESWEEP_WANDB_BASE_URL` selects another W&B server:
 
@@ -104,9 +102,11 @@ A test is `@pytest.mark.integration` when it manages real processes, waits on wa
 
 Mark tests explicitly according to the rules above, including tests that call shared helpers. Use pytest's built-in duration report to identify slow cases. Durations are advisory; timing thresholds do not fail a run.
 
+A test module that pins a cross-module contract carries `pytestmark = pytest.mark.contract`; the commit hook and CI run exactly those tests.
+
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions runs one Linux job on pull requests: Ruff linting, Ruff format checking, mypy, the module-size check, whole-suite collection, and the contract tests, with the tests importing from `src/` and no package build. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests are opt-in.
+GitHub Actions runs one Linux job on pull requests: Ruff linting, Ruff format checking, mypy, the module-size check, and the contract tests (`pytest -m "contract and not live"`, which also collects the whole suite), with the tests importing from `src/` and no package build. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests are opt-in.
 
 The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 

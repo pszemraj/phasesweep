@@ -70,7 +70,7 @@ phasesweep automates hyperparameter sweeps over a training codebase on a single 
 ## CI and Hooks
 
 - CI minutes cost the user money. Outside the approved scope below, CI stays static: no matrix, no full or integration suite, no build or install checks. Never quietly reintroduce removed checks or move them into hooks or other workflows.
-- **Approved scope, do not propose removing it:** the single Linux job in `.github/workflows/ci.yml`, on one Python version, runs Ruff check and format, mypy, the module-size check, whole-suite collection, and the contract tests (`tests/test_ledger_contract.py`, `tests/test_error_routing.py`, `tests/test_ledger_read_paths.py`). The test step's budget is about 20 seconds, with 40 seconds as the ceiling; going past about 20 seconds needs new approval. Every hook in `.pre-commit-config.yaml` is mandatory, including the contract-test and collection hooks.
+- **Approved scope, do not propose removing it:** the single Linux job in `.github/workflows/ci.yml`, on one Python version, runs Ruff check and format, mypy, the module-size check, and the contract tests (the tests marked `contract`, run with `pytest -m "contract and not live"`, which also collects the whole suite). The test step's budget is about 20 seconds, with 40 seconds as the ceiling; going past about 20 seconds needs new approval. Every hook in `.pre-commit-config.yaml` is mandatory, including the contract-test hook, which also collects the whole suite.
 
 ## Sweep and Experiment Ownership
 

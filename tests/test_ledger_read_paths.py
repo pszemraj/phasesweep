@@ -49,6 +49,8 @@ from tests.ledger_fixtures import (
 )
 from tests.mcp_helpers import stage_dead_run
 
+pytestmark = pytest.mark.contract
+
 #: Every fixture this matrix requires. A missing entry means an incomplete
 #: regeneration, not a smaller matrix, so it is asserted by name.
 REQUIRED_FIXTURES = ("current-journal",)

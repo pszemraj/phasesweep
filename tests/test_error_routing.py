@@ -128,6 +128,8 @@ from tests.ledger_fixtures import (
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
 from tests.recovery_helpers import load_only_recovery_needs
 
+pytestmark = pytest.mark.contract
+
 _SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError"})
 
 

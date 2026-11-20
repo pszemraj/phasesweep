@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.contract
+
 SRC = Path(__file__).resolve().parent.parent / "src"
 PACKAGE_ROOT = SRC / "phasesweep"
 

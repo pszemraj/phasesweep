@@ -25,12 +25,10 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy src
-      # Keep collection and in-process contracts within the approved test budget.
+      # Pytest collects the whole suite before selecting the tests marked
+      # `contract`; keep this step within the approved test budget.
       - name: Contract tests
         run: |
           bash scripts/check_module_size.sh
           python -m pip install 'pytest==9.1.1'
-          PYTHONPATH=src python -m pytest --collect-only -q -p no:cacheprovider
-          PYTHONPATH=src python -m pytest -p no:cacheprovider \
-            tests/test_ledger_contract.py tests/test_error_routing.py \
-            tests/test_ledger_read_paths.py
+          PYTHONPATH=src pytest -p no:cacheprovider -m "contract and not live"
