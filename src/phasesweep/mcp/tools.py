@@ -72,6 +72,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
     UnknownRunError,
     live_runner_step,
+    recover_run_step,
 )
 from phasesweep.mcp.failures import operator_failure, response_failure, run_failure_payload
 from phasesweep.mcp.redaction import (
@@ -1453,14 +1454,15 @@ class PhaseSweepMCP:
                             self._runs, handle, view=view, observation=observation
                         )
                         if failure is None:
-                            failure = json_object(_cleanup_uncertain_payload([]))
+                            failure = json_object(
+                                _cleanup_uncertain_payload([], run_id=handle.run_id)
+                            )
                             if self._runs.runner_may_be_alive(handle, view=view):
                                 failure["remediation"] = (
                                     "Cancellation could not stop the runner; trial cleanup is "
                                     "unconfirmed. Stop monitoring and ask the operator: "
                                     f"{live_runner_step(identity.pid, identity.pgid)} "
-                                    "Then run `phasesweep mcp recover-run` from a host shell, "
-                                    "review the preview, and repeat with `--confirm`."
+                                    f"Then {recover_run_step(handle.run_id)}."
                                 )
                         if observation.terminal_status is None:
                             self._runs.mark_cleanup_uncertain(handle, failure=failure)

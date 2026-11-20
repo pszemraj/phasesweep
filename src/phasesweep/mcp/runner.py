@@ -48,6 +48,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     operator_step,
 )
+from phasesweep.mcp.errors import recover_run_step
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -124,18 +125,17 @@ _SELF_CONTAINED_STEPS = frozenset({OperatorAction.RUN_RECOVER_RUN, OperatorActio
 _RUN_LOG_DETAILS = "The error in the PhaseSweep run log gives the details."
 
 
-def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") -> str:
+def _operator_remediation(steps: Sequence[OperatorAction], *, run_id: str, before: str = "") -> str:
     """Compose operator steps into one remediation, in the order they must happen.
 
     :param Sequence[OperatorAction] steps: Non-empty operator steps, none of them ``RETRY``.
+    :param str run_id: Run the remediation is recorded for, which its recover-run step names.
     :param str before: Clause naming what every step must precede, if any.
     :return str: The remediation, pointing at the run log when a step needs
         the error's details.
     """
     phrases = [
-        "run phasesweep mcp recover-run"
-        if step is OperatorAction.RUN_RECOVER_RUN
-        else OPERATOR_STEPS[step]
+        recover_run_step(run_id) if step is OperatorAction.RUN_RECOVER_RUN else OPERATOR_STEPS[step]
         for step in steps
     ]
     joined = phrases[0]
@@ -147,10 +147,11 @@ def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") 
     return remediation
 
 
-def _routed_next_steps(error: PhaseSweepError) -> dict[str, object]:
+def _routed_next_steps(error: PhaseSweepError, *, run_id: str) -> dict[str, object]:
     """Return the retryability, actor, and remediation a raise's routed action calls for.
 
     :param PhaseSweepError error: Failure carrying the routed action and its concrete detail.
+    :param str run_id: Run the failure is recorded for.
     :return dict[str, object]: ``retryable``, ``actor``, and ``remediation``
         payload fields: the agent's retry when the action is ``RETRY``, and
         otherwise the operator's step.
@@ -160,15 +161,18 @@ def _routed_next_steps(error: PhaseSweepError) -> dict[str, object]:
     remediation = (
         f"Ask the operator: {operator_step(error)}"
         if error.remediation is not None
-        else _operator_remediation([error.action])
+        else _operator_remediation([error.action], run_id=run_id)
     )
     return {"retryable": False, "actor": "operator", "remediation": remediation}
 
 
-def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, object]:
+def _cleanup_uncertain_payload(
+    actions: Sequence[OperatorAction], *, run_id: str
+) -> dict[str, object]:
     """Build a cleanup-uncertain failure with required repairs followed by recover-run.
 
     :param Sequence[OperatorAction] actions: Steps the cleanup routes, in order.
+    :param str run_id: Run whose cleanup is uncertain, which the recover-run step names.
     :return dict[str, object]: The ``"cleanup_uncertain"`` payload.
     """
     last = OperatorAction.RUN_RECOVER_RUN
@@ -178,7 +182,9 @@ def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, o
         "stage": "cleanup",
         "retryable": False,
         "actor": "operator",
-        "remediation": _operator_remediation([*repairs, last], before=" before another launch"),
+        "remediation": _operator_remediation(
+            [*repairs, last], run_id=run_id, before=" before another launch"
+        ),
     }
 
 
@@ -243,6 +249,7 @@ def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, 
 def _base_failure_payload(
     error: BaseException,
     *,
+    run_id: str,
     stage: str | None,
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure.
@@ -252,6 +259,7 @@ def _base_failure_payload(
     exception without a routed action keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
+    :param str run_id: Run the failure is recorded for.
     :param str | None stage: Failure stage to report; clamped to one of
         ``"preflight"``, ``"execution"``, or ``"cleanup"``, falling back to
         ``"execution"`` for any other value.
@@ -270,8 +278,8 @@ def _base_failure_payload(
         "internal_error",
     )
     if code == "cleanup_uncertain":
-        return _cleanup_uncertain_payload([error.action])
-    steps = _routed_next_steps(error)
+        return _cleanup_uncertain_payload([error.action], run_id=run_id)
+    steps = _routed_next_steps(error, run_id=run_id)
     if code == "experiment_busy":
         steps["remediation"] = (
             f"{steps['remediation']} MCP cannot cancel a CLI operation: only the interface "
@@ -309,6 +317,7 @@ def _cleanup_steps(
 def _cleanup_failure_payload(
     primary: BaseException,
     *,
+    run_id: str,
     cause_stage: str | None,
     cleanup_error: BaseException | None = None,
 ) -> dict[str, object]:
@@ -316,6 +325,7 @@ def _cleanup_failure_payload(
 
     :param BaseException primary: Terminal error observed before cleanup was
         found to be uncertain.
+    :param str run_id: Run whose cleanup is uncertain.
     :param str | None cause_stage: Stage at which ``primary`` occurred, used
         when classifying it as the nested cause.
     :param BaseException | None cleanup_error: The engine's recorded cleanup
@@ -326,13 +336,15 @@ def _cleanup_failure_payload(
         For an existing cleanup error, retain its explicit storage failure when that
         prevents inspection.
     """
-    payload = _cleanup_uncertain_payload(_cleanup_steps(primary, cleanup_error))
+    payload = _cleanup_uncertain_payload(_cleanup_steps(primary, cleanup_error), run_id=run_id)
     # Preserve the primary cause's policy beneath the authoritative cleanup refusal.
     if isinstance(primary, ProcessCleanupUncertainError):
         if isinstance(primary.__cause__, StudyStorageUnavailableError):
-            payload["cause"] = _base_failure_payload(primary.__cause__, stage=cause_stage)
+            payload["cause"] = _base_failure_payload(
+                primary.__cause__, run_id=run_id, stage=cause_stage
+            )
     else:
-        payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
+        payload["cause"] = _base_failure_payload(primary, run_id=run_id, stage=cause_stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
@@ -366,6 +378,7 @@ def _recorded_cleanup_error(report: TerminalReport | None) -> BaseException | No
 def _terminal_failure_payload(
     error: BaseException,
     *,
+    run_id: str,
     stage: str | None,
     cleanup_confirmed: bool,
     cleanup_error: BaseException | None = None,
@@ -373,6 +386,7 @@ def _terminal_failure_payload(
     """Classify one terminal error, making cleanup uncertainty authoritative.
 
     :param BaseException error: Primary terminal error.
+    :param str run_id: Run the failure is recorded for, which its operator steps name.
     :param str | None stage: Stage at which the primary error occurred.
     :param bool cleanup_confirmed: Whether child-process cleanup was confirmed.
     :param BaseException | None cleanup_error: The engine's recorded cleanup
@@ -380,8 +394,10 @@ def _terminal_failure_payload(
     :return dict[str, object]: Validated, path-free terminal failure payload.
     """
     if not cleanup_confirmed:
-        return _cleanup_failure_payload(error, cause_stage=stage, cleanup_error=cleanup_error)
-    payload = _base_failure_payload(error, stage=stage)
+        return _cleanup_failure_payload(
+            error, run_id=run_id, cause_stage=stage, cleanup_error=cleanup_error
+        )
+    payload = _base_failure_payload(error, run_id=run_id, stage=stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
@@ -878,6 +894,7 @@ def main(argv: list[str] | None = None) -> int:
                 if report.primary_error is not None:
                     status["failure"] = _terminal_failure_payload(
                         report.primary_error,
+                        run_id=args.run_id,
                         stage=report.failure_stage,
                         cleanup_confirmed=report.cleanup_confirmed,
                         cleanup_error=report.cleanup_error,
@@ -930,6 +947,7 @@ def main(argv: list[str] | None = None) -> int:
             primary, failure_stage = _terminal_error(terminal_report, exc)
             status["failure"] = _terminal_failure_payload(
                 primary,
+                run_id=args.run_id,
                 stage=failure_stage,
                 cleanup_confirmed=cleanup_confirmed,
                 cleanup_error=_recorded_cleanup_error(terminal_report),
@@ -948,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
         status["cleanup_confirmed"] = cleanup_confirmed
         status["failure"] = _terminal_failure_payload(
             primary,
+            run_id=args.run_id,
             stage=failure_stage,
             cleanup_confirmed=False if cleanup_uncertain else cleanup_confirmed,
             cleanup_error=_recorded_cleanup_error(terminal_report),

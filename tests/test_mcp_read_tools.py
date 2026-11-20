@@ -791,9 +791,9 @@ def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_con
     snapshot: str,
 ) -> None:
     """A recorded cleanup_uncertain failure asks for recover-run until recovery is confirmed, then says cleanup is settled, in the failure or beneath its snapshot refusal."""
-    failure = _cleanup_uncertain_payload([])
     if snapshot == "frozen":
         app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+        failure = _cleanup_uncertain_payload([], run_id=handle.run_id)
         write_run_status(
             store,
             **{
@@ -809,6 +809,7 @@ def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_con
         handle = stage_dead_run(
             store, "srv-recorded-cleanup", config, registry.get("srv").id, cleanup_uncertain=False
         )
+        failure = _cleanup_uncertain_payload([], run_id=handle.run_id)
         write_unsafe_cleanup_status(store, handle.run_id, failure=failure)
     run_id = handle.run_id
     stored_status = store.status_path(run_id).read_bytes()
@@ -817,7 +818,8 @@ def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_con
 
     assert before["recovery_required"] is True
     assert before["failure"] == failure
-    assert "recover-run before another launch" in before["failure"]["remediation"]
+    assert f"recover-run --state-dir STATE_DIR --run-id {run_id}`" in failure["remediation"]
+    assert "`--confirm` before another launch" in before["failure"]["remediation"]
 
     _record_confirmed_recovery(store, handle)
 

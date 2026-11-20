@@ -970,6 +970,8 @@ def test_timeout_remedy_matches_storage_and_budget(
     assert f"Raise {key}" in remedy
     assert ("completed trials are kept" in remedy) is persistent
     assert ("storage: null keeps no completed trials" in remedy) is not persistent
-    failure = _terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)
+    failure = _terminal_failure_payload(
+        error, run_id="r0", stage="execution", cleanup_confirmed=True
+    )
     assert failure["code"] == "timeout"
     assert failure["remediation"] == f"Ask the operator: {remedy}"

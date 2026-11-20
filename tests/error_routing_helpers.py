@@ -135,7 +135,7 @@ def assert_routes_declared_action(
         assert error.remediation not in str(error)
         assert error.remediation not in caplog.text
         failure = mcp_runner._terminal_failure_payload(
-            error, stage="execution", cleanup_confirmed=True
+            error, run_id="r0", stage="execution", cleanup_confirmed=True
         )
         expected = (
             error.remediation
@@ -204,6 +204,6 @@ def assert_runner_payload_follows_routing(errors: Iterable[PhaseSweepError]) -> 
     """
     for error in errors:
         failure = mcp_runner._terminal_failure_payload(
-            error, stage="preflight", cleanup_confirmed=True
+            error, run_id="r0", stage="preflight", cleanup_confirmed=True
         )
         assert_payload_follows(failure, [error.action])

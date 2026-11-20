@@ -278,7 +278,9 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     toward a new experiment name or archiving a healthy study; falling through to
     ``internal_error`` would report a plain misconfiguration as a bug.
     """
-    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
+    failure = mcp_runner._terminal_failure_payload(
+        error, run_id="r0", stage="preflight", cleanup_confirmed=True
+    )
 
     assert failure["code"] == code
     assert failure["stage"] == "preflight"
@@ -295,6 +297,7 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     """
     failure = mcp_runner._terminal_failure_payload(
         ActiveAttemptPersistenceError("attempt registry is unwritable"),
+        run_id="r0",
         stage="execution",
         cleanup_confirmed=True,
     )
@@ -954,7 +957,7 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
         ),
     )
 
-    failure = mcp_runner._cleanup_failure_payload(shutdown, cause_stage="execution")
+    failure = mcp_runner._cleanup_failure_payload(shutdown, run_id="r0", cause_stage="execution")
 
     assert failure["code"] == "cleanup_uncertain"
     assert failure["actor"] == "operator"
@@ -1204,8 +1207,10 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, then "
-        "run phasesweep mcp recover-run before another launch. The error in the "
-        "PhaseSweep run log gives the details."
+        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from a host "
+        "shell, with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it "
+        "with `--confirm` before another launch. The error in the PhaseSweep run log gives "
+        "the details."
     )
 
 

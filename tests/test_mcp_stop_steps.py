@@ -5,11 +5,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from phasesweep.mcp.errors import (
+    ConcurrencyLimitError,
+    ExperimentBusyError,
+    McpToolError,
+    RunCapacityUnknownError,
+    RunNamespaceMismatchError,
+)
 from phasesweep.mcp.failures import response_failure
 from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunStore
@@ -29,6 +37,10 @@ from tests.mcp_helpers import (
 )
 
 RUN_ID = "srv-needs-recovery"
+#: The operator's recover-run command for this run, as every agent-facing step spells it.
+FULL_RECOVER_RUN = f"`phasesweep mcp recover-run --state-dir STATE_DIR --run-id {RUN_ID}`"
+#: A mention of recover-run that leaves out the flags the command requires.
+BARE_RECOVER_RUN = re.compile(r"phasesweep mcp recover-run(?! --state-dir STATE_DIR --run-id )")
 #: A PID namespace the reader is not in, and a nested reader that cannot prove its processes gone.
 RECORDED_NAMESPACE = "pid:[4026539001]@100"
 NESTED_READER = "pid:[4026539333]@100"
@@ -101,7 +113,9 @@ def _runner_cleanup_unconfirmed(
 ) -> None:
     """The runner recorded that it could not confirm trial cleanup."""
     stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
-    write_unsafe_cleanup_status(store, RUN_ID, failure=_cleanup_uncertain_payload([]))
+    write_unsafe_cleanup_status(
+        store, RUN_ID, failure=_cleanup_uncertain_payload([], run_id=RUN_ID)
+    )
 
 
 def _upload_cleanup_unconfirmed(
@@ -170,7 +184,32 @@ def test_a_run_that_requires_recovery_names_the_operators_step(
     for failure in (run["failure"], results_failure):
         assert failure is not None
         assert failure["actor"] == "operator"
-        assert "phasesweep mcp recover-run" in failure["remediation"]
+        assert FULL_RECOVER_RUN in failure["remediation"]
+        assert BARE_RECOVER_RUN.search(failure["remediation"]) is None
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        ExperimentBusyError("srv", RUN_ID, recovery_required=True),
+        ExperimentBusyError("srv", RUN_ID, recovery_required=True, runner_observable=False),
+        ExperimentBusyError("srv", RUN_ID, runner_observable=False),
+        ConcurrencyLimitError(1, 1, [RUN_ID], recovery_required_run_ids=[RUN_ID]),
+        ConcurrencyLimitError(1, 1, [RUN_ID], unobservable_run_ids=[RUN_ID]),
+        RunCapacityUnknownError({f"run:{RUN_ID}"}, [RUN_ID]),
+        RunNamespaceMismatchError(RUN_ID),
+    ],
+    ids=lambda refusal: type(refusal).__name__,
+)
+def test_every_refusal_that_names_recover_run_gives_the_whole_command(
+    refusal: McpToolError,
+) -> None:
+    """A refusal that sends the operator to recover-run spells out its state-dir and run-id flags at every mention."""
+    text = str(refusal)
+
+    assert "phasesweep mcp recover-run --state-dir STATE_DIR --run-id " in text
+    assert "the catalog's `state_dir` as STATE_DIR" in text
+    assert BARE_RECOVER_RUN.search(text) is None
 
 
 def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause(
@@ -180,7 +219,7 @@ def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause
     config, app, _registry, store = side_effect_app(tmp_path)
     handle = stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
     recorded = {
-        **_cleanup_uncertain_payload([]),
+        **_cleanup_uncertain_payload([], run_id=RUN_ID),
         "cause": {
             "code": "storage_unavailable",
             "stage": "execution",
@@ -224,4 +263,4 @@ def test_a_cancel_that_leaves_recovery_names_the_operators_step(tmp_path: Path) 
 
     assert (result["cleanup_confirmed"], result["recovery_required"]) == (True, True)
     assert result["failure"]["code"] == "result_snapshot_unavailable"
-    assert "phasesweep mcp recover-run" in result["failure"]["remediation"]
+    assert FULL_RECOVER_RUN in result["failure"]["remediation"]

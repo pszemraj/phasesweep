@@ -237,9 +237,9 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
 
 def _failure_code(error: BaseException) -> object:
     """Return the failure code the MCP runner records for ``error``."""
-    return mcp_runner._terminal_failure_payload(error, stage="execution", cleanup_confirmed=True)[
-        "code"
-    ]
+    return mcp_runner._terminal_failure_payload(
+        error, run_id="r0", stage="execution", cleanup_confirmed=True
+    )["code"]
 
 
 @pytest.mark.parametrize(
@@ -346,7 +346,7 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
 
     # The MCP runner calls run_experiment, so this is the failure it records for a launch.
     failure = mcp_runner._terminal_failure_payload(
-        launched.value, stage="preflight", cleanup_confirmed=True
+        launched.value, run_id="r0", stage="preflight", cleanup_confirmed=True
     )
     assert failure["code"] == "trial_target_refused"
     assert failure["actor"] == "operator"

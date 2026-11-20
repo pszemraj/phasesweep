@@ -104,7 +104,9 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     assert "phasesweep run with the same config, without --dry-run" in advice
     assert "correct the experiment configuration" not in _operational_error_text(error)
     assert _operational_error_text(error).count(advice) == 1
-    failure = mcp_runner._terminal_failure_payload(error, stage="preflight", cleanup_confirmed=True)
+    failure = mcp_runner._terminal_failure_payload(
+        error, run_id="r0", stage="preflight", cleanup_confirmed=True
+    )
     assert failure["remediation"] == f"Ask the operator: {advice}"
 
 

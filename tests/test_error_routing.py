@@ -281,7 +281,7 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
     )
     failure = mcp_runner._terminal_failure_payload(
-        excinfo.value, stage="preflight", cleanup_confirmed=True
+        excinfo.value, run_id="r0", stage="preflight", cleanup_confirmed=True
     )
     assert (failure["code"], failure["stage"], failure["actor"]) == (
         "launch_environment_invalid",
@@ -1395,7 +1395,11 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     assert_runner_payload_follows_routing(errors)
     for primary, recorded, routed in _UNCONFIRMED_CLEANUPS:
         failure = mcp_runner._terminal_failure_payload(
-            primary, stage="execution", cleanup_confirmed=False, cleanup_error=recorded
+            primary,
+            run_id="r0",
+            stage="execution",
+            cleanup_confirmed=False,
+            cleanup_error=recorded,
         )
         assert failure["code"] == "cleanup_uncertain"
         # The durable payload schema is unchanged: the action routes, it is not stored.
@@ -1403,10 +1407,16 @@ def test_runner_payload_follows_the_routed_steps() -> None:
         assert_payload_follows(failure, routed)
     # A ledger failure with a shared-registry cleanup error composes both repairs, word for word.
     composed = mcp_runner._terminal_failure_payload(
-        _LEDGER_LOST, stage="execution", cleanup_confirmed=False, cleanup_error=_SHARED_REGISTRY
+        _LEDGER_LOST,
+        run_id="r0",
+        stage="execution",
+        cleanup_confirmed=False,
+        cleanup_error=_SHARED_REGISTRY,
     )
     assert composed["remediation"] == (
         "Ask the operator to restore or repair the storage ledger and access to it, and restore "
-        "the files and permissions identified in the error, then run phasesweep mcp recover-run "
-        "before another launch. The error in the PhaseSweep run log gives the details."
+        "the files and permissions identified in the error, then run `phasesweep mcp "
+        "recover-run --state-dir STATE_DIR --run-id r0` from a host shell, with the catalog's "
+        "`state_dir` as STATE_DIR, read its preview and repeat it with `--confirm` before "
+        "another launch. The error in the PhaseSweep run log gives the details."
     )

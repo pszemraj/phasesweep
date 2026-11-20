@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from phasesweep.mcp.errors import recover_run_step
 from phasesweep.mcp.runner import (
     FailureCode,
     FailurePayload,
@@ -80,10 +81,19 @@ _CLEANUP_SETTLED_REMEDIATION = (
     "run itself still ended without completing; a new run of this experiment keeps its finished "
     "trials and reruns its interrupted ones first."
 )
-_RECOVER_RUN_STEP = (
-    "Stop monitoring and ask the operator to run `phasesweep mcp recover-run` from a host shell, "
-    "review its preview and repeat with `--confirm`."
-)
+
+
+def _stop_for_recovery(run_id: str, *, outside_sandbox: bool = False) -> str:
+    """Tell the agent to stop and relay the operator's recover-run step for one run.
+
+    :param str run_id: Run the operator recovers.
+    :param bool outside_sandbox: The runner is in another PID namespace.
+    :return str: One sentence.
+    """
+    step = recover_run_step(run_id, outside_sandbox=outside_sandbox)
+    return f"Stop monitoring and ask the operator to {step}."
+
+
 # A run's claim refuses either verdict, so the step precedes the next launch's preflight.
 _PUBLICATION_FAILURES: dict[str, JsonObject] = {
     "failed": operator_failure(
@@ -164,17 +174,18 @@ def _recovery_failure(
             "cleanup_uncertain",
             "cleanup",
             "The server saved this run's launch but never recorded whether its runner "
-            f"started. {_RECOVER_RUN_STEP}",
+            f"started. {_stop_for_recovery(handle.run_id)}",
         )
     if observation.snapshot_recovery_required and not observation.cleanup_recovery_required:
         snapshot_unfinished = operator_failure(
             "result_snapshot_unavailable",
             "cleanup",
             "The runner stopped before it finished recording this run's result snapshot. "
-            f"{_RECOVER_RUN_STEP}",
+            f"{_stop_for_recovery(handle.run_id)}",
         )
         return _with_cause(snapshot_unfinished, recorded)
-    return _with_cause(json_object(_cleanup_uncertain_payload([])), recorded)
+    cleanup = _cleanup_uncertain_payload([], run_id=handle.run_id)
+    return _with_cause(json_object(cleanup), recorded)
 
 
 def run_failure_payload(
@@ -265,9 +276,8 @@ def _diagnose(
             "The run succeeded and its published results are unaffected, but cleanup of "
             "its MLflow upload worker is unconfirmed. Stop monitoring and ask the operator "
             "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG "
-            f"--generation {handle.run_id}`, then run `phasesweep mcp recover-run` from a "
-            "host shell, review its preview and repeat with `--confirm`, before another "
-            "launch.",
+            f"--generation {handle.run_id}`, then {recover_run_step(handle.run_id)}, before "
+            "another launch.",
         )
         return _Diagnosis(upload_cleanup, persisted, True)
     recorded = persisted
@@ -297,17 +307,14 @@ def _diagnose(
             )
         elif observation.runner_heartbeat_stale:
             remedy = (
-                "The runner is in another PID namespace and its heartbeat is stale; "
-                "it may have stopped. Stop monitoring and ask the operator to inspect "
-                "this run with `phasesweep mcp recover-run` from a host shell outside "
-                "the sandbox. Liveness and trial cleanup must be checked there."
+                "The runner is in another PID namespace and its heartbeat is stale; it may "
+                "have stopped, and only a shell outside the sandbox can check it and its "
+                f"trials. {_stop_for_recovery(handle.run_id, outside_sandbox=True)}"
             )
         else:
             remedy = (
                 "The runner exited without writing a final status; its trial processes may "
-                "still be alive. Stop monitoring and ask the operator to inspect this run "
-                "with `phasesweep mcp recover-run` from a host shell, then repeat with "
-                "`--confirm` after reviewing the process cleanup preview."
+                f"still be alive. {_stop_for_recovery(handle.run_id)}"
                 if recovery_required
                 else "The runner exited without writing a final status. Operator recovery "
                 "settled process cleanup; this run's historical results remain unavailable. "

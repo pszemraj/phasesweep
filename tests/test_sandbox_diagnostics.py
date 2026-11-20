@@ -17,7 +17,7 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     )
     # The lock is taken before the engine can report, so the runner has no report to read.
     primary, stage = _terminal_error(None, error)
-    failure = _terminal_failure_payload(primary, stage=stage, cleanup_confirmed=True)
+    failure = _terminal_failure_payload(primary, run_id="r0", stage=stage, cleanup_confirmed=True)
 
     assert failure["code"] == "storage_unavailable"
     assert failure["stage"] == "preflight"

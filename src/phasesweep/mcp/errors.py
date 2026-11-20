@@ -15,6 +15,25 @@ _MAX_LISTED_UNREADABLE_RECORDS = 5
 CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
 
 
+def recover_run_step(run_id: str, *, outside_sandbox: bool = False) -> str:
+    """Return the operator's whole ``recover-run`` step for one run, to follow "ask the operator to".
+
+    The command refuses to run without its state directory and run id, and the agent never
+    sees the state directory's path, so the step names it as the catalog's ``state_dir``.
+
+    :param str run_id: Run to recover, or a placeholder such as ``<run id>`` for several.
+    :param bool outside_sandbox: The run's processes are in another PID namespace, which only
+        a shell outside every sandbox can prove gone.
+    :return str: A lower-case clause ending without a full stop.
+    """
+    shell = "a host shell outside any sandbox" if outside_sandbox else "a host shell"
+    return (
+        f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from {shell}, "
+        "with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it with "
+        "`--confirm`"
+    )
+
+
 def live_runner_step(pid: int | None, pgid: int | None) -> str:
     """Return the host step for a runner that cancellation or recovery found still alive.
 
@@ -266,16 +285,13 @@ class ExperimentBusyError(McpToolError):
             including an unobservable runner whose heartbeat is stale.
         :param bool runner_observable: Whether this server can verify runner liveness.
         """
+        step = recover_run_step(run_id, outside_sandbox=not runner_observable)
         if recovery_required:
-            advice = (
-                "Ask the operator to inspect this run with `phasesweep mcp recover-run` "
-                "and complete its reported recovery before retrying the launch."
-            )
+            advice = f"Ask the operator to {step} before retrying the launch."
             if not runner_observable:
                 advice += (
                     " Its runner is in another PID namespace and has probably stopped or left "
-                    "cleanup uncertain; the operator must check and recover it from a host "
-                    "shell outside the sandbox."
+                    "cleanup uncertain."
                 )
         else:
             advice = (
@@ -285,8 +301,7 @@ class ExperimentBusyError(McpToolError):
             if not runner_observable:
                 advice += (
                     " This server cannot verify runner liveness across PID namespaces. "
-                    "Monitor durable progress; if it stops, ask the operator to inspect "
-                    "and recover from a host shell outside the sandbox."
+                    f"Monitor durable progress; if it stops, ask the operator to {step}."
                 )
         super().__init__(
             f"experiment {experiment_id!r} already has a running sweep "
@@ -323,29 +338,27 @@ class ConcurrencyLimitError(McpToolError):
         blockers = ", ".join(repr(run_id) for run_id in shown)
         omitted = max(0, running - len(shown))
         omitted_note = f" ({omitted} more active)" if omitted else ""
+        unobservable_ids = set(unobservable_run_ids)
         if recovery_ids:
             needs_recovery = ", ".join(repr(run_id) for run_id in shown if run_id in recovery_ids)
+            step = recover_run_step(
+                "<run id>", outside_sandbox=bool(unobservable_ids & recovery_ids)
+            )
             advice = (
                 f"Run_ids requiring operator recovery: {needs_recovery}. Ask the operator to "
-                "inspect these runs with `phasesweep mcp recover-run` and complete the "
-                "reported recovery before retrying the launch."
+                f"{step} for each of them before retrying the launch."
             )
         else:
             advice = (
                 "Call await_run with one of these run_ids, then retry this launch only "
                 "after that run is terminal. Ask the user before cancelling a blocking run."
             )
-        unobservable_ids = set(unobservable_run_ids)
-        if unobservable_ids & recovery_ids:
-            advice += (
-                " The operator must recover blockers whose runner is in another PID "
-                "namespace from a host shell outside the sandbox."
-            )
         if unobservable_ids - recovery_ids:
+            step = recover_run_step("<run id>", outside_sandbox=True)
             advice += (
                 " This server cannot verify runner liveness for blockers in another PID "
-                "namespace. Monitor durable progress; if it stops, ask the operator to "
-                "inspect and recover from a host shell outside the sandbox."
+                f"namespace. Monitor durable progress; if one stops, ask the operator to {step} "
+                "for it."
             )
         super().__init__(
             f"concurrency limit reached (max_concurrent_runs={limit}); {running} other "
@@ -370,9 +383,8 @@ class RunCapacityUnknownError(McpToolError):
         if recoverable_run_ids:
             ids = ", ".join(repr(run_id) for run_id in recoverable_run_ids)
             recovery = (
-                f" Pre-spawn orphan run id(s): {ids}. Ask the operator to run "
-                "`phasesweep mcp recover-run --state-dir <configured-state-dir> "
-                "--run-id <id>` and then repeat it with `--confirm`."
+                f" Pre-spawn orphan run id(s): {ids}. Ask the operator to "
+                f"{recover_run_step('<run id>')} for each of them."
             )
         recoverable = {f"run:{run_id}" for run_id in recoverable_run_ids}
         listed = sorted(
@@ -455,16 +467,15 @@ class RunNamespaceMismatchError(McpToolError):
 
         :param str run_id: Run id whose runner this server cannot signal.
         """
+        step = recover_run_step(run_id, outside_sandbox=True)
         super().__init__(
             f"run {run_id!r} was launched in another PID namespace, where its recorded "
             "process ids name unrelated processes for this server, so nothing was "
             "signalled. Do not retry cancellation. If get_run_status reports recovery_required, "
-            "stop monitoring and ask the operator to inspect and recover it with "
-            "phasesweep mcp recover-run from a host shell outside the sandbox. Otherwise "
-            "keep monitoring with await_run and tell the user this server cannot cancel it: "
-            "the operator can cancel it from the "
-            "environment that launched it while that environment runs, or recover it with "
-            "phasesweep mcp recover-run from the host once that environment has ended."
+            f"stop monitoring and ask the operator to {step}. Otherwise keep monitoring with "
+            "await_run and tell the user this server cannot cancel it: the operator can cancel "
+            "it from the environment that launched it while that environment runs, or, once "
+            f"that environment has ended, {step}."
         )
 
 

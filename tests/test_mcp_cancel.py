@@ -413,9 +413,13 @@ def test_terminal_cleanup_failure_precedes_the_cancellation_marker(
         store, "srv-terminal-failure", config, "srv", cleanup_uncertain=False, allow_cancel=True
     )
     specific = _cleanup_failure_payload(
-        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+        StudyStorageUnavailableError("ledger unavailable"),
+        run_id=handle.run_id,
+        cause_stage="execution",
     )
-    store.mark_cleanup_uncertain(handle, failure=_cleanup_uncertain_payload([]))
+    store.mark_cleanup_uncertain(
+        handle, failure=_cleanup_uncertain_payload([], run_id=handle.run_id)
+    )
     write_unsafe_cleanup_status(store, handle.run_id, failure=specific)
     if unobservable:
         monkeypatch.setattr(store, "runner_view", lambda _handle: RunnerView("unobservable"))
@@ -443,7 +447,9 @@ def test_live_cancellation_reservation_preserves_a_runner_failure(
     store.create(handle)
     store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
     specific = _cleanup_failure_payload(
-        StudyStorageUnavailableError("ledger unavailable"), cause_stage="execution"
+        StudyStorageUnavailableError("ledger unavailable"),
+        run_id=handle.run_id,
+        cause_stage="execution",
     )
 
     def record_terminal_failure(*_args: object, **_kwargs: object) -> bool:
