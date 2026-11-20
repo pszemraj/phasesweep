@@ -206,6 +206,7 @@ def validate_grid_targets(experiment: Experiment) -> None:
             phase,
             finished=_finished_trial_count(trials),
             measured=_measured_trial_count(trials),
+            has_study=study is not None,
         )
 
 
@@ -253,7 +254,7 @@ def _refuse_as_a_launch_would(
             _validate_study_schema(study)
             if reached and record.running:
                 _validate_fixed_configuration_target(
-                    phase, finished=record.finished, measured=record.measured
+                    phase, finished=record.finished, measured=record.measured, has_study=True
                 )
             elif reached:
                 _validate_trial_target(study, phase)

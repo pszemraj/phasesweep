@@ -458,10 +458,13 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         phase,
         finished=_finished_trial_count(trials),
         measured=_measured_trial_count(trials),
+        has_study=True,
     )
 
 
-def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measured: int) -> None:
+def _validate_fixed_configuration_target(
+    phase: Phase, *, finished: int, measured: int, has_study: bool
+) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
     A fixed configuration draws nothing, so every attempt runs the same trial.
@@ -475,12 +478,16 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, measure
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Finished attempts the phase's study holds.
     :param int measured: How many of those are COMPLETE, feasible or not.
+    :param bool has_study: Whether the phase's study exists, which decides whether a grid
+        refusal points at a new study.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
-        refusal = grid_target_refusal(phase, finished=finished, measured=measured)
+        refusal = grid_target_refusal(
+            phase, finished=finished, measured=measured, has_study=has_study
+        )
     if refusal is not None:
         message, remediation = refusal
         raise TrialTargetRefusedError(message, remediation=remediation)

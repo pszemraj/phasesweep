@@ -789,3 +789,18 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     )
     assert diagnosis not in remedy
     assert "correct the experiment configuration" not in error
+    assert "new `experiment` name" not in error
+    assert "old study" not in error
+
+
+def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_study(
+    tmp_path: Path,
+) -> None:
+    """Changing the search space of a grid that already ran needs a new study, and the remedy says so."""
+    trainer, _calls = write_flaky_trainer(tmp_path, failures=0)
+    assert run_experiment(_grid(tmp_path, trainer, 2))["p"].metric == 1.0
+    with pytest.raises(TrialTargetRefusedError) as refused:
+        run_experiment(_grid(tmp_path, trainer, 4))
+    message = _operational_error_text(refused.value)
+    assert "To enlarge the grid instead, change the search space." in message
+    _assert_fresh_study_remedy(message)
