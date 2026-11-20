@@ -41,9 +41,9 @@ trainer_config:
 metric:
   name: eval_loss
   goal: minimize
-  # Viability bound: a loss above this means the run diverged. A trial outside the bound completes
-  # with its real value but cannot win, so a diverged run never ranks. Set it above the loss of
-  # ordinary runs, which the trial table shows.
+  # Viability bound: a loss above this means the run diverged. A trial outside the bound is recorded
+  # INFEASIBLE with its real value and cannot win, so a diverged run never ranks. Set it above the
+  # loss of ordinary runs, which the trial table shows.
   max: 0.6
   extractor:
     type: json_envelope
