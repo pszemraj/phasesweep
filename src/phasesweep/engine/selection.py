@@ -61,7 +61,7 @@ from phasesweep.engine.state import (
     _validate_observed_block,
     constraint_attr,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
+from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction, PhaseSweepError
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 
 log = logging.getLogger("phasesweep.engine.selection")
@@ -125,8 +125,16 @@ def _no_feasible_remedy(
             phase, finished=finished, measured=_measured_trial_count(trials)
         )
         target = f"above {phase.n_trials}" if ceiling is None else f"to {ceiling}"
-        return f"{evidence} Fix the failure, then raise phases[{phase.name}].n_trials {target} in the config and rerun to retry failed attempts. {NEW_STUDY_STEP}"
-    return f"{evidence} Fix the failure, then raise the phase's n_trials and rerun to retry failed attempts. {NEW_STUDY_STEP}"
+        budget = f"phases[{phase.name}].n_trials {target}"
+    else:
+        budget = "the phase's n_trials"
+    # Only the trial budget may change under a recorded study; any other config edit is refused.
+    return (
+        f"{evidence} Fix the failure. If the fix needs no other config edit, raise {budget} "
+        "in the config and rerun to retry the failed attempts. If it edits the config (such as "
+        "`trial_command`, `trainer_config` or a `provenance` value), the study refuses the "
+        f"changed config, so {FRESH_STUDY}."
+    )
 
 
 @dataclass
