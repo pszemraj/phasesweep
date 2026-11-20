@@ -36,6 +36,7 @@ from phasesweep.engine.fingerprints import (
     _MAX_REPORTED_CHANGES,
     _changed_payload_keys,
     _render_changed_values,
+    _render_value,
 )
 from phasesweep.engine.optuna import _finished_trial_count, _measured_trial_count
 from phasesweep.engine.state import (
@@ -997,30 +998,49 @@ _NO_RECORDED_ENVIRONMENT = (
 )
 
 
-def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
-    """Render how a tracked environment differs, with the values on both sides.
-
-    The values are cut by the window :func:`~phasesweep.engine.fingerprints._render_changed_values`
-    applies to a phase fingerprint refusal, so a long ``PATH`` shows where the two differ.
+def _environment_entries(
+    old: dict[str, str], new: dict[str, str], *, full: bool
+) -> list[tuple[str, str]]:
+    """List each variable a tracked environment changed, with how it changed.
 
     :param dict[str, str] old: Mapping a trial of the other cohort recorded.
     :param dict[str, str] new: Mapping this invocation composes.
-    :return str: Each differing variable as ``NAME old -> new``, then each added name with its
-        value and each removed name with its old value, up to :data:`_MAX_REPORTED_CHANGES`
-        entries and a count of the rest; empty when the mappings are equal.
+    :param bool full: Show every value whole; otherwise cut a long pair to the window
+        :func:`~phasesweep.engine.fingerprints._render_changed_values` applies to a phase
+        fingerprint refusal, so a long ``PATH`` shows where the two differ.
+    :return list[tuple[str, str]]: Each differing variable's name and ``NAME old -> new``, then
+        each added name with its value and each removed name with its old value.
     """
-    changed: list[str] = []
-    added: list[str] = []
-    removed: list[str] = []
+    changed: list[tuple[str, str]] = []
+    added: list[tuple[str, str]] = []
+    removed: list[tuple[str, str]] = []
     for name, before, after in _changed_payload_keys(old, new):
-        old_text, new_text = _render_changed_values(before, after)
+        old_text, new_text = (
+            (_render_value(before), _render_value(after))
+            if full
+            else _render_changed_values(before, after)
+        )
         if before is _ABSENT:
-            added.append(f"added {name}={new_text}")
+            added.append((name, f"added {name}={new_text}"))
         elif after is _ABSENT:
-            removed.append(f"removed {name} (was {old_text})")
+            removed.append((name, f"removed {name} (was {old_text})"))
         else:
-            changed.append(f"{name} {old_text} -> {new_text}")
-    entries = [*changed, *added, *removed]
+            changed.append((name, f"{name} {old_text} -> {new_text}"))
+    return [*changed, *added, *removed]
+
+
+def _describe_environment_changes(
+    old: dict[str, str], new: dict[str, str], *, full: bool = False
+) -> str:
+    """Render how a tracked environment differs, with the values on both sides.
+
+    :param dict[str, str] old: Mapping a trial of the other cohort recorded.
+    :param dict[str, str] new: Mapping this invocation composes.
+    :param bool full: Show every value whole instead of cut to where the two differ.
+    :return str: The entries of :func:`_environment_entries` up to :data:`_MAX_REPORTED_CHANGES`
+        and a count of the rest; empty when the mappings are equal.
+    """
+    entries = [text for _name, text in _environment_entries(old, new, full=full)]
     shown = entries[:_MAX_REPORTED_CHANGES]
     if len(entries) > _MAX_REPORTED_CHANGES:
         shown.append(f"and {len(entries) - _MAX_REPORTED_CHANGES} more")
@@ -1029,7 +1049,7 @@ def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> s
 
 def _environment_difference(
     current: EnvironmentIdentity, trials: Sequence[optuna.trial.FrozenTrial]
-) -> str:
+) -> tuple[str, list[str]]:
     """Show what differs between this invocation's environment and another cohort's trial.
 
     Compares the tracked mapping against the latest of ``trials`` that recorded one. Pass-through
@@ -1037,18 +1057,47 @@ def _environment_difference(
 
     :param EnvironmentIdentity current: Environment this invocation composes.
     :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
-    :return str: A sentence showing each differing, added and removed variable with its values,
-        or one saying no trial of the other cohort recorded its environment.
+    :return tuple[str, list[str]]: A sentence showing each differing, added and removed variable
+        with both values whole, or one saying no trial of the other cohort recorded its
+        environment; and the names of those variables, empty in the second case.
     """
     for trial in reversed(trials):
         recorded = json_text_map(trial.user_attrs.get(TRAINER_ENV_ATTR))
         if recorded is None:
             # Allocation stopped before recording the mapping, or the mapping is malformed.
             continue
-        description = _describe_environment_changes(recorded, current.tracked)
+        description = _describe_environment_changes(recorded, current.tracked, full=True)
         if description:
-            return f"Compared with trial {trial.number}: {description}."
-    return _NO_RECORDED_ENVIRONMENT
+            names = [
+                name for name, _text in _environment_entries(recorded, current.tracked, full=True)
+            ]
+            return f"Compared with trial {trial.number}: {description}.", names
+    return _NO_RECORDED_ENVIRONMENT, []
+
+
+def _environment_cohort_remediation(names: Sequence[str]) -> str:
+    """Name the way back to a study's recorded environment, or the way out of it.
+
+    :param Sequence[str] names: Variables that differ from the recorded environment, empty
+        when no trial recorded its environment.
+    :return str: The step that continues the study and the one that starts a fresh study.
+    """
+    if names:
+        listed = ", ".join(f"`{name}`" for name in names)
+        pronoun = "it" if len(names) == 1 else "them"
+        way_back = (
+            f"Run with the recorded {listed} to continue this study "
+            f"(for an MCP run, set {pronoun} in the client's server `env`)"
+        )
+    else:
+        way_back = (
+            "Run in the environment that created this study to continue it "
+            "(for an MCP run, set that environment in the client's server `env`)"
+        )
+    return (
+        f"{way_back}, or set a new `experiment` name to start a fresh study. "
+        "Moving a variable into `env` or `execution.passthrough_env` also starts a new study."
+    )
 
 
 def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdentity) -> None:
@@ -1060,7 +1109,8 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
         semantic environment cohort. The message shows each variable that differs,
-        was added or was removed, with its old and new value.
+        was added or was removed, with its whole old and new value, and the remediation
+        names those variables.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
@@ -1085,13 +1135,13 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
         )
     if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
+        difference, names = _environment_difference(current, elsewhere)
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
-            f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
-            "No trial was allocated. Values under env are pinned; ambient variables under "
-            "execution.passthrough_env, such as rotating credentials, do not split cohorts.",
+            f"{current.digest[:12]}. {difference} No trial was allocated.",
             action=OperatorAction.FIX_CONFIG,
+            remediation=_environment_cohort_remediation(names),
         )
 
 

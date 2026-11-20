@@ -238,6 +238,17 @@ def _changed_payload_keys(
     return [] if old == new else [(path, old, new)]
 
 
+def _render_value(value: object) -> str:
+    """Render one side of a changed key as compact JSON.
+
+    :param object value: Payload value, or ``_ABSENT``.
+    :return str: The JSON text; ``<absent>`` stands for a missing key.
+    """
+    if value is _ABSENT:
+        return "<absent>"
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def _render_changed_values(old: object, new: object) -> tuple[str, str]:
     """Render both sides of a changed key as compact JSON, cut to a readable length.
 
@@ -249,12 +260,7 @@ def _render_changed_values(old: object, new: object) -> tuple[str, str]:
     :param object new: Current payload value, or ``_ABSENT``.
     :return tuple[str, str]: The old and new text; ``<absent>`` stands for a missing key.
     """
-    old_text, new_text = (
-        "<absent>"
-        if value is _ABSENT
-        else json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        for value in (old, new)
-    )
+    old_text, new_text = _render_value(old), _render_value(new)
     if max(len(old_text), len(new_text)) <= _MAX_REPORTED_VALUE_CHARS:
         return old_text, new_text
     shared = next(
