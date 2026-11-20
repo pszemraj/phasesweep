@@ -28,7 +28,12 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_STEP, OperatorAction, format_mismatch
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    OTHER_FORMAT_LEDGER_STEP,
+    OperatorAction,
+    format_mismatch,
+)
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
@@ -141,7 +146,8 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         raise TrialEvidenceMissingError(
             f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence that {found}.",
             action=OperatorAction.FRESH_NAMESPACE,
-            remediation=OTHER_FORMAT_STEP,
+            # The evidence is a trial attribute, so it stays in an explicit ledger.
+            remediation=OTHER_FORMAT_LEDGER_STEP,
         )
     extractor = provenance.get("extractor")
     if not isinstance(extractor, Mapping):
