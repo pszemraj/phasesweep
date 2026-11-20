@@ -272,12 +272,14 @@ def recover_run(
 
                 # Sent before the marker clears, so an upload worker whose cleanup is
                 # unconfirmed fails this command and leaves the run recovery-required, as an
-                # evidence worker's does; the next pass resolves it through its registry entry.
+                # evidence worker's does. The workers are registered under this run, so the
+                # next pass resolves one through its registry entry as this run's evidence.
                 delivery = deliver_recovered_attempts(
                     config,
                     evidence.ledger,
-                    None,
+                    run_id,
                     evidence.settled_generations,
+                    recovering=True,
                     tracker_unreachable=bool(evidence.pending_evidence),
                 )
             if needs.cleanup_needed or repairing_complete_snapshot:

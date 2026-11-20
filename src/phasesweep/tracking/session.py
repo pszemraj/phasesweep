@@ -518,16 +518,21 @@ def require_tracking_target(
     generation_id: str,
     environment: Mapping[str, str],
     deadline: float | None,
+    resolve_only: bool = False,
 ) -> None:
     """Resolve the MLflow target before a phase allocates trials or a run sends to it.
 
-    A generation whose summary run is bound only resolves the target, so a run that launches
-    nothing checks it under such a generation before sending recovered outcomes.
+    A generation whose summary run is bound only resolves the target, as does a check for a
+    caller that only sends recovered outcomes, so a run that launches nothing binds no summary
+    run. Its worker is registered under ``generation_id`` either way.
 
     :param Experiment experiment: MLflow-backed experiment.
-    :param str generation_id: Generation whose summary run is bound first unless it already is.
+    :param str generation_id: Generation of the run checking the target, whose summary run is
+        bound first unless it already is or ``resolve_only`` is set.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Phase/run deadline; reaching it stays a timeout.
+    :param bool resolve_only: Only resolve the target, for a caller that launches nothing and
+        sends recovered outcomes, defaults to False.
     :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
@@ -536,8 +541,12 @@ def require_tracking_target(
     settings = experiment.mlflow
     assert settings is not None
     try:
-        if (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
-            # An earlier phase bound the summary run; the target must still resolve.
+        if (
+            resolve_only
+            or (tracking_root(experiment) / generation_id / "generation-binding.json").exists()
+        ):
+            # An earlier phase bound the summary run, or the caller binds none; the target must
+            # still resolve.
             _resolve_source(
                 experiment, generation_id=generation_id, environment=environment, deadline=deadline
             )

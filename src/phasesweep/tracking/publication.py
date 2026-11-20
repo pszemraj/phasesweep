@@ -65,12 +65,25 @@ def _projection(
     }
 
 
-def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str]) -> bool:
+def _deliver(
+    experiment: Experiment,
+    path: Path,
+    environment: Mapping[str, str],
+    *,
+    worker_generation: str | None = None,
+) -> bool:
     """Try one persisted projection and retain pending state after an outage.
+
+    The upload worker is registered under the generation of the run that sends it, so a worker
+    whose cleanup that run cannot confirm is attributed to it, whatever generation the record
+    belongs to.
 
     :param Experiment experiment: Configured target.
     :param Path path: Pending delivery record.
     :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str | None worker_generation: Generation of the run sending another generation's
+        record, under which its upload worker is registered; ``None`` registers it under the
+        record's own generation, as for a run's own records and for sync-tracking, which is no run.
     :return bool: Whether delivery has succeeded.
     """
     record = read_record(path)
@@ -85,7 +98,7 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
         "finish": json_optional_text(record, "finish"),
     }
     try:
-        call_tracking(experiment, generation_id, action, environment)
+        call_tracking(experiment, worker_generation or generation_id, action, environment)
         # A lost acknowledgement resends the same projection on the next sync.
         write_record(path, {**record, "state": "delivered"})
     except (OSError, ValueError, RuntimeError) as exc:
@@ -614,24 +627,29 @@ def save_recovered_attempts(
 def deliver_recovered_attempts(
     experiment: Experiment,
     ledger: ValidatedLedger,
-    generation_id: str | None,
+    generation_id: str,
     generation_ids: Iterable[str],
     *,
+    recovering: bool = False,
     tracker_unreachable: bool = False,
 ) -> dict[str, int]:
     """Send the MLflow outcomes a recovery committed for earlier generations' attempts.
 
     Recovery itself sends nothing, so an unreachable tracker costs it no request. The records
     go only after a target check: the one :func:`require_tracking_target` made when the calling
-    run bound its own summary run, or else one made here under a settled generation whose
-    summary run is bound, which only resolves the target. A failed check or upload leaves the
-    rest pending for sync-tracking.
+    run bound its own summary run, or else a resolve made here, which binds no summary run. A
+    failed check or upload leaves the rest pending for sync-tracking. Every worker this starts
+    is registered under ``generation_id``, so one whose cleanup is unconfirmed belongs to the run
+    that is accountable for it, not to the generation whose record it was sending.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The ledger holding the settled trials.
-    :param str | None generation_id: The calling run's generation, whose own attempts its
-        terminal delivery sends, or None for ``recover-run``, which has no generation of its own.
+    :param str generation_id: The calling run's generation, whose own attempts its terminal
+        delivery sends, or for ``recover-run`` the run it recovers.
     :param Iterable[str] generation_ids: Generations whose trials the recovery settled.
+    :param bool recovering: The caller is ``recover-run``, so ``generation_id`` is the run it
+        recovers rather than its own invocation: that run's records are sent with the rest, and
+        the target is resolved here, as no check in this process covered it.
     :param bool tracker_unreachable: The caller found a tracker it could not read, so the
         records are only saved.
     :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
@@ -641,7 +659,8 @@ def deliver_recovered_attempts(
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.engine.trial import _environment_identity
 
-    paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - {generation_id})
+    own = set() if recovering else {generation_id}
+    paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - own)
     unsent = {"delivered": 0, "pending": len(paths)}
     if not paths:
         return unsent
@@ -654,23 +673,24 @@ def deliver_recovered_attempts(
         return unsent
     environment = _environment_identity(experiment, experiment.phases[0].name).values
     checked = (
-        generation_id is not None
+        not recovering
         and (tracking_root(experiment) / generation_id / "generation-binding.json").is_file()
     )
     if not checked:
         try:
             require_tracking_target(
                 experiment,
-                generation_id=paths[0].parent.parent.name,
+                generation_id=generation_id,
                 environment=environment,
                 deadline=None,
+                resolve_only=True,
             )
         except TrackingTargetUnavailableError as exc:
             log.warning("%s %s", exc, pending)
             return unsent
     delivered = 0
     for path in paths:
-        if not _deliver(experiment, path, environment):
+        if not _deliver(experiment, path, environment, worker_generation=generation_id):
             break
         delivered += 1
     return {"delivered": delivered, "pending": len(paths) - delivered}

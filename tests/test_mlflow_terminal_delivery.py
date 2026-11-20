@@ -1100,10 +1100,10 @@ def test_a_run_killed_before_delivering_a_recovered_outcome_leaves_it_for_sync(
         else:
             deliver = publication._deliver
 
-            def killed_at_send(experiment, path, environment):
+            def killed_at_send(experiment, path, environment, **kwargs):
                 if path.stem == f"attempt-{attempt}":
                     raise RunnerKilled()
-                return deliver(experiment, path, environment)
+                return deliver(experiment, path, environment, **kwargs)
 
             patch.setattr(publication, "_deliver", killed_at_send)
         with pytest.raises(RunnerKilled):

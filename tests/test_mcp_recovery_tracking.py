@@ -1,4 +1,4 @@
-"""recover-run's MLflow delivery: the outcomes of the trials it settles, sent once or left pending with their step."""
+"""recover-run and MLflow delivery: the outcomes of the trials it settles, sent once or left pending with their step, and the tracking workers whose cleanup it confirms."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
+from phasesweep.errors import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.tracking import mlflow as worker
@@ -23,6 +24,7 @@ from tests.conftest import write_experiment_config
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     make_mcp_app,
+    run_claimed_runner,
     stage_dead_run,
     write_srv_catalog,
     write_unsafe_cleanup_status,
@@ -36,6 +38,7 @@ from tests.tracking_helpers import (
 )
 
 _RUN_ID = "mcp-recovered-run"
+_SENDING_RUN_ID = "mcp-sending-run"
 _PENDING_STEP = "`phasesweep sync-tracking CONFIG`"
 
 
@@ -90,6 +93,24 @@ def _killed_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RecoveredRu
     return _RecoveredRun(tmp_path, monkeypatch, experiment, uploads, attempt)
 
 
+def _uncertain_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, generation_id: str | None = None
+) -> tuple[Experiment, list[dict[str, object]], str]:
+    """Fail the one managed attempt of a one-trial sweep with its cleanup unconfirmed.
+
+    :param str | None generation_id: The failed run's generation, as an MCP runner names it.
+    :return tuple[Experiment, list[dict[str, object]], str]: The experiment, the upload log,
+        and the attempt id.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    experiment = Experiment.model_validate(config)
+    attempt = leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=generation_id)
+    return experiment, uploads, attempt
+
+
 def _uncertain_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, retired: bool
 ) -> _RecoveredRun:
@@ -98,12 +119,7 @@ def _uncertain_run(
     :param bool retired: Drop its registry entry, so only the trial records the uncertainty.
     :return _RecoveredRun: The staged run.
     """
-    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
-    config["storage"] = f"journal:///{tmp_path}/study.journal"
-    config["phases"] = config["phases"][:1]
-    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
-    experiment = Experiment.model_validate(config)
-    attempt = leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=_RUN_ID)
+    experiment, uploads, attempt = _uncertain_attempt(tmp_path, monkeypatch, generation_id=_RUN_ID)
     if retired:
         _retire_active_attempt(experiment, attempt)
     return _RecoveredRun(tmp_path, monkeypatch, experiment, uploads, attempt)
@@ -241,3 +257,61 @@ def test_an_upload_worker_recover_run_cannot_confirm_leaves_the_run_for_another_
     assert run.sent() == []
     publication.sync_tracking(run.experiment)
     assert run.sent() == ["KILLED"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("earlier", "action"),
+    [("killed", "publish"), ("uncertain", "publish"), ("uncertain", "resolve")],
+    ids=["upload-after-success", "upload-after-failure", "resolve-after-failure"],
+)
+def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str, action: str
+) -> None:
+    """A tracking worker a run starts for an earlier generation's recovered outcome is that run's to recover.
+
+    The run recovers an earlier sweep's attempt, then succeeds or fails, leaving the worker that
+    resolves the target for that outcome, or uploads it, with its cleanup unconfirmed. Following
+    the steps the run's MCP status prints, sync-tracking where it names one and then a confirmed
+    recover-run, clears the run, and the outcome reaches its MLflow run once.
+    """
+    if earlier == "killed":
+        experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
+        finish = "KILLED"
+    else:
+        experiment, uploads, attempt = _uncertain_attempt(tmp_path, monkeypatch)
+        finish = "FAILED"
+    # The runner resolves the config's relative paths against its directory, and the earlier
+    # sweep ran from the working directory.
+    config = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
+    )
+    leaked = leak_tracking_worker(
+        monkeypatch, action=action, name=f"attempt-{attempt}" if action == "publish" else None
+    )
+    if earlier == "killed":
+        assert run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()) == 0
+    else:
+        # The earlier sweep's unsafe-cleanup abort stays recorded, so this run fails.
+        with pytest.raises(ProcessCleanupUncertainError, match="worker cleanup is uncertain"):
+            run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd())
+    assert leaked
+    failure = app.status(_SENDING_RUN_ID)["run"]["failure"]
+    assert failure["code"] == "cleanup_uncertain"
+    # The in-process runner recorded this test's own PID, and a launch saves the snapshot the
+    # helper does not.
+    store.config_snapshot_path(_SENDING_RUN_ID).write_bytes(config.read_bytes())
+    monkeypatch.setattr("phasesweep.mcp.recovery.is_same_live_process", lambda *a, **k: False)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
+
+    if _PENDING_STEP in failure["remediation"]:
+        publication.sync_tracking(experiment)
+    recovered = recover_run_cli(registry.state_dir, _SENDING_RUN_ID, confirm=True)
+
+    assert recovered.exit_code == 0, recovered.output
+    handle = store.get(_SENDING_RUN_ID)
+    assert handle is not None and not store.observe(handle).recovery_required
+    publication.sync_tracking(experiment)
+    publication.sync_tracking(experiment)
+    assert [r["finish"] for r in uploads if r["name"] == f"attempt-{attempt}"] == [finish]
