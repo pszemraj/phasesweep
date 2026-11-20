@@ -41,9 +41,8 @@ _PUBLICATION_FAILURES: dict[str, JsonObject] = {
         "actor": "operator",
         "remediation": (
             "The experiment's last published result no longer validates. Ask the operator to "
-            "inspect it with `phasesweep status CONFIG` and restore it before any launch of this "
-            "experiment: a successful run would move the publication pointer past it, and "
-            "nothing would report it again."
+            "inspect it with `phasesweep status CONFIG` and restore it; until then every run of "
+            "this experiment fails before its first trial."
         ),
     },
     "permission_denied": {
@@ -54,7 +53,8 @@ _PUBLICATION_FAILURES: dict[str, JsonObject] = {
         "remediation": (
             "This server cannot read the experiment's published result to validate it, which is "
             "not evidence of corruption. Ask the operator to read it as the publishing user or "
-            "restore the server's read permission."
+            "restore the server's read permission; until then every run of this experiment fails "
+            "before its first trial."
         ),
     },
 }
