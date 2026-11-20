@@ -46,6 +46,7 @@ from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR, TrialStateName
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.mcp.errors import live_runner_step
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
@@ -446,6 +447,34 @@ def _recovery_needs(
     )
 
 
+def _surviving_runner_step(identity: ProcessIdentity, *, lead: str = "") -> str:
+    """Return the operator step for a runner recovery found alive, naming its PID and group.
+
+    :param ProcessIdentity identity: Recorded runner PID and process group.
+    :param str lead: Step to take before the shared host step, ending in a space.
+    :return str: The step, ending in the instruction to repeat the command.
+    """
+    return (
+        f"{lead}{live_runner_step(identity.pid, identity.pgid)} "
+        "Then repeat this recover-run command."
+    )
+
+
+def _live_runner_refusal(identity: ProcessIdentity) -> RunRecoveryError:
+    """Build the refusal for a runner that is still alive.
+
+    :param ProcessIdentity identity: Recorded runner PID and process group.
+    :return RunRecoveryError: The refusal, for the caller to raise.
+    """
+    return RunRecoveryError(
+        "runner still appears live",
+        action=OperatorAction.RETRY,
+        remediation=_surviving_runner_step(
+            identity, lead="Stop it with cancel_run if the run should end. "
+        ),
+    )
+
+
 def _require_dead_runner(
     identity: ProcessIdentity, *, view: RunnerView, cleanup_needed: bool
 ) -> None:
@@ -471,9 +500,7 @@ def _require_dead_runner(
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
     if is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError(
-            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
-        )
+        raise _live_runner_refusal(identity)
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
@@ -535,9 +562,7 @@ def _cleanup_runner(
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError(
-            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
-        )
+        raise _live_runner_refusal(identity)
     if (
         needs.cleanup_needed
         and confirm
@@ -546,7 +571,10 @@ def _cleanup_runner(
             identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0
         )
     ):
-        raise RunRecoveryError("runner process-group cleanup is still uncertain")
+        raise RunRecoveryError(
+            "runner process-group cleanup is still uncertain",
+            remediation=_surviving_runner_step(identity),
+        )
 
 
 def _publication_recovery_action(

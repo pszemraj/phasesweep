@@ -14,6 +14,22 @@ _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
 
 
+def live_runner_step(pid: int | None, pgid: int | None) -> str:
+    """Return the host step for a runner that cancellation or recovery found still alive.
+
+    ``cancel_run`` and ``recover-run`` give the operator this one step, so neither refusal
+    leaves a runner that survived SIGKILL unnamed.
+
+    :param int | None pid: The runner's recorded PID.
+    :param int | None pgid: The runner's recorded process group.
+    :return str: One sentence naming the PID and process group and what to clear on the host.
+    """
+    return (
+        f"If runner PID {pid} (process group {pgid}) is still running on the host, clear the "
+        "cause there; a process in uninterruptible I/O ignores SIGKILL until the I/O ends."
+    )
+
+
 class CatalogError(Exception):
     """Catalog could not be loaded or validated. Operator-facing.
 

@@ -8,6 +8,8 @@ does for the rest of the package; both modules share their case record and asser
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from phasesweep.cli import _operational_error_text
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _generation_summary_path
 from phasesweep.errors import OperatorAction, PhaseSweepError
@@ -29,7 +32,7 @@ from phasesweep.mcp.recovery import (
 from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime.files import UnsafePrivatePathError
-from tests.conftest import make_experiment, requires_nonroot
+from tests.conftest import make_experiment, reaped_pid, requires_nonroot
 from tests.error_routing_helpers import (
     RoutingCase,
     Trigger,
@@ -43,7 +46,12 @@ from tests.error_routing_helpers import (
     truncated,
 )
 from tests.ledger_fixtures import Materialized, materialize, published_generation_id
-from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
+from tests.mcp_helpers import (
+    UNUSED_RUNNER_PGID,
+    make_run_handle,
+    stage_dead_run,
+    write_run_status,
+)
 from tests.recovery_helpers import load_only_recovery_needs
 
 pytestmark = pytest.mark.contract
@@ -310,6 +318,24 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     )
 
 
+def _recheck_runner_group_that_survives_the_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Re-check an exited runner whose process group the kill could not confirm gone."""
+    store = RunStore(tmp_path / "mcp-state")
+    handle = make_run_handle(run_id="wrap-recover", pid=reaped_pid())
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *_a, **_k: False)
+    return _cleanup_runner(
+        store.cleanup_identity(handle),
+        replace(load_only_recovery_needs(), cleanup_needed=True),
+        confirm=True,
+        view=RunnerView("observable"),
+        cleanup_recorded=False,
+    )
+
+
 def _recover_run_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Recover a run whose runner was recorded in a PID namespace this process cannot observe."""
     state_dir = tmp_path / "mcp-state"
@@ -478,14 +504,21 @@ CASES = (
         trigger=_recover_live_runner,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="runner still appears live; use cancel_run first",
+        message="runner still appears live",
     ),
     RoutingCase(
         id="recover_recheck_live_runner",
         trigger=_recheck_live_runner,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        message="runner still appears live; use cancel_run first",
+        message="runner still appears live",
+    ),
+    RoutingCase(
+        id="recover_runner_group_survives_the_kill",
+        trigger=_recheck_runner_group_that_survives_the_kill,
+        raised=RunRecoveryError,
+        action=OperatorAction.INSPECT_LOGS,
+        message="runner process-group cleanup is still uncertain",
     ),
     RoutingCase(
         id="recover_runner_in_foreign_pid_namespace",
@@ -553,6 +586,36 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
         trigger(tmp_path, monkeypatch)
     assert type(excinfo.value) is defect
     assert not isinstance(excinfo.value, PhaseSweepError)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "runner_is_live"),
+    [
+        (_recover_live_runner, True),
+        (_recheck_live_runner, True),
+        (_recheck_runner_group_that_survives_the_kill, False),
+    ],
+    ids=["inspection", "recheck", "group_survives_the_kill"],
+)
+def test_surviving_runner_refusal_names_the_runner_and_the_host_step(
+    trigger: Trigger,
+    runner_is_live: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusing a runner that survived names its PID and process group and the step cancellation ends with."""
+    with pytest.raises(RunRecoveryError) as excinfo:
+        trigger(tmp_path, monkeypatch)
+
+    step = excinfo.value.remediation
+    assert step is not None
+    assert re.search(r"runner PID \d+ \(process group \d+\)", step)
+    if runner_is_live:
+        assert f"runner PID {os.getpid()} (process group {UNUSED_RUNNER_PGID})" in step
+    assert ("cancel_run" in step) is runner_is_live
+    assert "is still running on the host, clear the cause there" in step
+    assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in step
+    assert step in _operational_error_text(excinfo.value)
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:

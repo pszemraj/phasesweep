@@ -71,6 +71,7 @@ from phasesweep.mcp.errors import (
     StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
+    live_runner_step,
 )
 from phasesweep.mcp.failures import run_failure_payload
 from phasesweep.mcp.redaction import (
@@ -1449,11 +1450,9 @@ class PhaseSweepMCP:
                             failure = json_object(_cleanup_uncertain_payload([]))
                             if self._runs.runner_may_be_alive(handle, view=view):
                                 failure["remediation"] = (
-                                    f"Cancellation could not stop runner PID {identity.pid} "
-                                    f"(process group {identity.pgid}); trial cleanup is unconfirmed. "
-                                    "Stop monitoring and ask the operator: If it is still running "
-                                    "on the host, clear the cause there; a process in "
-                                    "uninterruptible I/O ignores SIGKILL until the I/O ends. "
+                                    "Cancellation could not stop the runner; trial cleanup is "
+                                    "unconfirmed. Stop monitoring and ask the operator: "
+                                    f"{live_runner_step(identity.pid, identity.pgid)} "
                                     "Then run `phasesweep mcp recover-run` from a host shell, "
                                     "review the preview, and repeat with `--confirm`."
                                 )

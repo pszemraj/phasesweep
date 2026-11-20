@@ -354,8 +354,7 @@ def test_cancel_cleanup_confirmation_policy(
         failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
         remedy = failure["remediation"]
         assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
-        assert "If it is still running on the host" in remedy
-        assert "clear the cause" in remedy
+        assert "is still running on the host, clear the cause there" in remedy
         assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
         assert "cancel_run" not in remedy
         assert len(remedy.splitlines()) == 1

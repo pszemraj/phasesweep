@@ -308,7 +308,7 @@ def make_run_handle(
         # group. The autouse ``guard_runner_signals`` fixture in conftest is
         # what fails a test that reaches it. Explicit PID fixtures keep their
         # matching PGID for process-lifecycle tests.
-        process_group_id = 2_000_000_000 if pid is None else process_id
+        process_group_id = UNUSED_RUNNER_PGID if pid is None else process_id
         process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
         run_id=run_id,
@@ -330,6 +330,9 @@ def make_run_handle(
         else None,
     )
 
+
+#: Process group recorded for the default runner, which is pytest itself; no real group has it.
+UNUSED_RUNNER_PGID = 2_000_000_000
 
 #: Start time recorded for a runner that is gone; no live process has it.
 DEAD_RUNNER_STARTTIME = 111
