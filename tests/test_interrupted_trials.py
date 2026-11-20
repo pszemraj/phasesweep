@@ -1385,6 +1385,33 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
     _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["live", "recovered"])
+def test_finished_training_whose_tracker_answers_a_failure_fails_once(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None], path: str
+) -> None:
+    """A tracker's failure verdict on finished training records a failure with its reason, whether the trial was live or pending, and nothing trains again."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    if path == "recovered":
+        tracker.switch("denied")
+        with pytest.raises(TrackingTargetUnavailableError):
+            run_experiment(experiment)
+        (pending,) = phase_trials(experiment)
+        _assert_evidence_pending(experiment, pending)
+    tracker.switch("crashed")
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    (trial,) = phase_trials(experiment)
+    assert trial.state.name == "FAIL"
+    assert not _trial_interrupted(trial)
+    reason = trial.user_attrs[FAILURE_REASON_ATTR]
+    assert "crashed" in reason
+    outcome = trial.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert (outcome["outcome"], outcome["cause"]) == ("failure", reason)
+    assert launches.read_text().splitlines() == ["launch"]
+
+
 @pytest.mark.parametrize("first", ["cleanup", "left-running"])
 def test_unconfirmed_cleanup_outranks_a_parallel_trial_left_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str

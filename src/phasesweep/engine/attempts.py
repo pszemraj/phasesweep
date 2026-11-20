@@ -31,6 +31,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
+    FAILURE_REASON_ATTR,
     GENERATION_ID_ATTR,
     OVERRIDES_ATTR,
     RETURN_CODE_ATTR,
@@ -642,17 +643,25 @@ def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
 
 
 def _record_stale_trial_outcome(
-    study: optuna.Study, trial: optuna.trial.FrozenTrial, *, completed_feasible: bool | None = None
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+    *,
+    completed_feasible: bool | None = None,
+    evidence_failure: str | None = None,
 ) -> None:
     """Record a recovered result or interruption before advancing stale-trial recovery.
 
-    Keep recorded failures, fatal errors, interruptions, and their aborts. An unproven
-    success or missing outcome becomes interrupted and reruns. Recovery adds no abort.
-    Malformed or duplicate outcomes receive a fresh sequence.
+    Keep recorded failures, fatal errors, interruptions, and their aborts. A finished
+    trainer's evidence decides its outcome as it does a live trial's; an unproven success or
+    missing outcome becomes interrupted and reruns. Recovery adds no abort. Malformed or
+    duplicate outcomes receive a fresh sequence.
 
     :param optuna.Study study: Study providing outcome sequences.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial.
-    :param bool | None completed_feasible: Recovered result feasibility, or None for interruption.
+    :param bool | None completed_feasible: Recovered result feasibility, or None when no
+        result was accepted.
+    :param str | None evidence_failure: Why a finished trainer's evidence was rejected, recorded
+        as the cause of a failure, or None when no evidence answered.
     :raises StudyStorageUnavailableError: Outcome state could not be read or persisted; leave the trial RUNNING.
     """
     outcome: str | None = None
@@ -663,11 +672,12 @@ def _record_stale_trial_outcome(
             (candidate for candidate in trials if candidate.number == trial.number), trial
         )
         existing = _unduplicated_outcome(current, sequence_counts)
-        outcome = (
-            ("success" if completed_feasible else "failure")
-            if completed_feasible is not None
-            else _stale_recovery_outcome(existing)
-        )
+        if completed_feasible is not None:
+            outcome = "success" if completed_feasible else "failure"
+        elif evidence_failure is not None:
+            outcome = "failure"
+        else:
+            outcome = _stale_recovery_outcome(existing)
         policy: str | None = None
         abort: JsonObject | None = None
         if existing is None:
@@ -688,6 +698,8 @@ def _record_stale_trial_outcome(
                 if completed_feasible
                 else "recovered evidence violates metric or constraint bounds"
             )
+        elif evidence_failure is not None:
+            cause = evidence_failure
         payload = _trial_outcome_payload(sequence, outcome, cause=cause, policy=policy, abort=abort)
         active_trial = optuna.Trial(study, trial._trial_id)
         active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
@@ -1104,7 +1116,9 @@ def _recover_completed_trial(
     Trainer ledger attributes precede SDK workers and take priority over the reused
     process slot; the guardian covers a runner death before those attributes commit.
     Recorded process failures and interruptions remain authoritative; a measured
-    bound violation may still commit as COMPLETE and infeasible. Only a ledger study
+    bound violation may still commit as COMPLETE and infeasible. Evidence that answers
+    with a failure commits FAIL with that failure as the trial's outcome, as the live path
+    records it, so finished training is never trained again. Only a ledger study
     reaches recovery, so training it defers stays retained for a later pass.
 
     :param optuna.Study study: Owning study whose trial is still RUNNING.
@@ -1113,10 +1127,12 @@ def _recover_completed_trial(
     :param Path artifact_root: Owning artifact root containing generation snapshots.
     :param _PreflightCleanupReport | None report: Collector for newly recovered completed
         results and for evidence the tracker gave no answer about.
-    :return bool | None: True for recovered COMPLETE, False for unaccepted evidence, or None
-        when shutdown or an unreadable tracker leaves extraction pending.
+    :return bool | None: True once the finished trainer's evidence settled the trial as
+        COMPLETE or as a failure, False without proof the trainer finished, or None when
+        shutdown or an unreadable tracker leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
-    :raises StudyStorageUnavailableError: Valid completed evidence could not be committed.
+    :raises StudyStorageUnavailableError: The extracted evidence or its outcome could not be
+        committed.
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report
         collects the pending attempt for a refusal after the pass.
     """
@@ -1229,23 +1245,33 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    if result.failure_reason is not None:
-        log.warning(
-            "Completed orphan attempt %s evidence could not be accepted: %s",
-            record.attempt_id,
-            result.failure_reason,
-        )
-        return False
-    assert result.metric is not None
+    if result.failure_reason is None:
+        assert result.metric is not None
     try:
         record_trial_result(active_trial, result, overrides_json=overrides_json)
-        _record_stale_trial_outcome(study, trial, completed_feasible=result.feasible)
+        if result.failure_reason is not None:
+            # The tracker answered about finished training, so this is the trial's measured
+            # failure, recorded as the live path records it; only unproven training reruns.
+            active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
+            _record_stale_trial_outcome(study, trial, evidence_failure=result.failure_reason)
+        else:
+            _record_stale_trial_outcome(study, trial, completed_feasible=result.feasible)
         _record_cleanup_recovery(study, trial)
-        study.tell(trial.number, result.metric)
+        if result.metric is None or result.failure_reason is not None:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        else:
+            study.tell(trial.number, result.metric)
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Completed attempt {record.attempt_id} could not be committed; its retained evidence permits recovery on retry."
         ) from exc
+    if result.failure_reason is not None:
+        log.warning(
+            "Completed orphan attempt %s failed: its evidence could not be accepted: %s",
+            record.attempt_id,
+            result.failure_reason,
+        )
+        return True
     if report is not None:
         report.retained_results += 1
     log.warning(

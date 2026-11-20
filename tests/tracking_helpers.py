@@ -291,9 +291,9 @@ def remote_mlflow_example(tmp_path, monkeypatch):
 class SwitchableWandb:
     """A fake W&B server the real supervised reader polls, switched by a mode file.
 
-    ``up`` answers a finished run whose summary holds ``x=1.0``, ``denied`` rejects the
-    credentials with HTTP 401, and ``hang`` touches ``hung`` and blocks. Every run lookup
-    appends the mode it saw to ``polls``.
+    ``up`` answers a finished run whose summary holds ``x=1.0``, ``crashed`` answers a run
+    that crashed, ``denied`` rejects the credentials with HTTP 401, and ``hang`` touches
+    ``hung`` and blocks. Every run lookup appends the mode it saw to ``polls``.
     """
 
     mode: Path
@@ -303,7 +303,7 @@ class SwitchableWandb:
     def switch(self, mode: str) -> None:
         """Answer every later run lookup in ``mode``.
 
-        :param str mode: ``up``, ``denied`` or ``hang``.
+        :param str mode: ``up``, ``crashed``, ``denied`` or ``hang``.
         """
         self.mode.write_text(mode)
 
@@ -349,7 +349,8 @@ def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
                     time.sleep(60)
                 if mode == "denied":
                     raise _Denied("credentials rejected")
-                return type("Run", (), {{"state": "finished", "summary_metrics": {{"x": 1.0}}}})()
+                state = "crashed" if mode == "crashed" else "finished"
+                return type("Run", (), {{"state": state, "summary_metrics": {{"x": 1.0}}}})()
     """)
     return tracker
 

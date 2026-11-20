@@ -905,9 +905,10 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
 ):
     """A pending trial's managed run receives the outcome recovery commits.
 
-    Accepted evidence sends its accepted projection. Evidence the tracker refuses leaves the
-    unproven success recorded as an interruption, which ends the run KILLED and reruns. An
-    upload that fails leaves its record pending for sync-tracking and the run goes on.
+    Accepted evidence sends its accepted projection. Evidence the tracker answers with a
+    failure records the finished trial failed with that reason, as a live trial would be, which
+    ends the run FAILED and trains nothing again. An upload that fails leaves its record pending
+    for sync-tracking and the run goes on.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -950,7 +951,7 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     else:
         with pytest.raises(NoFeasibleTrialError):
             run_experiment(experiment)
-    recovered = read_phase_trials(validate_ledger(experiment), "depth").trials[0]
+    (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
     record_path = tracking_root(experiment) / generation / "delivery" / f"attempt-{attempt}.json"
     if upload == "offline":
@@ -967,9 +968,11 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
         assert delivered["finish"] is None
         assert delivered["projection"]["metrics"]["phasesweep.objective"] == 1.0
     else:
-        assert _trial_interrupted(recovered)
-        assert delivered["finish"] == "KILLED"
-        assert delivered["projection"]["tags"] == {"phasesweep.outcome": "KILLED"}
+        assert not _trial_interrupted(recovered)
+        cause = recovered.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
+        assert "MLflow run finished without metric 'eval/loss'" in cause
+        assert delivered["finish"] == "FAILED"
+        assert delivered["projection"]["tags"] == {"phasesweep.outcome": "FAILED"}
     # Nothing is left for sync-tracking to send again for that attempt.
     uploads.clear()
     publication.sync_tracking(experiment)
