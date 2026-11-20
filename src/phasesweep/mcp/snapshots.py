@@ -211,7 +211,7 @@ class TieSummary(_SnapshotModel):
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
     remedy: str | None = Field(
-        description="Configuration-first noise guidance; null for unchecked comparisons or repeat groups."
+        description="Configuration-first noise guidance for a flagged tie between single trials; otherwise null."
     )
     tied_trials: NonNegativeInt | None = Field(
         description=(

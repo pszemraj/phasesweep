@@ -734,7 +734,9 @@ def _confound_summary(
         "tie": {
             "verdict": tie["verdict"],
             "remedy": (
-                _noise_remedy() if block["ranked_groups"] is None and "detail" in tie else None
+                _noise_remedy()
+                if block["ranked_groups"] is None and tie["verdict"] == "heterogeneous"
+                else None
             ),
             "tied_trials": len(tie["detail"]["tied_trials"]) if "detail" in tie else None,
             "within_noise": (
