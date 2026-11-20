@@ -75,10 +75,8 @@ SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
-# Some clients put these instructions into every session the server is connected to, whether
-# or not a tool is used, and some show only the first line, cut at 250 characters. They are
-# therefore one short line holding what an agent needs before it touches PhaseSweep; the
-# workflow rules load on demand through get_guide.
+# Clients may load this into every session and may show only its first line, cut at 250
+# characters, so it is one short line; the workflow rules load on demand through get_guide.
 SERVER_INSTRUCTIONS = (
     "PhaseSweep runs hyperparameter sweeps on this machine. "
     "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
@@ -89,7 +87,7 @@ SERVER_INSTRUCTIONS = (
 DESCRIPTION_GET_GUIDE = (
     "Return the rules for using the PhaseSweep tools: when to launch or cancel, how to monitor "
     "a run, when to stop for the operator, and what to report with results. Call it once, before "
-    "any other PhaseSweep tool. Read-only: it reads no catalog and needs no experiment id."
+    "any other PhaseSweep tool."
 )
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call it after get_guide "
@@ -893,7 +891,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     def get_guide() -> str:
         """Return the packaged workflow rules.
 
-        :return str: The text the ``phasesweep_run_and_monitor`` prompt also serves.
+        :return str: The guide text.
         """
         return agent_prompt_text()
 
@@ -1086,7 +1084,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
     )
     def run_and_monitor_prompt() -> str:
-        """Return the packaged workflow rules, the text ``get_guide`` also serves.
+        """Return the packaged workflow rules.
 
         :return str: Prompt text.
         """
@@ -1194,7 +1192,7 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     else:
         # get_guide returns text blocks.
         text = "".join(block.text for block in result if isinstance(block, TextContent))
-        print(text.rstrip("\n"))
+        print(text)
     return 0
 
 

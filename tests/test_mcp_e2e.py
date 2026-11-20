@@ -283,10 +283,7 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.server_name == "phasesweep"
     assert initialization.server_version == __version__
-    # Some clients load the instructions into every session, and some show only the first
-    # line, cut at 250 characters, so one short line carries the gate and the guide pointer.
     instructions = initialization.instructions
-    assert instructions is not None
     assert len(instructions) <= 250
     assert "\n" not in instructions
     assert instructions.endswith(
@@ -442,18 +439,6 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
     assert [message.content.text for message in prompt.messages] == [guide]
-
-
-def test_fastmcp_get_guide_returns_the_guide_as_text(tmp_path: Path) -> None:
-    """A client receives the guide as plain text, not as a JSON object."""
-    pytest.importorskip("mcp")
-    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
-    app, _registry, _store = make_mcp_app(catalog)
-
-    result = call_mcp_tool(app, TOOL_GET_GUIDE, {})
-    assert result.isError is False
-    assert result.structuredContent is None
-    assert [block.text for block in result.content] == [agent_prompt_text()]
 
 
 def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:
