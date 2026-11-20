@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections.abc import Collection, Sequence
 from typing import Literal, TypeAlias
 
+from phasesweep.mcp.runs import decode_unreadable_record
+
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 _MAX_LISTED_UNREADABLE_RECORDS = 5
 
@@ -453,22 +455,22 @@ class RunCapacityUnknownError(McpToolError):
                 f" Pre-spawn orphan run id(s): {ids}. Ask the operator to "
                 f"{recover_run_step('<run id>')} for each of them."
             )
-        recoverable = {f"run:{run_id}" for run_id in recoverable_run_ids}
+        decoded = (decode_unreadable_record(identity) for identity in unreadable)
+        # Each label is a run id, or ``runs/<file name>`` for a handle file that names none.
         listed = sorted(
-            identity.removeprefix("run:")
-            if identity.startswith("run:")
-            else f"runs/{identity.removeprefix('handle:')}"
-            for identity in unreadable
-            if identity not in recoverable
+            (label, run_id is None)
+            for run_id, label in decoded
+            if run_id is None or run_id not in recoverable_run_ids
         )
         remaining = ""
         if listed:
-            shown = ", ".join(f"`{name}`" for name in listed[:_MAX_LISTED_UNREADABLE_RECORDS])
+            shown_records = listed[:_MAX_LISTED_UNREADABLE_RECORDS]
+            shown = ", ".join(f"`{label}`" for label, _is_file in shown_records)
             more = len(listed) - _MAX_LISTED_UNREADABLE_RECORDS
             more_note = f" and {more} more" if more > 0 else ""
             file_note = (
                 "; a listed `runs/` file moves out as it is"
-                if any("/" in name for name in listed)
+                if any(is_file for _label, is_file in shown_records)
                 else ""
             )
             remaining = (

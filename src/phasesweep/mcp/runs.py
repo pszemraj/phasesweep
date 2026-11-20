@@ -87,10 +87,28 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".transition.lock",
     ".heartbeat",
 )
+#: Prefixes of the identities :meth:`RunStore.launch_inventory` gives records it cannot
+#: read: ``run:<id>`` names a run id, and ``handle:<file name>`` a handle file under
+#: ``runs/`` whose stem is no safe run id.
+_UNREADABLE_RUN = "run:"
+_UNREADABLE_HANDLE_FILE = "handle:"
 MCP_STATE_FORMAT_VERSION = 9
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
+
+
+def decode_unreadable_record(identity: str) -> tuple[str | None, str]:
+    """Decode an unreadable-record identity from :meth:`RunStore.launch_inventory`.
+
+    :param str identity: ``run:<id>`` or ``handle:<file name under runs/>``.
+    :return tuple[str | None, str]: The run id it names, or ``None`` for a handle file, and
+        how the operator finds it: the run id, or ``runs/<file name>``.
+    """
+    if identity.startswith(_UNREADABLE_RUN):
+        run_id = identity.removeprefix(_UNREADABLE_RUN)
+        return run_id, run_id
+    return None, f"runs/{identity.removeprefix(_UNREADABLE_HANDLE_FILE)}"
 
 
 class UnsupportedStateFormatError(ValueError):
@@ -783,9 +801,9 @@ class RunStore:
             handle = self._load_handle(path, expected_run_id=path.stem)
             if handle is None:
                 unreadable.add(
-                    f"run:{path.stem}"
+                    f"{_UNREADABLE_RUN}{path.stem}"
                     if SAFE_NAME_PATTERN.fullmatch(path.stem)
-                    else f"handle:{path.name}"
+                    else f"{_UNREADABLE_HANDLE_FILE}{path.name}"
                 )
                 continue
             handles.append(handle)
@@ -817,7 +835,7 @@ class RunStore:
                     continue
                 run_id = path.name[: -len(suffix)]
                 if SAFE_NAME_PATTERN.fullmatch(run_id) and run_id not in readable_ids:
-                    unreadable.add(f"run:{run_id}")
+                    unreadable.add(f"{_UNREADABLE_RUN}{run_id}")
                 break
         return handles, unreadable
 

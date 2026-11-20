@@ -97,6 +97,7 @@ from phasesweep.mcp.runs import (
     RunnerView,
     RunState,
     RunStore,
+    decode_unreadable_record,
     write_status_file_if_absent,
 )
 from phasesweep.mcp.snapshots import (
@@ -251,6 +252,16 @@ def _cursor_offset(cursor: str | None) -> int:
     if offset < 0:
         raise McpToolError("invalid cursor; use next_cursor returned by list_experiments")
     return offset
+
+
+def _unreadable_run_ids(unreadable: set[str]) -> list[str]:
+    """Return the run ids that unreadable launch-inventory records name.
+
+    :param set[str] unreadable: Identities from :meth:`RunStore.launch_inventory`.
+    :return list[str]: Run ids, leaving out handle files that name none.
+    """
+    decoded = (decode_unreadable_record(identity)[0] for identity in unreadable)
+    return [run_id for run_id in decoded if run_id is not None]
 
 
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
@@ -1229,11 +1240,10 @@ class PhaseSweepMCP:
                     and self._runs.is_pre_spawn_orphan(handle.run_id)
                 }
                 abandoned.update(
-                    identity.removeprefix("run:")
-                    for identity in unreadable
-                    if identity.startswith("run:")
-                    and self._runs.launch_lease_path(identity.removeprefix("run:")).is_file()
-                    and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                    run_id
+                    for run_id in _unreadable_run_ids(unreadable)
+                    if self._runs.launch_lease_path(run_id).is_file()
+                    and self._runs.is_pre_spawn_orphan(run_id)
                 )
                 for abandoned_run_id in sorted(abandoned):
                     recovered_log = self._runs.clear_pre_spawn_orphan(abandoned_run_id)
@@ -1247,10 +1257,9 @@ class PhaseSweepMCP:
                     handles, unreadable = self._runs.launch_inventory()
                 if unreadable:
                     recoverable = sorted(
-                        identity.removeprefix("run:")
-                        for identity in unreadable
-                        if identity.startswith("run:")
-                        and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
+                        run_id
+                        for run_id in _unreadable_run_ids(unreadable)
+                        if self._runs.is_pre_spawn_orphan(run_id)
                     )
                     raise RunCapacityUnknownError(unreadable, recoverable)
                 live: list[RunHandle] = []

@@ -460,6 +460,20 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
     assert store.list_handles() == []
 
 
+def test_capacity_refusal_notes_runs_files_only_for_the_records_it_lists() -> None:
+    """A handle file past the listing cap gets no note about listed runs/ files."""
+    # Run ids that sort before ``runs/`` fill the listing cap ahead of the handle file.
+    many_runs = {f"run:a-{index}" for index in range(6)}
+
+    unlisted_file = str(RunCapacityUnknownError(many_runs | {"handle:zz bad.json"}))
+    listed_file = str(RunCapacityUnknownError({"run:a-0", "handle:zz bad.json"}))
+
+    assert "and 2 more" in unlisted_file
+    assert "moves out as it is" not in unlisted_file
+    assert "`runs/zz bad.json`" in listed_file
+    assert "; a listed `runs/` file moves out as it is" in listed_file
+
+
 @pytest.mark.parametrize(
     ("record_kind", "listed", "run_id"),
     [
