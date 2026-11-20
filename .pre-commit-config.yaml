@@ -10,6 +10,19 @@ default_stages: [pre-commit]
 repos:
   - repo: local
     hooks:
+      # From another environment the hooks below fail on missing imports and
+      # stubs, which hides the cause.
+      - id: environment
+        name: development environment
+        entry: >-
+          python -c "import importlib.util, sys;
+          sys.exit(None if importlib.util.find_spec('phasesweep') else
+          f'Is the right environment active? {sys.executable} has no phasesweep installed.')"
+        language: system
+        pass_filenames: false
+        always_run: true
+        fail_fast: true
+        stages: [pre-commit, pre-push]
       - id: ruff
         name: ruff check
         entry: ruff check --force-exclude --fix

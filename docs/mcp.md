@@ -58,7 +58,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Tool workflow
 
-The server sends [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) to every client as its MCP instructions, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
+The server's MCP instructions are one line: use these tools only when the user asks for PhaseSweep in the conversation, never suggest it otherwise, and call `get_guide` first. `get_guide` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
 
 Catalog operations use an experiment ID, except `explain_config`:
 
@@ -110,7 +110,7 @@ phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
 phasesweep mcp call inspect_experiment --catalog /absolute/path/to/catalog.yaml '{"experiment_id": "tiny_lm"}'
 ```
 
-The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and [audit log](#audit-log) apply as for a connected client, except that its audit records read `transport: "cli"`, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the structured result as JSON on stdout. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
+The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and [audit log](#audit-log) apply as for a connected client, except that its audit records read `transport: "cli"`, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the result on stdout: the structured result as JSON, or the text for `get_guide`. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
 
 A `launch_run` call from a shell outside the host's initial PID namespace, such as a sandboxed agent shell, prints a warning: the runner belongs to that namespace and ends when it does, so launch a run that must last from a shell outside any sandbox (see [PID namespaces](#pid-namespaces)).
 
@@ -133,7 +133,7 @@ Run status and results expose the run state, phase counts, winner presence, metr
 
 For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. `catalog_status` describes the current catalog reload state separately from those frozen scientific facts. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
-Read provenance and labels together; each tool's output schema also describes every field:
+Read provenance and labels together; the tool's output schema also describes every field:
 
 | Field | Interpretation |
 | --- | --- |

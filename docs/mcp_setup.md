@@ -56,9 +56,11 @@ codex mcp add phasesweep -- /absolute/path/to/phasesweep-mcp --catalog /absolute
 codex mcp list
 ```
 
+To keep a client from connecting the server at all, disable it in that client's own MCP settings.
+
 ### 4. Verify the connection
 
-Restart or reconnect the client as its documentation requires. Confirm the connection with the read-only `list_experiments` operation; for example, ask the agent to list available experiments and permitted actions without launching anything. The response contains catalog-approved IDs, descriptions, phase names, metrics, permitted actions and `catalog_status`; a stale catalog includes its reload refusal and operator remedy.
+Restart or reconnect the client as its documentation requires. Confirm the connection with the read-only `list_experiments` operation; for example, ask the agent to use PhaseSweep to list the available experiments and permitted actions without launching anything. Name PhaseSweep in the request: the server's instructions tell agents to use its tools only when the user asks for it. The response contains catalog-approved IDs, descriptions, phase names, metrics, permitted actions and `catalog_status`; a stale catalog includes its reload refusal and operator remedy.
 
 To check the same operation without a client, run it from a shell:
 

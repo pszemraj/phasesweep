@@ -1,7 +1,7 @@
 """FastMCP adapter: the only module that imports the MCP SDK.
 
 PhaseSweepMCP (in :mod:`phasesweep.mcp.tools`) holds all logic and is SDK-free.
-build_server wraps each method as a FastMCP tool; _safe_tool
+build_server wraps each method as a FastMCP tool and adds get_guide; _safe_tool
 guarantees tool errors are redacted. serve() loads the catalog, builds the
 store, and serves over stdio; call() runs one tool through the same server.
 """
@@ -50,6 +50,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
     TOOL_EXPLAIN_CONFIG,
+    TOOL_GET_GUIDE,
     TOOL_GET_LATEST_RUN,
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
@@ -74,11 +75,24 @@ SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
+# Clients may load this into every session and may show only its first line, cut at 250
+# characters, so it is one short line; the workflow rules load on demand through get_guide.
+SERVER_INSTRUCTIONS = (
+    "PhaseSweep runs hyperparameter sweeps on the MCP server host. "
+    "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
+    "PhaseSweep or offer it as an option otherwise. "
+    f"Call {TOOL_GET_GUIDE} before any other PhaseSweep tool."
+)
 
+DESCRIPTION_GET_GUIDE = (
+    "Return the rules for using the PhaseSweep tools: when to launch or cancel, how to monitor "
+    "a run, when to stop for the operator, and what to report with results. Call it once, before "
+    "any other PhaseSweep tool."
+)
 DESCRIPTION_LIST_EXPERIMENTS = (
-    "List the operator-approved experiments and their permitted actions. Call this first for "
-    "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
-    "ids returned by this catalog."
+    "List the operator-approved experiments and their permitted actions. Call it after get_guide "
+    "to discover experiments; follow next_cursor until null, then call inspect_experiment. "
+    "Read-only: use only ids returned by this catalog."
 )
 DESCRIPTION_EXPLAIN_CONFIG = (
     "Explain the experiment configuration schema: the type, default and rules of one config key "
@@ -871,8 +885,24 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("phasesweep", instructions=agent_prompt_text())
+    mcp = FastMCP("phasesweep", instructions=SERVER_INSTRUCTIONS)
     mcp._mcp_server.version = __version__
+
+    def get_guide() -> str:
+        """Return the packaged workflow rules.
+
+        :return str: The guide text.
+        """
+        return agent_prompt_text()
+
+    # The guide is prose for a model to read, so it is the one tool served as plain text:
+    # clients hand a structured result to the model as JSON, which escapes every newline.
+    mcp.tool(
+        name=TOOL_GET_GUIDE,
+        description=DESCRIPTION_GET_GUIDE,
+        annotations=_tool_annotations("Get Guide"),
+        structured_output=False,
+    )(_safe_tool(get_guide))
 
     async def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
@@ -1054,7 +1084,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
     )
     def run_and_monitor_prompt() -> str:
-        """Return safe agent instructions for the normal MCP sweep workflow.
+        """Return the packaged workflow rules.
 
         :return str: Prompt text.
         """
@@ -1106,7 +1136,7 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the nine tools over stdio.
+    """Load the catalog, build the run store, and serve the tools over stdio.
 
     The tools reread the catalog when it or a listed config changes; the run store
     stays on the ``state_dir`` loaded here.
@@ -1129,9 +1159,9 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     :param Path catalog: Operator-authored catalog file.
     :param str tool: Registered tool name, such as ``list_experiments``.
     :param JsonObject arguments: Tool arguments, validated by the tool's own schema.
-    :return int: Process exit code: 0 after the structured result is printed as
-        JSON on stdout, 1 after a tool error is printed on stderr, and 2 when a
-        startup prerequisite or the catalog failed before the tool could run.
+    :return int: Process exit code: 0 after the result is printed on stdout (JSON, or
+        the text of ``get_guide``), 1 after a tool error is printed on stderr, and 2 when
+        a startup prerequisite or the catalog failed before the tool could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.WARNING)
     if registry is None:
@@ -1147,16 +1177,22 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
         )
 
     from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.types import TextContent
 
     server = build_server(_open_app(registry, "cli"))
     try:
-        # Every tool declares structured output, so a result is (unstructured, structured).
-        _unstructured, structured = asyncio.run(server.call_tool(tool, arguments))
+        result = asyncio.run(server.call_tool(tool, arguments))
     except ToolError as exc:
         # The text a client receives in its ``isError`` result.
         print(str(exc), file=sys.stderr)
         return 1
-    print(json.dumps(json_object(structured), indent=2))
+    if isinstance(result, tuple):
+        # A tool with structured output returns (unstructured, structured).
+        print(json.dumps(json_object(result[1]), indent=2))
+    else:
+        # get_guide returns text blocks.
+        text = "".join(block.text for block in result if isinstance(block, TextContent))
+        print(text)
     return 0
 
 

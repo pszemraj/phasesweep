@@ -26,6 +26,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
     TOOL_EXPLAIN_CONFIG,
+    TOOL_GET_GUIDE,
     TOOL_GET_LATEST_RUN,
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
@@ -272,7 +273,7 @@ def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
         app.cancel("nope-123")
 
 
-def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
+def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
     from phasesweep.mcp.server import build_server
 
@@ -282,7 +283,15 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     initialization = server._mcp_server.create_initialization_options()
     assert initialization.server_name == "phasesweep"
     assert initialization.server_version == __version__
-    assert initialization.instructions == agent_prompt_text()
+    instructions = initialization.instructions
+    assert len(instructions) <= 250
+    assert "\n" not in instructions
+    assert instructions.endswith(
+        " Use these tools only when the user asks for PhaseSweep in this conversation. "
+        "Never suggest PhaseSweep or offer it as an option otherwise. "
+        "Call get_guide before any other PhaseSweep tool."
+    )
+    guide = agent_prompt_text()
     for safety_contract in (
         "When `recovery_required` is true, stop",
         "When `publication_integrity` is `failed`, stop",
@@ -302,10 +311,11 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         "Winner-only data cannot establish convergence, trends, robustness, causality",
         "advisory, not significance tests",
     ):
-        assert safety_contract in initialization.instructions
-    assert "../../../docs/" not in initialization.instructions
+        assert safety_contract in guide
+    assert "../../../docs/" not in guide
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
+        TOOL_GET_GUIDE,
         TOOL_LIST_EXPERIMENTS,
         TOOL_EXPLAIN_CONFIG,
         TOOL_INSPECT_EXPERIMENT,
@@ -318,7 +328,8 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     }
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
-    assert all(t.outputSchema for t in tools)
+    # The guide is prose, served as text; every other tool returns a described object.
+    assert [t.name for t in tools if not t.outputSchema] == [TOOL_GET_GUIDE]
     descriptions = {t.name: t.description for t in tools}
     for tool_name, safety_contracts in {
         TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
@@ -326,6 +337,8 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
         TOOL_GET_RUN_STATUS: ("run.state", "stop if run.recovery_required"),
         TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
         TOOL_EXPLAIN_CONFIG: ("config-authoring help", "not any catalog experiment"),
+        TOOL_GET_GUIDE: ("before any other PhaseSweep tool",),
+        TOOL_LIST_EXPERIMENTS: ("after get_guide",),
     }.items():
         for safety_contract in safety_contracts:
             assert safety_contract in descriptions[tool_name]
@@ -369,6 +382,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     assert key_schema["description"]
     assert {"type": "string", "maxLength": 200} in key_schema["anyOf"]
     assert server._tool_manager.get_tool(TOOL_EXPLAIN_CONFIG).is_async is False
+    assert schemas[TOOL_GET_GUIDE]["properties"] == {}
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
     assert schemas[TOOL_LIST_EXPERIMENTS]["properties"]["limit"]["default"] == DEFAULT_LIST_LIMIT
@@ -377,6 +391,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
     assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
+    assert annotations[TOOL_GET_GUIDE].readOnlyHint is True
     assert annotations[TOOL_EXPLAIN_CONFIG].readOnlyHint is True
     assert annotations[TOOL_EXPLAIN_CONFIG].destructiveHint is False
     assert annotations[TOOL_EXPLAIN_CONFIG].openWorldHint is False
@@ -386,7 +401,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     assert annotations[TOOL_CANCEL_RUN].destructiveHint is True
     assert annotations[TOOL_CANCEL_RUN].idempotentHint is True
 
-    output_schemas = {t.name: t.outputSchema for t in tools}
+    output_schemas = {t.name: t.outputSchema for t in tools if t.outputSchema}
     assert all("next_action" not in schema["properties"] for schema in output_schemas.values())
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
@@ -423,7 +438,7 @@ def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     prompts = asyncio.run(server.list_prompts())
     assert {prompt.name for prompt in prompts} == {PROMPT_RUN_AND_MONITOR}
     prompt = asyncio.run(server.get_prompt(PROMPT_RUN_AND_MONITOR, {}))
-    assert "<redacted>" in str(prompt)
+    assert [message.content.text for message in prompt.messages] == [guide]
 
 
 def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:

@@ -42,6 +42,7 @@ pre-commit install
 
 | Hook | Stage | Runs on |
 | --- | --- | --- |
+| development environment | pre-commit, pre-push | every commit and push, before the other hooks |
 | `ruff check --fix`, `ruff format` | pre-commit | changed Python files |
 | `pathlint check` | pre-commit | changed `src/` and `tests/` Python files |
 | module size | pre-commit | changed `src/` and `tests/` Python files |
@@ -51,11 +52,13 @@ pre-commit install
 | whole-suite collection | pre-commit | every commit, collecting the whole suite |
 | `mypy src` | pre-push | the whole package |
 
-Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
+The development environment hook stops the run when the `python` first on `PATH` has no `phasesweep` installed, which means another environment is active.
+
+Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. The development extra and [CI](../.github/workflows/ci.yml) pin the same exact versions of `ruff`, `mypy` and the YAML stubs; raise them in both places together. When Ruff rewrites a file, stage the fix and commit again.
 
 The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 
-`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone.
+`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hooks: the environment check, then `mypy src`.
 
 ### Source prose review
 
@@ -151,7 +154,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 - `phasesweep.cli`: Click command surface.
 - `phasesweep.errors`: the shared operator-facing error taxonomy and the operator steps behind the `fix:` lines.
 - `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train` that the templates and examples run.
-- Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (served to MCP clients).
+- Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (the workflow rules that the MCP `get_guide` tool and `phasesweep_run_and_monitor` prompt return).
 
 The configuration reference is written by hand. `tests/test_config_reference.py` compares its expanded key paths, variants, types and defaults with the schema. It does not validate prose about bounds, units or interactions.
 

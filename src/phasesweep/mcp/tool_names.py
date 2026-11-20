@@ -6,6 +6,7 @@ launch and cancel implementations record the same name in their audit events.
 
 from __future__ import annotations
 
+TOOL_GET_GUIDE = "get_guide"
 TOOL_INSPECT_EXPERIMENT = "inspect_experiment"
 TOOL_GET_LATEST_RUN = "get_latest_run"
 TOOL_GET_RUN_STATUS = "get_run_status"

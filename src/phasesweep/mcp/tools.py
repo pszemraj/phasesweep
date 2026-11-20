@@ -319,7 +319,7 @@ class _CatalogReloadRefusal:
 
 
 class PhaseSweepMCP:
-    """SDK-free implementation of every tool. Methods raise ``McpToolError``."""
+    """SDK-free implementation of every tool but ``get_guide``. Methods raise ``McpToolError``."""
 
     def __init__(
         self, registry: Registry, runs: RunStore, audit: AuditLogger | None = None

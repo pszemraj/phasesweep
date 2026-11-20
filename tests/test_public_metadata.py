@@ -12,6 +12,7 @@ import fnmatch
 import importlib
 import importlib.resources
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -151,6 +152,20 @@ def test_release_version_uses_event_tag_with_competing_annotated_tag(
         monkeypatch.setenv(name, value.replace("${{ github.event.release.tag_name }}", release_tag))
 
     assert run(sys.executable, "-m", "setuptools_scm") == expected_version
+
+
+def test_ci_installs_the_dev_extra_exact_pins() -> None:
+    """The git hooks and CI lint and type-check alike: CI installs each exact pin of the dev extra."""
+    dev = _pyproject()["project"]["optional-dependencies"]["dev"]
+    pins = {pin for pin in dev if pin.startswith(("ruff==", "mypy==", "types-PyYAML=="))}
+    assert len(pins) == 3, "the dev extra pins ruff, mypy and types-PyYAML exactly"
+    workflow_path = PYPROJECT_PATH.parent / ".github" / "workflows" / "ci.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    commands = [
+        step["run"] for job in workflow["jobs"].values() for step in job["steps"] if "run" in step
+    ]
+    installed = {token for command in commands for token in shlex.split(command, comments=True)}
+    assert pins <= installed, f"ci.yml does not install {sorted(pins - installed)}"
 
 
 @pytest.mark.integration
