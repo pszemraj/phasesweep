@@ -548,7 +548,7 @@ class Phase(_Frozen):
             "Numeric sampled parameter whose smaller values cost less. With mean repeats, "
             "advise the cheapest configuration within one standard error of the winner's "
             "mean, preferring better objectives for cost ties. Selection and result reads "
-            "report this without changing the winner. Excluded from study fingerprints."
+            "report this. Excluded from study fingerprints."
         ),
     )
     n_trials: ConfigInt = Field(ge=1)

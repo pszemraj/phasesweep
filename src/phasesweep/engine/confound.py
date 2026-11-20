@@ -2,8 +2,7 @@
 
 Without repeats, ranked units are individual trials. With repeats, they are
 complete groups; feasible members of unfinished groups count as ``incomplete_group``.
-Group aggregates are also compared using combined standard errors as a noise
-heuristic, not a significance test.
+Group aggregates are also compared using combined standard errors as a noise heuristic.
 
 Verdicts are frozen at selection, carried unchanged with the winner, and excluded
 from fingerprints. They never block selection, publication, or top-ups.
@@ -680,7 +679,7 @@ def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
             ("tie: " if not lines else "")
             + f"the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
             "within two standard errors of the winning group's aggregate, so their order "
-            "may be seed noise (an advisory heuristic, not a significance test)"
+            "may be seed noise"
         )
     return lines
 

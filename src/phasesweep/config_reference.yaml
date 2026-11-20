@@ -85,7 +85,7 @@ phases: list[object] (required)
     comment: string | null = null
 
     # Numeric sampled parameter whose smaller values cost less, for example model.depth.
-    # With mean repeats, advise the cheapest configuration within the winner's standard error; the selected winner never changes.
+    # With mean repeats, advise the cheapest configuration within the winner's standard error.
     # Requires: repeats.reduce mean and a numeric search_space parameter of this phase; numeric categorical choices may not include booleans.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats for selection, result reads and replay.
     cost_key: string | null = null
@@ -152,7 +152,7 @@ phases: list[object] (required)
         step: int = 1
 
     # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by single trials.
-    # Warning: R repeat values multiply the phase's cost by R. For a continuous hyperparameter, more distinct values with one trial each cover the same ground.
+    # Warning: R repeat values multiply the phase's cost by R.
     # Recommended: keep repeats for a few discrete finalists whose gap is near the noise, a one-off seed audit, or a final configuration's spread.
     # Requires: sampler.type grid, or random with sampler.seed on any storage, and allow_partial_grid false.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#repeats and https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#repeat-groups
@@ -401,7 +401,7 @@ provenance: map[string, string] = {}
 
 # ---------- Constraints ----------
 # A measured value outside a constraint's bounds makes the attempt infeasible: it keeps its real objective value for the sampler but cannot win.
-# An infeasible attempt counts toward phases[].max_consecutive_failures. Every constraint is read even after one is violated.
+# Every constraint is read even after one is violated.
 # A read that fails, or a value that is not a finite number, fails the attempt at once, before later constraints and gates are read.
 
 # Feasibility bounds on additional scalars, separate from metric ranking. Each item is one constraint.

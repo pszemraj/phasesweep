@@ -307,8 +307,7 @@ def ranked_group(
 def within_noise(winner: RankedGroup, other: RankedGroup) -> bool:
     """Say whether two groups' aggregates differ by no more than their noise.
 
-    Two combined standard errors is an advisory heuristic, not a significance
-    test, and it is applied to the median reducer as well.
+    The threshold of two combined standard errors applies to the median reducer as well.
 
     :param RankedGroup winner: The winning group.
     :param RankedGroup other: Another ranked group.
