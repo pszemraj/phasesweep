@@ -1176,12 +1176,15 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     ledger = validate_ledger(config)
     payload = experiment_status(config, ledger=ledger)
     phases = payload.get("phases")
-    phase_payloads = [phase for phase in phases or [] if isinstance(phase, dict)]
+    phase_payloads = (
+        [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
+    )
     running = 0
     for phase in phase_payloads:
         counts = phase.get("trials")
-        if isinstance(counts, dict) and isinstance(counts.get("RUNNING"), int):
-            running += counts["RUNNING"]
+        recorded = counts.get("RUNNING") if isinstance(counts, dict) else None
+        if isinstance(recorded, int):
+            running += recorded
     retained = any(
         phase.get("winner") is not None and phase.get("winner_is_published") is False
         for phase in phase_payloads
