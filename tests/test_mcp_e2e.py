@@ -331,7 +331,8 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     }
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
-    assert all(t.outputSchema for t in tools)
+    # The guide is prose, served as text; every other tool returns a described object.
+    assert [t.name for t in tools if not t.outputSchema] == [TOOL_GET_GUIDE]
     descriptions = {t.name: t.description for t in tools}
     for tool_name, safety_contracts in {
         TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
@@ -403,7 +404,7 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     assert annotations[TOOL_CANCEL_RUN].destructiveHint is True
     assert annotations[TOOL_CANCEL_RUN].idempotentHint is True
 
-    output_schemas = {t.name: t.outputSchema for t in tools}
+    output_schemas = {t.name: t.outputSchema for t in tools if t.outputSchema}
     assert all("next_action" not in schema["properties"] for schema in output_schemas.values())
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
@@ -444,16 +445,15 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
 
 
 def test_fastmcp_get_guide_returns_the_text_the_prompt_serves(tmp_path: Path) -> None:
-    """The guide has one source: the tool returns the packaged prompt text in full."""
+    """The guide has one source, and a client receives it as plain text, not as a JSON object."""
     pytest.importorskip("mcp")
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
     result = call_mcp_tool(app, TOOL_GET_GUIDE, {})
     assert result.isError is False
-    assert result.structuredContent == {"guide": agent_prompt_text()}
-
-    assert call_mcp_tool(app, TOOL_GET_GUIDE, {"topic": "workflow"}).isError is True
+    assert result.structuredContent is None
+    assert [block.text for block in result.content] == [agent_prompt_text()]
 
 
 def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:

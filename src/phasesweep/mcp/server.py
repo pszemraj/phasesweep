@@ -268,12 +268,6 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class GetGuideResult(_ToolPayload):
-    """Structured output for get_guide."""
-
-    guide: str = Field(description="The workflow rules, as numbered Markdown paragraphs.")
-
-
 class CapabilitiesPayload(_ToolPayload):
     """Catalog-authorized actions for one experiment."""
 
@@ -896,12 +890,21 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     mcp = FastMCP("phasesweep", instructions=SERVER_INSTRUCTIONS)
     mcp._mcp_server.version = __version__
 
-    def get_guide() -> GetGuideResult:
+    def get_guide() -> str:
         """Return the packaged workflow rules.
 
-        :return GetGuideResult: The text the ``phasesweep_run_and_monitor`` prompt also serves.
+        :return str: The text the ``phasesweep_run_and_monitor`` prompt also serves.
         """
-        return GetGuideResult(guide=agent_prompt_text())
+        return agent_prompt_text()
+
+    # The guide is prose for a model to read, so it is the one tool served as plain text:
+    # clients hand a structured result to the model as JSON, which escapes every newline.
+    mcp.tool(
+        name=TOOL_GET_GUIDE,
+        description=DESCRIPTION_GET_GUIDE,
+        annotations=_tool_annotations("Get Guide"),
+        structured_output=False,
+    )(_safe_tool(get_guide))
 
     async def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
@@ -999,7 +1002,6 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
     registrations: tuple[tuple[Callable[..., object], str, str, ToolAnnotations], ...] = (
-        (get_guide, TOOL_GET_GUIDE, DESCRIPTION_GET_GUIDE, _tool_annotations("Get Guide")),
         (
             list_experiments,
             TOOL_LIST_EXPERIMENTS,
@@ -1159,9 +1161,9 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     :param Path catalog: Operator-authored catalog file.
     :param str tool: Registered tool name, such as ``list_experiments``.
     :param JsonObject arguments: Tool arguments, validated by the tool's own schema.
-    :return int: Process exit code: 0 after the structured result is printed as
-        JSON on stdout, 1 after a tool error is printed on stderr, and 2 when a
-        startup prerequisite or the catalog failed before the tool could run.
+    :return int: Process exit code: 0 after the result is printed on stdout (JSON, or
+        the text of ``get_guide``), 1 after a tool error is printed on stderr, and 2 when
+        a startup prerequisite or the catalog failed before the tool could run.
     """
     registry = _load_server_registry(catalog, log_level=logging.WARNING)
     if registry is None:
@@ -1177,16 +1179,22 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
         )
 
     from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.types import TextContent
 
     server = build_server(_open_app(registry, "cli"))
     try:
-        # Every tool declares structured output, so a result is (unstructured, structured).
-        _unstructured, structured = asyncio.run(server.call_tool(tool, arguments))
+        result = asyncio.run(server.call_tool(tool, arguments))
     except ToolError as exc:
         # The text a client receives in its ``isError`` result.
         print(str(exc), file=sys.stderr)
         return 1
-    print(json.dumps(json_object(structured), indent=2))
+    if isinstance(result, tuple):
+        # A tool with structured output returns (unstructured, structured).
+        print(json.dumps(json_object(result[1]), indent=2))
+    else:
+        # get_guide returns text blocks.
+        text = "".join(block.text for block in result if isinstance(block, TextContent))
+        print(text.rstrip("\n"))
     return 0
 
 

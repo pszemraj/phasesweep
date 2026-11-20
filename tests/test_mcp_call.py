@@ -12,8 +12,9 @@ import pytest
 from click.testing import CliRunner, Result
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
+from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.tool_names import (
+    TOOL_GET_GUIDE,
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
@@ -56,6 +57,15 @@ def _mcp_call(catalog: Path, tool: str, *arguments: str) -> Result:
     return CliRunner().invoke(
         cli_main, ["mcp", "call", tool, "--catalog", str(catalog), *arguments]
     )
+
+
+def test_mcp_call_prints_the_guide_as_text(tmp_path: Path) -> None:
+    """``get_guide`` is the one tool whose result is prose, so it prints as written."""
+    result = _mcp_call(_catalog(tmp_path), TOOL_GET_GUIDE)
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout == agent_prompt_text() + "\n"
 
 
 def test_mcp_call_prints_structured_result_as_json(tmp_path: Path) -> None:

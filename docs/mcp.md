@@ -58,7 +58,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Tool workflow
 
-The server's MCP instructions are three sentences on one line: what PhaseSweep is, that an agent uses these tools only when the user asks for PhaseSweep in the conversation and never suggests it otherwise, and that it calls `get_guide` before any other tool. Some clients load a server's instructions into every session the server is connected to, and some show only their first line, so the workflow rules stay out of them. `get_guide()` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md), and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
+The server's MCP instructions are one line that says three things: what PhaseSweep is, that an agent uses these tools only when the user asks for PhaseSweep in the conversation and never suggests it otherwise, and that it calls `get_guide` before any other tool. Some clients load a server's instructions into every session the server is connected to, and some show only their first line, so the workflow rules stay out of them. `get_guide()` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, the one tool result that is not a JSON object, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
 
 Catalog operations use an experiment ID, except `explain_config`:
 
@@ -110,7 +110,7 @@ phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
 phasesweep mcp call inspect_experiment --catalog /absolute/path/to/catalog.yaml '{"experiment_id": "tiny_lm"}'
 ```
 
-The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and [audit log](#audit-log) apply as for a connected client, except that its audit records read `transport: "cli"`, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the structured result as JSON on stdout. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
+The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and [audit log](#audit-log) apply as for a connected client, except that its audit records read `transport: "cli"`, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the result on stdout: the structured result as JSON, or the text for `get_guide`. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
 
 A `launch_run` call from a shell outside the host's initial PID namespace, such as a sandboxed agent shell, prints a warning: the runner belongs to that namespace and ends when it does, so launch a run that must last from a shell outside any sandbox (see [PID namespaces](#pid-namespaces)).
 
