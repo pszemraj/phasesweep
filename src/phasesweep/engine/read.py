@@ -41,7 +41,6 @@ from phasesweep.engine.ledger import (
     resolved_ledger_path,
     validate_ledger,
 )
-from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.optuna import (
     _finished_trial_count,
     _PhaseTrialStats,
@@ -1048,15 +1047,16 @@ class UnpublishedWinnerStep:
 
 
 def unpublished_winner_step(
-    experiment: Experiment, ledger: ValidatedLedger
+    experiment: Experiment, ledger: ValidatedLedger, *, busy: bool
 ) -> UnpublishedWinnerStep | None:
     """Give one publication remedy from recorded failures, suppressing it during live work.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :param bool busy: Whether a run holds the experiment's locks, as the caller probed once.
     :return UnpublishedWinnerStep | None: The recorded cause and remedy, or the rerun instruction; none while busy or if storage is unreadable.
     """
-    if experiment_is_busy(experiment):
+    if busy:
         return None
     if not experiment.persistent:
         return UnpublishedWinnerStep(

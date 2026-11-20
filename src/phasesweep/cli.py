@@ -41,6 +41,7 @@ from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
+from phasesweep.engine.locking import experiment_is_busy
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -1009,6 +1010,22 @@ def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str
     ]
 
 
+def _interrupted_running_comment(running: int) -> str:
+    """Say that trials recorded RUNNING belong to no live run and how to recover them.
+
+    :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
+    :return str: One ``#`` comment line.
+    """
+    if running == 1:
+        subject, verb, pronoun = "the 1 trial", "was", "it"
+    else:
+        subject, verb, pronoun = f"the {running} trials", "were", "them"
+    return (
+        f"# No run is active, so {subject} recorded RUNNING {verb} interrupted; "
+        f"rerun the same config to recover {pronoun}."
+    )
+
+
 def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     """Render every phase's trial table under a header that names the winner marks' source.
 
@@ -1108,8 +1125,9 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr. An unpublished winner gets a comment explaining how to resume publication.
-    ``--trials`` prints the trial tables in its place, from one
+    on stderr. An unpublished winner gets a comment explaining how to resume publication,
+    and trials recorded RUNNING while no run holds the experiment's locks get a comment
+    saying that a rerun recovers them. ``--trials`` prints the trial tables in its place, from one
     publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
@@ -1123,6 +1141,9 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     require_study(config)
     if show_trials:
         tables = read_trial_tables(config, latest=True)
+        running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
+        if running and not experiment_is_busy(config):
+            click.echo(_interrupted_running_comment(running))
         click.echo(_render_trial_tables(tables, persisted=config.persistent))
         raise_for_unusable_publication(
             tables.experiment,
@@ -1134,13 +1155,22 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     ledger = validate_ledger(config)
     payload = experiment_status(config, ledger=ledger)
     phases = payload.get("phases")
-    if isinstance(phases, list) and any(
-        isinstance(phase, dict)
-        and phase.get("winner") is not None
-        and phase.get("winner_is_published") is False
-        for phase in phases
-    ):
-        step = unpublished_winner_step(config, ledger)
+    phase_payloads = [phase for phase in phases or [] if isinstance(phase, dict)]
+    running = 0
+    for phase in phase_payloads:
+        counts = phase.get("trials")
+        if isinstance(counts, dict) and isinstance(counts.get("RUNNING"), int):
+            running += counts["RUNNING"]
+    retained = any(
+        phase.get("winner") is not None and phase.get("winner_is_published") is False
+        for phase in phase_payloads
+    )
+    # One probe serves both comments: flock cannot test a lock without taking it.
+    busy = experiment_is_busy(config) if running or retained else False
+    if running and not busy:
+        click.echo(_interrupted_running_comment(running))
+    if retained:
+        step = unpublished_winner_step(config, ledger, busy=busy)
         if step is not None:
             click.echo(
                 "# Winner retained but not published"
