@@ -32,7 +32,7 @@ from phasesweep.engine.study_policy import (
     _require_trainer_cwd,
     _trial_program_refusal,
 )
-from phasesweep.engine.trial import _environment_identity
+from phasesweep.engine.trial import _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from tests.conftest import (
     make_experiment,
@@ -366,7 +366,7 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
 
     assert result.exit_code != 0
     assert isinstance(result.exception, PhaseSweepError)
-    assert f"program {program!r} resolves to" in str(result.exception)
+    assert repr(program) in str(result.exception)
     assert "which is not an executable file" in str(result.exception)
 
     _executable(tmp_path / "train.sh")
@@ -387,3 +387,27 @@ def test_require_trainer_cwd_leaves_a_program_found_through_path_to_the_launch(
     _require_trainer_cwd(experiment)
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on"):
         _launch_preflight(experiment, "p", None)
+
+
+def test_a_path_that_is_already_absolute_is_printed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory and program refusals say where a path resolves only when it differs from the text."""
+    gone = tmp_path.resolve() / "gone"
+    experiment = make_experiment(execution=ExecutionContext(cwd=str(gone)))
+    assert _missing_trainer_cwd(experiment) == (
+        f"execution.cwd is {str(gone)!r}, which is not a directory on this host."
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path.resolve()))
+    tilde = make_experiment(execution=ExecutionContext(cwd="~/gone"))
+    assert _missing_trainer_cwd(tilde) == (
+        f"execution.cwd '~/gone' resolves to {gone}, which is not a directory on this host."
+    )
+
+    absolute = _trial_program_refusal("/opt/nonexistent/bin/python x.py", path=None, cwd=tmp_path)
+    assert absolute is not None
+    assert absolute[0] == (
+        "The trial command's program is '/opt/nonexistent/bin/python', "
+        "which is not an executable file."
+    )

@@ -1320,9 +1320,11 @@ def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tupl
         resolved = cwd / program
         if resolved.is_file() and os.access(resolved, os.X_OK):
             return None
+        where = (
+            f"is {program!r}" if str(resolved) == program else f"{program!r} resolves to {resolved}"
+        )
         return (
-            f"The trial command's program {program!r} resolves to {resolved}, which is not an "
-            "executable file.",
+            f"The trial command's program {where}, which is not an executable file.",
             "Correct the path in trial_command or make the file executable; a relative path "
             "resolves against the trainer's working directory.",
         )

@@ -468,8 +468,11 @@ def _missing_trainer_cwd(experiment: Experiment) -> str | None:
     trainer_cwd = experiment.execution.resolved_cwd()
     if trainer_cwd is None or trainer_cwd.is_dir():
         return None
+    configured = experiment.execution.cwd
+    if configured == str(trainer_cwd):
+        return f"execution.cwd is {configured!r}, which is not a directory on this host."
     return (
-        f"execution.cwd {experiment.execution.cwd!r} resolves to {trainer_cwd}, which is not a "
+        f"execution.cwd {configured!r} resolves to {trainer_cwd}, which is not a "
         "directory on this host."
     )
 
