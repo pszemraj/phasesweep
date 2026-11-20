@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, MlflowTarget
 
 # Objective-evidence provenance schema version.
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 4
 # Log-regex evaluation revision included in the extractor contract.
 LOG_REGEX_EVALUATION_REVISION = 3
 

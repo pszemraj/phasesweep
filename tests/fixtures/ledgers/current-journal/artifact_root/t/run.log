@@ -1,10 +1,10 @@
-2026-11-20 09:14:27 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
-2026-11-20 09:14:27 I phasesweep.engine.phase phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1
-2026-11-20 09:14:27 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
-2026-11-20 09:14:27 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
-2026-11-20 09:14:27 I phasesweep.engine.phase phase=p TRIAL trial=0 state=COMPLETE value=0.5 duration=0.5s params={'a': 1} (1/2 finished)
-2026-11-20 09:14:27 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
-2026-11-20 09:14:28 I phasesweep.engine.phase phase=p TRIAL trial=1 state=COMPLETE value=0.5 duration=0.5s params={'a': 10} (2/2 finished)
-2026-11-20 09:14:28 W phasesweep.engine.selection [p] potential confounds in the 2 ranked trials (advisory; verdicts recorded in the winner's confound block): tie: trial(s) 1 matched the winner's value exactly with different params, and the lower draw position won. No noise estimate: one trial per configuration leaves the size of the gap uncertain. First compare more distinct values and inspect trends across neighboring configurations. Use phases[].repeats for a few discrete finalists or an explicit noise check.
-2026-11-20 09:14:28 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
-2026-11-20 09:14:28 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/b54f45a6855b45b59cb6aa4f561ddede/summary.yaml
+2026-11-20 12:15:37 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t
+2026-11-20 12:15:37 I phasesweep.engine.phase phase=p study=t::p finished=0 remaining=2 reruns=0 n_jobs=1
+2026-11-20 12:15:37 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-11-20 12:15:37 I phasesweep.engine.trial [p/trial_0] printf 'PSWOBJ=0.5\n' --a=1
+2026-11-20 12:15:37 I phasesweep.engine.phase phase=p TRIAL trial=0 state=COMPLETE value=0.5 duration=0.5s params={'a': 1} (1/2 finished)
+2026-11-20 12:15:37 I phasesweep.engine.trial [p/trial_1] printf 'PSWOBJ=0.5\n' --a=10
+2026-11-20 12:15:38 I phasesweep.engine.phase phase=p TRIAL trial=1 state=COMPLETE value=0.5 duration=0.5s params={'a': 10} (2/2 finished)
+2026-11-20 12:15:38 W phasesweep.engine.selection [p] potential confounds in the 2 ranked trials (verdicts recorded in the winner's confound block): tie: trial(s) 1 matched the winner's value exactly with different params, and the lower draw position won. No noise estimate: one trial per configuration leaves the size of the gap uncertain. First compare more distinct values and inspect trends across neighboring configurations. Use phases[].repeats for a few discrete finalists or an explicit noise check.
+2026-11-20 12:15:38 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
+2026-11-20 12:15:38 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root/t/generations/6a14d4d3a3fe4e7eb837b7cda969f1fc/summary.yaml
