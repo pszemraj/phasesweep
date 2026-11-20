@@ -247,19 +247,24 @@ def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None
     assert _load_phase_policy_state(study).consecutive_failures == 2
 
 
-def test_a_recovered_verdict_decides_its_abort_past_a_duplicate_its_recovery_heals() -> None:
-    """A RUNNING trial whose record duplicates a sequence leaves a peer's recovered verdict its abort decision.
+@pytest.mark.parametrize("holder", ["peer", "itself"])
+def test_a_recovered_verdict_decides_its_abort_past_a_duplicate_its_recovery_heals(
+    holder: str,
+) -> None:
+    """A recovered verdict decides its abort past a RUNNING trial's record that duplicates a sequence.
 
-    Recovery replaces that record with a fresh interruption, so the verdict's replay leaves it
-    out: the failure trips max_consecutive_failures at its own sequence, and once the duplicate
-    holder is recovered the strict replay validates and finds that abort.
+    Recovery replaces that record at a fresh sequence, whether a peer or the verdict's own
+    trial holds it, so the verdict's replay leaves it out: the failure trips
+    max_consecutive_failures at its own sequence, and once every duplicate holder is recovered
+    the strict replay validates and finds that abort.
     """
     phase = make_experiment(max_consecutive_failures=3).phases[0]
     study = optuna.create_study()
     _finished(study, 1, "failure")
     _finished(study, 2, "failure")
-    finished_training = _running_trial(study, None)
+    peer = _running_trial(study, None) if holder == "peer" else None
     duplicate = _running_trial(study, trial_outcome(2, "failure", cause="exit 1"))
+    finished_training = duplicate if peer is None else peer
 
     _record_stale_trial_outcome(
         study, finished_training, evidence_failure="crashed", policy_phase=phase
@@ -272,11 +277,13 @@ def test_a_recovered_verdict_decides_its_abort_past_a_duplicate_its_recovery_hea
         "crashed",
     )
     assert recorded[TRIAL_OUTCOME_ABORT_KEY]["completion_sequence"] == 3
-    with pytest.raises(StudySchemaMismatchError, match="both use completion sequence 2"):
-        _load_phase_policy_state(study)
-    _record_stale_trial_outcome(study, duplicate)
+    if peer is not None:
+        with pytest.raises(StudySchemaMismatchError, match="both use completion sequence 2"):
+            _load_phase_policy_state(study)
+        _record_stale_trial_outcome(study, duplicate)
     state = _load_phase_policy_state(study)
-    assert state.max_sequence == 4
+    assert state.max_sequence == (4 if peer is not None else 3)
+    assert state.consecutive_failures == 3
     assert state.abort == recorded[TRIAL_OUTCOME_ABORT_KEY]
 
 

@@ -655,11 +655,11 @@ def _record_stale_trial_outcome(
 
     Keep recorded failures, fatal errors, interruptions, and their aborts. A finished
     trainer's evidence decides its outcome as it does a live trial's; an unproven success or
-    missing outcome becomes interrupted and reruns. An evidence verdict on a trial that holds
-    no outcome record trips the producing phase's failure limit as the live path would,
-    through the same decision, and its abort is written with the outcome. A trial that already
-    holds one had its abort decided when that record was written, and an interruption trips
-    none. Malformed or duplicate outcomes receive a fresh sequence.
+    missing outcome becomes interrupted and reruns. Malformed or duplicate outcomes receive a
+    fresh sequence. An evidence verdict recorded at a fresh sequence trips the producing
+    phase's failure limit as the live path would, through the same decision, and its abort is
+    written with the outcome. A verdict at the sequence of the trial's own valid record keeps
+    that record's abort only when it agrees with the record, and an interruption trips none.
 
     :param optuna.Study study: Study providing outcome sequences.
     :param optuna.trial.FrozenTrial trial: Stale RUNNING trial.
@@ -695,12 +695,10 @@ def _record_stale_trial_outcome(
         if existing is None:
             sequence = max(sequence_counts, default=0) + 1
             cause: str | None = "stale RUNNING trial recovered after its orchestrator stopped"
-            if (
-                policy_phase is not None
-                and _parsed_trial_outcome(current.user_attrs.get(TRIAL_OUTCOME_ATTR)) is None
-            ):
-                # A RUNNING trial's duplicated record is one its own recovery replaces with a
-                # fresh interruption, so the decision replays the study as that leaves it.
+            if policy_phase is not None:
+                # Stale recovery replaces every RUNNING trial's duplicated record, this trial's
+                # included, at a fresh sequence, with an interruption or a verdict, so the
+                # decision replays the study without those records.
                 replaced = {
                     candidate.number
                     for candidate in trials
