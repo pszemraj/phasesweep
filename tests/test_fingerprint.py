@@ -986,7 +986,9 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
         run_experiment(foreign)
     assert type(excinfo.value) is ArtifactRootConflictError
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
-    assert "bound to a different storage ledger or experiment" in str(excinfo.value)
+    assert "was created with a different storage ledger than this config names" in str(
+        excinfo.value
+    )
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1494,12 +1496,12 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(tmp_path: Path
 
     offered = owner.model_copy(update={"storage": None})
     with pytest.raises(
-        ArtifactRootConflictError, match="bound to a different storage ledger"
+        ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         run_experiment(offered)
     assert str(excinfo.value).endswith("Nothing was written.")
     with pytest.raises(
-        ArtifactRootConflictError, match="bound to a different storage ledger"
+        ArtifactRootConflictError, match="created with a different storage ledger"
     ) as excinfo:
         read_status(offered)
     assert str(excinfo.value).endswith("Nothing was written.")

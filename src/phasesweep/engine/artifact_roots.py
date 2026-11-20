@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Literal
 
 import optuna
@@ -127,6 +128,65 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         ) from exc
 
 
+_MOVED_TREE_STEP = (
+    "Use the tree at the recorded path (move it back if it was moved), or set a new "
+    "`experiment` name in the config to start a fresh study (with `storage: auto`, a new "
+    "`workdir` also works)."
+)
+
+
+def _binding_mismatch(
+    path: Path, raw: object, expected: Mapping[str, object], experiment: Experiment
+) -> ArtifactRootConflictError:
+    """Name which recorded field of an artifact root's binding differs from this config's.
+
+    A tree moved or copied to another path differs in its root, which also changes the
+    ledger identity under ``storage: auto``, so the root is reported first and alone.
+
+    :param Path path: Binding file that was read.
+    :param object raw: The parsed binding.
+    :param Mapping[str, object] expected: The binding this config would write.
+    :param Experiment experiment: Config whose root, experiment and storage are checked.
+    :return ArtifactRootConflictError: The refusal, with the step that fits its cause.
+    """
+    root = expected["artifact_root"]
+    if not isinstance(raw, dict):
+        return ArtifactRootConflictError(
+            f"Artifact-root binding {path} is malformed: it is not a JSON object.",
+            action=OperatorAction.RESTORE_TREE,
+        )
+    if raw.get("artifact_root") != root:
+        return ArtifactRootConflictError(
+            f"The artifact tree at {root!r} was created at {raw.get('artifact_root')!r}. "
+            "Nothing was written.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=_MOVED_TREE_STEP,
+        )
+    causes: list[str] = []
+    names: list[str] = []
+    if raw.get("experiment") != expected["experiment"]:
+        causes.append(f"for experiment {raw.get('experiment')!r}, not {experiment.experiment!r}")
+        names.append("`experiment`")
+    if raw.get("storage_key") != expected["storage_key"]:
+        causes.append("with a different storage ledger than this config names")
+        names.append("`storage`")
+    if not causes:
+        return ArtifactRootConflictError(
+            f"Artifact-root binding {path} is malformed: it records fields this PhaseSweep "
+            "does not write.",
+            action=OperatorAction.RESTORE_TREE,
+        )
+    return ArtifactRootConflictError(
+        f"Artifact root {root!r} was created {', and '.join(causes)}. Nothing was written.",
+        action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            f"Restore the {' and '.join(names)} this tree was created with to continue this "
+            "study, or set a new `experiment` name to start a fresh study "
+            "(with `storage: auto`, a new `workdir` also works)."
+        ),
+    )
+
+
 def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     """Classify a tree's experiment and ledger ownership without reading the ledger.
 
@@ -172,11 +232,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             remediation=OTHER_FORMAT_STEP,
         )
     if raw != expected:
-        raise ArtifactRootConflictError(
-            f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-            f"ledger or experiment than {experiment.experiment!r}. Nothing was written.",
-            action=OperatorAction.FIX_CONFIG,
-        )
+        raise _binding_mismatch(path, raw, expected, experiment)
     return "bound"
 
 
@@ -258,6 +314,10 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
         f"config offers {offered!r}. No trial ran and nothing was published.",
         action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            "Restore the `workdir` and `experiment` that give the recorded artifact root to "
+            "continue this study, or set a new `experiment` name to start a fresh study."
+        ),
     )
 
 
