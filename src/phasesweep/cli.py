@@ -8,6 +8,7 @@ import shlex
 import sys
 import traceback
 from collections.abc import Sequence
+from decimal import Decimal
 from importlib import resources
 from pathlib import Path
 
@@ -930,13 +931,17 @@ _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 def _param_text(value: JsonValue) -> str:
     """Format one sampled param for a trial table, floats to four significant digits.
 
-    The exact value stays in ``trials.csv`` and ``winner.yaml``; the table is for reading.
+    Four digits would drop the leading digits of a float from 10000 up, which prints in full
+    plain notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
 
     :param JsonValue value: The recorded param value.
     :return str: Terminal text for the value.
     """
     if isinstance(value, float):
-        return f"{value:.4g}"
+        text = f"{value:.4g}"
+        if "e+" not in text:
+            return text
+        return format(Decimal(repr(value)).normalize(), "f")
     return str(value)
 
 

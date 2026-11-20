@@ -17,7 +17,7 @@ import phasesweep.engine.read as engine_read
 from phasesweep import experiment_status, run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Metric, Phase
-from phasesweep.config.search import IntParam, Sampler
+from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
@@ -27,7 +27,12 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.read import read_status, read_trial_tables
 from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.json import JsonValue
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    write_experiment_config,
+    write_trainer,
+)
 from tests.ledger_fixtures import materialize, published_generation_id
 
 EXPERIMENT_STATUS_KEYS = [
@@ -298,3 +303,36 @@ def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert payload["ledger_path"] is None
+
+
+def test_trial_table_prints_float_params_of_10000_or_more_in_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Float params from 10000 up print in plain notation, and smaller ones keep four significant digits."""
+    values = [16384.0, 100000.0, 12345.678, 9999.9, 0.0003162, 1.5e22]
+    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")\n')
+    phase = Phase(
+        name="p",
+        n_trials=len(values),
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"w": CategoricalParam(type="categorical", choices=values)},
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    run_experiment(experiment)
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+
+    assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
+
+    shown = {
+        line.split("w=")[1].split()[0]
+        for line in capsys.readouterr().out.splitlines()
+        if "w=" in line
+    }
+    assert shown == {
+        "16384",
+        "100000",
+        "12345.678",
+        "9999.9",
+        "0.0003162",
+        "15000000000000000000000",
+    }
