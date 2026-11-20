@@ -106,7 +106,7 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
     assert summary["capabilities"] == {
         "launch": False,
         "cancel": False,
-        "resume_from_phase": False,
+        "from_phase": False,
     }
 
     # The summary must carry no path, command, or storage URL.

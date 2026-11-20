@@ -67,7 +67,7 @@ To check the same operation without a client, run it from a shell:
 phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
 ```
 
-See [shell calls](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes and monitoring. For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow) and [response shapes](mcp.md#reading-status-responses).
+See [shell calls](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes and monitoring. For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow) and [response shapes](mcp.md#reading-status-responses). A launch of an experiment whose trials a shell run already finished launches nothing and succeeds with `run_wrote_generation: false`.
 
 ## Maintenance and troubleshooting
 

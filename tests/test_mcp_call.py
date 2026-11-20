@@ -18,6 +18,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
+    TOOL_NAMES,
 )
 from tests.mcp_helpers import (
     call_mcp_tool,
@@ -97,7 +98,6 @@ def test_mcp_call_prints_structured_result_as_json(tmp_path: Path) -> None:
             TOOL_INSPECT_EXPERIMENT, {"experiment_id": "missing"}, id="unknown_experiment"
         ),
         pytest.param(TOOL_INSPECT_EXPERIMENT, {"experiment_id": 3}, id="wrong_argument_type"),
-        pytest.param("no_such_tool", {}, id="unknown_tool"),
         pytest.param(TOOL_LAUNCH_RUN, {"experiment_id": "srv"}, id="refused_launch"),
     ],
 )
@@ -116,6 +116,15 @@ def test_mcp_call_tool_error_matches_client_is_error_text(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert result.stderr.strip() == client.content[0].text
+
+
+def test_mcp_call_names_the_tools_for_an_unknown_one(tmp_path: Path) -> None:
+    """A tool name that does not exist is bad input: exit 2, with every tool listed."""
+    result = _mcp_call(_catalog(tmp_path), "no_such_tool")
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert all(name in result.stderr for name in TOOL_NAMES)
 
 
 def test_mcp_call_rejects_undeclared_argument(tmp_path: Path) -> None:

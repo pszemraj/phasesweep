@@ -34,6 +34,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
+    TOOL_NAMES,
 )
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -106,7 +107,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
     assert summaries[0]["capabilities"] == {
         "launch": True,
         "cancel": True,
-        "resume_from_phase": True,
+        "from_phase": True,
     }
     structure = app.validate("e2e_lm")
     assert structure["capabilities"] == summaries[0]["capabilities"]
@@ -312,6 +313,8 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
         TOOL_LAUNCH_RUN,
         TOOL_CANCEL_RUN,
     }
+    # `phasesweep mcp call` offers exactly the registered tools.
+    assert sorted(TOOL_NAMES) == sorted(t.name for t in tools)
     assert all(t.description for t in tools)
     assert all(t.annotations is not None for t in tools)
     # The guide is prose, served as text; every other tool returns a described object.

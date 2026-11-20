@@ -193,7 +193,7 @@ class RegisteredExperiment:
         return {
             "launch": self.allow_launch,
             "cancel": self.allow_cancel,
-            "resume_from_phase": self.allow_from_phase,
+            "from_phase": self.allow_from_phase,
         }
 
 

@@ -82,6 +82,7 @@ from phasesweep.mcp.registry import (
     require_supported_mcp_host,
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
+from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
 from phasesweep.runtime.gpu import GpuPool
@@ -1369,13 +1370,14 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
         "Run one MCP tool against a catalog in this process and print its result (JSON, or the "
         "text of get_guide), through the same dispatch, validation, redaction and audit as "
         "`mcp serve`. "
+        f"TOOL is one of {', '.join(TOOL_NAMES)}. "
         "JSON_ARGS is a JSON object of tool arguments and defaults to {}. Exit code 0 prints the "
         "result; 1 prints the tool's error on stderr; 2 means bad input or a catalog that cannot "
         "be loaded as a whole. The call is real: launch_run starts a detached run."
     ),
     short_help="Call one MCP tool from the shell.",
 )
-@click.argument("tool")
+@click.argument("tool", type=click.Choice(TOOL_NAMES), metavar="TOOL")
 @click.argument("json_args", metavar="[JSON_ARGS]", default="{}", callback=_tool_arguments)
 @MCP_CATALOG
 @click.pass_context

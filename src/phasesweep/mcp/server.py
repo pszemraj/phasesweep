@@ -267,7 +267,7 @@ class CapabilitiesPayload(_ToolPayload):
 
     launch: bool = Field(description="Whether the agent may launch this experiment.")
     cancel: bool = Field(description="Whether the agent may cancel its launched runs.")
-    resume_from_phase: bool = Field(
+    from_phase: bool = Field(
         description="Whether launch may use from_phase after earlier winners exist."
     )
 
