@@ -2,7 +2,8 @@
 # installed in the active development environment (`pip install -e ".[dev]"`),
 # so pre-commit builds no per-hook environments, needs no network, and uses the
 # same tool versions as manual runs. Activate that environment before
-# committing or pushing.
+# committing or pushing; the `environment` hook stops a run started anywhere
+# else.
 minimum_pre_commit_version: "3.2.0"
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
@@ -10,6 +11,17 @@ default_stages: [pre-commit]
 repos:
   - repo: local
     hooks:
+      # Runs first and ends the run when it fails: outside the development
+      # environment the hooks below fail on missing imports and stubs, which
+      # hides the cause.
+      - id: environment
+        name: development environment
+        entry: python scripts/check_hook_environment.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        fail_fast: true
+        stages: [pre-commit, pre-push]
       - id: ruff
         name: ruff check
         entry: ruff check --force-exclude --fix

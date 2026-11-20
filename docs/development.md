@@ -42,6 +42,7 @@ pre-commit install
 
 | Hook | Stage | Runs on |
 | --- | --- | --- |
+| development environment | pre-commit, pre-push | every commit and push, before the other hooks |
 | `ruff check --fix`, `ruff format` | pre-commit | changed Python files |
 | `pathlint check` | pre-commit | changed `src/` and `tests/` Python files |
 | module size | pre-commit | changed `src/` and `tests/` Python files |
@@ -51,11 +52,13 @@ pre-commit install
 | whole-suite collection | pre-commit | every commit, collecting the whole suite |
 | `mypy src` | pre-push | the whole package |
 
+The [environment hook](../scripts/check_hook_environment.py) passes when the `python` first on `PATH` imports `phasesweep` from this checkout's `src/`. When it fails, it prints which Python it found and stops the run, so a commit or push from another environment ends with that one message, not with the import and stub errors the later hooks would report.
+
 Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
 
 The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 
-`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hook, `mypy src`, alone.
+`pre-commit run --all-files` runs the commit hooks over the whole tree; `pre-commit run --all-files --hook-stage pre-push` runs the push hooks: the environment check, then `mypy src`.
 
 ### Source prose review
 
