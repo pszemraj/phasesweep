@@ -1535,7 +1535,10 @@ def test_log_regex_min_max_fails_on_any_non_finite_match(
     (tmp_path / "stdout.log").write_text(text, encoding="utf-8")
     cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
     provenance: dict = {}
-    with pytest.raises(ExtractorError, match=rf"line {bad_line}\b.*anchor the pattern to digits"):
+    with pytest.raises(
+        ExtractorError,
+        match=rf"line {bad_line}\b.*anchor the pattern to digits.*changed pattern needs a new `experiment` name",
+    ):
         run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
     assert "source" not in provenance
 

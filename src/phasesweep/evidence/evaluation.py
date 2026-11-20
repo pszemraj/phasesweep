@@ -409,7 +409,9 @@ def _extract_log_regex(
                         raise ExtractorError(
                             f"Log file {target} has a non-finite match on line {line_no}, "
                             f"so select: {cfg.select} has no defined result; "
-                            "anchor the pattern to digits so nan and inf cannot match."
+                            "anchor the pattern to digits so nan and inf cannot match. On a "
+                            "persistent study the pattern is part of the study identity, so a "
+                            "changed pattern needs a new `experiment` name."
                         )
                     elif cfg.select == "min":
                         if result is None or v < result:
