@@ -4,8 +4,8 @@ The trial command runs through ``/bin/sh`` on the PATH the run starts with, in t
 working directory. A program that PATH lacks, or a missing ``execution.cwd``, would fail every
 trial before its trainer ran and record each as a failure, so the launch preflight refuses
 them up front. The program check judges only a plain first word and never refuses a command
-it cannot judge. ``validate`` runs only the directory check, whose answer is the same from
-any shell.
+it cannot judge. ``validate`` runs the directory check and judges a program written with a
+``/``, whose answers are the same from any shell.
 """
 
 from __future__ import annotations

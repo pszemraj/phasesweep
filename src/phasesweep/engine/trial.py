@@ -115,8 +115,8 @@ class TrialResult:
     objective_provenance: dict[str, Any] | None = None
     # True only when the phase/run deadline caused the failure.
     deadline_exhausted: bool = False
-    # True only when every failure is a tracker that gave no answer, so the finished
-    # training waits for a later read instead of being recorded as failed.
+    # True only when every failure is a tracker that gave no answer, so a persistent
+    # study's finished training waits for a later read instead of being recorded as failed.
     evidence_unreadable: bool = False
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
