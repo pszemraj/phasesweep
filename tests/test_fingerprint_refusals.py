@@ -57,7 +57,7 @@ def _refusal(study: optuna.Study, experiment: Experiment) -> StudyFingerprintMis
 
 
 def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
-    """Widening one bound refuses the study and names that key with both values."""
+    """Widening one bound refuses the study, names that key with both values, and offers the phase rename that then runs."""
     project = project_directory(tmp_path)
     config = write_anchored_config(
         project / "exp.yaml",
@@ -81,6 +81,17 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert "Changed: phase.search_space.x.high: 3 -> 4." in str(caught.value)
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
+    assert caught.value.remediation is not None
+    assert "give this phase a new `name`" in caught.value.remediation
+
+    write_anchored_config(
+        config,
+        workdir="runs",
+        storage="journal:///study.journal",
+        execution={"cwd": "."},
+        phases=[{**anchored_phase(4), "name": "wider"}],
+    )
+    assert set(run_experiment(load_experiment(config))) == {"wider"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(
@@ -172,8 +183,8 @@ def test_refusal_leads_with_restoring_the_recorded_value_it_shows() -> None:
     assert str(error) == str(error).rstrip()
     assert error.remediation == (
         "Restore the recorded value(s) to continue this study, or set a new `experiment` name "
-        "in the config to start a fresh study (with `storage: auto`, a new `workdir` also "
-        "works); the old study stays readable with its original config."
+        "in the config to start a fresh study (a new `workdir` also works unless `storage` "
+        "names a ledger); the old study stays readable with its original config."
     )
     assert NEW_STUDY_STEP[1:] in error.remediation
     assert _operational_error_text(error).endswith(error.remediation)
@@ -235,8 +246,8 @@ def test_a_tree_at_another_path_is_refused_as_created_elsewhere(tmp_path: Path) 
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert caught.value.remediation == (
         "Use the tree at the recorded path (move it back if it was moved), or set a new "
-        "`experiment` name in the config to start a fresh study (with `storage: auto`, a new "
-        "`workdir` also works)."
+        "`experiment` name in the config to start a fresh study (a new `workdir` also works "
+        "unless `storage` names a ledger)."
     )
 
 

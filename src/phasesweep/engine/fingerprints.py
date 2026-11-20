@@ -212,6 +212,13 @@ _RESTORE_OR_NEW_STUDY_STEP = (
     f"Restore the recorded value(s) to continue this study, or {FRESH_STUDY}; "
     "the old study stays readable with its original config."
 )
+#: A change confined to one phase leaves the other phases' studies valid, and a phase's study
+#: is named after it, so a new phase name reruns that phase alone.
+_RESTORE_OR_RENAME_PHASE_STEP = (
+    "Restore the recorded value(s) to continue this study, or give this phase a new `name` "
+    "(and update any `inherits` that names it) to rerun only this phase. To rerun every "
+    f"phase, {FRESH_STUDY}."
+)
 _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
@@ -371,7 +378,12 @@ def _verify_fingerprint(
             path == "execution.cwd" for path, _old, _new in changes
         )
         # The message shows the recorded values only when the study kept the payload they came from.
-        way_forward = _RESTORE_OR_NEW_STUDY_STEP if changes else NEW_STUDY_STEP
+        if not changes:
+            way_forward = NEW_STUDY_STEP
+        elif all(path.startswith("phase.") for path, _old, _new in changes):
+            way_forward = _RESTORE_OR_RENAME_PHASE_STEP
+        else:
+            way_forward = _RESTORE_OR_NEW_STUDY_STEP
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). {_describe_changed_keys(changes)}",

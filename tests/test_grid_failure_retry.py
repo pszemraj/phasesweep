@@ -204,9 +204,9 @@ def _assert_advises_limit(message: str, above: int, left: int, target: int) -> N
 
 
 def _assert_fresh_study_remedy(message: str) -> None:
-    """Assert new-workdir advice is conditional on automatic storage."""
+    """Assert new-workdir advice excludes a config whose storage names a ledger."""
     assert "new `experiment` name" in message
-    assert "with `storage: auto`, a new `workdir` also works" in message
+    assert "a new `workdir` also works unless `storage` names a ledger" in message
 
 
 def _assert_no_recovery(message: str) -> None:

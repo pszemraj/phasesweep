@@ -231,7 +231,7 @@ def test_measured_infeasible_fixed_configuration_says_nothing_can_continue(tmp_p
         assert "Its configuration was measured and is not feasible" in message
         assert "phases[p]" not in message
         assert "new `experiment` name" in message
-        assert "with `storage: auto`, a new `workdir` also works" in message
+        assert "a new `workdir` also works unless `storage` names a ledger" in message
     assert _call_count(calls) == 1
 
 

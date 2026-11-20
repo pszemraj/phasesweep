@@ -93,7 +93,7 @@ RERUN_CLEANUP_RECOVERY = (
 
 _FRESH_STUDY_TAIL = (
     " a new `experiment` name in the config to start a fresh study "
-    "(with `storage: auto`, a new `workdir` also works)"
+    "(a new `workdir` also works unless `storage` names a ledger)"
 )
 
 #: The one way to start over, worded as a clause for a step that offers it second.
