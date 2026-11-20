@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 
 from phasesweep.config.io import load_experiment_snapshot
 from phasesweep.config.models import Experiment
+from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
@@ -787,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
+        format=LOG_FORMAT,
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 

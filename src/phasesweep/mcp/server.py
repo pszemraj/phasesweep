@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
 
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.read import CostAdvisoryStatus
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
@@ -1131,7 +1132,7 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
     logging.basicConfig(
         level=log_level,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
+        format=LOG_FORMAT,
         datefmt="%H:%M:%S",
     )
 

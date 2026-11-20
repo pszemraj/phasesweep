@@ -36,6 +36,7 @@ from phasesweep.config.reference import (
 )
 from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
+from phasesweep.engine.artifacts import LOG_FORMAT
 from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
@@ -137,7 +138,7 @@ def _configure_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
+        format=LOG_FORMAT,
         datefmt="%H:%M:%S",
     )
     optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.ERROR)

@@ -39,6 +39,11 @@ from phasesweep.runtime.files import atomic_text_writer
 
 log = logging.getLogger(__name__)
 
+# One log line shape for every destination. The date format differs on purpose: console
+# handlers print clock time (``%H:%M:%S``), while ``run.log`` and the MCP runner's captured
+# log carry the date as well (``%Y-%m-%d %H:%M:%S``) because those files outlive the day.
+LOG_FORMAT = "%(asctime)s %(levelname).1s %(name)s %(message)s"
+
 
 def read_yaml_or_none(path: Path) -> object:
     """Read optional YAML without propagating read or decoding failures.
@@ -77,7 +82,7 @@ def _file_log_handler(path: Path) -> Iterator[None]:
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
     handler.setFormatter(
         logging.Formatter(
-            fmt="%(asctime)s %(levelname).1s %(name)s %(message)s",
+            fmt=LOG_FORMAT,
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
