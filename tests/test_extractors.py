@@ -690,6 +690,34 @@ def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tm
     assert timeout.reached is (answer == "running")
 
 
+@pytest.mark.integration
+def test_wandb_worker_polls_until_shortly_before_its_deadline(wandb_worker_sdk, tmp_path):
+    """A run that finishes four seconds inside a ten-second budget is captured, not timed out."""
+    wandb_worker_sdk("""
+        import time
+        _first_lookup = []
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                if not _first_lookup:
+                    _first_lookup.append(time.monotonic())
+                finished = time.monotonic() - _first_lookup[0] >= 6
+                return type("Run", (), {
+                    "state": "finished" if finished else "running",
+                    "summary_metrics": {"loss": 0.25},
+                })()
+    """)
+    source = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.2,
+        timeout_seconds=10,
+    )
+    assert run_extractor(make_trial_context(tmp_path), source) == 0.25
+
+
 @pytest.mark.parametrize(
     ("server", "unreadable"),
     [("refused", True), ("denied", True), ("failed-run", False), ("deleted-run", False)],
@@ -852,13 +880,14 @@ def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monk
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
-def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
-    """SDK success after the deadline remains a timeout."""
+def test_wandb_late_lookup_answer_is_kept_but_no_lookup_starts_late(monkeypatch, stage):
+    """A lookup answered after the polling deadline is used; none starts once it has passed."""
     public = pytest.importorskip("wandb.apis.public")
     from phasesweep.evidence.wandb import WandbPollTimeout
 
     clock = ManualClock()
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", clock.monotonic)
+    lookups = []
 
     class Api:
         def __init__(self, **kwargs):
@@ -866,12 +895,17 @@ def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
                 clock.now = 2.0
 
         def run(self, path):
+            lookups.append(path)
             clock.now = 2.0
             return SimpleNamespace(state="finished", summary_metrics={"loss": 0.2})
 
     monkeypatch.setattr(public, "Api", Api)
-    with pytest.raises(WandbPollTimeout):
-        _wandb_poll(required_keys=["loss"])
+    if stage == "constructor":
+        with pytest.raises(WandbPollTimeout):
+            _wandb_poll(required_keys=["loss"])
+        assert lookups == []
+    else:
+        assert _wandb_poll(required_keys=["loss"])["values"] == {"loss": 0.2}
 
 
 def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_path, monkeypatch):

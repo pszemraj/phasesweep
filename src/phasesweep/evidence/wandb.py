@@ -31,6 +31,9 @@ _FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
+# A summary poll stops this long before its deadline: a lookup still in flight then is bounded by
+# its one-second client timeout, and the report follows it.
+_REPORT_SECONDS = 2.0
 
 
 @dataclass(eq=False)
@@ -485,7 +488,8 @@ def _poll_wandb_summary(
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
 
-    A finished summary may still gain values while the public API catches up,
+    No lookup starts after the deadline, but the answer to one in flight is used. A finished
+    summary may still gain values while the public API catches up,
     so missing required keys are polled for ``_FINISH_SETTLE_SECONDS`` from the
     first finished read that lacked them; once that window passes before the
     deadline, the latest finished summary's missing and available keys are
@@ -553,10 +557,10 @@ def _poll_wandb_summary(
                     WandbRunMissingError(run_id) if reached else RuntimeError(_error_detail(exc))
                 )
             else:
+                # An answer in hand is used even when it arrived after the polling deadline:
+                # the reserve before the supervisor's deadline exists to report it.
                 last_error = None
                 reached = True
-                if time.monotonic() >= deadline:
-                    break
                 if run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
@@ -568,14 +572,11 @@ def _poll_wandb_summary(
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
-                        capture: dict[str, Any] = {
+                        return {
                             "values": values,
                             "present_keys": sorted(key for key in presence_keys if key in summary),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
-                        if time.monotonic() >= deadline:
-                            break
-                        return capture
                     missing = sorted(key for key in required if key not in summary)
                     available = sorted(summary)
                     missing_keys = WandbMissingKeysError(run_id, missing, available)
@@ -684,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
             # Stop polling early enough that a lookup in flight and the report of a missing run,
             # missing keys or a timeout finish before the supervisor's deadline.
             remaining = max(0.0, request["deadline"] - time.monotonic())
-            request["deadline"] -= report_reserve(remaining)
+            request["deadline"] -= report_reserve(remaining, _REPORT_SECONDS)
             response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}

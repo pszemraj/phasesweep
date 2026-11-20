@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     )
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
+# Once polling stops, a capture still reads every selected metric's history and the run again,
+# each an SDK request with its own retries, before it reports.
+_REPORT_SECONDS = 5.0
 # Worker response statuses; "unavailable" reports a request the tracker gave no answer to,
 # "unknown" a creation that may have taken effect, and "objective_missing" a finished managed
 # run without the configured objective metric.
@@ -570,7 +573,7 @@ def _find(client: _SdkClient, request: FindRequest) -> FindResult:
     """
     experiment_id = _resolve(client, request["settings"])
     identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
-    reserve = report_reserve(request["settings"]["timeout_seconds"])
+    reserve = report_reserve(request["settings"]["timeout_seconds"], _REPORT_SECONDS)
     stop = request["timeout_at"] - reserve
     while True:
         run = _identity_run(client, identity)
@@ -630,7 +633,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     binding, query = request["binding"], request["query"]
     # Stop just before timeout_at, a shared monotonic instant, so the worker can report
     # the run's state; a nearer phase or run deadline still stops it first.
-    reserve = report_reserve(request["settings"]["timeout_seconds"])
+    reserve = report_reserve(request["settings"]["timeout_seconds"], _REPORT_SECONDS)
     stop = request["timeout_at"] - reserve
     while True:
         run = client.get_run(binding["run_id"])

@@ -31,21 +31,20 @@ if TYPE_CHECKING:
 # Workers run SDK clients on the orchestrator's behalf, so its usage-telemetry
 # opt-outs apply even when the composed trainer environment omits them.
 _TELEMETRY_OPT_OUTS = ("DO_NOT_TRACK", "MLFLOW_DISABLE_TELEMETRY")
-# Time a polling worker keeps for its last request and its report before the supervisor stops it.
-_REPORT_SECONDS = 5.0
 
 
-def report_reserve(budget_seconds: float) -> float:
+def report_reserve(budget_seconds: float, report_seconds: float) -> float:
     """Return how long before its deadline a polling worker stops polling.
 
-    A request still in flight at that point and the response that reports it finish before the
-    supervisor stops the worker, so a missing run or an unfinished one is reported as such
-    instead of surfacing as a timeout.
+    The requests still to come after polling stops, and the response that reports them, finish
+    before the supervisor stops the worker, so a missing run or an unfinished one is reported as
+    such instead of surfacing as a timeout. An answer that arrives in the reserve is still used.
 
     :param float budget_seconds: Time the worker has to poll and report.
+    :param float report_seconds: Time the backend's last requests and report need.
     :return float: The reserve, at most half the budget so a short budget still polls.
     """
-    return min(_REPORT_SECONDS, budget_seconds / 2)
+    return min(report_seconds, budget_seconds / 2)
 
 
 def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
