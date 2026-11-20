@@ -87,6 +87,7 @@ from phasesweep.mcp.registry import (
     RegisteredExperiment,
     Registry,
     VisibleParamsPolicy,
+    without_launch,
 )
 from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
@@ -554,7 +555,7 @@ class PhaseSweepMCP:
         experiments = registry.summaries()
         if refusal is not None:
             for experiment in experiments:
-                experiment["capabilities"]["launch"] = False
+                experiment["capabilities"] = without_launch(experiment["capabilities"])
         total_count = len(experiments)
         page = experiments[offset : offset + limit]
         next_offset = offset + len(page)
@@ -638,7 +639,9 @@ class PhaseSweepMCP:
         return {
             "experiment_id": reg.id,
             "metric": reg.metric_payload,
-            "capabilities": {**reg.capabilities, "launch": reg.allow_launch and refusal is None},
+            "capabilities": (
+                reg.capabilities if refusal is None else without_launch(reg.capabilities)
+            ),
             "phases": phases,
             "catalog_status": self._catalog_status(),
         }

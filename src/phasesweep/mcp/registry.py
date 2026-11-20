@@ -189,12 +189,25 @@ class RegisteredExperiment:
 
     @property
     def capabilities(self) -> dict[str, bool]:
-        """Return the agent-visible catalog permissions for this experiment."""
+        """Return the agent-visible catalog permissions for this experiment.
+
+        ``from_phase`` is an option of a launch, so it is false whenever ``launch`` is.
+        """
         return {
             "launch": self.allow_launch,
             "cancel": self.allow_cancel,
-            "from_phase": self.allow_from_phase,
+            "from_phase": self.allow_launch and self.allow_from_phase,
         }
+
+
+def without_launch(capabilities: dict[str, bool]) -> dict[str, bool]:
+    """Clear what a server that refuses every launch cannot offer.
+
+    :param dict[str, bool] capabilities: An experiment's catalog permissions.
+    :return dict[str, bool]: The same permissions with ``launch`` and its ``from_phase``
+        option false; ``cancel`` stays, since it covers runs launched earlier.
+    """
+    return {**capabilities, "launch": False, "from_phase": False}
 
 
 def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:

@@ -164,8 +164,12 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
 
     assert _listed_ids(app) == ["srv"]
     listed = app.list_experiments()
-    assert listed["experiments"][0]["capabilities"]["launch"] is False
-    assert listed["experiments"][0]["capabilities"]["cancel"] is True
+    # A refused launch takes its from_phase option with it; cancel still covers the live run.
+    assert listed["experiments"][0]["capabilities"] == {
+        "launch": False,
+        "cancel": True,
+        "from_phase": False,
+    }
     catalog_status = listed["catalog_status"]
     assert catalog_status["stale"] is True
     assert catalog_status["reload_refusal"] == "invalid"
@@ -188,8 +192,11 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
         inspected = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
         assert not inspected.isError
         assert inspected.structuredContent["experiment_id"] == "srv"
-        assert inspected.structuredContent["capabilities"]["launch"] is False
-        assert inspected.structuredContent["capabilities"]["cancel"] is True
+        assert inspected.structuredContent["capabilities"] == {
+            "launch": False,
+            "cancel": True,
+            "from_phase": False,
+        }
     with pytest.raises(CatalogReloadRefusedError, match=REFUSALS[damage]) as excinfo:
         app.launch("srv")
     refused = call_mcp_tool(app, TOOL_LAUNCH_RUN, {"experiment_id": "srv"})
