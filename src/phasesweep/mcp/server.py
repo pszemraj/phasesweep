@@ -50,6 +50,7 @@ from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
     TOOL_EXPLAIN_CONFIG,
+    TOOL_GET_GUIDE,
     TOOL_GET_LATEST_RUN,
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
@@ -74,7 +75,22 @@ SAFE_NAME_JSON_PATTERN = SAFE_NAME_PATTERN.pattern
 CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
+# A client puts these instructions into every session the server is connected to, whether or
+# not a tool is used, and some show only the first line, cut at 250 characters. They are
+# therefore one short line holding what an agent needs before it touches PhaseSweep; the
+# workflow rules load on demand through get_guide.
+SERVER_INSTRUCTIONS = (
+    "PhaseSweep runs hyperparameter sweeps on this machine. "
+    "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
+    "PhaseSweep or offer it as an option otherwise. "
+    f"Call {TOOL_GET_GUIDE} before any other PhaseSweep tool."
+)
 
+DESCRIPTION_GET_GUIDE = (
+    "Return the rules for using the PhaseSweep tools: when to launch or cancel, how to monitor "
+    "a run, when to stop for the operator, and what to report with results. Call it once, before "
+    "any other PhaseSweep tool. Read-only: it reads no catalog and needs no experiment id."
+)
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call this first for "
     "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
@@ -250,6 +266,12 @@ class _ToolPayload(BaseModel):
     """Strict base for structured MCP tool results."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class GetGuideResult(_ToolPayload):
+    """Structured output for get_guide."""
+
+    guide: str = Field(description="The workflow rules, as numbered Markdown paragraphs.")
 
 
 class CapabilitiesPayload(_ToolPayload):
@@ -871,8 +893,15 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("phasesweep", instructions=agent_prompt_text())
+    mcp = FastMCP("phasesweep", instructions=SERVER_INSTRUCTIONS)
     mcp._mcp_server.version = __version__
+
+    def get_guide() -> GetGuideResult:
+        """Return the packaged workflow rules.
+
+        :return GetGuideResult: The text the ``phasesweep_run_and_monitor`` prompt also serves.
+        """
+        return GetGuideResult(guide=agent_prompt_text())
 
     async def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
@@ -970,6 +999,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
     registrations: tuple[tuple[Callable[..., object], str, str, ToolAnnotations], ...] = (
+        (get_guide, TOOL_GET_GUIDE, DESCRIPTION_GET_GUIDE, _tool_annotations("Get Guide")),
         (
             list_experiments,
             TOOL_LIST_EXPERIMENTS,
@@ -1054,7 +1084,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
     )
     def run_and_monitor_prompt() -> str:
-        """Return safe agent instructions for the normal MCP sweep workflow.
+        """Return the packaged workflow rules, the text ``get_guide`` also serves.
 
         :return str: Prompt text.
         """
@@ -1106,7 +1136,7 @@ def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the nine tools over stdio.
+    """Load the catalog, build the run store, and serve the tools over stdio.
 
     The tools reread the catalog when it or a listed config changes; the run store
     stays on the ``state_dir`` loaded here.

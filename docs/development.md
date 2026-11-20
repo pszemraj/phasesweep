@@ -151,7 +151,7 @@ Versions already uploaded to PyPI cannot be replaced; duplicate uploads fail vis
 - `phasesweep.cli`: Click command surface.
 - `phasesweep.errors`: the shared operator-facing error taxonomy and the operator steps behind the `fix:` lines.
 - `phasesweep.examples`: the toy trainers `fake_train` and `mlflow_train` that the templates and examples run.
-- Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (served to MCP clients).
+- Packaged data: `templates/` (the `init` templates), `config_reference.yaml` (parsed by `config/reference.py`, which expands its shared blocks into every key path for `explain`, `explain_config`, typo suggestions and validation hints), and `mcp/agent_prompt.md` (the workflow rules that the MCP `get_guide` tool and `phasesweep_run_and_monitor` prompt return).
 
 The configuration reference is written by hand. `tests/test_config_reference.py` compares its expanded key paths, variants, types and defaults with the schema. It does not validate prose about bounds, units or interactions.
 
