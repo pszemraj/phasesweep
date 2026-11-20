@@ -390,12 +390,17 @@ def _claim_catalog_entry_identity(
 
 @dataclass(frozen=True)
 class CatalogCheckEntry:
-    """Operator-facing validation verdict for one catalog entry."""
+    """Operator-facing validation verdict for one catalog entry.
+
+    ``cwd`` is the resolved directory the entry's runner and trainer start in; it is set
+    for entries that loaded.
+    """
 
     experiment_id: str
     error: str | None = None
     suggestion: str | None = None
     actions: tuple[str, ...] = ()
+    cwd: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -467,7 +472,7 @@ def _load_catalog_entries(
                 )
                 if allowed
             )
-            verdicts.append(CatalogCheckEntry(entry.id, actions=actions))
+            verdicts.append(CatalogCheckEntry(entry.id, actions=actions, cwd=registered.cwd))
     return items, tuple(verdicts)
 
 

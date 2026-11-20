@@ -1344,7 +1344,8 @@ def mcp_check(ctx: click.Context, catalog: Path) -> None:
 def _echo_catalog_report(report: CatalogCheckReport) -> None:
     """Print a per-experiment ok/FAIL table for an MCP catalog check.
 
-    Operator-facing: messages and suggestions may include paths.
+    Operator-facing: messages and suggestions may include paths. Each ok line ends with the
+    directory that entry's runner starts in.
 
     :param CatalogCheckReport report: Collected per-entry catalog verdicts.
     """
@@ -1352,7 +1353,7 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     for entry in report.entries:
         if entry.ok:
             actions = f"({', '.join(entry.actions)})" if entry.actions else "(read-only)"
-            click.echo(f"{entry.experiment_id:<{width}}  ok    {actions}")
+            click.echo(f"{entry.experiment_id:<{width}}  ok    {actions}  cwd {entry.cwd}")
             continue
         message = (entry.error or "").removeprefix(f"{entry.experiment_id!r}: ")
         click.echo(f"{entry.experiment_id:<{width}}  FAIL  {message}")

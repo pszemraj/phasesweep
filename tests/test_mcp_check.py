@@ -38,6 +38,7 @@ def test_check_catalog_reports_every_entry_ok(tmp_path: Path) -> None:
     assert report.ok
     assert [entry.experiment_id for entry in report.entries] == ["alpha", "beta"]
     assert all(entry.actions == ("launch", "cancel") for entry in report.entries)
+    assert all(entry.cwd == tmp_path.resolve() for entry in report.entries)
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
     Registry.load(catalog)
@@ -330,6 +331,7 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny" in ok_result.output
     assert "ok" in ok_result.output
     assert "(launch)" in ok_result.output
+    assert f"cwd {tmp_path.resolve()}" in ok_result.output
     assert (tmp_path / "state" / "runs").is_dir()
     assert (tmp_path / "state" / "logs").is_dir()
 

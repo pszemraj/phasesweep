@@ -38,19 +38,17 @@ def derive_experiment_id(config: Path) -> str:
     return derived
 
 
-def _catalog_relative_config(config: Path, catalog_dir: Path) -> str:
-    """Render a config path for the catalog, relative to the catalog when possible.
+def _path_beneath_catalog(config: Path, catalog_dir: Path) -> Path | None:
+    """Locate a config under the catalog's directory.
 
     :param Path config: Experiment config being cataloged.
     :param Path catalog_dir: Directory the catalog file will live in.
-    :return str: ``./``-prefixed relative path for configs under the catalog directory, otherwise the absolute path.
+    :return Path | None: Config path relative to ``catalog_dir``, or ``None`` when the config sits elsewhere.
     """
-    resolved = config.resolve()
     try:
-        relative = resolved.relative_to(catalog_dir)
+        return config.resolve().relative_to(catalog_dir)
     except ValueError:
-        return str(resolved)
-    return f"./{relative}"
+        return None
 
 
 def _yaml_string_scalar(value: str | Path) -> str:
@@ -87,15 +85,29 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             )
         seen[experiment_id] = config
         experiment_id_scalar = _yaml_string_scalar(experiment_id)
-        config_path = _yaml_string_scalar(_catalog_relative_config(config, catalog_dir))
+        beneath = _path_beneath_catalog(config, catalog_dir)
+        if beneath is None:
+            # A project outside the catalog's directory keeps the registry's default, its own directory.
+            config_ref = str(config.resolve())
+            cwd_line = (
+                "# cwd unset: the detached runner starts in the config's directory "
+                "(the trainer too, unless execution.cwd is set)"
+            )
+        else:
+            config_ref = f"./{beneath}"
+            cwd_line = (
+                'cwd: "."                     # detached runner cwd, relative to this catalog; '
+                "the trainer's only when execution.cwd is unset"
+            )
+        config_path = _yaml_string_scalar(config_ref)
         entries.append(
             f"""\
   - id: {experiment_id_scalar}          # catalog experiment identifier for inspection and launch
     config: {config_path}   # resolved relative to this catalog file
-    cwd: "."                     # detached runner cwd, relative to this catalog; the trainer's only when execution.cwd is unset
+    {cwd_line}
     # description: "Human-curated one-line purpose shown to the agent"
     visible_params: none        # winner values return <redacted>; set all, or list the keys to expose
-    # Side effects default to false. Uncomment deliberately to let the agent act:
+    # Side effects default to false. Uncomment to let the agent act:
     # allow:
     #   launch: true
     #   cancel: true
@@ -112,8 +124,7 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     state_dir = root / "mcp" / digest
     catalog_arg = shlex.quote(str(output.resolve()))
     header = f"""\
-# MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the
-# descriptions, paths, visibility, and permissions below, run:
+# MCP catalog scaffolded by `phasesweep mcp init-catalog`. Edit the entries, then run:
 #   phasesweep mcp check --catalog {catalog_arg}
 # Then configure your MCP client to run the absolute `phasesweep-mcp` executable
 # with `--catalog` and this absolute catalog path.

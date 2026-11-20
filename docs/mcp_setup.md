@@ -24,7 +24,7 @@ Before cataloging a source-checkout trainer, follow the [trainer environment pre
 phasesweep mcp init-catalog --from ./starter.yaml
 ```
 
-The command writes `catalog.yaml`, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog. Each entry takes its `id` from the config file name, sets `cwd: "."` (the catalog's directory, and the trainer's while `execution.cwd` is unset) and `visible_params: none`, and leaves `description` and the `allow` block commented out, so it is read-only until you grant permissions.
+The command writes `catalog.yaml`, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog. Each entry takes its `id` from the config file name, sets `visible_params: none`, and leaves `description` and the `allow` block commented out, so it is read-only until you grant permissions. A config beneath the catalog's directory is written as a relative path with `cwd: "."` (the catalog's directory, and the trainer's while `execution.cwd` is unset). A config elsewhere is written as an absolute path with no `cwd`, so the entry starts in that config's own directory.
 
 The scaffold records an absolute `state_dir` under `PHASESWEEP_HOME/mcp/<catalog-digest>`, or `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>` when unset; later environment changes do not move it. A missing absolute `PHASESWEEP_HOME` is created mode 0700; relative paths, symlink components and existing directories with another mode are refused. To place state elsewhere, edit `state_dir`. It must be writable by each participating shell, including sandboxes. Give the server and `phasesweep mcp call` the same catalog, and `recover-run` the same `--state-dir`; see [state ownership and format rules](mcp.md#fresh-mcp-state).
 
@@ -37,7 +37,7 @@ Validate the reviewed catalog with its absolute path:
 phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 ```
 
-This exercises server startup validation and provisions/probes its private state layout without launching a sweep. It prints one line per entry, `ok` with the actions it grants or `(read-only)`, or `FAIL` with the reason and, when one applies, a `fix:` line, and exits 0 only when every entry loads.
+This exercises server startup validation and provisions/probes its private state layout without launching a sweep. It prints one line per entry, `ok` with the actions it grants or `(read-only)` and the `cwd` its detached runner starts in, or `FAIL` with the reason and, when one applies, a `fix:` line, and exits 0 only when every entry loads.
 
 ### 3. Configure your client
 

@@ -87,6 +87,34 @@ def test_init_catalog_pins_runner_cwd_to_catalog_directory(tmp_path: Path) -> No
     assert f"phasesweep mcp check --catalog {output}" in text
 
 
+def test_init_catalog_leaves_cwd_to_each_config_outside_the_catalog_directory(
+    tmp_path: Path,
+) -> None:
+    """A catalog kept apart from its projects must not start their trainers in its own directory."""
+    projects = [tmp_path / "projects" / name for name in ("alpha", "beta")]
+    configs = []
+    for project in projects:
+        project.mkdir(parents=True)
+        configs.append(_write_config(project, f"{project.name}.yaml", name=project.name))
+    catalogs = tmp_path / "catalogs"
+    catalogs.mkdir()
+    output = catalogs / "catalog.yaml"
+
+    result = CliRunner().invoke(
+        cli_main,
+        ["mcp", "init-catalog", "-o", str(output)]
+        + [arg for config in configs for arg in ("--from", str(config))],
+    )
+
+    assert result.exit_code == 0, result.output
+    text = output.read_text()
+    assert "\n    cwd:" not in text
+    assert text.count("# cwd unset: the detached runner starts in the config's directory") == 2
+    registry = Registry.load(output)
+    for project in projects:
+        assert registry.get(project.name).cwd == project.resolve()
+
+
 def test_init_catalog_honors_umask(tmp_path: Path) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "project" / "catalog.yaml"
