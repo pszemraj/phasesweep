@@ -935,22 +935,26 @@ _WinnerDumper.add_representer(float, _WinnerDumper.represent_float)
 
 
 def _param_text(value: JsonValue) -> str:
-    """Format one sampled param using the shared float display precision.
+    """Format one sampled param for a trial table, floats to four significant digits.
+
+    The exact value stays in ``trials.csv`` and ``winner.yaml``; the table is for reading.
 
     :param JsonValue value: The recorded param value.
     :return str: Terminal text for the value.
     """
     if isinstance(value, float):
-        return _display_float(value)
+        return f"{value:.4g}"
     return str(value)
 
 
-def _trial_cell(value: JsonValue) -> str:
+def _trial_cell(value: JsonValue, column: str) -> str:
     """Format one trial-table cell for the terminal.
 
-    All floats use the shared display precision; a missing value prints as ``-``.
+    Params print floats to four significant digits and ``duration_s`` to one decimal place;
+    every other float uses the shared display precision. A missing value prints as ``-``.
 
     :param JsonValue value: The row's value for that column.
+    :param str column: Header of the column the value sits in.
     :return str: Terminal text for the cell.
     """
     if value is None:
@@ -958,7 +962,7 @@ def _trial_cell(value: JsonValue) -> str:
     if isinstance(value, dict):
         return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
     if isinstance(value, float):
-        return _display_float(value)
+        return f"{value:.1f}" if column == "duration_s" else _display_float(value)
     return str(value)
 
 
@@ -988,7 +992,7 @@ def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str
     :param Sequence[JsonObject] rows: Rows to display, with every named column present.
     :return list[str]: The header line followed by one line per row, without trailing spaces.
     """
-    cells = [[_trial_cell(row[column]) for column in columns] for row in rows]
+    cells = [[_trial_cell(row[column], column) for column in columns] for row in rows]
     widths = [
         max(len(column), *(len(row[index]) for row in cells))
         for index, column in enumerate(columns)
