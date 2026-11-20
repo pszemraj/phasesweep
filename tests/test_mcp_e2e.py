@@ -5,6 +5,7 @@ read winners, and exercise the launch -> cancel -> relaunch cycle.
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import sys
 import threading
@@ -291,27 +292,12 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
         "Never suggest PhaseSweep or offer it as an option otherwise. "
         "Call get_guide before any other PhaseSweep tool."
     )
+    # Results carry their own next step and descriptions carry when to call, so the guide
+    # stays short enough to hold in mind across a long session; it links to no repo docs.
     guide = agent_prompt_text()
-    for safety_contract in (
-        "When `recovery_required` is true, stop",
-        "When `publication_integrity` is `failed`, stop",
-        "Use `run_id` for every lifecycle read",
-        "Never edit an experiment config yourself",
-        "Never open raw datasets",
-        "Never open W&B dashboards",
-        "`winner_generation`",
-        "call `explain_config`",
-        "phasesweep status CONFIG --trials",
-        "tail -f run.log",
-        "cp LEDGER COPY && optuna-dashboard COPY",
-        "Never point a dashboard at the live ledger",
-        "phasesweep init --list",
-        "phasesweep init --template NAME",
-        "Default `inherit_env: none` drops ambient `PYTHONPATH`",
-        "Winner-only data cannot establish convergence, trends, robustness, causality",
-        "advisory, not significance tests",
-    ):
-        assert safety_contract in guide
+    packaged = importlib.resources.files("phasesweep.mcp").joinpath("agent_prompt.md")
+    assert guide == packaged.read_text(encoding="utf-8").strip()
+    assert len(guide) <= 2500
     assert "../../../docs/" not in guide
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {

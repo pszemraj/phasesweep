@@ -58,7 +58,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Tool workflow
 
-The server's MCP instructions are one line: use these tools only when the user asks for PhaseSweep in the conversation, never suggest it otherwise, and call `get_guide` first. `get_guide` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
+The server's MCP instructions are one line: use these tools only when the user asks for PhaseSweep in the conversation, never suggest it otherwise, and call `get_guide` first. `get_guide` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It is five short paragraphs: who owns the catalog and configs, the call loop, when to stop, what to report with a winner, and where per-trial data lives. Each tool's description says when to call that tool, and a response in a state where the agent must stop carries a `failure`, or for the catalog `catalog_status`, whose `remediation` says what the operator or user does.
 
 Catalog operations use an experiment ID, except `explain_config`:
 
@@ -182,7 +182,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, heartbeat, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials`; tools do not return raw logs, and agents need separate authorization to open them.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, heartbeat, and recovery sidecars under `state_dir/logs/`. This control-process log is separate from trainer logs and the engine's `run.log` in the experiment workdir. Operators can [follow progress](runtime.md#following-a-run) or run `phasesweep status CONFIG --trials`; tools do not return raw logs, and the guide points an agent with a shell on the host to these CLI reads when the user asks for per-trial data.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 

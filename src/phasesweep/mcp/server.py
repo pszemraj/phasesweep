@@ -77,7 +77,7 @@ CATALOG_RESOURCE_URI = "phasesweep://catalog"
 PROMPT_RUN_AND_MONITOR = "phasesweep_run_and_monitor"
 
 # Clients may load this into every session and may show only its first line, cut at 250
-# characters, so it is one short line; the workflow rules load on demand through get_guide.
+# characters, so it is one short line; the guide loads on demand through get_guide.
 SERVER_INSTRUCTIONS = (
     "PhaseSweep runs hyperparameter sweeps on the MCP server host. "
     "Use these tools only when the user asks for PhaseSweep in this conversation. Never suggest "
@@ -86,9 +86,9 @@ SERVER_INSTRUCTIONS = (
 )
 
 DESCRIPTION_GET_GUIDE = (
-    "Return the rules for using the PhaseSweep tools: when to launch or cancel, how to monitor "
-    "a run, when to stop for the operator, and what to report with results. Call it once, before "
-    "any other PhaseSweep tool."
+    "Return the PhaseSweep guide: who owns the catalog and configs, the call loop, when to stop, "
+    "what to report with a winner, and where per-trial data lives. Call it once, before any "
+    "other PhaseSweep tool."
 )
 DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call it after get_guide "
@@ -883,7 +883,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
     mcp._mcp_server.version = __version__
 
     def get_guide() -> str:
-        """Return the packaged workflow rules.
+        """Return the packaged agent guide.
 
         :return str: The guide text.
         """
@@ -1078,7 +1078,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         description="Safe workflow for launching, monitoring, and summarizing a phasesweep run.",
     )
     def run_and_monitor_prompt() -> str:
-        """Return the packaged workflow rules.
+        """Return the packaged agent guide.
 
         :return str: Prompt text.
         """

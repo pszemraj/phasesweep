@@ -14,7 +14,7 @@ MCP_EXTRA_INSTALL_COMMAND = 'pip install "phasesweep[mcp]"'
 
 @functools.cache
 def agent_prompt_text() -> str:
-    """Return the packaged workflow rules for agents using the MCP tools.
+    """Return the packaged guide for agents using the MCP tools.
 
     The ``get_guide`` tool and the ``phasesweep_run_and_monitor`` prompt both serve this text.
 
