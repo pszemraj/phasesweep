@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import phasesweep.mcp.errors as mcp_errors
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.tools as mcp_tools
 from phasesweep.engine.errors import StudyStorageUnavailableError
@@ -191,10 +192,12 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
 )
 def test_cancel_requires_catalog_and_launch_time_permission(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     catalog_allows_cancel: bool,
     run_allows_cancel: bool,
 ) -> None:
     """Cancellation remains denied when either authority source forbids it."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: True)
     config = write_srv_config(tmp_path)
     allowed = ALLOW_SIDE_EFFECTS
     if not catalog_allows_cancel:
@@ -234,6 +237,36 @@ def test_cancel_refusal_for_a_dead_runner_names_recovery_not_a_signal(tmp_path: 
     assert "kill -TERM" not in message
     assert f"phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}" in message
     assert app.status(run_id=run_id)["run"]["recovery_required"] is True
+
+
+def test_cancel_refusal_gives_no_pid_number_from_a_container_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server in a nested PID namespace finds the runner by run id, since its numbers name other processes on the host."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: False)
+    config = write_srv_config(tmp_path)
+    app, registry, store = make_mcp_app(
+        write_srv_catalog(
+            tmp_path,
+            config,
+            allow={"launch": True, "cancel": False, "from_phase": True},
+        )
+    )
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id="srv-denied-nested",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+    )
+    store.create(handle)
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(handle.run_id)
+
+    message = str(denied.value)
+    assert f"run `pgrep -af {handle.run_id}` from a host shell" in message
+    assert str(handle.pid) not in message
+    assert str(handle.pgid) not in message
 
 
 @pytest.mark.parametrize("runner", ["foreign_namespace", "finished"])
@@ -350,12 +383,19 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    ("runner_group_gone", "status_cleanup_confirmed", "preexisting_marker", "check_launch_gate"),
+    (
+        "runner_group_gone",
+        "status_cleanup_confirmed",
+        "preexisting_marker",
+        "check_launch_gate",
+        "initial_namespace",
+    ),
     [
-        pytest.param(False, None, False, True, id="runner-group-still-live"),
-        pytest.param(True, None, False, True, id="forced-runner-kill-without-status"),
-        pytest.param(True, False, False, False, id="runner-status-cleanup-unconfirmed"),
-        pytest.param(True, True, True, False, id="runner-status-cleanup-confirmed"),
+        pytest.param(False, None, False, True, True, id="runner-group-still-live"),
+        pytest.param(False, None, False, True, False, id="runner-group-still-live-in-container"),
+        pytest.param(True, None, False, True, True, id="forced-runner-kill-without-status"),
+        pytest.param(True, False, False, False, True, id="runner-status-cleanup-unconfirmed"),
+        pytest.param(True, True, True, False, True, id="runner-status-cleanup-confirmed"),
     ],
 )
 def test_cancel_cleanup_confirmation_policy(
@@ -365,8 +405,10 @@ def test_cancel_cleanup_confirmation_policy(
     status_cleanup_confirmed: bool | None,
     preexisting_marker: bool,
     check_launch_gate: bool,
+    initial_namespace: bool,
 ) -> None:
     """Cancellation confirms cleanup or reserves it with a static remedy every reader retains."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: initial_namespace)
     config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-cancel-policy"
@@ -412,7 +454,12 @@ def test_cancel_cleanup_confirmation_policy(
     if not runner_group_gone:
         failure = json.loads(store.cleanup_uncertain_path(run_id).read_text())["failure"]
         remedy = failure["remediation"]
-        assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
+        if initial_namespace:
+            assert f"runner PID {handle.pid} (process group {handle.pgid})" in remedy
+        else:
+            assert f"`pgrep -af {run_id}` from a host shell" in remedy
+            assert str(handle.pid) not in remedy
+            assert str(handle.pgid) not in remedy
         assert "is still running on the host, clear the cause there" in remedy
         assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in remedy
         assert "cancel_run" not in remedy

@@ -10,6 +10,7 @@ from collections.abc import Collection, Sequence
 from typing import Literal, TypeAlias
 
 from phasesweep.mcp.runs import decode_unreadable_record
+from phasesweep.runtime.reaper import in_initial_pid_namespace
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 _MAX_LISTED_UNREADABLE_RECORDS = 5
@@ -57,19 +58,43 @@ def run_log_reference(run_id: str) -> str:
     return f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`"
 
 
-def live_runner_step(pid: int | None, pgid: int | None) -> str:
+def host_runner_numbers(pid: int | None, pgid: int | None) -> tuple[int | None, int | None]:
+    """Keep a recorded PID and process group only where a host shell reads them the same.
+
+    A server in a container or sandbox records the PID numbers of its own namespace, and in
+    a host shell the same number can name an unrelated process group. Only the host's
+    initial namespace numbers its processes as the operator's shell does.
+
+    :param int | None pid: The runner's PID as this server recorded it.
+    :param int | None pgid: The runner's process group as this server recorded it.
+    :return tuple[int | None, int | None]: ``(pid, pgid)`` in the host's initial PID
+        namespace, else ``(None, None)``, which the step wording below answers by naming
+        the run for the shell to resolve.
+    """
+    return (pid, pgid) if in_initial_pid_namespace() else (None, None)
+
+
+def live_runner_step(pid: int | None, pgid: int | None, run_id: str = "<run-id>") -> str:
     """Return the host step for a runner that cancellation or recovery found still alive.
 
     ``cancel_run`` and ``recover-run`` give the operator this one step, so neither refusal
     leaves a runner that survived SIGKILL unnamed.
 
-    :param int | None pid: The runner's recorded PID.
-    :param int | None pgid: The runner's recorded process group.
-    :return str: One sentence naming the PID and process group and what to clear on the host.
+    :param int | None pid: The runner's PID when the operator's shell reads it as recorded, else ``None``.
+    :param int | None pgid: The runner's process group when the operator's shell reads it as recorded.
+    :param str run_id: The run, to find the runner by when no PID is given, defaults to ``<run-id>``.
+    :return str: One sentence naming the runner and what to clear on the host.
     """
+    if pid is not None and pgid is not None:
+        who = f"runner PID {pid} (process group {pgid})"
+    else:
+        who = (
+            f"the runner (the `runner.py --run-id {run_id}` line of `pgrep -af {run_id}` "
+            "from a host shell)"
+        )
     return (
-        f"If runner PID {pid} (process group {pgid}) is still running on the host, clear the "
-        "cause there; a process in uninterruptible I/O ignores SIGKILL until the I/O ends."
+        f"If {who} is still running on the host, clear the cause there; a process in "
+        "uninterruptible I/O ignores SIGKILL until the I/O ends."
     )
 
 
@@ -80,8 +105,8 @@ def runner_stop_step(run_id: str, pid: int | None, pgid: int | None) -> str:
     group SIGTERM ends the run ``cancelled`` with its trials cleaned up.
 
     :param str run_id: The run to stop.
-    :param int | None pid: The runner's PID when this server can probe it, else ``None``.
-    :param int | None pgid: The runner's process group when this server can probe it.
+    :param int | None pid: The runner's PID when a host shell reads it as recorded, else ``None``.
+    :param int | None pgid: The runner's process group when a host shell reads it as recorded.
     :return str: One sentence naming the host command.
     """
     if pid is not None and pgid is not None:

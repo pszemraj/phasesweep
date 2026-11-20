@@ -71,6 +71,7 @@ from phasesweep.mcp.errors import (
     StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
+    host_runner_numbers,
     live_runner_step,
     recover_run_step,
     runner_stop_step,
@@ -1505,11 +1506,14 @@ class PhaseSweepMCP:
                                 _cleanup_uncertain_payload([], run_id=handle.run_id)
                             )
                             if self._runs.runner_may_be_alive(handle, view=view):
+                                live_step = live_runner_step(
+                                    *host_runner_numbers(identity.pid, identity.pgid),
+                                    handle.run_id,
+                                )
                                 failure["remediation"] = (
                                     "Cancellation could not stop the runner; trial cleanup is "
                                     "unconfirmed. Stop monitoring and ask the operator: "
-                                    f"{live_runner_step(identity.pid, identity.pgid)} "
-                                    f"Then {recover_run_step(handle.run_id)}."
+                                    f"{live_step} Then {recover_run_step(handle.run_id)}."
                                 )
                         if observation.terminal_status is None:
                             self._runs.mark_cleanup_uncertain(handle, failure=failure)
@@ -1921,8 +1925,9 @@ class PhaseSweepMCP:
 
         :param RunHandle handle: Run whose cancellation was refused.
         :return str | None: The route, naming the runner's PID and group when this server
-            can probe them; the recovery step when the runner is gone; or ``None`` when
-            the run is not running.
+            can probe them and its numbers are the host's, else the run id to find the runner
+            by; the recovery step when the runner is gone; or ``None`` when the run is not
+            running.
         """
         view = self._runs.runner_view(handle)
         observation = self._runs.observe(handle, view=view)
@@ -1935,7 +1940,7 @@ class PhaseSweepMCP:
             if failure is not None:
                 return str(failure["remediation"])
         if view.visibility == "observable":
-            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
+            return runner_stop_step(handle.run_id, *host_runner_numbers(handle.pid, handle.pgid))
         return runner_stop_step(handle.run_id, None, None)
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
