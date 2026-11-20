@@ -2,8 +2,7 @@
 # installed in the active development environment (`pip install -e ".[dev]"`),
 # so pre-commit builds no per-hook environments, needs no network, and uses the
 # same tool versions as manual runs. Activate that environment before
-# committing or pushing; the `environment` hook stops a run started anywhere
-# else.
+# committing or pushing.
 minimum_pre_commit_version: "3.2.0"
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
@@ -11,12 +10,14 @@ default_stages: [pre-commit]
 repos:
   - repo: local
     hooks:
-      # Runs first and ends the run when it fails: outside the development
-      # environment the hooks below fail on missing imports and stubs, which
-      # hides the cause.
+      # From another environment the hooks below fail on missing imports and
+      # stubs, which hides the cause.
       - id: environment
         name: development environment
-        entry: python scripts/check_hook_environment.py
+        entry: >-
+          python -c "import importlib.util, sys;
+          sys.exit(None if importlib.util.find_spec('phasesweep') else
+          f'Is the right environment active? {sys.executable} has no phasesweep installed.')"
         language: system
         pass_filenames: false
         always_run: true

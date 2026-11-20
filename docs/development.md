@@ -52,7 +52,7 @@ pre-commit install
 | whole-suite collection | pre-commit | every commit, collecting the whole suite |
 | `mypy src` | pre-push | the whole package |
 
-The [environment hook](../scripts/check_hook_environment.py) passes when the `python` first on `PATH` finds `phasesweep` in this checkout's `src/`; it locates the package without importing it. When it fails, it names the Python it found, says that this Python has no `phasesweep` or finds it in another location, and stops the run, so a commit or push from another environment ends with that one message, not with the import and stub errors the later hooks would report.
+The development environment hook stops the run when the `python` first on `PATH` has no `phasesweep` installed, which means another environment is active.
 
 Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. The development extra pins `ruff`, `mypy` and the YAML stubs to exact versions, and [CI](../.github/workflows/ci.yml) installs those same versions, with an exact version of every other package it installs. A new release of one of them therefore cannot change what passes; the packages those depend on are not pinned. Raise the pins in `pyproject.toml` and the workflow together. When Ruff rewrites a file, stage the fix and commit again.
 
