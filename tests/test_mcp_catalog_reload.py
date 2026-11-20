@@ -37,6 +37,8 @@ from tests.mcp_helpers import (
 )
 
 LOGGER = "phasesweep.mcp.server"
+#: The refusal of a catalog whose ``broken`` entry fails, which names it and every launch.
+BROKEN_NAMED = r"catalog entry 'broken' failed to load, so this server refuses launches of every"
 
 
 def _listed_ids(app: PhaseSweepMCP) -> list[str]:
@@ -138,13 +140,20 @@ def _break_catalog(tmp_path: Path, catalog: Path, config: Path, damage: str) -> 
         )
 
 
-@pytest.mark.parametrize(
-    "damage", ["catalog_yaml", "invalid_config", "namespace_alias", "missing_config"]
-)
+#: How the refusal of each damaging edit begins: it names the entries that fail to load.
+REFUSALS = {
+    "catalog_yaml": "the catalog file does not validate, so this server refuses launches of every",
+    "invalid_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
+    "namespace_alias": "catalog entry 'alias' failed to load, so this server refuses launches of",
+    "missing_config": "catalog entry 'srv' failed to load, so this server refuses launches of every",
+}
+
+
+@pytest.mark.parametrize("damage", REFUSALS)
 def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, damage: str
 ) -> None:
-    """Reads serve the last valid catalog, launch refuses path-free, and the refusal logs once."""
+    """Reads serve the last valid catalog, launch refuses path-free naming the failed entries, and the refusal logs once."""
     caplog.set_level(logging.INFO, logger=LOGGER)
     config, app, _registry, store = side_effect_app(tmp_path)
     catalog = tmp_path / "srv.catalog.yaml"
@@ -160,6 +169,7 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     catalog_status = listed["catalog_status"]
     assert catalog_status["stale"] is True
     assert catalog_status["reload_refusal"] == "invalid"
+    assert catalog_status["remediation"].startswith(REFUSALS[damage])
     assert "phasesweep mcp check" in catalog_status["remediation"]
     latest = app.latest_run("srv")
     assert latest["run"] is not None and latest["run"]["run_id"] == "srv-live"
@@ -169,22 +179,23 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     assert status["catalog_status"] == catalog_status
     if damage == "invalid_config":
         # The served entry no longer describes the file, so inspection refuses too.
-        with pytest.raises(CatalogReloadRefusedError, match="does not validate"):
+        with pytest.raises(CatalogReloadRefusedError, match=REFUSALS[damage]):
             app.validate("srv")
         refused_inspection = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
         assert refused_inspection.isError
-        assert "inspection of changed configs" in str(refused_inspection.content)
+        assert "inspection of a changed config" in str(refused_inspection.content)
     else:
         inspected = call_mcp_tool(app, "inspect_experiment", {"experiment_id": "srv"})
         assert not inspected.isError
         assert inspected.structuredContent["experiment_id"] == "srv"
         assert inspected.structuredContent["capabilities"]["launch"] is False
         assert inspected.structuredContent["capabilities"]["cancel"] is True
-    with pytest.raises(CatalogReloadRefusedError, match="does not validate") as excinfo:
+    with pytest.raises(CatalogReloadRefusedError, match=REFUSALS[damage]) as excinfo:
         app.launch("srv")
     refused = call_mcp_tool(app, TOOL_LAUNCH_RUN, {"experiment_id": "srv"})
     assert refused.isError
     refusal_text = " ".join(getattr(item, "text", "") for item in refused.content)
+    assert str(excinfo.value) in refusal_text
     assert "phasesweep mcp check" in refusal_text
     for message in (str(excinfo.value), refusal_text):
         assert str(tmp_path) not in message
@@ -223,13 +234,14 @@ def test_startup_with_a_failed_entry_serves_the_rest_and_refuses_launch_until_fi
     patch_popen_capture(monkeypatch)
 
     # Launch is the first call: an unchanged-looking registry would clear the refusal here.
-    with pytest.raises(CatalogReloadRefusedError, match="does not validate") as refused:
+    with pytest.raises(CatalogReloadRefusedError, match=BROKEN_NAMED) as refused:
         app.launch("srv")
     listed = app.list_experiments()
     assert _listed_ids(app) == ["srv"]
     assert listed["experiments"][0]["capabilities"]["launch"] is False
     assert listed["catalog_status"]["stale"] is True
     assert listed["catalog_status"]["reload_refusal"] == "invalid"
+    assert listed["catalog_status"]["remediation"] == str(refused.value)
     with pytest.raises(CatalogEntryInvalidError, match="failed to load") as invalid:
         app.validate("broken")
     assert call_mcp_tool(app, "inspect_experiment", {"experiment_id": "broken"}).isError
@@ -329,9 +341,13 @@ def test_concurrent_calls_share_one_reload(tmp_path: Path, monkeypatch: pytest.M
     original_load = Registry.load
     loads: list[Path] = []
 
-    def counting_load(catalog_path: Path, *, bound_state_dir: Path | None = None) -> Registry:
+    def counting_load(
+        catalog_path: Path, *, bound_state_dir: Path | None = None, collect_errors: bool = False
+    ) -> Registry:
         loads.append(catalog_path)
-        return original_load(catalog_path, bound_state_dir=bound_state_dir)
+        return original_load(
+            catalog_path, bound_state_dir=bound_state_dir, collect_errors=collect_errors
+        )
 
     monkeypatch.setattr(Registry, "load", staticmethod(counting_load))
     barrier = threading.Barrier(8)

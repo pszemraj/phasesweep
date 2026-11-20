@@ -4,8 +4,9 @@ Experiment IDs map to validated configs and absolute paths resolved at load. A s
 starts through :meth:`Registry.load` with ``collect_errors=True``, so an invalid entry
 fails alone: the entries that load are served, the failed ones are kept in
 :attr:`Registry.failures`, and launches stay refused until every entry validates. A
-running server reloads the catalog through :meth:`Registry.load`, failing fast, when
-the catalog file or a listed config changes on disk, or while any entry has failed.
+running server rereads the catalog the same way when the catalog file or a listed config
+changes on disk, or while any entry has failed, and serves the reread only when every
+entry loads. Every entry error carries the fix ``phasesweep mcp check`` prints for it.
 """
 
 from __future__ import annotations
@@ -216,7 +217,10 @@ def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
     """
     resolved = _resolve_catalog_relative_path(base, path)
     if not resolved.is_dir():
-        raise CatalogError(f"{label} is not an existing directory: {resolved}")
+        raise CatalogError(
+            f"{label} is not an existing directory: {resolved}",
+            suggestion="create that directory, or point the entry's cwd at an existing one",
+        )
     return resolved
 
 
@@ -328,20 +332,33 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
-        raise CatalogError(f"{entry.id!r}: config not found: {cfg_path}")
+        raise CatalogError(
+            f"{entry.id!r}: config not found: {cfg_path}",
+            suggestion=(
+                "point the entry's config at an existing experiment YAML file; a relative path "
+                "resolves against the catalog's directory"
+            ),
+        )
     cwd = _resolve_existing_dir(
         base,
         entry.cwd if entry.cwd is not None else cfg_path.parent,
         label=f"{entry.id!r}: cwd",
+    )
+    invalid_config_fix = (
+        f"correct the config until `phasesweep validate {shlex.quote(str(cfg_path))}` passes"
     )
     try:
         config_bytes = cfg_path.read_bytes()
         config = load_experiment_bytes(config_bytes, source=cfg_path, config_dir=cfg_path.parent)
     except ValidationError as exc:
         detail = describe_validation_error(exc)
-        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {detail}") from exc
+        raise CatalogError(
+            f"{entry.id!r}: invalid config {cfg_path}: {detail}", suggestion=invalid_config_fix
+        ) from exc
     except (ValueError, OSError) as exc:
-        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
+        raise CatalogError(
+            f"{entry.id!r}: invalid config {cfg_path}: {exc}", suggestion=invalid_config_fix
+        ) from exc
     _require_persistent_storage(entry.id, config)
     if config.execution.cwd is None:
         # Server fingerprints use the runner's effective trainer cwd.
@@ -375,13 +392,18 @@ def _claim_catalog_entry_identity(
     :param dict[str, str] storage_owners: Catalog ids keyed by Optuna study namespace.
     :raises CatalogError: If another catalog id already governs either namespace.
     """
+    one_entry_fix = (
+        "keep one catalog entry per experiment: remove one of these entries, or give its config "
+        "its own experiment name"
+    )
     namespace = _artifact_root_identity(loaded.experiment)
     other = namespace_owners.get(namespace)
     if other is not None:
         raise CatalogError(
             f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
             f"experiment output namespace ({namespace}); one engine "
-            "experiment must be governed by exactly one catalog entry."
+            "experiment must be governed by exactly one catalog entry.",
+            suggestion=one_entry_fix,
         )
     namespace_owners[namespace] = loaded.id
 
@@ -395,7 +417,8 @@ def _claim_catalog_entry_identity(
             f"catalog ids {other!r} and {loaded.id!r} resolve to the same "
             f"Optuna study namespace ({loaded.experiment.experiment!r} on "
             f"{storage_identity}); one engine experiment must be governed "
-            "by exactly one catalog entry."
+            "by exactly one catalog entry.",
+            suggestion=one_entry_fix,
         )
     storage_owners[storage_key] = loaded.id
 
@@ -463,7 +486,10 @@ def _load_catalog_entries(
     for entry in catalog.experiments:
         try:
             if entry.id in seen:
-                raise CatalogError(f"duplicate catalog id {entry.id!r}")
+                raise CatalogError(
+                    f"duplicate catalog id {entry.id!r}",
+                    suggestion="give each catalog entry its own id",
+                )
             seen.add(entry.id)
             registered = _load_entry(base, entry)
             _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)

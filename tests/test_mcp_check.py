@@ -351,6 +351,50 @@ def test_mcp_check_cli_exit_codes_and_table(tmp_path: Path) -> None:
     assert "tiny2" in fail_result.output
 
 
+def test_mcp_check_prints_a_fix_for_every_failing_entry(tmp_path: Path) -> None:
+    """Each way an entry can fail to load prints a fix: line under its FAIL line."""
+    config = tmp_path / "one.yaml"
+    config.write_text(mcp_experiment_config_text(tmp_path, name="one"))
+    broken = tmp_path / "broken.yaml"
+    broken.write_text(mcp_experiment_config_text(tmp_path, name="broken") + "bogus_key: 1\n")
+    memory = tmp_path / "memory.yaml"
+    memory.write_text(_in_memory_config(tmp_path, "memory"))
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        f"""\
+state_dir: {tmp_path}/state
+experiments:
+  - id: one
+    config: {config}
+  - id: one
+    config: {config}
+  - id: alias
+    config: {config}
+  - id: ghost
+    config: {tmp_path}/missing.yaml
+  - id: nowhere
+    config: {config}
+    cwd: {tmp_path}/missing-dir
+  - id: broken
+    config: {broken}
+  - id: memory
+    config: {memory}
+"""
+    )
+
+    report = check_catalog(catalog)
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+
+    failing = [entry for entry in report.entries if not entry.ok]
+    assert len(failing) == 6
+    assert all(entry.suggestion for entry in failing), failing
+    assert result.exit_code == 2
+    lines = result.output.splitlines()
+    fail_lines = [index for index, line in enumerate(lines) if "  FAIL  " in line]
+    assert len(fail_lines) == 6
+    assert all(lines[index + 1].lstrip().startswith("fix: ") for index in fail_lines), lines
+
+
 def test_mcp_check_cli_catalog_level_failure_exits_2(tmp_path: Path) -> None:
     runner = CliRunner()
     broken = tmp_path / "broken.yaml"

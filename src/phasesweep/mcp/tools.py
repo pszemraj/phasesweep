@@ -81,7 +81,12 @@ from phasesweep.mcp.redaction import (
     status_payload,
     winners_payload,
 )
-from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
+from phasesweep.mcp.registry import (
+    CatalogCheckEntry,
+    RegisteredExperiment,
+    Registry,
+    VisibleParamsPolicy,
+)
 from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
@@ -322,6 +327,27 @@ class _CatalogReloadRefusal:
 
     reason: CatalogReloadRefusal
     detail: str
+    failed_ids: tuple[str, ...]
+
+    @classmethod
+    def from_failures(cls, failures: Sequence[CatalogCheckEntry]) -> _CatalogReloadRefusal:
+        """Refuse launches for a catalog whose file loads but some entries do not.
+
+        :param Sequence[CatalogCheckEntry] failures: Verdicts of the entries that failed.
+        :return _CatalogReloadRefusal: An ``invalid`` refusal naming those entries.
+        """
+        return cls(
+            "invalid",
+            "; ".join(failure.error or "" for failure in failures),
+            tuple(dict.fromkeys(failure.experiment_id for failure in failures)),
+        )
+
+    def error(self) -> CatalogReloadRefusedError:
+        """Return the agent-facing tool error this refusal raises and reports.
+
+        :return CatalogReloadRefusedError: The error, naming the failed entries.
+        """
+        return CatalogReloadRefusedError(self.reason, self.failed_ids)
 
 
 class PhaseSweepMCP:
@@ -347,9 +373,7 @@ class PhaseSweepMCP:
         # A registry started with failed entries is the refused state: launches stay refused
         # until a reload validates every entry.
         self._reload_refusal: _CatalogReloadRefusal | None = (
-            _CatalogReloadRefusal("invalid", registry.failures[0].error or "")
-            if registry.failures
-            else None
+            _CatalogReloadRefusal.from_failures(registry.failures) if registry.failures else None
         )
         self._runs = runs
         self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
@@ -360,11 +384,12 @@ class PhaseSweepMCP:
         The check hashes the catalog file and every config the held registry lists. An
         unchanged catalog keeps the held registry; a registry that started with failed
         entries is never unchanged, so each call retries the reload. A changed one is
-        reloaded through :meth:`Registry.load`, failing fast and bound to this server's
-        state directory, and swapped in whole. A reload that fails keeps the held
-        registry, which reads keep serving, and returns the refusal that launch reports.
-        A reload writes nothing, and its failure never escapes this method. Each new
-        refusal and each reload is logged once for the operator, with paths.
+        reloaded through :meth:`Registry.load`, bound to this server's state directory and
+        collecting every entry's verdict so the refusal can name each failed entry, and is
+        swapped in whole only when every entry loads. A reload with any failure keeps the
+        held registry, which reads keep serving, and returns the refusal that launch
+        reports. A reload writes nothing, and its failure never escapes this method. Each
+        new refusal and each reload is logged once for the operator, with paths.
 
         :return tuple[Registry, _CatalogReloadRefusal | None]: Registry to serve, and
             the refusal of the latest reread or ``None`` when the registry is current.
@@ -379,34 +404,42 @@ class PhaseSweepMCP:
                     )
                     self._reload_refusal = None
                 return registry, None
+            error: Exception | None = None
             try:
-                reloaded = Registry.load(registry.catalog_path, bound_state_dir=self._state_dir)
+                reloaded = Registry.load(
+                    registry.catalog_path, bound_state_dir=self._state_dir, collect_errors=True
+                )
             except Exception as exc:
+                error = exc
                 refusal = _CatalogReloadRefusal(
                     "state_dir_changed" if isinstance(exc, StateDirChangedError) else "invalid",
                     str(exc) if isinstance(exc, CatalogError) else repr(exc),
+                    (),
                 )
-                if refusal != self._reload_refusal:
-                    log.warning(
-                        "catalog reload refused; reads keep the entries already loaded and "
-                        "launches are refused until %s: %s",
-                        "the MCP server restarts"
-                        if refusal.reason == "state_dir_changed"
-                        else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
-                        refusal.detail,
-                        exc_info=None if isinstance(exc, CatalogError) else exc,
+            else:
+                if not reloaded.failures:
+                    self._registry = reloaded
+                    self._reload_refusal = None
+                    log.info(
+                        "reloaded catalog %s: %d experiments, max_concurrent_runs=%d",
+                        reloaded.catalog_path,
+                        len(reloaded),
+                        reloaded.max_concurrent_runs,
                     )
-                self._reload_refusal = refusal
-                return registry, refusal
-            self._registry = reloaded
-            self._reload_refusal = None
-            log.info(
-                "reloaded catalog %s: %d experiments, max_concurrent_runs=%d",
-                reloaded.catalog_path,
-                len(reloaded),
-                reloaded.max_concurrent_runs,
-            )
-            return reloaded, None
+                    return reloaded, None
+                refusal = _CatalogReloadRefusal.from_failures(reloaded.failures)
+            if refusal != self._reload_refusal:
+                log.warning(
+                    "catalog reload refused; reads keep the entries already loaded and "
+                    "launches are refused until %s: %s",
+                    "the MCP server restarts"
+                    if refusal.reason == "state_dir_changed"
+                    else f"`phasesweep mcp check --catalog {registry.catalog_path}` passes",
+                    refusal.detail,
+                    exc_info=None if error is None or isinstance(error, CatalogError) else error,
+                )
+            self._reload_refusal = refusal
+            return registry, refusal
 
     def _serving_registry(self) -> Registry:
         """Return the registry read tools serve after the edit check.
@@ -429,9 +462,7 @@ class PhaseSweepMCP:
         return {
             "stale": refusal is not None,
             "reload_refusal": refusal.reason if refusal is not None else None,
-            "remediation": str(CatalogReloadRefusedError(refusal.reason))
-            if refusal is not None
-            else None,
+            "remediation": str(refusal.error()) if refusal is not None else None,
         }
 
     def _audit_success(
@@ -1173,7 +1204,7 @@ class PhaseSweepMCP:
         try:
             registry, refusal = self._refresh_registry()
             if refusal is not None:
-                raise CatalogReloadRefusedError(refusal.reason)
+                raise refusal.error()
             reg = registry.get(experiment_id)
             resolved["experiment_id"] = reg.id
             if not reg.allow_launch:
@@ -1574,7 +1605,7 @@ class PhaseSweepMCP:
             data = None
         if data is None or hashlib.sha256(data).hexdigest() != reg.config_sha256:
             if refusal is not None:
-                raise CatalogReloadRefusedError(refusal.reason)
+                raise refusal.error()
             raise ConfigChangedError(reg.id)
         return data
 
