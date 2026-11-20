@@ -252,7 +252,10 @@ def _validate_generation_manifest(
         )
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
-        raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
+        raise _fail(
+            f"unsupported summary schema_version {summary.get('schema_version')!r}; "
+            f"this checkout reads {GENERATION_SUMMARY_SCHEMA_VERSION}"
+        )
     metric = summary.get("metric")
     if (
         not isinstance(metric, Mapping)

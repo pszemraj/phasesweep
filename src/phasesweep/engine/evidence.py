@@ -28,6 +28,7 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
@@ -134,7 +135,12 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         )
 
     if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
-        fail("unsupported schema version")
+        raise TrialEvidenceMissingError(
+            f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence in format "
+            f"{provenance.get('schema_version')!r}; this checkout reads format "
+            f"{EVIDENCE_PROVENANCE_SCHEMA_VERSION}.",
+            action=OperatorAction.FRESH_NAMESPACE,
+        )
     extractor = provenance.get("extractor")
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")

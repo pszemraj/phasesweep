@@ -124,7 +124,10 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=f"unsupported PhaseSweep format {previous}",
+        match=(
+            f"uses PhaseSweep format {previous}; this checkout reads format "
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written"
+        ),
     ) as excinfo:
         run_experiment(experiment)
 
@@ -177,7 +180,7 @@ def test_format_refusal_guidance_matches_cli_operation(
 
     output = capsys.readouterr()
     assert code == 1
-    assert "unsupported" in output.err
+    assert "this checkout reads format" in output.err
     assert "Traceback" not in output.err
     assert tree_snapshot(materialized.root) == before
     if read_only:
@@ -190,14 +193,22 @@ def test_format_refusal_guidance_matches_cli_operation(
 
 
 @pytest.mark.parametrize(
-    "schema_version",
-    [2, None, float(STUDY_SCHEMA_VERSION), True],
+    "schema_version, shown",
+    [
+        (2, "format 2"),
+        (None, "unmarked"),
+        (float(STUDY_SCHEMA_VERSION), f"format {float(STUDY_SCHEMA_VERSION)}"),
+        (True, "format True"),
+    ],
     ids=["old-version", "unmarked", "float-version", "bool-version"],
 )
 def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
-    tmp_path: Path, schema_version: int | float | None
+    tmp_path: Path, schema_version: int | float | None, shown: str
 ) -> None:
-    """Changing experiment/workdir cannot reinterpret an old populated ledger as fresh."""
+    """An old populated ledger is refused naming its format and the one this checkout reads.
+
+    Changing experiment/workdir cannot reinterpret it as fresh.
+    """
     ledger = tmp_path / "old.journal"
     storage = f"journal:///{ledger}"
     old = optuna.create_study(
@@ -218,7 +229,10 @@ def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
 
     with pytest.raises(
         StudySchemaMismatchError,
-        match=r"old_experiment::removed_phase.*Nothing was written",
+        match=(
+            rf"'old_experiment::removed_phase' \({shown}\); "
+            rf"this checkout reads format {STUDY_SCHEMA_VERSION}\. Nothing was written"
+        ),
     ) as excinfo:
         run_experiment(experiment)
 

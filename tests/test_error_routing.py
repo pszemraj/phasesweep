@@ -29,6 +29,7 @@ from phasesweep.engine import fingerprints, guards, study_policy, trial
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.attempts import (
+    ATTEMPT_REGISTRY_SCHEMA_VERSION,
     _preflight_active_attempts,
     _PreflightCleanupReport,
 )
@@ -742,6 +743,13 @@ def _field_dropped(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
+def _previous_format(entry: Path) -> None:
+    """Stamp a registry entry with the previous registry format."""
+    payload = json.loads(entry.read_text())
+    payload["schema_version"] = ATTEMPT_REGISTRY_SCHEMA_VERSION - 1
+    entry.write_text(json.dumps(payload))
+
+
 def _locator_cleared(entry: Path) -> None:
     """Leave a journal identity without the locator recovery requires."""
     payload = json.loads(entry.read_text())
@@ -1159,6 +1167,16 @@ ORIGIN_CASES = (
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="has an unsupported or partial schema.",
+    ),
+    RoutingCase(
+        id="registry_entry_other_format",
+        trigger=_scan_registry(damage=_previous_format),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message=(
+            f"uses format {ATTEMPT_REGISTRY_SCHEMA_VERSION - 1}; "
+            f"this checkout reads format {ATTEMPT_REGISTRY_SCHEMA_VERSION}."
+        ),
     ),
     RoutingCase(
         id="registry_identity_without_locator",

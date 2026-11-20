@@ -475,6 +475,16 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             + ".",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
+    if (
+        isinstance(payload, dict)
+        and "schema_version" in payload
+        and payload["schema_version"] != ATTEMPT_REGISTRY_SCHEMA_VERSION
+    ):
+        raise ProcessCleanupUncertainError(
+            f"Attempt registry entry {entry_path} uses format {payload['schema_version']!r}; "
+            f"this checkout reads format {ATTEMPT_REGISTRY_SCHEMA_VERSION}.",
+            action=OperatorAction.RESTORE_TREE,
+        )
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
         required = {
             "schema_version",

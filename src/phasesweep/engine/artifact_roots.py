@@ -166,8 +166,9 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootSchemaMismatchError(
-            f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
-            f"format {raw.get('schema_version')!r}. Nothing was written.",
+            f"Artifact root {expected['artifact_root']!r} uses PhaseSweep "
+            f"format {raw.get('schema_version')!r}; this checkout reads format "
+            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written.",
         )
     if raw != expected:
         raise ArtifactRootConflictError(

@@ -33,6 +33,8 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
+from phasesweep.errors import OperatorAction
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
     make_experiment,
@@ -586,6 +588,29 @@ def test_present_incomplete_objective_provenance_blocks_selection(
     with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
         selected = select_winner(study, experiment, phase_name="p")
         evidence_ops._verify_winner_evidence(experiment, experiment.phases[0], selected)
+
+
+def test_provenance_in_another_format_names_both_and_routes_to_a_new_study(
+    tmp_path: Path,
+) -> None:
+    """A well-formed record in another format is refused as that format, not as malformed."""
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    trial = deepcopy(phase_trials(experiment)[0])
+    record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+    record["schema_version"] = EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1
+    trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
+    study = optuna.create_study(direction="minimize")
+    study.add_trial(trial)
+
+    with pytest.raises(TrialEvidenceMissingError) as excinfo:
+        evidence_ops._validate_selection_evidence(experiment, {"p": study})
+
+    message = str(excinfo.value)
+    assert f"in format {EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1}" in message
+    assert f"this checkout reads format {EVIDENCE_PROVENANCE_SCHEMA_VERSION}" in message
+    assert "malformed" not in message
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
 
 
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:

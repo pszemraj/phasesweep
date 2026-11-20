@@ -61,6 +61,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     _outcome_sequence_counts,
     _recovered_trial_state,
     _study_schema_supported,
@@ -634,10 +635,14 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         if not _study_schema_supported(version, has_trials)
     ]
     if unsupported:
-        detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
+        detail = ", ".join(
+            f"{name!r} ({'unmarked' if version is None else 'format ' + repr(version)})"
+            for name, version in unsupported
+        )
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
-            f"state: {detail}. Nothing was written.",
+            f"state: {detail}; this checkout reads format {STUDY_SCHEMA_VERSION}. "
+            "Nothing was written.",
         )
 
 
