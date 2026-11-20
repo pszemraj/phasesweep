@@ -653,6 +653,13 @@ def test_wandb_capture_is_unreadable_only_when_wandb_gave_no_answer(tmp_path, mo
     assert calls == 1
 
 
+# The capture budget includes the supervised worker's startup, which takes 0.5 to 0.9 s
+# from spawn to its first poll, alone or under ``pytest -n 12`` on this file. A test that
+# needs a poll before its deadline, or polling to continue past startup, gets several
+# times that so a loaded host cannot leave it without one.
+_WORKER_POLL_BUDGET_SECONDS = 6
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("answer", ["connection", "running"])
 def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tmp_path, answer):
@@ -673,7 +680,7 @@ def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tm
         project="p",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=1,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
     with pytest.raises(ExtractorError) as refused:
         run_extractor(make_trial_context(tmp_path), source)
@@ -992,7 +999,7 @@ def test_wandb_missing_summary_key_reports_available_names_after_polling(
         project="p",
         metric_key="eval_loss",
         poll_seconds=0.02,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
 
     with pytest.raises(ExtractorError) as caught:
@@ -1027,7 +1034,7 @@ def test_wandb_finished_summary_can_gain_a_required_key(wandb_worker_sdk, tmp_pa
         project="p",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
 
     assert run_extractor(make_trial_context(tmp_path), extractor) == 0.25
@@ -1790,7 +1797,7 @@ def test_wandb_missing_run_worker_names_target_and_init_overrides(
         project="project",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=2,
+        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
     )
     context = make_trial_context(tmp_path)
     with pytest.raises(ExtractorError) as refused:
