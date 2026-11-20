@@ -475,12 +475,9 @@ def _entry_removal_step(entry_path: Path) -> str:
     :return str: The process check for the attempt the entry names, then the deletion that
         lets the next run recover the attempt from its trial directory.
     """
-    return (
-        recorded_process_check(
-            f"the {PROCESS_IDENTITY_FILE} in the directory under {entry_path.parent.parent} "
-            f"whose name ends in {entry_path.stem}"
-        )
-        + "; once none is alive, delete the entry file."
+    return recorded_process_check(
+        f"the {PROCESS_IDENTITY_FILE} in the directory under {entry_path.parent.parent} "
+        f"whose name ends in {entry_path.stem}"
     )
 
 

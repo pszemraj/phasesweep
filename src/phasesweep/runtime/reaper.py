@@ -178,16 +178,20 @@ def group_members_command(pgid: str) -> str:
 
 
 def recorded_process_check(identity_location: str) -> str:
-    """Word the manual check of a recorded trial process, for a refusal's remedy.
+    """Word the manual check of a recorded trial process and the deletion it makes safe.
+
+    The recorded group number means something only where the sweep ran: from a host shell,
+    a number a container recorded names another group or none.
 
     :param str identity_location: Where the ``process_identity.json`` to read is, as a
         path or a description of the directory holding it.
-    :return str: A sentence, without its final period, naming the file to read and the
-        command that lists every member of the recorded process group.
+    :return str: The step naming the file to read, where to run the command that lists
+        every member of the recorded process group, and the entry deletion that follows.
     """
     return (
-        f"Look up pid and pgid in {identity_location} and list the members of that process "
-        f"group with {group_members_command('<pgid>')}"
+        f"Look up pgid in {identity_location} and, on the host or in the container the sweep "
+        f"ran in, list that process group's members with {group_members_command('<pgid>')}; "
+        "once it lists none, delete the entry file."
     )
 
 

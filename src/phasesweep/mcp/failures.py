@@ -277,8 +277,9 @@ def _diagnose(
             "cleanup",
             "The run succeeded and its published results are unaffected, but cleanup of "
             "its MLflow upload worker is unconfirmed. Stop monitoring and ask the operator "
-            "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG`, then "
-            f"{recover_run_step(handle.run_id)}, before another launch.",
+            "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG`, using "
+            f"the config this run launched with, then {recover_run_step(handle.run_id)}, before "
+            "another launch.",
         )
         return _Diagnosis(upload_cleanup, persisted, True)
     recorded = persisted

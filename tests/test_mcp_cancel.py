@@ -220,7 +220,7 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
         app.cancel(run_id)
     assert (
-        f"To stop this run, the operator can run `kill -TERM -- -{handle.pgid}` from a host "
+        f"To stop this run, the operator can run `kill -TERM -{handle.pgid}` from a host "
         f"shell, which signals runner PID {handle.pid} and its process group {handle.pgid}; "
         "the runner handles SIGTERM as cancellation. Do not retry."
     ) in str(denied.value)
@@ -304,8 +304,8 @@ def test_cancel_refusal_names_a_stop_route_only_it_can_give(
     else:
         assert (
             f"To stop this run, the operator can run `pgrep -af {run_id}` from a host shell, take "
-            f"the PID of its `runner.py --run-id {run_id}` line and run `kill -TERM -- -<that "
-            "PID>`, since the runner leads its own process group; the runner handles SIGTERM as "
+            f"the PID of its `runner.py --run-id {run_id}` line and run `kill -TERM -<that PID>`, "
+            "since the runner leads its own process group; the runner handles SIGTERM as "
             "cancellation. Do not retry."
         ) in message
 

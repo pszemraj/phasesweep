@@ -21,6 +21,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _generation_summary_path
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.mcp import errors as mcp_errors
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _cleanup_runner,
@@ -427,7 +428,7 @@ CASES = (
         trigger=_recover_over_malformed_registry_entry,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        message="Look up pid and pgid in the process_identity.json in the directory under",
+        message="Look up pgid in the process_identity.json in the directory under",
     ),
     RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,
@@ -599,21 +600,28 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
     ],
     ids=["inspection", "recheck", "group_survives_the_kill"],
 )
+@pytest.mark.parametrize("initial_namespace", [True, False], ids=["host", "container"])
 def test_surviving_runner_refusal_names_the_runner_and_the_host_step(
     trigger: Trigger,
     runner_is_live: bool,
+    initial_namespace: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refusing a runner that survived names its PID and process group and the step cancellation ends with."""
+    """Refusing a runner that survived names it as cancellation does, by PID and process group in the host's namespace and by run id elsewhere, with the step cancellation ends with."""
+    monkeypatch.setattr(mcp_errors, "in_initial_pid_namespace", lambda: initial_namespace)
     with pytest.raises(RunRecoveryError) as excinfo:
         trigger(tmp_path, monkeypatch)
 
     step = excinfo.value.remediation
     assert step is not None
-    assert re.search(r"runner PID \d+ \(process group \d+\)", step)
-    if runner_is_live:
-        assert f"runner PID {os.getpid()} (process group {UNUSED_RUNNER_PGID})" in step
+    if initial_namespace:
+        assert re.search(r"runner PID \d+ \(process group \d+\)", step)
+        if runner_is_live:
+            assert f"runner PID {os.getpid()} (process group {UNUSED_RUNNER_PGID})" in step
+    else:
+        assert "`runner.py --run-id wrap-recover` line of `pgrep -af wrap-recover`" in step
+        assert "runner PID" not in step
     assert ("cancel_run" in step) is runner_is_live
     assert "is still running on the host, clear the cause there" in step
     assert "uninterruptible I/O ignores SIGKILL until the I/O ends" in step

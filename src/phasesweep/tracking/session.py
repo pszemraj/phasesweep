@@ -202,8 +202,7 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
                     f"Tracking operation {operation_id} has an unreadable lifecycle record in "
                     f"{directory} ({exc}), so its worker may still be running. Its attempt "
                     f"registry entry {entry_path} is kept. "
-                    + recorded_process_check(str(directory / PROCESS_IDENTITY_FILE))
-                    + "; once none is alive, delete the entry file.",
+                    + recorded_process_check(str(directory / PROCESS_IDENTITY_FILE)),
                     action=OperatorAction.RESTORE_TREE,
                 ) from exc
             log.warning(

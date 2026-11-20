@@ -511,12 +511,9 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
     )
     assert f"Unreadable or orphaned: {listed}." in message
     assert (
-        "`pgrep -af <run-id>` on the server host for each run id and, where it lists no process "
-        "of that run, runner or trial, move `runs/<run-id>.json` and `logs/<run-id>.*` out of "
-        "the state directory"
-    ) in message
-    assert (
-        "a trial process it still lists is settled by the next run of that experiment's config"
+        "`pgrep -af <run-id>` on the server host for each run id, wait for any process of that "
+        "run it lists, runner or trial, to exit, or stop it, and then move `runs/<run-id>.json` "
+        "and `logs/<run-id>.*` out of the state directory"
     ) in message
     assert ("a listed `runs/` file moves out as it is" in message) is (run_id is None)
     assert "inspect and repair" not in message

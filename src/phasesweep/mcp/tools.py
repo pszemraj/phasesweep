@@ -71,7 +71,6 @@ from phasesweep.mcp.errors import (
     StateDirChangedError,
     UnknownExperimentError,
     UnknownRunError,
-    host_runner_numbers,
     live_runner_step,
     recover_run_step,
     runner_stop_step,
@@ -1507,8 +1506,7 @@ class PhaseSweepMCP:
                             )
                             if self._runs.runner_may_be_alive(handle, view=view):
                                 live_step = live_runner_step(
-                                    *host_runner_numbers(identity.pid, identity.pgid),
-                                    handle.run_id,
+                                    identity.pid, identity.pgid, handle.run_id
                                 )
                                 failure["remediation"] = (
                                     "Cancellation could not stop the runner; trial cleanup is "
@@ -1940,21 +1938,22 @@ class PhaseSweepMCP:
             if failure is not None:
                 return str(failure["remediation"])
         if view.visibility == "observable":
-            return runner_stop_step(handle.run_id, *host_runner_numbers(handle.pid, handle.pgid))
+            return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
         return runner_stop_step(handle.run_id, None, None)
 
     def _cancel_allowed(self, handle: RunHandle) -> bool:
         """Require both launch-time and current cancellation permission.
 
         A catalog edit may revoke permission but cannot grant it. Decataloged runs retain their
-        launch-time permission. An entry that is cataloged but failed to load keeps the
-        ``allow.cancel`` its catalog declares, because that block parsed: a revocation holds
-        while the entry fails, and a grant keeps a live run stoppable when its config breaks.
+        launch-time permission. An entry that failed to load when the server started keeps the
+        ``allow.cancel`` that catalog declares, because that block parsed, so a live run stays
+        stoppable when its config breaks. An edit made while an entry fails applies, like any
+        other, once every entry loads.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
         :return bool: Whether both launch-time and current permission are true, where the
-            current permission is the declared one for an entry that failed to load; or the
-            launch-time permission alone when the id is no longer cataloged.
+            current permission is the one the held catalog declares for an entry that failed
+            to load; or the launch-time permission alone when the id is no longer cataloged.
         """
         if not handle.allow_cancel:
             return False

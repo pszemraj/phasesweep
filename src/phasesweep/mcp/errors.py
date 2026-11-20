@@ -58,15 +58,15 @@ def run_log_reference(run_id: str) -> str:
     return f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`"
 
 
-def host_runner_numbers(pid: int | None, pgid: int | None) -> tuple[int | None, int | None]:
+def _host_runner_numbers(pid: int | None, pgid: int | None) -> tuple[int | None, int | None]:
     """Keep a recorded PID and process group only where a host shell reads them the same.
 
-    A server in a container or sandbox records the PID numbers of its own namespace, and in
+    A process in a container or sandbox records the PID numbers of its own namespace, and in
     a host shell the same number can name an unrelated process group. Only the host's
     initial namespace numbers its processes as the operator's shell does.
 
-    :param int | None pid: The runner's PID as this server recorded it.
-    :param int | None pgid: The runner's process group as this server recorded it.
+    :param int | None pid: The runner's PID as recorded.
+    :param int | None pgid: The runner's process group as recorded.
     :return tuple[int | None, int | None]: ``(pid, pgid)`` in the host's initial PID
         namespace, else ``(None, None)``, which the step wording below answers by naming
         the run for the shell to resolve.
@@ -78,13 +78,15 @@ def live_runner_step(pid: int | None, pgid: int | None, run_id: str) -> str:
     """Return the host step for a runner that cancellation or recovery found still alive.
 
     ``cancel_run`` and ``recover-run`` give the operator this one step, so neither refusal
-    leaves a runner that survived SIGKILL unnamed.
+    leaves a runner that survived SIGKILL unnamed. It names the recorded numbers only in
+    the host's initial PID namespace, and the run to find the runner by anywhere else.
 
-    :param int | None pid: The runner's PID when the operator's shell reads it as recorded, else ``None``.
-    :param int | None pgid: The runner's process group when the operator's shell reads it as recorded.
-    :param str run_id: The run, to find the runner by when no PID is given.
+    :param int | None pid: The runner's recorded PID, if any.
+    :param int | None pgid: The runner's recorded process group, if any.
+    :param str run_id: The run, to find the runner by when no number is named.
     :return str: One sentence naming the runner and what to clear on the host.
     """
+    pid, pgid = _host_runner_numbers(pid, pgid)
     if pid is not None and pgid is not None:
         who = f"runner PID {pid} (process group {pgid})"
     else:
@@ -102,22 +104,25 @@ def runner_stop_step(run_id: str, pid: int | None, pgid: int | None) -> str:
     """Return the operator's route to stop a running run that ``cancel_run`` may not stop.
 
     The runner leads its own process group and handles SIGTERM as cancellation, so a
-    group SIGTERM ends the run ``cancelled`` with its trials cleaned up.
+    group SIGTERM ends the run ``cancelled`` with its trials cleaned up. The command names
+    the recorded group only in the host's initial PID namespace, and the run to find the
+    runner by anywhere else.
 
     :param str run_id: The run to stop.
-    :param int | None pid: The runner's PID when a host shell reads it as recorded, else ``None``.
-    :param int | None pgid: The runner's process group when a host shell reads it as recorded.
+    :param int | None pid: The runner's recorded PID, if any.
+    :param int | None pgid: The runner's recorded process group, if any.
     :return str: One sentence naming the host command.
     """
+    pid, pgid = _host_runner_numbers(pid, pgid)
     if pid is not None and pgid is not None:
         found = (
-            f"run `kill -TERM -- -{pgid}` from a host shell, which signals runner PID {pid} and "
+            f"run `kill -TERM -{pgid}` from a host shell, which signals runner PID {pid} and "
             f"its process group {pgid}"
         )
     else:
         found = (
             f"run `pgrep -af {run_id}` from a host shell, take the PID of its "
-            f"`runner.py --run-id {run_id}` line and run `kill -TERM -- -<that PID>`, since the "
+            f"`runner.py --run-id {run_id}` line and run `kill -TERM -<that PID>`, since the "
             "runner leads its own process group"
         )
     return (
@@ -241,11 +246,13 @@ class PermissionDeniedError(McpToolError):
             its runner is gone.
         """
         # Launch-time permission caps cancellation, so a later catalog grant cannot reach
-        # a run launched without it.
+        # a run launched without it. An edit is read only from a catalog whose every entry
+        # loads, so a grant made while another entry fails waits for that entry's fix.
         applies = (
-            "which applies on the next call but never to a run launched without it"
+            "which applies on the next call with a valid catalog but never to a run launched "
+            "without it"
             if action == "cancel"
-            else "which applies on the next call"
+            else "which applies on the next call with a valid catalog"
         )
         stop = f" {stop_step}" if stop_step is not None else ""
         super().__init__(
@@ -510,10 +517,9 @@ class RunCapacityUnknownError(McpToolError):
             )
             remaining = (
                 f" Unreadable or orphaned: {shown}{more_note}. Ask the operator to run "
-                "`pgrep -af <run-id>` on the server host for each run id and, where it lists no "
-                "process of that run, runner or trial, move `runs/<run-id>.json` and "
-                f"`logs/<run-id>.*` out of the state directory{file_note}; a trial process it "
-                "still lists is settled by the next run of that experiment's config."
+                "`pgrep -af <run-id>` on the server host for each run id, wait for any process "
+                "of that run it lists, runner or trial, to exit, or stop it, and then move "
+                f"`runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory{file_note}."
             )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
