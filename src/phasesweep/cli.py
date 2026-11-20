@@ -1032,8 +1032,12 @@ def _table_lines(columns: Sequence[str], rows: Sequence[JsonObject]) -> list[str
     ]
 
 
-def _interrupted_running_comment(running: int) -> str:
-    """Say that trials recorded RUNNING belong to no live run and how to recover them.
+def _unsettled_running_comment(running: int) -> str:
+    """Say that trials recorded RUNNING belong to no live run and what a rerun does with them.
+
+    Such a trial was cut off, or finished with a result its run could not read. A rerun
+    settles both, and stops a trainer that outlived its run, so the comment says to let
+    one finish first.
 
     :param int running: How many trials the ledger records as RUNNING while no run holds the locks.
     :return str: One ``#`` comment line.
@@ -1043,8 +1047,9 @@ def _interrupted_running_comment(running: int) -> str:
     else:
         subject, verb, pronoun = f"the {running} trials", "were", "them"
     return (
-        f"# No run is active, so {subject} recorded RUNNING {verb} interrupted; "
-        f"rerun the same config to recover {pronoun}."
+        f"# No run is active, so {subject} recorded RUNNING {verb} left by a run that stopped "
+        f"before recording {pronoun}; rerun the same config to settle {pronoun}. A trainer "
+        "still running is stopped and its trial rerun, so wait for it to exit to keep its result."
     )
 
 
@@ -1078,7 +1083,7 @@ def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
             snapshot = csv_root / table.phase / "trials.csv"
             note = "storage: null keeps no trial ledger"
             if snapshot.is_file():
-                note += f"; the last run's trials are in {snapshot}"
+                note += f"; the trials of this phase's last run are in {snapshot}"
         elif not table.rows:
             note = "no trials yet"
         else:
@@ -1154,7 +1159,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     to decide what to inspect, and the boundary's one-line diagnostic follows
     on stderr. An unpublished winner gets a comment explaining how to resume publication,
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
-    saying that a rerun recovers them. ``--trials`` prints the trial tables in its place, from one
+    saying that a rerun settles them. ``--trials`` prints the trial tables in its place, from one
     publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
@@ -1170,7 +1175,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         tables = read_trial_tables(config, latest=True)
         running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
         if running and not experiment_is_busy(config):
-            click.echo(_interrupted_running_comment(running))
+            click.echo(_unsettled_running_comment(running))
         click.echo(
             _render_trial_tables(
                 tables, csv_root=None if config.persistent else _experiment_dir(config)
@@ -1202,7 +1207,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     # One probe serves both comments: flock cannot test a lock without taking it.
     busy = experiment_is_busy(config) if running or retained else False
     if running and not busy:
-        click.echo(_interrupted_running_comment(running))
+        click.echo(_unsettled_running_comment(running))
     if retained:
         step = unpublished_winner_step(config, ledger, busy=busy)
         if step is not None:

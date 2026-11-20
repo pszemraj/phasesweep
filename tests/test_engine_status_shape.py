@@ -318,7 +318,7 @@ def test_in_memory_trial_table_points_at_the_last_runs_csv(
     snapshot = tmp_path / "runs" / experiment.experiment / "p" / "trials.csv"
     assert snapshot.is_file()
     assert (
-        f"(storage: null keeps no trial ledger; the last run's trials are in {snapshot})"
+        f"(storage: null keeps no trial ledger; the trials of this phase's last run are in {snapshot})"
         in capsys.readouterr().out
     )
 

@@ -472,8 +472,9 @@ def test_model_samplers_top_up_real_runs_exactly(
 
 
 _NO_RUN_ACTIVE = (
-    "# No run is active, so the 1 trial recorded RUNNING was interrupted; "
-    "rerun the same config to recover it."
+    "# No run is active, so the 1 trial recorded RUNNING was left by a run that stopped before "
+    "recording it; rerun the same config to settle it. A trainer still running is stopped and "
+    "its trial rerun, so wait for it to exit to keep its result."
 )
 
 
