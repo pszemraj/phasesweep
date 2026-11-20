@@ -93,6 +93,8 @@ FailureCode: TypeAlias = Literal[
     "cancelled",
     "result_snapshot_unavailable",
     "publication_not_committed",
+    "publication_corrupt",
+    "publication_unreadable",
     "internal_error",
 ]
 

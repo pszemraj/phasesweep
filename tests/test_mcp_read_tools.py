@@ -444,11 +444,66 @@ def test_mcp_winners_hide_unusable_live_publications(
         )
 
     results = app.winners(run_id=run_id)
+    status = app.status(run_id=run_id)
 
     assert results["result_source"] == "current_shared_study"
     assert results["publication_integrity"] == integrity
     assert results["winner_count"] == 0
     assert results["phases"] == []
+    assert results["failure"] == status["run"]["failure"] == _PUBLICATION_FAILURES[integrity]
+
+
+_PUBLICATION_FAILURES = {
+    "failed": {
+        "code": "publication_corrupt",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "The experiment's last published result no longer validates. Ask the operator to "
+            "inspect it with `phasesweep status CONFIG` and restore it before any launch of this "
+            "experiment: a successful run would move the publication pointer past it, and "
+            "nothing would report it again."
+        ),
+    },
+    "permission_denied": {
+        "code": "publication_unreadable",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "This server cannot read the experiment's published result to validate it, which is "
+            "not evidence of corruption. Ask the operator to read it as the publishing user or "
+            "restore the server's read permission."
+        ),
+    },
+}
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+@pytest.mark.integration
+def test_unusable_publication_carries_the_operators_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, integrity: str, read_tool: str
+) -> None:
+    """A run with no failure of its own over an unusable publication reports that publication's step, with winners withheld."""
+    app, _registry, store, handle, complete = _published_run_terminal(tmp_path)
+    snapshot = json.loads(json.dumps(complete["result_snapshot"]))
+    snapshot["status"]["publication_integrity"] = integrity
+    write_run_status(store, **{**complete, "result_snapshot": snapshot})
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = _read_run_tool(app, read_tool, handle.run_id)
+
+    assert payload["publication_integrity"] == integrity
+    if read_tool == "winners":
+        assert (payload["winner_count"], payload["phases"]) == (0, [])
+        failure = payload["failure"]
+    else:
+        assert payload["run"]["state"] == "succeeded"
+        failure = payload["run"]["failure"]
+    assert failure == _PUBLICATION_FAILURES[integrity]
+    assert app.latest_run("srv")["run"]["failure"] is None
 
 
 @pytest.mark.parametrize("kind", ["wandb", "json"])

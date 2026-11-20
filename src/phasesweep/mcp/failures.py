@@ -1,12 +1,13 @@
 """Read-time composition of the ``failure`` payload an MCP run read returns.
 
 A run read reports one safe failure payload chosen from the runner's recorded terminal status, its
-cleanup record and what the read can observe of the runner now. The choice reads only the run store
-and the run handle, never the catalog or the server, so it lives apart from the tool methods that
-call it.
+cleanup record and what the read can observe of the runner now. The choice reads only the run store,
+the run handle and the publication verdict the read already holds, never the catalog or the server,
+so it lives apart from the tool methods that call it.
 
 A response is the agent's only instruction at the moment it must stop, so every read that reports
-``recovery_required`` carries a failure naming the operator's step. Nothing here is stored.
+``recovery_required`` carries a failure naming the operator's step, and so does a read over a
+publication it cannot use. Nothing here is stored.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from pydantic import ValidationError
 
 from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation, RunStore
-from phasesweep.mcp.snapshots import parse_result_snapshot
+from phasesweep.mcp.snapshots import McpPublicationState, parse_result_snapshot
 from phasesweep.runtime.json import JsonObject, json_object
 
 _CLEANUP_SETTLED_REMEDIATION = (
@@ -31,6 +32,32 @@ _RECOVER_RUN_STEP = (
     "Stop monitoring and ask the operator to run `phasesweep mcp recover-run` from a host shell, "
     "review its preview and repeat with `--confirm`."
 )
+# A run's claim refuses either verdict, so the step precedes the next launch's preflight.
+_PUBLICATION_FAILURES: dict[str, JsonObject] = {
+    "failed": {
+        "code": "publication_corrupt",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "The experiment's last published result no longer validates. Ask the operator to "
+            "inspect it with `phasesweep status CONFIG` and restore it before any launch of this "
+            "experiment: a successful run would move the publication pointer past it, and "
+            "nothing would report it again."
+        ),
+    },
+    "permission_denied": {
+        "code": "publication_unreadable",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "This server cannot read the experiment's published result to validate it, which is "
+            "not evidence of corruption. Ask the operator to read it as the publishing user or "
+            "restore the server's read permission."
+        ),
+    },
+}
 
 
 def response_failure(
@@ -40,11 +67,14 @@ def response_failure(
     view: RunnerView | None = None,
     observation: RunObservation | None = None,
     force_snapshot_unavailable: bool = False,
+    publication_integrity: McpPublicationState | None = None,
 ) -> JsonObject | None:
     """Return the failure a run read reports, carrying the step whenever the agent must stop.
 
     The run's own diagnosis is reported as :func:`run_failure_payload` composes it, except that
-    a run requiring recovery always reports a failure naming ``recover-run``.
+    a run requiring recovery always reports a failure naming ``recover-run``. A run with no
+    failure of its own reports a ``failed`` or ``permission_denied`` publication instead;
+    ``unknown`` already reads as an unavailable snapshot.
 
     :param RunStore runs: Store holding the run's durable state.
     :param RunHandle handle: Run being read.
@@ -53,6 +83,8 @@ def response_failure(
         to observe it here.
     :param bool force_snapshot_unavailable: The response already reports the terminal snapshot
         unavailable.
+    :param McpPublicationState | None publication_integrity: The response's publication verdict,
+        or ``None`` when it reports none.
     :return JsonObject | None: The validated failure, or ``None`` when the run has none.
     """
     if view is None:
@@ -68,6 +100,10 @@ def response_failure(
     )
     if observation.recovery_required and not diagnosis.names_recover_run:
         return _recovery_failure(handle, observation, diagnosis.recorded)
+    if diagnosis.failure is None and publication_integrity is not None:
+        publication = _PUBLICATION_FAILURES.get(publication_integrity)
+        if publication is not None:
+            return dict(publication)
     return diagnosis.failure
 
 

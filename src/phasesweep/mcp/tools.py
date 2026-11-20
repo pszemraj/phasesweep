@@ -624,6 +624,7 @@ class PhaseSweepMCP:
         view: RunnerView | None = None,
         *,
         force_snapshot_unavailable: bool = False,
+        publication_integrity: McpPublicationState | None = None,
     ) -> JsonObject:
         """Build one agent-visible run state with explicit recovery metadata.
 
@@ -632,6 +633,8 @@ class PhaseSweepMCP:
             ``None`` to derive it here; every field below uses the same one.
         :param bool force_snapshot_unavailable: The result response has already
             reported its terminal snapshot unavailable, so the failure says so too.
+        :param McpPublicationState | None publication_integrity: The response's publication
+            verdict, whose step a run with no failure reports; ``None`` when it reports none.
         :return JsonObject: Run id, state, launch timestamp, and recovery flag.
             ``runner_observable`` is False for a running run whose runner is in
             another PID namespace and cannot be proven gone; ``recovery_required``
@@ -657,6 +660,7 @@ class PhaseSweepMCP:
                 view=view,
                 observation=observation,
                 force_snapshot_unavailable=force_snapshot_unavailable,
+                publication_integrity=publication_integrity,
             ),
         }
 
@@ -762,6 +766,7 @@ class PhaseSweepMCP:
             handle,
             view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
+            publication_integrity=status["publication_integrity"],
         )
         delivery = self._tracking_delivery(handle, experiment)
         if delivery is not None:
@@ -1026,6 +1031,7 @@ class PhaseSweepMCP:
             handle,
             view=view,
             force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
+            publication_integrity=publication_integrity,
         )
         result["catalog_status"] = self._catalog_status()
         return result
