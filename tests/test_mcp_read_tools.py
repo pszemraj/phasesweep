@@ -405,7 +405,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     monkeypatch: pytest.MonkeyPatch,
     integrity: str,
 ) -> None:
-    """A live publication failure or access denial cannot expose stale winners."""
+    """A live publication failure or access denial cannot expose stale winners, and a run still running reports no failure for it."""
     run_id, _trainer, write_srv_config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
@@ -434,7 +434,8 @@ def test_mcp_winners_hide_unusable_live_publications(
     assert results["publication_integrity"] == integrity
     assert results["winner_count"] == 0
     assert results["phases"] == []
-    assert results["failure"] == status["run"]["failure"] == _PUBLICATION_FAILURES[integrity]
+    assert status["run"]["state"] == "running"
+    assert results["failure"] is status["run"]["failure"] is None
 
 
 _PUBLICATION_FAILURES = {
@@ -445,7 +446,7 @@ _PUBLICATION_FAILURES = {
         "actor": "operator",
         "remediation": (
             "The experiment's last published result no longer validates. Ask the operator to "
-            "inspect it with `phasesweep status CONFIG` and restore it; until then every run of "
+            "inspect it with `phasesweep status CONFIG` and restore it; until then a new run of "
             "this experiment fails before its first trial."
         ),
     },
@@ -457,7 +458,7 @@ _PUBLICATION_FAILURES = {
         "remediation": (
             "This server cannot read the experiment's published result to validate it, which is "
             "not evidence of corruption. Ask the operator to read it as the publishing user or "
-            "restore the server's read permission; until then every run of this experiment fails "
+            "restore the server's read permission; until then a new run of this experiment fails "
             "before its first trial."
         ),
     },

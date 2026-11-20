@@ -99,7 +99,7 @@ _PUBLICATION_FAILURES: dict[str, JsonObject] = {
         "publication_corrupt",
         "preflight",
         "The experiment's last published result no longer validates. Ask the operator to "
-        "inspect it with `phasesweep status CONFIG` and restore it; until then every run of "
+        "inspect it with `phasesweep status CONFIG` and restore it; until then a new run of "
         "this experiment fails before its first trial.",
     ),
     "permission_denied": operator_failure(
@@ -107,7 +107,7 @@ _PUBLICATION_FAILURES: dict[str, JsonObject] = {
         "preflight",
         "This server cannot read the experiment's published result to validate it, which is "
         "not evidence of corruption. Ask the operator to read it as the publishing user or "
-        "restore the server's read permission; until then every run of this experiment fails "
+        "restore the server's read permission; until then a new run of this experiment fails "
         "before its first trial.",
     ),
 }
@@ -125,9 +125,10 @@ def response_failure(
     """Return the failure a run read reports, carrying the step whenever the agent must stop.
 
     The run's own diagnosis is reported as :func:`run_failure_payload` composes it, except that
-    a run requiring recovery always reports a failure naming ``recover-run``. A run with no
-    failure of its own reports a ``failed`` or ``permission_denied`` publication instead;
-    ``unknown`` already reads as an unavailable snapshot.
+    a run requiring recovery always reports a failure naming ``recover-run``. A stopped run with
+    no failure of its own reports a ``failed`` or ``permission_denied`` publication instead; a
+    run still running passed its preflight and is not stopped by one, and ``unknown`` already
+    reads as an unavailable snapshot.
 
     :param RunStore runs: Store holding the run's durable state.
     :param RunHandle handle: Run being read.
@@ -152,7 +153,7 @@ def response_failure(
     failure = diagnosis.failure
     if observation.recovery_required and not diagnosis.names_recover_run:
         failure = _recovery_failure(handle, observation, diagnosis.recorded)
-    elif failure is None and publication_integrity is not None:
+    elif failure is None and publication_integrity is not None and observation.state != "running":
         failure = _PUBLICATION_FAILURES.get(publication_integrity)
     return _validated(failure)
 
