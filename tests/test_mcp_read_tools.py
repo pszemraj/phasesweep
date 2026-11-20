@@ -728,7 +728,11 @@ def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
     tmp_path: Path,
     read_tool: str,
 ) -> None:
-    """A succeeded run with no recorded failure and unconfirmed cleanup reads sync-tracking then recover-run, with winners readable until recovery is confirmed."""
+    """A succeeded run with no recorded failure and unconfirmed cleanup reads sync-tracking then recover-run, with winners readable until recovery is confirmed.
+
+    The step is unscoped: the worker may have been sending an earlier generation's recovered
+    outcome, whose record a sync scoped to this run's generation leaves pending.
+    """
     app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
     run_id = handle.run_id
     assert terminal.get("failure") is None
@@ -753,7 +757,8 @@ def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
     assert failure["actor"] == "operator"
     assert failure["retryable"] is False
     remediation = failure["remediation"]
-    assert f"phasesweep sync-tracking CONFIG --generation {run_id}" in remediation
+    assert "`phasesweep sync-tracking CONFIG`" in remediation
+    assert "--generation" not in remediation
     assert remediation.index("sync-tracking") < remediation.index("phasesweep mcp recover-run")
     assert store.status_path(run_id).read_bytes() == stored_status
 
