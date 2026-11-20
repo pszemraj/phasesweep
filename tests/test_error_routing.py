@@ -36,6 +36,7 @@ from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncer
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -261,6 +262,7 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
+    """A trainer environment that cannot be composed is a launch-environment refusal."""
     experiment = make_experiment(
         execution=ExecutionContext(inherit_env=["WANDB_MODE"]),
         gates=[
@@ -271,11 +273,19 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     )
     monkeypatch.setenv("WANDB_MODE", "offline")
 
-    with pytest.raises(PhaseSweepError) as excinfo:
+    with pytest.raises(LaunchEnvironmentError) as excinfo:
         trial._environment_identity(experiment, "p")
     assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert str(excinfo.value) == (
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
+    )
+    failure = mcp_runner._terminal_failure_payload(
+        excinfo.value, stage="preflight", cleanup_confirmed=True
+    )
+    assert (failure["code"], failure["stage"], failure["actor"]) == (
+        "launch_environment_invalid",
+        "preflight",
+        "operator",
     )
 
 
@@ -1306,14 +1316,14 @@ ORIGIN_CASES = (
     RoutingCase(
         id="launch_preflight_program_missing",
         trigger=_run_with_missing_program,
-        raised=PhaseSweepError,
+        raised=LaunchEnvironmentError,
         action=OperatorAction.FIX_CONFIG,
         message="program 'phasesweep-no-such-trainer' is not on the trainer's PATH",
     ),
     RoutingCase(
         id="launch_preflight_trainer_cwd_missing",
         trigger=_run_with_missing_trainer_cwd,
-        raised=PhaseSweepError,
+        raised=LaunchEnvironmentError,
         action=OperatorAction.FIX_CONFIG,
         message="which is not a directory on this host",
     ),

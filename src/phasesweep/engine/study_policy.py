@@ -26,6 +26,7 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
 )
 from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialTargetRefusedError,
@@ -62,7 +63,6 @@ from phasesweep.errors import (
     NEW_STUDY_STEP,
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
-    PhaseSweepError,
 )
 from phasesweep.runtime.json import JsonObject, json_text_map
 
@@ -1187,14 +1187,12 @@ def _require_trainer_cwd(experiment: Experiment) -> None:
     launch, which runs it in :func:`_launch_preflight`.
 
     :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
-    :raises PhaseSweepError: ``execution.cwd`` is not a directory on this host.
+    :raises LaunchEnvironmentError: ``execution.cwd`` is not a directory on this host.
     """
     missing = _missing_trainer_cwd(experiment)
     if missing is not None:
-        raise PhaseSweepError(
-            missing,
-            action=OperatorAction.FIX_CONFIG,
-            remediation="Create that directory, or set execution.cwd to an existing one.",
+        raise LaunchEnvironmentError(
+            missing, remediation="Create that directory, or set execution.cwd to an existing one."
         )
 
 
@@ -1260,8 +1258,8 @@ def _launch_preflight(
         environment identity.
     :raises StudyFingerprintMismatchError: The study's trials ran under another environment
         cohort.
-    :raises PhaseSweepError: The trainer environment cannot be composed, ``execution.cwd`` is
-        not a directory, or the trial command's program cannot be found.
+    :raises LaunchEnvironmentError: The trainer environment cannot be composed,
+        ``execution.cwd`` is not a directory, or the trial command's program cannot be found.
     """
     identity = _environment_identity(experiment, phase_name)
     if study is not None:
@@ -1274,9 +1272,8 @@ def _launch_preflight(
     )
     if refusal is not None:
         message, remediation = refusal
-        raise PhaseSweepError(
+        raise LaunchEnvironmentError(
             f"{message} Every trial would fail before its trainer started, so none was allocated.",
-            action=OperatorAction.FIX_CONFIG,
             remediation=remediation,
         )
     return identity

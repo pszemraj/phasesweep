@@ -24,7 +24,8 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.cli import cli as cli_main
 from phasesweep.config.models import ExecutionContext, Experiment, Phase
 from phasesweep.config.search import IntParam, Sampler
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import LaunchEnvironmentError, StudyFingerprintMismatchError
+from phasesweep.engine.guards import _raise_collected_errors
 from phasesweep.engine.paths import _artifact_root_binding_path
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
 from phasesweep.engine.study_policy import _launch_preflight, _trial_program_refusal
@@ -172,7 +173,7 @@ def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path:
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on") as caught:
         run_experiment(experiment)
 
-    assert type(caught.value) is PhaseSweepError
+    assert type(caught.value) is LaunchEnvironmentError
     assert caught.value.action is OperatorAction.FIX_CONFIG
     assert "none was allocated" in str(caught.value)
     assert not _artifact_root_binding_path(experiment).exists()
@@ -256,13 +257,26 @@ def test_resume_reports_an_experiment_wide_refusal_once_with_its_fix(tmp_path: P
             run_experiment(_with_target(experiment, 3), dry_run=dry_run)
 
         error = caught.value
-        assert type(error) is PhaseSweepError
+        assert type(error) is LaunchEnvironmentError
         assert str(error).count("is not on the trainer's PATH") == 1
         assert "multiple unsafe studies" not in str(error)
         assert error.action is OperatorAction.FIX_CONFIG
         assert error.remediation is not None
         assert _operational_error_text(error).endswith(f"\nfix: {error.remediation}")
     assert len(phase_trials(experiment, "a")) == len(phase_trials(experiment, "b")) == 1
+
+
+def test_studies_refused_for_different_launch_environment_reasons_share_the_type() -> None:
+    """Differing launch-environment refusals across studies aggregate under their own type."""
+    with pytest.raises(LaunchEnvironmentError, match="multiple unsafe studies") as caught:
+        _raise_collected_errors(
+            [
+                LaunchEnvironmentError("W&B logging is offline."),
+                LaunchEnvironmentError("No program."),
+            ]
+        )
+
+    assert caught.value.action is OperatorAction.FIX_CONFIG
 
 
 @pytest.mark.integration

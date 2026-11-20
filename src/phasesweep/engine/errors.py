@@ -40,6 +40,17 @@ class ArtifactRootSchemaMismatchError(ArtifactRootConflictError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
+class LaunchEnvironmentError(PhaseSweepError):
+    """Raised when no trial could start in the configured environment, before one is allocated.
+
+    ``execution.cwd`` is not a directory, the trial command's program cannot be found, or the
+    trainer environment cannot be composed. The configuration or the environment it runs in
+    holds the fix, so every raise routes to ``FIX_CONFIG``.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 class PublicationIntegrityError(PhaseSweepError):
     """Raised when a recorded publication exists but fails validation.
 

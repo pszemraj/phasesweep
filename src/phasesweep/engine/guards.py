@@ -18,6 +18,7 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -197,6 +198,7 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     :raises StudyFingerprintMismatchError: Every collected refusal is one.
     :raises StudyStorageUnavailableError: Every collected refusal is one.
     :raises TrialTargetRefusedError: Every collected refusal is one.
+    :raises LaunchEnvironmentError: Every collected refusal is one.
     :raises ProcessCleanupUncertainError: Any collected refusal is one.
     :raises PhaseSweepError: The collected refusals are expected but of mixed kinds.
     :raises RuntimeError: At least one collected error is an unexpected
@@ -225,6 +227,7 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
         StudyFingerprintMismatchError,
         StudyStorageUnavailableError,
         TrialTargetRefusedError,
+        LaunchEnvironmentError,
     ):
         if all(isinstance(error, error_type) for error in errors):
             raise error_type(message, action=shared) from first

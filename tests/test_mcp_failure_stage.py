@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config.models import Phase
+from phasesweep.config.models import ExecutionContext, Phase
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    LaunchEnvironmentError,
     StudyFingerprintMismatchError,
     TrackingTargetUnavailableError,
 )
@@ -79,6 +80,51 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     failure = json.loads(store.status_path("refused").read_text())["failure"]
     assert (failure["code"], failure["stage"]) == ("fingerprint_mismatch", "preflight")
     assert _generation_path(experiment).read_bytes() == generation_before
+
+
+@pytest.mark.parametrize(
+    ("refusal", "remediation"),
+    [
+        pytest.param(
+            "program_missing",
+            "Put the program on the PATH the run starts with, or name it by absolute path in "
+            "trial_command.",
+            id="program_missing",
+        ),
+        pytest.param(
+            "trainer_cwd_missing",
+            "Create that directory, or set execution.cwd to an existing one.",
+            id="trainer_cwd_missing",
+        ),
+    ],
+)
+def test_a_refused_launch_environment_reports_its_own_code_and_fix(
+    tmp_path: Path, refusal: str, remediation: str
+) -> None:
+    """A launch whose trials could not start fails at preflight with the raise's own fix."""
+    experiment = (
+        make_experiment(
+            workdir=tmp_path / "runs", trial_command="phasesweep-no-such-trainer {overrides}"
+        )
+        if refusal == "program_missing"
+        else make_experiment(
+            workdir=tmp_path / "runs", execution=ExecutionContext(cwd=str(tmp_path / "gone"))
+        )
+    )
+    config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    store = RunStore(tmp_path / "state")
+
+    with pytest.raises(LaunchEnvironmentError):
+        run_claimed_runner(store, "refused", config_path, experiment_id="t", cwd=tmp_path)
+
+    failure = json.loads(store.status_path("refused").read_text())["failure"]
+    assert failure == {
+        "code": "launch_environment_invalid",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": f"Ask the operator: {remediation}",
+    }
 
 
 @pytest.mark.integration

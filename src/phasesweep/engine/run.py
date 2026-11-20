@@ -72,7 +72,7 @@ def _preflight_missing_reached_phase_environments(
     :param Experiment experiment: Parsed experiment supplying phase environments.
     :param Mapping[str, object] existing_studies: Durable studies found under the lock.
     :param str | None from_phase: Optional first phase this invocation can execute.
-    :raises PhaseSweepError: A missing reached phase has an invalid launch environment, a
+    :raises LaunchEnvironmentError: A missing reached phase has an invalid launch environment, a
         missing trainer directory or a trial program its trainer cannot find; see
         :func:`phasesweep.engine.study_policy._launch_preflight`.
     """

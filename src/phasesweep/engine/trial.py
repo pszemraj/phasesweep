@@ -23,6 +23,7 @@ import optuna
 
 from phasesweep.config.common import check_bounds
 from phasesweep.config.models import TRIAL_BOUND_ENV, Experiment, Observation, _wandb_query
+from phasesweep.engine.errors import LaunchEnvironmentError
 from phasesweep.engine.progress import _warn_once
 from phasesweep.engine.state import (
     DURATION_ATTR,
@@ -34,10 +35,6 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_SCHEMA_VERSION,
     constraint_attr,
     observed_attr,
-)
-from phasesweep.errors import (
-    OperatorAction,
-    PhaseSweepError,
 )
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
@@ -211,6 +208,8 @@ def _environment_identity(
     :param Experiment experiment: Experiment supplying the environment contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline or disabled W&B for new remote work.
+    :raises LaunchEnvironmentError: The managed W&B bindings conflict with the configured
+        environment, or W&B logging is offline or disabled.
     :return EnvironmentIdentity: Tracked values, their digest, and the full launch environment.
     """
     cohort_names = set(experiment.execution.tracked_env_names()) | set(experiment.env)
@@ -240,7 +239,7 @@ def _environment_identity(
                 require_online=require_wandb_online,
             )
         except ValueError as exc:
-            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
+            raise LaunchEnvironmentError(str(exc)) from exc
     elif "WANDB_RUN_ID" not in experiment.env:
         # Track explicit trainer-owned W&B identities, but exclude inherited ids from the cohort.
         env.pop("WANDB_RUN_ID", None)
