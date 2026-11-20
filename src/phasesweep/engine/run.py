@@ -325,6 +325,8 @@ def _run_experiment_outcome(
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         if not environments_preflighted:
+            # Checked before recovery: recovery stops a surviving trainer, which a launch
+            # that then refuses its own config should not do.
             _preflight_missing_reached_phase_environments(
                 experiment,
                 claimed.studies,

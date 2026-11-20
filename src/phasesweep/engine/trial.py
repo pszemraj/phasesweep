@@ -854,6 +854,8 @@ def extract_trial_result(
                     phase_name=executed.ctx.phase,
                     trial_id=executed.ctx.trial_id,
                 )
+            # Gates run only on a result that has its objective. A trial left pending by an
+            # unreadable tracker meets them when a later read answers, with the same verdict.
             return _failed_trial(
                 rc=rc,
                 duration=duration,

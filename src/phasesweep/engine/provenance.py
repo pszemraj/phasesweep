@@ -194,6 +194,10 @@ def _load_generation_experiment(artifact_root: Path, generation_id: str) -> Expe
 def _load_generation_code_revision(artifact_root: Path, generation_id: str) -> CodeRevision | None:
     """Read the trainer code revision one generation recorded in its reproducibility record.
 
+    The record is taken as its directory names it. Only a record copied by hand from another
+    generation could differ, and the revision feeds one ``show-winners`` line; publication
+    validation checks the identity of the records a publication depends on.
+
     :param Path artifact_root: Experiment artifact directory containing the generation.
     :param str generation_id: Generation whose recorded revision is required.
     :raises WinnerIntegrityError: The record is absent, unreadable, or holds a malformed revision.
