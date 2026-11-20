@@ -699,12 +699,23 @@ def _record_stale_trial_outcome(
                 policy_phase is not None
                 and _parsed_trial_outcome(current.user_attrs.get(TRIAL_OUTCOME_ATTR)) is None
             ):
-                state = _load_phase_policy_state(study)
+                # A RUNNING trial's duplicated record is one its own recovery replaces with a
+                # fresh interruption, so the decision replays the study as that leaves it.
+                replaced = {
+                    candidate.number
+                    for candidate in trials
+                    if candidate.state == optuna.trial.TrialState.RUNNING
+                    and _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR))
+                    is not None
+                    and _unduplicated_outcome(candidate, sequence_counts) is None
+                }
+                state = _load_phase_policy_state(study, leave_out=replaced)
                 abort = _abort_decision(
                     policy_phase,
                     trial.number,
                     outcome,
-                    completion_sequence=state.max_sequence,
+                    # The abort belongs at this outcome's own sequence.
+                    completion_sequence=sequence - 1,
                     consecutive_failures=state.consecutive_failures,
                     aborted=state.abort is not None,
                 )

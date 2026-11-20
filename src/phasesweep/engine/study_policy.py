@@ -6,7 +6,7 @@ import os
 import re
 import shlex
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
@@ -250,11 +250,16 @@ def _load_recovery_record(study: optuna.Study) -> _RecoveryRecord | None:
     return _RecoveryRecord(start_after_sequence, trial_target)
 
 
-def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
+def _load_phase_policy_state(
+    study: optuna.Study, *, leave_out: Collection[int] = ()
+) -> _PhasePolicyState:
     """Validate and reconstruct the durable consecutive-failure state.
 
     :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` and
         per-trial outcome attrs are read and validated.
+    :param Collection[int] leave_out: Numbers of RUNNING trials whose records stale recovery
+        replaces, which a replay predicting the state after that recovery skips; defaults to
+        none, replaying every record.
     :return _PhasePolicyState: Reconstructed state: the highest recorded
         outcome sequence, the consecutive-failure count since the last
         recovery boundary, and the first abort recorded after it (if any)
@@ -270,6 +275,8 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     events: list[tuple[int, str, dict[str, Any] | None, int]] = []
     seen_sequences: dict[int, int] = {}
     for trial in study.get_trials(deepcopy=False):
+        if trial.number in leave_out:
+            continue
         raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
         parsed = _parsed_trial_outcome(raw)
         if trial.state.is_finished() and parsed is None:
