@@ -106,35 +106,36 @@ DESCRIPTION_EXPLAIN_CONFIG = (
 )
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
-    "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
-    "Read-only: the server rereads an edited catalog or config before each call, so this "
-    "describes what launch_run would start now."
+    "inheritance, and search-space keys. Call after list_experiments, before launch_run or "
+    "advising on the experiment. Read-only: the server rereads an edited catalog or config "
+    "before each call, so this describes what launch_run would start now."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the most recently launched run for one experiment. Call only to recover a lost "
-    "run_id; then use that run_id with await_run, get_run_status, or get_run_results. "
-    "Read-only: found=false never authorizes launching a replacement."
+    "run_id; then use run.run_id with await_run, get_run_status, or get_run_results. "
+    "Read-only: when found is false, stop; it never authorizes launching a replacement."
 )
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
-    "inspection and explicit user authorization; monitor with the returned run_id. "
+    "inspection and explicit user authorization for that experiment, and keep the returned "
+    "run_id for every later call. Never launch a replacement run on your own. "
     "Never retry permission refusals. Retry a config-changed refusal once; report an "
     "invalid-catalog or changed-state_dir refusal to the operator and wait for the fix. For "
     "capacity refusals, await healthy named blockers; report blockers requiring recovery to the "
-    "operator before retrying. "
-    "When runner liveness is unobservable, monitor durable progress and notify the operator "
-    "if it stops."
+    "operator before retrying."
 )
 DESCRIPTION_GET_RUN_STATUS = (
     "Read process state and per-phase progress for exactly one run_id. Use as a single status "
-    "check when await_run is unsuitable. State is run.state; stop if run.recovery_required is "
-    "true. Read-only: reuse the run_id returned by launch_run or get_latest_run."
+    "check when await_run is unsuitable, never in a polling loop. State is run.state; stop if "
+    "run.recovery_required is true. Read-only: reuse the run_id returned by launch_run or "
+    "get_latest_run."
 )
 DESCRIPTION_GET_RUN_RESULTS = (
     "Return terminal per-phase winners, completeness, metrics, gates, and "
     "policy-filtered sampled parameters. Call after a run becomes terminal; this ends the normal "
-    "workflow. Read-only: treat redaction as policy and never infer trends or convergence from "
-    "winner-only data."
+    "workflow. Say when a winner comes from an earlier generation (winner_generation "
+    "prior_generation), when its labels are historical (published_config_matches_current "
+    "false), and that a confound check reading n/a was not run. Read-only."
 )
 DESCRIPTION_CANCEL_RUN = (
     "Request bounded cancellation of one launched run. Call only when the user explicitly asks; "
@@ -143,11 +144,12 @@ DESCRIPTION_CANCEL_RUN = (
 )
 DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
-    "recovery. Call after launch_run and repeat while running; omit timeout_seconds for a "
-    "client-safe 20-second wait, and request longer waits only when the client permits them. "
-    "State is run.state; stop immediately if run.recovery_required is true. Call "
-    "get_run_results when terminal. Read-only: always reuse "
-    "the run_id, including after a client disconnect."
+    "recovery. Call after launch_run and repeat with the same run_id while run.state is "
+    "running, including after reason phase_completed and after a client disconnect; omit "
+    "timeout_seconds for a client-safe 20-second wait, and request longer waits only when the "
+    "client permits them. Stop immediately if run.recovery_required is true. When "
+    "run.runner_observable is false, monitor durable progress and notify the operator if it "
+    "stops. Call get_run_results when terminal. Read-only."
 )
 
 ExperimentId = Annotated[
@@ -202,7 +204,7 @@ PublishedConfigMatchesCurrent = Annotated[
             "Whether the producing configuration matches the corresponding prefix of the "
             "current phase plan. Appended phases do not invalidate that agreement. False "
             "means the producing semantics differ and these result labels are historical. "
-            "Null when no producing fingerprint is available. Never treat null as 'no drift'."
+            "Null when no producing fingerprint is available; null does not establish a match."
         )
     ),
 ]
@@ -408,11 +410,8 @@ class RunPayload(_ToolPayload):
     )
     runner_observable: bool = Field(
         description=(
-            "False for a running runner in another PID namespace: liveness and cancellation "
-            "are unavailable. Monitor durable trial counts, do not call cancel_run, and "
-            "notify the user if counts stop advancing. With recovery_required also true, the "
-            "runner has probably stopped or left cleanup uncertain: ask the operator to check "
-            "and recover it from a host shell."
+            "False for a running runner in another PID namespace, where liveness and "
+            "cancellation are unavailable."
         )
     )
     failure: FailurePayload | None = Field(
@@ -656,11 +655,7 @@ class WinnerPhasePayload(_ToolPayload):
         description="Other repeat configurations within two combined standard errors, with params, gap, combined_se and threshold; null when retained trials are unavailable. Parameter values follow visible_params."
     )
     confound: ConfoundSummary = Field(
-        description=(
-            "Advisory verdicts on the population this winner was selected from. Report every "
-            "flagged check with its counts before relying on the winner or on phases that "
-            "inherit it."
-        )
+        description="Verdicts on the population this winner was selected from, frozen at selection."
     )
     observed: dict[str, float] = Field(
         description=(
@@ -673,8 +668,7 @@ class WinnerPhasePayload(_ToolPayload):
         description=(
             "For a phase with repeats: the reducer, the spread of the member metrics and the "
             "member trial numbers of the winning group, whose last member is "
-            "winner_source.trial_number. Report the spread with the metric. Null for a phase "
-            "without repeats."
+            "winner_source.trial_number. Null for a phase without repeats."
         )
     )
 

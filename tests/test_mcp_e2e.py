@@ -330,18 +330,16 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     assert all(t.annotations is not None for t in tools)
     # The guide is prose, served as text; every other tool returns a described object.
     assert [t.name for t in tools if not t.outputSchema] == [TOOL_GET_GUIDE]
+    # The when-to-call rules live where the model reads them at the moment of the call.
     descriptions = {t.name: t.description for t in tools}
-    for tool_name, safety_contracts in {
-        TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
-        TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
-        TOOL_GET_RUN_STATUS: ("run.state", "stop if run.recovery_required"),
-        TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
-        TOOL_EXPLAIN_CONFIG: ("config-authoring help", "not any catalog experiment"),
+    for tool_name, when_to_call in {
         TOOL_GET_GUIDE: ("before any other PhaseSweep tool",),
-        TOOL_LIST_EXPERIMENTS: ("after get_guide",),
+        TOOL_LAUNCH_RUN: ("explicit user authorization",),
+        TOOL_CANCEL_RUN: ("user explicitly asks",),
+        TOOL_AWAIT_RUN: ("same run_id", "phase_completed"),
     }.items():
-        for safety_contract in safety_contracts:
-            assert safety_contract in descriptions[tool_name]
+        for rule in when_to_call:
+            assert rule in descriptions[tool_name]
     for tool_name in (
         TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,

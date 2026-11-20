@@ -145,8 +145,7 @@ class WinnerSourceSnapshot(_SnapshotModel):
 
 _VERDICT_DESCRIPTION = (
     "ok: checked, nothing found. heterogeneous: a potential confound in the population "
-    "this winner was chosen from; report it before relying on the winner. n/a: not "
-    "checked; never read it as clean."
+    "this winner was chosen from. n/a: not checked."
 )
 
 
