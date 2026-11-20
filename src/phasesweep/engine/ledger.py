@@ -67,7 +67,7 @@ from phasesweep.engine.state import (
     _study_schema_supported,
 )
 from phasesweep.errors import (
-    OTHER_FORMAT_LEDGER_STEP,
+    OTHER_FORMAT_STEP,
     OperatorAction,
     PhaseSweepError,
     format_found,
@@ -645,7 +645,7 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
             f"state: {detail}; {format_reads(STUDY_SCHEMA_VERSION)}. Nothing was written.",
-            remediation=OTHER_FORMAT_LEDGER_STEP,
+            remediation=OTHER_FORMAT_STEP,
         )
 
 

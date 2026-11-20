@@ -62,7 +62,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import (
     NEW_STUDY_STEP,
-    OTHER_FORMAT_LEDGER_STEP,
+    OTHER_FORMAT_STEP,
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
     format_mismatch,
@@ -372,7 +372,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} {format_mismatch(version, STUDY_SCHEMA_VERSION)}. "
         f"Affected trial numbers: {trial_numbers}.",
-        remediation=OTHER_FORMAT_LEDGER_STEP,
+        remediation=OTHER_FORMAT_STEP,
     )
 
 

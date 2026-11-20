@@ -30,7 +30,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.errors import (
     NEW_STUDY_STEP,
-    OTHER_FORMAT_LEDGER_STEP,
+    OTHER_FORMAT_STEP,
     OperatorAction,
     format_mismatch,
 )
@@ -147,7 +147,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence that {found}.",
             action=OperatorAction.FRESH_NAMESPACE,
             # The evidence is a trial attribute, so it stays in an explicit ledger.
-            remediation=OTHER_FORMAT_LEDGER_STEP,
+            remediation=OTHER_FORMAT_STEP,
         )
     extractor = provenance.get("extractor")
     if not isinstance(extractor, Mapping):

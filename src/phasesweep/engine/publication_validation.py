@@ -32,7 +32,7 @@ from phasesweep.engine.state import (
     _parse_winner_source,
     _validate_observed_block,
 )
-from phasesweep.errors import OTHER_FORMAT_LEDGER_STEP, format_mismatch
+from phasesweep.errors import OTHER_FORMAT_STEP, format_mismatch
 from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import JsonObject, json_object
 
@@ -257,7 +257,7 @@ def _validate_generation_manifest(
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         found = format_mismatch(summary.get("schema_version"), GENERATION_SUMMARY_SCHEMA_VERSION)
         # The summary's studies may sit in an explicit ledger, which a new name leaves behind.
-        raise _fail(f"the summary {found}", remediation=OTHER_FORMAT_LEDGER_STEP)
+        raise _fail(f"the summary {found}", remediation=OTHER_FORMAT_STEP)
     metric = summary.get("metric")
     if (
         not isinstance(metric, Mapping)

@@ -34,7 +34,7 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_LEDGER_STEP, OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_STEP, OperatorAction
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.evidence.models import JsonExtractor, WandbExtractor, WandbSummaryRequiredGate
 from tests.conftest import (
@@ -615,7 +615,7 @@ def test_provenance_in_another_format_names_both_and_routes_to_a_new_study(
     assert "malformed" not in message
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
     # The record is a trial attribute, so the step must also leave an explicit ledger.
-    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
 
 
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:

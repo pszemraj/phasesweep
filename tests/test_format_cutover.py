@@ -58,7 +58,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _initialize_study_schema, _validate_study_schema
 from phasesweep.errors import (
-    OTHER_FORMAT_LEDGER_STEP,
     OTHER_FORMAT_STEP,
     OperatorAction,
     PhaseSweepError,
@@ -138,7 +137,7 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
     assert tree_snapshot(materialized.root) == before
 
 
@@ -170,9 +169,9 @@ def test_artifact_root_format_refusal_names_a_step_that_is_accepted(
 ) -> None:
     """One pass of the old-format fix line is a fresh start, whichever ledger the config names.
 
-    An explicit ledger keeps the old studies when only the experiment name changes, so its line
-    also names a new ledger. Under ``storage: auto`` the ledger lives in the artifact root, so
-    a new experiment name alone starts fresh.
+    An explicit ledger keeps the old studies when only the experiment name changes, so the
+    line names a new ledger for a config that names one. Under ``storage: auto`` the ledger
+    lives in the artifact root, so a new experiment name alone starts fresh.
     """
     explicit = storage_kind == "explicit"
     journal = tmp_path / "old.journal"
@@ -184,9 +183,7 @@ def test_artifact_root_format_refusal_names_a_step_that_is_accepted(
     with pytest.raises(ArtifactRootConflictError, match="uses format") as refused:
         run_experiment(old)
 
-    assert refused.value.remediation == (
-        OTHER_FORMAT_LEDGER_STEP if explicit else OTHER_FORMAT_STEP
-    )
+    assert refused.value.remediation == OTHER_FORMAT_STEP
     if explicit:
         with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
             run_experiment(old.model_copy(update={"experiment": "fresh"}))
@@ -215,10 +212,7 @@ def test_artifact_binding_without_a_version_is_refused_as_unversioned(tmp_path: 
         run_experiment(materialized.experiment)
 
 
-@pytest.mark.parametrize(
-    "format_record, step",
-    [("artifact-root", OTHER_FORMAT_LEDGER_STEP), ("study", OTHER_FORMAT_LEDGER_STEP)],
-)
+@pytest.mark.parametrize("format_record", ["artifact-root", "study"])
 @pytest.mark.parametrize(
     "command, options",
     [
@@ -235,7 +229,6 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
     format_record: str,
-    step: str,
     command: str,
     options: list[str],
 ) -> None:
@@ -256,7 +249,7 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     assert "checkout" not in output.err
     assert "format None" not in output.err
     assert not [record for record in caplog.records if "DRY RUN" in record.getMessage()]
-    assert output.err.endswith(f"\nfix: {step}\n")
+    assert output.err.endswith(f"\nfix: {OTHER_FORMAT_STEP}\n")
     assert tree_snapshot(materialized.root) == before
 
 
@@ -305,7 +298,7 @@ def test_unsupported_populated_ledger_is_refused_with_a_fresh_output_root(
         run_experiment(experiment)
 
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
-    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
     assert not _experiment_dir(experiment).exists()
     assert {
         path.name: path.read_bytes()

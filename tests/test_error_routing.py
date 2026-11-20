@@ -75,7 +75,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import (
-    OTHER_FORMAT_LEDGER_STEP,
+    OTHER_FORMAT_STEP,
     ForeignPidNamespaceError,
     OperatorAction,
     PhaseSweepError,
@@ -270,7 +270,7 @@ def test_live_study_schema_refusal_gives_the_ledger_step():
     with pytest.raises(StudySchemaMismatchError) as excinfo:
         study_policy._validate_study_schema(_populated_study())
 
-    assert excinfo.value.remediation == OTHER_FORMAT_LEDGER_STEP
+    assert excinfo.value.remediation == OTHER_FORMAT_STEP
 
 
 def _collected(*errors: PhaseSweepError) -> PhaseSweepError:
