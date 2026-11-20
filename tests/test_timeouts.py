@@ -9,8 +9,9 @@ from pathlib import Path
 
 import optuna
 import pytest
+from pydantic import ValidationError
 
-from phasesweep import run_experiment
+from phasesweep import load_experiment, run_experiment
 from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.artifacts import _load_winner
@@ -35,6 +36,7 @@ from tests.conftest import (
     write_trainer,
     write_trial_zero_trainer,
 )
+from tests.experiments import phase_payload, write_experiment
 
 
 def _sleeping_score_experiment(
@@ -84,23 +86,21 @@ def _executed_trial(tmp_path: Path, process: ProcessResult) -> ExecutedTrial:
     )
 
 
-def test_zero_phase_timeout_refuses_to_launch_and_blames_the_phase_setting(tmp_path: Path) -> None:
-    """A phase timeout of 0 leaves no time to launch, and the refusal does not blame the run."""
-    exp = _sleeping_score_experiment(
-        tmp_path, experiment="phase_zero_timeout", timeout_seconds_per_phase=0.0
-    )
-
-    with pytest.raises(TimeoutError, match="sets timeout_seconds_per_phase to 0") as refused:
-        run_experiment(exp)
-
-    assert "Run wallclock deadline" not in str(refused.value)
-    from phasesweep.errors import operator_step
-
-    assert isinstance(refused.value, PhaseSweepError)
-    assert "Raise timeout_seconds_per_phase" in operator_step(refused.value)
-    assert "start the run again; storage: null" in operator_step(refused.value)
-    run_log = tmp_path / "runs" / "phase_zero_timeout" / "run.log"
-    assert "fix: Raise timeout_seconds_per_phase" in run_log.read_text()
+@pytest.mark.parametrize(
+    ("fields", "key"),
+    [
+        ({"phases": [phase_payload(timeout_seconds_per_phase=0)]}, "timeout_seconds_per_phase"),
+        ({"phases": [phase_payload(timeout_seconds_per_trial=0)]}, "timeout_seconds_per_trial"),
+        ({"timeout_seconds_per_run": 0}, "timeout_seconds_per_run"),
+    ],
+    ids=["phase", "trial", "run"],
+)
+def test_zero_wallclock_budget_is_refused_at_config_validation(
+    tmp_path: Path, fields: dict[str, object], key: str
+) -> None:
+    """A zero wallclock budget could never launch a trial, so validation refuses it and names the key."""
+    with pytest.raises(ValidationError, match=rf"(?s){key}.*greater than 0"):
+        load_experiment(write_experiment(tmp_path / "zero.yaml", **fields))
 
 
 def test_runtime_rejects_unexplained_trial_budget_shortfall(

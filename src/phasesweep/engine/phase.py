@@ -646,8 +646,7 @@ def _phase_budget(phase: Phase, run_deadline: float | None, *, persistent: bool)
     :param float | None run_deadline: Whole-run ``time.monotonic()`` deadline,
         when configured.
     :param bool persistent: Whether completed trials survive the next invocation.
-    :raises TimeoutError: The run deadline has already passed, or the phase's own
-        ``timeout_seconds_per_phase`` is 0.
+    :raises TimeoutError: The run deadline has already passed.
     :return _PhaseBudget: The optimize timeout in seconds, its monotonic
         deadline, and which guard (``"phase"`` or ``"run"``) sets it.
     """
@@ -665,15 +664,9 @@ def _phase_budget(phase: Phase, run_deadline: float | None, *, persistent: bool)
             else min(optimize_timeout, remaining_run_seconds)
         )
     if optimize_timeout is not None and optimize_timeout <= 0.0:
-        if timeout_source == "run":
-            raise phase_timeout(
-                f"Run wallclock deadline reached before phase {phase.name!r} could launch.",
-                scope="run",
-                persistent=persistent,
-            )
         raise phase_timeout(
-            f"Phase {phase.name!r} sets timeout_seconds_per_phase to 0, so it could not launch.",
-            scope="phase",
+            f"Run wallclock deadline reached before phase {phase.name!r} could launch.",
+            scope="run",
             persistent=persistent,
         )
     optimize_deadline = None if optimize_timeout is None else time.monotonic() + optimize_timeout

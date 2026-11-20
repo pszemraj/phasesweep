@@ -247,7 +247,7 @@ phases: list[object] (required)
     # Recommended: when repeats compares multiple configurations, keep it above the repeat count so one failing configuration cannot abort the phase. validate and run --dry-run warn.
     max_consecutive_failures: int = 5
 
-    # Wallclock limit for one trainer process, in seconds, >= 0. null means no limit, and 0 expires at once, so every attempt fails.
+    # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
     # Requires: phases[].allow_unbounded_trials true for null.
@@ -256,8 +256,8 @@ phases: list[object] (required)
     # Permit timeout_seconds_per_trial null. true alone changes nothing, because the 72-hour default applies until that key is null.
     allow_unbounded_trials: bool = false
 
-    # Wallclock budget for the phase, in seconds, >= 0. Its clock starts after the resume checks and GPU discovery, before the first trial.
-    # A phase with no work left never starts the clock. 0 makes a phase with work fail before any trial starts, which allow_incomplete_on_timeout cannot rescue.
+    # Wallclock budget for the phase, in seconds, > 0. Its clock starts after the resume checks and GPU discovery, before the first trial.
+    # A phase with no work left never starts the clock.
     timeout_seconds_per_phase: float | null = null
 
     # Accept a feasible winner from fewer than n_trials attempts when a phase or run deadline leaves the phase incomplete, and persist that decision.
@@ -513,9 +513,8 @@ execution: object = {}
 
 # ---------- Run deadline ----------
 
-# Wallclock budget for one phasesweep run invocation, in seconds, >= 0. Its clock starts once the ledger is claimed and restarts at every invocation.
+# Wallclock budget for one phasesweep run invocation, in seconds, > 0. Its clock starts once the ledger is claimed and restarts at every invocation.
 # It also caps W&B evidence reads and MLflow resolution, run creation and capture, but not MLflow result uploads.
-# 0 fails the first phase before it starts, even a replay of finished work.
 # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation
 timeout_seconds_per_run: float | null = null
 

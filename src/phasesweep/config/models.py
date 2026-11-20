@@ -705,7 +705,7 @@ class Phase(_Frozen):
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: ConfigFloat | None = Field(default=259200.0, ge=0)
+    timeout_seconds_per_trial: ConfigFloat | None = Field(default=259200.0, gt=0)
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(
@@ -713,7 +713,7 @@ class Phase(_Frozen):
             "Otherwise timeout_seconds_per_trial must be finite."
         ),
     )
-    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, ge=0)
+    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, gt=0)
     allow_incomplete_on_timeout: bool = Field(
         default=False,
         description=(
@@ -1126,7 +1126,7 @@ class Experiment(_Frozen):
             "environment-inheritance contract."
         ),
     )
-    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, gt=0)
 
     @property
     def resolved_storage(self) -> str | None:
