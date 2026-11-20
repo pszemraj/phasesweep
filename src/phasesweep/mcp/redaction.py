@@ -85,6 +85,23 @@ def _tie_groups_payload(
     return public
 
 
+def _run_wrote_generation(
+    result_source: ResultSource, current_generation_id: str | None, run_id: str | None
+) -> bool | None:
+    """Say whether the queried run wrote its own generation.
+
+    A run that claims its generation moves the current pointer to its run ID.
+
+    :param ResultSource result_source: Where the result facts came from.
+    :param str | None current_generation_id: Current generation the facts record.
+    :param str | None run_id: Queried run, or ``None`` when no run is queried.
+    :return bool | None: Whether it wrote one, or ``None`` for an unavailable snapshot.
+    """
+    if result_source == "terminal_snapshot_unavailable":
+        return None
+    return run_id is not None and current_generation_id == run_id
+
+
 def winners_payload(
     experiment_id: str,
     views: Sequence[PhaseWinnerView | WinnerSnapshot],
@@ -93,6 +110,7 @@ def winners_payload(
     declared_phases: list[str],
     result_source: ResultSource,
     publication_integrity: McpPublicationState,
+    current_generation_id: str | None,
     run_id: str | None = None,
     represented_generation_id: str | None = None,
     visible_params: VisibleParamsPolicy = "none",
@@ -115,6 +133,8 @@ def winners_payload(
         state or a frozen terminal run snapshot.
     :param McpPublicationState publication_integrity: Last-success validation verdict,
         or ``unknown`` when the terminal snapshot is unavailable.
+    :param str | None current_generation_id: Current generation the result facts record,
+        which names ``run_id`` only when that run wrote its own generation.
     :param str | None run_id: Run id represented by a frozen snapshot, if any.
     :param str | None represented_generation_id: Generation whose results are being represented.
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
@@ -181,6 +201,7 @@ def winners_payload(
         "run_id": run_id,
         "result_source": result_source,
         "represented_generation_id": represented_generation_id,
+        "run_wrote_generation": _run_wrote_generation(result_source, current_generation_id, run_id),
         "publication_integrity": publication_integrity,
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
@@ -282,11 +303,8 @@ def status_payload(
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
         "is_published": status["is_published"],
-        # A run that claims its generation moves the current pointer to its run ID.
-        "run_wrote_generation": (
-            None
-            if result_source == "terminal_snapshot_unavailable"
-            else status["current_generation_id"] == run["run_id"]
+        "run_wrote_generation": _run_wrote_generation(
+            result_source, status["current_generation_id"], run["run_id"]
         ),
         "publication_integrity": status["publication_integrity"],
         "result_context": status["result_context"],

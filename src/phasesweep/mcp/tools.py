@@ -1052,6 +1052,7 @@ class PhaseSweepMCP:
             declared_phases=status["result_phase_plan"],
             result_source=result_source,
             publication_integrity=publication_integrity,
+            current_generation_id=status["current_generation_id"],
             run_id=run_id,
             represented_generation_id=represented_generation_id,
             visible_params=visible_params,

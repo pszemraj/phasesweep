@@ -700,6 +700,12 @@ class GetRunResultsResult(_ToolPayload):
             "generation."
         )
     )
+    run_wrote_generation: bool | None = Field(
+        description=(
+            "Whether this run wrote its own generation. When false, the run launched no trials "
+            "and its winners are an earlier generation's; null for an unavailable placeholder."
+        )
+    )
     publication_integrity: PublicationIntegrity
     result_context: ResultContext
     published_config_matches_current: PublishedConfigMatchesCurrent
