@@ -288,7 +288,7 @@ def test_failed_invocation_leaves_a_pending_trials_managed_run_open(tmp_path, mo
     (pending,) = study.get_trials()
     optuna.Trial(study, pending._trial_id).set_user_attr(FEASIBLE_ATTR, True)
     study.tell(pending.number, 0.5)
-    publication._rebuild_attempt_intents(experiment, [generation])
+    publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     record = read_record(delivery / f"attempt-{attempt}.json")
     assert record["finish"] is None
     assert record["projection"]["metrics"]["phasesweep.objective"] == 0.5
@@ -317,7 +317,7 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
             0,
             trial=create_trial(state=TrialState.FAIL, user_attrs={CLEANUP_CONFIRMED_ATTR: False}),
         )
-    publication._rebuild_attempt_intents(experiment, [generation])
+    publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     delivery = tracking_root(experiment) / generation / "delivery"
     assert [path.name for path in delivery.glob("attempt-*.json")] == [f"attempt-{'1' * 32}.json"]
     assert read_record(delivery / f"attempt-{'1' * 32}.json")["finish"] == "FAILED"
@@ -344,7 +344,7 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
             number,
             trial=create_trial(state=TrialState.FAIL, user_attrs={TRIAL_OUTCOME_ATTR: record}),
         )
-    publication._rebuild_attempt_intents(experiment, [generation])
+    publication._rebuild_attempt_intents(experiment, validate_ledger(experiment), [generation])
     delivery = tracking_root(experiment) / generation / "delivery"
     assert read_record(delivery / f"attempt-{'1' * 32}.json")["finish"] == "KILLED"
     assert read_record(delivery / f"attempt-{'2' * 32}.json")["finish"] == "FAILED"
@@ -892,3 +892,55 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     assert [r["finish"] for r in uploads if r["binding"]["run_id"] == "late-run"] == (
         [] if reply == "ok" else ["FAILED"]
     )
+
+
+def _tree_listing(root):
+    """List every entry below ``root`` with its size and modification time."""
+    return {
+        path.relative_to(root).as_posix(): (path.lstat().st_size, path.lstat().st_mtime_ns)
+        for path in [root, *sorted(root.rglob("*"))]
+    }
+
+
+def test_sync_refuses_a_tree_of_another_format_as_run_does_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    """sync-tracking checks the artifact-root binding under its lock before it writes anything."""
+    from phasesweep.engine.errors import ArtifactRootSchemaMismatchError
+    from phasesweep.engine.paths import _artifact_root_binding_path
+
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    deliver = publication.call_tracking
+
+    def offline(*args, **kwargs):
+        raise OSError("tracking server offline")
+
+    monkeypatch.setattr(publication, "call_tracking", offline)
+    run_experiment(experiment)
+    pending = publication.delivery_status(experiment)
+    assert pending["pending"] == 7 and pending["delivered"] == 0
+    binding_path = _artifact_root_binding_path(experiment)
+    current = binding_path.read_text()
+    binding = json.loads(current)
+    binding["schema_version"] -= 1
+    binding_path.write_text(json.dumps(binding) + "\n")
+    monkeypatch.setattr(publication, "call_tracking", deliver)
+    journal = tmp_path / "study.journal"
+    before = (_tree_listing(_experiment_dir(experiment)), journal.read_bytes())
+
+    with pytest.raises(ArtifactRootSchemaMismatchError) as run_refusal:
+        run_experiment(experiment)
+    uploads.clear()
+    with pytest.raises(ArtifactRootSchemaMismatchError) as sync_refusal:
+        publication.sync_tracking(experiment)
+    assert str(sync_refusal.value) == str(run_refusal.value)
+    assert "Nothing was written" in str(sync_refusal.value)
+    assert uploads == []
+    assert (_tree_listing(_experiment_dir(experiment)), journal.read_bytes()) == before
+
+    # Restoring the binding lets the next sync deliver every pending upload.
+    binding_path.write_text(current)
+    assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 7}
+    assert len(uploads) == 7

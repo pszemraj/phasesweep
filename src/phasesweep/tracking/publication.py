@@ -548,26 +548,21 @@ def publish_failed_generation(
         _deliver(experiment, path, environment)
 
 
-def _rebuild_attempt_intents(experiment: Experiment, generation_ids: Iterable[str]) -> None:
+def _rebuild_attempt_intents(
+    experiment: Experiment, ledger: ValidatedLedger, generation_ids: Iterable[str]
+) -> None:
     """Save the attempt records an interrupted or failed invocation never saved.
 
     :param Experiment experiment: Configured experiment.
+    :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
     :param Iterable[str] generation_ids: Generations whose attempts are checked.
     """
-    from phasesweep.engine.ledger import validate_ledger
-    from phasesweep.errors import PhaseSweepError
-
     unrecorded = {
         generation_id: attempts
         for generation_id in generation_ids
         if (attempts := _unrecorded_attempts(experiment, generation_id))
     }
     if not unrecorded:
-        return
-    try:
-        ledger = validate_ledger(experiment)
-    except PhaseSweepError as exc:
-        log.warning("Unsaved MLflow attempt results stay unresolved: %s", exc)
         return
     phases = {binding["phase"] for attempts in unrecorded.values() for _, binding in attempts}
     trials = _attempt_trials(ledger, phases)
@@ -594,8 +589,9 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
     """Retry pending result projections without selecting or training.
 
-    Reconcile unresolved creations first, then rebuild missing attempt records
-    from Optuna and winner records from committed generation artifacts.
+    Check the artifact-root binding and ledger format as every writer does, then
+    reconcile unresolved creations, rebuild missing attempt records from Optuna
+    and winner records from committed generation artifacts.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -603,6 +599,10 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     :raises ValueError: The generation name is unsafe, or a delivery record is malformed.
     :raises TrackingSyncRefusedError: The config has no ``mlflow`` block, no deliveries
         exist, or the target or generation does not match the saved records.
+    :raises ArtifactRootConflictError: The tree records another owner or another format;
+        nothing is written.
+    :raises StudySchemaMismatchError: The ledger holds unsupported study state; nothing is written.
+    :raises StudyStorageUnavailableError: An unbound tree's ledger cannot be inspected.
     :raises PhaseSweepError: The MLflow SDK is not installed, or a published
         generation's artifacts no longer validate.
     :return dict[str, int]: Remaining pending and delivered counts in that scope.
@@ -610,6 +610,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
     from phasesweep.engine.errors import TrackingSyncRefusedError
+    from phasesweep.engine.ledger import validate_ledger
     from phasesweep.engine.locking import _experiment_lock
     from phasesweep.engine.trial import _environment_identity
     from phasesweep.runtime.shutdown import signal_handler_scope
@@ -624,6 +625,8 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         )
     require_mlflow_sdk()
     with signal_handler_scope(), _experiment_lock(experiment):
+        # Refuse a tree this checkout cannot own before anything here writes to it.
+        ledger = validate_ledger(experiment)
         _preflight_active_attempts(
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
         )
@@ -642,7 +645,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
         parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
-        _rebuild_attempt_intents(experiment, [parent.parent.name for parent in parents])
+        _rebuild_attempt_intents(experiment, ledger, [parent.parent.name for parent in parents])
         for parent in parents:
             if (parent.parent / "delivery" / "generation.json").exists() or not _published(
                 experiment, parent.parent.name

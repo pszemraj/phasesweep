@@ -1197,9 +1197,12 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         metrics={"phasesweep.objective": 2.0}, params={}, tags={}, summary={"metric": 2.0}
     )
     from phasesweep.engine.attempts import _register_active_attempt
+    from phasesweep.engine.ledger import claim_ledger, validate_ledger
     from phasesweep.engine.paths import _attempts_dir
     from phasesweep.runtime.process import write_attempt_lifecycle
 
+    # A run binds its tree before it registers any attempt; sync-tracking checks that binding.
+    claim_ledger(validate_ledger(experiment))
     trial_dir = tmp_path / "unfinished-training"
     trial_dir.mkdir()
     write_attempt_lifecycle(trial_dir, attempt_id="d" * 32, state="allocated")

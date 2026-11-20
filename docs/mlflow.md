@@ -126,7 +126,7 @@ Result uploads leave pending records on failure without changing accepted scores
 phasesweep sync-tracking mlflow.yaml
 ```
 
-`sync-tracking` retries uploads only, using the original target configuration. `--generation GENERATION_ID` limits retries to one generation, whose ID is the MCP run ID for detached runs. `sync-tracking` holds the experiment lock, skips delivered projections, and exits nonzero while uploads remain pending, when no delivery records exist in scope, or without an `mlflow` block. Permanent remote refusals, such as a deleted run, remain pending.
+`sync-tracking` retries uploads only, using the original target configuration. `--generation GENERATION_ID` limits retries to one generation, whose ID is the MCP run ID for detached runs. `sync-tracking` holds the experiment lock, refuses a tree whose binding or ledger format a run would refuse before writing anything, skips delivered projections, and exits nonzero while uploads remain pending, when no delivery records exist in scope, or without an `mlflow` block. Permanent remote refusals, such as a deleted run, remain pending.
 
 Run creation searches exact generation/attempt identity tags before creating anything. An unconfirmed creation request is not sent again: its pending record survives restarts, and reconciliation or `sync-tracking` binds the run if it appears. HTTP(S) uses this identity reconciliation; Databricks retains its SDK creation retries, so a lost response there can leave an extra unbound run.
 

@@ -46,13 +46,13 @@ flowchart TD
 
 #### 1. Mutations hold the experiment lock
 
-A run, and a `recover-run` the operator confirms, hold the experiment lock before they write the artifact tree or the ledger or read anything such a write depends on; only a run's fresh-tree checks (invariant 11) read earlier. `sync-tracking` holds it too: it retires tracking attempts and writes the tracking tree, reading the ledger only through `validate_ledger` and `read_phase_trials`.
+A run, and a `recover-run` the operator confirms, hold the experiment lock before they write the artifact tree or the ledger or read anything such a write depends on; only a run's fresh-tree checks (invariant 11) read earlier. `sync-tracking` holds it too: it checks the tree's binding and ledger format through `validate_ledger` before anything else, so a refused tree is left unchanged, then retires tracking attempts and writes the tracking tree, reading the ledger only through that handle and `read_phase_trials`.
 
 macOS's root-owned `/var` and `/tmp` aliases address the same host-lock files as their physical paths; operator-controlled symlink components remain refused.
 
-**Held by:** `runtime.files.lock_dir`, `engine.locking._experiment_lock`, entered as the outermost durable-state context in `engine.run._run_experiment_outcome`, in `mcp.recovery.recover_run` only when the operator confirms, and in `tracking.publication.sync_tracking` inside `runtime.shutdown.signal_handler_scope` for its whole body: tracking-only attempt resolution, record rebuilds, and deliveries
+**Held by:** `runtime.files.lock_dir`, `engine.locking._experiment_lock`, entered as the outermost durable-state context in `engine.run._run_experiment_outcome`, in `mcp.recovery.recover_run` only when the operator confirms, and in `tracking.publication.sync_tracking` inside `runtime.shutdown.signal_handler_scope` for its whole body: `engine.ledger.validate_ledger` first, then tracking-only attempt resolution, record rebuilds, and deliveries
 
-**Tests:** `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration`, `tests/test_locking.py::test_macos_system_temp_aliases_share_physical_host_locks`
+**Tests:** `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration`, `tests/test_locking.py::test_macos_system_temp_aliases_share_physical_host_locks`, `tests/test_mlflow_terminal_delivery.py::test_sync_refuses_a_tree_of_another_format_as_run_does_and_writes_nothing`
 
 #### 2. Validation writes nothing
 
