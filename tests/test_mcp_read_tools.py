@@ -52,6 +52,7 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.files import private_atomic_write_text
 from tests.conftest import (
     phase_study,
     write_constant_trainer,
@@ -72,6 +73,22 @@ from tests.mcp_helpers import (
     write_srv_catalog,
     write_srv_config,
 )
+
+
+def _record_confirmed_recovery(store: RunStore, handle: RunHandle) -> None:
+    """Write the evidence a confirmed ``recover-run`` leaves, settling the run's process cleanup."""
+    private_atomic_write_text(
+        store.cleanup_recovery_path(handle.run_id),
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": [],
+                "reaped_attempt_locations": {},
+            }
+        ),
+    )
 
 
 def _record_published_run_snapshot(
@@ -664,6 +681,53 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert payload.publication_integrity == "ok"
     assert payload.represented_generation_id == run_id
     assert tree_snapshot(store.log_path(run_id).parent) == logs_before
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.integration
+def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
+    tmp_path: Path,
+    read_tool: str,
+) -> None:
+    """A succeeded run with no recorded failure and unconfirmed cleanup reads sync-tracking then recover-run, with winners readable until recovery is confirmed."""
+    app, _registry, store, handle, terminal = _published_run_terminal(tmp_path)
+    run_id = handle.run_id
+    assert terminal.get("failure") is None
+    write_run_status(store, **{**terminal, "cleanup_confirmed": False})
+    stored_status = store.status_path(run_id).read_bytes()
+
+    payload = _read_run_tool(app, read_tool, run_id)
+
+    if read_tool == "winners":
+        assert payload["winner_count"] == 1
+        failure = payload["failure"]
+    else:
+        assert payload["run"]["state"] == "running"
+        assert payload["run"]["recovery_required"] is True
+        assert payload["phases"][0]["winner_present"] is True
+        failure = payload["run"]["failure"]
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["publication_integrity"] == "ok"
+    assert payload["represented_generation_id"] == run_id
+    assert failure is not None
+    assert failure["code"] == "cleanup_uncertain"
+    assert failure["actor"] == "operator"
+    assert failure["retryable"] is False
+    remediation = failure["remediation"]
+    assert f"phasesweep sync-tracking CONFIG --generation {run_id}" in remediation
+    assert remediation.index("sync-tracking") < remediation.index("phasesweep mcp recover-run")
+    assert store.status_path(run_id).read_bytes() == stored_status
+
+    _record_confirmed_recovery(store, handle)
+
+    settled = _read_run_tool(app, read_tool, run_id)
+    if read_tool == "winners":
+        assert settled["winner_count"] == 1
+        assert settled["failure"] is None
+    else:
+        assert settled["run"]["state"] == "succeeded"
+        assert settled["run"]["recovery_required"] is False
+        assert settled["run"]["failure"] is None
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])

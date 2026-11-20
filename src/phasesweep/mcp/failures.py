@@ -62,6 +62,23 @@ def run_failure_payload(
             )
     if persisted is not None and observation.cleanup_recovery_required:
         return persisted
+    if observation.cleanup_recovery_required and terminal.get("returncode") == 0:
+        # A succeeded run records no failure, but its MLflow upload worker's cleanup can be
+        # unconfirmed, and that leaves the agent a recovery with no step to relay.
+        return {
+            "code": "cleanup_uncertain",
+            "stage": "cleanup",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "The run succeeded and its published results are unaffected, but cleanup of "
+                "its MLflow upload worker is unconfirmed. Stop monitoring and ask the operator "
+                "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG "
+                f"--generation {handle.run_id}`, then run `phasesweep mcp recover-run` from a "
+                "host shell, review its preview and repeat with `--confirm`, before another "
+                "launch."
+            ),
+        }
     runner_ended_with_boot = (
         observation.terminal_status is None
         and handle.launch_state == "spawned"
