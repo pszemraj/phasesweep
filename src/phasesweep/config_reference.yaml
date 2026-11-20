@@ -1,4 +1,4 @@
-# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml.
+# config_reference.yaml: every key of a PhaseSweep experiment, in signature form (key: type = default), so it does not load. Start from https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml or a template: phasesweep init --list names them and phasesweep init --template NAME writes one.
 
 # Config file: the CONFIG argument of phasesweep run, validate, status, show-winners and sync-tracking, read once per invocation. No default file is searched.
 # explain and MCP explain_config pin links to the installed release tag or source revision at read time; this file links to development docs.
@@ -28,6 +28,7 @@ experiment: string (required)
 # {config_path}, {overrides} or {overrides_path} carries the trainer input, as override_format says, for example python train.py --config {config_path}.
 # PhaseSweep shell-quotes every placeholder but {trial_id}. Write {{ and }} for literal braces and $VAR or ${{VAR}} for a shell variable.
 # Unknown placeholders, attribute or index access, format specs such as {trial_id:05d}, conversions such as {phase!r}, or unbalanced braces fail config load.
+# See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#source-checkout-preflight before running a trainer from a source checkout.
 trial_command: string (required)
 
 # ---------- Objective ----------
@@ -78,6 +79,7 @@ phases: list[object] (required)
     # When the target is reached with no eligible feasible attempt, the phase fails.
     # On persistent storage a raised target runs the remaining attempts in the same study, and a lowered one is refused.
     # While a phase that inherits from this one, even indirectly, has trials, a run that would add trials here is refused. Use a new experiment name then.
+    # Recommended: one trial per configuration, spending the budget on more distinct values, such as 7 to 8 log-spaced learning rates.
     # See: https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#timeouts-cleanup-and-continuation for retries, aborts and partial results.
     n_trials: int (required)
 
