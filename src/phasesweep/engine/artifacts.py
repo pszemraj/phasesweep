@@ -330,7 +330,7 @@ def _load_winner(
             else "The last published generation holds no winner for it."
         )
         rerun = (
-            "Resume without --from-phase to reuse completed trials"
+            "Run without --from-phase so the earlier phases run first (completed trials are reused)"
             if experiment.persistent
             else "Run without --from-phase to start every phase again, because storage: null "
             "keeps no completed trials"
