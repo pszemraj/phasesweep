@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from phasesweep.mcp.errors import recover_run_step
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step
 from phasesweep.mcp.runner import (
     FailureCode,
     FailurePayload,
@@ -78,8 +78,7 @@ def _validated(failure: JsonObject | None) -> JsonObject | None:
 
 _CLEANUP_SETTLED_REMEDIATION = (
     "Operator recovery settled this run's process cleanup, so no recover-run step remains. The "
-    "run itself still ended without completing; a new run of this experiment keeps its finished "
-    "trials and reruns its interrupted ones first."
+    f"run itself still ended without completing; {NEW_RUN_RESUMES}."
 )
 
 
@@ -300,10 +299,9 @@ def _diagnose(
         recovery_required = observation.recovery_required or observation.runner_heartbeat_stale
         if runner_ended_with_boot:
             remedy = (
-                "The runner ended with an earlier host boot. No process from that boot "
-                "remains, so process cleanup and recover-run are not required. This "
-                "run's historical results are unavailable; do not substitute mutable "
-                "experiment-level results."
+                "The runner ended with an earlier host boot, so no process from that boot "
+                "remains and no recover-run step is needed. This run recorded no results; "
+                f"{NEW_RUN_RESUMES}."
             )
         elif observation.runner_heartbeat_stale:
             remedy = (
@@ -316,9 +314,8 @@ def _diagnose(
                 "The runner exited without writing a final status; its trial processes may "
                 f"still be alive. {_stop_for_recovery(handle.run_id)}"
                 if recovery_required
-                else "The runner exited without writing a final status. Operator recovery "
-                "settled process cleanup; this run's historical results remain unavailable. "
-                "Do not substitute mutable experiment-level results."
+                else "The runner exited without writing a final status, and operator recovery "
+                f"settled its process cleanup. This run recorded no results; {NEW_RUN_RESUMES}."
             )
         runner_failure = operator_failure(
             "cleanup_uncertain" if recovery_required else "result_snapshot_unavailable",
@@ -332,9 +329,9 @@ def _diagnose(
         snapshot_unavailable = operator_failure(
             "result_snapshot_unavailable",
             "cleanup",
-            "Report that this run's historical results are unavailable and ask "
-            "the operator to inspect the PhaseSweep run or server diagnostics; "
-            "do not substitute mutable experiment-level results.",
+            "Report that this run's results are unavailable, not another run's results in "
+            "their place, and ask the operator to inspect the PhaseSweep run or server "
+            "diagnostics.",
         )
         return _Diagnosis(_with_cause(snapshot_unavailable, persisted), recorded, False)
     # Other terminal diagnoses and remediations survive operator recovery; the live

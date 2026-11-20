@@ -48,7 +48,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     operator_step,
 )
-from phasesweep.mcp.errors import recover_run_step
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -238,10 +238,7 @@ def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, 
             code="cancelled",
             retryable=True,
             actor="agent",
-            remediation=(
-                "A new run of this experiment keeps its finished trials and reruns the "
-                "interrupted ones first."
-            ),
+            remediation=f"The run was cancelled; {NEW_RUN_RESUMES}.",
         )
     return payload
 

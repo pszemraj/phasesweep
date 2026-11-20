@@ -14,6 +14,11 @@ _MAX_LISTED_UNREADABLE_RECORDS = 5
 
 CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
 
+#: What the next launch does with an experiment whose run ended early, for a run that stopped.
+NEW_RUN_RESUMES = (
+    "a new run of this experiment keeps its finished trials and reruns its interrupted ones first"
+)
+
 
 def recover_run_step(run_id: str, *, outside_sandbox: bool = False) -> str:
     """Return the operator's whole ``recover-run`` step for one run, to follow "ask the operator to".
@@ -227,8 +232,8 @@ class RunSnapshotUnavailableError(McpToolError):
         """
         super().__init__(
             f"saved config snapshot for run {run_id!r} is unavailable or invalid; "
-            "the run cannot be monitored safely. Report this to the operator; do not "
-            "substitute experiment-level results."
+            "the run cannot be monitored safely. Report this to the operator, not another "
+            "run's results in its place."
         )
 
 
@@ -245,9 +250,8 @@ class RunResultSnapshotUnavailableError(McpToolError):
         super().__init__(
             f"terminal result snapshot for run {run_id!r} is unavailable or invalid{state}; "
             "retry once after a short delay only if finalization is still pending. "
-            "If the error persists, report it to the operator; a missing historical "
-            "snapshot cannot be rebuilt from mutable shared results; do not substitute "
-            "experiment-level results."
+            "If the error persists, report it to the operator; this run's results cannot be "
+            "rebuilt, so do not report another run's results in their place."
         )
 
 
@@ -262,7 +266,7 @@ class RunPersistentStateUnavailableError(McpToolError):
         super().__init__(
             f"run {run_id!r} cannot be read safely because its persistent study state is "
             "unavailable or incompatible. Report this to the operator; do not retry, "
-            "launch a replacement, or substitute experiment-level results."
+            "launch a replacement, or report another run's results in its place."
         )
 
 

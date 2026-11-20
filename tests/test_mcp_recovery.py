@@ -422,7 +422,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
         "runner exited without writing a final status"
         in unavailable["run"]["failure"]["remediation"]
     )
-    assert "settled process cleanup" in unavailable["run"]["failure"]["remediation"]
+    assert "settled its process cleanup" in unavailable["run"]["failure"]["remediation"]
     assert unavailable["phases"][0]["trial_data_available"] is False
 
     captured = patch_popen_capture(monkeypatch)
@@ -566,10 +566,10 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "The runner ended with an earlier host boot. No process from that boot "
-            "remains, so process cleanup and recover-run are not required. This "
-            "run's historical results are unavailable; do not substitute mutable "
-            "experiment-level results."
+            "The runner ended with an earlier host boot, so no process from that boot "
+            "remains and no recover-run step is needed. This run recorded no results; a new "
+            "run of this experiment keeps its finished trials and reruns its interrupted ones "
+            "first."
         ),
     }
     for payload in (status, awaited):

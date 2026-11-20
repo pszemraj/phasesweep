@@ -52,7 +52,6 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
-from phasesweep.runtime.files import private_atomic_write_text
 from tests.conftest import (
     phase_study,
     write_constant_trainer,
@@ -65,6 +64,7 @@ from tests.mcp_helpers import (
     drift_experiment,
     make_mcp_app,
     make_run_handle,
+    record_confirmed_recovery,
     side_effect_app,
     stage_dead_run,
     stage_live_run,
@@ -74,22 +74,6 @@ from tests.mcp_helpers import (
     write_srv_config,
     write_unsafe_cleanup_status,
 )
-
-
-def _record_confirmed_recovery(store: RunStore, handle: RunHandle) -> None:
-    """Write the evidence a confirmed ``recover-run`` leaves, settling the run's process cleanup."""
-    private_atomic_write_text(
-        store.cleanup_recovery_path(handle.run_id),
-        json.dumps(
-            {
-                "run_id": handle.run_id,
-                "config_sha256": handle.config_sha256,
-                "cleanup_confirmed": True,
-                "reaped_attempt_ids": [],
-                "reaped_attempt_locations": {},
-            }
-        ),
-    )
 
 
 def _record_published_run_snapshot(
@@ -772,7 +756,7 @@ def test_run_whose_upload_cleanup_is_unconfirmed_names_the_operator_steps(
     assert remediation.index("sync-tracking") < remediation.index("phasesweep mcp recover-run")
     assert store.status_path(run_id).read_bytes() == stored_status
 
-    _record_confirmed_recovery(store, handle)
+    record_confirmed_recovery(store, handle)
 
     settled = _read_run_tool(app, read_tool, run_id)
     if read_tool == "winners":
@@ -821,7 +805,7 @@ def test_recorded_cleanup_failure_stops_asking_for_recovery_once_recovery_is_con
     assert f"recover-run --state-dir STATE_DIR --run-id {run_id}`" in failure["remediation"]
     assert "`--confirm` before another launch" in before["failure"]["remediation"]
 
-    _record_confirmed_recovery(store, handle)
+    record_confirmed_recovery(store, handle)
 
     after = app.status(run_id=run_id)["run"]
 

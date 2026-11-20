@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -23,11 +22,12 @@ from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime import reaper
-from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.time import utc_now_iso
 from tests.mcp_helpers import (
     claim_runner_handle,
+    earlier_boot_id,
     make_dead_run_handle,
+    record_confirmed_recovery,
     side_effect_app,
     stage_dead_run,
     stage_live_run,
@@ -229,18 +229,7 @@ def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause
         },
     }
     write_unsafe_cleanup_status(store, RUN_ID, failure=recorded, result_snapshot_state="failed")
-    private_atomic_write_text(
-        store.cleanup_recovery_path(RUN_ID),
-        json.dumps(
-            {
-                "run_id": RUN_ID,
-                "config_sha256": handle.config_sha256,
-                "cleanup_confirmed": True,
-                "reaped_attempt_ids": [],
-                "reaped_attempt_locations": {},
-            }
-        ),
-    )
+    record_confirmed_recovery(store, handle)
 
     failure = response_failure(store, handle, view=store.runner_view(handle))
     read_failure = app.status(run_id=RUN_ID)["run"]["failure"]
@@ -251,6 +240,35 @@ def test_a_recovered_cleanup_failure_without_a_snapshot_keeps_one_level_of_cause
     assert failure["code"] == "result_snapshot_unavailable"
     assert failure["cause"]["code"] == "cleanup_uncertain"
     assert "cause" not in failure["cause"]
+
+
+@pytest.mark.parametrize("ended", ["recovered", "earlier-boot"])
+def test_a_run_that_ended_without_status_says_a_new_run_resumes(tmp_path: Path, ended: str) -> None:
+    """A runner that ended without a final status, once recovered or from an earlier boot, reads as a run that recorded no results and whose next run keeps the finished trials."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    boot_id = earlier_boot_id() if ended == "earlier-boot" else None
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False, boot_id=boot_id)
+    if ended == "recovered":
+        # The terminal status recover-run writes for a runner that exited without one.
+        write_run_status(
+            store,
+            RUN_ID,
+            returncode=1,
+            error_class="RunnerExitedWithoutStatus",
+            result_snapshot_state="failed",
+        )
+
+    run = app.status(run_id=RUN_ID)["run"]
+
+    assert (run["state"], run["recovery_required"]) == ("failed", False)
+    assert run["failure"]["code"] == "result_snapshot_unavailable"
+    remediation = run["failure"]["remediation"]
+    assert "This run recorded no results" in remediation
+    assert (
+        "a new run of this experiment keeps its finished trials and reruns its interrupted "
+        "ones first" in remediation
+    )
+    assert "substitute" not in remediation
 
 
 def test_a_cancel_that_leaves_recovery_names_the_operators_step(tmp_path: Path) -> None:
