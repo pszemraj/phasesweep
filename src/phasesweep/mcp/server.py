@@ -1,7 +1,7 @@
 """FastMCP adapter: the only module that imports the MCP SDK.
 
 PhaseSweepMCP (in :mod:`phasesweep.mcp.tools`) holds all logic and is SDK-free.
-build_server wraps each method as a FastMCP tool; _safe_tool
+build_server wraps each method as a FastMCP tool and adds get_guide; _safe_tool
 guarantees tool errors are redacted. serve() loads the catalog, builds the
 store, and serves over stdio; call() runs one tool through the same server.
 """

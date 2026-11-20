@@ -444,8 +444,8 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
     assert [message.content.text for message in prompt.messages] == [guide]
 
 
-def test_fastmcp_get_guide_returns_the_text_the_prompt_serves(tmp_path: Path) -> None:
-    """The guide has one source, and a client receives it as plain text, not as a JSON object."""
+def test_fastmcp_get_guide_returns_the_guide_as_text(tmp_path: Path) -> None:
+    """A client receives the guide as plain text, not as a JSON object."""
     pytest.importorskip("mcp")
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)

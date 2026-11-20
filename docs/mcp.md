@@ -133,7 +133,7 @@ Run status and results expose the run state, phase counts, winner presence, metr
 
 For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. `catalog_status` describes the current catalog reload state separately from those frozen scientific facts. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
-Read provenance and labels together; each tool's output schema also describes every field:
+Read provenance and labels together; the tool's output schema also describes every field:
 
 | Field | Interpretation |
 | --- | --- |
