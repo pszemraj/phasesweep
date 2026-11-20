@@ -1745,7 +1745,7 @@ def test_cli_boundary_reports_expected_run_failure(
 @pytest.mark.parametrize(
     ("action", "remedy"),
     [
-        (OperatorAction.FRESH_NAMESPACE, "start a fresh study by setting a new `experiment` name"),
+        (OperatorAction.FRESH_NAMESPACE, "set a new `experiment` name in the config to start"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "restore the files and permissions identified in the error"),
         (

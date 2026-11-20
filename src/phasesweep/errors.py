@@ -91,16 +91,19 @@ RERUN_CLEANUP_RECOVERY = (
 )
 
 
-NEW_STUDY_STEP = (
-    "Set a new `experiment` name in the config to start a fresh "
-    "study (with `storage: auto`, a new `workdir` also works); the old study stays readable "
-    "with its original config."
+_FRESH_STUDY_TAIL = (
+    " a new `experiment` name in the config to start a fresh study "
+    "(with `storage: auto`, a new `workdir` also works)"
 )
+
+#: The one way to start over, worded as a clause for a step that offers it second.
+FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
+
+NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
 #: The way out of data another PhaseSweep release wrote, for an artifact root or a study.
 OTHER_FORMAT_STEP = (
-    "Set a new `experiment` name in the config to start a fresh study (with `storage: auto`, "
-    "a new `workdir` also works). The PhaseSweep release that wrote the old data still reads it."
+    f"Set{_FRESH_STUDY_TAIL}. The PhaseSweep release that wrote the old data still reads it."
 )
 
 #: The same for a ledger, which holds every experiment's studies: under an explicit `storage` a
@@ -144,10 +147,7 @@ def format_mismatch(version: object, current: int) -> str:
 
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.FRESH_NAMESPACE: (
-        "start a fresh study by setting a new `experiment` name in the config "
-        "(with `storage: auto`, a new `workdir` also works)"
-    ),
+    OperatorAction.FRESH_NAMESPACE: FRESH_STUDY,
     OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
     OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
     OperatorAction.PROVISION_LOCK_DIR: (

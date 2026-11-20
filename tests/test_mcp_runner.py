@@ -262,7 +262,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "start a fresh study by setting a new `experiment` name",
+            "set a new `experiment` name in the config to start a fresh study",
             id="artifact_root",
         ),
     ],

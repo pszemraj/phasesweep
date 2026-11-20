@@ -14,7 +14,7 @@ import optuna
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)
@@ -209,8 +209,8 @@ _MAX_REPORTED_VALUE_CHARS = 80
 _REPORTED_VALUE_LEAD_CHARS = 24
 #: The refusal shows each recorded value, so restoring it is the first way out.
 _RESTORE_OR_NEW_STUDY_STEP = (
-    "Restore the recorded value(s) to continue this study, or "
-    f"{NEW_STUDY_STEP[:1].lower()}{NEW_STUDY_STEP[1:]}"
+    f"Restore the recorded value(s) to continue this study, or {FRESH_STUDY}; "
+    "the old study stays readable with its original config."
 )
 _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "

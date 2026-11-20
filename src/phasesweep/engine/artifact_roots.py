@@ -35,7 +35,7 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
-from phasesweep.errors import OTHER_FORMAT_STEP, OperatorAction, format_mismatch
+from phasesweep.errors import FRESH_STUDY, OTHER_FORMAT_STEP, OperatorAction, format_mismatch
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
@@ -129,9 +129,7 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
 
 
 _MOVED_TREE_STEP = (
-    "Use the tree at the recorded path (move it back if it was moved), or set a new "
-    "`experiment` name in the config to start a fresh study (with `storage: auto`, a new "
-    "`workdir` also works)."
+    f"Use the tree at the recorded path (move it back if it was moved), or {FRESH_STUDY}."
 )
 
 
@@ -181,8 +179,7 @@ def _binding_mismatch(
         action=OperatorAction.FIX_CONFIG,
         remediation=(
             f"Restore the {' and '.join(names)} this tree was created with to continue this "
-            "study, or set a new `experiment` name to start a fresh study "
-            "(with `storage: auto`, a new `workdir` also works)."
+            f"study, or {FRESH_STUDY}."
         ),
     )
 
