@@ -54,6 +54,7 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    console_script,
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
@@ -1294,7 +1295,7 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
     _experiment_dir(experiment).mkdir(parents=True)
 
     result = subprocess.run(
-        [sys.executable, "-m", "phasesweep", "status", str(config_path)],
+        [str(console_script("phasesweep")), "status", str(config_path)],
         capture_output=True,
         text=True,
         cwd=tmp_path,

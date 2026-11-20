@@ -580,6 +580,21 @@ def copy_fake_train(tmp_path: Path) -> Path:
     return trainer
 
 
+def console_script(name: str) -> Path:
+    """Locate a console script installed beside the test interpreter.
+
+    The environment's script directory need not be on ``PATH``, so tests name the script by
+    path and never depend on the ambient lookup.
+
+    :param str name: Console script name, for example ``phasesweep``.
+    :return Path: Path of the script.
+    """
+    script = Path(sys.executable).with_name(name)
+    if not script.is_file():
+        pytest.fail(f"console script {name!r} is not installed beside {sys.executable}")
+    return script
+
+
 #: The objective the packaged ``fake_train`` example writes to ``result.json``.
 FAKE_TRAIN_METRIC = Metric(
     name="eval_loss",

@@ -15,7 +15,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -39,6 +38,7 @@ from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, kill_stale_group
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
+    console_script,
     copy_fake_train,
     make_experiment,
     phase_trials,
@@ -119,7 +119,7 @@ class _Harness:
         """
         with self.log.open("a") as handle:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "phasesweep", "run", str(config)],
+                [str(console_script("phasesweep")), "run", str(config)],
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
                 stderr=subprocess.STDOUT,

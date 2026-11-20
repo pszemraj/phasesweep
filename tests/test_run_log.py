@@ -6,7 +6,6 @@ import csv
 import logging
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import optuna
@@ -24,6 +23,7 @@ from phasesweep.evidence.models import LogRegexExtractor
 from phasesweep.runtime.gpu import GpuPool
 from tests.conftest import (
     bounded_metric,
+    console_script,
     make_experiment,
     phase_study,
     trial_outcome,
@@ -278,7 +278,7 @@ def test_cli_failed_trial_tracebacks_require_verbose(tmp_path: Path, verbose: bo
     config_path.write_text(experiment.model_dump_json())
 
     result = subprocess.run(
-        [sys.executable, "-m", "phasesweep", "run", str(config_path), *(["-v"] if verbose else [])],
+        [str(console_script("phasesweep")), "run", str(config_path), *(["-v"] if verbose else [])],
         capture_output=True,
         text=True,
         cwd=tmp_path,

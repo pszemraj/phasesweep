@@ -25,6 +25,7 @@ from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.read import read_result, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.tracking.publication import delivery_status, sync_tracking
+from tests.conftest import console_script
 
 pytestmark = pytest.mark.integration
 
@@ -42,9 +43,7 @@ def _server(tmp_path):
     with (tmp_path / "server.log").open("w") as log:
         process = subprocess.Popen(
             [
-                sys.executable,
-                "-m",
-                "mlflow",
+                str(console_script("mlflow")),
                 "server",
                 "--host",
                 "127.0.0.1",
@@ -305,7 +304,7 @@ def test_two_phases_native_http_then_offline(offline_server, tmp_path, monkeypat
         workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     config["trial_command"] = (
-        f"{Path(sys.executable).with_name('phasesweep-mlflow-train')} --config {{config_path}}"
+        f"{console_script('phasesweep-mlflow-train')} --config {{config_path}}"
     )
     config["mlflow"].update(tracking_uri=uri, run_mode=mode, timeout_seconds=15, poll_seconds=0.05)
     if mode == "trainer":

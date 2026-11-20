@@ -82,6 +82,7 @@ from phasesweep.runtime.reaper import (
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import (
+    console_script,
     lose_record_writes,
     make_experiment,
     mark_current_format,
@@ -428,7 +429,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     resume_args = ["--from-phase", from_phase] if from_phase is not None else []
     try:
         refused_run = subprocess.run(
-            [sys.executable, "-m", "phasesweep", "run", str(config_path), *resume_args],
+            [str(console_script("phasesweep")), "run", str(config_path), *resume_args],
             capture_output=True,
             text=True,
             start_new_session=True,
