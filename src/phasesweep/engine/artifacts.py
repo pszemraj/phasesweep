@@ -33,6 +33,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_ATTR,
     Winner,
 )
+from phasesweep.engine.study_policy import _describe_environment_changes
 from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, operator_step
 from phasesweep.runtime.files import atomic_text_writer
@@ -238,33 +239,57 @@ def _warn_environment_drift(
     experiment: Experiment,
     phase_name: str,
     stored_digest: str,
+    stored_environment: dict[str, str] | None = None,
 ) -> None:
     """Warn once when result reuse crosses semantic environment cohorts.
 
     Skipped-phase loading and no-work replay reuse results without allocating trials;
-    ordinary top-ups refuse cohort drift before allocation.
+    ordinary top-ups refuse cohort drift before allocation. The warning names the
+    variables that differ when the caller holds the winning trial's recorded mapping,
+    and shows the two digests otherwise.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
     :param str stored_digest: Digest recorded on the reused winner or its trial.
+    :param dict[str, str] | None stored_environment: Tracked mapping the winning trial
+        recorded, or ``None`` when the caller holds only the digest.
     """
-    current_digest = _environment_identity(
+    current = _environment_identity(
         experiment,
         phase_name,
         require_wandb_online=False,
-    ).digest
-    if stored_digest == current_digest:
+    )
+    if stored_digest == current.digest:
+        return
+    differences = (
+        _describe_environment_changes(stored_environment, current.tracked)
+        if stored_environment is not None
+        else ""
+    )
+    key = ("environment-drift", experiment.experiment, phase_name, stored_digest)
+    if differences:
+        _warn_once(
+            log,
+            key,
+            "[%s] reused winner ran under a different trainer environment: %s "
+            "(execution.inherit_env=%r). The recorded result is being reused across an "
+            "environment change; confirm the difference is irrelevant to the metric, or "
+            "re-run the phase.",
+            phase_name,
+            differences,
+            experiment.execution.inherit_env,
+        )
         return
     _warn_once(
         log,
-        ("environment-drift", experiment.experiment, phase_name, stored_digest),
+        key,
         "[%s] reused winner ran under trainer environment %s..., but this process "
         "composes %s... under execution.inherit_env=%r. The recorded result is being "
         "reused across an environment change; confirm the difference is irrelevant to "
         "the metric, or re-run the phase.",
         phase_name,
         stored_digest[:12],
-        current_digest[:12],
+        current.digest[:12],
         experiment.execution.inherit_env,
     )
 

@@ -53,6 +53,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OBSERVED_PREFIX,
     RERUN_OF_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
@@ -61,7 +62,7 @@ from phasesweep.engine.state import (
     constraint_attr,
 )
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, PhaseSweepError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 
 log = logging.getLogger("phasesweep.engine.selection")
 
@@ -150,6 +151,9 @@ class SelectedTrial:
     # Advisory verdicts on the population this selection ranked
     # (:mod:`phasesweep.engine.confound`).
     confound: dict[str, Any]
+    # The tracked environment mapping behind ``trainer_env_digest``, or ``None`` when the
+    # trial recorded none. Only the ledger trial holds it; winner.yaml keeps the digest.
+    trainer_env: dict[str, str] | None = None
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
     # Report-only values the selected trial recorded, by observation name; for
@@ -405,6 +409,7 @@ def select_winner(
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
+        trainer_env=json_text_map(best.user_attrs.get(TRAINER_ENV_ATTR)),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
         confound=confound,
         observed=(

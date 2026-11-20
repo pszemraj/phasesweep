@@ -1729,7 +1729,9 @@ def _select_phase_winner(
     if verify_evidence:
         _verify_winner_evidence(experiment, phase, selected)
         # Replayed winners may predate the current environment cohort.
-        _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
+        _warn_environment_drift(
+            experiment, phase.name, selected.trainer_env_digest, selected.trainer_env
+        )
     effective = _winner_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,

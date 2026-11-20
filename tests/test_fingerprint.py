@@ -536,6 +536,41 @@ def test_replay_under_changed_environment_warns_about_drift(
 
 
 @pytest.mark.integration
+def test_drift_warning_names_the_variable_where_the_trial_mapping_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A replayed phase names the changed variable; a skipped phase's published winner shows digests.
+
+    The ledger trial records the tracked mapping and winner.yaml records only its digest, so a
+    skipped phase loaded from the publication holds nothing to compare.
+    """
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+    caplog.set_level(logging.WARNING, logger="phasesweep")
+    base = _environment_cohort_experiment(
+        tmp_path,
+        write_constant_trainer(tmp_path),
+        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+    )
+    experiment = base.model_copy(
+        update={"phases": [base.phases[0], base.phases[0].model_copy(update={"name": "q"})]}
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+    run_experiment(experiment, from_phase="q")
+
+    messages = [r.getMessage() for r in caplog.records if "reused winner" in r.getMessage()]
+    (skipped,) = [m for m in messages if m.startswith("[p]")]
+    (replayed,) = [m for m in messages if m.startswith("[q]")]
+    assert len(messages) == 2
+    assert 'PHASESWEEP_DATASET_REV "revision-a" -> "revision-b"' in replayed
+    assert "but this process composes" not in replayed
+    assert "but this process composes" in skipped
+    assert "revision-a" not in skipped
+
+
+@pytest.mark.integration
 def test_identical_semantic_environment_resumes_persistent_study(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
