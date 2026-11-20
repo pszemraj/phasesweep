@@ -88,9 +88,12 @@ class _PreflightCleanupReport:
     unreceipted_attempt_ids: set[str] = field(default_factory=set)
     """Recovered tracking operations whose cleanup receipt could not be written."""
     unreadable_evidence: dict[str, str] = field(default_factory=dict)
-    """Completed attempts left RUNNING because their tracker gave no answer, with the
-    first failure. Any entry stops later extractions in the pass, so an outage costs one
-    read; a run that just met it seeds one under its generation id."""
+    """Completed attempts left RUNNING because their tracker gave no answer, each with its
+    failure."""
+    unreadable_tracker: str | None = None
+    """First reason a tracker could not be read in this pass, from an extraction or the run
+    that just stopped on it. Once set, later extractions in the pass skip their read, so an
+    outage costs one read."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -1140,12 +1143,10 @@ def _recover_completed_trial(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
         return None
-    if report is not None and report.unreadable_evidence:
+    if report is not None and report.unreadable_tracker is not None:
         # This pass already found a tracker unreadable; keep the training without
         # spending another read's timeout on it.
-        report.unreadable_evidence.setdefault(
-            record.attempt_id, next(iter(report.unreadable_evidence.values()))
-        )
+        report.unreadable_evidence.setdefault(record.attempt_id, report.unreadable_tracker)
         _warn_deferred_extraction(
             record.attempt_id, record.phase_name, trial.number, persistent=True
         )
@@ -1211,6 +1212,8 @@ def _recover_completed_trial(
         if report is None:
             raise _pending_evidence_refusal({record.attempt_id: result.failure_reason})
         report.unreadable_evidence[record.attempt_id] = result.failure_reason
+        if report.unreadable_tracker is None:
+            report.unreadable_tracker = result.failure_reason
         log.warning(
             "Completed orphan attempt %s stays pending; its tracker gave no answer: %s",
             record.attempt_id,

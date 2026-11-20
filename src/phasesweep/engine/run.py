@@ -397,7 +397,7 @@ def _run_experiment_outcome(
                 if isinstance(exc, TrackingTargetUnavailableError):
                     # The run just found its tracker unreadable; keep pending training
                     # without spending another read's timeout before reporting it.
-                    reconciliation.unreadable_evidence[generation_id] = str(exc)
+                    reconciliation.unreadable_tracker = str(exc)
                 try:
                     guard_ops._reconcile_existing_studies(
                         experiment,

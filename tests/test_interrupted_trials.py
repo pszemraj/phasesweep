@@ -1304,14 +1304,31 @@ def _assert_restored_tracker_keeps_training(
 @pytest.mark.parametrize("n_jobs", [1, 2])
 def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     wandb_worker_sdk: Callable[[str], None],
     n_jobs: int,
 ) -> None:
-    """A tracker that gives no answer stops the run with each finished trial pending; its next answer is kept."""
+    """A tracker that gives no answer stops the run with each finished trial pending; its next answer is kept.
+
+    The run's reconciliation learns of the outage from the live stop, so it reads no tracker,
+    and its pending evidence names only attempts.
+    """
+    import phasesweep.engine.guards as guards_module
+
     caplog.set_level(logging.INFO)
     tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
     experiment, launches = wandb_objective_experiment(tmp_path, n_trials=n_jobs, n_jobs=n_jobs)
+    reconciliations: list[_PreflightCleanupReport] = []
+    reconcile = guards_module._reconcile_existing_studies
+
+    def recording_reconcile(
+        *args: object, cleanup_report: _PreflightCleanupReport, **kwargs: object
+    ):
+        reconciliations.append(cleanup_report)
+        return reconcile(*args, cleanup_report=cleanup_report, **kwargs)
+
+    monkeypatch.setattr(guards_module, "_reconcile_existing_studies", recording_reconcile)
     tracker.switch("denied")
     with pytest.raises(TrackingTargetUnavailableError) as refused:
         run_experiment(experiment)
@@ -1325,7 +1342,14 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
         assert caplog.text.count(retained) == 1
     # Each trial read the tracker once; reconciliation did not spend another read.
     assert tracker.lookups("denied") == n_jobs
+    (reconciliation,) = reconciliations
+    assert set(reconciliation.unreadable_evidence) == {
+        trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials
+    }
+    assert reconciliation.unreadable_tracker == str(refused.value)
     _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+    # Only a failed run reconciles.
+    assert len(reconciliations) == 1
 
 
 def _in_memory_wandb_sweep(
