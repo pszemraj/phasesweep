@@ -70,6 +70,9 @@ from phasesweep.runtime.shutdown import (
 )
 from phasesweep.runtime.time import utc_now_iso
 
+#: This module's file, which the MCP server launches by path as the detached runner.
+RUNNER_SCRIPT_PATH = Path(__file__).resolve()
+
 FailureCode: TypeAlias = Literal[
     "fingerprint_mismatch",
     "artifact_root_conflict",

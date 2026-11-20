@@ -40,6 +40,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     _safe_tool,
@@ -1101,6 +1102,7 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "attacker"))
     monkeypatch.setenv("PYTHONSTARTUP", str(tmp_path / "attacker" / "startup.py"))
     monkeypatch.setenv("PYTHONEXECUTABLE", str(tmp_path / "attacker" / "python"))
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.setenv("PHASESWEEP_KEEP_ME", "kept")
     app, _registry, _store = make_mcp_app(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
@@ -1111,15 +1113,15 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
 
     cmd = captured["cmd"]
     assert cmd[0] == sys.executable
-    # The flags must precede -m, or the interpreter treats them as module args.
-    assert cmd[1:3] == ["-P", "-s"]
-    assert cmd[3:5] == ["-m", "phasesweep.mcp.runner"]
+    # The flag must precede the script, or the interpreter passes it to the script.
+    assert cmd[1:3] == ["-P", str(RUNNER_SCRIPT_PATH)]
     env = captured["env"]
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
     assert "PYTHONSTARTUP" not in env
     assert "PYTHONEXECUTABLE" not in env
-    assert env["PYTHONNOUSERSITE"] == "1"
+    # The user site stays as the server has it, so the runner imports what the server did.
+    assert "PYTHONNOUSERSITE" not in env
     assert env["PHASESWEEP_KEEP_ME"] == "kept"
 
 
@@ -1142,7 +1144,7 @@ def test_spawned_runner_cannot_execute_project_local_code(
         "pathlib.Path(sys.argv[1]).write_text(phasesweep.__file__ + '\\n' + repr(sys.path))\n"
     )
     cmd = captured["cmd"]
-    flags = cmd[1 : cmd.index("-m")]
+    flags = cmd[1 : cmd.index(str(RUNNER_SCRIPT_PATH))]
 
     completed = subprocess.run(
         [cmd[0], *flags, "-c", probe, str(resolved)],
@@ -1206,7 +1208,7 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
+    """Reproducing the unhardened spawn contract - project cwd, no ``-P``,
     inherited environment - must import the shadow package.
     """
     _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)

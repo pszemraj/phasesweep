@@ -79,7 +79,7 @@ from phasesweep.mcp.redaction import (
     winners_payload,
 )
 from phasesweep.mcp.registry import RegisteredExperiment, Registry, VisibleParamsPolicy
-from phasesweep.mcp.runner import _cleanup_uncertain_payload
+from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -148,14 +148,15 @@ _PRE_IMPORT_CODE_ENV_VARS = (
 def _runner_env() -> dict[str, str]:
     """Remove interpreter startup hooks while preserving other operator environment variables.
 
-    :return dict[str, str]: Copy of this server's environment with the
-        pre-import code hooks removed and ``PYTHONNOUSERSITE`` forced on.
+    The user site stays importable, so a runner finds a PhaseSweep this server imported from
+    there, and trainers inherit the same site setting as from a shell.
+
+    :return dict[str, str]: Copy of this server's environment with the pre-import code hooks
+        removed.
     """
-    env = {
+    return {
         name: value for name, value in os.environ.items() if name not in _PRE_IMPORT_CODE_ENV_VARS
     }
-    env["PYTHONNOUSERSITE"] = "1"
-    return env
 
 
 def _runner_protocol_argv(
@@ -1731,11 +1732,9 @@ class PhaseSweepMCP:
         ack_read, ack_write = os.pipe()
         cmd = [
             sys.executable,
-            # Exclude cwd/script paths and user site packages during interpreter startup.
+            # Keep the script's own directory off sys.path during interpreter startup.
             "-P",
-            "-s",
-            "-m",
-            "phasesweep.mcp.runner",
+            str(RUNNER_SCRIPT_PATH),
             *_runner_protocol_argv(
                 run_id=run_id,
                 config_snapshot_path=config_snapshot_path,

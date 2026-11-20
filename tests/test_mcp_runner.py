@@ -213,8 +213,8 @@ def _spawned_runner(
     )
     cmd = [
         sys.executable,
-        "-m",
-        "phasesweep.mcp.runner",
+        "-P",
+        str(mcp_runner.RUNNER_SCRIPT_PATH),
         *runner_argv(
             store,
             run_id=run_id,
@@ -453,8 +453,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         result = subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "phasesweep.mcp.runner",
+                "-P",
+                str(mcp_runner.RUNNER_SCRIPT_PATH),
                 *runner_argv(
                     store,
                     run_id=run_id,
