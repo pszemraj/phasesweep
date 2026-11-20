@@ -174,7 +174,7 @@ def test_invalid_edit_keeps_reads_and_refuses_launch_until_fixed(
     assert catalog_status["stale"] is True
     assert catalog_status["reload_refusal"] == "invalid"
     assert catalog_status["remediation"].startswith(REFUSALS[damage])
-    assert "phasesweep mcp check" in catalog_status["remediation"]
+    assert "`phasesweep mcp check --catalog CATALOG`" in catalog_status["remediation"]
     latest = app.latest_run("srv")
     assert latest["run"] is not None and latest["run"]["run_id"] == "srv-live"
     assert latest["catalog_status"] == catalog_status

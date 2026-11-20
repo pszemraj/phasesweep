@@ -136,7 +136,14 @@ def recover_run(
         ) from None
     except ValueError as exc:
         # Not a state directory at all: the path given is what needs fixing.
-        raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
+        raise RunRecoveryError(
+            str(exc),
+            action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Pass that `state_dir` as an absolute path: a relative one in the catalog "
+                "resolves against the catalog's directory, not the shell's."
+            ),
+        ) from None
     except UnsafePrivatePathError as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from None
     handle = store.get(run_id)
@@ -168,6 +175,10 @@ def recover_run(
         raise RunRecoveryError(
             f"the runner of {run_id} cannot be inspected from here: {view.reason}",
             action=OperatorAction.FIX_CONFIG,
+            remediation=(
+                "Run this command from a host shell outside any sandbox or container, where "
+                "the runner's processes are visible."
+            ),
         )
     current_boot = read_boot_id()
     if needs.cleanup_needed and (identity.boot_id is None or current_boot is None):
@@ -332,6 +343,10 @@ def _recover_pre_spawn_orphan(
     raise RunRecoveryError(
         f"unknown run id: {run_id}; pass a run id this MCP state directory records.",
         action=OperatorAction.FIX_CONFIG,
+        remediation=(
+            "Pass a run id the server returned for this catalog; the state directory holds "
+            "one `runs/<run-id>.json` file per run it records."
+        ),
     )
 
 

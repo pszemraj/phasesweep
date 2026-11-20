@@ -221,6 +221,21 @@ def test_cancel_requires_catalog_and_launch_time_permission(
     ) in str(denied.value)
 
 
+def test_cancel_refusal_for_a_dead_runner_names_recovery_not_a_signal(tmp_path: Path) -> None:
+    """A run whose runner is gone has no group to signal, so the refusal gives its recover-run step."""
+    config, app, registry, store = side_effect_app(tmp_path)
+    run_id = "srv-denied-dead"
+    stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted") as denied:
+        app.cancel(run_id)
+
+    message = str(denied.value)
+    assert "kill -TERM" not in message
+    assert f"phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}" in message
+    assert app.status(run_id=run_id)["run"]["recovery_required"] is True
+
+
 @pytest.mark.parametrize("runner", ["foreign_namespace", "finished"])
 def test_cancel_refusal_names_a_stop_route_only_it_can_give(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str

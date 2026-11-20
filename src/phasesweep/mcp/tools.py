@@ -1915,13 +1915,25 @@ class PhaseSweepMCP:
     def _runner_stop_step(self, handle: RunHandle) -> str | None:
         """Name the operator's route to stop a running run that cancel_run refuses.
 
+        A run whose runner is gone still reads as running until recovery settles it. Its
+        process group no longer exists and the number may belong to another group, so
+        the route is the run's recovery step, never a signal.
+
         :param RunHandle handle: Run whose cancellation was refused.
         :return str | None: The route, naming the runner's PID and group when this server
-            can probe them, or ``None`` when the run is not running.
+            can probe them; the recovery step when the runner is gone; or ``None`` when
+            the run is not running.
         """
         view = self._runs.runner_view(handle)
-        if self._runs.observe(handle, view=view).state != "running":
+        observation = self._runs.observe(handle, view=view)
+        if observation.state != "running":
             return None
+        if observation.recovery_required and (
+            view.visibility != "observable" or not self._runs.runner_may_be_alive(handle, view=view)
+        ):
+            failure = run_failure_payload(self._runs, handle, view=view, observation=observation)
+            if failure is not None:
+                return str(failure["remediation"])
         if view.visibility == "observable":
             return runner_stop_step(handle.run_id, handle.pid, handle.pgid)
         return runner_stop_step(handle.run_id, None, None)

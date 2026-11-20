@@ -22,13 +22,20 @@ NEW_RUN_RESUMES = (
 )
 
 
+#: The operator's command for a catalog that does not load. The agent never sees the
+#: catalog's path, and the command refuses to run without it.
+CHECK_CATALOG_COMMAND = (
+    "`phasesweep mcp check --catalog CATALOG` (with this server's catalog file as CATALOG)"
+)
+
+
 def recover_run_step(run_id: str, *, outside_sandbox: bool = False) -> str:
     """Return the operator's whole ``recover-run`` step for one run, to follow "ask the operator to".
 
     The command refuses to run without its state directory and run id, and the agent never
     sees the state directory's path, so the step names it as the catalog's ``state_dir``.
 
-    :param str run_id: Run to recover, or a placeholder such as ``<run id>`` for several.
+    :param str run_id: Run to recover, or the placeholder ``<run-id>`` for several.
     :param bool outside_sandbox: The run's processes are in another PID namespace, which only
         a shell outside every sandbox can prove gone.
     :return str: A lower-case clause ending without a full stop.
@@ -160,9 +167,9 @@ class CatalogEntryInvalidError(UnknownExperimentError):
         """
         return (
             f"experiment {experiment_id!r} is in the catalog but its entry failed to load, so "
-            "this server cannot serve it. Ask the operator to run `phasesweep mcp check` and "
-            "fix it; the server rereads the catalog on the next call. Do not retry until the "
-            "operator reports the fix."
+            f"this server cannot serve it. Ask the operator to run {CHECK_CATALOG_COMMAND} and "
+            "fix what it reports; the server rereads the catalog on the next call. Do not "
+            "retry until the operator reports the fix."
         )
 
 
@@ -205,7 +212,8 @@ class PermissionDeniedError(McpToolError):
         :param str action: Forbidden action name.
         :param str experiment_id: Catalog id whose permissions denied the action.
         :param str | None stop_step: For a refused cancel of a running run, the operator's
-            route to stop it from :func:`runner_stop_step`.
+            route to stop it from :func:`runner_stop_step`, or the run's recovery step when
+            its runner is gone.
         """
         # Launch-time permission caps cancellation, so a later catalog grant cannot reach
         # a run launched without it.
@@ -282,7 +290,7 @@ class CatalogReloadRefusedError(McpToolError):
                 f"{failing}, so this server refuses launches of every experiment, showing "
                 "`launch: false` for each, and inspection of a changed config, until the "
                 f"operator fixes {them}; "
-                "`phasesweep mcp check` shows why. Other reads keep using the entries that "
+                f"{CHECK_CATALOG_COMMAND} shows why. Other reads keep using the entries that "
                 "loaded and saved run snapshots, and the server rereads the catalog on the "
                 "next call. Do not retry until the operator reports the fix."
             )
@@ -413,7 +421,7 @@ class ConcurrencyLimitError(McpToolError):
         if recovery_ids:
             needs_recovery = ", ".join(repr(run_id) for run_id in shown if run_id in recovery_ids)
             step = recover_run_step(
-                "<run id>", outside_sandbox=bool(unobservable_ids & recovery_ids)
+                "<run-id>", outside_sandbox=bool(unobservable_ids & recovery_ids)
             )
             advice = (
                 f"Run_ids requiring operator recovery: {needs_recovery}. Ask the operator to "
@@ -425,7 +433,7 @@ class ConcurrencyLimitError(McpToolError):
                 "after that run is terminal. Ask the user before cancelling a blocking run."
             )
         if unobservable_ids - recovery_ids:
-            step = recover_run_step("<run id>", outside_sandbox=True)
+            step = recover_run_step("<run-id>", outside_sandbox=True)
             advice += (
                 " This server cannot verify runner liveness for blockers in another PID "
                 f"namespace. Monitor durable progress; if one stops, ask the operator to {step} "
@@ -455,7 +463,7 @@ class RunCapacityUnknownError(McpToolError):
             ids = ", ".join(repr(run_id) for run_id in recoverable_run_ids)
             recovery = (
                 f" Pre-spawn orphan run id(s): {ids}. Ask the operator to "
-                f"{recover_run_step('<run id>')} for each of them."
+                f"{recover_run_step('<run-id>')} for each of them."
             )
         decoded = (decode_unreadable_record(identity) for identity in unreadable)
         # Each label is a run id, or ``runs/<file name>`` for a handle file that names none.

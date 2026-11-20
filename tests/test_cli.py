@@ -438,6 +438,7 @@ def test_recover_run_expands_user_state_dir(
     assert result.exit_code != 0
     assert "unknown run id: missing" in result.output
     assert "not an existing MCP state directory" not in result.output
+    assert "fix: Pass a run id the server returned for this catalog" in result.output
 
 
 def test_recover_run_surfaces_host_error_suggestion(

@@ -33,6 +33,7 @@ from tests.mcp_helpers import (
     write_runner_heartbeat,
     write_unsafe_cleanup_status,
 )
+from tests.recovery_helpers import recover_run_cli
 
 RUN_ID = "srv-needs-recovery"
 #: The operator's recover-run command for this run, as every agent-facing step spells it.
@@ -264,3 +265,15 @@ def test_a_cancel_that_leaves_recovery_names_the_operators_step(tmp_path: Path) 
     assert (result["cleanup_confirmed"], result["recovery_required"]) == (True, True)
     assert result["failure"]["code"] == "result_snapshot_unavailable"
     assert FULL_RECOVER_RUN in result["failure"]["remediation"]
+
+
+def test_recover_run_tells_a_wrong_state_dir_how_a_relative_one_resolves(tmp_path: Path) -> None:
+    """A path that holds no state directory gets a fix line about the catalog's relative ``state_dir``."""
+    result = recover_run_cli(tmp_path / "not-state", RUN_ID)
+
+    assert result.exit_code != 0
+    assert "not an existing MCP state directory" in result.output
+    assert (
+        "fix: Pass that `state_dir` as an absolute path: a relative one in the catalog resolves "
+        "against the catalog's directory, not the shell's."
+    ) in " ".join(result.output.split())
