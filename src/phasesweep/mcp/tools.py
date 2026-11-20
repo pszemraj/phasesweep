@@ -1947,17 +1947,20 @@ class PhaseSweepMCP:
         """Require both launch-time and current cancellation permission.
 
         A catalog edit may revoke permission but cannot grant it. Decataloged runs retain their
-        launch-time permission, and so do runs of an entry that failed to load: its current
-        permission is unknown, so it counts as removed.
+        launch-time permission. An entry that is cataloged but failed to load keeps the
+        ``allow.cancel`` its catalog declares, because that block parsed: a revocation holds
+        while the entry fails, and a grant keeps a live run stoppable when its config breaks.
 
         :param RunHandle handle: Run handle whose cancellation permission should be checked.
-        :return bool: Whether both launch-time and current permission are true,
-            or the launch-time permission alone when the id is no longer cataloged or its
-            entry failed to load.
+        :return bool: Whether both launch-time and current permission are true, where the
+            current permission is the declared one for an entry that failed to load; or the
+            launch-time permission alone when the id is no longer cataloged.
         """
         if not handle.allow_cancel:
             return False
         try:
             return self._registry.get(handle.experiment_id).allow_cancel
+        except CatalogEntryInvalidError:
+            return self._registry.failed_entry_allows_cancel(handle.experiment_id)
         except UnknownExperimentError:
             return True

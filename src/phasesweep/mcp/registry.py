@@ -456,7 +456,8 @@ class CatalogCheckEntry:
 
     ``trainer_cwd`` is the resolved directory the entry's trainer starts in: its
     ``execution.cwd``, or the entry's runner ``cwd`` when that is unset. It is set for
-    entries that loaded.
+    entries that loaded. ``actions`` lists what the entry's ``allow`` block grants,
+    declared the same way for an entry that failed to load, whose catalog file still parsed.
     """
 
     experiment_id: str
@@ -524,28 +525,43 @@ def _load_catalog_entries(
         except CatalogError as exc:
             if not collect_errors:
                 raise
-            verdicts.append(CatalogCheckEntry(entry.id, error=str(exc), suggestion=exc.suggestion))
+            verdicts.append(
+                CatalogCheckEntry(
+                    entry.id,
+                    error=str(exc),
+                    suggestion=exc.suggestion,
+                    actions=_granted_actions(entry.allow),
+                )
+            )
             continue
 
         items[entry.id] = registered
         if collect_errors:
-            actions = tuple(
-                action
-                for action, allowed in (
-                    ("launch", registered.allow_launch),
-                    ("cancel", registered.allow_cancel),
-                    ("from_phase", registered.allow_from_phase),
-                )
-                if allowed
-            )
             verdicts.append(
                 CatalogCheckEntry(
                     entry.id,
-                    actions=actions,
+                    actions=_granted_actions(entry.allow),
                     trainer_cwd=registered.experiment.execution.resolved_cwd(),
                 )
             )
     return items, tuple(verdicts)
+
+
+def _granted_actions(allow: _Allow) -> tuple[str, ...]:
+    """List the actions an entry's ``allow`` block grants, in the order ``check`` prints them.
+
+    :param _Allow allow: The entry's declared permissions.
+    :return tuple[str, ...]: Granted action names among ``launch``, ``cancel`` and ``from_phase``.
+    """
+    return tuple(
+        action
+        for action, allowed in (
+            ("launch", allow.launch),
+            ("cancel", allow.cancel),
+            ("from_phase", allow.from_phase),
+        )
+        if allowed
+    )
 
 
 def check_catalog(catalog_path: Path) -> CatalogCheckReport:
@@ -697,6 +713,22 @@ class Registry:
             return self._items[experiment_id]
         except KeyError:
             raise UnknownExperimentError(experiment_id) from None
+
+    def failed_entry_allows_cancel(self, experiment_id: str) -> bool:
+        """Return whether every failed entry with this id still declares ``allow.cancel``.
+
+        The catalog file parsed, so a failed entry's ``allow`` block is known even though
+        its experiment did not load.
+
+        :param str experiment_id: Catalog id of an entry that failed to load.
+        :return bool: Whether a failed entry has that id and every such entry grants cancellation.
+        """
+        declared = [
+            "cancel" in failure.actions
+            for failure in self.failures
+            if failure.experiment_id == experiment_id
+        ]
+        return bool(declared) and all(declared)
 
     def summaries(self) -> list[dict[str, Any]]:
         """Path-free catalog listing for ``list_experiments``.

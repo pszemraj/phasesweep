@@ -21,8 +21,10 @@ from phasesweep.mcp.errors import (
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
+from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import _cleanup_failure_payload, _cleanup_uncertain_payload
-from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation, RunStore
+from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime import reaper
 from phasesweep.runtime.reaper import (
     read_boot_id,
@@ -380,6 +382,49 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
 
     with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
+
+
+@pytest.mark.parametrize("declared_cancel", [False, True])
+def test_cancel_of_an_entry_that_failed_to_load_follows_its_declared_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_cancel: bool
+) -> None:
+    """A failed entry keeps the ``allow.cancel`` its catalog declares, so a revocation holds and a grant stays usable."""
+    config = write_srv_config(tmp_path, name="broken")
+    snapshot = config.read_bytes()
+    catalog = write_mcp_catalog(
+        tmp_path,
+        {"broken": config},
+        allow={"launch": True, "cancel": declared_cancel, "from_phase": True},
+        cwd={"broken": tmp_path / "missing-cwd"},
+    )
+    registry = Registry.load(catalog, collect_errors=True)
+    assert [failure.experiment_id for failure in registry.failures] == ["broken"]
+    store = RunStore(registry.state_dir)
+    app = PhaseSweepMCP(registry, store)
+    run_id = "broken-running"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id="broken",
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        allow_cancel=True,
+    )
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+
+    def fake_kill_stale_group(*args: object, **kwargs: object) -> bool:
+        write_run_status(
+            store, run_id, returncode=143, error_class="cancelled", cleanup_confirmed=True
+        )
+        return True
+
+    monkeypatch.setattr("phasesweep.mcp.tools.kill_stale_group", fake_kill_stale_group)
+
+    if declared_cancel:
+        assert app.cancel(run_id)["state"] == "cancelled"
+    else:
+        with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
+            app.cancel(run_id)
+        assert store.observe(handle).state == "running"
 
 
 @pytest.mark.parametrize(
