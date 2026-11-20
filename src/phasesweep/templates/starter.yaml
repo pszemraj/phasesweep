@@ -1,10 +1,8 @@
 # phasesweep template: two chained phases on the packaged toy trainer, the smallest complete setup
 # Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
 #
-# Runnable PhaseSweep starter. The human owns this file: review trainer commands,
-# paths, search spaces, and permissions before launching real workloads.
-# To use your own trainer, replace trial_command, the trainer_config keys and the
-# metric extractor.
+# Runnable PhaseSweep starter. To use your own trainer, replace trial_command,
+# the trainer_config keys and the metric extractor.
 experiment: phasesweep_starter
 storage: auto
 provenance:
@@ -42,7 +40,7 @@ metric:
   # without a PhaseSweep reporting import.
   name: eval_loss
   goal: minimize
-  # Goal ranks trial scalars; the trainer owns evaluation and aggregation.
+  # Goal ranks trial scalars.
   extractor:
     type: json_envelope
     path: result.json

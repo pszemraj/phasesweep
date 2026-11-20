@@ -231,7 +231,7 @@ phases: list[object] (required)
     # It does nothing when GPUs are detected, when a device list is set, or under whole_node. With no GPU found, n_jobs above 1 needs it.
     # Any n_jobs needs it when the driver lists hardware but nvidia-smi cannot enumerate it or resolve the ambient CUDA_VISIBLE_DEVICES tokens.
     # A CUDA_VISIBLE_DEVICES of "" or -1, from env or the ambient environment, disables CUDA for single_per_trial trainers and needs no opt-in.
-    # Warning: true can let trainers see every GPU without host locks. It does not turn a CUDA model into a CPU model.
+    # Warning: true can let trainers see every GPU without host locks.
     allow_no_gpu_isolation: bool = false
 
     # ---------- Phase limits ----------
@@ -261,7 +261,7 @@ phases: list[object] (required)
     timeout_seconds_per_phase: float | null = null
 
     # Accept a feasible winner from fewer than n_trials attempts when a phase or run deadline leaves the phase incomplete, and persist that decision.
-    # false fails the run as a timeout. A per-trial timeout alone never enables it, and it never lets missing or infeasible evidence win.
+    # false fails the run as a timeout. A per-trial timeout alone never enables it.
     # Reusing a stored partial result, on a replay or through --from-phase, needs it true as well.
     allow_incomplete_on_timeout: bool = false
 
@@ -550,16 +550,15 @@ JsonEnvelopeExtractor:
   # Exact nonempty evaluation.policy the envelope must report, for example final or best. It checks metadata and never selects a checkpoint.
   policy: string (required)
 
-  # Exact nonempty evaluation.checkpoint the envelope must report. It never loads weights.
+  # Exact nonempty evaluation.checkpoint the envelope must report.
   checkpoint: string | null = null
 
-  # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
+  # Exact evaluation.step the envelope must report, an integer >= 0.
   expected_step: int | null = null
 
-  # Nonempty progress axis the sweep holds fixed, which the evaluation_point verdict compares. step is the envelope's own evaluation.step.
+  # Nonempty progress axis the sweep holds fixed, such as tokens for a fixed-token sweep, which the evaluation_point verdict compares. step is the envelope's own evaluation.step.
   # Any other name is read from evaluation.progress, and a missing position, or one that is not a finite number >= 0, fails the read.
   # Only used when: this is metric.extractor. A constraint or observation reader must leave it at its default, or config load fails.
-  # Recommended: the axis the comparison holds fixed, such as tokens for a fixed-token sweep.
   # See: https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#training-length-comparison
   evaluation_axis: string = "step"
 
