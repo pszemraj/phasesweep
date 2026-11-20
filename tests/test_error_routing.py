@@ -656,11 +656,6 @@ def _scan_registry(
     return trigger
 
 
-def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
-    """Return the fixture's config pointed at a workdir its studies never published into."""
-    return materialized.experiment.model_copy(update={"workdir": str(tmp_path / "moved")})
-
-
 def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Inspect recovery after the symlink a run's pinned workdir names was retargeted.
 
