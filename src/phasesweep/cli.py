@@ -38,6 +38,7 @@ from phasesweep.config.reference import (
 from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.artifacts import LOG_FORMAT
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import (
@@ -739,7 +740,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
-    :raises WinnerIntegrityError: An unpublished winner's producing snapshot, or a carried winner's source generation record, is unavailable or invalid.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
     """
     experiment = _command_config(config_path, settings=settings)
     require_study(experiment)
@@ -833,12 +834,19 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
             click.echo(f"=== {name} ===")
             carried = ""
             if winner.source is not None and winner.source.generation_id != winner.generation_id:
-                source_revision = _load_generation_code_revision(
-                    _experiment_dir(experiment), winner.source.generation_id
-                )
+                try:
+                    source_text = _code_revision_text(
+                        _load_generation_code_revision(
+                            _experiment_dir(experiment), winner.source.generation_id
+                        )
+                    )
+                except WinnerIntegrityError:
+                    # Only this display line needs the source generation's record, so its
+                    # loss must not cut the listing short.
+                    source_text = "unreadable (its reproducibility.json cannot be read)"
                 carried = (
                     f"; winner trial from generation {winner.source.generation_id}, "
-                    f"code revision {_code_revision_text(source_revision)}"
+                    f"code revision {source_text}"
                 )
             click.echo(
                 f"# winner generation: {winner.generation_id} "

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -13,7 +14,11 @@ from click.testing import CliRunner
 from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import ExecutionContext, Experiment
-from phasesweep.engine.paths import _experiment_dir, _generation_reproducibility_path
+from phasesweep.engine.paths import (
+    _experiment_dir,
+    _generation_dir,
+    _generation_reproducibility_path,
+)
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
 from tests.conftest import (
@@ -253,11 +258,13 @@ def test_show_winners_names_the_code_revision_of_the_publishing_generation(
     assert "winner trial from generation" not in result.output
 
 
-@pytest.mark.integration
-def test_show_winners_names_a_carried_winners_own_code_revision(
-    tmp_path: Path, hermetic_git: None
-) -> None:
-    """A winner carried from an earlier generation shows that generation's revision beside the publication's."""
+def _carried_winner_study(tmp_path: Path) -> tuple[Path, Experiment, str, str, str, str]:
+    """Run two generations whose second publishes a winner carried from the first.
+
+    :param Path tmp_path: Per-test directory holding the ledger, workdir, trainer and repository.
+    :return tuple[Path, Experiment, str, str, str, str]: The config path, the experiment, the
+        first and second generation ids, and the git commit each generation ran under.
+    """
     repo = tmp_path / "repo"
     first_head = _committed_repo(repo)
     experiment = make_experiment(
@@ -276,8 +283,20 @@ def test_show_winners_names_a_carried_winners_own_code_revision(
     experiment = experiment.model_copy(update={"phases": [phase]})
     run_experiment(experiment)
     second_generation = published_generation_id(experiment)
-    assert first_generation is not None and second_generation != first_generation
+    assert first_generation is not None and second_generation is not None
+    assert second_generation != first_generation
     config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    return config_path, experiment, first_generation, second_generation, first_head, second_head
+
+
+@pytest.mark.integration
+def test_show_winners_names_a_carried_winners_own_code_revision(
+    tmp_path: Path, hermetic_git: None
+) -> None:
+    """A winner carried from an earlier generation shows that generation's revision beside the publication's."""
+    config_path, _, first_generation, second_generation, first_head, second_head = (
+        _carried_winner_study(tmp_path)
+    )
 
     result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
@@ -286,3 +305,24 @@ def test_show_winners_names_a_carried_winners_own_code_revision(
         f"# winner generation: {second_generation} (published); "
         f"winner trial from generation {first_generation}, code revision {first_head}\n"
     ) in result.output
+
+
+@pytest.mark.integration
+def test_show_winners_carries_on_when_the_source_generation_record_is_gone(
+    tmp_path: Path, hermetic_git: None
+) -> None:
+    """A carried winner whose earlier generation was removed reads ``unreadable`` on its line, and the listing continues."""
+    config_path, experiment, first_generation, second_generation, _, second_head = (
+        _carried_winner_study(tmp_path)
+    )
+    shutil.rmtree(_generation_dir(_experiment_dir(experiment), first_generation))
+
+    result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+    assert result.exit_code == 0, result.output
+    assert f"# publication code revision: {second_head}\n" in result.output
+    assert (
+        f"# winner generation: {second_generation} (published); "
+        f"winner trial from generation {first_generation}, code revision unreadable "
+        "(its reproducibility.json cannot be read)\n"
+    ) in result.output
+    assert "trial_number:" in result.output.split("=== p ===", 1)[1]
