@@ -39,6 +39,15 @@ def recover_run_step(run_id: str, *, outside_sandbox: bool = False) -> str:
     )
 
 
+def run_log_reference(run_id: str) -> str:
+    """Name a run's own log, which holds its errors, for an agent that never sees the state path.
+
+    :param str run_id: Run whose runner log is named.
+    :return str: A noun phrase locating the log under the catalog's ``state_dir``.
+    """
+    return f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`"
+
+
 def live_runner_step(pid: int | None, pgid: int | None) -> str:
     """Return the host step for a runner that cancellation or recovery found still alive.
 
@@ -441,9 +450,9 @@ class RunnerExitedBeforeReceiptError(McpToolError):
         super().__init__(
             f"run {run_id!r} did not start: its detached runner exited with code {returncode} "
             "before it recorded its launch receipt, so no trial ran. Do not retry the launch. "
-            f"Ask the operator to read the runner log {run_id}.log under the MCP state "
-            "directory's logs/ and fix what it reports, often a PhaseSweep the server imports "
-            "only through PYTHONPATH, which the runner does not inherit."
+            f"Ask the operator to read {run_log_reference(run_id)}, and fix what it reports, "
+            "often a PhaseSweep the server imports only through PYTHONPATH, which the runner "
+            "does not inherit."
         )
 
 

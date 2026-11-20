@@ -307,7 +307,8 @@ def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
     assert failure["actor"] == "operator"
     assert failure["remediation"] == (
         "Ask the operator to restore the files and permissions identified in the error. The "
-        "error in the PhaseSweep run log gives the details."
+        "error in this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the "
+        "details."
     )
 
 
@@ -346,7 +347,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         "actor": "operator",
         "remediation": (
             "Ask the operator to restore or repair the storage ledger and access to it. The "
-            "error in the PhaseSweep run log gives the details."
+            f"error in this run's log, `logs/{run_id}.log` under the catalog's `state_dir`, "
+            "gives the details."
         ),
     }
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
@@ -1209,8 +1211,8 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         "Ask the operator to restore or repair the storage ledger and access to it, then "
         f"run `phasesweep mcp recover-run --state-dir STATE_DIR --run-id {run_id}` from a host "
         "shell, with the catalog's `state_dir` as STATE_DIR, read its preview and repeat it "
-        "with `--confirm` before another launch. The error in the PhaseSweep run log gives "
-        "the details."
+        f"with `--confirm` before another launch. The error in this run's log, `logs/{run_id}.log` "
+        "under the catalog's `state_dir`, gives the details."
     )
 
 

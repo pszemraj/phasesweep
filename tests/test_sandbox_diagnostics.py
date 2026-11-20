@@ -26,7 +26,7 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     assert failure["remediation"] == (
         "Ask the operator to point PHASESWEEP_LOCK_DIR at an existing writable directory shared "
         "by every shell, MCP server, and sandbox on the host, or run on the host. The error in "
-        "the PhaseSweep run log gives the details."
+        "this run's log, `logs/r0.log` under the catalog's `state_dir`, gives the details."
     )
     assert "/private/host/locks" not in str(failure)
 

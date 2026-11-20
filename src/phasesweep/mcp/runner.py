@@ -48,7 +48,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     operator_step,
 )
-from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step, run_log_reference
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
@@ -122,28 +122,51 @@ class FailurePayload(FailureCausePayload):
 
 
 _SELF_CONTAINED_STEPS = frozenset({OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS})
-_RUN_LOG_DETAILS = "The error in the PhaseSweep run log gives the details."
+
+
+def _run_log_details(run_id: str) -> str:
+    """Point at the log holding the error a step's specifics come from.
+
+    The runner's own log has every error; the experiment's ``run.log`` misses the ones
+    raised before the engine opened it.
+
+    :param str run_id: Run whose log holds the error.
+    :return str: One sentence.
+    """
+    return f"The error in {run_log_reference(run_id)}, gives the details."
+
+
+def _operator_step_phrase(step: OperatorAction, *, run_id: str) -> str:
+    """Render one operator step for a run as a clause after "ask the operator to".
+
+    :param OperatorAction step: Routed step, other than ``RETRY``.
+    :param str run_id: Run the step is for, whose recover-run command and log it names.
+    :return str: The step's phrase.
+    """
+    if step is OperatorAction.RUN_RECOVER_RUN:
+        return recover_run_step(run_id)
+    if step is OperatorAction.INSPECT_LOGS:
+        return f"inspect {run_log_reference(run_id)}, and the logs its error points to"
+    return OPERATOR_STEPS[step]
 
 
 def _operator_remediation(steps: Sequence[OperatorAction], *, run_id: str, before: str = "") -> str:
     """Compose operator steps into one remediation, in the order they must happen.
 
     :param Sequence[OperatorAction] steps: Non-empty operator steps, none of them ``RETRY``.
-    :param str run_id: Run the remediation is recorded for, which its recover-run step names.
+    :param str run_id: Run the remediation is recorded for, whose recover-run step and log it
+        names.
     :param str before: Clause naming what every step must precede, if any.
-    :return str: The remediation, pointing at the run log when a step needs
+    :return str: The remediation, pointing at the run's log when a step needs
         the error's details.
     """
-    phrases = [
-        recover_run_step(run_id) if step is OperatorAction.RUN_RECOVER_RUN else OPERATOR_STEPS[step]
-        for step in steps
-    ]
+    phrases = [_operator_step_phrase(step, run_id=run_id) for step in steps]
     joined = phrases[0]
     if len(phrases) > 1:
         joined = f"{', and '.join(phrases[:-1])}, then {phrases[-1]}"
     remediation = f"Ask the operator to {joined}{before}."
     if not _SELF_CONTAINED_STEPS.issuperset(steps):
-        remediation = f"{remediation} {_RUN_LOG_DETAILS}"
+        remediation = f"{remediation} {_run_log_details(run_id)}"
     return remediation
 
 
@@ -159,7 +182,7 @@ def _routed_next_steps(error: PhaseSweepError, *, run_id: str) -> dict[str, obje
     if error.action is OperatorAction.RETRY:
         return {"retryable": True, "actor": "agent", "remediation": operator_step(error)}
     remediation = (
-        f"Ask the operator: {operator_step(error)}"
+        f"Ask the operator: {operator_step(error)} {_run_log_details(run_id)}"
         if error.remediation is not None
         else _operator_remediation([error.action], run_id=run_id)
     )
@@ -211,10 +234,13 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
 )
 
 
-def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, object]:
+def _unrouted_failure_payload(
+    error: BaseException, *, run_id: str, stage: str
+) -> dict[str, object]:
     """Map an exception that carries no operator action to its fixed failure.
 
     :param BaseException error: Exception that is not a :class:`PhaseSweepError`.
+    :param str run_id: Run the failure is recorded for, whose log holds its traceback.
     :param str stage: Stage the failure occurred at.
     :return dict[str, object]: A ``"timeout"`` or ``"cancelled"`` payload, or
         ``"internal_error"`` for any other exception.
@@ -224,7 +250,7 @@ def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, 
         "stage": stage,
         "retryable": False,
         "actor": "operator",
-        "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
+        "remediation": f"Ask the operator to inspect {run_log_reference(run_id)}, before retrying.",
     }
     if isinstance(error, TimeoutError):
         payload.update(
@@ -269,7 +295,7 @@ def _base_failure_payload(
         stage if stage is not None and stage in {"preflight", "cleanup"} else "execution"
     )
     if not isinstance(error, PhaseSweepError):
-        return _unrouted_failure_payload(error, stage=failure_stage)
+        return _unrouted_failure_payload(error, run_id=run_id, stage=failure_stage)
     code: FailureCode = next(
         (code for error_type, code in _FAILURE_CODES if isinstance(error, error_type)),
         "internal_error",

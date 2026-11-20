@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step
+from phasesweep.mcp.errors import NEW_RUN_RESUMES, recover_run_step, run_log_reference
 from phasesweep.mcp.runner import (
     FailureCode,
     FailurePayload,
@@ -330,8 +330,7 @@ def _diagnose(
             "result_snapshot_unavailable",
             "cleanup",
             "Report that this run's results are unavailable, not another run's results in "
-            "their place, and ask the operator to inspect the PhaseSweep run or server "
-            "diagnostics.",
+            f"their place, and ask the operator to inspect {run_log_reference(handle.run_id)}.",
         )
         return _Diagnosis(_with_cause(snapshot_unavailable, persisted), recorded, False)
     # Other terminal diagnoses and remediations survive operator recovery; the live

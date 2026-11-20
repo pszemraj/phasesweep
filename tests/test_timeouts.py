@@ -974,4 +974,4 @@ def test_timeout_remedy_matches_storage_and_budget(
         error, run_id="r0", stage="execution", cleanup_confirmed=True
     )
     assert failure["code"] == "timeout"
-    assert failure["remediation"] == f"Ask the operator: {remedy}"
+    assert failure["remediation"].startswith(f"Ask the operator: {remedy} ")

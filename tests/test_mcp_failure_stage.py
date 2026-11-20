@@ -101,7 +101,7 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
 def test_a_refused_launch_environment_reports_its_own_code_and_fix(
     tmp_path: Path, refusal: str, remediation: str
 ) -> None:
-    """A launch whose trials could not start fails at preflight with the raise's own fix."""
+    """A launch whose trials could not start fails at preflight with the raise's own fix and the runner log that holds the error."""
     experiment = (
         make_experiment(
             workdir=tmp_path / "runs", trial_command="phasesweep-no-such-trainer {overrides}"
@@ -123,7 +123,10 @@ def test_a_refused_launch_environment_reports_its_own_code_and_fix(
         "stage": "preflight",
         "retryable": False,
         "actor": "operator",
-        "remediation": f"Ask the operator: {remediation}",
+        "remediation": (
+            f"Ask the operator: {remediation} The error in this run's log, `logs/refused.log` "
+            "under the catalog's `state_dir`, gives the details."
+        ),
     }
 
 

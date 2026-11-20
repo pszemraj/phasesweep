@@ -107,7 +107,7 @@ def test_evidence_pending_preview_routes_to_resume(tmp_path: Path) -> None:
     failure = mcp_runner._terminal_failure_payload(
         error, run_id="r0", stage="preflight", cleanup_confirmed=True
     )
-    assert failure["remediation"] == f"Ask the operator: {advice}"
+    assert failure["remediation"].startswith(f"Ask the operator: {advice} ")
 
 
 @pytest.mark.integration

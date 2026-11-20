@@ -140,7 +140,7 @@ def assert_routes_declared_action(
         expected = (
             error.remediation
             if error.action is OperatorAction.RETRY
-            else f"Ask the operator: {error.remediation}"
+            else f"Ask the operator: {error.remediation} {mcp_runner._run_log_details('r0')}"
         )
         assert failure["remediation"] == expected
         if case.id.startswith("live_abort_with_"):
@@ -163,7 +163,7 @@ _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
         OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",
         OperatorAction.RUN_RECOVER_RUN: "recover-run",
         OperatorAction.FIX_CONFIG: "correct the experiment configuration",
-        OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
+        OperatorAction.INSPECT_LOGS: "inspect this run's log",
     }
 )
 
@@ -193,7 +193,7 @@ def assert_payload_follows(failure: Mapping[str, object], routed: list[OperatorA
     assert not [marker for marker in unrouted if marker in remediation], remediation
     # A step whose specifics are in the message points at the run log holding it.
     self_contained = {OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS}
-    points_at_log = remediation.endswith("The error in the PhaseSweep run log gives the details.")
+    points_at_log = remediation.endswith("under the catalog's `state_dir`, gives the details.")
     assert points_at_log is not self_contained.issuperset(steps), remediation
 
 

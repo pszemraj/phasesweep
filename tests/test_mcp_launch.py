@@ -1257,7 +1257,7 @@ def test_runner_that_exits_before_its_receipt_names_its_exit_code(
 
     (run_id,) = run_ids
     message = str(caught.value)
-    assert f"runner log {run_id}.log under the MCP state directory's logs/" in message
+    assert f"this run's log, `logs/{run_id}.log` under the catalog's `state_dir`" in message
     assert str(tmp_path) not in message
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["returncode"] == 1
