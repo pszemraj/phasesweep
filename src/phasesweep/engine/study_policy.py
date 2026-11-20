@@ -1274,6 +1274,7 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
         experiment.trial_command,
         path=path,
         cwd=experiment.execution.resolved_cwd() or Path.cwd(),
+        path_from_config="PATH" in experiment.env,
     )
     if refusal is not None:
         message, remediation = refusal
@@ -1283,7 +1284,9 @@ def _require_launch_target(experiment: Experiment, *, path: str | None = None) -
         )
 
 
-def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tuple[str, str] | None:
+def _trial_program_refusal(
+    command: str, *, path: str | None, cwd: Path, path_from_config: bool = False
+) -> tuple[str, str] | None:
     """Judge whether the shell that runs a trial command can find its program.
 
     The trial command runs through ``/bin/sh``, so only a first word with no quoting,
@@ -1294,6 +1297,8 @@ def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tupl
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
         written with a ``/``.
     :param Path cwd: Directory the trainer starts in, which relative paths resolve against.
+    :param bool path_from_config: The config's ``env`` sets ``PATH``, so no shell or client
+        entry changes the one searched.
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
     """
@@ -1324,10 +1329,14 @@ def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tupl
     search = os.pathsep.join(str(cwd / entry) for entry in path.split(os.pathsep))
     if shutil.which(program, path=search) is not None:
         return None
+    source = (
+        "the PATH the config's `env` sets"
+        if path_from_config
+        else "the PATH the run starts with (for an MCP run, the PATH in the client's server entry)"
+    )
     return (
         f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",
-        "Put the program on the PATH the run starts with (for an MCP run, the PATH in the "
-        "client's server entry), or name it by absolute path in trial_command.",
+        f"Put the program on {source}, or name it by absolute path in trial_command.",
     )
 
 

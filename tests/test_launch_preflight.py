@@ -85,6 +85,19 @@ def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
     )
 
 
+def test_program_missing_from_a_path_the_config_sets_is_sent_to_the_config(tmp_path: Path) -> None:
+    """When the config's ``env`` sets ``PATH``, the fix line names that, not the shell or client."""
+    refusal = _trial_program_refusal(
+        f"{_MISSING} --lr 1", path="/nowhere", cwd=tmp_path, path_from_config=True
+    )
+
+    assert refusal is not None
+    assert refusal[1] == (
+        "Put the program on the PATH the config's `env` sets, or name it by absolute path in "
+        "trial_command."
+    )
+
+
 def test_relative_path_entry_resolves_against_the_trainer_directory(tmp_path: Path) -> None:
     """A relative PATH entry is searched from the trainer's directory, as its shell would."""
     _executable(tmp_path / "tools" / "trainer")
