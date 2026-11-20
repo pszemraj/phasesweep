@@ -31,8 +31,10 @@ _FINISH_SETTLE_SECONDS = 30.0
 _HISTORY_RETRY_SECONDS = 2.0
 # Server row cap for unsampled history requests and scan pages.
 _HISTORY_SAMPLES = 10_000
-# A summary poll stops this long before its deadline: a lookup still in flight then is bounded by
-# its one-second client timeout, and the report follows it.
+# A summary poll stops this long before its deadline. Each lookup's client is made with the
+# polling time left, rounded up to whole seconds and at least one, as its timeout, so a lookup
+# still in flight at the polling deadline ends within about a second of it, and the report
+# follows in what remains.
 _REPORT_SECONDS = 2.0
 
 
