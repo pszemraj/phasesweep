@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 # Objective-evidence provenance schema version.
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
 # Log-regex evaluation revision included in the extractor contract.
-LOG_REGEX_EVALUATION_REVISION = 2
+LOG_REGEX_EVALUATION_REVISION = 3
 
 
 def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
@@ -358,7 +358,8 @@ def _extract_log_regex(
     :param LogRegexExtractor cfg: Log path, named value group, and first/last/min/max selector.
     :param dict | None provenance: Optional source-evidence sink.
     :raises ExtractorError: The log is missing, unreadable, has no numeric match,
-        or a line eligible for matching is invalid UTF-8.
+        has a non-finite match under ``min`` or ``max``, or a line eligible for
+        matching is invalid UTF-8.
     :return float: Selected match value.
     """
     import re
@@ -402,6 +403,14 @@ def _extract_log_regex(
                     if cfg.select in ("first", "last"):
                         result = v
                         result_line = line_no
+                    elif not math.isfinite(v):
+                        # Float ordering puts nan and inf anywhere, so a diverged
+                        # run would be scored on whichever side of them it landed.
+                        raise ExtractorError(
+                            f"Log file {target} has a non-finite match on line {line_no}, "
+                            f"so select: {cfg.select} has no defined result; "
+                            "anchor the pattern to digits so nan and inf cannot match."
+                        )
                     elif cfg.select == "min":
                         if result is None or v < result:
                             result, result_line = v, line_no

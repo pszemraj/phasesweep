@@ -1545,6 +1545,30 @@ def test_log_regex_considers_every_numeric_match_per_line(
     }
 
 
+@pytest.mark.parametrize(
+    ("select", "text", "bad_line"),
+    [
+        ("min", "loss=nan\nloss=0.5\nloss=0.3\n", 1),
+        ("min", "loss=0.5\nloss=0.3\nloss=nan\n", 3),
+        ("min", "loss=0.5\nloss=inf\nloss=0.3\n", 2),
+        ("max", "loss=nan\nloss=0.5\nloss=0.3\n", 1),
+        ("max", "loss=0.5\nloss=0.3\nloss=nan\n", 3),
+        ("max", "loss=0.5\nloss=-inf\n", 2),
+    ],
+)
+def test_log_regex_min_max_fails_on_any_non_finite_match(
+    tmp_path: Path, select: str, text: str, bad_line: int
+) -> None:
+    """A min or max over matches that include nan or inf fails wherever the value sits,
+    naming the line of the first non-finite match and the pattern fix."""
+    (tmp_path / "stdout.log").write_text(text, encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
+    provenance: dict = {}
+    with pytest.raises(ExtractorError, match=rf"line {bad_line}\b.*anchor the pattern to digits"):
+        run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+    assert "source" not in provenance
+
+
 def test_log_regex_reports_no_matches(tmp_path):
     (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
     cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")

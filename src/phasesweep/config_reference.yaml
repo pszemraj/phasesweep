@@ -577,7 +577,7 @@ LogRegexExtractor:
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.
-  # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, and a NaN seen after a number is ignored.
+  # A loose capture can select nan or inf and fail the trial, so anchor the pattern to digits.
   select: "last" | "first" | "min" | "max" = "last"
 
 # Requires: the top-level mlflow block.
