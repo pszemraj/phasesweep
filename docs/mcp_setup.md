@@ -58,6 +58,8 @@ codex mcp list
 
 To keep a client from connecting the server at all, disable it in that client's own MCP settings.
 
+The client starts the server with the client's environment, not your shell's, and trainers inherit it, so a `trial_command` program resolves on the `PATH` the client starts the server with. That `PATH` often lacks the Python environment your shell activates. Give `trial_command` an absolute interpreter path, such as `/absolute/path/to/python train.py --config {config_path}`, or set `PATH` in the client's server entry. A run whose program is missing from that `PATH` is refused before any trial starts: its `failure.remediation` gives this fix, and its runner log, `<run-id>.log` under `state_dir/logs/`, names the program and the `PATH` it searched.
+
 ### 4. Verify the connection
 
 Restart or reconnect the client as its documentation requires. Confirm the connection with the read-only `list_experiments` operation; for example, ask the agent to use PhaseSweep to list the available experiments and permitted actions without launching anything. Name PhaseSweep in the request: the server's instructions tell agents to use its tools only when the user asks for it. The response contains catalog-approved IDs, descriptions, phase names, metrics, permitted actions and `catalog_status`; a stale catalog includes its reload refusal and operator remedy.
@@ -87,3 +89,5 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - `runner_observable: false`, alone or with `recovery_required: true`, or a PID-namespace refusal: follow [PID namespace recovery](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).
 - Trainer environment cohort mismatch: the [launching server or `mcp call` shell](mcp.md#the-catalog) supplies the trainer's base environment; reconcile it using the [trainer contract](config.md#trainer-contract).
+- A run refused because its trial program is not on the trainer's `PATH`: the client's `PATH` lacks it; [configure the client](#3-configure-your-client) or name the program by absolute path in `trial_command`.
+- `its detached runner exited with code`: the runner failed before it started work; its own error is in `<run-id>.log` under `state_dir/logs/`.
