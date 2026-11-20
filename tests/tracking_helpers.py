@@ -7,6 +7,7 @@ import errno
 import json
 import shlex
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from optuna.trial import TrialState
 
 import phasesweep.engine.attempts as attempts_module
 import phasesweep.engine.cleanup as cleanup_module
+import phasesweep.engine.guards as guards_module
 import phasesweep.engine.phase as phase_module
 from phasesweep.config.models import Experiment
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
@@ -285,6 +287,47 @@ def remote_mlflow_example(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     return config, uploads
+
+
+class RunnerKilled(BaseException):
+    """Stands in for the orchestrator dying, which no handler of the run may observe."""
+
+
+def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None):
+    """Leave ``n_jobs`` managed attempts RUNNING, as a runner killed with them in flight does.
+
+    Each attempt's managed run exists; the trainers never start, no outcome is recorded and no
+    reconciliation runs.
+
+    :param str | None generation_id: The killed run's generation, as an MCP runner names it.
+    :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(
+        n_trials=n_jobs,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        sampler={"type": "random", "seed": 1},
+        search_space={"model.depth": {"type": "categorical", "choices": [1, 2, 3]}},
+    )
+    experiment = Experiment.model_validate(config)
+    in_flight = threading.Barrier(n_jobs)
+
+    def dies(*args, **kwargs):
+        in_flight.wait(10)
+        raise RunnerKilled()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(phase_module, "launch_trial", dies)
+        patch.setattr(phase_module, "_record_outcome", lambda *args, **kwargs: None)
+        patch.setattr(guards_module, "_reconcile_existing_studies", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled):
+            run_experiment(experiment, generation_id=generation_id)
+    trials = read_phase_trials(validate_ledger(experiment), "depth").trials
+    assert [trial.state for trial in trials] == [TrialState.RUNNING] * n_jobs
+    return experiment, uploads, [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
 
 
 @dataclasses.dataclass(frozen=True)

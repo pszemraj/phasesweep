@@ -37,6 +37,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.ledger import (
+    ValidatedLedger,
     open_existing_study,
     repair_incomplete_journal_record,
     validate_ledger,
@@ -109,6 +110,10 @@ class _CleanupEvidence:
     # Completed attempts left RUNNING because their tracker gave no answer, with the failure.
     pending_evidence: dict[str, str] = field(default_factory=dict)
     inspection_messages: dict[_AttemptRecord, str] = field(default_factory=dict)
+    # Generations whose trials a confirmed pass settled, and the ledger holding them, so their
+    # MLflow outcomes go out once the recovery is committed.
+    settled_generations: set[str] = field(default_factory=set)
+    ledger: ValidatedLedger | None = None
 
 
 def recover_run(
@@ -260,6 +265,20 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
+            delivery: dict[str, int] | None = None
+            if config.mlflow is not None and evidence.ledger is not None:
+                from phasesweep.tracking.publication import deliver_recovered_attempts
+
+                # Sent before the marker clears, so an upload worker whose cleanup is
+                # unconfirmed fails this command and leaves the run recovery-required, as an
+                # evidence worker's does; the next pass resolves it through its registry entry.
+                delivery = deliver_recovered_attempts(
+                    config,
+                    evidence.ledger,
+                    None,
+                    evidence.settled_generations,
+                    tracker_unreachable=bool(evidence.pending_evidence),
+                )
             if needs.cleanup_needed or repairing_complete_snapshot:
                 store.clear_cleanup_uncertain(handle)
             if needs.cleanup_needed:
@@ -280,6 +299,19 @@ def recover_run(
                     f"tracker could not be read for their evidence ({first}). Restore access "
                     "to the tracker, then start the run again; their training is kept and "
                     "nothing is retrained."
+                )
+            if delivery is not None and (delivery["delivered"] or delivery["pending"]):
+                pending = delivery["pending"]
+                emit(
+                    f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered "
+                    "trials; "
+                    + (
+                        f"{pending} stay pending. Once the tracker is reachable, run "
+                        "`phasesweep sync-tracking CONFIG` with the config this run launched "
+                        "with; delivery never retrains."
+                        if pending
+                        else "none stay pending."
+                    )
                 )
     except RunRecoveryError:
         raise
@@ -630,7 +662,7 @@ def _publication_recovery_action(
 
 def _load_recovery_studies(
     config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
-) -> dict[str, optuna.Study]:
+) -> tuple[ValidatedLedger, dict[str, optuna.Study]]:
     """Validate study ownership and load phases needed for trial cleanup recovery.
 
     Validate before opening or writing. Confirmed recovery holds the experiment lock and
@@ -647,7 +679,8 @@ def _load_recovery_studies(
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
-    :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
+    :return tuple[ValidatedLedger, dict[str, optuna.Study]]: The validated ledger, and its
+        loadable phase studies keyed by phase name.
     """
     # A storage refusal gains a recover-run retry here, but that retry cannot
     # succeed until the ledger is back, so these wraps route to restoring it.
@@ -702,7 +735,7 @@ def _load_recovery_studies(
                 f"{exc}{recovery_step}",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
-    return loaded_studies
+    return ledger, loaded_studies
 
 
 def _recover_trial_evidence(
@@ -737,7 +770,7 @@ def _recover_trial_evidence(
     inspected_studies = 0
     loaded_studies: dict[str, optuna.Study] = {}
     if needs.cleanup_needed:
-        loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+        ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         active_report = _PreflightCleanupReport(inspection_messages={} if not confirm else None)
         registered_attempts = _preflight_active_attempts(
             config, active_report, confirm=confirm, retain_recovery_evidence=True
@@ -803,6 +836,16 @@ def _recover_trial_evidence(
         evidence.retained_results = active_report.retained_results
         evidence.pending_evidence = active_report.unreadable_evidence
         evidence.inspection_messages = active_report.inspection_messages or {}
+        if confirm:
+            active_report.record_generations(inspected_attempts)
+            evidence.settled_generations = active_report.settled_generations
+            evidence.ledger = ledger
+            if config.mlflow is not None:
+                from phasesweep.tracking.publication import save_recovered_attempts
+
+                # As in a run: recovery sends nothing, and what it settled waits as pending
+                # records until the recovery is committed.
+                save_recovered_attempts(config, ledger, evidence.settled_generations)
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
@@ -821,7 +864,7 @@ def _recover_trial_evidence(
         } & evidence.reaped_attempt_ids
         if pending_ids:
             if not loaded_studies:
-                loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+                _ledger, loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
             for phase_name, study in loaded_studies.items():
                 for trial in study.get_trials(deepcopy=False):
                     trial_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)

@@ -614,42 +614,50 @@ def save_recovered_attempts(
 def deliver_recovered_attempts(
     experiment: Experiment,
     ledger: ValidatedLedger,
-    generation_id: str,
+    generation_id: str | None,
     generation_ids: Iterable[str],
     *,
     tracker_unreachable: bool = False,
-) -> None:
-    """Send the MLflow outcomes this run's recovery committed for earlier generations' attempts.
+) -> dict[str, int]:
+    """Send the MLflow outcomes a recovery committed for earlier generations' attempts.
 
     Recovery itself sends nothing, so an unreachable tracker costs it no request. The records
-    go only after a target check: the one :func:`require_tracking_target` made when this run
-    bound its own summary run, or else one made here under a settled generation whose summary
-    run is bound, which only resolves the target. A failed check or upload leaves the rest
-    pending for sync-tracking.
+    go only after a target check: the one :func:`require_tracking_target` made when the calling
+    run bound its own summary run, or else one made here under a settled generation whose
+    summary run is bound, which only resolves the target. A failed check or upload leaves the
+    rest pending for sync-tracking.
 
     :param Experiment experiment: Configured experiment.
-    :param ValidatedLedger ledger: The run's ledger, holding the settled trials.
-    :param str generation_id: This run's generation, whose own attempts its terminal delivery sends.
-    :param Iterable[str] generation_ids: Generations whose trials this run's recovery settled.
-    :param bool tracker_unreachable: The run stopped because a tracker could not be read, so
-        the records are only saved.
+    :param ValidatedLedger ledger: The ledger holding the settled trials.
+    :param str | None generation_id: The calling run's generation, whose own attempts its
+        terminal delivery sends, or None for ``recover-run``, which has no generation of its own.
+    :param Iterable[str] generation_ids: Generations whose trials the recovery settled.
+    :param bool tracker_unreachable: The caller found a tracker it could not read, so the
+        records are only saved.
     :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
+    :return dict[str, int]: How many of the settled attempts' outcomes were ``delivered`` here
+        and how many stay ``pending``.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.engine.trial import _environment_identity
 
     paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - {generation_id})
+    unsent = {"delivered": 0, "pending": len(paths)}
     if not paths:
-        return
+        return unsent
     pending = (
         f"The MLflow outcomes of {len(paths)} recovered attempt(s) stay pending; run phasesweep "
         "sync-tracking with the same config to deliver them."
     )
     if tracker_unreachable:
         log.warning(pending)
-        return
+        return unsent
     environment = _environment_identity(experiment, experiment.phases[0].name).values
-    if not (tracking_root(experiment) / generation_id / "generation-binding.json").is_file():
+    checked = (
+        generation_id is not None
+        and (tracking_root(experiment) / generation_id / "generation-binding.json").is_file()
+    )
+    if not checked:
         try:
             require_tracking_target(
                 experiment,
@@ -659,10 +667,13 @@ def deliver_recovered_attempts(
             )
         except TrackingTargetUnavailableError as exc:
             log.warning("%s %s", exc, pending)
-            return
+            return unsent
+    delivered = 0
     for path in paths:
         if not _deliver(experiment, path, environment):
-            return
+            break
+        delivered += 1
+    return {"delivered": delivered, "pending": len(paths) - delivered}
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:

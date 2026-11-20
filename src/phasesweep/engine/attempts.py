@@ -100,8 +100,9 @@ class _PreflightCleanupReport:
     that just stopped on it. Once set, later extractions in the pass skip their read, so an
     outage costs one read."""
     settled_generations: set[str] = field(default_factory=set)
-    """Generations whose stale trials this pass made terminal. Recovery sends nothing to a
-    tracker; the run delivers those attempts' MLflow outcomes once it has reached it."""
+    """Generations whose trials this pass made terminal or confirmed clean. Recovery sends
+    nothing to a tracker; the run delivers those attempts' MLflow outcomes once it has reached
+    it."""
     error: BaseException | None = None
     process_actions: dict[_AttemptRecord, bool] = field(default_factory=dict)
     """Inspected attempts mapped to whether their live group needs termination."""
@@ -115,17 +116,18 @@ class _PreflightCleanupReport:
             self.error = error
 
     def record_generations(self, attempts: Mapping[str, _AttemptRecord]) -> None:
-        """Record the producing generation of each attempt that has one.
+        """Record the producing generation of each attempt that has one, as settled.
 
-        :param Mapping[str, _AttemptRecord] attempts: Recovered attempts keyed by id.
+        :param Mapping[str, _AttemptRecord] attempts: Attempts whose trials this pass made
+            terminal or confirmed clean, keyed by id.
         """
-        self.recovered_attempt_generations.update(
-            {
-                attempt_id: record.generation_id
-                for attempt_id, record in attempts.items()
-                if record.generation_id is not None
-            }
-        )
+        generations = {
+            attempt_id: record.generation_id
+            for attempt_id, record in attempts.items()
+            if record.generation_id is not None
+        }
+        self.recovered_attempt_generations.update(generations)
+        self.settled_generations.update(generations.values())
 
 
 def _pending_evidence_refusal(pending: Mapping[str, str]) -> TrackingTargetUnavailableError:
@@ -873,6 +875,8 @@ def _registry_attempt_fail_stale_trial(
             if not recovered:
                 _record_cleanup_recovery(study, trial)
                 report.cleanup_recovered_trials += 1
+            # A pass interrupted after the ledger write may not have saved the outcome record.
+            report.settled_generations.add(entry["generation_id"])
             return "recovered"
         return "terminal"
     if stored_attempt_id is None or stored_generation_id is None:
