@@ -1275,6 +1275,12 @@ _SHELL_OWN_WORDS = frozenset(
 #: A first word of only these characters names a program with no quoting, expansion,
 #: assignment or placeholder in it.
 _PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
+#: Characters the trial command's lexer splits out as shell operators. The newline is one
+#: because it separates commands.
+_SHELL_OPERATOR_CHARS = "();<>|&\n"
+#: The operators after a program that cannot rescue its failure: ``&&``, and a redirection
+#: (``>``, ``2>&1``), which belongs to the program's own command.
+_NON_RESCUING_OPERATOR = re.compile(r"&&|[<>]+&?")
 
 
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
@@ -1316,7 +1322,11 @@ def _trial_program_refusal(
 
     The trial command runs through ``/bin/sh``, so only a first word with no quoting,
     expansion, assignment or placeholder is judged, and never a word the shell handles
-    itself. Anything else is left to the shell, never refused.
+    itself. A missing first program fails the whole command only when nothing after it can
+    rescue it, so a command is judged only when it is one simple command or commands joined
+    by ``&&``. Any other operator outside quotes (``||``, ``;``, ``|``, ``&``, a subshell or a
+    newline between commands) can run something else after the failure. Anything the check
+    cannot judge is left to the shell, never refused.
 
     :param str command: The trial command template.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1327,12 +1337,26 @@ def _trial_program_refusal(
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
     """
+    text = command.strip()
     try:
-        words = shlex.split(command)
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_SHELL_OPERATOR_CHARS)
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        words = list(lexer)
     except ValueError:
         return None
-    if not words or command.split(maxsplit=1)[0] != words[0]:
+    if not words or text.split(maxsplit=1)[0] != words[0]:
         return None
+    # A quoted word that looks like an operator reads as one here, which only leaves the
+    # command unjudged.
+    for word in words[1:]:
+        if (
+            word
+            and all(char in _SHELL_OPERATOR_CHARS for char in word)
+            and _NON_RESCUING_OPERATOR.fullmatch(word) is None
+        ):
+            return None
     program = words[0]
     if program in _SHELL_OWN_WORDS or _PLAIN_PROGRAM.fullmatch(program) is None:
         return None

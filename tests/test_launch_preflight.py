@@ -3,8 +3,8 @@
 The trial command runs through ``/bin/sh`` on the PATH the run starts with, in the trainer's
 working directory. A program that PATH lacks, or a missing ``execution.cwd``, would fail every
 trial before its trainer ran and record each as a failure, so the launch preflight refuses
-them up front. The program check judges only a plain first word and never refuses a command
-it cannot judge. ``validate`` runs the directory check and judges a program written with a
+them up front. The program check judges only a plain first word, and only in a command that no
+later operator could rescue; it never refuses a command it cannot judge. ``validate`` runs the directory check and judges a program written with a
 ``/``, whose answers are the same from any shell.
 """
 
@@ -148,11 +148,43 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param(f'{_MISSING}"" --x 1', id="partly-quoted"),
         pytest.param(f"{_MISSING}>out.log", id="redirection"),
         pytest.param("", id="empty"),
+        pytest.param(f"{_MISSING} --x 1 || true", id="or-fallback"),
+        pytest.param(f"{_MISSING} --x 1 || {_MISSING}-2 --x 1", id="or-second-program"),
+        pytest.param(f"{_MISSING} --x 1 ; true", id="sequence"),
+        pytest.param(f"{_MISSING} --x 1 | tee out.log", id="pipe"),
+        pytest.param(f"{_MISSING} --x 1 &", id="background"),
+        pytest.param(f"{_MISSING} --x 1\ntrue", id="newline-between-commands"),
+        pytest.param(f"{_MISSING} --x 1 && true || true", id="and-then-or"),
+        pytest.param(f"{_MISSING} --x $(true)", id="command-substitution"),
+        pytest.param(f"{_MISSING} --x 1 '||' true", id="quoted-operator-word"),
     ],
 )
 def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) -> None:
     """None of these is refused, even on a PATH where no program can be found."""
     assert _trial_program_refusal(command, path=str(tmp_path), cwd=tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"{_MISSING} --x 1", id="simple"),
+        pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
+        pytest.param(f"{_MISSING} --x 1 && true && true", id="long-and-chain"),
+        pytest.param(f"{_MISSING} --x 1 > out.log 2>&1", id="redirections"),
+        pytest.param(f"{_MISSING} --x 'a || b; c | d'", id="operators-inside-quotes"),
+        pytest.param(f'{_MISSING} --x ""', id="empty-argument"),
+        pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
+        pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
+    ],
+)
+def test_program_check_refuses_a_command_nothing_after_its_program_can_rescue(
+    tmp_path: Path, command: str
+) -> None:
+    """A missing first program fails the whole command when only ``&&`` follows it."""
+    refusal = _trial_program_refusal(command, path=str(tmp_path), cwd=tmp_path)
+
+    assert refusal is not None
+    assert f"program {_MISSING!r} is not on the trainer's PATH" in refusal[0]
 
 
 def test_program_check_skips_a_trainer_that_gets_no_path(tmp_path: Path) -> None:
@@ -385,6 +417,37 @@ def test_validate_refuses_a_program_written_with_a_slash_that_is_not_executable(
     _executable(tmp_path / "train.sh")
     result = CliRunner().invoke(cli_main, ["validate", str(config)])
     assert (result.exit_code == 0) == (program == "./train.sh"), result.output
+
+
+def test_validate_accepts_a_missing_program_whose_fallback_the_shell_would_run(
+    tmp_path: Path,
+) -> None:
+    """``a || b`` succeeds through ``b`` when ``a`` is missing, so ``validate`` leaves it to the shell."""
+    config = tmp_path / "experiment.yaml"
+    write_experiment_config(
+        config,
+        make_experiment(
+            workdir=tmp_path / "runs",
+            trial_command="./accelerated-trainer {overrides} || phasesweep-fake-train {overrides}",
+            execution=ExecutionContext(cwd=str(tmp_path)),
+        ),
+    )
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    assert result.exit_code == 0, result.output
+
+    write_experiment_config(
+        config,
+        make_experiment(
+            workdir=tmp_path / "runs",
+            trial_command="./accelerated-trainer {overrides} && phasesweep-fake-train {overrides}",
+            execution=ExecutionContext(cwd=str(tmp_path)),
+        ),
+    )
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, PhaseSweepError)
+    assert "'./accelerated-trainer' resolves to" in str(result.exception)
 
 
 def test_the_any_shell_check_leaves_a_program_found_through_path_to_the_launch(
