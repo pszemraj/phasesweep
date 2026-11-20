@@ -54,7 +54,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Fresh MCP state
 
-`state_dir` is private and owner-only. A new path or an empty private directory can be initialized with the current format marker. The server refuses existing durable run data without that marker, or a malformed or unsupported marker, before changing the directory. There is no migration, adoption, or repair path for a refused directory: point `state_dir` at a fresh path instead.
+`state_dir` is private and owner-only. A new path or an empty private directory can be initialized with the current format marker. The server refuses existing durable run data without that marker, or with a marker that is unreadable or declares another format, before changing the directory. There is no migration, adoption, or repair path for a refused directory: point `state_dir` at a fresh path instead.
 
 ## Tool workflow
 
