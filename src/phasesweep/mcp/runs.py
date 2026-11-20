@@ -15,7 +15,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Annotated, Literal, NotRequired, TypeAlias, TypeGuard, cast
+from typing import IO, Annotated, Literal, NotRequired, TypeAlias, TypeGuard
 from uuid import UUID, uuid4
 
 from pydantic import Field, TypeAdapter, ValidationError
@@ -395,10 +395,11 @@ class RunStore:
             payload = json.loads(raw)
         except ValueError:
             payload = None
+        keys = set(payload) if isinstance(payload, dict) else set()
         version = payload.get("schema_version") if isinstance(payload, dict) else None
         if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
             raise self._marker_version_refusal(version)
-        if type(version) is not int or set(cast(dict[str, object], payload)) != {"schema_version"}:
+        if type(version) is not int or keys != {"schema_version"}:
             raise UnsafePrivatePathError(
                 f"MCP state directory {marker.parent} format marker {marker} is malformed. "
                 "Restore it before retrying recovery."
