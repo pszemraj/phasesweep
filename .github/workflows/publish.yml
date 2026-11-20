@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install packaging tools
-        run: python -m pip install build packaging twine
+        run: pip install build packaging twine
       - name: Validate the release tag and commit
         id: release
         env:
