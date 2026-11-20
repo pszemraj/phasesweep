@@ -17,15 +17,18 @@ import pytest
 import yaml
 
 from phasesweep import run_experiment
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.cli import _operational_error_text
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.artifacts import _write_trials_csv
-from phasesweep.engine.errors import StudyFingerprintMismatchError
+from phasesweep.engine.errors import StudyFingerprintMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
 from phasesweep.engine.study_policy import (
     _describe_environment_changes,
+    _environment_cohort_remediation,
     _validate_environment_cohort,
 )
 from phasesweep.engine.trial import (
@@ -569,3 +572,64 @@ def test_a_real_run_records_the_mapping_and_a_changed_tz_is_refused(
     with pytest.raises(StudyFingerprintMismatchError) as caught:
         run_experiment(topped_up)
     assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo".' in str(caught.value)
+
+
+def _two_phase_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Experiment:
+    """Run two phases of two trials each, and return the experiment that ran them."""
+    monkeypatch.setenv("PATH", _REAL_PATH)
+    phases = [
+        Phase(
+            name=name,
+            n_trials=2,
+            gpu_policy="none",
+            sampler=Sampler(type="random", seed=0),
+            search_space={f"{name}_x": IntParam(type="int", low=0, high=10)},
+        )
+        for name in ("a", "b")
+    ]
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), phases=phases
+    )
+    run_experiment(experiment)
+    return experiment
+
+
+def _with_targets(experiment: Experiment, n_trials: int) -> Experiment:
+    """Return ``experiment`` with every phase's trial target set to ``n_trials``."""
+    phases = [phase.model_copy(update={"n_trials": n_trials}) for phase in experiment.phases]
+    return experiment.model_copy(update={"phases": phases})
+
+
+@pytest.mark.integration
+def test_two_phases_refused_for_one_cohort_share_one_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both topped-up phases name the changed ``TZ`` in the message, and the fix line carries the step once."""
+    experiment = _two_phase_study(tmp_path, monkeypatch)
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+
+    with pytest.raises(StudyFingerprintMismatchError, match="multiple unsafe studies") as caught:
+        run_experiment(_with_targets(experiment, 3))
+
+    refusal = caught.value
+    assert str(refusal).count('TZ "Europe/Berlin" -> "Asia/Tokyo"') == 2
+    assert refusal.remediation == _environment_cohort_remediation(["TZ"])
+    assert _operational_error_text(refusal).endswith(f"\nfix: {refusal.remediation}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_two_lowered_targets_carry_both_steps_in_a_run_and_a_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    """The dry run collapses refused studies as a run does, so it prints the same fix line."""
+    experiment = _two_phase_study(tmp_path, monkeypatch)
+
+    with pytest.raises(TrialTargetRefusedError, match="multiple unsafe studies") as caught:
+        run_experiment(_with_targets(experiment, 1), dry_run=dry_run)
+
+    assert caught.value.remediation == (
+        "Set phases[a].n_trials to at least 2 and rerun. "
+        "Set phases[b].n_trials to at least 2 and rerun."
+    )
+    assert _operational_error_text(caught.value).endswith(f"\nfix: {caught.value.remediation}")

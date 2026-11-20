@@ -23,6 +23,7 @@ import pytest
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
+from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine import fingerprints, guards, study_policy, trial
@@ -42,6 +43,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
+    TrialTargetRefusedError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.generation import InvocationGeneration
@@ -260,6 +262,60 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
         call()
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
     assert _UNMARKED_STUDY_DIAGNOSTIC_MARKERS[label] in str(excinfo.value), label
+
+
+def _collected(*errors: PhaseSweepError) -> PhaseSweepError:
+    """Return the aggregate ``_raise_collected_errors`` raises for refusals with differing messages."""
+    with pytest.raises(PhaseSweepError) as excinfo:
+        guards._raise_collected_errors(list(errors))
+    return excinfo.value
+
+
+def test_collected_refusals_carry_the_remediation_they_share():
+    """Studies refused for different messages but one step print that step once."""
+    step = "Set phases[p].n_trials to at least 2 and rerun."
+    aggregate = _collected(
+        TrialTargetRefusedError("phase a", remediation=step),
+        TrialTargetRefusedError("phase b", remediation=step),
+    )
+
+    assert aggregate.remediation == step
+    assert aggregate.action is OperatorAction.FIX_CONFIG
+    assert _operational_error_text(aggregate).endswith(f"\nfix: {step}")
+
+
+def test_collected_refusals_list_each_distinct_remediation_once_in_order():
+    """Differing steps are all kept, in the order their refusals were collected."""
+    aggregate = _collected(
+        TrialTargetRefusedError("phase a", remediation="Raise a."),
+        LaunchEnvironmentError("phase b", remediation="Create b."),
+        TrialTargetRefusedError("phase c", remediation="Raise a."),
+    )
+
+    assert aggregate.remediation == "Raise a. Create b."
+    assert type(aggregate) is PhaseSweepError
+
+
+def test_collected_refusal_without_a_remediation_contributes_its_action_step():
+    """A refusal that names no step of its own is not dropped from a fix line that names others."""
+    aggregate = _collected(
+        TrialTargetRefusedError("phase a", remediation="Raise a."),
+        TrialTargetRefusedError("phase b"),
+    )
+
+    assert aggregate.remediation == (
+        "Raise a. Correct the experiment configuration or the environment it runs in."
+    )
+
+
+def test_collected_refusals_without_any_remediation_keep_the_action_step():
+    """With no step of their own, the aggregate's action alone speaks for them."""
+    aggregate = _collected(TrialTargetRefusedError("phase a"), TrialTargetRefusedError("phase b"))
+
+    assert aggregate.remediation is None
+    assert _operational_error_text(aggregate).endswith(
+        "\nfix: correct the experiment configuration or the environment it runs in."
+    )
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):

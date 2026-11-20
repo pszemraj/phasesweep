@@ -33,7 +33,12 @@ from phasesweep.engine.study_policy import (
     _validate_study_direction,
     _validate_trial_target,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
 
 
 def _reconcile_existing_studies(
@@ -186,11 +191,27 @@ def _preflight_existing_studies(
     return studies
 
 
+def _collected_remediation(errors: Sequence[Exception]) -> str | None:
+    """Join the steps the collected refusals call for, each distinct step once.
+
+    :param Sequence[Exception] errors: Refusals collected across the studies, in phase order.
+    :return str | None: The steps in order of first appearance, a refusal with no remediation
+        of its own contributing its action's step; ``None`` when no refusal carries a
+        remediation, so the aggregate's action speaks for it.
+    """
+    routed = [error for error in errors if isinstance(error, PhaseSweepError)]
+    if not any(error.remediation for error in routed):
+        return None
+    steps = [operator_step(error) for error in routed]
+    return " ".join(dict.fromkeys(step[:1].upper() + step[1:] for step in steps))
+
+
 def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     """Raise one refusal, or an aggregate preserving the collected studies and remedies.
 
     A refusal every study reports alike, with the same type and message, as an experiment-wide
-    refusal does, is raised once and unchanged, so its fix line survives.
+    refusal does, is raised once and unchanged, so its fix line survives. An aggregate carries
+    the remediation every refusal shares, or each distinct step once when they differ.
 
     :param Sequence[Exception] errors: Refusals collected across the studies, in
         phase order; nothing is raised when it is empty.
@@ -222,6 +243,7 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
         for error in errors
     }
     shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
+    remediation = _collected_remediation(errors)
     for error_type in (
         StudySchemaMismatchError,
         StudyFingerprintMismatchError,
@@ -230,17 +252,19 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
         LaunchEnvironmentError,
     ):
         if all(isinstance(error, error_type) for error in errors):
-            raise error_type(message, action=shared) from first
+            raise error_type(message, action=shared, remediation=remediation) from first
     cleanup_error = next(
         (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
         None,
     )
     if cleanup_error is not None:
-        raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
+        raise ProcessCleanupUncertainError(
+            message, action=shared, remediation=remediation
+        ) from cleanup_error
     unexpected = next(
         (error for error in errors if not isinstance(error, PhaseSweepError)),
         None,
     )
     if unexpected is not None:
         raise RuntimeError(message) from unexpected
-    raise PhaseSweepError(message, action=shared) from first
+    raise PhaseSweepError(message, action=shared, remediation=remediation) from first
