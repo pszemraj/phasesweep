@@ -453,27 +453,42 @@ def _open_attempt_registry(
         os.close(directory_fd)
 
 
+_UNVERIFIABLE_ATTEMPT = "Recovery cannot prove whether a process from this attempt is still alive."
+
+
+def _entry_removal_step(entry_path: Path) -> str:
+    """Name the check that makes deleting an attempt registry entry safe, and the deletion.
+
+    :param Path entry_path: Registry entry that recovery cannot use.
+    :return str: The process check for the attempt the entry names, then the deletion that
+        lets the next run recover the attempt from its trial directory.
+    """
+    return (
+        recorded_process_check(
+            f"the {PROCESS_IDENTITY_FILE} in the directory under {entry_path.parent.parent} "
+            f"whose name ends in {entry_path.stem}"
+        )
+        + "; once none is alive, delete the entry file."
+    )
+
+
 def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any]:
     """Load and validate one attempt registry entry.
 
     :param Path entry_path: Registry entry file to parse.
     :param int directory_fd: Open descriptor for the entry's validated parent directory.
     :return dict[str, Any]: The validated entry payload.
-    :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
-        — recovery cannot know whether a process from it is still alive.
+    :raises ProcessCleanupUncertainError: The entry is unreadable, malformed or in another
+        format — recovery cannot know whether a process from it is still alive.
     """
     try:
         payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
     except (OSError, UnsafePrivatePathError, ValueError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
-            "Recovery cannot prove whether a process from this attempt is still alive. "
-            + recorded_process_check(
-                f"the {PROCESS_IDENTITY_FILE} in the directory under {entry_path.parent.parent} "
-                f"whose name ends in {entry_path.stem}"
-            )
-            + ".",
+            f"{_UNVERIFIABLE_ATTEMPT}",
             action=OperatorAction.RESTORE_TREE,
+            remediation=_entry_removal_step(entry_path),
         ) from exc
     if (
         isinstance(payload, dict)
@@ -482,8 +497,9 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     ):
         found = format_mismatch(payload["schema_version"], ATTEMPT_REGISTRY_SCHEMA_VERSION)
         raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} {found}.",
+            f"Attempt registry entry {entry_path} {found}. {_UNVERIFIABLE_ATTEMPT}",
             action=OperatorAction.RESTORE_TREE,
+            remediation=_entry_removal_step(entry_path),
         )
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
         required = {
@@ -514,8 +530,10 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             locator_identity = canonical_storage_identity(json_text(payload, "storage_locator"))
         except ValueError as exc:
             raise ProcessCleanupUncertainError(
-                f"Attempt registry entry {entry_path} has an unsupported or partial schema.",
+                f"Attempt registry entry {entry_path} has an unsupported or partial schema. "
+                f"{_UNVERIFIABLE_ATTEMPT}",
                 action=OperatorAction.RESTORE_TREE,
+                remediation=_entry_removal_step(entry_path),
             ) from exc
     if (
         not isinstance(payload, dict)
@@ -538,8 +556,10 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         or type(payload.get("trial_number")) is not int
     ):
         raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} has an unsupported or partial schema.",
+            f"Attempt registry entry {entry_path} has an unsupported or partial schema. "
+            f"{_UNVERIFIABLE_ATTEMPT}",
             action=OperatorAction.RESTORE_TREE,
+            remediation=_entry_removal_step(entry_path),
         )
     return payload
 

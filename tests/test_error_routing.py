@@ -806,6 +806,11 @@ def _previous_format(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
+def _entry_garbled(entry: Path) -> None:
+    """Overwrite a registry entry with text that is not JSON."""
+    entry.write_text("{not json\n")
+
+
 def _locator_cleared(entry: Path) -> None:
     """Leave a journal identity without the locator recovery requires."""
     payload = json.loads(entry.read_text())
@@ -817,6 +822,28 @@ def _locator_cleared(entry: Path) -> None:
 def _trial_dir_removed(entry: Path) -> None:
     """Remove the trial directory a registry entry names."""
     Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_entry_garbled, _previous_format, _field_dropped, _locator_cleared],
+    ids=["unreadable", "other-format", "partial-schema", "identity-without-locator"],
+)
+def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: Callable[[Path], None]
+) -> None:
+    """Restoring files cannot clear an entry recovery cannot use; checking the process and deleting it does."""
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        _scan_registry(damage=damage)(tmp_path, monkeypatch)
+
+    error = excinfo.value
+    assert "Recovery cannot prove whether a process from this attempt is still alive." in str(error)
+    assert error.remediation is not None
+    assert error.remediation.startswith("Look up pid and pgid in the process_identity.json")
+    assert "`ps -o pid,pgid,sid,cmd -p <pid>,<pgid>`" in error.remediation
+    assert error.remediation.endswith("; once none is alive, delete the entry file.")
+    assert error.remediation not in str(error)
+    assert _operational_error_text(error).endswith(f"\nfix: {error.remediation}")
 
 
 def _fd_listing_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1216,6 +1243,13 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message='pip install "phasesweep[mlflow]"',
+    ),
+    RoutingCase(
+        id="registry_entry_unreadable",
+        trigger=_scan_registry(damage=_entry_garbled),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="is unreadable or malformed.",
     ),
     RoutingCase(
         id="registry_entry_partial_schema",

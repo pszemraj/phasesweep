@@ -19,7 +19,7 @@ from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.paths import _attempts_dir
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp import runner as mcp_runner
 from tests.ledger_fixtures import Materialized, materialize
 
@@ -137,12 +137,17 @@ def assert_routes_declared_action(
         failure = mcp_runner._terminal_failure_payload(
             error, run_id="r0", stage="execution", cleanup_confirmed=True
         )
-        expected = (
-            error.remediation
-            if error.action is OperatorAction.RETRY
-            else f"Ask the operator: {error.remediation} {mcp_runner._run_log_details('r0')}"
-        )
-        assert failure["remediation"] == expected
+        if isinstance(error, ProcessCleanupUncertainError):
+            # A cleanup-uncertain failure routes its repair and then recover-run, and points at
+            # the run log, which holds the step the error carries.
+            assert failure["code"] == "cleanup_uncertain"
+        else:
+            expected = (
+                error.remediation
+                if error.action is OperatorAction.RETRY
+                else f"Ask the operator: {error.remediation} {mcp_runner._run_log_details('r0')}"
+            )
+            assert failure["remediation"] == expected
         if case.id.startswith("live_abort_with_"):
             run_log = tmp_path / "runs" / "t" / "run.log"
             assert run_log.read_text(encoding="utf-8").count(error.remediation) == 1
