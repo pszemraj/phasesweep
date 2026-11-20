@@ -44,7 +44,7 @@ from phasesweep.engine.preview import (
 )
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import _environment_identity
+from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import ensure_artifact_dir, require_supported_runtime
 from phasesweep.runtime.shutdown import (
@@ -62,7 +62,7 @@ def _preflight_missing_reached_phase_environments(
     *,
     from_phase: str | None,
 ) -> None:
-    """Validate launch environments for reached phases with no durable study.
+    """Check that each reached phase with no durable study could start its trials.
 
     A phase absent from an otherwise bound tree has no completed trial to
     replay, so it must be able to launch before this invocation tops up an
@@ -72,11 +72,13 @@ def _preflight_missing_reached_phase_environments(
     :param Experiment experiment: Parsed experiment supplying phase environments.
     :param Mapping[str, object] existing_studies: Durable studies found under the lock.
     :param str | None from_phase: Optional first phase this invocation can execute.
-    :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
+    :raises PhaseSweepError: A missing reached phase has an invalid launch environment, a
+        missing trainer directory or a trial program its trainer cannot find; see
+        :func:`phasesweep.engine.study_policy._launch_preflight`.
     """
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
-            _environment_identity(experiment, phase.name)
+            _launch_preflight(experiment, phase.name, None)
 
 
 @dataclass(frozen=True)
@@ -196,8 +198,8 @@ def run_experiment(
     Live runs hold the experiment lock across all phases and install shutdown
     handlers. Dry runs inspect recorded state and render commands without writes
     or trainer subprocesses; GPU checks may read local inventory through nvidia-smi.
-    Dry-run checks omit recovery-dependent checks, trainer
-    environments and trial evidence. Fingerprints with placeholder ancestry
+    A dry run applies each launching phase's launch preflight, cohort check included, and
+    omits recovery-dependent checks and trial evidence. Fingerprints with placeholder ancestry
     remain unknown until the parent publishes a winner.
 
     :param Experiment experiment: Parsed experiment config.

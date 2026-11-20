@@ -27,12 +27,11 @@ from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledge
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
     _initialize_study_schema,
+    _launch_preflight,
     _load_accepted_partial_decision,
-    _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
 )
-from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 
 
@@ -100,8 +99,12 @@ def _preflight_existing_studies(
         configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
-    :raises PhaseSweepError: Multiple studies failed preflight for mixed
-        expected reasons not covered by a more specific common exception type.
+    :raises StudyFingerprintMismatchError: A reached phase that needs new trials holds
+        trials from another trainer-environment cohort.
+    :raises PhaseSweepError: A reached phase that needs new trials could not start them
+        (see :func:`phasesweep.engine.study_policy._launch_preflight`), or multiple studies
+        failed preflight for mixed expected reasons not covered by a more specific common
+        exception type.
     :raises RuntimeError: Multiple studies failed and at least one error is an
         unexpected implementation failure that must retain traceback reporting.
     """
@@ -175,9 +178,7 @@ def _preflight_existing_studies(
                     partial_decision is not None and phase.n_trials == partial_decision.trial_target
                 )
                 if needs_new_trials:
-                    _validate_environment_cohort(
-                        study, _environment_identity(experiment, phase.name)
-                    )
+                    _launch_preflight(experiment, phase.name, study)
         except Exception as exc:
             errors.append(exc)
     _raise_collected_errors(errors)

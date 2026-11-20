@@ -66,6 +66,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import (
     _consecutive_failure_threshold_tripped,
+    _launch_preflight,
     _load_phase_policy_state,
     _record_recovery_boundary,
 )
@@ -575,12 +576,15 @@ def test_terminal_callback_reports_success_evidence(
     captured: list[TerminalReport] = []
     validated_environments: list[str] = []
 
-    def validate_environment(_experiment: Experiment, phase_name: str) -> EnvironmentIdentity:
+    def validate_environment(
+        _experiment: Experiment, phase_name: str, study: optuna.Study | None
+    ) -> EnvironmentIdentity:
         assert not _artifact_root_binding_path(experiment).exists()
+        assert study is None
         validated_environments.append(phase_name)
-        return _environment_identity(_experiment, phase_name)
+        return _launch_preflight(_experiment, phase_name, study)
 
-    monkeypatch.setattr("phasesweep.engine.run._environment_identity", validate_environment)
+    monkeypatch.setattr("phasesweep.engine.run._launch_preflight", validate_environment)
 
     def preflight(_ledger, *, cleanup_report, from_phase):
         del from_phase

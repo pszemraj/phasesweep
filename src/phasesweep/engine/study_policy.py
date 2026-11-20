@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import re
+import shlex
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
-from phasesweep.config.models import Phase
+from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import (
     fixed_configuration_target_refusal,
     grid_cardinality,
@@ -52,8 +57,13 @@ from phasesweep.engine.state import (
     _study_schema_supported,
     _trial_interrupted,
 )
-from phasesweep.engine.trial import EnvironmentIdentity
-from phasesweep.errors import NEW_STUDY_STEP, RERUN_CLEANUP_RECOVERY, OperatorAction
+from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
+from phasesweep.errors import (
+    NEW_STUDY_STEP,
+    RERUN_CLEANUP_RECOVERY,
+    OperatorAction,
+    PhaseSweepError,
+)
 from phasesweep.runtime.json import JsonObject, json_text_map
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
@@ -1081,3 +1091,192 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
             "execution.passthrough_env, such as rotating credentials, do not split cohorts.",
             action=OperatorAction.FIX_CONFIG,
         )
+
+
+#: Words ``/bin/sh`` handles itself rather than finding on PATH: the reserved words and
+#: builtins of dash and bash, since either may be ``/bin/sh``.
+_SHELL_OWN_WORDS = frozenset(
+    [
+        "case",
+        "coproc",
+        "do",
+        "done",
+        "elif",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "in",
+        "select",
+        "then",
+        "time",
+        "until",
+        "while",
+        ".",
+        "alias",
+        "bg",
+        "bind",
+        "break",
+        "builtin",
+        "caller",
+        "cd",
+        "command",
+        "compgen",
+        "complete",
+        "compopt",
+        "continue",
+        "declare",
+        "dirs",
+        "disown",
+        "echo",
+        "enable",
+        "eval",
+        "exec",
+        "exit",
+        "export",
+        "false",
+        "fc",
+        "fg",
+        "getopts",
+        "hash",
+        "help",
+        "history",
+        "jobs",
+        "kill",
+        "let",
+        "local",
+        "logout",
+        "mapfile",
+        "popd",
+        "printf",
+        "pushd",
+        "pwd",
+        "read",
+        "readarray",
+        "readonly",
+        "return",
+        "set",
+        "shift",
+        "shopt",
+        "source",
+        "suspend",
+        "test",
+        "times",
+        "trap",
+        "true",
+        "type",
+        "typeset",
+        "ulimit",
+        "umask",
+        "unalias",
+        "unset",
+        "wait",
+    ]
+)
+#: A first word of only these characters names a program with no quoting, expansion,
+#: assignment or placeholder in it.
+_PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
+
+
+def _require_trainer_cwd(experiment: Experiment) -> None:
+    """Refuse a configured trainer directory that does not exist.
+
+    The answer is the same from any shell, so ``validate`` runs this check as well as every
+    launch, which runs it in :func:`_launch_preflight`.
+
+    :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
+    :raises PhaseSweepError: ``execution.cwd`` is not a directory on this host.
+    """
+    missing = _missing_trainer_cwd(experiment)
+    if missing is not None:
+        raise PhaseSweepError(
+            missing,
+            action=OperatorAction.FIX_CONFIG,
+            remediation="Create that directory, or set execution.cwd to an existing one.",
+        )
+
+
+def _trial_program_refusal(command: str, *, path: str | None, cwd: Path) -> tuple[str, str] | None:
+    """Judge whether the shell that runs a trial command can find its program.
+
+    The trial command runs through ``/bin/sh``, so only a first word with no quoting,
+    expansion, assignment or placeholder is judged, and never a word the shell handles
+    itself. Anything else is left to the shell, never refused.
+
+    :param str command: The trial command template.
+    :param str | None path: ``PATH`` the trainer receives, or ``None`` when it receives none.
+    :param Path cwd: Directory the trainer starts in, which relative paths resolve against.
+    :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
+        is found or cannot be judged.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if not words or command.split(maxsplit=1)[0] != words[0]:
+        return None
+    program = words[0]
+    if program in _SHELL_OWN_WORDS or _PLAIN_PROGRAM.fullmatch(program) is None:
+        return None
+    if "/" in program:
+        resolved = cwd / program
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return None
+        return (
+            f"The trial command's program {program!r} resolves to {resolved}, which is not an "
+            "executable file.",
+            "Correct the path in trial_command or make the file executable; a relative path "
+            "resolves against the trainer's working directory.",
+        )
+    if path is None:
+        return None
+    # The shell resolves a relative PATH entry against the trainer's directory.
+    search = os.pathsep.join(str(cwd / entry) for entry in path.split(os.pathsep))
+    if shutil.which(program, path=search) is not None:
+        return None
+    return (
+        f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",
+        "Put the program on the PATH the run starts with, or name it by absolute path in "
+        "trial_command.",
+    )
+
+
+def _launch_preflight(
+    experiment: Experiment, phase_name: str, study: optuna.Study | None
+) -> EnvironmentIdentity:
+    """Refuse a phase launch whose trials could not start, before any trial is allocated.
+
+    The cohort check comes first, so a changed ``PATH`` reads as a cohort refusal that shows
+    the old and new values, not as a missing program.
+
+    :param Experiment experiment: Experiment supplying the trainer environment, working
+        directory and trial command.
+    :param str phase_name: Phase about to allocate trials.
+    :param optuna.Study | None study: The phase's existing study, or ``None`` when it has none.
+    :return EnvironmentIdentity: The trainer environment the phase launches with.
+    :raises StudySchemaMismatchError: A populated study has a trial with no usable
+        environment identity.
+    :raises StudyFingerprintMismatchError: The study's trials ran under another environment
+        cohort.
+    :raises PhaseSweepError: The trainer environment cannot be composed, ``execution.cwd`` is
+        not a directory, or the trial command's program cannot be found.
+    """
+    identity = _environment_identity(experiment, phase_name)
+    if study is not None:
+        _validate_environment_cohort(study, identity)
+    _require_trainer_cwd(experiment)
+    refusal = _trial_program_refusal(
+        experiment.trial_command,
+        path=identity.values.get("PATH"),
+        cwd=experiment.execution.resolved_cwd() or Path.cwd(),
+    )
+    if refusal is not None:
+        message, remediation = refusal
+        raise PhaseSweepError(
+            f"{message} Every trial would fail before its trainer started, so none was allocated.",
+            action=OperatorAction.FIX_CONFIG,
+            remediation=remediation,
+        )
+    return identity

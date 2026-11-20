@@ -1035,6 +1035,24 @@ def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.Monk
     )
 
 
+def _run_with_missing_program(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Run a fresh tree whose trial command names a program missing from the trainer's PATH."""
+    return run_experiment(
+        make_experiment(
+            workdir=tmp_path / "runs", trial_command="phasesweep-no-such-trainer {overrides}"
+        )
+    )
+
+
+def _run_with_missing_trainer_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Run a fresh tree whose execution.cwd names no directory."""
+    return run_experiment(
+        make_experiment(
+            workdir=tmp_path / "runs", execution=ExecutionContext(cwd=str(tmp_path / "gone"))
+        )
+    )
+
+
 ORIGIN_CASES = (
     RoutingCase(
         id="stale_trial_in_foreign_pid_namespace",
@@ -1287,6 +1305,20 @@ ORIGIN_CASES = (
         raised=TrackingTargetUnavailableError,
         action=OperatorAction.FIX_CONFIG,
         message="1 completed trial(s) finished training, but the tracker gave no answer",
+    ),
+    RoutingCase(
+        id="launch_preflight_program_missing",
+        trigger=_run_with_missing_program,
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message="program 'phasesweep-no-such-trainer' is not on the trainer's PATH",
+    ),
+    RoutingCase(
+        id="launch_preflight_trainer_cwd_missing",
+        trigger=_run_with_missing_trainer_cwd,
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message="which is not a directory on this host",
     ),
 )
 

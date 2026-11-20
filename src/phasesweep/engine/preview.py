@@ -43,6 +43,7 @@ from phasesweep.engine.state import (
     _recovered_trial_state,
 )
 from phasesweep.engine.study_policy import (
+    _launch_preflight,
     _load_phase_policy_state,
     _pending_rerun_count,
     _validate_fixed_configuration_target,
@@ -220,8 +221,9 @@ def _refuse_as_a_launch_would(
 
     Combine per-study refusals as a launch does. For RUNNING studies, apply direction,
     schema, and fixed-target checks using predicted recovery counts; defer target
-    and descendant checks requiring actual recovery. Preview does not verify trainer
-    environment, evidence, or per-study artifact-root claims.
+    and descendant checks requiring actual recovery. Preview does not verify evidence or
+    per-study artifact-root claims; :func:`_preview_phase` runs each launching phase's
+    launch preflight.
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
@@ -311,7 +313,8 @@ def _preview_phase(
         for phases earlier in the chain.
     :param RecordedPhase | None recorded: What the ledger holds for the phase,
         or ``None`` when that could not be read and the phase previews as fresh.
-    :raises PhaseSweepError: A launch would refuse the phase's recorded state.
+    :raises PhaseSweepError: A launch would refuse the phase's recorded state, or its
+        launch preflight (:func:`phasesweep.engine.study_policy._launch_preflight`) refuses.
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
@@ -397,6 +400,8 @@ def _preview_phase(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
         return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
+    # Recovery keeps each RUNNING attempt's environment, so the snapshot's cohort is the launch's.
+    _launch_preflight(experiment, phase.name, None if recorded is None else recorded.study)
     GpuPool.for_phase(phase, cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"))
     winner = _dry_run_phase(
         experiment,

@@ -167,10 +167,11 @@ _STDERR_QUOTE_CHARS = 200
 # A terminal color or cursor sequence, which would otherwise leave its ``[31m`` residue.
 _ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-# Stderr patterns eligible for the narrowed-environment hint.
+# Stderr patterns eligible for the narrowed-environment hint. ``sh: 1: NAME: not found``
+# is dash's wording for a program missing from PATH.
 _MISSING_ENVIRONMENT_STDERR = re.compile(
     r"ModuleNotFoundError|ImportError|No module named"
-    r"|command not found|No such file or directory"
+    r"|command not found|sh: \d+: .+: not found|No such file or directory"
     r"|KeyError: ['\"][A-Z][A-Z0-9_]*['\"]"
     r"|(?i:environment variable|is not set)"
 )
@@ -434,6 +435,22 @@ class TrialExecutionError(RuntimeError):
     """
 
 
+def _missing_trainer_cwd(experiment: Experiment) -> str | None:
+    """Describe a configured trainer directory that is not a directory on this host.
+
+    :param Experiment experiment: Experiment whose ``execution.cwd`` is checked.
+    :return str | None: The diagnostic, or ``None`` when ``execution.cwd`` is unset or names
+        a directory.
+    """
+    trainer_cwd = experiment.execution.resolved_cwd()
+    if trainer_cwd is None or trainer_cwd.is_dir():
+        return None
+    return (
+        f"execution.cwd {experiment.execution.cwd!r} resolves to {trainer_cwd}, which is not a "
+        "directory on this host."
+    )
+
+
 def _failed_trial(
     *,
     rc: int,
@@ -618,12 +635,11 @@ def launch_trial(
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
             env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
+    # The launch preflight checked this directory, but it can vanish while a phase runs.
+    missing_cwd = _missing_trainer_cwd(experiment)
+    if missing_cwd is not None:
+        raise TrialExecutionError(missing_cwd)
     trainer_cwd = experiment.execution.resolved_cwd()
-    if trainer_cwd is not None and not trainer_cwd.is_dir():
-        raise TrialExecutionError(
-            f"execution.cwd {experiment.execution.cwd!r} resolves to {trainer_cwd}, which is not a "
-            "directory on this host."
-        )
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
     env["PHASESWEEP_PHASE"] = phase_name

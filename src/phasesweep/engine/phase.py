@@ -87,6 +87,7 @@ from phasesweep.engine.study_policy import (
     _config_retires_abort,
     _consecutive_failure_threshold_tripped,
     _initialize_study_schema,
+    _launch_preflight,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
     _next_consecutive_failures,
@@ -99,14 +100,12 @@ from phasesweep.engine.study_policy import (
     _recovery_action,
     _recovery_advice,
     _streak_trials_all_infeasible,
-    _validate_environment_cohort,
     _validate_study_direction,
     _validate_trial_target,
 )
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     TrialExecutionError,
-    _environment_identity,
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
@@ -1543,9 +1542,8 @@ def _run_phase(
             experiment, phase, inherited_winners, study, resume, verify_evidence=True
         )
 
-    # No-op replay needs no launch environment; new allocations must match the cohort.
-    environment_identity = _environment_identity(experiment, phase.name)
-    _validate_environment_cohort(study, environment_identity)
+    # No-op replay needs no launch environment; new allocations must be able to start.
+    environment_identity = _launch_preflight(experiment, phase.name, study)
 
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.wandb import require_wandb_sdk

@@ -703,6 +703,7 @@ def test_nonzero_exit_reason_quotes_the_last_stderr_line(
         "ImportError: cannot import name 'y' from 'x'",
         "/usr/bin/python: No module named x",
         "sh: 1: nvidia-smi: command not found",
+        "/bin/sh: 1: python: not found",
         "FileNotFoundError: [Errno 2] No such file or directory: 'data.csv'",
         "KeyError: 'HF_HOME'",
         "RuntimeError: the HF_HOME environment variable must be set",
