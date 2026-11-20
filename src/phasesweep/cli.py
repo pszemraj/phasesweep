@@ -1269,8 +1269,9 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
     name="call",
     context_settings=CONTEXT_SETTINGS,
     help=(
-        "Run one MCP tool against a catalog in this process and print its structured result as "
-        "JSON, through the same dispatch, validation, redaction and audit as `mcp serve`. "
+        "Run one MCP tool against a catalog in this process and print its result (JSON, or the "
+        "text of get_guide), through the same dispatch, validation, redaction and audit as "
+        "`mcp serve`. "
         "JSON_ARGS is a JSON object of tool arguments and defaults to {}. Exit code 0 prints the "
         "result; 1 prints the tool's error on stderr; 2 means bad input or a catalog that does "
         "not load. The call is real: launch_run starts a detached run."
