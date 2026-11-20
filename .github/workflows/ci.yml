@@ -27,7 +27,7 @@ jobs:
       - run: mypy src
       # Pytest collects the whole suite before selecting the tests marked
       # `contract`; keep this step within the approved test budget.
-      # CI does not install phasesweep, so PYTHONPATH=src makes pytest import it from the checkout.
+      # CI stays static and has no install step, so PYTHONPATH=src makes pytest import the checkout.
       - name: Contract tests
         run: |
           bash scripts/check_module_size.sh
