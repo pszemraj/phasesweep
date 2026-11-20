@@ -52,7 +52,7 @@ pre-commit install
 | whole-suite collection | pre-commit | every commit, collecting the whole suite |
 | `mypy src` | pre-push | the whole package |
 
-The [environment hook](../scripts/check_hook_environment.py) passes when the `python` first on `PATH` imports `phasesweep` from this checkout's `src/`. When it fails, it prints which Python it found and stops the run, so a commit or push from another environment ends with that one message, not with the import and stub errors the later hooks would report.
+The [environment hook](../scripts/check_hook_environment.py) passes when the `python` first on `PATH` finds `phasesweep` in this checkout's `src/`; it locates the package without importing it. When it fails, it prints which Python it found and where that Python finds the package, then stops the run, so a commit or push from another environment ends with that one message, not with the import and stub errors the later hooks would report.
 
 Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. The development extra pins `ruff` and `mypy` to exact versions, and [CI](../.github/workflows/ci.yml) installs those same versions together with an exact version of every package its checks import, so a new release cannot change the result for an unchanged tree. Raise the pins in `pyproject.toml` and the workflow together. When Ruff rewrites a file, stage the fix and commit again.
 
