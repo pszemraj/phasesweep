@@ -35,10 +35,16 @@ _HISTORY_SAMPLES = 10_000
 
 @dataclass(eq=False)
 class WandbPollTimeout(TimeoutError):
-    """The complete worker exhausted its summary visibility budget."""
+    """The complete worker exhausted its summary visibility budget.
+
+    ``reached`` says whether the last poll got an answer about the run: a run seen but
+    never finished, or finished without its keys, is a verdict on the trial, while polls
+    that all failed in transport or setup say nothing about it.
+    """
 
     run_id: str
     timeout_seconds: float
+    reached: bool
     last_error: Exception | None = None
 
 
@@ -212,7 +218,8 @@ def poll_wandb_summary(
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
-    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
+    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget; it was
+        reached only when the worker reports that its last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -225,7 +232,7 @@ def poll_wandb_summary(
         time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
     )
     if time.monotonic() >= deadline:
-        raise WandbPollTimeout(run_id, timeout_seconds)
+        raise WandbPollTimeout(run_id, timeout_seconds, reached=False)
     result, response, diagnostic_path = run_worker(
         {
             "task": "summary",
@@ -283,8 +290,12 @@ def poll_wandb_summary(
     if response.get("status") != "summary":
         if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
             detail = response.get("cause")
+            # A worker stopped before it reported never got an answer this side can use.
             raise WandbPollTimeout(
-                run_id, timeout_seconds, RuntimeError(detail) if detail else None
+                run_id,
+                timeout_seconds,
+                reached=response.get("status") == "timeout" and response.get("reached") is True,
+                last_error=RuntimeError(detail) if detail else None,
             )
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
@@ -490,7 +501,8 @@ def _poll_wandb_summary(
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
     :return dict[str, Any]: Numeric values, present keys, and retrieval time.
-    :raises WandbPollTimeout: The run did not finish with the required keys in time.
+    :raises WandbPollTimeout: The run did not finish with the required keys in time,
+        reached when the last poll got an answer about the run.
     :raises WandbRunMissingError: The final lookup at the deadline found no matching run.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -506,6 +518,8 @@ def _poll_wandb_summary(
 
     deadline = time.monotonic() + timeout_seconds if deadline is None else deadline
     last_error: Exception | None = None
+    # Whether the latest poll got an answer about the run rather than failing in transport.
+    reached = False
     missing_keys: WandbMissingKeysError | None = None
     settle_by = math.inf
     required = tuple(required_keys)
@@ -519,6 +533,7 @@ def _poll_wandb_summary(
             if not _is_retryable_setup_error(exc):
                 raise WandbSetupError(run_id, _error_detail(exc)) from exc
             last_error = RuntimeError(_error_detail(exc))
+            reached = False
         else:
             if time.monotonic() >= deadline:
                 break
@@ -532,13 +547,14 @@ def _poll_wandb_summary(
                     and not _is_retryable_setup_error(exc)
                 ):
                     raise WandbSetupError(run_id, _error_detail(exc)) from exc
+                # "No such run" answers the lookup; any other failure leaves it unanswered.
+                reached = _is_missing_run_error(exc)
                 last_error = (
-                    WandbRunMissingError(run_id)
-                    if _is_missing_run_error(exc)
-                    else RuntimeError(_error_detail(exc))
+                    WandbRunMissingError(run_id) if reached else RuntimeError(_error_detail(exc))
                 )
             else:
                 last_error = None
+                reached = True
                 if time.monotonic() >= deadline:
                     break
                 if run.state in {"failed", "crashed", "killed", "preempted"}:
@@ -575,7 +591,7 @@ def _poll_wandb_summary(
         time.sleep(min(poll_seconds, max(0.0, wake_by - time.monotonic())))
     if isinstance(last_error, WandbRunMissingError):
         raise last_error
-    raise WandbPollTimeout(run_id, timeout_seconds, last_error)
+    raise WandbPollTimeout(run_id, timeout_seconds, reached=reached, last_error=last_error)
 
 
 def _locate_wandb_position(
@@ -680,7 +696,11 @@ def main(argv: list[str] | None = None) -> int:
     except WandbRunMissingError:
         response = {"status": "run_missing"}
     except WandbPollTimeout as exc:
-        response = {"status": "timeout", "cause": str(exc.last_error) if exc.last_error else None}
+        response = {
+            "status": "timeout",
+            "cause": str(exc.last_error) if exc.last_error else None,
+            "reached": exc.reached,
+        }
     except ValueError:
         response = {
             "status": "invalid_evidence",

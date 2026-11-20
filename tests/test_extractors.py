@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
+    EvidenceUnreadableError,
     ExtractorError,
     evaluate_gates,
     extractor_config_fingerprint,
@@ -151,7 +152,8 @@ def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("status", [401, 403, 429, 503, "connection", "timeout"])
-def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
+def test_wandb_real_sdk_error_causes_are_preserved(tmp_path, monkeypatch, status):
+    """A denial ends polling as unreadable evidence; a transient fault is retried."""
     public = pytest.importorskip("wandb.apis.public")
     from requests import HTTPError, Response
     from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -188,6 +190,15 @@ def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
         assert str(status) in caught.value.cause
         assert "secret-token" not in caught.value.cause
         assert len(attempts) == 1
+        # Rejected credentials say nothing about the trial, so its evidence is unreadable.
+        attempts.clear()
+        monkeypatch.setattr(
+            "phasesweep.evidence.evaluation.poll_wandb_summary",
+            lambda trial_dir, environment, **kwargs: _wandb_poll(**kwargs),
+        )
+        extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        with pytest.raises(EvidenceUnreadableError, match=str(status)):
+            run_extractor(make_trial_context(tmp_path), extractor)
     else:
         assert _wandb_poll(required_keys=["eval/loss"])["values"] == {"eval/loss": 0.25}
         assert len(attempts) == 2
@@ -227,7 +238,7 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
-        ("WandbPollTimeout", ("attempt", 1.0)),
+        ("WandbPollTimeout", ("attempt", 1.0, False)),
         ("WandbRunTerminalError", ("attempt", "crashed")),
         ("WandbSetupError", ("attempt", "denied")),
         ("WandbMissingKeysError", ("attempt", ["loss"], ["eval/loss"])),
@@ -593,6 +604,192 @@ def test_wandb_gates_share_failed_capture(tmp_path, monkeypatch):
     assert "ended in 'failed'" in results[0].detail
 
 
+def _wandb_failures() -> dict[str, tuple[Exception, bool]]:
+    """Return each W&B reader failure and whether it leaves the evidence unreadable."""
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    attempt = "attempt-test"
+    return {
+        "transport-timeout": (wandb_evidence.WandbPollTimeout(attempt, 1.0, reached=False), True),
+        "reached-timeout": (wandb_evidence.WandbPollTimeout(attempt, 1.0, reached=True), False),
+        "setup": (wandb_evidence.WandbSetupError(attempt, "HTTPError (HTTP 401)"), True),
+        "sdk": (ImportError("wandb"), True),
+        "worker": (RuntimeError("worker exited"), True),
+        "missing-run": (wandb_evidence.WandbRunMissingError(attempt), False),
+        "terminal": (wandb_evidence.WandbRunTerminalError(attempt, "crashed"), False),
+        "missing-keys": (wandb_evidence.WandbMissingKeysError(attempt, ["loss"], []), False),
+        "invalid": (ValueError("not a finite number"), False),
+    }
+
+
+@pytest.mark.parametrize("failure", list(_wandb_failures()))
+def test_wandb_capture_is_unreadable_only_when_wandb_gave_no_answer(tmp_path, monkeypatch, failure):
+    """The objective and every gate see one cached failure, unreadable only without an answer."""
+    from phasesweep.evidence.models import WandbQuery
+
+    error, unreadable = _wandb_failures()[failure]
+    calls = 0
+
+    def capture(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    extractor = WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["loss"]
+    )
+    ctx = replace(
+        make_trial_context(tmp_path), wandb_query=WandbQuery(extractor, ("loss",), ("loss",))
+    )
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(ctx, extractor)
+    assert isinstance(refused.value, EvidenceUnreadableError) is unreadable
+    assert not isinstance(refused.value, DeadlineExceededError)
+    (result,) = evaluate_gates(ctx, [gate])
+    assert (result.passed, result.deadline_exhausted) == (False, False)
+    assert result.evidence_unreadable is unreadable
+    assert calls == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("answer", ["connection", "running"])
+def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tmp_path, answer):
+    """A timeout after transport failures is unreadable; one after seeing the run unfinished fails it."""
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    wandb_worker_sdk(f"""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                if {answer!r} == "connection":
+                    raise ConnectionError("tracker unreachable")
+                return type("Run", (), {{"state": "running", "summary_metrics": {{}}}})()
+    """)
+    source = WandbExtractor(
+        type="wandb",
+        entity="e",
+        project="p",
+        metric_key="loss",
+        poll_seconds=0.01,
+        timeout_seconds=1,
+    )
+    with pytest.raises(ExtractorError) as refused:
+        run_extractor(make_trial_context(tmp_path), source)
+    assert isinstance(refused.value, EvidenceUnreadableError) is (answer == "connection")
+    timeout = refused.value.__cause__
+    assert isinstance(timeout, WandbPollTimeout)
+    assert timeout.reached is (answer == "running")
+
+
+@pytest.mark.parametrize(
+    ("server", "unreadable"),
+    [("refused", True), ("denied", True), ("failed-run", False), ("deleted-run", False)],
+)
+def test_mlflow_capture_is_unreadable_only_when_mlflow_gave_no_answer(
+    tmp_path, monkeypatch, server, unreadable
+):
+    """A refused connection or denied access leaves the evidence unreadable; a FAILED or deleted run fails it."""
+    import errno
+    import shlex
+
+    import mlflow
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos import databricks_pb2
+
+    from phasesweep.evidence.evaluation import TrialContext, _capture_mlflow
+    from phasesweep.evidence.mlflow import compile_query
+    from phasesweep.runtime import process
+    from phasesweep.tracking import mlflow as worker
+    from phasesweep.tracking import session
+    from tests.tracking_helpers import mlflow_binding, mlflow_run, native_experiment
+
+    binding = mlflow_binding()
+    session.write_record(
+        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+    )
+    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    experiment = native_experiment(tmp_path)
+    ctx = TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=0,
+        duration_seconds=1,
+        mlflow_settings=experiment.mlflow.model_dump(),
+        mlflow_query=compile_query(experiment, []),
+    )
+
+    def get_run(_run_id):
+        if server == "refused":
+            raise MlflowException("private") from ConnectionRefusedError(
+                errno.ECONNREFUSED, "private"
+            )
+        if server == "denied":
+            raise MlflowException("private", error_code=databricks_pb2.PERMISSION_DENIED)
+        if server == "deleted-run":
+            raise MlflowException("private", error_code=databricks_pb2.RESOURCE_DOES_NOT_EXIST)
+        return mlflow_run(binding, status="FAILED")
+
+    monkeypatch.setattr(
+        mlflow, "MlflowClient", lambda tracking_uri: SimpleNamespace(get_run=get_run)
+    )
+
+    def run_in_process(command, **kwargs):
+        request_path, response_path = shlex.split(command)[-2:]
+        assert worker.main([request_path, response_path]) == 0
+        return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+    monkeypatch.setattr(process, "run_supervised", run_in_process)
+    with pytest.raises(ExtractorError) as refused:
+        _capture_mlflow(ctx, deadline=None)
+    assert isinstance(refused.value, EvidenceUnreadableError) is unreadable
+    assert "private" not in str(refused.value)
+
+
+@pytest.mark.parametrize("definite_gate", [False, True], ids=["unreadable-only", "with-definite"])
+def test_a_definite_gate_failure_outranks_an_unreadable_one(tmp_path, monkeypatch, definite_gate):
+    """A result is unreadable only when every failed gate is; one definite failure fails the trial."""
+    from phasesweep.config.models import Metric
+    from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+    from phasesweep.evidence.models import RequiredFileGate
+    from phasesweep.evidence.wandb import WandbSetupError
+    from phasesweep.runtime.process import ProcessResult
+    from tests.conftest import make_experiment
+
+    def denied(**kwargs):
+        raise WandbSetupError("attempt-test", "HTTPError (HTTP 401)")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", denied)
+    (tmp_path / "r.json").write_text(json.dumps({"x": 0.5}))
+    experiment = make_experiment(
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="x"))
+    )
+    gates = [
+        WandbSummaryRequiredGate(
+            type="wandb_summary_required", entity="e", project="p", keys=["done"]
+        )
+    ]
+    if definite_gate:
+        gates.append(RequiredFileGate(type="required_file", path="checkpoint.pt"))
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=ExecutedTrial(make_trial_context(tmp_path), ProcessResult(0, False, -1, 1.0)),
+        gates=gates,
+    )
+    assert result.failure_reason is not None
+    assert result.gate_results is not None
+    assert [gate.passed for gate in result.gate_results] == [False] * len(gates)
+    assert result.evidence_unreadable is not definite_gate
+    assert not result.deadline_exhausted
+
+
 @pytest.mark.parametrize("failure_kind", ["deadline", "cleanup"])
 def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_kind):
     from phasesweep.errors import UnsafeProcessCleanupError
@@ -636,7 +833,7 @@ def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypat
         calls += 1
         if calls == 1:
             clock.now = 1.0
-            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds)
+            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds, reached=False)
         return {"values": {}, "present_keys": ["done"]}
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
@@ -961,6 +1158,8 @@ def test_wandb_missing_keys_without_a_full_window_poll_until_the_deadline(
     with pytest.raises(WandbPollTimeout) as caught:
         _wandb_poll(required_keys=["train/train_runtime"], poll_seconds=5, timeout_seconds=240)
     assert clock.now == 240
+    # The run answered every poll, so the timeout is a verdict on the trial.
+    assert caught.value.reached is True
     if finished_from_read is None:
         assert caught.value.last_error is None
     else:
@@ -1566,6 +1765,8 @@ def test_wandb_missing_run_diagnostic_follows_the_last_observation(
     assert calls >= 2
     assert "private" not in str(refused.value)
     if isinstance(refused.value, WandbPollTimeout):
+        # Only a lookup that failed in transport leaves the run unanswered.
+        assert refused.value.reached is (last_observation != "network")
         detail = str(refused.value.last_error)
         assert "private" not in detail
         assert "Could not find run" not in detail

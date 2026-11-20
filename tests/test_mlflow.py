@@ -21,6 +21,7 @@ from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
+    OperationUnavailableError,
     _capture,
     _create,
     _find,
@@ -1458,43 +1459,65 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "action,error,expected",
+    "action,error,status,expected",
     [
         (
             "publish",
             lambda: ModuleNotFoundError("No module named 'mlflow'", name="mlflow"),
+            "unavailable",
             "requires phasesweep[mlflow]",
         ),
         (
             "publish",
             lambda: ModuleNotFoundError("No module named 'boto3'", name="boto3"),
+            "unavailable",
             "needs Python module 'boto3'",
         ),
         (
             "publish",
             _server_error("PERMISSION_DENIED"),
+            "unavailable",
             "(MlflowException: PERMISSION_DENIED); check tracking access and credentials.",
         ),
         (
             "publish",
             _server_error("RESOURCE_DOES_NOT_EXIST"),
+            "error",
             "(MlflowException: RESOURCE_DOES_NOT_EXIST); the experiment or run no longer exists.",
         ),
         (
             "publish",
             _server_error("INVALID_PARAMETER_VALUE"),
+            "error",
             "(MlflowException: INVALID_PARAMETER_VALUE); MLflow rejected a logged name or value.",
         ),
         (
             "resolve",
             _server_error("INVALID_PARAMETER_VALUE"),
+            "error",
             "(MlflowException: INVALID_PARAMETER_VALUE); MLflow rejected the configured experiment.",
         ),
-        ("publish", _upload_forbidden, "(HTTPError: 403); check tracking access and credentials."),
+        (
+            "publish",
+            _upload_forbidden,
+            "error",
+            "(HTTPError: 403); check tracking access and credentials.",
+        ),
+        ("capture", _connection_lost, "unavailable", "(ConnectionError)"),
     ],
-    ids=["sdk", "dependency", "denied", "deleted", "rejected", "bad-target", "upload"],
+    ids=[
+        "sdk",
+        "dependency",
+        "denied",
+        "deleted",
+        "rejected",
+        "bad-target",
+        "upload",
+        "no-response",
+    ],
 )
-def test_worker_names_the_failure_cause(tmp_path, monkeypatch, action, error, expected):
+def test_worker_names_the_failure_cause(tmp_path, monkeypatch, action, error, status, expected):
+    """A missing SDK, denied access or a lost connection is unavailable; a server verdict is an error."""
     import json
 
     from phasesweep.tracking import mlflow as worker
@@ -1506,9 +1529,10 @@ def test_worker_names_the_failure_cause(tmp_path, monkeypatch, action, error, ex
     request, response = tmp_path / "request.json", tmp_path / "response.json"
     request.write_text(json.dumps({"action": action}))
     assert worker.main([str(request), str(response)]) == 0
-    message = json.loads(response.read_text())["message"]
-    assert expected in message
-    assert "private" not in message
+    reported = json.loads(response.read_text())
+    assert reported["status"] == status
+    assert expected in reported["message"]
+    assert "private" not in reported["message"]
 
 
 def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
@@ -1529,6 +1553,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
     [
         (0, False, {"status": "ok", "result": {"x": 1}}, {"x": 1}),
         (0, False, {"status": "error", "message": "rejected"}, OperationRejectedError),
+        (0, False, {"status": "unavailable", "message": "refused"}, OperationUnavailableError),
         (
             0,
             False,
@@ -1561,6 +1586,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
     ids=[
         "ok",
         "error",
+        "unavailable",
         "unknown",
         "crashed",
         "invalid-status",
@@ -1607,7 +1633,7 @@ def test_worker_outcomes_reach_the_controller_as_distinct_exceptions(
                 caught.value if expected is type(response) else caught.value.__cause__
             ) is response
             assert "private" not in str(caught.value)
-    assert seen == [frozenset({"ok", "error", "unknown"})]
+    assert seen == [frozenset({"ok", "error", "unavailable", "unknown"})]
 
 
 @pytest.mark.parametrize("failure", ["target", "attempt"])

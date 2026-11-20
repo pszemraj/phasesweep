@@ -41,6 +41,7 @@ from phasesweep.errors import (
 )
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
+    EvidenceUnreadableError,
     ExtractorError,
     GateResult,
     TrialContext,
@@ -116,6 +117,9 @@ class TrialResult:
     objective_provenance: dict[str, Any] | None = None
     # True only when the phase/run deadline caused the failure.
     deadline_exhausted: bool = False
+    # True only when every failure is a tracker that gave no answer, so the finished
+    # training waits for a later read instead of being recorded as failed.
+    evidence_unreadable: bool = False
     # Report-only values read after acceptance, by observation name. A name
     # whose extraction failed or came out non-finite is absent.
     observed: dict[str, float] = field(default_factory=dict)
@@ -438,6 +442,7 @@ def _failed_trial(
     constraints: dict[str, float] | None = None,
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
+    evidence_unreadable: bool = False,
     objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
@@ -453,6 +458,7 @@ def _failed_trial(
     :param list[GateResult] | None gate_results: Evidence gate results collected before the
         failure, if any.
     :param bool deadline_exhausted: Whether the phase/run deadline caused the failure.
+    :param bool evidence_unreadable: Whether every failure is a tracker that gave no answer.
     :param dict[str, object] | None objective_provenance: Frozen evidence already captured
         before a later gate failed.
     :return TrialResult: A result with ``metric=None`` and ``feasible=False``.
@@ -466,6 +472,7 @@ def _failed_trial(
         failure_reason=failure_reason,
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
+        evidence_unreadable=evidence_unreadable,
         objective_provenance=objective_provenance,
     )
 
@@ -786,12 +793,17 @@ def extract_trial_result(
             value = run_extractor(executed.ctx, extractor, deadline=deadline, provenance=provenance)
         except ExtractorError as exc:
             exhausted = isinstance(exc, DeadlineExceededError)
+            unreadable = isinstance(exc, EvidenceUnreadableError)
             log.warning(
                 "[%s/trial_%d] %s extraction %s: %s",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
                 log_label,
-                "exceeded deadline" if exhausted else "failed",
+                "exceeded deadline"
+                if exhausted
+                else "got no answer from the tracker"
+                if unreadable
+                else "failed",
                 exc,
             )
             return _failed_trial(
@@ -800,6 +812,7 @@ def extract_trial_result(
                 failure_reason=f"{label}: {exc}",
                 constraints=constraint_values,
                 deadline_exhausted=exhausted,
+                evidence_unreadable=unreadable,
             )
         if not math.isfinite(value):
             log.warning(
@@ -864,6 +877,8 @@ def extract_trial_result(
             constraints=constraint_values,
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
+            # A definite gate failure fails the trial whatever the tracker would answer.
+            evidence_unreadable=all(gate.evidence_unreadable for gate in failed_gates),
         )
 
     expired = _deadline_failure("the trial result could be accepted")

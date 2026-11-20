@@ -46,8 +46,12 @@ if TYPE_CHECKING:
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
 # Time a capture or find keeps for its last poll and its report before the parent stops it.
 _REPORT_SECONDS = 5.0
-# Worker response statuses; "unknown" reports a creation that may have taken effect.
-_STATUSES = frozenset({"ok", "error", "unknown"})
+# Worker response statuses; "unavailable" reports a request the tracker gave no answer to,
+# and "unknown" a creation that may have taken effect.
+_STATUSES = frozenset({"ok", "error", "unavailable", "unknown"})
+# Server error codes that answer the request about its subject: the experiment or run is gone,
+# or a value was rejected. Every other code says the tracker could not serve the request.
+_ANSWERED_CODES = frozenset({"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", "INVALID_PARAMETER_VALUE"})
 # Server verdicts that reject a creation request outright, so no run was created.
 _REJECTED_CREATION = frozenset(
     {
@@ -67,6 +71,14 @@ class OperationOutcomeUnknownError(RuntimeError):
 
 class OperationRejectedError(RuntimeError):
     """A confirmed request rejection, including creation refused before sending."""
+
+
+class OperationUnavailableError(OperationRejectedError):
+    """The tracker gave no answer: it was unreachable, refused access, or lacked its SDK.
+
+    No request reached a server that acted on it, so it is a rejection to every caller;
+    an evidence read additionally learns nothing about its run.
+    """
 
 
 class _SdkExperiment(Protocol):
@@ -312,6 +324,7 @@ def request_operation(
     :raises UnsafeProcessCleanupError: The worker's cleanup is uncertain, so it may still run.
     :raises OperationOutcomeUnknownError: The worker crashed, its response could not be read
         or trusted, or it reported that a creation may have taken effect.
+    :raises OperationUnavailableError: The worker reported that the tracker gave no answer.
     :raises OperationRejectedError: The worker reported that the request failed.
     :return JsonObject: Successful public-client response.
     """
@@ -351,6 +364,8 @@ def request_operation(
         ) from exc
     if status == "error":
         raise OperationRejectedError(message)
+    if status == "unavailable":
+        raise OperationUnavailableError(message)
     raise OperationOutcomeUnknownError(message)
 
 
@@ -823,6 +838,10 @@ class _Arguments(argparse.Namespace):
 def main(argv: list[str] | None = None) -> int:
     """Run an internal request without leaking SDK error details.
 
+    A missing SDK or dependency, a refused connection, a request with no response, and a
+    server error other than a verdict on the experiment, run or value report ``unavailable``;
+    other failures, a run that ended FAILED or KILLED and missing evidence report ``error``.
+
     :param list[str] | None argv: Private request/response paths.
     :return int: Zero after a structured response, 130 on interruption.
     """
@@ -839,7 +858,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as exc:
         missing = exc.name or "an optional dependency"
         response = {
-            "status": "error",
+            "status": "unavailable",
             "message": "MLflow requires phasesweep[mlflow] in the controller environment."
             if missing.partition(".")[0] == "mlflow"
             else f"MLflow {request['action']} needs Python module {missing!r}, which is not installed in the controller environment.",
@@ -879,8 +898,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             advice = "check tracking access and credentials"
+        # A refused connection, a request that got no response, or a server error that is not
+        # a verdict on the experiment, run or value leaves the request unanswered.
+        unanswered = (
+            isinstance(failure, ConnectionRefusedError)
+            or (isinstance(exc, RequestException) and exc.response is None)
+            or (isinstance(exc, MlflowException) and code not in _ANSWERED_CODES)
+        )
         response = {
-            "status": "error",
+            "status": "unavailable" if unanswered else "error",
             "message": f"MLflow {request['action']} failed ({cause}); {advice}.",
         }
     private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))
