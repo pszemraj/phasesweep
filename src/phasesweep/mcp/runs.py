@@ -1256,10 +1256,11 @@ class RunStore:
         :param RunHandle handle: Persisted runner identity.
         :param RunnerView | None view: The caller's derivation of the runner,
             or ``None`` to derive it here.
-        :return bool: True when PID and starttime still identify a non-zombie
-            process of the boot and PID namespace the handle was written under,
-            or when the runner lives in a PID namespace this process cannot
-            observe. False when it is provably gone or absent, or observably dead.
+        :return bool: True when PID and starttime still identify a process that has
+            not exited, by :func:`phasesweep.runtime.reaper._has_exited`, in the boot
+            and PID namespace the handle was written under, or when the runner lives
+            in a PID namespace this process cannot observe. False when it is provably
+            gone or absent, or observably exited.
         """
         if handle.launch_state != "spawned" or handle.pid is None or handle.pid_starttime is None:
             return False
