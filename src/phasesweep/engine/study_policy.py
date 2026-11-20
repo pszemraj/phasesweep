@@ -1115,7 +1115,8 @@ def _environment_cohort_remediation(restore: Sequence[str], unset: Sequence[str]
         )
     return (
         f"{way_back}, or set a new `experiment` name to start a fresh study. "
-        "Moving a variable into `env` or `execution.passthrough_env` also starts a new study."
+        "Pinning a variable under `env` or listing it under `execution.passthrough_env` changes "
+        "the study's identity, so that edit needs the new `experiment` name too."
     )
 
 

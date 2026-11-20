@@ -341,8 +341,9 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
     assert refusal.remediation == (
         "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study "
         "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` "
-        "name to start a fresh study. Moving a variable into `env` or "
-        "`execution.passthrough_env` also starts a new study."
+        "name to start a fresh study. Pinning a variable under `env` or listing it under "
+        "`execution.passthrough_env` changes the study's identity, so that edit needs the new "
+        "`experiment` name too."
     )
     assert "passthrough_env" not in str(refusal)
     assert "do not split cohorts" not in str(refusal)
