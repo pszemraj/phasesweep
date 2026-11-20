@@ -157,7 +157,7 @@ def assert_routes_declared_action(
 
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.FRESH_NAMESPACE: "fresh namespace for the state identified in the error",
+        OperatorAction.FRESH_NAMESPACE: "start a fresh study by setting a new `experiment` name",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
         OperatorAction.PROVISION_LOCK_DIR: "point PHASESWEEP_LOCK_DIR at an existing writable",

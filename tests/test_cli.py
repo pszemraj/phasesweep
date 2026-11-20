@@ -1745,7 +1745,7 @@ def test_cli_boundary_reports_expected_run_failure(
 @pytest.mark.parametrize(
     ("action", "remedy"),
     [
-        (OperatorAction.FRESH_NAMESPACE, "fresh namespace for the state identified in the error"),
+        (OperatorAction.FRESH_NAMESPACE, "start a fresh study by setting a new `experiment` name"),
         (OperatorAction.RESTORE_LEDGER, "restore or repair the storage ledger"),
         (OperatorAction.RESTORE_TREE, "restore the files and permissions identified in the error"),
         (
@@ -1784,8 +1784,6 @@ def test_cli_boundary_renders_action_once(
     assert diagnostic_line == f"phasesweep: {diagnostic}"
     assert fix_line.startswith("fix: ")
     assert fix_line.count(remedy) == 1
-    if action is OperatorAction.FRESH_NAMESPACE:
-        assert "new experiment name" not in fix_line
     if action is OperatorAction.RUN_RECOVER_RUN:
         assert "`phasesweep mcp recover-run` for an MCP run" in fix_line
 

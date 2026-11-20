@@ -9,7 +9,7 @@ from typing import ClassVar, Self
 class OperatorAction(StrEnum):
     """Operator remediation category for routing expected failures.
 
-    FRESH_NAMESPACE starts a separate namespace for the affected state;
+    FRESH_NAMESPACE starts a fresh study under a new ``experiment`` name;
     RESTORE_LEDGER repairs storage; RESTORE_TREE repairs files or permissions;
     PROVISION_LOCK_DIR points PHASESWEEP_LOCK_DIR at an existing writable
     directory every launching context shares, or moves the work to the host.
@@ -100,7 +100,10 @@ NEW_STUDY_STEP = (
 
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.FRESH_NAMESPACE: "use a fresh namespace for the state identified in the error",
+    OperatorAction.FRESH_NAMESPACE: (
+        "start a fresh study by setting a new `experiment` name in the config "
+        "(with `storage: auto`, a new `workdir` also works)"
+    ),
     OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
     OperatorAction.RESTORE_TREE: "restore the files and permissions identified in the error",
     OperatorAction.PROVISION_LOCK_DIR: (

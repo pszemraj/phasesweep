@@ -262,7 +262,7 @@ def _spawned_runner(
         pytest.param(
             ArtifactRootConflictError("bound to /a, offered /b"),
             "artifact_root_conflict",
-            "fresh namespace for the state identified in the error",
+            "start a fresh study by setting a new `experiment` name",
             id="artifact_root",
         ),
     ],
@@ -757,7 +757,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "fresh namespace for the state identified in the error" in remediation
+    assert "start a fresh study by setting a new `experiment` name" in remediation
 
 
 @pytest.mark.integration

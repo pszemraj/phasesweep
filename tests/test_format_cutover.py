@@ -187,9 +187,9 @@ def test_format_refusal_guidance_matches_cli_operation(
         assert "inspect the raw artifacts" in output.err
         assert "exact checkout that produced" in output.err
         assert "if available" in output.err
-        assert "fresh namespace" not in output.err
+        assert "start a fresh study" not in output.err
     else:
-        assert "fresh namespace" in output.err
+        assert "start a fresh study" in output.err
 
 
 @pytest.mark.parametrize(
