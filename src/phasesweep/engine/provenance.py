@@ -191,6 +191,24 @@ def _load_generation_experiment(artifact_root: Path, generation_id: str) -> Expe
         ) from exc
 
 
+def _load_generation_code_revision(artifact_root: Path, generation_id: str) -> CodeRevision | None:
+    """Read the trainer code revision one generation recorded in its reproducibility record.
+
+    :param Path artifact_root: Experiment artifact directory containing the generation.
+    :param str generation_id: Generation whose recorded revision is required.
+    :raises WinnerIntegrityError: The record is absent, unreadable, or holds a malformed revision.
+    :return CodeRevision | None: The recorded revision, or ``None`` when none was readable then.
+    """
+    record_path = path_ops._generation_reproducibility_path(artifact_root, generation_id)
+    try:
+        record = json_object(strict_json_loads(record_path.read_text(encoding="utf-8")))
+        return _parse_code_revision(record)
+    except (OSError, ValueError) as exc:
+        raise WinnerIntegrityError(
+            f"Cannot read the code revision of generation {generation_id!r} at {record_path}: {exc}"
+        ) from exc
+
+
 def _write_generation_provenance(
     experiment: Experiment,
     generation_id: str,

@@ -16,7 +16,12 @@ from phasesweep.config.models import ExecutionContext, Experiment
 from phasesweep.engine.paths import _experiment_dir, _generation_reproducibility_path
 from phasesweep.engine.provenance import _code_revision
 from phasesweep.engine.state import REPRODUCIBILITY_SCHEMA_VERSION
-from tests.conftest import make_experiment, write_experiment_config, write_param_echo_trainer
+from tests.conftest import (
+    make_experiment,
+    write_experiment_config,
+    write_param_echo_trainer,
+    write_trial_zero_trainer,
+)
 from tests.ledger_fixtures import published_generation_id
 
 
@@ -212,10 +217,10 @@ def test_generation_records_no_revision_for_a_trainer_cwd_outside_git(
 
 @pytest.mark.integration
 @pytest.mark.parametrize("state", ["clean", "dirty", "outside-git"])
-def test_show_winners_names_the_code_revision_that_produced_the_winners(
+def test_show_winners_names_the_code_revision_of_the_publishing_generation(
     tmp_path: Path, hermetic_git: None, state: str
 ) -> None:
-    """The printed revision is the producing generation's, not the checkout's today."""
+    """The publication revision is the publishing generation's, not the checkout's today."""
     cwd = tmp_path / "repo"
     if state == "outside-git":
         cwd.mkdir()
@@ -237,9 +242,47 @@ def test_show_winners_names_the_code_revision_that_produced_the_winners(
     result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
     assert result.exit_code == 0, result.output
     expected = {
-        "clean": f"# code revision: {head}\n",
-        "dirty": f"# code revision: {head} (dirty)\n",
-        "outside-git": "# code revision: unknown (not a git work tree or git unavailable)\n",
+        "clean": f"# publication code revision: {head}\n",
+        "dirty": f"# publication code revision: {head} (dirty)\n",
+        "outside-git": (
+            "# publication code revision: unknown (not a git work tree or git unavailable)\n"
+        ),
     }[state]
     assert expected in result.output
     assert result.output.index(expected) < result.output.index("=== p ===")
+    assert "winner trial from generation" not in result.output
+
+
+@pytest.mark.integration
+def test_show_winners_names_a_carried_winners_own_code_revision(
+    tmp_path: Path, hermetic_git: None
+) -> None:
+    """A winner carried from an earlier generation shows that generation's revision beside the publication's."""
+    repo = tmp_path / "repo"
+    first_head = _committed_repo(repo)
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_trial_zero_trainer(tmp_path, otherwise='print("x=9.0")'),
+        n_trials=1,
+        execution=ExecutionContext(cwd=str(repo)),
+    )
+    run_experiment(experiment)
+    first_generation = published_generation_id(experiment)
+
+    (repo / "tracked.txt").write_text("v2\n")
+    _git(repo, "commit", "-q", "-am", "change the trainer")
+    second_head = _git(repo, "rev-parse", "HEAD")
+    phase = experiment.phases[0].model_copy(update={"n_trials": 2})
+    experiment = experiment.model_copy(update={"phases": [phase]})
+    run_experiment(experiment)
+    second_generation = published_generation_id(experiment)
+    assert first_generation is not None and second_generation != first_generation
+    config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    result = CliRunner().invoke(cli, ["show-winners", str(config_path)])
+    assert result.exit_code == 0, result.output
+    assert f"# publication code revision: {second_head}\n" in result.output
+    assert (
+        f"# winner generation: {second_generation} (published); "
+        f"winner trial from generation {first_generation}, code revision {first_head}\n"
+    ) in result.output

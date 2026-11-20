@@ -46,7 +46,11 @@ from phasesweep.engine.paths import (
     _trial_dir_for,
 )
 from phasesweep.engine.preview import validate_grid_targets
-from phasesweep.engine.provenance import _load_generation_experiment
+from phasesweep.engine.provenance import (
+    CodeRevision,
+    _load_generation_code_revision,
+    _load_generation_experiment,
+)
 from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
@@ -714,6 +718,17 @@ def _render_reference_index() -> None:
     )
 
 
+def _code_revision_text(revision: CodeRevision | None) -> str:
+    """Render a generation's recorded trainer revision for a ``show-winners`` comment line.
+
+    :param CodeRevision | None revision: The recorded revision, ``None`` when none was readable.
+    :return str: The commit, marked ``(dirty)`` when tracked files differed, or ``unknown``.
+    """
+    if revision is None:
+        return "unknown (not a git work tree or git unavailable)"
+    return f"{revision['commit']}{' (dirty)' if revision['dirty'] else ''}"
+
+
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
@@ -729,7 +744,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises PublicationAccessError: This user cannot validate the publication.
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
-    :raises WinnerIntegrityError: An unpublished winner's producing snapshot is unavailable or invalid.
+    :raises WinnerIntegrityError: An unpublished winner's producing snapshot, or a carried winner's source generation record, is unavailable or invalid.
     """
     click.get_current_context().ensure_object(dict)["read_only"] = True
     experiment = _command_config(config_path, settings=settings)
@@ -790,12 +805,7 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                 f"{validated.generation_id} does not match the current config."
             )
             click.echo("# Rendering the saved phase plan and annotations.")
-        revision = validated.code_revision
-        if revision is None:
-            click.echo("# code revision: unknown (not a git work tree or git unavailable)")
-        else:
-            dirty = " (dirty)" if revision["dirty"] else ""
-            click.echo(f"# code revision: {revision['commit']}{dirty}")
+        click.echo(f"# publication code revision: {_code_revision_text(validated.code_revision)}")
     trainer_bases: dict[str | None, JsonObject] = {}
     for view in views:
         winner_publication = publication.validated if view.is_published else None
@@ -827,9 +837,18 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
                     phase.comment for phase in winner_publication.phase_plan if phase.name == name
                 )
             click.echo(f"=== {name} ===")
+            carried = ""
+            if winner.source is not None and winner.source.generation_id != winner.generation_id:
+                source_revision = _load_generation_code_revision(
+                    _experiment_dir(experiment), winner.source.generation_id
+                )
+                carried = (
+                    f"; winner trial from generation {winner.source.generation_id}, "
+                    f"code revision {_code_revision_text(source_revision)}"
+                )
             click.echo(
                 f"# winner generation: {winner.generation_id} "
-                f"({'published' if winner.is_published else 'unpublished'})"
+                f"({'published' if winner.is_published else 'unpublished'}){carried}"
             )
             if winner.is_published and not is_published and winner.config_matches_current is False:
                 click.echo(
