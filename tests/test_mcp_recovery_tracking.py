@@ -11,8 +11,8 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.attempts import _retire_active_attempt
 from phasesweep.engine.errors import TrackingSyncRefusedError
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
+from phasesweep.engine.paths import _attempts_dir
 from phasesweep.engine.state import CLEANUP_CONFIRMED_ATTR
-from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.tracking import mlflow as worker
@@ -30,6 +30,7 @@ from tests.mcp_helpers import (
 from tests.recovery_helpers import recover_run_cli
 from tests.tracking_helpers import (
     killed_sweep,
+    leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
     remote_mlflow_example,
 )
@@ -214,31 +215,28 @@ def test_an_upload_worker_recover_run_cannot_confirm_leaves_the_run_for_another_
 ) -> None:
     """An upload worker whose cleanup is unconfirmed fails recover-run as an evidence worker's does.
 
-    The run stays recovery-required; the next confirmed pass clears it without sending again,
-    and the outcome waits for sync-tracking.
+    The run stays recovery-required; the next confirmed pass resolves the worker through its
+    registry entry and clears the run without sending again, and the outcome waits for
+    sync-tracking.
     """
     run = _killed_run(tmp_path, monkeypatch)
-    deliver = publication.call_tracking
+    leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{run.attempt}")
 
-    def leaked(*args: object, **kwargs: object) -> object:
-        request = args[2]
-        if isinstance(request, dict) and request.get("name") == f"attempt-{run.attempt}":
-            raise UnsafeProcessCleanupError("upload worker may still be alive")
-        return deliver(*args, **kwargs)
+    failed = run.recover()
 
-    with monkeypatch.context() as patch:
-        patch.setattr(publication, "call_tracking", leaked)
-        failed = run.recover()
-
+    [operation] = leaked
     assert failed.exit_code != 0
-    assert "upload worker may still be alive" in failed.output
+    assert "worker cleanup is uncertain" in failed.output
     assert run.store.observe(run.handle).recovery_required
     assert read_record(run.record)["state"] == "pending"
+    entry = _attempts_dir(run.experiment) / f"{operation}.json"
+    assert entry.is_file()
     run.uploads.clear()
 
     retried = run.recover()
 
     assert retried.exit_code == 0, retried.output
+    assert not entry.exists()
     assert not run.store.observe(run.handle).recovery_required
     assert run.sent() == []
     publication.sync_tracking(run.experiment)

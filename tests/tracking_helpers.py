@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import json
+import os
 import shlex
 import sys
 import threading
@@ -287,6 +288,61 @@ def remote_mlflow_example(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "request_operation", respond)
     monkeypatch.setattr(worker, "request_operation", respond)
     return config, uploads
+
+
+def leak_tracking_worker(monkeypatch, *, action="publish", name=None):
+    """Leave the first MLflow worker of one request with its cleanup unconfirmed.
+
+    The worker's process group really runs and exits, but its lifecycle stays ``terminating`` and
+    its attempt-registry entry stays, as for a worker the controller lost track of, so a later pass
+    resolves it from its recorded identity. Every other request reaches the request operation
+    already in place.
+
+    :param pytest.MonkeyPatch monkeypatch: Replaces ``request_operation`` for the test.
+    :param str action: Worker action to leave unconfirmed: ``publish`` for an upload, ``resolve``
+        for a target check.
+    :param str | None name: Upload name to match, such as ``attempt-<id>``; any request of
+        ``action`` when ``None``.
+    :return list[str]: The operation id of the worker left unconfirmed, once one has been.
+    """
+    respond = session.request_operation
+    leaked = []
+
+    def leaky(request, *, operation_id, directory, environment, deadline):
+        matches = request["action"] == action and name in {None, request.get("name")}
+        if not matches or leaked:
+            return respond(
+                request,
+                operation_id=operation_id,
+                directory=directory,
+                environment=environment,
+                deadline=deadline,
+            )
+        leaked.append(operation_id)
+        with Path(os.devnull).open("w") as sink:
+            process.run_supervised(
+                "true",
+                env=dict(os.environ),
+                stdout=sink,
+                stderr=sink,
+                timeout=10,
+                trial_dir=directory,
+                attempt_id=operation_id,
+            )
+        process.write_attempt_lifecycle(
+            directory,
+            attempt_id=operation_id,
+            state="terminating",
+            return_code=-15,
+            cleanup_confirmed=False,
+        )
+        raise UnsafeProcessCleanupError(
+            f"mlflow worker cleanup is uncertain for attempt {operation_id!r}; recover {directory}."
+        )
+
+    monkeypatch.setattr(session, "request_operation", leaky)
+    monkeypatch.setattr(worker, "request_operation", leaky)
+    return leaked
 
 
 class RunnerKilled(BaseException):

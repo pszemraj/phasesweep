@@ -63,6 +63,7 @@ from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
     killed_sweep,
+    leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
     mlflow_binding,
     mlflow_run,
@@ -1068,17 +1069,11 @@ def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_a
 ):
     """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports."""
     experiment, _uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
-    deliver = publication.call_tracking
-
-    def leaked(*args, **kwargs):
-        if args[2].get("name") == f"attempt-{attempt}":
-            raise UnsafeProcessCleanupError("upload worker may still be alive")
-        return deliver(*args, **kwargs)
-
-    monkeypatch.setattr(publication, "call_tracking", leaked)
+    leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     [report] = reports
+    assert leaked
     assert not report.cleanup_confirmed
     assert attempt not in report.uncertain_attempt_ids
     [recovered] = [
