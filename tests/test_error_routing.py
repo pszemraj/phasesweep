@@ -130,9 +130,6 @@ _SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "Ru
 def _import_every_module() -> None:
     """Import the whole package so no subclass is missing from the walk."""
     for module in pkgutil.walk_packages(phasesweep.__path__, f"{phasesweep.__name__}."):
-        # Importing a ``__main__`` module runs the program it guards.
-        if module.name.rsplit(".", 1)[-1] == "__main__":
-            continue
         importlib.import_module(module.name)
 
 
