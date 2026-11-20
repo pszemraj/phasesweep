@@ -460,25 +460,76 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
     assert store.list_handles() == []
 
 
-@pytest.mark.parametrize("record_kind", ["malformed_handle", "orphan_config"])
-def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
+@pytest.mark.parametrize(
+    ("record_kind", "listed", "run_id"),
+    [
+        ("malformed_handle", "`srv-broken`", "srv-broken"),
+        ("orphan_config", "`srv-orphan`", "srv-orphan"),
+        ("unsafe_handle_name", "`runs/not a run id.json`", None),
+    ],
+)
+def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     record_kind: str,
+    listed: str,
+    run_id: str | None,
 ) -> None:
+    """The refusal lists each blocking record and the step that clears it, which a launch then passes."""
     config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
+    state_dir = tmp_path / "state"
     if record_kind == "malformed_handle":
-        (tmp_path / "state" / "runs" / "srv-broken.json").write_text("{not valid json")
-    else:
+        (state_dir / "runs" / "srv-broken.json").write_text("{not valid json")
+        store.log_path("srv-broken").write_text("runner output\n")
+    elif record_kind == "orphan_config":
         with open_private_text(store.config_snapshot_path("srv-orphan"), "x") as output:
             output.write("experiment: srv\n")
+    else:
+        (state_dir / "runs" / "not a run id.json").write_text("{not valid json")
 
-    with pytest.raises(RunCapacityUnknownError, match="cannot prove available launch capacity"):
+    with pytest.raises(RunCapacityUnknownError) as refused:
         app.launch("srv")
 
+    message = str(refused.value)
+    assert "cannot prove available launch capacity because the MCP state contains 1 unreadable" in (
+        message
+    )
+    assert f"Unreadable or orphaned: {listed}." in message
+    assert "`pgrep -af <run-id>` on the server host" in message
+    assert "move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory" in message
+    assert ("a listed `runs/` file moves out as it is" in message) is (run_id is None)
+    assert "inspect and repair" not in message
     assert "cmd" not in captured
     assert store.list_handles() == []
+
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    if run_id is None:
+        (state_dir / "runs" / "not a run id.json").rename(moved / "not a run id.json")
+    else:
+        for path in [
+            state_dir / "runs" / f"{run_id}.json",
+            *(state_dir / "logs").glob(f"{run_id}.*"),
+        ]:
+            if path.exists():
+                path.rename(moved / path.name)
+    with store.launch_lock() as acquired:
+        assert acquired
+        assert store.launch_inventory() == ([], set())
+    if run_id is not None:
+        assert store.get(run_id) is None
+
+    result = app.launch("srv")
+
+    assert "cmd" in captured
+    assert [handle.run_id for handle in store.list_handles()] == [result["run_id"]]
+    assert sorted(path.name for path in (state_dir / "runs").iterdir()) == [
+        f"{result['run_id']}.json"
+    ]
+    assert all(
+        path.name.startswith(result["run_id"] + ".") for path in (state_dir / "logs").iterdir()
+    )
 
 
 def test_launch_passes_config_snapshot_to_runner(

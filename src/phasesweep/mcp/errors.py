@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Literal, TypeAlias
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
+_MAX_LISTED_UNREADABLE_RECORDS = 5
 
 CatalogReloadRefusal: TypeAlias = Literal["invalid", "state_dir_changed"]
 
@@ -355,10 +356,13 @@ class ConcurrencyLimitError(McpToolError):
 class RunCapacityUnknownError(McpToolError):
     """Raised when persisted run records cannot prove launch capacity."""
 
-    def __init__(self, unreadable_records: int, recoverable_run_ids: Sequence[str] = ()) -> None:
+    def __init__(
+        self, unreadable: Collection[str], recoverable_run_ids: Sequence[str] = ()
+    ) -> None:
         """Create a fail-closed capacity error without exposing state paths.
 
-        :param int unreadable_records: Distinct malformed or orphaned run identities.
+        :param Collection[str] unreadable: Distinct malformed or orphaned record identities,
+            ``run:<id>`` or ``handle:<file name under runs/>``.
         :param Sequence[str] recoverable_run_ids: Safe run ids whose only
             evidence is a provably pre-spawn config snapshot.
         """
@@ -370,11 +374,34 @@ class RunCapacityUnknownError(McpToolError):
                 "`phasesweep mcp recover-run --state-dir <configured-state-dir> "
                 "--run-id <id>` and then repeat it with `--confirm`."
             )
+        recoverable = {f"run:{run_id}" for run_id in recoverable_run_ids}
+        listed = sorted(
+            identity.removeprefix("run:")
+            if identity.startswith("run:")
+            else f"runs/{identity.removeprefix('handle:')}"
+            for identity in unreadable
+            if identity not in recoverable
+        )
+        remaining = ""
+        if listed:
+            shown = ", ".join(f"`{name}`" for name in listed[:_MAX_LISTED_UNREADABLE_RECORDS])
+            more = len(listed) - _MAX_LISTED_UNREADABLE_RECORDS
+            more_note = f" and {more} more" if more > 0 else ""
+            file_note = (
+                "; a listed `runs/` file moves out as it is"
+                if any("/" in name for name in listed)
+                else ""
+            )
+            remaining = (
+                f" Unreadable or orphaned: {shown}{more_note}. Ask the operator to run "
+                "`pgrep -af <run-id>` on the server host for each run id and, where no runner "
+                "is alive, move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
+                f"directory{file_note}."
+            )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
-            f"{unreadable_records} unreadable or orphaned run record(s).{recovery} Do not retry or "
-            "launch a replacement. Ask the operator to inspect and repair the MCP state "
-            "directory first."
+            f"{len(unreadable)} unreadable or orphaned run record(s).{recovery}{remaining} "
+            "Do not retry or launch a replacement."
         )
 
 

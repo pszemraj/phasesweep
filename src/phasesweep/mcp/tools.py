@@ -1218,7 +1218,7 @@ class PhaseSweepMCP:
                         if identity.startswith("run:")
                         and self._runs.is_pre_spawn_orphan(identity.removeprefix("run:"))
                     )
-                    raise RunCapacityUnknownError(len(unreadable), recoverable)
+                    raise RunCapacityUnknownError(unreadable, recoverable)
                 live: list[RunHandle] = []
                 recovery_required_run_ids: list[str] = []
                 unobservable_run_ids: list[str] = []
