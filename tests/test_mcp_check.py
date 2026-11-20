@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.registry import Registry, check_catalog
+from phasesweep.mcp.runs import FRESH_STATE_DIR_STEP
 from phasesweep.runtime.files import PlatformCapabilityError
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_config_catalog
 
@@ -266,6 +267,7 @@ def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_pat
 
 
 def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None:
+    """Unmarked run data refuses the catalog with the fresh state_dir fix, not the writable-path one."""
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
@@ -280,7 +282,7 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
 
     with pytest.raises(CatalogError, match="durable run data has no format marker") as exc_info:
         check_catalog(catalog)
-    assert exc_info.value.suggestion is None
+    assert exc_info.value.suggestion == FRESH_STATE_DIR_STEP
     with pytest.raises(CatalogError, match="durable run data has no format marker"):
         Registry.load(catalog)
 
@@ -288,7 +290,7 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
 
     assert result.exit_code == 2
     assert "durable run data has no format marker" in result.output
-    assert "use a fresh MCP state directory" in result.output
+    assert f"\nfix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "writable directory path" not in result.output
 
 

@@ -51,7 +51,12 @@ from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import MCP_STATE_FORMAT_VERSION, RunHandle, RunStore
+from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
+    MCP_STATE_FORMAT_VERSION,
+    RunHandle,
+    RunStore,
+)
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import private_atomic_write_text
@@ -105,10 +110,7 @@ def test_recovery_cli_renders_state_directory_remedy(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "use a fresh MCP state directory" in result.output
-    assert (
-        "fix: Point the catalog's `state_dir` at a new directory; the PhaseSweep release that "
-        "wrote this one still reads it."
-    ) in result.output
+    assert f"fix: {FRESH_STATE_DIR_STEP}" in result.output
     assert "artifact root" not in result.output
     assert marker.read_bytes() == before
 

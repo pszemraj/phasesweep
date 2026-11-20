@@ -92,6 +92,11 @@ _RUN_EVIDENCE_SUFFIXES = (
 #: ``runs/`` whose stem is no safe run id.
 _UNREADABLE_RUN = "run:"
 _UNREADABLE_HANDLE_FILE = "handle:"
+#: The operator's step for a state directory in another format, which nothing migrates.
+FRESH_STATE_DIR_STEP = (
+    "Point the catalog's `state_dir` at a new directory; the PhaseSweep release that wrote "
+    "this one still reads it."
+)
 MCP_STATE_FORMAT_VERSION = 9
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"

@@ -41,7 +41,7 @@ from phasesweep.mcp.errors import (
     StateDirChangedError,
     UnknownExperimentError,
 )
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import FRESH_STATE_DIR_STEP, RunStore, UnsupportedStateFormatError
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
     UnsafePrivatePathError,
@@ -242,6 +242,10 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
+    except UnsupportedStateFormatError as exc:
+        raise CatalogError(
+            f"state_dir is not usable: {resolved}: {exc}", suggestion=FRESH_STATE_DIR_STEP
+        ) from exc
     except ValueError as exc:
         raise CatalogError(f"state_dir is not usable: {resolved}: {exc}") from exc
     except (OSError, UnsafePrivatePathError) as exc:

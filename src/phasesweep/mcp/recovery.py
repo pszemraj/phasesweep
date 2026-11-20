@@ -49,6 +49,7 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.errors import live_runner_step
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
+    FRESH_STATE_DIR_STEP,
     ProcessIdentity,
     RunHandle,
     RunnerView,
@@ -131,10 +132,7 @@ def recover_run(
         raise RunRecoveryError(
             str(exc),
             action=OperatorAction.FRESH_NAMESPACE,
-            remediation=(
-                "Point the catalog's `state_dir` at a new directory; the PhaseSweep release "
-                "that wrote this one still reads it."
-            ),
+            remediation=FRESH_STATE_DIR_STEP,
         ) from None
     except ValueError as exc:
         # Not a state directory at all: the path given is what needs fixing.
