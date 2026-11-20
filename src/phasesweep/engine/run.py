@@ -610,13 +610,14 @@ def _run_experiment_inner(
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
+        # A tree this PhaseSweep cannot use refuses before the preview, as a launch would.
+        recorded = _preview_ledger(experiment, from_phase=from_phase)
         for _phase, lines in experiment_disclosures(experiment):
             for warning, line in lines:
                 if warning:
                     log.warning("DRY RUN warning: %s", line)
                 else:
                     log.info("DRY RUN %s", line)
-        recorded = _preview_ledger(experiment, from_phase=from_phase)
         preloaded_winners = resume_ops._preflight_skipped_winners(
             experiment, from_phase=from_phase, run_deadline=None
         )

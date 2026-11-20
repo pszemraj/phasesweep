@@ -178,12 +178,13 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
     format_record: str,
     step: str,
     command: str,
     options: list[str],
 ) -> None:
-    """Data in another format ends in one fix line whichever command meets it."""
+    """Data in another format ends in one fix line whichever command meets it, before any preview."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     if format_record == "artifact-root":
         binding_path = _artifact_root_binding_path(materialized.experiment)
@@ -212,6 +213,7 @@ def test_format_refusal_gives_the_same_fix_to_every_command(
     assert "Traceback" not in output.err
     assert "checkout" not in output.err
     assert "format None" not in output.err
+    assert not [record for record in caplog.records if "DRY RUN" in record.getMessage()]
     assert output.err.endswith(f"\nfix: {step}\n")
     assert tree_snapshot(materialized.root) == before
 
