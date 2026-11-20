@@ -121,6 +121,8 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
     ShutdownLaunchRefusedError,
+    interruption_cause,
+    launch_refusal_text,
     servicing_shutdown_signal,
 )
 
@@ -861,9 +863,7 @@ def _refuse_launch_during_shutdown() -> None:
     """
     signum = servicing_shutdown_signal()
     if signum is not None:
-        raise TrialExecutionError(
-            f"trainer launch refused: orchestrator interrupted by signal {signum}"
-        )
+        raise TrialExecutionError(launch_refusal_text(signum))
 
 
 def _record_outcome(
@@ -1208,9 +1208,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             else:
                 # Under n_jobs > 1 the shutdown handler runs in the main thread and
                 # kills this worker's trainer, which ends here as a trainer error.
-                _record_outcome(
-                    run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
-                )
+                _record_outcome(run, trial, "interrupted", cause=interruption_cause(signum))
             raise
         except UnsafeProcessCleanupError as exc:
             run.record_fatal(exc)
@@ -1248,12 +1246,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                 except ValueError as lifecycle_error:
                     raise exc from lifecycle_error
             if _completed_trainer_duration(trial, lifecycle) is None:
-                _record_outcome(
-                    run,
-                    trial,
-                    "interrupted",
-                    cause=f"orchestrator interrupted by signal {exc.signum}",
-                )
+                _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
             elif isinstance(attempt_id, str):
                 _warn_deferred_extraction(attempt_id, run.phase.name, trial.number)
             raise

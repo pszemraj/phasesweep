@@ -84,6 +84,24 @@ _servicing_signum: int | None = None
 _shutdown_wakers: list[Callable[[], None]] = []
 
 
+def interruption_cause(signum: int) -> str:
+    """Return the cause text recorded for a trial the orchestrator's shutdown signal stopped.
+
+    :param int signum: The shutdown signal being serviced.
+    :return str: The trial outcome cause for that signal.
+    """
+    return f"orchestrator interrupted by signal {signum}"
+
+
+def launch_refusal_text(signum: int) -> str:
+    """Return the message of a trainer launch that a shutdown being serviced refused.
+
+    :param int signum: The shutdown signal being serviced.
+    :return str: The refusal message, ending in the interruption cause for that signal.
+    """
+    return f"trainer launch refused: {interruption_cause(signum)}"
+
+
 class ShutdownLaunchRefusedError(RuntimeError):
     """Raised by a launch that a shutdown being serviced refused before any process started."""
 
@@ -92,7 +110,7 @@ class ShutdownLaunchRefusedError(RuntimeError):
 
         :param int signum: The shutdown signal being serviced.
         """
-        super().__init__(f"trainer launch refused: orchestrator interrupted by signal {signum}")
+        super().__init__(launch_refusal_text(signum))
         self.signum = signum
 
 
