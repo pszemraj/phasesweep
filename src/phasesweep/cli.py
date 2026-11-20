@@ -103,6 +103,13 @@ CONFIG_OVERRIDES = click.option(
         "Paths resolve against the config file's directory, just as in the config."
     ),
 )
+MCP_CATALOG = click.option(
+    "--catalog",
+    required=True,
+    metavar="PATH",
+    type=CONFIG_PATH,
+    help="MCP catalog that maps agent-visible experiment ids to config files.",
+)
 
 # Exit taxonomy for the process-level boundary in main(). Commands that already
 # choose an exit status keep it; these are the codes the boundary itself uses.
@@ -1230,13 +1237,7 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     help="Serve the optional MCP server over stdio using an operator-authored catalog.",
     short_help="Serve the MCP server.",
 )
-@click.option(
-    "--catalog",
-    required=True,
-    metavar="PATH",
-    type=CONFIG_PATH,
-    help="MCP catalog that maps agent-visible experiment ids to config files.",
-)
+@MCP_CATALOG
 @click.pass_context
 def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     """Serve the MCP server over stdio.
@@ -1280,13 +1281,7 @@ def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> J
 )
 @click.argument("tool")
 @click.argument("json_args", metavar="[JSON_ARGS]", default="{}", callback=_tool_arguments)
-@click.option(
-    "--catalog",
-    required=True,
-    metavar="PATH",
-    type=CONFIG_PATH,
-    help="MCP catalog that maps agent-visible experiment ids to config files.",
-)
+@MCP_CATALOG
 @click.pass_context
 def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path) -> None:
     """Call one MCP tool without a client, for scripting or debugging.
@@ -1311,13 +1306,7 @@ def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path
     ),
     short_help="Preflight an MCP catalog.",
 )
-@click.option(
-    "--catalog",
-    required=True,
-    metavar="PATH",
-    type=CONFIG_PATH,
-    help="MCP catalog that maps agent-visible experiment ids to config files.",
-)
+@MCP_CATALOG
 @click.pass_context
 def mcp_check(ctx: click.Context, catalog: Path) -> None:
     """Preflight an MCP catalog for the operator.
