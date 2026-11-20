@@ -1037,10 +1037,35 @@ def _environment_entries(
                 _EnvironmentChange(name, f"removed {name} (was {old_text})", recorded=True)
             )
         else:
+            entries = _path_list_difference(before, after) if full else ""
             changed.append(
-                _EnvironmentChange(name, f"{name} {old_text} -> {new_text}", recorded=True)
+                _EnvironmentChange(name, f"{name} {old_text} -> {new_text}{entries}", recorded=True)
             )
     return [*changed, *added, *removed]
+
+
+def _path_list_difference(before: object, after: object) -> str:
+    """Name the entries two ``PATH``-like values do not share, which their whole text hides.
+
+    :param object before: Recorded value.
+    :param object after: Current value.
+    :return str: A parenthesised note led by a space, or an empty string when neither value
+        is a separator-joined list.
+    """
+    if not isinstance(before, str) or not isinstance(after, str):
+        return ""
+    if os.pathsep not in before and os.pathsep not in after:
+        return ""
+    recorded, current = before.split(os.pathsep), after.split(os.pathsep)
+    parts = [
+        f"only {side}: {', '.join(entries)}"
+        for side, entries in (
+            ("recorded", [entry for entry in recorded if entry not in current]),
+            ("current", [entry for entry in current if entry not in recorded]),
+        )
+        if entries
+    ]
+    return f" ({'; '.join(parts)})" if parts else " (the same entries in another order)"
 
 
 def _describe_environment_changes(

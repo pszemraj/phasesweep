@@ -105,14 +105,16 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
             {},
             {"PATH": "/opt/second/bin:/usr/bin"},
             [],
-            'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".',
+            'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+            "(only recorded: /opt/first/bin; only current: /opt/second/bin).",
             id="changed-path",
         ),
         pytest.param(
             {},
             {"TZ": "Asia/Tokyo", "PATH": "/opt/second/bin:/usr/bin"},
             [],
-            'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin"; '
+            'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+            "(only recorded: /opt/first/bin; only current: /opt/second/bin); "
             'TZ "Europe/Berlin" -> "Asia/Tokyo".',
             id="two-changed-variables",
         ),
@@ -286,7 +288,8 @@ def test_the_latest_trial_that_recorded_a_mapping_is_the_comparison(
     message = _refusal(study, _identity(experiment))
 
     assert (
-        'Compared with trial 1: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".'
+        'Compared with trial 1: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin" '
+        "(only recorded: /opt/first/bin; only current: /opt/second/bin)."
     ) in message
 
 
