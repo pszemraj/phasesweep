@@ -81,7 +81,12 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
             raise CatalogError(
                 f"configs {seen[experiment_id]} and {config} both derive the "
                 f"experiment id {experiment_id!r}",
-                suggestion="rename one file, or edit the generated id afterwards",
+                # Nothing is written on this refusal, so there is no generated id to edit.
+                suggestion=(
+                    "rename one of the config files, since each entry's id comes from its file "
+                    "name, or leave one out and add its entry to the written catalog by hand "
+                    "with another id"
+                ),
             )
         seen[experiment_id] = config
         experiment_id_scalar = _yaml_string_scalar(experiment_id)
