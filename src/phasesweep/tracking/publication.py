@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.runtime.files import UnsafePrivatePathError
 from phasesweep.runtime.json import (
     JsonObject,
     json_number,
@@ -577,12 +578,15 @@ def save_recovered_attempts(
     """Save the records of attempts whose outcomes recovery committed, sending nothing.
 
     As for sync-tracking, only a generation whose summary run is bound has attempt runs to
-    finish, and a record already saved is kept as it is.
+    finish, and a record already saved is kept as it is. The outcomes are already in the
+    ledger, from which sync-tracking rebuilds any record left unsaved, so a record that cannot
+    be written or read costs a warning, never the caller's run or recovery.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
     :param Iterable[str] generation_ids: Generations whose trials recovery settled.
-    :return list[Path]: Those generations' attempt records not yet delivered, in generation order.
+    :return list[Path]: Those generations' attempt records not yet delivered, in generation order,
+        or none when they could not all be saved and read.
     """
     root = tracking_root(experiment)
     generations = sorted(
@@ -590,13 +594,21 @@ def save_recovered_attempts(
         for generation_id in set(generation_ids)
         if (root / generation_id / "generation-binding.json").is_file()
     )
-    _rebuild_attempt_intents(experiment, ledger, generations)
-    return [
-        path
-        for generation_id in generations
-        for path in sorted((root / generation_id / "delivery").glob("attempt-*.json"))
-        if read_record(path)["state"] != "delivered"
-    ]
+    try:
+        _rebuild_attempt_intents(experiment, ledger, generations)
+        return [
+            path
+            for generation_id in generations
+            for path in sorted((root / generation_id / "delivery").glob("attempt-*.json"))
+            if read_record(path)["state"] != "delivered"
+        ]
+    except (OSError, ValueError, UnsafePrivatePathError) as exc:
+        log.warning(
+            "The MLflow outcomes of recovered attempts were not all saved (%s); run phasesweep "
+            "sync-tracking with the same config to rebuild them from the ledger and deliver them.",
+            exc,
+        )
+        return []
 
 
 def deliver_recovered_attempts(

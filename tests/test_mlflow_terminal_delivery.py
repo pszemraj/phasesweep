@@ -897,8 +897,13 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
 
 @pytest.mark.parametrize(
     "answer,upload",
-    [("accepted", "up"), ("objective-missing", "up"), ("accepted", "offline")],
-    ids=["accepted", "objective-missing", "upload-offline"],
+    [
+        ("accepted", "up"),
+        ("objective-missing", "up"),
+        ("accepted", "offline"),
+        ("accepted", "unsaved"),
+    ],
+    ids=["accepted", "objective-missing", "upload-offline", "record-unsaved"],
 )
 def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     tmp_path, monkeypatch, caplog, answer, upload
@@ -907,8 +912,8 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
 
     Accepted evidence sends its accepted projection. Evidence the tracker answers with a
     failure records the finished trial failed with that reason, as a live trial would be, which
-    ends the run FAILED and trains nothing again. An upload that fails leaves its record pending
-    for sync-tracking and the run goes on.
+    ends the run FAILED and trains nothing again. An upload that fails, or a record that cannot
+    be saved, leaves the outcome for sync-tracking and the run still publishes its result.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking.mlflow import OperationUnavailableError
@@ -945,6 +950,9 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
     reachable["capture"] = True
     if upload == "offline":
         refused_upload["name"] = f"attempt-{attempt}"
+    delivery = tracking_root(experiment) / generation / "delivery"
+    if upload == "unsaved":
+        delivery.chmod(0o500)
     uploads.clear()
     if answer == "accepted":
         run_experiment(experiment)
@@ -953,7 +961,14 @@ def test_recovery_delivers_the_outcome_it_records_for_a_pending_trial(
             run_experiment(experiment)
     (recovered,) = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert recovered.state == (TrialState.COMPLETE if answer == "accepted" else TrialState.FAIL)
-    record_path = tracking_root(experiment) / generation / "delivery" / f"attempt-{attempt}.json"
+    record_path = delivery / f"attempt-{attempt}.json"
+    if upload == "unsaved":
+        assert read_status(experiment)["published_generation_id"] not in {None, generation}
+        assert not record_path.exists()
+        assert "phasesweep sync-tracking" in caplog.text
+        delivery.chmod(0o700)
+        uploads.clear()
+        publication.sync_tracking(experiment)
     if upload == "offline":
         assert read_record(record_path)["state"] == "pending"
         assert "Retry with sync-tracking" in caplog.text
