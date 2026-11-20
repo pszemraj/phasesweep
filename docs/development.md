@@ -54,7 +54,7 @@ pre-commit install
 
 The [environment hook](../scripts/check_hook_environment.py) passes when the `python` first on `PATH` imports `phasesweep` from this checkout's `src/`. When it fails, it prints which Python it found and stops the run, so a commit or push from another environment ends with that one message, not with the import and stub errors the later hooks would report.
 
-Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. When Ruff rewrites a file, stage the fix and commit again.
+Ruff checks public docstrings and function annotations, and mypy checks source typing; both also run in CI. The development extra pins `ruff` and `mypy` to exact versions, and [CI](../.github/workflows/ci.yml) installs those same versions together with an exact version of every package its checks import, so a new release cannot change the result for an unchanged tree. Raise the pins in `pyproject.toml` and the workflow together. When Ruff rewrites a file, stage the fix and commit again.
 
 The [module-size hook](../scripts/check_module_size.sh) limits each touched source or test module to 2000 lines. The [typing-escapes hook](../scripts/check_typing_escapes.py) rejects `Any`, `typing.cast`, and `# type: ignore` on added or edited lines, including docstring type fields. Narrow values with `isinstance`, use `TypedDict` for known shapes and `Protocol` for external APIs, or use `phasesweep.runtime.json.JsonValue` / `JsonObject` for open JSON. Existing escapes must be fixed when their lines change. The review-provenance hook rejects `review vN`, `PR #N`, `reviewer N`, `blocker N`, `gap hunt`, `pre-vN` and `finding X1` in comments and docstrings; state the reason in place and leave provenance to git history.
 

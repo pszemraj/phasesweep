@@ -153,6 +153,17 @@ def test_release_version_uses_event_tag_with_competing_annotated_tag(
     assert run(sys.executable, "-m", "setuptools_scm") == expected_version
 
 
+def test_ci_installs_the_dev_extra_ruff_and_mypy() -> None:
+    """The git hooks and CI run the same ruff and mypy: CI installs the dev extra's exact pins."""
+    dev = _pyproject()["project"]["optional-dependencies"]["dev"]
+    pins = [requirement for requirement in dev if requirement.startswith(("ruff==", "mypy=="))]
+    assert len(pins) == 2
+    workflow_path = PYPROJECT_PATH.parent / ".github" / "workflows" / "ci.yml"
+    workflow = workflow_path.read_text(encoding="utf-8")
+    for pin in pins:
+        assert f"'{pin}'" in workflow
+
+
 @pytest.mark.integration
 def test_mcp_entrypoint_without_optional_sdk(tmp_path: Path) -> None:
     """Exercise the real entry point in a fresh process even with the dev extra installed."""
