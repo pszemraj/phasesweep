@@ -12,6 +12,7 @@ import fnmatch
 import importlib
 import importlib.resources
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -153,15 +154,19 @@ def test_release_version_uses_event_tag_with_competing_annotated_tag(
     assert run(sys.executable, "-m", "setuptools_scm") == expected_version
 
 
-def test_ci_installs_the_dev_extra_ruff_and_mypy() -> None:
-    """The git hooks and CI run the same ruff and mypy: CI installs the dev extra's exact pins."""
+def test_ci_installs_the_dev_extra_exact_pins() -> None:
+    """The git hooks and CI lint and type-check alike: CI installs each exact pin of the dev extra."""
     dev = _pyproject()["project"]["optional-dependencies"]["dev"]
-    pins = [requirement for requirement in dev if requirement.startswith(("ruff==", "mypy=="))]
-    assert len(pins) == 2
+    pins = {requirement for requirement in dev if "==" in requirement}
+    assert {pin.split("==")[0] for pin in pins} == {"ruff", "mypy", "types-PyYAML"}
     workflow_path = PYPROJECT_PATH.parent / ".github" / "workflows" / "ci.yml"
-    workflow = workflow_path.read_text(encoding="utf-8")
-    for pin in pins:
-        assert f"'{pin}'" in workflow
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    install_command = next(
+        step["run"]
+        for step in workflow["jobs"]["linux"]["steps"]
+        if step.get("name") == "Install static-check dependencies"
+    )
+    assert pins <= set(shlex.split(install_command))
 
 
 @pytest.mark.integration

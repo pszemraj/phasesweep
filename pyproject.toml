@@ -50,10 +50,11 @@ dev = [
     "pytest>=7",
     "pytest-xdist>=3.6,<4",
     "setuptools-scm[simple]>=9.2",
-    # Exact, and the same versions CI installs: a new ruff or mypy release changes what passes.
+    # Exact, and the same versions CI installs: a new release of the linter, the type checker
+    # or the stubs it reads changes what passes.
     "ruff==0.15.21",
     "mypy==2.3.0",
-    "types-PyYAML>=6.0",
+    "types-PyYAML==6.0.12.20260518",
     "mcp>=1.27,<1.28",
     "pre-commit>=3.2",
     "pathlint>=0.3.1",
