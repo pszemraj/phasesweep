@@ -496,8 +496,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             "generation_id",
         }
         if (
-            payload.get("schema_version") == ATTEMPT_REGISTRY_SCHEMA_VERSION
-            and set(payload) == required
+            set(payload) == required
             and all(
                 isinstance(payload[k], str) and payload[k] for k in required - {"schema_version"}
             )
@@ -522,7 +521,6 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         not isinstance(payload, dict)
         or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
         or payload.get("kind") != "trial"
-        or payload.get("schema_version") != ATTEMPT_REGISTRY_SCHEMA_VERSION
         or not isinstance(payload.get("attempt_id"), str)
         or not isinstance(payload.get("trial_dir"), str)
         or not isinstance(payload.get("study_name"), str)
