@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -19,17 +18,16 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.failures import response_failure
 from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime import reaper
-from phasesweep.runtime.time import utc_now_iso
 from tests.mcp_helpers import (
-    claim_runner_handle,
     earlier_boot_id,
     make_dead_run_handle,
     record_confirmed_recovery,
     side_effect_app,
     stage_dead_run,
+    stage_launching_run,
     stage_live_run,
     write_run_status,
     write_runner_heartbeat,
@@ -48,34 +46,18 @@ NESTED_READER = "pid:[4026539333]@100"
 Stage = Callable[[Path, PhaseSweepMCP, RunStore, pytest.MonkeyPatch], None]
 
 
-def _prepare_launch(config: Path, store: RunStore) -> RunHandle:
-    """Persist the launch handle and config snapshot a server saves before it spawns the runner."""
-    snapshot = config.read_bytes()
-    claim_runner_handle(
-        store,
-        run_id=RUN_ID,
-        config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        config_dir=config.resolve().parent,
-        started_at=utc_now_iso(),
-    )
-    store.config_snapshot_path(RUN_ID).write_bytes(snapshot)
-    handle = store.get(RUN_ID)
-    assert handle is not None
-    return handle
-
-
 def _launch_unresolved(
     config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The server saved the launch handle but never recorded whether its runner started."""
-    _prepare_launch(config, store)
+    stage_launching_run(store, RUN_ID, config)
 
 
 def _launch_failure_record(
     config: Path, app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed launch whose runner group could not be confirmed gone, as the server records it."""
-    pending = _prepare_launch(config, store)
+    pending = stage_launching_run(store, RUN_ID, config)
     store.mark_cleanup_uncertain(
         make_dead_run_handle(
             run_id=RUN_ID,

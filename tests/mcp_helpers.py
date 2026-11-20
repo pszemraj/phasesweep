@@ -631,6 +631,20 @@ def stage_live_run(
     )
 
 
+def stage_launching_run(
+    store: RunStore, run_id: str, config: Path, experiment_id: str = "srv"
+) -> RunHandle:
+    """Persist the launch handle and config snapshot a server saves before it spawns the runner."""
+    return _stage_run(
+        store,
+        config,
+        make_run_handle,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        launch_state="launching",
+    )
+
+
 def write_unsafe_cleanup_status(store: RunStore, run_id: str, **extra: object) -> None:
     """Record the terminal status of a run whose process-group cleanup was never confirmed."""
     write_run_status(

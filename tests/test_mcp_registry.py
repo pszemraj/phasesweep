@@ -418,6 +418,7 @@ def test_collecting_load_records_failed_entries_and_serves_the_rest(tmp_path: Pa
 
 
 def test_collecting_load_serves_neither_entry_of_a_repeated_id(tmp_path: Path) -> None:
+    """A repeated id fails as one entry, and neither of its entries is served."""
     good = _write(tmp_path / "good.yaml", _experiment_yaml(tmp_path, name="good"))
     catalog = write_mcp_catalog(tmp_path, {"good": good})
     catalog.write_text(catalog.read_text() + f"  - id: good\n    config: {good}\n")
