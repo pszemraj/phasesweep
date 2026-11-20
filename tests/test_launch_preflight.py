@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import optuna
@@ -19,8 +20,10 @@ import pytest
 from click.testing import CliRunner
 
 from phasesweep import run_experiment
+from phasesweep.cli import _operational_error_text
 from phasesweep.cli import cli as cli_main
-from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.models import ExecutionContext, Experiment, Phase
+from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.paths import _artifact_root_binding_path
 from phasesweep.engine.state import TRAINER_ENV_ATTR, TRAINER_ENV_DIGEST_ATTR
@@ -46,9 +49,9 @@ def _executable(path: Path) -> Path:
 
 
 def _with_target(experiment: Experiment, n_trials: int) -> Experiment:
-    """Return ``experiment`` with its only phase's trial target set to ``n_trials``."""
-    phase = experiment.phases[0].model_copy(update={"n_trials": n_trials})
-    return experiment.model_copy(update={"phases": [phase]})
+    """Return ``experiment`` with every phase's trial target set to ``n_trials``."""
+    phases = [phase.model_copy(update={"n_trials": n_trials}) for phase in experiment.phases]
+    return experiment.model_copy(update={"phases": phases})
 
 
 def _completed_study(experiment: Experiment) -> optuna.Study:
@@ -218,6 +221,48 @@ def test_resume_refuses_a_vanished_trainer_directory_without_recording_a_trial(
 
     assert [(trial.number, trial.state) for trial in phase_trials(experiment)] == before
     assert before == [(0, optuna.trial.TrialState.COMPLETE)]
+
+
+@pytest.mark.integration
+def test_resume_reports_an_experiment_wide_refusal_once_with_its_fix(tmp_path: Path) -> None:
+    """Two phases that both need trials share one refusal, which keeps its type and fix line."""
+    program = tmp_path / "bin" / "trainer"
+    program.parent.mkdir()
+    program.write_text(
+        f'#!/bin/sh\nexec {sys.executable} {write_constant_trainer(tmp_path)} "$@"\n'
+    )
+    program.chmod(0o755)
+    phases = [
+        Phase(
+            name=name,
+            n_trials=1,
+            gpu_policy="none",
+            sampler=Sampler(type="random", seed=0),
+            search_space={f"{name}_x": IntParam(type="int", low=0, high=10)},
+        )
+        for name in ("a", "b")
+    ]
+    experiment = make_experiment(
+        persistent=tmp_path,
+        phases=phases,
+        trial_command="trainer --out {trial_dir}/r.json {overrides}",
+        env={"PATH": f"{program.parent}:/usr/bin:/bin"},
+    )
+    run_experiment(experiment)
+    program.unlink()
+
+    for dry_run in (False, True):
+        with pytest.raises(PhaseSweepError, match="program 'trainer' is not on") as caught:
+            run_experiment(_with_target(experiment, 3), dry_run=dry_run)
+
+        error = caught.value
+        assert type(error) is PhaseSweepError
+        assert str(error).count("is not on the trainer's PATH") == 1
+        assert "multiple unsafe studies" not in str(error)
+        assert error.action is OperatorAction.FIX_CONFIG
+        assert error.remediation is not None
+        assert _operational_error_text(error).endswith(f"\nfix: {error.remediation}")
+    assert len(phase_trials(experiment, "a")) == len(phase_trials(experiment, "b")) == 1
 
 
 @pytest.mark.integration

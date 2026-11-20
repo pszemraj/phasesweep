@@ -188,6 +188,9 @@ def _preflight_existing_studies(
 def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     """Raise one refusal, or an aggregate preserving the collected studies and remedies.
 
+    A refusal every study reports alike, with the same type and message, as an experiment-wide
+    refusal does, is raised once and unchanged, so its fix line survives.
+
     :param Sequence[Exception] errors: Refusals collected across the studies, in
         phase order; nothing is raised when it is empty.
     :raises StudySchemaMismatchError: Every collected refusal is one, or the only one.
@@ -202,7 +205,8 @@ def _raise_collected_errors(errors: Sequence[Exception]) -> None:
     if not errors:
         return
     first = errors[0]
-    if len(errors) == 1:
+    # An experiment-wide refusal comes once per study; one copy says it all, with its fix line.
+    if all(type(error) is type(first) and str(error) == str(first) for error in errors):
         raise first
     message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
         str(error) for error in errors
