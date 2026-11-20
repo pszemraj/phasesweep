@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ import pytest
 
 from phasesweep.config.models import Phase
 from phasesweep.config.search import IntParam, Sampler
+from phasesweep.engine import locking
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.locking import (
     _experiment_lock,
@@ -54,6 +56,66 @@ def test_busy_probe_observes_run_locks_without_creating_paths(
         assert "MCP" not in str(busy.value.remediation)
         assert "only if the user" not in str(busy.value.remediation)
     assert not experiment_is_busy(experiment)
+
+
+@pytest.mark.parametrize("held_index", [0, 1], ids=["first-lock", "second-lock"])
+def test_run_lock_waits_out_a_probe_that_holds_it_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_index: int
+) -> None:
+    """A run whose lock a ``status`` probe holds for an instant takes it once the probe lets go.
+
+    ``flock`` contends per open file, so a second handle in this process stands in
+    for the probing process; it is released at the run's first retry, inside the window.
+    """
+    experiment = make_experiment(persistent=tmp_path)
+    paths = _run_lock_paths(experiment)
+    assert len(paths) == 2
+    probe = runtime_files.try_lock_file(paths[held_index])
+    assert probe is not None
+    retries: list[float] = []
+
+    def release_probe(seconds: float) -> None:
+        retries.append(seconds)
+        if len(retries) == 1:
+            runtime_files.unlock_file(probe)
+
+    monkeypatch.setattr(
+        locking, "time", SimpleNamespace(monotonic=time.monotonic, sleep=release_probe)
+    )
+    try:
+        with _experiment_lock(experiment):
+            assert experiment_is_busy(experiment)
+    finally:
+        if not probe.closed:
+            runtime_files.unlock_file(probe)
+
+    assert len(retries) == 1
+
+
+def test_run_lock_held_past_the_retry_window_is_refused_as_busy(tmp_path: Path) -> None:
+    """A holder that outlasts the retry window still gets the unchanged busy refusal."""
+    experiment = make_experiment(persistent=tmp_path)
+    path = _run_lock_paths(experiment)[0]
+    holder = runtime_files.try_lock_file(path)
+    assert holder is not None
+    started = time.monotonic()
+    try:
+        with pytest.raises(ExperimentLockBusyError) as busy, _experiment_lock(experiment):
+            pytest.fail("the run took a lock another process holds")
+    finally:
+        runtime_files.unlock_file(holder)
+
+    assert time.monotonic() - started >= locking._PROBE_OUTLAST_SECONDS
+    assert busy.value.args[0] == (
+        "Another phasesweep process appears to be using the same experiment backend or "
+        f"output namespace for {experiment.experiment!r} (lock file: {path}). phasesweep "
+        "supports one active orchestrator per experiment output namespace and per "
+        "persistent storage identity."
+    )
+    assert busy.value.remediation == (
+        "Wait for the other PhaseSweep operation using this experiment output or storage "
+        "namespace to finish, then retry the same command."
+    )
 
 
 @pytest.mark.parametrize(

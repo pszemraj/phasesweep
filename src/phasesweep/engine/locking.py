@@ -5,9 +5,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import IO
 
 from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import (
@@ -24,12 +25,18 @@ from phasesweep.runtime.files import (
     lock_dir as _lock_dir,
 )
 
+#: How long a run-style acquisition keeps retrying a held experiment lock before it
+#: refuses as busy. ``flock`` cannot test a lock without taking it, so a ``status``
+#: read (:func:`experiment_is_busy`) holds the lock for the microseconds its probe
+#: takes; this bound outlasts such a probe many times over, while a real holder is
+#: still refused after a wait nobody notices.
+_PROBE_OUTLAST_SECONDS = 0.1
 
-def _lock_digest(material: dict[str, Any]) -> str:
+
+def _lock_digest(material: dict[str, str]) -> str:
     """Hash a lock-material dict into a 24-char hex digest.
 
-    :param dict[str, Any] material: Lock identity material, represented as a
-        JSON-serializable mapping.
+    :param dict[str, str] material: Lock identity material.
     :return str: First 24 hex characters of the canonical JSON's SHA-256.
     """
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
@@ -101,6 +108,9 @@ def _run_lock_paths(experiment: Experiment, *, read_only: bool = False) -> list[
 def experiment_is_busy(experiment: Experiment) -> bool:
     """Probe the existing orchestration locks without creating directories or files.
 
+    The probe takes each lock for an instant, because ``flock`` has no test that
+    leaves it untaken; a run starting in that instant retries past it.
+
     :param Experiment experiment: Experiment whose output and storage namespaces are probed.
     :return bool: Whether another operation holds either lock at the instant of the probe.
     """
@@ -114,6 +124,22 @@ def experiment_is_busy(experiment: Experiment) -> bool:
     return False
 
 
+def _lock_outlasting_probes(path: Path) -> IO[str] | None:
+    """Take one experiment lock, retrying for :data:`_PROBE_OUTLAST_SECONDS` while it is held.
+
+    :param Path path: Lock file to take exclusively.
+    :return IO[str] | None: The held lock handle, or ``None`` when another process
+        still holds the lock once the retry window has passed.
+    """
+    deadline = time.monotonic() + _PROBE_OUTLAST_SECONDS
+    while (handle := try_lock_file(path)) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.002, remaining))
+    return handle
+
+
 @contextlib.contextmanager
 def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     """Hold same-host advisory locks for the whole phase-chained experiment.
@@ -122,14 +148,15 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
     may be shared by configs that differ on the other, so both constrain execution.
 
     :param Experiment experiment: Experiment whose complete lock set is acquired.
-    :raises ExperimentLockBusyError: Another process holds the output or storage lock.
+    :raises ExperimentLockBusyError: Another process still holds the output or storage
+        lock after the brief retry that outlasts a ``status`` probe.
     :return Iterator[None]: Context manager iterator for the held lock set.
     """
     paths = _run_lock_paths(experiment)
-    handles: list[Any] = []
+    handles: list[IO[str]] = []
     try:
         for path in paths:
-            handle = try_lock_file(path)
+            handle = _lock_outlasting_probes(path)
             if handle is None:
                 raise ExperimentLockBusyError(
                     f"Another phasesweep process appears to be using the same "
