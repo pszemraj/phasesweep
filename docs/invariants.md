@@ -331,3 +331,13 @@ MLflow evidence is read only from the run bound to the attempt; another run's me
 **Held by:** `tracking.mlflow._capture`, `tracking.mlflow._publish`, `tracking.publication._unaccepted_projection`, `tracking.publication._save_attempt_intents`, which applies an ended invocation's status only to a finished trial, and `tracking.publication._save_intent`
 
 **Tests:** `tests/test_mlflow_terminal_delivery.py::test_publish_applies_the_owned_run_outcome`, `tests/test_mlflow_terminal_delivery.py::test_failed_invocation_leaves_a_pending_trials_managed_run_open`, `tests/test_mlflow_integration.py::test_managed_failed_trial_overrides_the_trainer_run_status`, `tests/test_mlflow_integration.py::test_failed_trainer_http_summary_delivery_and_sync`
+
+### MCP responses
+
+#### 31. A response that requires recovery carries its step
+
+An agent reads its next step from the response in hand, so every MCP response that reports `recovery_required: true` (`get_run_status`, `await_run`, `get_latest_run` and a successful `cancel_run`) carries a `failure` whose `remediation` names the operator's step, and `get_run_results` for that run carries one too. A diagnosis that already names `recover-run` stands. Otherwise the read composes the step from the cause: an unresolved launch and unconfirmed cleanup report `cleanup_uncertain`, an unfinished result snapshot reports `result_snapshot_unavailable`, and a failure the run recorded stays beneath it as `cause`. Reads compose the step from durable evidence and store nothing; a failing cancellation stores only the diagnosis it raised.
+
+**Held by:** `mcp.failures.response_failure` and `mcp.failures._recovery_failure`, called by `mcp.tools.PhaseSweepMCP._run_payload`, `mcp.tools.PhaseSweepMCP.winners` and `mcp.tools.PhaseSweepMCP.cancel`; `mcp.failures.run_failure_payload`, the diagnosis a failing cancellation raises and stores
+
+**Tests:** `tests/test_mcp_stop_steps.py::test_a_run_that_requires_recovery_names_the_operators_step`, `tests/test_mcp_stop_steps.py::test_a_cancel_that_leaves_recovery_names_the_operators_step`

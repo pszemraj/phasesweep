@@ -1,0 +1,183 @@
+"""Every MCP response that requires operator recovery carries the operator's step."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from phasesweep.mcp.runner import _cleanup_uncertain_payload
+from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime import reaper
+from phasesweep.runtime.time import utc_now_iso
+from tests.mcp_helpers import (
+    claim_runner_handle,
+    make_dead_run_handle,
+    side_effect_app,
+    stage_dead_run,
+    stage_live_run,
+    write_run_status,
+    write_runner_heartbeat,
+    write_unsafe_cleanup_status,
+)
+
+RUN_ID = "srv-needs-recovery"
+#: A PID namespace the reader is not in, and a nested reader that cannot prove its processes gone.
+RECORDED_NAMESPACE = "pid:[4026539001]@100"
+NESTED_READER = "pid:[4026539333]@100"
+
+Stage = Callable[[Path, PhaseSweepMCP, RunStore, pytest.MonkeyPatch], None]
+
+
+def _prepare_launch(config: Path, store: RunStore) -> RunHandle:
+    """Persist the launch handle and config snapshot a server saves before it spawns the runner."""
+    snapshot = config.read_bytes()
+    claim_runner_handle(
+        store,
+        run_id=RUN_ID,
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        config_dir=config.resolve().parent,
+        started_at=utc_now_iso(),
+    )
+    store.config_snapshot_path(RUN_ID).write_bytes(snapshot)
+    handle = store.get(RUN_ID)
+    assert handle is not None
+    return handle
+
+
+def _launch_unresolved(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server saved the launch handle but never recorded whether its runner started."""
+    _prepare_launch(config, store)
+
+
+def _launch_failure_record(
+    config: Path, app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed launch whose runner group could not be confirmed gone, as the server records it."""
+    pending = _prepare_launch(config, store)
+    store.mark_cleanup_uncertain(
+        make_dead_run_handle(
+            run_id=RUN_ID,
+            experiment_id=pending.experiment_id,
+            config_sha256=pending.config_sha256,
+            config_dir=pending.config_dir,
+        )
+    )
+    app._record_launch_failure(pending, cleanup_confirmed=False, error_class="RuntimeError")
+
+
+def _runner_exited(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner exited without writing its final status."""
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
+
+
+def _cleanup_marker_dead_runner(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cleanup reservation outlives a runner that wrote no final status."""
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=True)
+
+
+def _cleanup_marker_live_runner(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation reserved cleanup and never recorded its outcome; the runner still lives."""
+    store.mark_cleanup_uncertain(stage_live_run(store, RUN_ID, config, "srv"))
+
+
+def _runner_cleanup_unconfirmed(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner recorded that it could not confirm trial cleanup."""
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
+    write_unsafe_cleanup_status(store, RUN_ID, failure=_cleanup_uncertain_payload([]))
+
+
+def _upload_cleanup_unconfirmed(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A succeeded run whose upload worker's cleanup is unconfirmed."""
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
+    write_run_status(
+        store, RUN_ID, returncode=0, cleanup_confirmed=False, result_snapshot_state="failed"
+    )
+
+
+def _snapshot_finalization(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, _monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner died after recording its outcome but before finalizing its result snapshot."""
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False)
+    write_run_status(store, RUN_ID, returncode=0, result_snapshot_state="pending")
+
+
+def _stale_heartbeat(
+    config: Path, _app: PhaseSweepMCP, store: RunStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner in another PID namespace stopped refreshing its heartbeat."""
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
+    stage_dead_run(
+        store, RUN_ID, config, "srv", cleanup_uncertain=False, pid_namespace=RECORDED_NAMESPACE
+    )
+    write_runner_heartbeat(store, RUN_ID, age_seconds=600.0)
+
+
+CAUSES: dict[str, Stage] = {
+    "launch-unresolved": _launch_unresolved,
+    "launch-failure-record": _launch_failure_record,
+    "runner-exited": _runner_exited,
+    "cleanup-marker-dead-runner": _cleanup_marker_dead_runner,
+    "cleanup-marker-live-runner": _cleanup_marker_live_runner,
+    "runner-cleanup-unconfirmed": _runner_cleanup_unconfirmed,
+    "upload-cleanup-unconfirmed": _upload_cleanup_unconfirmed,
+    "snapshot-finalization": _snapshot_finalization,
+    "stale-heartbeat": _stale_heartbeat,
+}
+
+
+@pytest.mark.parametrize("read_tool", ["get_run_status", "await_run", "get_latest_run"])
+@pytest.mark.parametrize("cause", CAUSES)
+def test_a_run_that_requires_recovery_names_the_operators_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str, read_tool: str
+) -> None:
+    """Every read that reports recovery_required true carries a failure naming recover-run for the operator, and so does get_run_results."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    CAUSES[cause](config, app, store, monkeypatch)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    if read_tool == "get_run_status":
+        run = app.status(run_id=RUN_ID)["run"]
+    elif read_tool == "await_run":
+        awaited = asyncio.run(app.await_run(RUN_ID, timeout_seconds=0))
+        assert awaited["reason"] == "recovery_required"
+        run = awaited["run"]
+    else:
+        run = app.latest_run("srv")["run"]
+    results_failure = app.winners(run_id=RUN_ID)["failure"]
+
+    assert run["recovery_required"] is True
+    for failure in (run["failure"], results_failure):
+        assert failure is not None
+        assert failure["actor"] == "operator"
+        assert "phasesweep mcp recover-run" in failure["remediation"]
+
+
+def test_a_cancel_that_leaves_recovery_names_the_operators_step(tmp_path: Path) -> None:
+    """A cancellation that confirms cleanup but leaves the result snapshot unfinished names recover-run."""
+    config, app, _registry, store = side_effect_app(tmp_path)
+    stage_dead_run(store, RUN_ID, config, "srv", cleanup_uncertain=False, allow_cancel=True)
+    write_run_status(store, RUN_ID, returncode=143, result_snapshot_state="pending")
+
+    result = app.cancel(RUN_ID)
+
+    assert (result["cleanup_confirmed"], result["recovery_required"]) == (True, True)
+    assert result["failure"]["code"] == "result_snapshot_unavailable"
+    assert "phasesweep mcp recover-run" in result["failure"]["remediation"]

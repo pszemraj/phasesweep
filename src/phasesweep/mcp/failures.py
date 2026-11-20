@@ -4,16 +4,20 @@ A run read reports one safe failure payload chosen from the runner's recorded te
 cleanup record and what the read can observe of the runner now. The choice reads only the run store
 and the run handle, never the catalog or the server, so it lives apart from the tool methods that
 call it.
+
+A response is the agent's only instruction at the moment it must stop, so every read that reports
+``recovery_required`` carries a failure naming the operator's step. Nothing here is stored.
 """
 
 from __future__ import annotations
 
 import contextlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from phasesweep.mcp.runner import FailurePayload
+from phasesweep.mcp.runner import FailurePayload, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import RunHandle, RunnerView, RunObservation, RunStore
 from phasesweep.mcp.snapshots import parse_result_snapshot
 from phasesweep.runtime.json import JsonObject, json_object
@@ -23,6 +27,88 @@ _CLEANUP_SETTLED_REMEDIATION = (
     "run itself still ended without completing; start a new run only if the user still wants "
     "the sweep to continue."
 )
+_RECOVER_RUN_STEP = (
+    "Stop monitoring and ask the operator to run `phasesweep mcp recover-run` from a host shell, "
+    "review its preview and repeat with `--confirm`."
+)
+
+
+def response_failure(
+    runs: RunStore,
+    handle: RunHandle,
+    *,
+    view: RunnerView | None = None,
+    observation: RunObservation | None = None,
+    force_snapshot_unavailable: bool = False,
+) -> JsonObject | None:
+    """Return the failure a run read reports, carrying the step whenever the agent must stop.
+
+    The run's own diagnosis is reported as :func:`run_failure_payload` composes it, except that
+    a run requiring recovery always reports a failure naming ``recover-run``.
+
+    :param RunStore runs: Store holding the run's durable state.
+    :param RunHandle handle: Run being read.
+    :param RunnerView | None view: The read's derivation of the runner, or ``None`` to derive it.
+    :param RunObservation | None observation: The read's observation of the run, or ``None``
+        to observe it here.
+    :param bool force_snapshot_unavailable: The response already reports the terminal snapshot
+        unavailable.
+    :return JsonObject | None: The validated failure, or ``None`` when the run has none.
+    """
+    if view is None:
+        view = runs.runner_view(handle)
+    if observation is None:
+        observation = runs.observe(handle, view=view)
+    diagnosis = _diagnose(
+        runs,
+        handle,
+        view=view,
+        observation=observation,
+        force_snapshot_unavailable=force_snapshot_unavailable,
+    )
+    if observation.recovery_required and not diagnosis.names_recover_run:
+        return _recovery_failure(handle, observation, diagnosis.recorded)
+    return diagnosis.failure
+
+
+def _recovery_failure(
+    handle: RunHandle, observation: RunObservation, recorded: JsonObject | None
+) -> JsonObject:
+    """Name the operator's recover-run step for a run whose diagnosis carries none.
+
+    :param RunHandle handle: Run that requires recovery.
+    :param RunObservation observation: The read's observation of the run.
+    :param JsonObject | None recorded: The run's own recorded failure, kept as the cause.
+    :return JsonObject: A ``cleanup_uncertain`` failure for an unresolved launch or unconfirmed
+        cleanup, or ``result_snapshot_unavailable`` for an unfinished result snapshot.
+    """
+    cause: JsonObject = {}
+    if recorded is not None:
+        cause = {"cause": {key: value for key, value in recorded.items() if key != "cause"}}
+    if handle.launch_state == "launching" and observation.terminal_status is None:
+        return {
+            "code": "cleanup_uncertain",
+            "stage": "cleanup",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "The server saved this run's launch but never recorded whether its runner "
+                f"started. {_RECOVER_RUN_STEP}"
+            ),
+        }
+    if observation.snapshot_recovery_required and not observation.cleanup_recovery_required:
+        return {
+            "code": "result_snapshot_unavailable",
+            "stage": "cleanup",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "The runner stopped before it finished recording this run's result snapshot. "
+                f"{_RECOVER_RUN_STEP}"
+            ),
+            **cause,
+        }
+    return {**json_object(_cleanup_uncertain_payload([])), **cause}
 
 
 def run_failure_payload(
@@ -34,6 +120,9 @@ def run_failure_payload(
     force_snapshot_unavailable: bool = False,
 ) -> JsonObject | None:
     """Return a validated safe terminal failure, never the raw exception text.
+
+    Cancellation composes its own remedy when this diagnosis has none, so it reads this
+    rather than :func:`response_failure`.
 
     :param RunStore runs: Store holding the run's durable state.
     :param RunHandle handle: Run handle whose recorded terminal status
@@ -54,6 +143,43 @@ def run_failure_payload(
         view = runs.runner_view(handle)
     if observation is None:
         observation = runs.observe(handle, view=view)
+    return _diagnose(
+        runs,
+        handle,
+        view=view,
+        observation=observation,
+        force_snapshot_unavailable=force_snapshot_unavailable,
+    ).failure
+
+
+@dataclass(frozen=True)
+class _Diagnosis:
+    """A run's diagnosed failure, its own recorded failure, and whether the first names recover-run."""
+
+    failure: JsonObject | None
+    recorded: JsonObject | None
+    names_recover_run: bool
+
+
+def _diagnose(
+    runs: RunStore,
+    handle: RunHandle,
+    *,
+    view: RunnerView,
+    observation: RunObservation,
+    force_snapshot_unavailable: bool,
+) -> _Diagnosis:
+    """Diagnose one run's failure from its recorded status, cleanup record and runner.
+
+    :param RunStore runs: Store holding the run's durable state.
+    :param RunHandle handle: Run being diagnosed.
+    :param RunnerView view: The read's derivation of the runner.
+    :param RunObservation observation: The read's observation of the run.
+    :param bool force_snapshot_unavailable: The response already reports the terminal snapshot
+        unavailable.
+    :return _Diagnosis: The failure to report, the run's validated recorded failure, and
+        whether that failure asks the operator for ``recover-run``.
+    """
     terminal: Mapping[str, object] = observation.terminal_status or {}
     persisted: JsonObject | None = None
     recorded_failure = terminal.get("failure")
@@ -67,11 +193,11 @@ def run_failure_payload(
                 )
             )
     if persisted is not None and observation.cleanup_recovery_required:
-        return persisted
+        return _Diagnosis(persisted, persisted, persisted["code"] == "cleanup_uncertain")
     if observation.cleanup_recovery_required and terminal.get("returncode") == 0:
         # A succeeded run records no failure, but its MLflow upload worker's cleanup can be
         # unconfirmed, and that leaves the agent a recovery with no step to relay.
-        return {
+        upload_cleanup: JsonObject = {
             "code": "cleanup_uncertain",
             "stage": "cleanup",
             "retryable": False,
@@ -85,6 +211,8 @@ def run_failure_payload(
                 "launch."
             ),
         }
+        return _Diagnosis(upload_cleanup, persisted, True)
+    recorded = persisted
     if persisted is not None and persisted["code"] == "cleanup_uncertain":
         # The recorded step was recover-run, and cleanup recovery is no longer required.
         persisted = {**persisted, "remediation": _CLEANUP_SETTLED_REMEDIATION}
@@ -127,13 +255,14 @@ def run_failure_payload(
                 "settled process cleanup; this run's historical results remain unavailable. "
                 "Do not substitute mutable experiment-level results."
             )
-        return {
+        runner_failure: JsonObject = {
             "code": ("cleanup_uncertain" if recovery_required else "result_snapshot_unavailable"),
             "stage": "cleanup",
             "retryable": False,
             "actor": "operator",
             "remediation": remedy,
         }
+        return _Diagnosis(runner_failure, recorded, recovery_required)
     if force_snapshot_unavailable or (
         observation.state != "running" and parse_result_snapshot(terminal) is None
     ):
@@ -150,7 +279,7 @@ def run_failure_payload(
         }
         if persisted is not None:
             failure["cause"] = persisted
-        return failure
+        return _Diagnosis(failure, recorded, False)
     # Other terminal diagnoses and remediations survive operator recovery; the live
     # recovery_required field says whether recovery is still needed.
-    return persisted
+    return _Diagnosis(persisted, recorded, False)

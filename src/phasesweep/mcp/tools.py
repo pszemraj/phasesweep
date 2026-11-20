@@ -73,7 +73,7 @@ from phasesweep.mcp.errors import (
     UnknownRunError,
     live_runner_step,
 )
-from phasesweep.mcp.failures import run_failure_payload
+from phasesweep.mcp.failures import response_failure, run_failure_payload
 from phasesweep.mcp.redaction import (
     ResultSource,
     intersect_visible_params,
@@ -651,7 +651,7 @@ class PhaseSweepMCP:
                 observation.recovery_required or observation.runner_heartbeat_stale
             ),
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
-            "failure": run_failure_payload(
+            "failure": response_failure(
                 self._runs,
                 handle,
                 view=view,
@@ -1021,7 +1021,7 @@ class PhaseSweepMCP:
             result_context=status["result_context"],
             published_config_matches_current=status["published_config_matches_current"],
         )
-        result["failure"] = run_failure_payload(
+        result["failure"] = response_failure(
             self._runs,
             handle,
             view=view,
@@ -1465,6 +1465,10 @@ class PhaseSweepMCP:
                 "cleanup_confirmed": confirmed,
                 "recovery_required": recovery_required,
             }
+            if recovery_required:
+                result["failure"] = response_failure(
+                    self._runs, handle, view=view, observation=observation
+                )
         except Exception as exc:
             self._audit_error(
                 TOOL_CANCEL_RUN,
