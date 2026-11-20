@@ -328,7 +328,7 @@ def test_the_refusal_shows_a_long_value_whole_and_the_drift_warning_cuts_it(
 
 
 def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The way back is the recorded values of the differing variables, in the order the message lists them."""
+    """The way back restores the recorded value of a differing variable and unsets an added one."""
     names = ["PS_COHORT_ADDED"]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
     study = study_with_stamped_environment(_identity(experiment))
@@ -339,8 +339,8 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
     refusal = _refused(study, _identity(experiment))
 
     assert refusal.remediation == (
-        "Run with the recorded `PATH`, `TZ`, `PS_COHORT_ADDED` to continue this study "
-        "(for an MCP run, set them in the client's server `env`), or set a new `experiment` "
+        "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study "
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` "
         "name to start a fresh study. Moving a variable into `env` or "
         "`execution.passthrough_env` also starts a new study."
     )
@@ -348,27 +348,35 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
     assert "do not split cohorts" not in str(refusal)
 
 
-def test_the_remediation_for_one_variable_speaks_of_it_in_the_singular(
+def test_the_remediation_restores_a_changed_variable_and_unsets_an_added_one_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One differing variable is restored as ``it``, not ``them``."""
-    experiment = make_experiment()
+    """A changed variable is run with its recorded value, and an added one is run without."""
+    experiment = make_experiment(execution=ExecutionContext(inherit_env=["PS_COHORT_ADDED"]))
     study = study_with_stamped_environment(_identity(experiment))
     monkeypatch.setenv("TZ", "Asia/Tokyo")
 
-    refusal = _refused(study, _identity(experiment))
+    changed = _refused(study, _identity(experiment))
+    monkeypatch.setenv("TZ", _AMBIENT["TZ"])
+    monkeypatch.setenv("PS_COHORT_ADDED", "new")
+    added = _refused(study, _identity(experiment))
 
-    assert refusal.remediation is not None
-    assert refusal.remediation.startswith(
+    assert changed.remediation is not None
+    assert changed.remediation.startswith(
         "Run with the recorded `TZ` to continue this study "
-        "(for an MCP run, set it in the client's server `env`), or set a new `experiment` name"
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
+    )
+    assert added.remediation is not None
+    assert added.remediation.startswith(
+        "Run without `PS_COHORT_ADDED` to continue this study "
+        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
     )
 
 
 def test_the_remediation_names_every_variable_though_the_message_counts_the_rest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The cap on shown values never hides a variable the operator must restore."""
+    """The cap on shown values never hides a variable the operator must change."""
     names = [f"PS_COHORT_VAR_{index:02d}" for index in range(12)]
     experiment = make_experiment(execution=ExecutionContext(inherit_env=names))
     study = study_with_stamped_environment(_identity(experiment))
@@ -607,7 +615,7 @@ def test_two_phases_refused_for_one_cohort_share_one_fix(
 
     refusal = caught.value
     assert str(refusal).count('TZ "Europe/Berlin" -> "Asia/Tokyo"') == 2
-    assert refusal.remediation == _environment_cohort_remediation(["TZ"])
+    assert refusal.remediation == _environment_cohort_remediation(["TZ"], [])
     assert _operational_error_text(refusal).endswith(f"\nfix: {refusal.remediation}")
 
 
