@@ -92,9 +92,9 @@ DESCRIPTION_GET_GUIDE = (
     "any other PhaseSweep tool. Read-only: it reads no catalog and needs no experiment id."
 )
 DESCRIPTION_LIST_EXPERIMENTS = (
-    "List the operator-approved experiments and their permitted actions. Call this first for "
-    "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
-    "ids returned by this catalog."
+    "List the operator-approved experiments and their permitted actions. Call it after get_guide "
+    "to discover experiments; follow next_cursor until null, then call inspect_experiment. "
+    "Read-only: use only ids returned by this catalog."
 )
 DESCRIPTION_EXPLAIN_CONFIG = (
     "Explain the experiment configuration schema: the type, default and rules of one config key "

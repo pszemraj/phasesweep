@@ -340,6 +340,7 @@ def test_fastmcp_registers_its_tools(tmp_path: Path) -> None:
         TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
         TOOL_EXPLAIN_CONFIG: ("config-authoring help", "not any catalog experiment"),
         TOOL_GET_GUIDE: ("before any other PhaseSweep tool",),
+        TOOL_LIST_EXPERIMENTS: ("after get_guide",),
     }.items():
         for safety_contract in safety_contracts:
             assert safety_contract in descriptions[tool_name]
