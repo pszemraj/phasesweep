@@ -509,3 +509,43 @@ def test_status_tells_a_killed_run_from_a_live_one(harness: _Harness) -> None:
         recovered = CliRunner().invoke(cli, [*arguments, str(config)])
         assert recovered.exit_code == 0, recovered.output
         assert "No run is active" not in recovered.output
+
+
+@pytest.mark.parametrize("persistent", [True, False], ids=["persistent", "in-memory"])
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGHUP, signal.SIGTERM])
+def test_a_stopped_run_ends_with_the_next_step_once(
+    harness: _Harness, sig: signal.Signals, persistent: bool
+) -> None:
+    """After SIGINT, SIGHUP or SIGTERM the last line says to rerun, and what that keeps."""
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid", seed=0),
+        search_space={"model.n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+    )
+    if persistent:
+        experiment = harness.experiment("stopped", phase)
+    else:
+        experiment = make_experiment(
+            workdir=harness.root / "stopped" / "runs",
+            trial_command=f"python {harness.trainer} {{overrides}}",
+            metric=FAKE_TRAIN_METRIC,
+            phases=[phase],
+        )
+    config = harness.config(experiment)
+
+    harness.interrupt(config, 0, sig)
+
+    assert harness.spawned[-1].returncode == 128 + sig
+    expected = (
+        "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
+        "and interrupted ones rerun first."
+        if persistent
+        else "phasesweep: stopped. Rerun the same command to start over: storage: null keeps "
+        "no completed trials."
+    )
+    lines = harness.log.read_text().splitlines()
+    assert lines[-1] == expected
+    assert lines.count(expected) == 1
+    assert "Aborted." not in lines

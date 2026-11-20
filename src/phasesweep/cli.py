@@ -509,7 +509,26 @@ def run(
                 "the result is available for inspection.",
                 err=True,
             )
+        elif not dry_run:
+            click.echo(_resume_hint(config), err=True)
         raise
+
+
+def _resume_hint(config: Experiment) -> str:
+    """Name the next step after a run was stopped by SIGINT, SIGHUP or SIGTERM.
+
+    :param Experiment config: The config the stopped run was started with.
+    :return str: One line, printed last, so the cleanup log above it is not the final word.
+    """
+    if config.persistent:
+        return (
+            "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
+            "and interrupted ones rerun first."
+        )
+    return (
+        "phasesweep: stopped. Rerun the same command to start over: storage: null keeps no "
+        "completed trials."
+    )
 
 
 def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:
