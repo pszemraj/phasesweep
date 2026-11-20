@@ -397,7 +397,7 @@ class RunStore:
             payload = None
         version = payload.get("schema_version") if isinstance(payload, dict) else None
         if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
-            raise self._format_refusal(f"format marker declares unsupported format {version}")
+            raise self._marker_version_refusal(version)
         if type(version) is not int or set(cast(dict[str, object], payload)) != {"schema_version"}:
             raise UnsafePrivatePathError(
                 f"MCP state directory {marker.parent} format marker {marker} is malformed. "
@@ -478,16 +478,15 @@ class RunStore:
     def _require_supported_format_marker(self) -> None:
         """Require the exact current private namespace marker without writing it.
 
-        :raises ValueError: The marker is malformed or declares another format.
+        :raises UnsupportedStateFormatError: The marker is unreadable, malformed, or
+            declares another format.
         """
         payload = _read_json_object(self._format_marker_path)
-        if (
-            payload is None
-            or set(payload) != {"schema_version"}
-            or type(payload["schema_version"]) is not int
-            or payload["schema_version"] != MCP_STATE_FORMAT_VERSION
-        ):
-            raise self._format_refusal("format marker is malformed or unsupported")
+        version = None if payload is None else payload.get("schema_version")
+        if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
+            raise self._marker_version_refusal(version)
+        if payload is None or set(payload) != {"schema_version"} or type(version) is not int:
+            raise self._format_refusal("format marker is unreadable or malformed")
 
     def _create_format_marker(self) -> None:
         """Atomically claim the current format for a verified fresh namespace.
@@ -510,6 +509,17 @@ class RunStore:
         return UnsupportedStateFormatError(
             f"MCP state directory {self._format_marker_path.parent} {detail}; "
             "use a fresh MCP state directory."
+        )
+
+    def _marker_version_refusal(self, version: int) -> UnsupportedStateFormatError:
+        """Build the refusal for a well-formed marker that declares another format.
+
+        :param int version: Format the marker declares.
+        :return UnsupportedStateFormatError: Refusal naming both formats and the fresh-directory step.
+        """
+        return self._format_refusal(
+            f"format marker declares format {version}; "
+            f"this PhaseSweep reads format {MCP_STATE_FORMAT_VERSION}"
         )
 
     @contextlib.contextmanager

@@ -504,11 +504,21 @@ def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("marker_text", "match"),
     [
-        ("not json\n", "malformed or unsupported"),
-        ('{"schema_version": 0}\n', "malformed or unsupported"),
+        ("not json\n", "format marker is unreadable or malformed; use a fresh MCP state directory"),
         (
             json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION, "unexpected": True}),
-            "malformed or unsupported",
+            "format marker is unreadable or malformed; use a fresh MCP state directory",
+        ),
+        (
+            '{"schema_version": 0}\n',
+            f"format marker declares format 0; this PhaseSweep reads format "
+            f"{mcp_runs.MCP_STATE_FORMAT_VERSION}; use a fresh MCP state directory",
+        ),
+        (
+            json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION - 1}),
+            f"format marker declares format {mcp_runs.MCP_STATE_FORMAT_VERSION - 1}; "
+            f"this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}; "
+            "use a fresh MCP state directory",
         ),
     ],
 )
@@ -656,7 +666,10 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
         (_symlink_to_state_dir, "is not a real directory"),
-        (_marker_text('{"schema_version": 0}\n'), "declares unsupported format 0"),
+        (
+            _marker_text('{"schema_version": 0}\n'),
+            f"declares format 0; this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}",
+        ),
         # No marker and no run handles: the path names some other directory,
         # whatever its layout or permissions, and no chmod turns it into state.
         (
