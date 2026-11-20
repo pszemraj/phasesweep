@@ -388,6 +388,52 @@ def _abort_record(
     }
 
 
+def _abort_decision(
+    phase: Phase,
+    trial_number: int,
+    outcome: str,
+    *,
+    completion_sequence: int,
+    consecutive_failures: int,
+    aborted: bool,
+    cause: str | None = None,
+    fatal_policy: str | None = None,
+) -> JsonObject | None:
+    """Return the abort record that recording ``outcome`` after the given state would trip.
+
+    A live phase execution and stale-trial recovery both decide here, so an outcome trips the
+    same abort whichever of them records it.
+
+    :param Phase phase: Phase whose ``max_consecutive_failures`` and ``n_trials`` apply.
+    :param int trial_number: Trial whose outcome is about to be recorded.
+    :param str outcome: The terminal outcome about to be recorded.
+    :param int completion_sequence: Completion sequence of the last recorded outcome.
+    :param int consecutive_failures: Failure streak before ``outcome``.
+    :param bool aborted: Whether an abort already stopped the phase, so a streak trips no other.
+    :param str | None cause: The outcome's recorded cause, if any.
+    :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
+    :return JsonObject | None: The abort record at the next completion sequence, or ``None``
+        when the outcome trips nothing.
+    """
+    sequence = completion_sequence + 1
+    if outcome == "fatal":
+        return _abort_record(
+            policy=fatal_policy or "fatal_trial_exception",
+            completion_sequence=sequence,
+            trial_target=phase.n_trials,
+            cause=cause or f"trial {trial_number} hit a fatal objective error",
+        )
+    streak = _next_consecutive_failures(consecutive_failures, outcome)
+    if aborted or not _consecutive_failure_threshold_tripped(streak, phase):
+        return None
+    return _failure_policy_abort_record(
+        phase,
+        consecutive_failures=streak,
+        completion_sequence=sequence,
+        trial_target=phase.n_trials,
+    )
+
+
 def _as_sentence(cause: object) -> str:
     """End a recorded abort cause as a sentence, so the text after it starts a new one.
 
@@ -749,22 +795,15 @@ class _PhaseExecution:
         """
         if self.abort_recorded:
             return None
-        sequence = self.completion_sequence + 1
-        if outcome == "fatal":
-            return _abort_record(
-                policy=fatal_policy or "fatal_trial_exception",
-                completion_sequence=sequence,
-                trial_target=self.phase.n_trials,
-                cause=cause or f"trial {trial_number} hit a fatal objective error",
-            )
-        streak = _next_consecutive_failures(self.consecutive_failures, outcome)
-        if self.aborted or not _consecutive_failure_threshold_tripped(streak, self.phase):
-            return None
-        return _failure_policy_abort_record(
+        return _abort_decision(
             self.phase,
-            consecutive_failures=streak,
-            completion_sequence=sequence,
-            trial_target=self.phase.n_trials,
+            trial_number,
+            outcome,
+            completion_sequence=self.completion_sequence,
+            consecutive_failures=self.consecutive_failures,
+            aborted=self.aborted,
+            cause=cause,
+            fatal_policy=fatal_policy,
         )
 
     def advance(self, trial_number: int, outcome: str) -> bool:

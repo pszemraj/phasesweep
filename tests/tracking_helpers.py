@@ -356,7 +356,13 @@ def switchable_wandb(install_sdk, tmp_path: Path) -> SwitchableWandb:
 
 
 def wandb_objective_experiment(
-    tmp_path: Path, *, n_trials: int, n_jobs: int = 1
+    tmp_path: Path,
+    *,
+    n_trials: int,
+    n_jobs: int = 1,
+    switch_at_launch: tuple[SwitchableWandb, int, str] | None = None,
+    max_consecutive_failures: int = 5,
+    metric_max: float | None = None,
 ) -> tuple[Experiment, Path]:
     """Build a persistent sweep whose objective W&B reports once its trainer exits cleanly.
 
@@ -366,6 +372,11 @@ def wandb_objective_experiment(
     :param Path tmp_path: Directory holding the ledger, workdir, trainer and launch log.
     :param int n_trials: The phase's trial target.
     :param int n_jobs: The phase's parallel workers.
+    :param tuple[SwitchableWandb, int, str] | None switch_at_launch: The fake W&B server, a
+        launch number and a mode: that launch's trainer switches the server to the mode, so
+        its own evidence and every later lookup see it.
+    :param int max_consecutive_failures: The phase's failure limit.
+    :param float | None metric_max: Upper bound above which the objective is infeasible.
     :return tuple[Experiment, Path]: The experiment and its trainer launch log.
     """
     from phasesweep.config.models import Metric
@@ -373,6 +384,11 @@ def wandb_objective_experiment(
     from tests.conftest import make_experiment, write_trainer
 
     launches = tmp_path / "launches"
+    switch = (
+        None
+        if switch_at_launch is None
+        else (switch_at_launch[1], str(switch_at_launch[0].mode), switch_at_launch[2])
+    )
     trainer = write_trainer(
         tmp_path / "trainer.py",
         f"""
@@ -381,6 +397,9 @@ def wandb_objective_experiment(
         launches = Path({str(launches)!r})
         with launches.open("a") as log:
             log.write("launch\\n")
+        switch = {switch!r}
+        if switch is not None and len(launches.read_text().splitlines()) == switch[0]:
+            Path(switch[1]).write_text(switch[2])
         deadline = time.monotonic() + 15
         while len(launches.read_text().splitlines()) < {n_jobs} and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -398,8 +417,9 @@ def wandb_objective_experiment(
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=trainer,
-        metric=Metric(extractor=remote),
+        metric=Metric(extractor=remote, max=metric_max),
         n_trials=n_trials,
         n_jobs=n_jobs,
+        max_consecutive_failures=max_consecutive_failures,
     )
     return experiment, launches

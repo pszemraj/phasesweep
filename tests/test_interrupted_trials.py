@@ -1412,6 +1412,54 @@ def test_finished_training_whose_tracker_answers_a_failure_fails_once(
     assert launches.read_text().splitlines() == ["launch"]
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["live", "recovered"])
+@pytest.mark.parametrize("verdict", ["failure", "infeasible"])
+def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None], verdict: str, path: str
+) -> None:
+    """A failure or infeasible value the tracker reports for finished training counts toward max_consecutive_failures whether the trial was live or pending: its outcome carries the same abort, and the phase publishes nothing."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    # The second trial's verdict trips the limit: a crashed run after a success, or a second
+    # value above the bound.
+    final_mode = "crashed" if verdict == "failure" else "up"
+    limit = 1 if verdict == "failure" else 2
+    experiment, launches = wandb_objective_experiment(
+        tmp_path,
+        n_trials=2,
+        switch_at_launch=(tracker, 2, "denied" if path == "recovered" else final_mode),
+        max_consecutive_failures=limit,
+        metric_max=None if verdict == "failure" else 0.5,
+    )
+    if path == "recovered":
+        with pytest.raises(TrackingTargetUnavailableError):
+            run_experiment(experiment)
+        _assert_evidence_pending(experiment, phase_trials(experiment)[1])
+        tracker.switch(final_mode)
+    with pytest.raises(PhaseAbortRefusedError if path == "recovered" else NoFeasibleTrialError):
+        run_experiment(experiment)
+    first, second = phase_trials(experiment)
+    assert second.state.name == ("FAIL" if verdict == "failure" else "COMPLETE")
+    outcome = second.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert outcome["outcome"] == "failure"
+    assert outcome[TRIAL_OUTCOME_ABORT_KEY] == {
+        "schema_version": 1,
+        "policy": "max_consecutive_failures",
+        "completion_sequence": 2,
+        "trial_target": 2,
+        "cause": f"{limit} consecutive failed/infeasible trials reached "
+        f"max_consecutive_failures={limit}.",
+        "threshold": limit,
+        "consecutive_failures": limit,
+    }
+    assert TRIAL_OUTCOME_ABORT_KEY not in first.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert not _last_successful_generation_path(experiment).exists()
+    # Either way the next run refuses the recorded abort and trains nothing.
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
 @pytest.mark.parametrize("first", ["cleanup", "left-running"])
 def test_unconfirmed_cleanup_outranks_a_parallel_trial_left_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
