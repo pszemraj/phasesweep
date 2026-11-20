@@ -34,6 +34,7 @@ PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 CONSOLE_SCRIPTS = {
     "phasesweep": "phasesweep.cli:main",
     "phasesweep-mcp": "phasesweep.mcp.server:main",
+    "phasesweep-fake-train": "phasesweep.examples.fake_train:main",
     "phasesweep-mlflow-train": "phasesweep.examples.mlflow_train:main",
 }
 
@@ -45,7 +46,7 @@ def _pyproject() -> dict:
 
 
 def test_console_scripts_declare_importable_targets() -> None:
-    """The CLI, MCP server and packaged MLflow trainer resolve to real callables."""
+    """The CLI, MCP server and both packaged toy trainers resolve to real callables."""
     assert _pyproject()["project"]["scripts"] == CONSOLE_SCRIPTS
 
     for target in CONSOLE_SCRIPTS.values():
