@@ -1,6 +1,6 @@
 # Tiny Decoder Enwik8 example
 
-This example runs a tiny Enwik8 decoder training sweep with PhaseSweep using the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The model shape stays fixed while three phases tune optimizer scale, regularization, and training stability; [`run_trial.py`](run_trial.py) passes each materialized trainer config to the upstream trainer and publishes the final-checkpoint objective.
+This example runs a tiny Enwik8 decoder training sweep with PhaseSweep using the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The model shape stays fixed while three phases tune optimizer scale, regularization, and training stability; [`run_trial.py`](run_trial.py) is the trainer each trial runs: it calls the upstream trainer's `train()` with each materialized trainer config and publishes the final-checkpoint objective.
 
 ## Setup
 
@@ -11,7 +11,7 @@ git submodule update --init examples/tiny_decoder_enwik8/upstream
 pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
-The submodule checkout also brings the [dataset](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/data/README.md): `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. The wrapper runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
+The submodule checkout also brings the [dataset](https://github.com/pszemraj/decoder-pytorch-template/blob/9c90a551ae79061f0ed797e035462539c8a08403/data/README.md): `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` trains with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves. It loads the checkout's `train.py` in its own process, and that script imports `decoder_pytorch` from the environment, so the editable install above must come from the same checkout.
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
@@ -21,7 +21,7 @@ Run GPU validation, dry runs, and training from a shell with [host GPU access](.
 
 ## CLI smoke sweep
 
-For a short GPU integration check, run the two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. The wrapper passes its `trainer_config` keys to the upstream trainer and requires `run_dir` for checkpoint output. The config leases one discovered GPU, runs 10 training batches per trial, sets trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`. The same commands use CUDA on Linux or MPS on Apple silicon macOS; the trainer chooses the device, and PhaseSweep holds its host lease:
+For a short GPU integration check, run the two-trial [`gpu_smoke.yaml`](gpu_smoke.yaml) first. `run_trial.py` passes the `trainer_config` keys to the upstream trainer and requires `run_dir` for checkpoint output. The config leases one discovered GPU, runs 10 training batches per trial, sets trial/run timeouts, and writes its experiment outputs under `/tmp/phasesweep-tiny-decoder-enwik8-gpu-smoke`. The same commands use CUDA on Linux or MPS on Apple silicon macOS; the trainer chooses the device, and PhaseSweep holds its host lease:
 
 ```bash
 phasesweep validate examples/tiny_decoder_enwik8/gpu_smoke.yaml
@@ -44,9 +44,9 @@ A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
-The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
+The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training finishes, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 
-Checkpoint loading and final evaluation belong to this example's trainer wrapper. See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
+See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
 
 ## Learning rates over seeds
 
@@ -110,9 +110,9 @@ phasesweep show-winners examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 phasesweep status examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
 ```
 
-The wrapper's `--mlflow` option logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The upstream trainer runs as pinned, with no modification.
+The `--mlflow` option of `run_trial.py` logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The upstream trainer runs as pinned, with no modification.
 
-The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. The wrapper then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
+The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. `run_trial.py` then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
 
 Completed trials are reused. See [continuation](../../docs/runtime.md#timeouts-cleanup-and-continuation) for a fresh study and [copying the repeats config](#learning-rates-over-seeds) for the working-directory rule. To use another server, change `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
 
