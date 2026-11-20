@@ -532,7 +532,9 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         ):
             return payload
         raise ProcessCleanupUncertainError(
-            "Malformed tracking operation registry entry.", action=OperatorAction.RESTORE_TREE
+            f"Tracking operation registry entry {entry_path} is malformed. {_UNVERIFIABLE_ATTEMPT}",
+            action=OperatorAction.RESTORE_TREE,
+            remediation=_entry_removal_step(entry_path),
         )
     locator_identity: str | None = None
     if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):

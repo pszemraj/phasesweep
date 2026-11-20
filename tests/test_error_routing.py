@@ -824,19 +824,39 @@ def _trial_dir_removed(entry: Path) -> None:
     Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
 
 
+def _tracking_kind_malformed(entry: Path) -> None:
+    """Mark a trial entry as a tracking operation, whose fields it then does not match."""
+    payload = json.loads(entry.read_text())
+    payload["kind"] = "tracking"
+    entry.write_text(json.dumps(payload))
+
+
 @pytest.mark.parametrize(
     "damage",
-    [_entry_garbled, _previous_format, _field_dropped, _locator_cleared],
-    ids=["unreadable", "other-format", "partial-schema", "identity-without-locator"],
+    [_entry_garbled, _previous_format, _field_dropped, _locator_cleared, _tracking_kind_malformed],
+    ids=[
+        "unreadable",
+        "other-format",
+        "partial-schema",
+        "identity-without-locator",
+        "malformed-tracking",
+    ],
 )
 def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: Callable[[Path], None]
 ) -> None:
-    """Restoring files cannot clear an entry recovery cannot use; checking the process and deleting it does."""
+    """Restoring files cannot clear an entry recovery cannot use; the refusal names it, and checking the process and deleting it does."""
+    entries: list[Path] = []
+
+    def recorded(entry: Path) -> None:
+        entries.append(entry)
+        damage(entry)
+
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
-        _scan_registry(damage=damage)(tmp_path, monkeypatch)
+        _scan_registry(damage=recorded)(tmp_path, monkeypatch)
 
     error = excinfo.value
+    assert f"registry entry {entries[0]} " in str(error)
     assert "Recovery cannot prove whether a process from this attempt is still alive." in str(error)
     assert error.remediation is not None
     assert error.remediation.startswith("Look up pid and pgid in the process_identity.json")
