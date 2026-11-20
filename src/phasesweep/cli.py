@@ -1122,7 +1122,8 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
             _experiment_dir(config),
         )
         return
-    payload = experiment_status(config)
+    ledger = validate_ledger(config)
+    payload = experiment_status(config, ledger=ledger)
     phases = payload.get("phases")
     if isinstance(phases, list) and any(
         isinstance(phase, dict)
@@ -1130,9 +1131,13 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         and phase.get("winner_is_published") is False
         for phase in phases
     ):
-        step = unpublished_winner_step(config)
+        step = unpublished_winner_step(config, ledger)
         if step is not None:
-            click.echo(f"# Winner retained but not published; {step}")
+            click.echo(
+                "# Winner retained but not published"
+                f"{'.' if step.cause is None else f'; {step.cause}'}"
+            )
+            click.echo(f"# fix: {step.fix}")
     click.echo(yaml.dump(payload, Dumper=_WinnerDumper, sort_keys=False).rstrip())
     raise_for_unusable_publication(
         str(payload["experiment"]),

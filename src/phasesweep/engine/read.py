@@ -34,6 +34,7 @@ from phasesweep.engine.fingerprints import (
     _recorded_config_matches,
 )
 from phasesweep.engine.ledger import (
+    ValidatedLedger,
     log_storage_read_failure,
     read_phase_studies,
     read_phase_trials,
@@ -784,6 +785,7 @@ def _read_status(
     trial_generation_id: str | None,
     comparison_experiment: Experiment | None,
     latest: bool = False,
+    ledger: ValidatedLedger | None = None,
 ) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
@@ -794,6 +796,8 @@ def _read_status(
     :param Experiment | None comparison_experiment: Optional current config for
         drift comparison.
     :param bool latest: Represent the captured current generation when its namespace exists.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or ``trial_generation_id`` is not a safe
@@ -801,7 +805,7 @@ def _read_status(
     :return tuple[EngineStatus, PublicationPointer]: The status payload and
         the single pointer resolution every fact in it came from.
     """
-    ledger = validate_ledger(experiment)
+    ledger = validate_ledger(experiment) if ledger is None else ledger
     current_generation_id, represented_generation_id, publication = _read_generation_selection(
         experiment, generation_id=generation_id, latest=latest
     )
@@ -1052,18 +1056,31 @@ def _cli_phase_payloads(
     return cli_phases
 
 
-def unpublished_winner_step(experiment: Experiment) -> str | None:
+@dataclass(frozen=True)
+class UnpublishedWinnerStep:
+    """How a retained winner gets published: the recorded cause when one blocks it, then the fix."""
+
+    cause: str | None
+    fix: str
+
+
+def unpublished_winner_step(
+    experiment: Experiment, ledger: ValidatedLedger
+) -> UnpublishedWinnerStep | None:
     """Give one publication remedy from recorded failures, suppressing it during live work.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
-    :return str | None: The recorded remedy or rerun instruction; none while busy or if storage is unreadable.
+    :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
+    :return UnpublishedWinnerStep | None: The recorded cause and remedy, or the rerun instruction; none while busy or if storage is unreadable.
     """
     if experiment_is_busy(experiment):
         return None
     if experiment.resolved_storage is None:
-        return "Rerun the same config to start the run again; storage: null keeps no completed trials between runs."
+        return UnpublishedWinnerStep(
+            None,
+            "Rerun the same config to start the run again; storage: null keeps no completed trials between runs.",
+        )
     try:
-        ledger = validate_ledger(experiment)
         studies = read_phase_studies(ledger)
     except StudyStorageUnavailableError:
         return None
@@ -1079,7 +1096,7 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
         ):
             cause = str(abort["cause"]).rstrip(".")
             advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
-            return f"Phase {phase.name!r}: {cause}. fix: {advice}"
+            return UnpublishedWinnerStep(f"Phase {phase.name!r}: {cause}.", advice)
         if _finished_trial_count(trials) < phase.n_trials:
             continue
         axis = repeat_axis(phase)
@@ -1089,11 +1106,21 @@ def unpublished_winner_step(experiment: Experiment) -> str | None:
             else bool(_rank_groups(trials, experiment, axis).groups)
         )
         if not eligible:
-            return f"Phase {phase.name!r} has no feasible winner. fix: {_no_feasible_remedy(experiment, trials, phase.name)}"
-    return "Rerun the same config to resume and publish; completed trials are kept."
+            return UnpublishedWinnerStep(
+                f"Phase {phase.name!r} has no feasible winner.",
+                _no_feasible_remedy(experiment, trials, phase.name),
+            )
+    return UnpublishedWinnerStep(
+        None, "Rerun the same config to resume and publish; completed trials are kept."
+    )
 
 
-def experiment_status(experiment: Experiment, *, generation_id: str | None = None) -> JsonObject:
+def experiment_status(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+    ledger: ValidatedLedger | None = None,
+) -> JsonObject:
     """Inspect study progress and phase winners without creating or modifying state.
 
     By default each phase uses its latest usable winner, falling back to the validated
@@ -1103,6 +1130,8 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :param str | None generation_id: Optional generation pin, disabling published fallback.
+    :param ValidatedLedger | None ledger: Handle the caller already validated for ``experiment``,
+        so one command validates once; validated here when omitted.
     :raises StudyStorageUnavailableError: No study has started at the configured root.
     :raises ArtifactRootConflictError: The root belongs to another ledger or experiment.
     :raises StudySchemaMismatchError: The stored study format is unsupported.
@@ -1116,6 +1145,7 @@ def experiment_status(experiment: Experiment, *, generation_id: str | None = Non
         trial_generation_id=None,
         comparison_experiment=None,
         latest=True,
+        ledger=ledger,
     )
     integrity = status["publication_integrity"]
     ledger_path = resolved_ledger_path(experiment)
