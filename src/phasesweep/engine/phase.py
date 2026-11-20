@@ -214,7 +214,8 @@ class _TrialLeftRunning(BaseException):
     """Keep a trial RUNNING, with no outcome, and stop the phase with ``error``.
 
     Optuna does not catch this BaseException subclass, so it commits no terminal
-    state. After workers drain, ``_run_phase`` raises ``error``. Stale recovery
+    state. After workers drain, ``_run_phase`` raises ``error``, unless a worker's
+    unconfirmed process cleanup outranks it. Stale recovery
     then settles the trial: it records an outcome that could not be persisted
     before committing the terminal state, or extracts finished training once
     the tracker that gave no answer about it answers.
@@ -805,16 +806,21 @@ class _PhaseExecution:
         """Record the first fatal objective or post-trial exception and stop peer launches.
 
         First-writer wins so the root failure is not replaced by secondary
-        peer-abort or persistence fallout. The original exception object keeps
-        its worker traceback for the post-optimize re-raise.
+        peer-abort or persistence fallout, except that unconfirmed process cleanup
+        replaces a trial left RUNNING: a leaked group may hold the GPU, so it must
+        stop all work until recovery whichever worker recorded first. The original
+        exception object keeps its worker traceback for the post-optimize re-raise.
 
         :param BaseException error: The fatal exception a worker observed.
         """
         with self.fatal_lock:
-            first = self.fatal_error is None
-            if first:
+            recorded = self.fatal_error is None or (
+                isinstance(self.fatal_error, _TrialLeftRunning)
+                and isinstance(error, UnsafeProcessCleanupError)
+            )
+            if recorded:
                 self.fatal_error = error
-        if first:
+        if recorded:
             log.error(
                 "phase=%s FATAL OBJECTIVE ERROR (%s): %s",
                 self.phase.name,
@@ -1610,11 +1616,15 @@ def _run_phase(
                     callbacks=[functools.partial(_after_trial, run)],
                     catch=(TrialExecutionError,),
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Drain workers before run reconciliation can reap their trials.
                 if phase.n_jobs > 1:
                     _await_worker_trials(run.workers, study)
-                raise
+                if not isinstance(exc, _TrialLeftRunning):
+                    raise
+                # A trial left RUNNING stops the phase with whichever recorded fatal
+                # error outranks it once every worker has recorded its own.
+                run.record_fatal(exc)
         finally:
             # Snapshot CSV on every exit without masking the optimize error.
             with contextlib.suppress(Exception):

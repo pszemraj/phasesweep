@@ -1385,6 +1385,48 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
     _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
 
 
+@pytest.mark.parametrize("first", ["cleanup", "left-running"])
+def test_unconfirmed_cleanup_outranks_a_parallel_trial_left_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """Under n_jobs above 1, a worker's unconfirmed cleanup stops the run whichever worker records first.
+
+    One worker leaves its trial RUNNING for an unreadable tracker and its stop reaches the
+    optimize loop first; the other cannot confirm its trainer group gone. The leaked group
+    may hold the GPU, so the cleanup error is what the run raises.
+    """
+    from phasesweep.engine.errors import tracker_unreadable
+    from phasesweep.errors import UnsafeProcessCleanupError
+
+    experiment = make_experiment(persistent=tmp_path, n_trials=3, n_jobs=2)
+    cleanup_recorded = threading.Event()
+    left_running_raised = threading.Event()
+
+    def stubbed_objective(run: phase_module._PhaseExecution, trial: optuna.Trial) -> float:
+        if trial.number == 0:
+            if first == "cleanup":
+                assert cleanup_recorded.wait(10)
+            left_running = phase_module._TrialLeftRunning(tracker_unreadable("tracker down"))
+            run.record_fatal(left_running)
+            left_running_raised.set()
+            raise left_running
+        cleanup_error = UnsafeProcessCleanupError("trainer group may still be alive")
+        if first == "cleanup":
+            # The launch path records unconfirmed cleanup before it releases the lease.
+            run.record_fatal(cleanup_error)
+            cleanup_recorded.set()
+        assert left_running_raised.wait(10)
+        # The trial left RUNNING finishes first, so the optimize loop surfaces it.
+        time.sleep(0.2)
+        raise cleanup_error
+
+    monkeypatch.setattr(phase_module, "_execute_objective", stubbed_objective)
+    with pytest.raises(UnsafeProcessCleanupError, match="trainer group may still be alive"):
+        run_experiment(experiment)
+    states = {trial.number: trial.state.name for trial in phase_trials(experiment)}
+    assert states[1] == "FAIL"
+
+
 def _in_memory_wandb_sweep(
     tmp_path: Path, tracker: SwitchableWandb, *, n_trials: int, deny_at_launch: int
 ) -> tuple[Experiment, Path]:
