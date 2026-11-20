@@ -34,7 +34,12 @@ from phasesweep.engine.state import (
 )
 from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
 from tests.conftest import make_experiment
-from tests.experiments import anchored_phase, project_directory, write_anchored_config
+from tests.experiments import (
+    anchored_phase,
+    phase_payload,
+    project_directory,
+    write_anchored_config,
+)
 from tests.ledger_fixtures import materialize
 
 _CWD_SENTENCE = "The trainer working directory follows the directory phasesweep runs from"
@@ -92,6 +97,40 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
         phases=[{**anchored_phase(4), "name": "wider"}],
     )
     assert set(run_experiment(load_experiment(config))) == {"wider"}
+
+
+def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path: Path) -> None:
+    """A changed phase that another inherits reruns by renaming both, and the fix line names the dependent."""
+    project = project_directory(tmp_path)
+    fields: dict[str, object] = {
+        "workdir": "runs",
+        "storage": "journal:///study.journal",
+        "execution": {"cwd": "."},
+    }
+    child = phase_payload(
+        name="q", inherits=["p"], search_space={"y": {"type": "int", "low": 0, "high": 3}}
+    )
+    config = write_anchored_config(
+        project / "exp.yaml", phases=[anchored_phase(3), child], **fields
+    )
+    run_experiment(load_experiment(config))
+    write_anchored_config(config, phases=[anchored_phase(4), child], **fields)
+
+    with pytest.raises(StudyFingerprintMismatchError, match="::p'") as caught:
+        run_experiment(load_experiment(config))
+
+    assert caught.value.remediation is not None
+    assert (
+        "give this phase and each phase that inherits it (`q`) a new `name`"
+        in caught.value.remediation
+    )
+
+    renamed = [
+        {**anchored_phase(4), "name": "wider"},
+        {**child, "name": "after", "inherits": ["wider"]},
+    ]
+    write_anchored_config(config, phases=renamed, **fields)
+    assert set(run_experiment(load_experiment(config))) == {"wider", "after"}
 
 
 def test_refusal_names_the_trainer_cwd_when_the_same_config_runs_from_another_directory(

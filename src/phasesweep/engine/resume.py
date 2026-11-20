@@ -167,7 +167,7 @@ def _reject_bound_descendant_topups(
         to its published winner: it holds a stored fingerprint and at least
         one trial.
     """
-    for index, phase in experiment.phases_from(from_phase):
+    for _, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
         if study is None:
             continue
@@ -181,17 +181,13 @@ def _reject_bound_descendant_topups(
             # deterministic selection; its unused slots are not a top-up.
             continue
 
-        reached = {phase.name}
-        for candidate in experiment.phases[index + 1 :]:
-            if any(parent in reached for parent in candidate.inherits):
-                reached.add(candidate.name)
         # Only a populated descendant has consumed this winner. The fingerprint
         # is stamped before resource preflight, so a child that failed
         # preflight holds a fingerprint and no trials, and _verify_fingerprint
         # rebinds such an empty study to the new inherited config.
         bound = [
             name
-            for name in sorted(reached - {phase.name})
+            for name in sorted(experiment.phases_inheriting(phase.name))
             if (dependent := existing_studies.get(name)) is not None
             and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
             and dependent.get_trials(deepcopy=False)

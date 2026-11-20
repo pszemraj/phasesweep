@@ -212,13 +212,6 @@ _RESTORE_OR_NEW_STUDY_STEP = (
     f"Restore the recorded value(s) to continue this study, or {FRESH_STUDY}; "
     "the old study stays readable with its original config."
 )
-#: A change confined to one phase leaves the other phases' studies valid, and a phase's study
-#: is named after it, so a new phase name reruns that phase alone.
-_RESTORE_OR_RENAME_PHASE_STEP = (
-    "Restore the recorded value(s) to continue this study, or give this phase a new `name` "
-    "(and update any `inherits` that names it) to rerun only this phase. To rerun every "
-    f"phase, {FRESH_STUDY}."
-)
 _CWD_FOLLOWS_INVOCATION = (
     "The trainer working directory follows the directory phasesweep runs from when "
     "execution.cwd is unset; run from the original directory or set execution.cwd in the "
@@ -315,6 +308,32 @@ def _describe_changed_keys(changes: list[tuple[str, object, object]]) -> str:
     return f"Changed: {'; '.join(shown)}."
 
 
+def _restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
+    """Offer the rename that reruns a phase whose own keys changed, beside restoring them.
+
+    A phase's study is named after the phase, so a new name starts a new study and leaves
+    the other phases' studies valid. A phase that inherits the renamed one records that
+    name in its own study identity, so it needs a new name as well.
+
+    :param Experiment experiment: Experiment whose phases may inherit ``phase``.
+    :param Phase phase: Phase whose own configuration differs from its study's.
+    :return str: The operator's step.
+    """
+    dependents = experiment.phases_inheriting(phase.name)
+    if dependents:
+        named = ", ".join(f"`{name}`" for name in dependents)
+        rename = (
+            f"give this phase and each phase that inherits it ({named}) a new `name`, "
+            "updating every `inherits` to match, to rerun only those phases"
+        )
+    else:
+        rename = "give this phase a new `name` to rerun only this phase"
+    return (
+        f"Restore the recorded value(s) to continue this study, or {rename}. "
+        f"To rerun every phase, {FRESH_STUDY}."
+    )
+
+
 def _stamp_fingerprint(study: optuna.Study, fingerprint: str, payload: JsonObject) -> None:
     """Record a study's fingerprint beside the payload it digests.
 
@@ -381,7 +400,7 @@ def _verify_fingerprint(
         if not changes:
             way_forward = NEW_STUDY_STEP
         elif all(path.startswith("phase.") for path, _old, _new in changes):
-            way_forward = _RESTORE_OR_RENAME_PHASE_STEP
+            way_forward = _restore_or_rename_step(experiment, phase)
         else:
             way_forward = _RESTORE_OR_NEW_STUDY_STEP
         raise StudyFingerprintMismatchError(

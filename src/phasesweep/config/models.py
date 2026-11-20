@@ -1156,6 +1156,23 @@ class Experiment(_Frozen):
         """
         return next(phase for phase in self.phases if phase.name == name)
 
+    def phases_inheriting(self, name: str) -> tuple[str, ...]:
+        """Name every phase that inherits ``name``, directly or through another phase.
+
+        A phase inherits only phases declared before it, so one pass in declaration order
+        reaches every dependent.
+
+        :param str name: Phase whose dependents are wanted.
+        :return tuple[str, ...]: Dependent phase names in declaration order, without ``name``.
+        """
+        reached = {name}
+        dependents = []
+        for candidate in self.phases:
+            if candidate.name not in reached and reached.intersection(candidate.inherits):
+                reached.add(candidate.name)
+                dependents.append(candidate.name)
+        return tuple(dependents)
+
     def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
         """Yield the phases a run resuming at ``from_phase`` reaches, in order.
 
