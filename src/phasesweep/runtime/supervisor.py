@@ -135,11 +135,41 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
     return cmd, env, cwd
 
 
+def _has_exited(pid: int, state: bytes) -> bool:
+    """Return whether a process whose ``stat`` reads ``state`` can no longer run.
+
+    This is a stdlib-only copy of ``phasesweep.runtime.reaper._has_exited``,
+    because the guardian runs under ``python -I -S`` without the package; change
+    both together. ``X`` always means exited. ``Z`` means exited only once
+    ``/proc/<pid>/task`` lists no thread but the leader's own: a leader that
+    ends with ``pthread_exit`` reads ``Z`` while its other threads keep running.
+    An exiting thread leaves that listing without ever reading ``Z``, so the
+    other entries' own states are not read. A vanished entry has exited; an
+    unreadable listing keeps the lease.
+
+    :param int pid: Process whose ``stat`` was read.
+    :param bytes state: Its state field from ``/proc/<pid>/stat``.
+    :return bool: Whether every thread of the process has exited.
+    """
+    if state == b"X":
+        return True
+    if state != b"Z":
+        return False
+    try:
+        with os.scandir(f"/proc/{pid}/task") as tasks:
+            return all(task.name == str(pid) for task in tasks)
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError:
+        return False
+
+
 def _trainer_group_alive(pgid: int) -> bool:
-    """Return whether ``pgid`` still has a nonterminal member.
+    """Return whether ``pgid`` still has a member that can run.
 
     ``killpg(..., 0)`` is the primary existence probe. On Linux a procfs scan
-    checks for nonterminal group members. Unreadable possible members keep the lease.
+    checks for group members that have not exited, by :func:`_has_exited`.
+    Unreadable possible members keep the lease.
 
     :param int pgid: Trainer process-group identifier.
     :return bool: ``True`` while a live member exists or absence is uncertain.
@@ -186,7 +216,7 @@ def _trainer_group_alive(pgid: int) -> bool:
             if member_pgid != pgid:
                 continue
             found_member = True
-            if state not in {b"Z", b"X"}:
+            if not _has_exited(int(entry.name), state):
                 return True
 
     # A group that exists but had no readable member, or a scan with missing

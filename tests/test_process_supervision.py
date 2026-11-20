@@ -1433,13 +1433,18 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
     unreadable_pgid: int,
     expected: tuple[tuple[int, ...], bool, bool],
 ) -> None:
-    """Terminal Z/X members stay conclusive despite unreadable unrelated processes."""
+    """Exited Z/X members stay conclusive despite unreadable unrelated processes.
+
+    The ``Z`` member lists only its own thread, as a dead, unreaped zombie does.
+    """
     monkeypatch.setattr("phasesweep.runtime.reaper.sys", SimpleNamespace(platform="linux"))
     real_iterdir = Path.iterdir
 
     def fake_iterdir(path: Path):
         if path == Path("/proc"):
             return iter((Path("/proc/11"), Path("/proc/22")))
+        if path == Path("/proc/11/task"):
+            return iter((Path("/proc/11/task/11"),))
         return real_iterdir(path)
 
     def fake_stat(path: Path) -> tuple[_ProcStat | None, bool]:
@@ -1470,7 +1475,10 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     unreadable_pgid: int,
     expected_alive: bool,
 ) -> None:
-    """The stdlib guardian releases Z/X groups only with target-scoped complete evidence."""
+    """The stdlib guardian releases Z/X groups only with target-scoped complete evidence.
+
+    The ``Z`` member lists only its own thread, as a dead, unreaped zombie does.
+    """
     monkeypatch.setattr(supervisor, "sys", SimpleNamespace(platform="linux"))
 
     real_open = builtins.open
@@ -1485,7 +1493,11 @@ def test_guardian_proc_scan_ignores_only_proven_unrelated_entries(
     monkeypatch.setattr("phasesweep.runtime.supervisor.os.killpg", lambda *_args: None)
     entries = MagicMock()
     entries.__iter__.return_value = (SimpleNamespace(name="11"), SimpleNamespace(name="22"))
-    monkeypatch.setattr("phasesweep.runtime.supervisor.os.scandir", Mock(return_value=entries))
+    tasks = MagicMock()
+    tasks.__enter__.return_value = tasks
+    tasks.__iter__.return_value = (SimpleNamespace(name="11"),)
+    listings = {"/proc": entries, "/proc/11/task": tasks}
+    monkeypatch.setattr("phasesweep.runtime.supervisor.os.scandir", listings.__getitem__)
     monkeypatch.setattr("phasesweep.runtime.supervisor.os.getpgid", lambda _pid: unreadable_pgid)
     monkeypatch.setattr(builtins, "open", fake_open)
 
