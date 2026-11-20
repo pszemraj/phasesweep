@@ -39,6 +39,7 @@ from phasesweep.engine.trial import (
     launch_trial,
     prepare_trainer_input,
 )
+from phasesweep.evidence.evaluation import MlflowObjectiveMissingError
 from phasesweep.evidence.models import JsonEnvelopeExtractor, WandbSummaryRequiredGate
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
@@ -771,6 +772,32 @@ def test_a_failure_without_an_environment_cause_does_not_use_up_the_phase_hint(
 
     (hint,) = _environment_hints(caplog)
     assert hint.startswith("[p/trial_1] the trainer exited with code 1 under ")
+
+
+def test_missing_managed_objective_warns_once_per_phase_and_each_reason_keeps_the_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one-run hint is logged for a phase's first trial that lacks its managed objective; every reason stays the key diagnostic."""
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+    diagnostic = "MLflow run finished without metric 'loss'; available metric keys: ['other']."
+
+    def missing_objective(*_args: object, **_kwargs: object) -> float:
+        raise MlflowObjectiveMissingError(diagnostic)
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", missing_objective)
+    experiment = make_experiment()
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        results = [
+            _exit_code_result(tmp_path, experiment, "p", 0, trial_id=0),
+            _exit_code_result(tmp_path, experiment, "p", 0, trial_id=1),
+            _exit_code_result(tmp_path, experiment, "other", 0, trial_id=0),
+        ]
+
+    assert [result.failure_reason for result in results] == [f"metric extractor: {diagnostic}"] * 3
+    hints = [r.getMessage() for r in caplog.records if "logged under another key" in r.getMessage()]
+    assert [hint.split()[0] for hint in hints] == ["[p/trial_0]", "[other/trial_0]"]
+    assert all("read MLFLOW_RUN_ID before any MLflow call" in hint for hint in hints)
 
 
 @pytest.mark.parametrize(

@@ -47,8 +47,9 @@ _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
 # Time a capture or find keeps for its last poll and its report before the parent stops it.
 _REPORT_SECONDS = 5.0
 # Worker response statuses; "unavailable" reports a request the tracker gave no answer to,
-# and "unknown" a creation that may have taken effect.
-_STATUSES = frozenset({"ok", "error", "unavailable", "unknown"})
+# "unknown" a creation that may have taken effect, and "objective_missing" a finished managed
+# run without the configured objective metric.
+_STATUSES = frozenset({"ok", "error", "unavailable", "unknown", "objective_missing"})
 # Server error codes that answer the request about its subject: the experiment or run is gone,
 # or a value was rejected. Every other code says the tracker could not serve the request.
 _ANSWERED_CODES = frozenset({"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", "INVALID_PARAMETER_VALUE"})
@@ -78,6 +79,13 @@ class OperationUnavailableError(OperationRejectedError):
 
     No request reached a server that acted on it, so it is a rejection to every caller;
     an evidence read additionally learns nothing about its run.
+    """
+
+
+class ManagedObjectiveMissingError(ValueError):
+    """A finished managed run lacks the configured objective metric.
+
+    The trainer logged the objective under another key, into another run, or not at all.
     """
 
 
@@ -326,6 +334,8 @@ def request_operation(
         or trusted, or it reported that a creation may have taken effect.
     :raises OperationUnavailableError: The worker reported that the tracker gave no answer.
     :raises OperationRejectedError: The worker reported that the request failed.
+    :raises ManagedObjectiveMissingError: The worker reported that a finished managed run lacks
+        the configured objective metric.
     :return JsonObject: Successful public-client response.
     """
     try:
@@ -364,6 +374,8 @@ def request_operation(
         ) from exc
     if status == "error":
         raise OperationRejectedError(message)
+    if status == "objective_missing":
+        raise ManagedObjectiveMissingError(message)
     if status == "unavailable":
         raise OperationUnavailableError(message)
     raise OperationOutcomeUnknownError(message)
@@ -649,13 +661,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
                     and MlflowExtractor.model_validate(query["objective"]).metric_key
                     not in run.data.metrics
                 ):
-                    lacking += (
-                        " Check whether the objective was logged under another key or logging "
-                        "went to another run. Log the configured metric key into the supplied "
-                        "run; after end_run() or another start_run(), resume its saved ID. "
-                        "Give a logger the supplied run ID: read MLFLOW_RUN_ID before any "
-                        "MLflow call, or use mlflow.active_run().info.run_id while the run is active."
-                    )
+                    raise ManagedObjectiveMissingError(lacking)
                 raise ValueError(lacking)
             observations: dict[str, Observation] = {}
             for key in keys:
@@ -865,6 +871,8 @@ def main(argv: list[str] | None = None) -> int:
         }
     except OperationOutcomeUnknownError as exc:
         response = {"status": "unknown", "message": str(exc)}
+    except ManagedObjectiveMissingError as exc:
+        response = {"status": "objective_missing", "message": str(exc)}
     except (ValueError, TimeoutError) as exc:
         response = {"status": "error", "message": str(exc)}
     except KeyboardInterrupt:

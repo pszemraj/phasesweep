@@ -19,6 +19,7 @@ from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 from phasesweep.tracking.mlflow import (
+    ManagedObjectiveMissingError,
     OperationOutcomeUnknownError,
     OperationRejectedError,
     OperationUnavailableError,
@@ -1094,7 +1095,11 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
 
     import mlflow
 
-    from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
+    from phasesweep.evidence.evaluation import (
+        MlflowObjectiveMissingError,
+        TrialContext,
+        _capture_mlflow,
+    )
     from phasesweep.runtime import process
     from phasesweep.tracking import mlflow as worker
     from phasesweep.tracking import session
@@ -1130,26 +1135,33 @@ def test_finished_without_a_required_metric_reaches_the_trial_as_the_extractor_e
         return process.ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
 
     monkeypatch.setattr(process, "run_supervised", run_in_process)
-    with pytest.raises(ExtractorError) as failure:
+    with pytest.raises(MlflowObjectiveMissingError) as failure:
         _capture_mlflow(ctx, deadline=None)
-    assert str(failure.value).startswith(
+    assert str(failure.value) == (
         "MLflow run finished without metric 'eval/loss'; "
         "available metric keys: ['accuracy', 'cost']."
     )
-    assert "logged under another key or logging went to another run" in str(failure.value)
-    assert len(str(failure.value).splitlines()) == 1
 
 
-def test_managed_missing_objective_explains_the_one_run_contract(clock: ManualClock) -> None:
-    """A missing managed objective gives actionable key/run advice on one line."""
-    message = _finished_failure(clock, metrics={"other": 0.9})
-    lines = message.splitlines()
-    assert len(lines) == 1
-    assert "logged under another key or logging went to another run" in message
-    assert "Log the configured metric key" in message
-    assert "resume its saved ID" in message
-    assert "read MLFLOW_RUN_ID before any MLflow call" in message
-    assert "mlflow.active_run().info.run_id" in message
+def test_managed_missing_objective_is_a_diagnostic_without_advice(clock: ManualClock) -> None:
+    """A missing managed objective names the key and the keys the run has, on one line, and carries no advice."""
+    client = _states_client(mlflow_binding(), "FINISHED", metrics={"other": 0.9})
+    with pytest.raises(ManagedObjectiveMissingError) as failure:
+        _capture(client, _capture_request(mlflow_binding()))
+    assert str(failure.value) == (
+        "MLflow run finished without metric 'loss'; available metric keys: ['other']."
+    )
+
+
+def test_missing_param_in_a_managed_run_that_has_its_objective_is_a_plain_failure(
+    clock: ManualClock,
+) -> None:
+    """A managed run that logged the objective but lacks a required param is not an objective-missing case."""
+    gate = MlflowRequiredGate(type="mlflow_required", params=["lr"])
+    client = _states_client(mlflow_binding(), "FINISHED", metrics={"loss": 0.1})
+    with pytest.raises(ValueError, match="finished without param 'lr'") as failure:
+        _capture(client, _capture_request(mlflow_binding(), gates=[gate]))
+    assert not isinstance(failure.value, ManagedObjectiveMissingError)
 
 
 def test_trainer_owned_missing_objective_keeps_the_key_diagnostic(clock: ManualClock) -> None:
@@ -1560,6 +1572,12 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
             {"status": "unknown", "message": "may have taken effect"},
             OperationOutcomeUnknownError,
         ),
+        (
+            0,
+            False,
+            {"status": "objective_missing", "message": "no objective"},
+            ManagedObjectiveMissingError,
+        ),
         (1, False, {}, OperationOutcomeUnknownError),
         (0, False, {"status": "other"}, OperationOutcomeUnknownError),
         (0, True, {}, TimeoutError),
@@ -1588,6 +1606,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
         "error",
         "unavailable",
         "unknown",
+        "objective-missing",
         "crashed",
         "invalid-status",
         "timed-out",
@@ -1633,7 +1652,7 @@ def test_worker_outcomes_reach_the_controller_as_distinct_exceptions(
                 caught.value if expected is type(response) else caught.value.__cause__
             ) is response
             assert "private" not in str(caught.value)
-    assert seen == [frozenset({"ok", "error", "unavailable", "unknown"})]
+    assert seen == [frozenset({"ok", "error", "unavailable", "unknown", "objective_missing"})]
 
 
 @pytest.mark.parametrize("failure", ["target", "attempt"])

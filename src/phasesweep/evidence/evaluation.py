@@ -151,6 +151,10 @@ class EvidenceUnreadableError(ExtractorError):
     """
 
 
+class MlflowObjectiveMissingError(ExtractorError):
+    """Raised when a finished managed MLflow run lacks the configured objective metric."""
+
+
 @contextmanager
 def _trial_json_read_errors(target: Path, *, noun: str) -> Iterator[None]:
     """Translate file-read and JSON-decoding failures into extractor diagnostics.
@@ -625,10 +629,12 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     :raises DeadlineExceededError: The execution deadline stopped the capture.
     :raises EvidenceUnreadableError: MLflow gave no answer: it was unreachable, refused
         access, lacked its SDK, timed out, or the reader's outcome is unknown.
+    :raises MlflowObjectiveMissingError: A finished managed run lacks the objective metric.
     :raises ExtractorError: Binding or remote evidence cannot be accepted.
     """
     from phasesweep.evidence.mlflow import validate_capture
     from phasesweep.tracking.mlflow import (
+        ManagedObjectiveMissingError,
         OperationOutcomeUnknownError,
         OperationUnavailableError,
         request_operation,
@@ -676,6 +682,8 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
         raise EvidenceUnreadableError(str(exc)) from exc
     except (OperationUnavailableError, OperationOutcomeUnknownError) as exc:
         raise EvidenceUnreadableError(str(exc)) from exc
+    except ManagedObjectiveMissingError as exc:
+        raise MlflowObjectiveMissingError(str(exc)) from exc
     except (OSError, ValueError, RuntimeError) as exc:
         if isinstance(exc, UnsafeProcessCleanupError):
             raise

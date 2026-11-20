@@ -44,6 +44,7 @@ from phasesweep.evidence.evaluation import (
     EvidenceUnreadableError,
     ExtractorError,
     GateResult,
+    MlflowObjectiveMissingError,
     TrialContext,
     evaluate_gates,
     locate_objective_position,
@@ -425,6 +426,29 @@ def _warn_narrowed_environment_exit(
         experiment.execution.inherit_env,
         ", ".join(admitted),
         "" if stderr_line is None else f' Its last stderr line was "{stderr_line}".',
+    )
+
+
+def _warn_managed_objective_missing(
+    *, experiment: Experiment, phase_name: str, trial_id: int
+) -> None:
+    """Explain the managed one-run contract on a phase's first trial that lacks its objective.
+
+    :param Experiment experiment: Experiment used for the warning identity.
+    :param str phase_name: Phase used for the warning identity.
+    :param int trial_id: Trial whose managed run finished without the objective metric.
+    """
+    _warn_once(
+        log,
+        ("mlflow-objective-missing", experiment.experiment, phase_name),
+        "[%s/trial_%d] the managed MLflow run finished without the objective metric. Check "
+        "whether the objective was logged under another key or logging went to another run. "
+        "Log the configured metric key into the supplied run; after end_run() or another "
+        "start_run(), resume its saved ID. Give a logger the supplied run ID: read "
+        "MLFLOW_RUN_ID before any MLflow call, or use mlflow.active_run().info.run_id while "
+        "the run is active. This hint is shown once per phase.",
+        phase_name,
+        trial_id,
     )
 
 
@@ -822,6 +846,12 @@ def extract_trial_result(
                 else "failed",
                 exc,
             )
+            if isinstance(exc, MlflowObjectiveMissingError):
+                _warn_managed_objective_missing(
+                    experiment=experiment,
+                    phase_name=executed.ctx.phase,
+                    trial_id=executed.ctx.trial_id,
+                )
             return _failed_trial(
                 rc=rc,
                 duration=duration,
