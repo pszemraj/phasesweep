@@ -109,7 +109,7 @@ def test_repeat_summary_includes_losing_infeasible_and_partial_groups(
     assert partial.group == 7 and partial.n == 1 and partial.expected == 3
     assert partial.mean == partial.min == partial.max == 7.0
     assert partial.sd is None and partial.aggregate is None and not partial.eligible
-    rendered = _render_trial_tables(tables, persisted=True)
+    rendered = _render_trial_tables(tables, csv_root=None)
     assert "Repeat groups (statistics include infeasible measured members):" in rendered
     assert "n/expected" in rendered and "aggregate" in rendered and "eligible" in rendered
     assert "3/3" in rendered and "1/3" in rendered
@@ -127,7 +127,7 @@ def test_repeat_table_explains_group_numbers_while_members_arrive(tmp_path: Path
         (group,) = table.groups
         assert group.params == {"x": 1} and group.group == seed
         assert all(row["repeat_group"] == seed for row in table.rows)
-        rendered = _render_trial_tables(tables, persisted=True)
+        rendered = _render_trial_tables(tables, csv_root=None)
         assert f"{seed + 1}/2" in rendered
         assert "highest member trial number so far" in rendered
         assert "can change as members arrive" in rendered
@@ -195,6 +195,6 @@ def test_repeat_observed_means_report_their_own_contributor_counts(tmp_path: Pat
     assert group.n == 3
     assert group.observed == {"cost": 2.0, "heldout": 0.7}
     assert group.observed_n == {"cost": 1, "heldout": 2}
-    rendered = _render_trial_tables(tables, persisted=True)
+    rendered = _render_trial_tables(tables, csv_root=None)
     assert "observed:heldout" in rendered and "observed_n:heldout" in rendered
     assert "observed:cost" in rendered and "observed_n:cost" in rendered

@@ -1047,11 +1047,13 @@ def _interrupted_running_comment(running: int) -> str:
     )
 
 
-def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
+def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
     """Render every phase's trial table under a header that names the winner marks' source.
 
     :param TrialTables tables: The tables one publication resolution produced.
-    :param bool persisted: Whether the experiment keeps its trials in a ledger.
+    :param Path | None csv_root: The artifact directory of an experiment that keeps no ledger,
+        where each phase's ``trials.csv`` is the only record of its trials; ``None`` when a
+        ledger holds them.
     :return str: The header line, then each phase's heading and table.
     """
     represented = tables.represented_generation_id or tables.published_generation_id
@@ -1071,8 +1073,11 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     for table in tables.phases:
         if not table.available:
             note = "trial data unavailable"
-        elif not persisted:
-            note = "no trials recorded: storage is null"
+        elif csv_root is not None:
+            snapshot = csv_root / table.phase / "trials.csv"
+            note = "storage: null keeps no trial ledger"
+            if snapshot.is_file():
+                note += f"; the last run's trials are in {snapshot}"
         elif not table.rows:
             note = "no trials yet"
         else:
@@ -1165,7 +1170,11 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
         if running and not experiment_is_busy(config):
             click.echo(_interrupted_running_comment(running))
-        click.echo(_render_trial_tables(tables, persisted=config.persistent))
+        click.echo(
+            _render_trial_tables(
+                tables, csv_root=None if config.persistent else _experiment_dir(config)
+            )
+        )
         raise_for_unusable_publication(
             tables.experiment,
             tables.publication_integrity,

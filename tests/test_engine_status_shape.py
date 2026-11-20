@@ -305,6 +305,24 @@ def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
     assert payload["ledger_path"] is None
 
 
+def test_in_memory_trial_table_points_at_the_last_runs_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With ``storage: null`` the trial table names the ``trials.csv`` the last run wrote."""
+    experiment = make_experiment(workdir=tmp_path / "runs", trial_command="echo x=0.5 {overrides}")
+    run_experiment(experiment)
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+
+    assert invoke_cli_boundary(["status", str(config), "--trials"], monkeypatch) == 0
+
+    snapshot = tmp_path / "runs" / experiment.experiment / "p" / "trials.csv"
+    assert snapshot.is_file()
+    assert (
+        f"(storage: null keeps no trial ledger; the last run's trials are in {snapshot})"
+        in capsys.readouterr().out
+    )
+
+
 def test_trial_table_prints_float_params_of_10000_or_more_in_full(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
