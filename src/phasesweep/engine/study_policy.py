@@ -61,8 +61,10 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import (
     NEW_STUDY_STEP,
+    OTHER_FORMAT_STEP,
     RERUN_CLEANUP_RECOVERY,
     OperatorAction,
+    format_mismatch,
 )
 from phasesweep.runtime.json import JsonObject, json_text_map
 
@@ -366,10 +368,10 @@ def _validate_study_schema(study: optuna.Study) -> None:
         return
 
     trial_numbers = [trial.number for trial in trials]
-    detail = "missing" if version is None else repr(version)
     raise StudySchemaMismatchError(
-        f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
-        f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}.",
+        f"Study {study.study_name!r} {format_mismatch(version, STUDY_SCHEMA_VERSION)}. "
+        f"Affected trial numbers: {trial_numbers}.",
+        remediation=OTHER_FORMAT_STEP,
     )
 
 

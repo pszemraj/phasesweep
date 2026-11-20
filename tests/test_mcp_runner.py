@@ -757,7 +757,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     # Unsupported state routes to starting fresh, rather than to archiving
     # this study and continuing under the current one.
     remediation = terminal["failure"]["remediation"]
-    assert "start a fresh study by setting a new `experiment` name" in remediation
+    assert "to start a fresh study" in remediation
 
 
 @pytest.mark.integration

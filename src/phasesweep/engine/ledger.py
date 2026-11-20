@@ -66,7 +66,13 @@ from phasesweep.engine.state import (
     _recovered_trial_state,
     _study_schema_supported,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import (
+    OTHER_FORMAT_LEDGER_STEP,
+    OperatorAction,
+    PhaseSweepError,
+    format_found,
+    format_reads,
+)
 from phasesweep.runtime.files import fsync_directory, journal_file_path, try_flock, unlock_file
 from phasesweep.runtime.shutdown import defer_shutdown_signals
 
@@ -635,14 +641,11 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         if not _study_schema_supported(version, has_trials)
     ]
     if unsupported:
-        detail = ", ".join(
-            f"{name!r} ({'unmarked' if version is None else 'format ' + repr(version)})"
-            for name, version in unsupported
-        )
+        detail = ", ".join(f"{name!r} {format_found(version)}" for name, version in unsupported)
         raise StudySchemaMismatchError(
             "The selected local storage ledger contains unsupported PhaseSweep study "
-            f"state: {detail}; this checkout reads format {STUDY_SCHEMA_VERSION}. "
-            "Nothing was written.",
+            f"state: {detail}; {format_reads(STUDY_SCHEMA_VERSION)}. Nothing was written.",
+            remediation=OTHER_FORMAT_LEDGER_STEP,
         )
 
 

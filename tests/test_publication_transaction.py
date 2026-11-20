@@ -1161,7 +1161,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     summary = yaml.safe_load(summary_path.read_text())
     if tamper == "schema_version":
         summary["schema_version"] = 3
-        semantic_error = f"unsupported summary schema_version 3; this checkout reads {GENERATION_SUMMARY_SCHEMA_VERSION}"
+        semantic_error = f"the summary uses format 3; this PhaseSweep reads format {GENERATION_SUMMARY_SCHEMA_VERSION}"
     elif tamper == "phase_plan":
         summary["phase_plan"][0]["name"] = "q"
         semantic_error = "phase plan"

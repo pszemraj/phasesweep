@@ -28,7 +28,7 @@ from phasesweep.engine.state import (
     Winner,
     constraint_attr,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OTHER_FORMAT_STEP, OperatorAction, format_mismatch
 from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
@@ -135,11 +135,13 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         )
 
     if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
+        found = format_mismatch(
+            provenance.get("schema_version"), EVIDENCE_PROVENANCE_SCHEMA_VERSION
+        )
         raise TrialEvidenceMissingError(
-            f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence in format "
-            f"{provenance.get('schema_version')!r}; this checkout reads format "
-            f"{EVIDENCE_PROVENANCE_SCHEMA_VERSION}.",
+            f"{subject} has {OBJECTIVE_PROVENANCE_ATTR!r} evidence that {found}.",
             action=OperatorAction.FRESH_NAMESPACE,
+            remediation=OTHER_FORMAT_STEP,
         )
     extractor = provenance.get("extractor")
     if not isinstance(extractor, Mapping):

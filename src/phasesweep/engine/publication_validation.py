@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     _parse_winner_source,
     _validate_observed_block,
 )
+from phasesweep.errors import OTHER_FORMAT_STEP, format_mismatch
 from phasesweep.runtime.files import file_sha256
 from phasesweep.runtime.json import JsonObject, json_object
 
@@ -231,14 +232,16 @@ def _validate_generation_manifest(
         semantics, and every winner exactly as this validation read it.
     """
 
-    def _fail(reason: str) -> PublicationIntegrityError:
+    def _fail(reason: str, *, remediation: str | None = None) -> PublicationIntegrityError:
         """Build one uniformly labeled manifest-validation error.
 
         :param str reason: Specific validation failure being reported.
+        :param str | None remediation: Concrete operator step when the failure has one.
         :return PublicationIntegrityError: Error naming the generation and reason.
         """
         return PublicationIntegrityError(
-            f"Generation {generation_id!r} manifest validation failed: {reason}"
+            f"Generation {generation_id!r} manifest validation failed: {reason}",
+            remediation=remediation,
         )
 
     def _permission_fail(reason: str) -> PublicationAccessError:
@@ -252,10 +255,8 @@ def _validate_generation_manifest(
         )
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
-        raise _fail(
-            f"unsupported summary schema_version {summary.get('schema_version')!r}; "
-            f"this checkout reads {GENERATION_SUMMARY_SCHEMA_VERSION}"
-        )
+        found = format_mismatch(summary.get("schema_version"), GENERATION_SUMMARY_SCHEMA_VERSION)
+        raise _fail(f"the summary {found}", remediation=OTHER_FORMAT_STEP)
     metric = summary.get("metric")
     if (
         not isinstance(metric, Mapping)

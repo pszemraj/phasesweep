@@ -97,6 +97,50 @@ NEW_STUDY_STEP = (
     "with its original config."
 )
 
+#: The way out of data another PhaseSweep release wrote, for an artifact root or a study.
+OTHER_FORMAT_STEP = (
+    "Set a new `experiment` name in the config to start a fresh study (with `storage: auto`, "
+    "a new `workdir` also works). The PhaseSweep release that wrote the old data still reads it."
+)
+
+#: The same for a ledger, which holds every experiment's studies: under an explicit `storage` a
+#: new `experiment` name leaves the unsupported study in place, and a new ledger alone leaves the
+#: artifact root bound to the old one, so both must change.
+OTHER_FORMAT_LEDGER_STEP = (
+    "Set a new `experiment` name and a new `storage` ledger in the config to start a fresh "
+    "study (with `storage: auto`, a new `experiment` name or `workdir` alone is enough). "
+    "The PhaseSweep release that wrote the old data still reads it."
+)
+
+
+def format_found(version: object) -> str:
+    """Word the format version a record carries.
+
+    :param object version: The version the record holds, or ``None`` when it holds none.
+    :return str: ``uses format 14``, or ``has no format version`` for ``None``.
+    """
+    return "has no format version" if version is None else f"uses format {version!r}"
+
+
+def format_reads(current: int) -> str:
+    """Word the format version this PhaseSweep reads.
+
+    :param int current: The format version this PhaseSweep reads.
+    :return str: ``this PhaseSweep reads format 15``.
+    """
+    return f"this PhaseSweep reads format {current}"
+
+
+def format_mismatch(version: object, current: int) -> str:
+    """Word how a record's format differs from the one this PhaseSweep reads.
+
+    :param object version: The version the record holds, or ``None`` when it holds none.
+    :param int current: The format version this PhaseSweep reads.
+    :return str: A clause for the record's subject to lead, such as
+        ``uses format 14; this PhaseSweep reads format 15``.
+    """
+    return f"{format_found(version)}; {format_reads(current)}"
+
 
 # Path-free action phrases; boundary renderers supply framing and diagnostic details.
 OPERATOR_STEPS: dict[OperatorAction, str] = {

@@ -37,7 +37,6 @@ from phasesweep.config.reference import (
 from phasesweep.config.run_overrides import CreatedKey, SetPathError, apply_set, created_key_notes
 from phasesweep.config.search import phase_draws
 from phasesweep.engine.artifacts import LOG_FORMAT
-from phasesweep.engine.errors import ArtifactRootSchemaMismatchError, StudySchemaMismatchError
 from phasesweep.engine.fingerprints import _recorded_config_matches
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import (
@@ -153,20 +152,13 @@ def cli() -> None:
     """Run the phasesweep command line interface."""
 
 
-def _operational_error_text(exc: PhaseSweepError, *, read_only: bool = False) -> str:
-    """Format an operational diagnosis with advice for the requested operation.
+def _operational_error_text(exc: PhaseSweepError) -> str:
+    """Format an operational diagnosis followed by its operator step.
 
     :param PhaseSweepError exc: Operational failure to render.
-    :param bool read_only: Whether the command only inspects existing state.
     :return str: Diagnostic followed by its operator step.
     """
-    if read_only and isinstance(exc, (ArtifactRootSchemaMismatchError, StudySchemaMismatchError)):
-        return (
-            f"{exc}\nfix: inspect the raw artifacts, or use the exact checkout that produced "
-            "them for inspection if available; this checkout reads only its current format."
-        )
-    step = operator_step(exc)
-    return f"{exc}\nfix: {step}"
+    return f"{exc}\nfix: {operator_step(exc)}"
 
 
 def main() -> None:
@@ -179,9 +171,8 @@ def main() -> None:
         bug), ``_ABORT_EXIT`` (interrupted), or the status the command or
         Click chose.
     """
-    operation = {"read_only": False}
     try:
-        status = cli.main(standalone_mode=False, obj=operation)
+        status = cli.main(standalone_mode=False)
     except click.ClickException as exc:
         # Includes UsageError, which already carries exit code 2.
         if (
@@ -206,10 +197,7 @@ def main() -> None:
         click.echo(f"phasesweep: {exc}", err=True)
         sys.exit(_USAGE_EXIT)
     except PhaseSweepError as exc:
-        click.echo(
-            f"phasesweep: {_operational_error_text(exc, read_only=operation['read_only'])}",
-            err=True,
-        )
+        click.echo(f"phasesweep: {_operational_error_text(exc)}", err=True)
         # -v (see _configure_logging) means the operator asked for internals.
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             traceback.print_exc()
@@ -498,7 +486,6 @@ def run(
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
     """
-    click.get_current_context().ensure_object(dict)["read_only"] = dry_run
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
     # codes remain structured throughout startup, including dry-run previews.
@@ -753,7 +740,6 @@ def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     :raises PublicationIntegrityError: The publication is corrupt; nothing is rendered.
     :raises WinnerIntegrityError: An unpublished winner's producing snapshot, or a carried winner's source generation record, is unavailable or invalid.
     """
-    click.get_current_context().ensure_object(dict)["read_only"] = True
     experiment = _command_config(config_path, settings=settings)
     require_study(experiment)
     validate_ledger(experiment)
@@ -1120,7 +1106,6 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         validated as the current user.
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
-    click.get_current_context().ensure_object(dict)["read_only"] = True
     config = _command_config(config_path, settings=settings)
     require_study(config)
     if show_trials:

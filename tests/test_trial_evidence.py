@@ -608,8 +608,10 @@ def test_provenance_in_another_format_names_both_and_routes_to_a_new_study(
         evidence_ops._validate_selection_evidence(experiment, {"p": study})
 
     message = str(excinfo.value)
-    assert f"in format {EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1}" in message
-    assert f"this checkout reads format {EVIDENCE_PROVENANCE_SCHEMA_VERSION}" in message
+    assert (
+        f"uses format {EVIDENCE_PROVENANCE_SCHEMA_VERSION - 1}; "
+        f"this PhaseSweep reads format {EVIDENCE_PROVENANCE_SCHEMA_VERSION}"
+    ) in message
     assert "malformed" not in message
     assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
 

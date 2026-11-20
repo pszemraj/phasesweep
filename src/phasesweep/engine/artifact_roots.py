@@ -34,7 +34,7 @@ from phasesweep.engine.publication import (
     raise_for_unusable_publication,
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import OTHER_FORMAT_STEP, OperatorAction, format_mismatch
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
@@ -166,9 +166,10 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootSchemaMismatchError(
-            f"Artifact root {expected['artifact_root']!r} uses PhaseSweep "
-            f"format {raw.get('schema_version')!r}; this checkout reads format "
-            f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}. Nothing was written.",
+            f"Artifact root {expected['artifact_root']!r} "
+            f"{format_mismatch(raw.get('schema_version'), ARTIFACT_ROOT_BINDING_SCHEMA_VERSION)}. "
+            "Nothing was written.",
+            remediation=OTHER_FORMAT_STEP,
         )
     if raw != expected:
         raise ArtifactRootConflictError(

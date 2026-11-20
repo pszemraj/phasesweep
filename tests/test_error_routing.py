@@ -223,7 +223,7 @@ def test_no_feasible_subclasses_rewrap_with_the_donated_action():
 
 
 _UNMARKED_STUDY_DIAGNOSTIC_MARKERS = {
-    "study schema": "unsupported phasesweep storage schema",
+    "study schema": "has no format version; this PhaseSweep reads format",
     "trial target": "has trial state but no",
     "environment cohort": "without a semantic trainer-environment identity",
     "phase fingerprint": "has no semantic fingerprint",
@@ -1175,7 +1175,7 @@ ORIGIN_CASES = (
         action=OperatorAction.RESTORE_TREE,
         message=(
             f"uses format {ATTEMPT_REGISTRY_SCHEMA_VERSION - 1}; "
-            f"this checkout reads format {ATTEMPT_REGISTRY_SCHEMA_VERSION}."
+            f"this PhaseSweep reads format {ATTEMPT_REGISTRY_SCHEMA_VERSION}."
         ),
     ),
     RoutingCase(

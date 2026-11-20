@@ -45,7 +45,7 @@ from phasesweep.engine.state import (
     _trial_outcome_payload,
     _unduplicated_outcome,
 )
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError, format_mismatch
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
@@ -480,9 +480,9 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         and "schema_version" in payload
         and payload["schema_version"] != ATTEMPT_REGISTRY_SCHEMA_VERSION
     ):
+        found = format_mismatch(payload["schema_version"], ATTEMPT_REGISTRY_SCHEMA_VERSION)
         raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} uses format {payload['schema_version']!r}; "
-            f"this checkout reads format {ATTEMPT_REGISTRY_SCHEMA_VERSION}.",
+            f"Attempt registry entry {entry_path} {found}.",
             action=OperatorAction.RESTORE_TREE,
         )
     if isinstance(payload, dict) and payload.get("kind") == "tracking":
