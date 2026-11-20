@@ -31,6 +31,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     WinnerIntegrityError,
     phase_timeout,
+    tracker_unreadable,
 )
 from phasesweep.engine.evidence import _verify_winner_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
@@ -113,7 +114,7 @@ from phasesweep.engine.trial import (
     trial_run_name,
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
-from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
+from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
@@ -208,13 +209,23 @@ class _UnlaunchedAbortError(TrialExecutionError):
 _UNLAUNCHED_ABORT_CAUSE = "phase aborted before this trial's trainer launched"
 
 
-class _TrialOutcomeUnrecordedAbort(BaseException):
-    """Keep a trial RUNNING when its outcome cannot be persisted.
+class _TrialLeftRunning(BaseException):
+    """Keep a trial RUNNING, with no outcome, and stop the phase with ``error``.
 
-    Optuna does not catch this BaseException subclass. After workers drain,
-    ``_run_phase`` converts it to ``StudyStorageUnavailableError``; stale
-    recovery records the outcome before committing the trial's terminal state.
+    Optuna does not catch this BaseException subclass, so it commits no terminal
+    state. After workers drain, ``_run_phase`` raises ``error``. Stale recovery
+    then settles the trial: it records an outcome that could not be persisted
+    before committing the terminal state, or extracts finished training once
+    the tracker that gave no answer about it answers.
     """
+
+    def __init__(self, error: PhaseSweepError) -> None:
+        """Carry the operator error the phase stops with.
+
+        :param PhaseSweepError error: Error ``_run_phase`` raises after workers drain.
+        """
+        super().__init__(str(error))
+        self.error = error
 
 
 _OUTCOME_WRITE_RETRY_DELAYS = (0.05, 0.25)
@@ -882,8 +893,8 @@ def _record_outcome(
     :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
     :param str | None cause: Optional explanation stored in the outcome.
     :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
-    :raises _TrialOutcomeUnrecordedAbort: Retries exhausted; leave the trial RUNNING
-        and stop launches for stale-attempt recovery.
+    :raises _TrialLeftRunning: Retries exhausted; leave the trial RUNNING and stop
+        launches for stale-attempt recovery, carrying ``StudyStorageUnavailableError``.
     """
     write_error: Exception | None = None
     abort_record: JsonObject | None = None
@@ -918,15 +929,17 @@ def _record_outcome(
             run.abort_recorded = True
             break
     if write_error is not None:
-        unrecorded = _TrialOutcomeUnrecordedAbort(
-            f"Could not persist the terminal outcome for trial {trial.number} "
-            f"in study {run.study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
-            f"attempts ({type(write_error).__name__}: {write_error}). Trial "
-            f"{trial.number} was deliberately left RUNNING, with its durable "
-            "attempt record intact, so no finished trial exists without its "
-            "outcome record. Once storage accepts writes again, the next run "
-            "recovers it through the standard stale-attempt protocol, which "
-            "records its outcome before marking the trial FAIL."
+        unrecorded = _TrialLeftRunning(
+            StudyStorageUnavailableError(
+                f"Could not persist the terminal outcome for trial {trial.number} "
+                f"in study {run.study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
+                f"attempts ({type(write_error).__name__}: {write_error}). Trial "
+                f"{trial.number} was deliberately left RUNNING, with its durable "
+                "attempt record intact, so no finished trial exists without its "
+                "outcome record. Once storage accepts writes again, the next run "
+                "recovers it through the standard stale-attempt protocol, which "
+                "records its outcome before marking the trial FAIL."
+            )
         )
         run.record_fatal(unrecorded)
         raise unrecorded from write_error
@@ -949,8 +962,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     :raises PhaseSweepShutdown: Shutdown interrupted the trial or left completed training pending extraction.
     :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
         persisted; nothing was launched and no GPU lease was consumed.
-    :raises _TrialOutcomeUnrecordedAbort: A successful trial's terminal outcome could not be
-        persisted, so the trial is left ``RUNNING`` for stale-attempt recovery.
+    :raises _TrialLeftRunning: A successful trial's terminal outcome could not be persisted,
+        or the tracker gave no answer about a finished trial's evidence, so the trial is
+        left ``RUNNING`` for stale-attempt recovery.
     :return float: The extracted metric value (Optuna minimizes/maximizes per ``direction``).
     """
     experiment = run.experiment
@@ -1120,6 +1134,20 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     except ShutdownLaunchRefusedError as exc:
         raise PhaseSweepShutdown(exc.signum, ShutdownCleanupReport(exc.signum, True, ())) from exc
     preserve_trainer_on_shutdown()
+    if result.evidence_unreadable and not result.deadline_exhausted:
+        # No answer from the tracker says nothing about the training, so no outcome
+        # is recorded: recovery extracts it once the tracker answers.
+        _warn_deferred_extraction(attempt_id, phase.name, trial.number)
+        left_running = _TrialLeftRunning(
+            tracker_unreadable(
+                f"Trial {trial.number} in phase {phase.name!r} finished training, but the "
+                f"tracker gave no answer about its evidence: "
+                f"{(result.failure_reason or '').rstrip('.')}. The trial stays RUNNING with "
+                "its training kept, and no further trial starts."
+            )
+        )
+        run.record_fatal(left_running)
+        raise left_running
     if result.deadline_exhausted:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
@@ -1175,8 +1203,8 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     with run.workers.track(trial.number):
         try:
             return _execute_objective(run, trial)
-        except _TrialOutcomeUnrecordedAbort:
-            # Do not retry outcome recording through a later exception handler.
+        except _TrialLeftRunning:
+            # The trial deliberately has no outcome; no later handler may record one.
             raise
         except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
             _record_outcome(run, trial, "interrupted", cause=str(exc))
@@ -1610,8 +1638,8 @@ def _run_phase(
 
         # Propagate swallowed worker/callback errors before selection or timeout classification.
         run.raise_if_fatal()
-    except _TrialOutcomeUnrecordedAbort as exc:
-        raise StudyStorageUnavailableError(str(exc)) from exc
+    except _TrialLeftRunning as exc:
+        raise exc.error from exc
 
     return _finish_phase(run, phase_fingerprint=resume.phase_fingerprint)
 

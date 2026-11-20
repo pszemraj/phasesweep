@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from phasesweep.config.models import Phase
-from phasesweep.engine.errors import ArtifactRootConflictError, StudyFingerprintMismatchError
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    StudyFingerprintMismatchError,
+    TrackingTargetUnavailableError,
+)
 from phasesweep.engine.paths import _generation_path
 from phasesweep.engine.run import TerminalReport, run_experiment
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import make_experiment, write_experiment_config
 from tests.mcp_helpers import SEEDED_RANDOM, run_claimed_runner
+from tests.tracking_helpers import switchable_wandb, wandb_objective_experiment
 
 
 def test_a_failure_the_engine_never_reported_is_a_preflight_failure() -> None:
@@ -73,3 +79,22 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     failure = json.loads(store.status_path("refused").read_text())["failure"]
     assert (failure["code"], failure["stage"]) == ("fingerprint_mismatch", "preflight")
     assert _generation_path(experiment).read_bytes() == generation_before
+
+
+@pytest.mark.integration
+def test_an_unreadable_tracker_stops_the_live_run_and_refuses_the_next_at_preflight(
+    tmp_path: Path, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """The run that met the outage claimed its generation; the next is refused before claiming one."""
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, _launches = wandb_objective_experiment(tmp_path, n_trials=1)
+    config_path = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    store = RunStore(tmp_path / "state")
+    tracker.switch("denied")
+
+    for run_id, stage in (("live", "execution"), ("next", "preflight")):
+        with pytest.raises(TrackingTargetUnavailableError):
+            run_claimed_runner(store, run_id, config_path, experiment_id="t", cwd=tmp_path)
+        failure = json.loads(store.status_path(run_id).read_text())["failure"]
+        assert (failure["code"], failure["stage"]) == ("tracking_unavailable", stage)
+        assert "nothing is retrained" in failure["remediation"]

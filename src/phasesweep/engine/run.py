@@ -31,6 +31,7 @@ from phasesweep.config.models import (
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
     phase_timeout,
 )
 from phasesweep.engine.phase import _run_phase
@@ -391,6 +392,10 @@ def _run_experiment_outcome(
             if generation.claimed:
                 # Only a claimed generation launched work whose studies need reconciling.
                 reconciliation = attempt_ops._PreflightCleanupReport()
+                if isinstance(exc, TrackingTargetUnavailableError):
+                    # The run just found its tracker unreadable; keep pending training
+                    # without spending another read's timeout before reporting it.
+                    reconciliation.unreadable_evidence[generation_id] = str(exc)
                 try:
                     guard_ops._reconcile_existing_studies(
                         experiment,

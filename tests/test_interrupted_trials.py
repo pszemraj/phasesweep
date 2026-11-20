@@ -1299,6 +1299,34 @@ def _assert_restored_tracker_keeps_training(
     assert launches.read_text().splitlines() == ["launch"] * len(pending)
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    wandb_worker_sdk: Callable[[str], None],
+    n_jobs: int,
+) -> None:
+    """A tracker that gives no answer stops the run with each finished trial pending; its next answer is kept."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = wandb_objective_experiment(tmp_path, n_trials=n_jobs, n_jobs=n_jobs)
+    tracker.switch("denied")
+    with pytest.raises(TrackingTargetUnavailableError) as refused:
+        run_experiment(experiment)
+    assert refused.value.remediation is not None
+    assert "nothing is retrained" in refused.value.remediation
+    trials = phase_trials(experiment)
+    assert len(trials) == n_jobs
+    for trial in trials:
+        _assert_evidence_pending(experiment, trial)
+        retained = f"Trial {trial.number} in phase p finished training; its result is retained."
+        assert caplog.text.count(retained) == 1
+    # Each trial read the tracker once; reconciliation did not spend another read.
+    assert tracker.lookups("denied") == n_jobs
+    _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+
+
 _RUN_CONFIG = """
 import sys
 from phasesweep import run_experiment

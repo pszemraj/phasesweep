@@ -39,6 +39,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.generation import InvocationGeneration
@@ -75,6 +76,7 @@ from phasesweep.errors import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
 )
+from phasesweep.evidence.evaluation import EvidenceUnreadableError
 from phasesweep.evidence.models import LogRegexExtractor, WandbSummaryRequiredGate
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
@@ -617,6 +619,32 @@ def _preflight_registered_trial_without_attempt(
     running.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(running, state=optuna.trial.TrialState.FAIL)
     return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
+
+
+def _unreadable_tracker_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Experiment:
+    """Return a persistent sweep whose trainer exits cleanly while its tracker gives no answer."""
+    monkeypatch.setattr(
+        trial, "run_extractor", raiser(EvidenceUnreadableError("W&B gave no answer"))
+    )
+    return make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'study.journal'}",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+
+
+def _run_while_tracker_unreadable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Run a trial whose finished training the tracker gives no answer about."""
+    return run_experiment(_unreadable_tracker_sweep(tmp_path, monkeypatch))
+
+
+def _resume_while_tracker_unreadable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Run again while the tracker still gives no answer about the pending trial."""
+    experiment = _unreadable_tracker_sweep(tmp_path, monkeypatch)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    return run_experiment(experiment)
 
 
 def _inspect_uncertain(*kept: str) -> Trigger:
@@ -1245,6 +1273,20 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message="Correct the storage path, or the workdir for auto storage",
+    ),
+    RoutingCase(
+        id="live_trial_tracker_unreadable",
+        trigger=_run_while_tracker_unreadable,
+        raised=TrackingTargetUnavailableError,
+        action=OperatorAction.FIX_CONFIG,
+        message="finished training, but the tracker gave no answer about its evidence",
+    ),
+    RoutingCase(
+        id="pending_trial_tracker_unreadable",
+        trigger=_resume_while_tracker_unreadable,
+        raised=TrackingTargetUnavailableError,
+        action=OperatorAction.FIX_CONFIG,
+        message="1 completed trial(s) finished training, but the tracker gave no answer",
     ),
 )
 
