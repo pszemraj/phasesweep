@@ -56,7 +56,7 @@ codex mcp add phasesweep -- /absolute/path/to/phasesweep-mcp --catalog /absolute
 codex mcp list
 ```
 
-A connected server tells agents to use PhaseSweep only when you ask for it in the conversation, and never to suggest it. To keep a client from connecting the server at all, use the client's own switch: in Claude Code, toggle the PhaseSweep server off in the `/mcp` panel, which applies to the current project; in Codex, set `enabled = false` under `[mcp_servers.phasesweep]` in its `config.toml`.
+To keep a client from connecting the server at all, disable it in that client's own MCP settings.
 
 ### 4. Verify the connection
 

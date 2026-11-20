@@ -14,10 +14,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      # Every package installed here has an exact version, so a new release of one
-      # of them cannot change what passes; the packages they depend on still float.
-      # The dev extra in pyproject.toml pins the same ruff, mypy and types-PyYAML;
-      # raise them in both places together.
+      # Exact versions, so CI and the dev extra in pyproject.toml lint and type-check
+      # with the same tools; raise ruff, mypy and types-PyYAML in both places together.
       - name: Install static-check dependencies
         run: >-
           python -m pip install

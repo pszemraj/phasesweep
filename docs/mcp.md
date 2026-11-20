@@ -58,7 +58,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Tool workflow
 
-The server's MCP instructions are one line that says three things: what PhaseSweep is, that an agent uses these tools only when the user asks for PhaseSweep in the conversation and never suggests it otherwise, and that it calls `get_guide` before any other tool. Some clients load a server's instructions into every session the server is connected to, and some show only their first line, so the workflow rules stay out of them. `get_guide()` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, the one tool result that is not a JSON object, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
+The server's MCP instructions are one line: use these tools only when the user asks for PhaseSweep in the conversation, never suggest it otherwise, and call `get_guide` first. `get_guide` returns [agent_prompt.md](../src/phasesweep/mcp/agent_prompt.md) as plain text, and the packaged `phasesweep_run_and_monitor` prompt returns the same text. It holds the rules agents follow: when to launch or cancel, how to monitor, when to stop for the operator, and what to report with results.
 
 Catalog operations use an experiment ID, except `explain_config`:
 
