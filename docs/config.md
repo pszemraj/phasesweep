@@ -522,22 +522,24 @@ A trial that does not report what the extractor expects fails with the cause on 
 
 ### Source-checkout preflight
 
-Before launching a source-checkout trainer, verify the package actually imported by the configured Python executable. Running a checkout's example script does not make Python import that checkout's library. Match the example to its installed library, or explicitly select the checkout's source directory:
+Before launching a source-checkout trainer, verify the package actually imported by the configured Python executable. Running a checkout's example script does not make Python import that checkout's library. Match the example to its installed library, or install the checkout into the trainer's environment, with that environment active:
+
+```bash
+pip install -e /absolute/path/to/transformers
+```
+
+Then run the trainer from the checkout:
 
 ```yaml
 execution:
   cwd: /absolute/path/to/transformers
-env:
-  PYTHONPATH: /absolute/path/to/transformers/src
 ```
 
-Run a CPU-only preflight with that same executable and explicit environment; for this example:
+Run a CPU-only preflight with that same executable and verify the import path: `__file__` must point into the checkout. For this example:
 
 ```bash
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
-  /absolute/path/to/python -c 'import transformers; print(transformers.__version__); print(transformers.__file__)'
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
-  /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
+CUDA_VISIBLE_DEVICES='' /absolute/path/to/python -c 'import transformers; print(transformers.__version__); print(transformers.__file__)'
+CUDA_VISIBLE_DEVICES='' /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
 ```
 
-Carry all required settings into the experiment's composed environment: the default `inherit_env: none` drops ambient `PYTHONPATH` and other shell settings. Use the actual example's `--help` to choose supported arguments; configuration validation does not execute the trainer or establish library compatibility. For remote metrics, honor the [tracker environment contract](#wb-evidence) so the final objective stays in the attempt's one bound run.
+The default `inherit_env: none` drops ambient `PYTHONPATH` and other shell settings, so an installed checkout reaches the trainer and an exported `PYTHONPATH` does not; carry every other required setting into the experiment's composed environment. Use the actual example's `--help` to choose supported arguments; configuration validation does not execute the trainer or establish library compatibility. For remote metrics, honor the [tracker environment contract](#wb-evidence) so the final objective stays in the attempt's one bound run.
