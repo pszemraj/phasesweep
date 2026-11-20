@@ -36,21 +36,29 @@ def _warn_once(logger: logging.Logger, key: Hashable, message: str, *args: objec
         logger.warning(message, *args)
 
 
-def _warn_deferred_extraction(attempt_id: str, phase_name: str, trial_number: int) -> None:
-    """Explain retained training once across shutdown and reconciliation.
+def _warn_deferred_extraction(
+    attempt_id: str, phase_name: str, trial_number: int, *, persistent: bool
+) -> None:
+    """Explain once across shutdown and reconciliation what becomes of unextracted training.
 
-    :param str attempt_id: Attempt whose completed training awaits extraction.
+    Only a persistent study outlives the run to extract it later; ``storage: null`` loses it.
+
+    :param str attempt_id: Attempt whose completed training was not extracted.
     :param str phase_name: Owning phase.
     :param int trial_number: Trial number within that phase.
+    :param bool persistent: Whether the trial's study outlives this run.
     """
-    _warn_once(
-        log,
-        ("deferred-extraction", attempt_id),
-        "Trial %d in phase %s finished training; its result is retained. "
-        "The next phasesweep run with the same config will extract the result without retraining.",
-        trial_number,
-        phase_name,
-    )
+    if persistent:
+        message = (
+            "Trial %d in phase %s finished training; its result is retained. The next "
+            "phasesweep run with the same config will extract the result without retraining."
+        )
+    else:
+        message = (
+            "Trial %d in phase %s finished training, but its result was not extracted and is "
+            "lost: storage: null keeps no trials between runs."
+        )
+    _warn_once(log, ("deferred-extraction", attempt_id), message, trial_number, phase_name)
 
 
 def _log_phase_header(

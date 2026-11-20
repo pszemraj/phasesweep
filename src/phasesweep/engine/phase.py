@@ -953,8 +953,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
         persisted; nothing was launched and no GPU lease was consumed.
     :raises _TrialLeftRunning: A successful trial's terminal outcome could not be persisted,
-        or the tracker gave no answer about a finished trial's evidence, so the trial is
-        left ``RUNNING`` for stale-attempt recovery.
+        or, in a persistent study, the tracker gave no answer about a finished trial's
+        evidence, so the trial is left ``RUNNING`` for stale-attempt recovery.
     :return float: The extracted metric value (Optuna minimizes/maximizes per ``direction``).
     """
     experiment = run.experiment
@@ -1124,10 +1124,11 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     except ShutdownLaunchRefusedError as exc:
         raise PhaseSweepShutdown(exc.signum, ShutdownCleanupReport(exc.signum, True, ())) from exc
     preserve_trainer_on_shutdown()
-    if result.evidence_unreadable and not result.deadline_exhausted:
+    if result.evidence_unreadable and not result.deadline_exhausted and experiment.persistent:
         # No answer from the tracker says nothing about the training, so no outcome
-        # is recorded: recovery extracts it once the tracker answers.
-        _warn_deferred_extraction(attempt_id, phase.name, trial.number)
+        # is recorded: recovery extracts it once the tracker answers. An in-memory
+        # study has no later run to do that, so there the trial fails with the reason.
+        _warn_deferred_extraction(attempt_id, phase.name, trial.number, persistent=True)
         left_running = _TrialLeftRunning(
             tracker_unreadable(
                 f"Trial {trial.number} in phase {phase.name!r} finished training, but the "
@@ -1246,7 +1247,12 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             if _completed_trainer_duration(trial, lifecycle) is None:
                 _record_outcome(run, trial, "interrupted", cause=interruption_cause(exc.signum))
             elif isinstance(attempt_id, str):
-                _warn_deferred_extraction(attempt_id, run.phase.name, trial.number)
+                _warn_deferred_extraction(
+                    attempt_id,
+                    run.phase.name,
+                    trial.number,
+                    persistent=run.experiment.persistent,
+                )
             raise
         except BaseException as exc:
             run.record_fatal(exc)

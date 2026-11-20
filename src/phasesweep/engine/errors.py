@@ -182,9 +182,9 @@ class TrialTargetRefusedError(PhaseSweepError):
 class TrackingTargetUnavailableError(PhaseSweepError):
     """Raised when a tracker gives no answer that new work or completed training needs.
 
-    Before a phase allocates trials, its MLflow target must resolve. A trial that
-    finished training while its tracker could not be read stays RUNNING, its
-    training kept, and the run stops until the tracker answers.
+    Before a phase allocates trials, its MLflow target must resolve. In a persistent
+    study, a trial that finished training while its tracker could not be read stays
+    RUNNING, its training kept, and the run stops until the tracker answers.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

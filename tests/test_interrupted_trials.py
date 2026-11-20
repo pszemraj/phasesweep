@@ -44,6 +44,7 @@ from phasesweep.engine.paths import (
     _attempts_dir,
     _experiment_dir,
     _generation_config_snapshot_path,
+    _last_successful_generation_path,
     _phase_dir,
 )
 from phasesweep.engine.preview import _preview_ledger
@@ -78,7 +79,7 @@ from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
 from phasesweep.runtime.json import JsonObject, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
-from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownLaunchRefusedError
 from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
@@ -1325,6 +1326,118 @@ def test_unreadable_tracker_leaves_finished_training_pending_until_it_answers(
     # Each trial read the tracker once; reconciliation did not spend another read.
     assert tracker.lookups("denied") == n_jobs
     _assert_restored_tracker_keeps_training(experiment, tracker, launches, caplog)
+
+
+def _in_memory_wandb_sweep(
+    tmp_path: Path, tracker: SwitchableWandb, *, n_trials: int, deny_at_launch: int
+) -> tuple[Experiment, Path]:
+    """Build a ``storage: null`` sweep whose W&B objective answers once each trainer exits.
+
+    :param Path tmp_path: Directory holding the workdir, trainer and launch log.
+    :param SwitchableWandb tracker: The fake W&B server the trainer switches.
+    :param int n_trials: The phase's trial target.
+    :param int deny_at_launch: Launch number at which the trainer switches W&B to ``denied``.
+    :return tuple[Experiment, Path]: The experiment and its trainer launch log.
+    """
+    from phasesweep.config.models import Metric
+    from phasesweep.evidence.models import WandbExtractor
+
+    launches = tmp_path / "launches"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        launches = Path({str(launches)!r})
+        with launches.open("a") as log:
+            log.write("launch\\n")
+        if len(launches.read_text().splitlines()) == {deny_at_launch}:
+            Path({str(tracker.mode)!r}).write_text("denied")
+        """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="x",
+        poll_seconds=0.01,
+        timeout_seconds=30,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        metric=Metric(extractor=remote),
+        n_trials=n_trials,
+    )
+    assert not experiment.persistent
+    return experiment, launches
+
+
+@pytest.mark.integration
+def test_in_memory_run_fails_a_trial_whose_tracker_is_unreadable_and_promises_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """With storage: null nothing outlives the run, so the trial fails with the tracker's reason and no later read is promised."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = _in_memory_wandb_sweep(tmp_path, tracker, n_trials=1, deny_at_launch=1)
+    with pytest.raises(NoFeasibleTrialError) as refused:
+        run_experiment(experiment)
+    assert not isinstance(refused.value, TrackingTargetUnavailableError)
+    assert "state=FAIL" in caplog.text
+    assert "reason=metric extractor: W&B authentication/setup failed" in caplog.text
+    assert "retained" not in caplog.text
+    assert "kept" not in str(refused.value) + str(refused.value.remediation)
+    # The next run starts afresh: nothing was kept, so the trainer runs again.
+    tracker.switch("up")
+    assert run_experiment(experiment)["p"].metric == 1.0
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
+@pytest.mark.integration
+def test_in_memory_sweep_keeps_its_finished_trials_when_the_tracker_turns_unreadable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, wandb_worker_sdk: Callable[[str], None]
+) -> None:
+    """An in-memory sweep fails the trials its tracker cannot answer about and still publishes the rest."""
+    caplog.set_level(logging.INFO)
+    tracker = switchable_wandb(wandb_worker_sdk, tmp_path)
+    experiment, launches = _in_memory_wandb_sweep(tmp_path, tracker, n_trials=6, deny_at_launch=5)
+    winners = run_experiment(experiment)
+    assert winners["p"].metric == 1.0
+    assert launches.read_text().splitlines() == ["launch"] * 6
+    assert _last_successful_generation_path(experiment).is_file()
+    assert caplog.text.count("state=COMPLETE") == 4
+    assert caplog.text.count("reason=metric extractor: W&B authentication/setup failed") == 2
+
+
+@pytest.mark.parametrize("storage", ["journal", "memory"])
+def test_shutdown_during_extraction_promises_kept_training_only_with_persistent_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    storage: str,
+) -> None:
+    """Finished training a shutdown stops before extraction is kept only by a persistent study."""
+    trainer = write_trainer(tmp_path / "trainer.py", "pass\n")
+    experiment = make_experiment(
+        persistent=tmp_path if storage == "journal" else None,
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=1,
+    )
+
+    def interrupted(**_kwargs: object) -> None:
+        raise ShutdownLaunchRefusedError(signal.SIGTERM)
+
+    monkeypatch.setattr(phase_module, "extract_trial_result", interrupted)
+    with pytest.raises(PhaseSweepShutdown):
+        run_experiment(experiment)
+    retained = "Trial 0 in phase p finished training; its result is retained."
+    lost = "Trial 0 in phase p finished training, but its result was not extracted"
+    assert (retained in caplog.text) is (storage == "journal")
+    assert (lost in caplog.text) is (storage == "memory")
+    if storage == "memory":
+        assert "storage: null keeps no trials between runs" in caplog.text
 
 
 _RUN_CONFIG = """

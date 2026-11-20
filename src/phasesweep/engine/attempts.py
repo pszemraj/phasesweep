@@ -1095,7 +1095,8 @@ def _recover_completed_trial(
     Trainer ledger attributes precede SDK workers and take priority over the reused
     process slot; the guardian covers a runner death before those attributes commit.
     Recorded process failures and interruptions remain authoritative; a measured
-    bound violation may still commit as COMPLETE and infeasible.
+    bound violation may still commit as COMPLETE and infeasible. Only a ledger study
+    reaches recovery, so training it defers stays retained for a later pass.
 
     :param optuna.Study study: Owning study whose trial is still RUNNING.
     :param optuna.trial.FrozenTrial trial: Stale trial with retained trainer evidence.
@@ -1135,7 +1136,9 @@ def _recover_completed_trial(
     ):
         return False
     if servicing_shutdown_signal() is not None:
-        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        _warn_deferred_extraction(
+            record.attempt_id, record.phase_name, trial.number, persistent=True
+        )
         return None
     if report is not None and report.unreadable_evidence:
         # This pass already found a tracker unreadable; keep the training without
@@ -1143,7 +1146,9 @@ def _recover_completed_trial(
         report.unreadable_evidence.setdefault(
             record.attempt_id, next(iter(report.unreadable_evidence.values()))
         )
-        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        _warn_deferred_extraction(
+            record.attempt_id, record.phase_name, trial.number, persistent=True
+        )
         return None
     experiment = _load_generation_experiment(artifact_root, record.generation_id)
     phase = experiment.phase(record.phase_name)
@@ -1191,10 +1196,14 @@ def _recover_completed_trial(
             gates=phase.gates,
         )
     except PhaseSweepShutdown:
-        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        _warn_deferred_extraction(
+            record.attempt_id, record.phase_name, trial.number, persistent=True
+        )
         raise
     if servicing_shutdown_signal() is not None:
-        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        _warn_deferred_extraction(
+            record.attempt_id, record.phase_name, trial.number, persistent=True
+        )
         return None
     if result.evidence_unreadable and result.failure_reason is not None:
         # No answer says nothing about the training. A pass with a report refuses new
@@ -1207,7 +1216,9 @@ def _recover_completed_trial(
             record.attempt_id,
             result.failure_reason,
         )
-        _warn_deferred_extraction(record.attempt_id, record.phase_name, trial.number)
+        _warn_deferred_extraction(
+            record.attempt_id, record.phase_name, trial.number, persistent=True
+        )
         return None
     if result.failure_reason is not None:
         log.warning(
