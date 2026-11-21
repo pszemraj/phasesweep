@@ -8,8 +8,15 @@ from pathlib import Path
 import pytest
 
 from phasesweep.config.models import Experiment
+from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.selection import PhaseTrialsFailedError
-from tests.conftest import invoke_cli_boundary, terminal_stderr
+from tests.conftest import (
+    invoke_cli_boundary,
+    make_experiment,
+    terminal_stderr,
+    write_constant_trainer,
+    write_experiment_config,
+)
 
 _DIAGNOSIS = (
     "No completed trials in phase. The phase's trials.csv records why each failed or "
@@ -146,6 +153,34 @@ def test_a_dry_run_wraps_its_lines_to_the_terminal_and_keeps_its_commands_whole(
         for line in stderr.text.splitlines()
     ]
     assert lines == _STARTER_DRY_RUN_AT_80
+
+
+@pytest.mark.integration
+def test_a_run_with_nothing_to_run_still_names_the_command_that_reads_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The replay's closing sentence is followed by the same ``Next:`` line a launching run prints."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+    next_line = f"Next: phasesweep status {config} --trials"
+    assert next_line in capsys.readouterr().err.splitlines()
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 0
+
+    lines = capsys.readouterr().err.splitlines()
+    closing = next(index for index, line in enumerate(lines) if line.startswith("Finished in"))
+    assert "nothing to run" in lines[closing]
+    after = lines[closing + 1 :]
+    assert after[after.index("") + 1] == next_line
+    assert after[after.index("") + 2].startswith("log: ")
 
 
 def test_validate_says_it_checked_the_config_alone_and_names_the_dry_run(

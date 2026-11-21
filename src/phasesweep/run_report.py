@@ -672,6 +672,18 @@ class SummaryPhase:
     winner_dirs: tuple[str, ...] = ()
 
 
+def _next_line(command: str, *, color: bool) -> str:
+    """Draw the command a run closes by pointing to.
+
+    A command is pasted, so it stays on one line whatever the width.
+
+    :param str command: The command that reads the result.
+    :param bool color: Whether to style the label.
+    :return str: The ``Next:`` line.
+    """
+    return f"{paint('Next:', 'label', color=color)} {command}"
+
+
 @dataclass(frozen=True)
 class Summary:
     """What a finished run did and where it went: counts, winners, files and the next command."""
@@ -712,9 +724,7 @@ class Summary:
         if self.written:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))
-        # A command is pasted, so it stays on one line whatever the width.
-        following = f"{paint('Next:', 'label', color=color)} {self.next_command}"
-        return [*lines, "", following]
+        return [*lines, "", _next_line(self.next_command, color=color)]
 
     def _headline_lines(self, width: int, *, color: bool) -> list[str]:
         """Wrap the headline, styling its opening words.
@@ -754,11 +764,12 @@ class Summary:
 
 @dataclass(frozen=True)
 class NothingToRun:
-    """The one line a run closes with when every trial was already finished and nothing changed."""
+    """The sentence a run closes with when every trial was already finished and nothing changed."""
 
     elapsed: str
     trials: int
     generation_id: str
+    next_command: str
 
     def _text(self) -> str:
         """Say that the run launched nothing and wrote nothing.
@@ -771,16 +782,16 @@ class NothingToRun:
         )
 
     def render(self, width: int, *, color: bool) -> list[str]:
-        """Draw the sentence wrapped to the terminal.
+        """Draw the sentence wrapped to the terminal, then the command that reads the result.
 
         :param int width: Columns available to each line.
-        :param bool color: Whether to style the opening words.
-        :return list[str]: A blank line, then the sentence.
+        :param bool color: Whether to style the opening words and the label.
+        :return list[str]: A blank line, the sentence, a blank line and the ``Next:`` line.
         """
         lines = wrap(self._text(), width)
         opening = f"Finished in {self.elapsed}"
         lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
-        return ["", *lines]
+        return ["", *lines, "", _next_line(self.next_command, color=color)]
 
 
 @dataclass(frozen=True)
@@ -880,14 +891,15 @@ def run_totals(counts: Mapping[str, PhaseCounts]) -> str:
 
 
 def nothing_to_run(
-    *, elapsed: float, counts: Mapping[str, PhaseCounts], generation_id: str
+    *, elapsed: float, counts: Mapping[str, PhaseCounts], generation_id: str, next_command: str
 ) -> NothingToRun:
-    """Build the closing line of a run that replayed a published result unchanged.
+    """Build the closing block of a run that replayed a published result unchanged.
 
     :param float elapsed: Wall-clock seconds the engine took.
     :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run replayed.
     :param str generation_id: The generation that already publishes the winners.
+    :param str next_command: The command that reads the result.
     :return NothingToRun: The block to log.
     """
     trials = sum(item.total for item in counts.values())
-    return NothingToRun(duration_text(elapsed), trials, generation_id)
+    return NothingToRun(duration_text(elapsed), trials, generation_id, next_command)

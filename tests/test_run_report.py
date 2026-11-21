@@ -1155,18 +1155,35 @@ def test_summary_dims_the_winners_directory_on_a_terminal() -> None:
     assert f"                 \x1b[2m{SHORT_TRIAL_DIR}\x1b[0m" in lines
 
 
-def test_nothing_to_run_is_one_sentence() -> None:
-    """A replay says it launched nothing and which generation already holds the result."""
+@pytest.mark.parametrize("width", [80, 60])
+def test_nothing_to_run_is_one_sentence_and_a_next_line(width: int) -> None:
+    """A replay says it launched nothing and which generation holds the result, then where to look."""
     block = nothing_to_run(
         elapsed=0.42,
         counts={"depth": _counts(complete=2), "learning_rate": _counts(complete=2)},
         generation_id="6413d5c1edd5475998cfadd4d3b59980",
+        next_command="phasesweep status starter.yaml --trials",
     )
-    assert block.render(80, color=False) == [
+    sentence = {
+        80: [
+            "Finished in 0.4s: nothing to run, 4 trials already finished, and generation",
+            "6413d5c1edd5475998cfadd4d3b59980 already publishes these winners.",
+        ],
+        60: [
+            "Finished in 0.4s: nothing to run, 4 trials already finished,",
+            "and generation 6413d5c1edd5475998cfadd4d3b59980 already",
+            "publishes these winners.",
+        ],
+    }[width]
+    assert block.render(width, color=False) == [
         "",
-        "Finished in 0.4s: nothing to run, 4 trials already finished, and generation",
-        "6413d5c1edd5475998cfadd4d3b59980 already publishes these winners.",
+        *sentence,
+        "",
+        "Next: phasesweep status starter.yaml --trials",
     ]
+    assert block.render(width, color=True)[-1] == (
+        "\x1b[1mNext:\x1b[0m phasesweep status starter.yaml --trials"
+    )
 
 
 def test_banner_and_summary_style_only_labels_paths_and_the_winner_mark() -> None:

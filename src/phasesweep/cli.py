@@ -680,11 +680,15 @@ def _closing_block(
     :param str | None from_phase: The ``--from-phase`` value, if given.
     :return Summary | NothingToRun: The block to print.
     """
+    next_command = shlex.join(
+        ["phasesweep", "status", *_config_arguments(config_path, settings), "--trials"]
+    )
     if outcome.replayed_generation_id is not None:
         return nothing_to_run(
             elapsed=elapsed,
             counts=outcome.phase_counts,
             generation_id=outcome.replayed_generation_id,
+            next_command=next_command,
         )
     root = _experiment_dir(config)
     candidates = [
@@ -704,9 +708,7 @@ def _closing_block(
         from_phase=from_phase,
         written_root=display_path(root),
         written=written,
-        next_command=shlex.join(
-            ["phasesweep", "status", *_config_arguments(config_path, settings), "--trials"]
-        ),
+        next_command=next_command,
     )
 
 
