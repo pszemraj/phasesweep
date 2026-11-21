@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import phase_draws
+from phasesweep.engine.confound import _flagged_checks
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
@@ -559,6 +560,8 @@ class SummaryPhase:
     winner: tuple[str, ...]
     #: Directory of each trial the winner stands on, as the console shows it.
     winner_dirs: tuple[str, ...] = ()
+    #: Confound checks the winner's selection flagged, in report order.
+    flagged: tuple[str, ...] = ()
 
 
 def _next_line(command: str, *, color: bool) -> str:
@@ -607,6 +610,7 @@ class Summary:
                 ]
                 drawn[0] = paint_word(drawn[0], _WINNER_WORD, "winner", start=len(pad), color=color)
                 lines.extend(drawn)
+                lines.extend(self._flagged_lines(phase, pad, width, color=color))
                 lines.extend(
                     pad + line
                     for line in directory_lines(
@@ -617,6 +621,27 @@ class Summary:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))
         return [*lines, "", _next_line(self.next_command, color=color)]
+
+    @staticmethod
+    def _flagged_lines(phase: SummaryPhase, pad: str, width: int, *, color: bool) -> list[str]:
+        """Draw the confound checks a winner's selection flagged, under its facts.
+
+        The one warning printed as the phase ended scrolls away in a long sweep, so the summary
+        names the checks again and says where the numbers behind them are.
+
+        :param SummaryPhase phase: The phase whose winner is drawn.
+        :param str pad: Indent of the winner's label column.
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the label.
+        :return list[str]: The lines under the winner's text column, empty when none was flagged.
+        """
+        if not phase.flagged:
+            return []
+        indent = pad + " " * len(f"{_WINNER_WORD}{GAP}")
+        text = f"{', '.join(phase.flagged)} (see show-winners)"
+        lines = wrap_labeled("flagged:", text, width - len(indent))
+        lines[0] = paint_word(lines[0], "flagged:", "warning", color=color)
+        return [indent + line for line in lines]
 
     def _headline_lines(self, width: int, *, color: bool) -> list[str]:
         """Wrap the headline, styling its opening words.
@@ -761,12 +786,15 @@ def summary(
             clauses = ("trial counts unavailable",)
         facts: tuple[str, ...] = ()
         directories: tuple[str, ...] = ()
+        flagged: tuple[str, ...] = ()
         if winner is not None:
             head, tail = winner_facts(winner, experiment.metric.name)
             facts = (*head, *tail)
+            if winner.confound is not None:
+                flagged = tuple(_flagged_checks(winner.confound))
             if phase.name in counts:
                 directories = tuple(display_path(path) for path in counts[phase.name].winner_dirs)
-        phases.append(SummaryPhase(phase.name, clauses, facts, directories))
+        phases.append(SummaryPhase(phase.name, clauses, facts, directories, flagged))
     headline = f"Finished in {duration_text(elapsed)}: {run_totals(counts)}"
     return Summary(headline, tuple(phases), written_root, tuple(written), next_command)
 

@@ -55,6 +55,7 @@ from tests.conftest import (
     make_experiment,
     phase_study,
     run_log_text,
+    single_trial_confound,
     stub_run_command,
     trial_outcome,
     write_constant_trainer,
@@ -1066,6 +1067,108 @@ def test_summary_counts_the_trials_toward_n_trials_and_names_interrupted_ones_ap
     )
     assert replay.render(200, color=False)[1].startswith(
         "Finished in 0.4s: nothing to run, 8 trials already finished"
+    )
+
+
+def _flagged_block(*names: str) -> dict[str, object]:
+    """Build a one-trial confound block whose checks ``names`` are flagged."""
+    block = single_trial_confound(0)
+    checks = block["checks"]
+    for name in names:
+        checks[name]["verdict"] = "heterogeneous"
+    return block
+
+
+def _flagged_summary(depth: tuple[str, ...], learning_rate: tuple[str, ...]) -> Summary:
+    """Build the starter's summary whose winners carry blocks that flag the named checks."""
+    winners = {
+        name: Winner(
+            trial_number=0,
+            params=STARTER_WINNERS[name].params,
+            effective_overrides={},
+            metric=0.3,
+            confound=_flagged_block(*flagged),
+        )
+        for name, flagged in (("depth", depth), ("learning_rate", learning_rate))
+    }
+    return summary(
+        _grid_experiment(),
+        elapsed=3.0,
+        counts={"depth": _counts(complete=2), "learning_rate": _counts(complete=2)},
+        winners=winners,
+        from_phase=None,
+        written_root="runs/x",
+        written=[],
+        next_command="phasesweep status c.yaml --trials",
+    )
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            80,
+            [
+                "  depth          2 complete",
+                "                 winner  trial 0  eval_loss 0.3  model.n_layers=8",
+                "                         flagged: survivorship (see show-winners)",
+                "  learning_rate  2 complete",
+                "                 winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003",
+                "                         flagged: evaluation_point, survivorship, tie (see",
+                "                                  show-winners)",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "  depth          2 complete",
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         model.n_layers=8",
+                "                         flagged: survivorship (see",
+                "                                  show-winners)",
+                "  learning_rate  2 complete",
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         optimizer.lr=0.0003",
+                "                         flagged: evaluation_point,",
+                "                                  survivorship, tie (see",
+                "                                  show-winners)",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_summary_names_the_checks_a_winners_selection_flagged(
+    width: int, expected: list[str]
+) -> None:
+    """A flagged winner gets one line under its facts naming each check and where to read more."""
+    block = _flagged_summary(("survivorship",), ("evaluation_point", "survivorship", "tie"))
+    lines = block.render(width, color=False)
+
+    assert lines[3:-2] == expected
+    assert all(len(line) <= width for line in lines)
+
+
+def test_summary_adds_no_flag_line_for_a_winner_without_flagged_checks() -> None:
+    """Clean checks, or no confound block at all, leave the winner's lines as they were."""
+    clean = _flagged_summary((), ())
+    assert not any("flagged" in line for line in clean.render(80, color=False))
+    assert not any(
+        "flagged" in line
+        for line in _summary_with_dirs(()).render(80, color=False)  # winners without a block
+    )
+
+
+def test_summary_paints_only_the_flag_label_yellow_on_a_terminal() -> None:
+    """The label is the warning style; redirected output carries no escape and the same text."""
+    block = _flagged_summary(("survivorship",), ())
+    styled = block.render(80, color=True)
+
+    assert (
+        "                         \x1b[33mflagged:\x1b[0m survivorship (see show-winners)" in styled
+    )
+    assert re.sub(r"\x1b\[[0-9;]*m", "", "\n".join(styled)) == "\n".join(
+        block.render(80, color=False)
     )
 
 
