@@ -1340,9 +1340,13 @@ def _trial_program_refusal(
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
     """
-    text = command.strip(" \t\n")
-    # An escaped first ampersand leaves a background operator in e.g. `trainer \&& true`.
-    control_text = re.sub(r"(?<!\\)&&", "", text)
+    text = command
+    if "#" not in text:
+        # The shell removes a continued newline without inserting a word boundary.
+        text = re.sub(r"(?<!\\)\\\n", "", text)
+    text = text.strip(" \t\n")
+    # Only an unescaped `&&` or descriptor duplication can account for a bare ampersand.
+    control_text = re.sub(r"(?<!\\)(?:&&|[<>]&(?:[0-9]+|-)(?=$|[ \t<>]))", "", text)
     if any(char in control_text for char in "\n\r();|&`") or "${" in text:
         return None
     program = re.split(r"[ \t]", text, maxsplit=1)[0]
@@ -1369,7 +1373,8 @@ def _trial_program_refusal(
     source = (
         "the PATH the config's `env` sets"
         if path_from_config
-        else "the PATH the run starts with (for an MCP run, the PATH in the client's server entry)"
+        else "the PATH used to launch PhaseSweep (activate the environment containing the program "
+        "for CLI runs, or set PATH in the MCP server entry)"
     )
     return (
         f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",

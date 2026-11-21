@@ -58,12 +58,14 @@ def _with_target(experiment: Experiment, n_trials: int) -> Experiment:
     return experiment.model_copy(update={"phases": phases})
 
 
-def test_program_on_the_path_is_found(tmp_path: Path) -> None:
+@pytest.mark.parametrize("program", ["trainer", "trai\\\nner"])
+def test_program_on_the_path_is_found(tmp_path: Path, program: str) -> None:
     """A plain first word that an executable on PATH matches passes the program check."""
     _executable(tmp_path / "bin" / "trainer")
 
     assert (
-        _trial_program_refusal("trainer --lr 1", path=str(tmp_path / "bin"), cwd=tmp_path) is None
+        _trial_program_refusal(f"{program} --lr 1", path=str(tmp_path / "bin"), cwd=tmp_path)
+        is None
     )
 
 
@@ -79,8 +81,9 @@ def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
     message, remediation = refusal
     assert f"program {_MISSING!r} is not on the trainer's PATH (/nowhere:/also/nowhere)" in message
     assert remediation == (
-        "Put the program on the PATH the run starts with (for an MCP run, the PATH in the "
-        "client's server entry), or name it by absolute path in trial_command."
+        "Put the program on the PATH used to launch PhaseSweep (activate the environment containing "
+        "the program for CLI runs, or set PATH in the MCP server entry), or name it by absolute path "
+        "in trial_command."
     )
 
 
@@ -150,12 +153,15 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param(f"{_MISSING} --x 1 | tee out.log", id="pipe"),
         pytest.param(f"{_MISSING} --x 1 &", id="background"),
         pytest.param(rf"{_MISSING} \&& true", id="escaped-ampersand-before-background"),
+        pytest.param(rf"{_MISSING} \>&1", id="escaped-redirection-before-background"),
+        pytest.param(f"{_MISSING} &>out.log", id="non-posix-redirect-or-background"),
         pytest.param(f"{_MISSING} --x 1\ntrue", id="newline-between-commands"),
         pytest.param(
             f'{_MISSING} "$(echo "\'")" || echo "$(echo "\'")"',
             id="fallback-after-nested-quotes-in-command-substitution",
         ),
-        pytest.param(f"{_MISSING} \\\n  --x 1", id="continued-command"),
+        pytest.param(f"{_MISSING} # \\\ntrue", id="backslash-in-comment"),
+        pytest.param(f"{_MISSING} \\\\\ntrue", id="escaped-backslash-before-newline"),
         pytest.param(f"{_MISSING} --x 1 # don't\ntrue # it's", id="comment-quotes-span-lines"),
     ],
 )
@@ -171,6 +177,8 @@ def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) 
         pytest.param(f"{_MISSING} --note 'a b'", id="quoted-argument"),
         pytest.param(f"{_MISSING} --lr $LR", id="parameter-argument"),
         pytest.param(f"{_MISSING} >out.log", id="redirection"),
+        pytest.param(f"{_MISSING} >out.log 2>&1", id="file-descriptor-duplication"),
+        pytest.param(f"{_MISSING} \\\n  --x 1", id="continued-command"),
         pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
         pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
         pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
@@ -207,7 +215,8 @@ def test_cohort_refusal_comes_before_the_program_check(monkeypatch: pytest.Monke
 def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path: Path) -> None:
     """A launch whose program PATH lacks is refused before it binds the tree or opens a ledger."""
     experiment = make_experiment(
-        persistent=tmp_path, trial_command=f"{_MISSING} --note 'a b' {{overrides}}"
+        persistent=tmp_path,
+        trial_command=f"{_MISSING} --note 'a b' \\\n  {{overrides}} >out.log 2>&1",
     )
 
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on") as caught:

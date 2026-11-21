@@ -87,8 +87,9 @@ def test_fingerprint_refusal_on_an_existing_tree_reports_preflight(
     [
         pytest.param(
             "program_missing",
-            "Put the program on the PATH the run starts with (for an MCP run, the PATH in the "
-            "client's server entry), or name it by absolute path in trial_command.",
+            "Put the program on the PATH used to launch PhaseSweep (activate the environment "
+            "containing the program for CLI runs, or set PATH in the MCP server entry), or name "
+            "it by absolute path in trial_command.",
             id="program_missing",
         ),
         pytest.param(
