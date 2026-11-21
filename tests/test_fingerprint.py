@@ -26,6 +26,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     PublishedStudyMissingError,
     RunRequestError,
+    StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -63,7 +64,7 @@ from phasesweep.engine.state import (
     WinnerSource,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+from phasesweep.errors import FRESH_STUDY, OperatorAction, ProcessCleanupUncertainError
 from phasesweep.evidence.models import JsonEqualsGate, LogRegexExtractor, WandbExtractor
 from phasesweep.runtime.files import (
     atomic_text_writer,
@@ -831,8 +832,17 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     topped_up_parent = experiment.phases[0].model_copy(update={"n_trials": 2})
     topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
 
-    with pytest.raises(RuntimeError, match="dependent phase study.*new experiment name"):
+    with pytest.raises(
+        StudyContextConflictError, match="dependent phase study.*inheritance"
+    ) as refused:
         run_experiment(topped_up)
+
+    # The one rename step comes first, naming the dependent, then the new experiment name.
+    assert refused.value.remediation == (
+        "To run the larger budget, give the phase, and each phase that inherits it (`lr`), a new "
+        "`name`, updating every `inherits` to match; each renamed phase starts a new study and "
+        f"runs again, and every other phase keeps its results. To rerun every phase, {FRESH_STUDY}."
+    )
 
     parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials
     assert len(parent_after) == len(parent_before) == 1
