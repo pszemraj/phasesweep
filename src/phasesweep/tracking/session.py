@@ -114,11 +114,12 @@ def record_name(path: Path) -> str:
         return f"the summary-run creation record of generation {path.parent.name}"
     if path.name.endswith(_PENDING_SUFFIX):
         # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
-        _, generation, attempt = path.parent.name.split("__")
-        return (
-            f"the run-creation record of attempt {attempt.removeprefix('attempt_')} of "
-            f"generation {generation.removeprefix('generation_')}"
+        # The markers fix the parse, as a generation id may hold "__" itself: an MCP run's is
+        # named after its catalog id, which may. An attempt id is hex.
+        generation, _, attempt = path.parent.name.partition("__generation_")[2].rpartition(
+            "__attempt_"
         )
+        return f"the run-creation record of attempt {attempt} of generation {generation}"
     generation = path.parent.parent.name
     if path.stem == "generation":
         return f"the summary record of generation {generation}"
