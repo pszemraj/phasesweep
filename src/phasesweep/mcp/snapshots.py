@@ -215,14 +215,20 @@ class SurvivorshipSummary(_SnapshotModel):
 
 
 class TieSummary(_SnapshotModel):
-    """Whether the winner stands clear of ranked units that used other params.
+    """Whether draw order or seed noise could have decided the winner.
 
-    A unit is a trial, or a complete repeat group in a repeats phase.
+    Without repeats, ok only means no other configuration matched the winner's value
+    exactly; it says nothing about the margin. With repeats, it also flags groups within
+    two standard errors of the winning group. A unit is a trial, or a complete repeat group
+    in a repeats phase.
     """
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
     remedy: str | None = Field(
-        description="Configuration-first noise guidance for a flagged tie between single trials; otherwise null."
+        description=(
+            "For a flagged exact tie between single trials, what draw order decided and how to "
+            "separate the configurations, distinct values first; otherwise null."
+        )
     )
     tied_trials: NonNegativeInt | None = Field(
         description=(

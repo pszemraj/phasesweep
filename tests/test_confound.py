@@ -521,9 +521,15 @@ def test_tie_between_distinct_params_is_heterogeneous() -> None:
         "detail": {"tied_trials": [1], "within_noise": None},
     }
     (line,) = _describe_flagged(block, winner_trial=0)
-    assert "trial(s) 1 matched" in line
-    assert "No noise estimate" in line
-    assert "phases[].repeats" in line
+    assert line == (
+        "tie: trial(s) 1 matched the winner's value exactly with different params. The tied "
+        "configurations scored identically, so draw order chose the winner that later phases "
+        "inherit. First compare more distinct values and inspect trends across neighboring "
+        "configurations. Use phases[].repeats for a few discrete finalists or an explicit "
+        "noise check."
+    )
+    # Distinct values come before seeds.
+    assert line.index("distinct values") < line.index("phases[].repeats")
 
 
 def test_noise_remedy_accompanies_only_a_flagged_tie() -> None:

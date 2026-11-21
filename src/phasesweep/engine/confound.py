@@ -759,7 +759,7 @@ def _describe_flagged(
             tied = ", ".join(str(number) for number in detail["tied_trials"])
             lines.append(
                 f"tie: trial(s) {tied} matched the winner's value exactly with different "
-                "params, and the lower draw position won. " + _noise_remedy()
+                "params. " + _noise_remedy()
             )
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
@@ -879,15 +879,15 @@ def _evaluation_point_remedy(kind: str, *, axis: str = "step") -> str:
 
 
 def _noise_remedy() -> str:
-    """Return guidance when the selected configurations carry no repeat noise estimate.
+    """Return guidance for an exact tie between configurations measured once each.
 
     :return str: Configuration-comparison guidance shared by winner output and MCP results.
     """
     return (
-        "No noise estimate: one trial per configuration leaves the size of the gap uncertain. "
-        "First compare more distinct values and inspect trends across neighboring "
-        "configurations. Use phases[].repeats for a few discrete finalists or an explicit "
-        "noise check."
+        "The tied configurations scored identically, so draw order chose the winner that "
+        "later phases inherit. First compare more distinct values and inspect trends across "
+        "neighboring configurations. Use phases[].repeats for a few discrete finalists or an "
+        "explicit noise check."
     )
 
 
