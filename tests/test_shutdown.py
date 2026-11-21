@@ -614,18 +614,18 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
         (
             signal.SIGINT,
             1,
-            "Interrupted (SIGINT): stopping 1 running trial and waiting for it to exit.",
+            "Interrupted (SIGINT): stopping 1 trial and waiting for it to exit.",
         ),
         (
             signal.SIGTERM,
             3,
-            "Interrupted (SIGTERM): stopping 3 running trials and waiting for them to exit.",
+            "Interrupted (SIGTERM): stopping 3 trials and waiting for them to exit.",
         ),
         (signal.SIGHUP, 0, "Interrupted (SIGHUP): no trainer is running."),
         (
             99,
             2,
-            "Interrupted (signal 99): stopping 2 running trials and waiting for them to exit.",
+            "Interrupted (signal 99): stopping 2 trials and waiting for them to exit.",
         ),
     ],
 )

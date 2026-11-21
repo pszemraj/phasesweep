@@ -141,7 +141,7 @@ def _interrupt_text(signum: int, running: int) -> str:
 
     :param int signum: Shutdown signal number.
     :param int running: Process groups of running trainers the signal will stop.
-    :return str: For example ``Interrupted (SIGINT): stopping 2 running trials.``
+    :return str: For example ``Interrupted (SIGINT): stopping 2 trials and waiting for them to exit.``
     """
     try:
         name = signal.Signals(signum).name
@@ -150,10 +150,10 @@ def _interrupt_text(signum: int, running: int) -> str:
     if running == 0:
         return f"Interrupted ({name}): no trainer is running."
     # A trainer that ignores SIGTERM keeps the run silent until its grace period ends, so the
-    # line says the run is waiting.
+    # line says the run is waiting. It stays short enough for one line of an 80-column terminal.
     pronoun = "it" if running == 1 else "them"
     return (
-        f"Interrupted ({name}): stopping {plural(running, 'running trial')} "
+        f"Interrupted ({name}): stopping {plural(running, 'trial')} "
         f"and waiting for {pronoun} to exit."
     )
 
