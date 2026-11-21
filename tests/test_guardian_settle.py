@@ -268,13 +268,13 @@ def test_a_helper_that_exits_within_the_settle_keeps_the_roots_exit(
 
 
 def test_a_trials_time_ends_when_its_root_exits(tmp_path: Path) -> None:
-    """A root that exits at once and leaves a helper alive for a second reports its own short time, in the result and in the lifecycle record."""
+    """A root that exits at once and leaves a helper alive for three seconds reports its own short time, in the result and in the lifecycle record."""
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
     trial_dir = tmp_path / "time"
 
     started = time.monotonic()
     result = _supervise(
-        trial_dir, [sys.executable, str(trainer), str(marks), "1.0", "0"], timeout=30.0
+        trial_dir, [sys.executable, str(trainer), str(marks), "3.0", "0"], timeout=30.0
     )
     elapsed = time.monotonic() - started
 
@@ -282,8 +282,8 @@ def test_a_trials_time_ends_when_its_root_exits(tmp_path: Path) -> None:
     assert (marks / "helper_done").exists(), "the guardian did not wait for the helper"
     lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=trial_dir.name)
     assert lifecycle is not None and lifecycle.duration_seconds is not None
-    assert result.duration_seconds < elapsed - 1.0
-    assert lifecycle.duration_seconds < elapsed - 1.0
+    assert elapsed - result.duration_seconds > 2.0
+    assert elapsed - lifecycle.duration_seconds > 2.0
 
 
 def _named_command(marks: Path) -> str:
