@@ -756,6 +756,8 @@ class _PhaseExecution:
     aborted: bool = False
     # Set once an outcome carrying this execution's abort record is durable.
     abort_recorded: bool = False
+    # An outcome write could not be verified, so the next completion sequence is unknown.
+    unconfirmed_outcome: StudyStorageUnavailableError | None = None
     deadline_exhausted: bool = False
     # Retain the first fatal worker exception for propagation after all workers drain.
     fatal_error: BaseException | None = None
@@ -903,6 +905,25 @@ def _refuse_launch_during_shutdown() -> None:
         raise TrialExecutionError(launch_refusal_text(signum))
 
 
+def _outcome_recording_error(
+    run: _PhaseExecution, trial: optuna.Trial, detail: str
+) -> StudyStorageUnavailableError:
+    """Explain why a trial must remain RUNNING for stale-attempt recovery.
+
+    :param _PhaseExecution run: Phase execution whose study owns the trial.
+    :param optuna.Trial trial: Trial whose terminal outcome could not be confirmed.
+    :param str detail: Cause of the write or readback failure.
+    :return StudyStorageUnavailableError: The operator refusal carried out of optimization.
+    """
+    return StudyStorageUnavailableError(
+        f"Could not confirm the terminal outcome for trial {trial.number} "
+        f"in study {run.study.study_name!r} {detail}. Trial {trial.number} "
+        "was deliberately left RUNNING, with its durable attempt record intact. "
+        "Once the ledger is accessible, the next run recovers the attempt before allocating "
+        "new work."
+    )
+
+
 def _record_outcome(
     run: _PhaseExecution,
     trial: optuna.Trial,
@@ -914,7 +935,8 @@ def _record_outcome(
     """Persist an outcome and its abort decision before the trial becomes terminal.
 
     Sequence numbers follow lock-acquisition order, independent of trial number.
-    Retries rebuild the payload under the lock; backoff releases the lock.
+    Read back a failed write under the lock before another writer can assign its sequence.
+    Only a confirmed absent outcome retries with a new decision after backoff.
     Already-recorded trials are ignored. A later success cannot clear an abort.
 
     :param _PhaseExecution run: Phase execution whose counters advance after the durable write.
@@ -922,8 +944,8 @@ def _record_outcome(
     :param str outcome: ``success``, ``failure``, ``interrupted``, or ``fatal``.
     :param str | None cause: Optional explanation stored in the outcome.
     :param str | None fatal_policy: Optional policy stored in the outcome and fatal abort.
-    :raises _TrialLeftRunning: Retries exhausted; leave the trial RUNNING and stop
-        launches for stale-attempt recovery, carrying ``StudyStorageUnavailableError``.
+    :raises _TrialLeftRunning: Retries exhausted or an outcome remains unconfirmed; leave
+        the trial RUNNING and stop launches for stale-attempt recovery.
     """
     write_error: Exception | None = None
     abort_record: JsonObject | None = None
@@ -933,6 +955,8 @@ def _record_outcome(
         with run.outcome_lock:
             if trial.number in run.recorded_outcomes:
                 return
+            if run.unconfirmed_outcome is not None:
+                raise _TrialLeftRunning(run.unconfirmed_outcome)
             abort_record = run.abort_decision(
                 trial.number, outcome, cause=cause, fatal_policy=fatal_policy
             )
@@ -947,7 +971,29 @@ def _record_outcome(
                 trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
             except Exception as exc:
                 write_error = exc
-                continue
+                # Trial.user_attrs comes from Optuna's local cache, which a failed
+                # acknowledgment may leave behind the journal.
+                stored: object
+                try:
+                    stored = run.study._storage.get_trial(trial._trial_id).user_attrs.get(
+                        TRIAL_OUTCOME_ATTR
+                    )
+                except Exception as read_error:
+                    stored = None
+                    detail = f"readback failed ({type(read_error).__name__}: {read_error})"
+                else:
+                    if stored is None:
+                        continue
+                    detail = "readback found a different outcome"
+                if stored != payload:
+                    run.unconfirmed_outcome = _outcome_recording_error(
+                        run,
+                        trial,
+                        f"after its write failed ({type(exc).__name__}: {exc}) and {detail}",
+                    )
+                    unconfirmed = _TrialLeftRunning(run.unconfirmed_outcome)
+                    run.record_fatal(unconfirmed)
+                    raise unconfirmed from exc
 
             write_error = None
             run.advance(trial.number, outcome)
@@ -958,15 +1004,11 @@ def _record_outcome(
             break
     if write_error is not None:
         unrecorded = _TrialLeftRunning(
-            StudyStorageUnavailableError(
-                f"Could not persist the terminal outcome for trial {trial.number} "
-                f"in study {run.study.study_name!r} after {_OUTCOME_WRITE_ATTEMPTS} "
-                f"attempts ({type(write_error).__name__}: {write_error}). Trial "
-                f"{trial.number} was deliberately left RUNNING, with its durable "
-                "attempt record intact, so no finished trial exists without its "
-                "outcome record. Once storage accepts writes again, the next run "
-                "recovers it through the standard stale-attempt protocol, which "
-                "records its outcome before marking the trial FAIL."
+            _outcome_recording_error(
+                run,
+                trial,
+                f"after {_OUTCOME_WRITE_ATTEMPTS} write attempts "
+                f"({type(write_error).__name__}: {write_error})",
             )
         )
         run.record_fatal(unrecorded)
