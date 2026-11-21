@@ -358,6 +358,7 @@ def _save_attempt_intents(
     from optuna.trial import TrialState
 
     from phasesweep.engine.attempts import _trial_requires_cleanup_recovery
+    from phasesweep.engine.paths import _attempts_dir
     from phasesweep.engine.state import _trial_interrupted
 
     paths: list[Path] = []
@@ -365,9 +366,17 @@ def _save_attempt_intents(
         found = trials.get(binding["attempt_id"])
         name = f"attempt-{binding['attempt_id']}"
         if found is None:
-            if ended is not None and not experiment.persistent and binding["run_mode"] == "managed":
+            entry = _attempts_dir(experiment) / f"{binding['attempt_id']}.json"
+            if (
+                ended is not None
+                and not experiment.persistent
+                and binding["run_mode"] == "managed"
+                and not entry.exists()
+            ):
                 # An in-memory ledger ended with the invocation that held the trial, so no
-                # outcome but that invocation's status can ever reach the run.
+                # outcome but that invocation's status can ever reach the run. A registry
+                # entry means the attempt's cleanup is unconfirmed and its trainer may still
+                # log to the run, so it waits for the run that retires the entry.
                 projection = _unaccepted_projection(binding, ended)
                 paths.append(
                     _save_intent(experiment, generation_id, name, binding, projection, finish=ended)

@@ -829,8 +829,10 @@ def _registry_attempt_fail_stale_trial(
         return "recovered"
     storage_url = entry["storage_locator"]
     if storage_url is None:
-        # In-memory storage died with its orchestrator; nothing to update.
+        # In-memory storage died with its orchestrator, so no trial is left to update. The
+        # attempt's cleanup is confirmed here, which is what lets its managed run be ended.
         resolve()
+        report.settled_generations.add(entry["generation_id"])
         return "terminal"
     try:
         study = open_registry_study(storage_url, entry["study_name"])

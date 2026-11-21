@@ -1088,25 +1088,26 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
 def test_a_killed_in_memory_sweeps_attempt_runs_end_with_its_summary_run(
     tmp_path, monkeypatch, caller
 ):
-    """An in-memory sweep killed outright has its managed attempt runs ended KILLED with its summary run.
+    """An in-memory sweep killed outright has its managed attempt runs ended KILLED once their cleanup is confirmed.
 
     Its trials were gone with the process, so nothing else could ever end those runs. The next
-    run or sync-tracking ends each once, and a later run or sync sends nothing more of it.
+    run's preflight confirms the attempts' cleanup, so that run ends them with the summary run.
+    sync-tracking confirms no trainer's cleanup: it ends the summary run and leaves each attempt,
+    whose trainer may still log to its run, to the next run. Each outcome is sent once.
     """
     experiment, uploads, attempts = killed_sweep(tmp_path, monkeypatch, n_jobs=2, persistent=False)
     [killed] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
     uploads.clear()
 
-    if caller == "next-run":
-        run_experiment(experiment)
-    else:
-        assert publication.sync_tracking(experiment) == {"delivered": 3, "pending": 0}
+    if caller == "sync-tracking":
+        assert publication.sync_tracking(experiment) == {"delivered": 1, "pending": 0}
+        assert _sent(uploads, attempts) == []
+    run_experiment(experiment)
 
     assert _sent(uploads, attempts) == ["KILLED", "KILLED"]
     assert [entry for entry in _summaries(uploads) if entry[0] == killed] == [(killed, "KILLED")]
     uploads.clear()
-    if caller == "next-run":
-        run_experiment(experiment)
+    run_experiment(experiment)
     publication.sync_tracking(experiment)
     assert _sent(uploads, attempts) == []
     assert [entry for entry in _summaries(uploads) if entry[0] == killed] == []
