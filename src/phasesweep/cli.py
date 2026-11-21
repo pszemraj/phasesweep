@@ -53,9 +53,9 @@ from phasesweep.engine.paths import (
     _generation_dir,
     _generation_summary_path,
     _generation_winner_path,
-    _phase_dir,
     _run_log_path,
     _trial_dir_for,
+    _trials_csv_path,
 )
 from phasesweep.engine.preview import validate_trial_targets
 from phasesweep.engine.provenance import (
@@ -766,7 +766,7 @@ def _closing_block(
     root = _experiment_dir(config)
     candidates = [
         _generation_summary_path(config, outcome.generation_id),
-        *(_phase_dir(config, phase.name) / "trials.csv" for phase in config.phases),
+        *(_trials_csv_path(config, phase.name) for phase in config.phases),
     ]
     written = [
         path.relative_to(root).as_posix()

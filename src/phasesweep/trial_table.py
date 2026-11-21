@@ -14,6 +14,7 @@ from typing import TypeGuard
 
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.config.search import CategoricalParam, SearchParam, sampler_search_space
+from phasesweep.engine.paths import TRIALS_CSV_FILENAME
 from phasesweep.engine.read import (
     _REPEAT_GROUP_COLUMN,
     _RERUN_OF_COLUMN,
@@ -416,7 +417,7 @@ def _phase_lines(
         count = "trial data unavailable"
     elif csv_root is not None:
         count = "no trial ledger (storage: null)"
-        snapshot = csv_root / table.phase / "trials.csv"
+        snapshot = csv_root / table.phase / TRIALS_CSV_FILENAME
         if snapshot.is_file():
             notes.append(f"the trials of this phase's last run are in {display_path(snapshot)}")
     elif not table.rows:
