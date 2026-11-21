@@ -343,7 +343,7 @@ def test_in_memory_trial_table_points_at_the_last_runs_csv(
 
     assert (tmp_path / "runs" / experiment.experiment / "p" / "trials.csv").is_file()
     lines = capsys.readouterr().out.splitlines()
-    heading = lines.index("p: storage: null keeps no trial ledger, objective (lower is better)")
+    heading = lines.index("p: no trial ledger (storage: null), objective (lower is better)")
     assert lines[heading + 1] == (
         f"  the trials of this phase's last run are in runs/{experiment.experiment}/p/trials.csv"
     )

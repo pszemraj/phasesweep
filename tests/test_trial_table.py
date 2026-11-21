@@ -232,12 +232,46 @@ def test_storage_null_names_the_last_runs_csv_when_one_exists(
     (tmp_path / "runs" / "depth" / "trials.csv").write_text("number\n", encoding="utf-8")
     with_csv = _render(tables, phase, csv_root=tmp_path / "runs")
 
-    heading = "depth: storage: null keeps no trial ledger, eval_loss (lower is better)"
+    heading = "depth: no trial ledger (storage: null), eval_loss (lower is better)"
     assert without.splitlines()[3:] == [heading]
     assert with_csv.splitlines()[3:] == [
         heading,
         "  the trials of this phase's last run are in runs/depth/trials.csv",
     ]
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            80,
+            ["learning_rate: no trial ledger (storage: null), eval_loss (lower is better)"],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "learning_rate: no trial ledger (storage: null), eval_loss",
+                "  (lower is better)",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_storage_null_heading_wraps_to_the_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, expected: list[str]
+) -> None:
+    """The heading keeps the phase name, the explanation and the objective, and wraps under an indent."""
+    monkeypatch.chdir(tmp_path)
+    phase = _phase(
+        "learning_rate", **{"optimizer.lr": FloatParam(type="float", low=1e-4, high=1e-3)}
+    )
+    tables = _tables(_table("learning_rate", []), represented=None, published=None)
+
+    rendered = _render(tables, phase, width=width, csv_root=tmp_path / "runs")
+
+    assert rendered.splitlines()[3:] == expected
+    assert all(len(line) <= width for line in rendered.splitlines())
 
 
 def test_repeat_groups_mark_every_member_of_the_winning_group() -> None:

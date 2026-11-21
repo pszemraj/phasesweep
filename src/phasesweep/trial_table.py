@@ -402,7 +402,7 @@ def _phase_lines(
     if not table.available:
         count = "trial data unavailable"
     elif csv_root is not None:
-        count = "storage: null keeps no trial ledger"
+        count = "no trial ledger (storage: null)"
         snapshot = csv_root / table.phase / "trials.csv"
         if snapshot.is_file():
             notes.append(f"the trials of this phase's last run are in {display_path(snapshot)}")
