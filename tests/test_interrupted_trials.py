@@ -352,8 +352,7 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
     assert "p  3 trials to run, 1 of them a rerun, 1 at a time" in lines
     assert f"p  trial 1  RERUN of trial 0  reason: {_STALE_CAUSE}" in lines
     (rerun_line,) = (line for line in lines if line.startswith("p  trial 1  COMPLETE  "))
-    assert "  1/3  " in rerun_line
-    assert rerun_line.endswith("  rerun of 0")
+    assert "  1/3  " in rerun_line and rerun_line.endswith("  rerun of 0")
     with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["state"] for row in rows] == ["INTERRUPTED", "COMPLETE", "COMPLETE", "COMPLETE"]
