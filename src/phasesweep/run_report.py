@@ -504,6 +504,17 @@ def _value_lines(row: BannerRow, room: int, *, color: bool) -> list[str]:
     return [paint(line, "path", color=color) if row.is_path else line for line in lines]
 
 
+def _hanging(lead: str, visible: int, values: Sequence[str]) -> list[str]:
+    """Put ``lead`` before the first value and blanks as wide as it before each later one.
+
+    :param str lead: Text before the first value, possibly styled.
+    :param int visible: Columns ``lead`` takes on screen, its escape sequences not counted.
+    :param Sequence[str] values: The value's lines, without the lead.
+    :return list[str]: The lines, every later one hanging under the first value.
+    """
+    return [(lead if index == 0 else " " * visible) + value for index, value in enumerate(values)]
+
+
 @dataclass(frozen=True)
 class Banner:
     """What a run is about to do: the experiment, its phases and where everything goes."""
@@ -546,12 +557,11 @@ class Banner:
         :param bool color: Whether to style the label and a path.
         :return list[str]: The row's lines.
         """
-        values = _value_lines(row, room, color=color)
-        pad = " " * (len(INDENT) + _BANNER_LABEL_WIDTH)
-        return [
-            (_label_column(row.label, color=color) if index == 0 else pad) + value
-            for index, value in enumerate(values)
-        ]
+        return _hanging(
+            _label_column(row.label, color=color),
+            len(INDENT) + _BANNER_LABEL_WIDTH,
+            _value_lines(row, room, color=color),
+        )
 
 
 def _gpu_fact(phase: Phase) -> str:
@@ -785,14 +795,11 @@ class LogLine:
         :return list[str]: The lines of the log line.
         """
         label = "log:"
-        pad = " " * (len(label) + 1)
+        taken = len(label) + 1
         values = _value_lines(
-            BannerRow("log", self.path, is_path=True), max(width - len(pad), 20), color=color
+            BannerRow("log", self.path, is_path=True), max(width - taken, 20), color=color
         )
-        return [
-            (paint(label, "label", color=color) + " " if index == 0 else pad) + value
-            for index, value in enumerate(values)
-        ]
+        return _hanging(paint(label, "label", color=color) + " ", taken, values)
 
 
 def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:
