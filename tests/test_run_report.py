@@ -170,8 +170,8 @@ def test_trial_params_share_the_line_only_when_it_fits(experiment: Experiment) -
             [
                 "12:00:00  depth          trial 3  FAIL  0.5s  3/4  model.n_layers=8",
                 "                         reason: non-zero exit code 1; stderr:",
-                "                         torch.OutOfMemoryError: CUDA out of memory. Tried to",
-                "                         allocate 2.00 GiB",
+                "                                 torch.OutOfMemoryError: CUDA out of memory.",
+                "                                 Tried to allocate 2.00 GiB",
             ],
             id="80",
         ),
@@ -181,9 +181,10 @@ def test_trial_params_share_the_line_only_when_it_fits(experiment: Experiment) -
                 "12:00:00  depth          trial 3  FAIL  0.5s  3/4",
                 "                         model.n_layers=8",
                 "                         reason: non-zero exit code 1;",
-                "                         stderr: torch.OutOfMemoryError:",
-                "                         CUDA out of memory. Tried to",
-                "                         allocate 2.00 GiB",
+                "                                 stderr:",
+                "                                 torch.OutOfMemoryError:",
+                "                                 CUDA out of memory. Tried",
+                "                                 to allocate 2.00 GiB",
             ],
             id="60",
         ),
@@ -192,7 +193,7 @@ def test_trial_params_share_the_line_only_when_it_fits(experiment: Experiment) -
 def test_failed_trial_wraps_its_reason_to_the_terminal(
     experiment: Experiment, width: int, expected: list[str]
 ) -> None:
-    """A failure has no objective, and its cause wraps under the text without overrunning."""
+    """A failure has no objective, and its cause hangs under the text after ``reason:``."""
     failed = trial_line(
         experiment,
         experiment.phases[0],
@@ -267,12 +268,20 @@ def test_rerun_and_skipped_lines(experiment: Experiment) -> None:
     assert console(rerun_line(experiment, depth, number=5, source=3, reason=None)) == [
         "12:00:00  depth          trial 5  RERUN of trial 3"
     ]
+    assert console(rerun_line(experiment, depth, number=4, source=2, reason=OOM), 60) == [
+        "12:00:00  depth          trial 4  RERUN of trial 2",
+        "                         reason: non-zero exit code 1;",
+        "                                 stderr:",
+        "                                 torch.OutOfMemoryError:",
+        "                                 CUDA out of memory. Tried",
+        "                                 to allocate 2.00 GiB",
+    ]
 
     skipped = skipped_line(experiment, depth, "no published or required winner")
     assert console(skipped) == ["12:00:00  depth          skipped: no published or required winner"]
     assert console(skipped, 60) == [
         "12:00:00  depth          skipped: no published or required",
-        "                         winner",
+        "                                  winner",
     ]
     assert str(skipped) == "depth  skipped: no published or required winner"
 
@@ -484,25 +493,57 @@ def test_prose_report_lines_wrap_to_the_terminal(
     assert str(_HOST_LOCK_WAIT).startswith("Waiting for a GPU: another process holds its lock")
 
 
-def test_a_warning_wraps_under_its_label(redirect_stderr: Callable[..., FakeStderr]) -> None:
-    """A long warning wraps to the terminal with a hanging indent under ``warning:``."""
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            80,
+            [
+                "12:00:00  warning: [learning_rate] only 1 of 2 grid cells succeeded; the winner",
+                "                   was chosen without a successful trial for: {'optimizer.lr':",
+                "                   0.0003}.",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "12:00:00  warning: [learning_rate] only 1 of 2 grid cells",
+                "                   succeeded; the winner was chosen without",
+                "                   a successful trial for: {'optimizer.lr':",
+                "                   0.0003}.",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_a_warning_wraps_under_the_text_after_its_label(
+    redirect_stderr: Callable[..., FakeStderr],
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    expected: list[str],
+) -> None:
+    """A long warning wraps to the terminal, every later line hanging under the text, not the label."""
     stderr = redirect_stderr()
+    monkeypatch.setenv("COLUMNS", str(width))
     message = (
         "[learning_rate] only 1 of 2 grid cells succeeded; the winner was chosen without a "
         "successful trial for: {'optimizer.lr': 0.0003}."
     )
     handler = ConsoleHandler()
     handler.handle(record("phasesweep.engine.selection", logging.WARNING, message))
-    assert stderr.getvalue() == (
-        "12:00:00  warning: [learning_rate] only 1 of 2 grid cells succeeded; the winner\n"
-        "          was chosen without a successful trial for: {'optimizer.lr': 0.0003}.\n"
-    )
+    assert stderr.getvalue().splitlines() == expected
+    assert all(len(line) <= width for line in expected)
     stderr.truncate(0)
     stderr.seek(0)
     handler.handle(
         record("phasesweep.engine.phase", logging.ERROR, "phase=%s ABORTED: %s", "p", "x")
     )
     assert stderr.getvalue() == "12:00:00  error: phase=p ABORTED: x\n"
+    stderr.truncate(0)
+    stderr.seek(0)
+    handler.handle(record("phasesweep.engine.phase", logging.ERROR, "first line\nsecond line"))
+    assert stderr.getvalue() == "12:00:00  error: first line\n                 second line\n"
 
 
 def test_a_failure_record_prints_no_traceback(redirect_stderr: Callable[..., FakeStderr]) -> None:

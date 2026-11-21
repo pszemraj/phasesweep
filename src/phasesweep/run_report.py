@@ -38,6 +38,7 @@ from phasesweep.runtime.terminal import (
     plural,
     significant,
     wrap,
+    wrap_labeled,
 )
 
 report = logging.getLogger(REPORT_LOGGER)
@@ -92,18 +93,6 @@ def _lay_out_clauses(label: str, label_width: int, clauses: Sequence[str], width
     """
     lead = f"{label:<{label_width}}{GAP}"
     return hang(lead, pack(clauses, width - len(lead), separator=", "))
-
-
-def _reason_lines(reason: str, label_width: int, width: int) -> list[str]:
-    """Wrap a trial's cause under the text of its line.
-
-    :param str reason: The cause, first line of the recorded outcome.
-    :param int label_width: Width of the label column the text is indented past.
-    :param int width: Columns available to each line.
-    :return list[str]: The wrapped lines, each indented past the label column.
-    """
-    pad = " " * (label_width + len(GAP))
-    return wrap(f"reason: {reason}", width, indent=pad, subsequent_indent=pad)
 
 
 @dataclass(frozen=True)
@@ -184,7 +173,8 @@ class FactLine(ReportBlock):
                 lines[0], word, style, start=self.label_width + len(GAP), color=color
             )
         if self.reason:
-            lines.extend(_reason_lines(self.reason, self.label_width, width))
+            pad = " " * (self.label_width + len(GAP))
+            lines.extend(wrap_labeled("reason:", self.reason, width, indent=pad))
         return lines
 
     def __str__(self) -> str:
@@ -214,7 +204,7 @@ class SkippedLine(ReportBlock):
         :return list[str]: The wrapped lines.
         """
         lead = f"{self.phase:<{self.label_width}}{GAP}"
-        return wrap(f"skipped: {self.why}", width, indent=lead, subsequent_indent=" " * len(lead))
+        return hang(lead, wrap_labeled("skipped:", self.why, width - len(lead)))
 
     def __str__(self) -> str:
         """Return the phase name and why it is skipped on one line.

@@ -21,6 +21,7 @@ from phasesweep.runtime.terminal import (
     terminal_width,
     use_color,
     wrap,
+    wrap_labeled,
 )
 
 _PACKAGE_LOGGER = "phasesweep"
@@ -127,11 +128,8 @@ def _diagnostic(record: logging.LogRecord, width: int, color: bool) -> list[str]
     :param bool color: Whether to style the label.
     :return list[str]: The wrapped lines; a message line break starts a new wrapped paragraph.
     """
-    label = "error" if record.levelno >= logging.ERROR else "warning"
-    style: Style = "error" if label == "error" else "warning"
-    paragraphs = record.getMessage().splitlines() or [""]
-    lines = wrap(f"{label}: {paragraphs[0]}", width)
-    for paragraph in paragraphs[1:]:
-        lines.extend(wrap(paragraph, width) or [""])
-    lines[0] = paint_word(lines[0], f"{label}:", style, color=color)
+    label = "error:" if record.levelno >= logging.ERROR else "warning:"
+    style: Style = "error" if label == "error:" else "warning"
+    lines = wrap_labeled(label, record.getMessage(), width)
+    lines[0] = paint_word(lines[0], label, style, color=color)
     return lines

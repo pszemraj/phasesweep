@@ -32,11 +32,11 @@ from phasesweep.runtime.terminal import (
     param_text,
     plural,
     wrap,
+    wrap_labeled,
 )
 
 #: The word that marks a winning row, and so the width of the leading marker column.
 _WINNER_WORD = "winner"
-_REASON_LABEL = "reason: "
 _REPEAT_GROUPS_HEADING = "Repeat groups (statistics include infeasible measured members):"
 _REPEAT_GROUPS_NOTE = (
     "Group numbers track the highest member trial number so far and can change as members arrive."
@@ -246,14 +246,7 @@ def _table_lines(
             lines.append(f"{INDENT}{blank}{body}")
         reason = reasons[index] if reasons else None
         if reason:
-            lines.extend(
-                wrap(
-                    f"{_REASON_LABEL}{reason}",
-                    width,
-                    indent=reason_indent,
-                    subsequent_indent=reason_indent + " " * len(_REASON_LABEL),
-                )
-            )
+            lines.extend(wrap_labeled("reason:", reason, width, indent=reason_indent))
     return lines
 
 

@@ -167,6 +167,20 @@ def test_wrap_labeled_hangs_every_later_line_and_paragraph_under_the_text() -> N
     assert wrap_labeled("fix:", "", 30) == ["fix:"]
 
 
+def test_wrap_labeled_indents_the_label_and_every_later_line_alike() -> None:
+    """An indent precedes the label and the text it hangs under, and counts toward the width."""
+    lines = wrap_labeled(
+        "reason:", "exited with code 3 before the metric file was written", 34, indent="    "
+    )
+
+    assert lines == [
+        "    reason: exited with code 3",
+        "            before the metric file",
+        "            was written",
+    ]
+    assert wrap_labeled("reason:", "", 34, indent="    ") == ["    reason:"]
+
+
 def test_directory_lines_name_a_shared_parent_once_and_fit_or_keep_whole() -> None:
     """Directories in one parent print it once; a width breaks at slashes, none keeps one line."""
     parent = "/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth"
