@@ -118,6 +118,7 @@ from phasesweep.runtime.terminal import (
     plural,
     terminal_width,
     use_color,
+    wrap,
 )
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
@@ -602,7 +603,14 @@ def run(
                     err=True,
                 )
             elif not dry_run:
-                click.echo(_resume_hint(config), err=True)
+                click.echo(
+                    _resume_hint(
+                        config,
+                        command=_rerun_command(config_path, settings, from_phase),
+                        width=terminal_width(sys.stderr),
+                    ),
+                    err=True,
+                )
             raise
         if not dry_run and finished:
             _print_block(
@@ -666,7 +674,6 @@ def _closing_block(
         for path in candidates
         if path.is_relative_to(root) and path.is_file() and path.stat().st_mtime >= wall_start
     ]
-    arguments = [str(config_path), *(part for item in settings for part in ("--set", item))]
     return summary(
         config,
         elapsed=elapsed,
@@ -675,25 +682,62 @@ def _closing_block(
         from_phase=from_phase,
         written_root=display_path(root),
         written=written,
-        next_command=shlex.join(["phasesweep", "status", *arguments, "--trials"]),
+        next_command=shlex.join(
+            ["phasesweep", "status", *_config_arguments(config_path, settings), "--trials"]
+        ),
     )
 
 
-def _resume_hint(config: Experiment) -> str:
+def _config_arguments(config_path: Path, settings: tuple[str, ...]) -> list[str]:
+    """List the arguments that name an experiment's config on a command line, as typed.
+
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :return list[str]: The path, then each ``--set`` and its assignment, ready for ``shlex.join``.
+    """
+    return [str(config_path), *(part for item in settings for part in ("--set", item))]
+
+
+def _rerun_command(config_path: Path, settings: tuple[str, ...], from_phase: str | None) -> str:
+    """Build the shell-quoted ``phasesweep run`` command that repeats an invocation.
+
+    Only what decides which trials run is repeated; ``--verbose`` changes the log alone.
+
+    :param Path config_path: The config path as typed.
+    :param tuple[str, ...] settings: The ``--set`` assignments as typed.
+    :param str | None from_phase: The ``--from-phase`` value, if given.
+    :return str: The command, quoted so it can be pasted into a shell.
+    """
+    return shlex.join(
+        [
+            "phasesweep",
+            "run",
+            *_config_arguments(config_path, settings),
+            *(() if from_phase is None else ("--from-phase", from_phase)),
+        ]
+    )
+
+
+def _resume_hint(config: Experiment, *, command: str, width: int) -> str:
     """Name the next step after a run was stopped by SIGINT, SIGHUP or SIGTERM.
 
     :param Experiment config: The config the stopped run was started with.
-    :return str: One line, printed last, so the cleanup log above it is not the final word.
+    :param str command: The shell-quoted command that repeats the run.
+    :param int width: Terminal columns the sentence wraps to; the command stays on one line.
+    :return str: The sentence, then the command on a line of its own, printed last so the
+        cleanup log above it is not the final word.
     """
     if config.persistent:
-        return (
+        sentence = (
             "phasesweep: stopped. Rerun the same command to resume: finished trials are kept "
             "and interrupted ones rerun first."
         )
-    return (
-        "phasesweep: stopped. Rerun the same command to start over: storage: null keeps no "
-        "completed trials."
-    )
+    else:
+        sentence = (
+            "phasesweep: stopped. Rerun the same command to start over: storage: null keeps no "
+            "completed trials."
+        )
+    return "\n".join([*wrap(sentence, width), command])
 
 
 def _command_config(path: Path, *, settings: tuple[str, ...]) -> Experiment:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -554,7 +555,8 @@ def test_a_stopped_run_ends_with_the_next_step_once(
         "no completed trials."
     )
     lines = harness.log.read_text().splitlines()
-    assert lines[-2] == expected
+    assert lines[-3] == expected
+    assert lines[-2] == shlex.join(["phasesweep", "run", str(config)])
     assert lines[-1].startswith("log: ") and lines[-1].endswith("run.log")
     assert lines.count(expected) == 1
     assert "Aborted." not in lines

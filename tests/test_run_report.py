@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import shlex
 import signal
 import sys
 import threading
@@ -15,7 +16,7 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.cli import _console_logging
+from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
 from phasesweep.engine.paths import _run_log_path
@@ -1045,8 +1046,127 @@ def test_the_log_path_comes_last_after_ctrl_c(
     assert invoke_cli_boundary(["run", str(config_path)], monkeypatch) == 128 + signal.SIGINT
 
     lines = capsys.readouterr().err.splitlines()
-    assert lines[-2].startswith("phasesweep: stopped. Rerun the same command to resume")
+    assert lines[-3].startswith("phasesweep: stopped. Rerun the same command to resume")
+    assert lines[-2] == f"phasesweep run {config_path}"
     assert lines[-1] == f"log: {log.resolve()}"
+
+
+def test_the_stop_hint_repeats_the_command_quoted_with_its_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A path with spaces, a quoted ``--set`` value and ``--from-phase`` all come back pasteable."""
+    monkeypatch.setenv("COLUMNS", "500")
+    config = make_experiment(persistent=tmp_path)
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(signum=signal.SIGTERM, cleanup_confirmed=True, child_pgids=()),
+    )
+    stub_run_command(monkeypatch, shutdown, config=config, writes_log=True)
+    monkeypatch.setattr("phasesweep.cli._command_config", lambda _path, settings: config)
+    config_path = tmp_path / "my sweeps" / "experiment.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("placeholder: true\n")
+
+    assert (
+        invoke_cli_boundary(
+            [
+                "run",
+                str(config_path),
+                "--set",
+                "phases.p.n_trials=12",
+                "--set",
+                "provenance.note=two words",
+                "--from-phase",
+                "p",
+            ],
+            monkeypatch,
+        )
+        == 128 + signal.SIGTERM
+    )
+
+    command = capsys.readouterr().err.splitlines()[-2]
+    assert command == (
+        f"phasesweep run '{config_path}' --set phases.p.n_trials=12 "
+        "--set 'provenance.note=two words' --from-phase p"
+    )
+    assert shlex.split(command)[2:] == [
+        str(config_path),
+        "--set",
+        "phases.p.n_trials=12",
+        "--set",
+        "provenance.note=two words",
+        "--from-phase",
+        "p",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("persistent", "width", "expected"),
+    [
+        pytest.param(
+            True,
+            80,
+            [
+                "phasesweep: stopped. Rerun the same command to resume: finished trials are kept",
+                "and interrupted ones rerun first.",
+                "phasesweep run sweep.yaml --set optimizer.lr=0.01",
+            ],
+            id="persistent-80",
+        ),
+        pytest.param(
+            True,
+            60,
+            [
+                "phasesweep: stopped. Rerun the same command to resume:",
+                "finished trials are kept and interrupted ones rerun first.",
+                "phasesweep run sweep.yaml --set optimizer.lr=0.01",
+            ],
+            id="persistent-60",
+        ),
+        pytest.param(
+            False,
+            80,
+            [
+                "phasesweep: stopped. Rerun the same command to start over: storage: null keeps",
+                "no completed trials.",
+                "phasesweep run sweep.yaml --set optimizer.lr=0.01",
+            ],
+            id="in-memory-80",
+        ),
+        pytest.param(
+            False,
+            60,
+            [
+                "phasesweep: stopped. Rerun the same command to start over:",
+                "storage: null keeps no completed trials.",
+                "phasesweep run sweep.yaml --set optimizer.lr=0.01",
+            ],
+            id="in-memory-60",
+        ),
+    ],
+)
+def test_the_stop_hint_wraps_its_sentence_and_keeps_the_command_on_one_line(
+    tmp_path: Path, persistent: bool, width: int, expected: list[str]
+) -> None:
+    """Both forms wrap the prose to the terminal, and the command line below it is never broken."""
+    config = make_experiment(persistent=tmp_path if persistent else None)
+    command = _rerun_command(Path("sweep.yaml"), ("optimizer.lr=0.01",), None)
+
+    assert _resume_hint(config, command=command, width=width).splitlines() == expected
+
+
+def test_the_stop_hint_never_breaks_a_command_wider_than_the_terminal(tmp_path: Path) -> None:
+    """A long config path stays whole on its line at 60 columns, so the line can be pasted."""
+    long_path = Path("experiments/a-long-project-name/phasesweep_starter/sweeps/sweep.yaml")
+    command = _rerun_command(long_path, (), "depth")
+
+    lines = _resume_hint(
+        make_experiment(persistent=tmp_path), command=command, width=60
+    ).splitlines()
+
+    assert lines[-1] == f"phasesweep run {long_path} --from-phase depth"
+    assert len(lines[-1]) > 60
+    assert all(len(line) <= 60 for line in lines[:-1])
 
 
 LONG_LOG = (
