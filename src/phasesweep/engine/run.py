@@ -490,12 +490,15 @@ def _run_experiment_outcome(
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
-                except BaseException as tracking_exc:  # primary error must survive
+                except (PhaseSweepShutdown, KeyboardInterrupt) as tracking_exc:
+                    # The closing count already says what stays pending; the run keeps its error.
                     if (
                         isinstance(tracking_exc, PhaseSweepShutdown)
                         and not tracking_exc.report.cleanup_confirmed
                     ):
                         cleanup.mark_uncertain(tracking_exc)
+                    log.info("MLflow failure delivery stopped by a shutdown")
+                except BaseException:  # primary error must survive
                     log.exception(
                         "MLflow failure delivery did not complete; preserving the original error"
                     )

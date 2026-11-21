@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import importlib
 import json
+import logging
 import os
 import signal
 import sys
@@ -966,23 +967,22 @@ def test_sync_keeps_a_record_whose_search_fails(
         (TimeoutError("MLflow operation exceeded its deadline."), 1),
         (OperationUnavailableError("tracking server unreachable"), 1),
         (OperationOutcomeUnknownError("MLflow worker failed (exit 1)."), 1),
-        (ShutdownLaunchRefusedError(signal.SIGINT), 1),
         (RuntimeError("MLflow find failed (MlflowException: PERMISSION_DENIED)."), 2),
     ],
-    ids=["timeout", "unavailable", "outcome-unknown", "shutdown", "answered-failure"],
+    ids=["timeout", "unavailable", "outcome-unknown", "answered-failure"],
 )
 def test_a_creation_search_without_an_answer_ends_the_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: Exception, searched: int
 ) -> None:
     """A search MLflow gives no answer to leaves every later intent unsearched and pending.
 
-    The pass reports the missing answer so its caller sends no uploads. A failure MLflow
-    answered concerns that one record, so the next intent is still searched.
+    The pass stops its delivery sending, so no upload follows. A failure MLflow answered
+    concerns that one record, so the next intent is still searched.
     """
     from phasesweep.tracking import session
 
     experiment = native_experiment(tmp_path)
-    assert session.resolve_pending_creations(experiment, {}, None)
+    session.resolve_pending_creations(experiment, {}, None)
     root = session.tracking_root(experiment)
     paths = [
         _write_pending(
@@ -1000,9 +1000,64 @@ def test_a_creation_search_without_an_answer_ends_the_pass(
         raise outcome
 
     monkeypatch.setattr(session, "call_tracking", find)
-    assert session.resolve_pending_creations(experiment, {}, None) is (searched == 2)
+    tally = session.DeliveryTally()
+    session.resolve_pending_creations(experiment, {}, None, tally=tally)
+    assert tally.sending is (searched == 2)
     assert sent == ["1" * 32, "2" * 32][:searched]
     assert all(path.exists() for path in paths)
+
+
+@pytest.mark.parametrize("failure", ["refused-launch", "killed-worker"])
+def test_a_shutdown_ends_a_delivery_pass_without_blaming_mlflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    """A search or upload that fails while a shutdown is serviced stops the pass with no warning.
+
+    A shutdown refuses every worker launch and kills running workers, so the failure says
+    nothing about MLflow: the records stay pending and nothing more is requested.
+    """
+    from phasesweep.runtime import shutdown
+    from phasesweep.tracking import publication, session
+
+    experiment = native_experiment(tmp_path)
+    root = session.tracking_root(experiment)
+    intents = [
+        _write_pending(
+            root / generation / "generation-binding.pending.json",
+            attempt_identity(generation, generation),
+        )
+        for generation in ("1" * 32, "2" * 32)
+    ]
+    records = [root / ("1" * 32) / "delivery" / f"attempt-{n}.json" for n in "ab"]
+    record = {"schema_version": 1, "state": "pending", "generation_id": "1" * 32}
+    for path in records:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        session.write_record(path, {**record, "binding": {}, "projection": {}, "finish": None})
+    requests: list[str] = []
+
+    def interrupted(*args: object, **kwargs: object) -> None:
+        requests.append("request")
+        monkeypatch.setattr(shutdown, "_servicing_signum", signal.SIGINT)
+        if failure == "refused-launch":
+            raise ShutdownLaunchRefusedError(signal.SIGINT)
+        raise OperationOutcomeUnknownError("MLflow worker failed (exit -2).")
+
+    monkeypatch.setattr(session, "call_tracking", interrupted)
+    monkeypatch.setattr(publication, "call_tracking", interrupted)
+    caplog.set_level(logging.INFO)
+    tally = session.DeliveryTally()
+    session.resolve_pending_creations(experiment, {}, None, tally=tally)
+    assert (requests, tally.sending, tally.unanswered) == (["request"], False, None)
+    monkeypatch.setattr(shutdown, "_servicing_signum", None)
+    tally = session.DeliveryTally()
+    assert publication._send(experiment, records, {}, worker_generation=None, tally=tally) == []
+    assert (requests, tally.sending, tally.unanswered) == (["request"] * 2, False, None)
+    assert all(path.exists() for path in intents)
+    assert [session.read_record(path)["state"] for path in records] == ["pending", "pending"]
+    assert "pending (" not in caplog.text and "unresolved" not in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["invalid-intent", "unsafe-binding", "full-disk"])
@@ -1060,7 +1115,9 @@ def test_sync_reports_local_creation_record_failures(
     assert not path.with_name("generation-binding.json").exists()
 
     collected: list[TrackingSyncRefusedError] = []
-    assert session.resolve_pending_creations(experiment, {}, None, errors=collected)
+    tally = session.DeliveryTally()
+    session.resolve_pending_creations(experiment, {}, None, errors=collected, tally=tally)
+    assert tally.sending
     assert len(collected) == 1 and collected[0].args == caught.value.args
     assert path.exists()
     assert not healthy.exists()

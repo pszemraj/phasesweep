@@ -374,11 +374,14 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     publication.deliver_closeout(experiment, ledger, generation, error=KeyboardInterrupt())
-    assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
+    # An interrupted run only saves its records; the next run or sync-tracking sends them.
+    assert requests == []
+    saved = [read_record(path) for path in publication._pending_records(experiment, generation)]
+    assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in saved] == [
         ("4", None),
         ("a", "KILLED"),
     ]
-    accepted = requests[0]["projection"]
+    accepted = saved[0]["projection"]
     assert accepted["metrics"] == {
         "phasesweep.objective": 0.5,
         "phasesweep.feasible": 1.0,
@@ -628,7 +631,10 @@ def _fail_engine(tmp_path, monkeypatch, error):
 
 @pytest.mark.parametrize("failure", ["ordinary", "signal", "keyboard"])
 def test_failure_projection_outage_preserves_error_and_retries(tmp_path, monkeypatch, failure):
-    """Terminal failures retain status intent and original error despite upload outage."""
+    """Terminal failures retain status intent and original error despite upload outage.
+
+    An ordinary failure sends its summary record once; a shutdown only saves it.
+    """
     error = (
         PhaseSweepShutdown(
             signal.SIGTERM,
@@ -659,9 +665,10 @@ def test_failure_projection_outage_preserves_error_and_retries(tmp_path, monkeyp
     assert record["finish"] == ("FAILED" if failure == "ordinary" else "KILLED")
     assert "private trainer failure" not in str(record)
     assert record["projection"]["metrics"] == {}
+    assert len(requests) == (1 if failure == "ordinary" else 0)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 1}
-    assert requests[0] == requests[1]
+    assert requests[0] == requests[-1]
     # sync-tracking sends the saved summary record as it is and never rebuilds it.
     assert read_record(record_path) == {**record, "state": "delivered"}
 

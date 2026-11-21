@@ -23,6 +23,7 @@ from phasesweep.runtime.json import (
     json_optional_text,
     json_text,
 )
+from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
@@ -130,7 +131,8 @@ def _send(
     A failure MLflow answered, such as a deleted run, concerns its record alone, so it costs a
     warning and the rest go on. A request MLflow gives no answer to would meet the same tracker
     for every later record, so one such request ends the pass and stops ``tally`` sending,
-    leaving the rest pending for the next run or sync-tracking.
+    leaving the rest pending for the next run or sync-tracking. A shutdown ends the pass too,
+    without a warning, as MLflow was not what failed.
 
     :param Experiment experiment: Configured target.
     :param list[Path] paths: Delivery records, in sending order.
@@ -143,31 +145,30 @@ def _send(
     """
     delivered: list[Path] = []
     for index, path in enumerate(paths):
-        if not tally.sending:
+        if not tally.sending or tally.stop_for_shutdown():
             break
         try:
             _deliver(experiment, path, environment, worker_generation=worker_generation)
         except ProcessCleanupUncertainError:
             raise
-        except NO_ANSWER as exc:
+        except (OSError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
+            if tally.stop_for_shutdown():
+                break
+            unanswered = isinstance(exc, NO_ANSWER)
             later = len(paths) - index - 1
             log.warning(
                 "MLflow upload %s of generation %s is pending (%s).%s",
                 path.stem,
                 path.parent.parent.name,
                 exc,
-                f" MLflow did not answer, so {later} later upload(s) wait too." if later else "",
+                f" MLflow did not answer, so {later} later upload(s) wait too."
+                if unanswered and later
+                else "",
             )
-            tally.sending = False
-            tally.unanswered = unready_target_text(experiment, exc)
-            break
-        except (OSError, ValueError, RuntimeError) as exc:
-            log.warning(
-                "MLflow upload %s of generation %s is pending (%s).",
-                path.stem,
-                path.parent.parent.name,
-                exc,
-            )
+            if unanswered:
+                tally.sending = False
+                tally.unanswered = unready_target_text(experiment, exc)
+                break
             continue
         delivered.append(path)
     return delivered
@@ -959,7 +960,11 @@ def _deliver_outstanding(
         creations = _pending_creations(experiment, scope, skip)
         own_pending = [path for path in own or [] if read_record(path)["state"] != "delivered"]
         pending = _pending_records(experiment, scope, skip=skip)
-        if not tally.sending or not (creations or pending or own_pending):
+        if (
+            not tally.sending
+            or tally.stop_for_shutdown()
+            or not (creations or pending or own_pending)
+        ):
             return
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         if resolve:
@@ -1127,7 +1132,9 @@ def deliver_closeout(
 
     The run's own records are saved before anything is sent, so however the delivery ends they
     are counted; then every ended generation's records go, the run's own last, through the core
-    sync-tracking runs. The closing lines are logged however the delivery ends.
+    sync-tracking runs. A run that is shutting down, or that just found its tracker silent,
+    only saves: a shutdown refuses every worker launch. The closing lines are logged however
+    the delivery ends, a shutdown during it included.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The run's ledger, holding its trials and those it settled.
@@ -1142,8 +1149,11 @@ def deliver_closeout(
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
-    # A run that just found its tracker silent sends nothing more to it.
-    tally = DeliveryTally(sending=not isinstance(error, TrackingTargetUnavailableError))
+    tally = DeliveryTally(
+        sending=not isinstance(
+            error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
+        )
+    )
     try:
         if error is not None:
             own = _save_failed(experiment, generation_id, error, ledger)

@@ -28,7 +28,7 @@ from phasesweep.runtime.json import (
     strict_json_loads,
 )
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, recorded_process_check
-from phasesweep.runtime.shutdown import ShutdownLaunchRefusedError
+from phasesweep.runtime.shutdown import servicing_shutdown_signal
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
     OperationRejectedError,
@@ -60,14 +60,13 @@ INHERITS_FILE = "mlflow-inherits.json"
 _PENDING_SUFFIX = ".pending.json"
 PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
-# Failures that say nothing about a request's subject: MLflow gave no answer, the worker's
-# answer was lost, or a shutdown being serviced refused to start the worker. The next request
-# would meet the same tracker, so a pass that sees one stops sending and leaves the rest pending.
+# Failures that say nothing about a request's subject: MLflow gave no answer, or the worker's
+# answer was lost. The next request would meet the same tracker, so a pass that sees one stops
+# sending and leaves the rest pending.
 NO_ANSWER: tuple[type[Exception], ...] = (
     TimeoutError,
     OperationUnavailableError,
     OperationOutcomeUnknownError,
-    ShutdownLaunchRefusedError,
 )
 
 
@@ -76,7 +75,7 @@ class DeliveryTally:
     """What the requests of one delivery met: a run's closeout, recover-run or sync-tracking.
 
     Every pass of one closeout shares it. Once ``sending`` is False the later passes only save
-    their records: a later request would meet the same silent tracker.
+    their records: a later request would meet the same silent tracker, or a shutdown.
     """
 
     sending: bool = True
@@ -85,6 +84,19 @@ class DeliveryTally:
     """Why MLflow gave no answer, once a request got none."""
     delivered: int = 0
     """Records of ended generations delivered."""
+
+    def stop_for_shutdown(self) -> bool:
+        """Stop sending, without blaming MLflow, once a shutdown is being serviced.
+
+        A shutdown refuses every worker launch and kills running workers, so a failure seen
+        while one is under way says nothing about MLflow, and nothing more is sent.
+
+        :return bool: Whether a shutdown is under way, in which case sending has stopped.
+        """
+        if servicing_shutdown_signal() is None:
+            return False
+        self.sending = False
+        return True
 
 
 def tracking_root(experiment: Experiment) -> Path:
@@ -433,14 +445,14 @@ def resolve_pending_creations(
     worker_generation: str | None = None,
     errors: list[TrackingSyncRefusedError] | None = None,
     tally: DeliveryTally | None = None,
-) -> bool:
+) -> None:
     """Reconcile pending creations with one read-only search per record.
 
     The caller holds the experiment lock and has confirmed cleanup of registered workers for
     the generations it reconciles. Persist each found binding before retiring its intent.
     Retire an unmatched intent only after a successful lookup started outside its request window.
-    A search MLflow gives no answer to ends the pass, leaving the later intents for the next one;
-    the caller then sends no uploads either, as they would meet the same tracker.
+    A search MLflow gives no answer to, or a shutdown, ends the pass and stops ``tally``
+    sending, leaving the later intents and every upload for the next pass.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Mapping[str, str] environment: Composed credentials and transport.
@@ -450,11 +462,10 @@ def resolve_pending_creations(
         each record's own generation.
     :param list[TrackingSyncRefusedError] | None errors: Collect local record failures and
         continue, or raise the first one if omitted.
-    :param DeliveryTally | None tally: The delivery this pass belongs to, which stops sending
-        once a search gets no answer.
+    :param DeliveryTally | None tally: The delivery this pass belongs to; a fresh one when
+        omitted.
     :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
     :raises TrackingSyncRefusedError: A local creation record could not be read or updated.
-    :return bool: Whether MLflow answered every search sent, True when there was none to send.
     """
     from phasesweep.engine.errors import TrackingSyncRefusedError
 
@@ -464,11 +475,12 @@ def resolve_pending_creations(
         for pending in pending_creation_records(experiment, generation_id)
         if pending not in skipped
     ]
+    tally = DeliveryTally() if tally is None else tally
     for pending in records:
+        if not tally.sending or tally.stop_for_shutdown():
+            return
         try:
-            answered = _reconcile_creation(
-                experiment, pending, environment, worker_generation, tally
-            )
+            _reconcile_creation(experiment, pending, environment, worker_generation, tally)
         except (OSError, UnsafePrivatePathError, ValueError) as exc:
             failure = TrackingSyncRefusedError(
                 f"Could not reconcile local MLflow creation record {pending}: {exc}",
@@ -478,10 +490,6 @@ def resolve_pending_creations(
                 raise failure from exc
             failure.__cause__ = exc
             errors.append(failure)
-            continue
-        if not answered:
-            return False
-    return True
 
 
 def _reconcile_creation(
@@ -489,22 +497,21 @@ def _reconcile_creation(
     pending: Path,
     environment: Mapping[str, str],
     worker_generation: str | None,
-    tally: DeliveryTally | None,
-) -> bool:
+    tally: DeliveryTally,
+) -> None:
     """Bind a found run or retire its expired intent after one conclusive lookup.
 
     :param Experiment experiment: Configured experiment with a verified tracking target.
     :param Path pending: Unconfirmed creation intent.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None worker_generation: Invocation registering the lookup, defaulting to the intent's generation.
-    :param DeliveryTally | None tally: The delivery the search belongs to, told when MLflow
-        gives no answer.
-    :return bool: Whether MLflow answered, False when the search met one of :data:`NO_ANSWER`.
+    :param DeliveryTally tally: The delivery the search belongs to, which stops sending when
+        MLflow gives no answer or a shutdown is under way.
     """
     path = pending.with_suffix("").with_suffix(".json")
     if path.exists():
         _retire_creation(pending)
-        return True
+        return
     settings = experiment.mlflow
     assert settings is not None
     identity = validate_identity(read_record(pending).get("identity"))
@@ -522,27 +529,27 @@ def _reconcile_creation(
         )
     except PhaseSweepError:
         raise
-    except NO_ANSWER as exc:
-        # The caller skips its uploads after this, so this is the pass's only outage warning.
+    except (TimeoutError, ValueError, RuntimeError) as exc:  # every NO_ANSWER error included
+        if tally.stop_for_shutdown():
+            return
+        if not isinstance(exc, NO_ANSWER):
+            log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
+            return
+        # The pass sends nothing after this, so this is its only outage warning.
         log.warning(
             "MLflow run creation at %s is still unresolved (%s). MLflow did not answer, so later "
             "searches and uploads wait too.",
             pending,
             exc,
         )
-        if tally is not None:
-            tally.sending = False
-            tally.unanswered = unready_target_text(experiment, exc)
-        return False
-    except (ValueError, RuntimeError) as exc:
-        log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
-        return True
+        tally.sending = False
+        tally.unanswered = unready_target_text(experiment, exc)
+        return
     if binding is not None:
         write_record(path, binding)
     elif not expired:
-        return True
+        return
     _retire_creation(pending)
-    return True
 
 
 def _resolve_source(

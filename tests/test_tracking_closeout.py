@@ -16,6 +16,7 @@ from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.read import read_status
 from phasesweep.engine.run import TerminalReport, run_experiment
+from phasesweep.runtime import shutdown
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -190,6 +191,68 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     sweep.uploads.clear()
     publication.sync_tracking(experiment)
     assert sweep.uploads == []
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("moment", ["trial", "target-check", "closeout"])
+def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    moment: str,
+) -> None:
+    """A Ctrl-C stops MLflow delivery without blaming MLflow, and the closing line counts what stays pending.
+
+    The shutdown arrives during a trial's upload, during the next run's target check while an
+    earlier run's records are pending, or during that run's closeout delivery. No request
+    follows it, no line says MLflow did not answer or was not ready, and the closing line
+    still counts every pending record, the earlier run's in parentheses.
+    """
+    caplog.set_level(logging.INFO)
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    pending, earlier = 2, 0
+    if moment != "trial":
+        caplog.clear()
+        respond = session.request_operation
+        closing: list[bool] = []
+        after: list[str] = []
+
+        def ctrl_c(request: dict[str, object], **kwargs: object) -> JsonObject:
+            if shutdown.servicing_shutdown_signal() is not None:
+                # What the supervisor does to every launch while the shutdown is serviced.
+                after.append(str(request["action"]))
+                raise ShutdownLaunchRefusedError(signal.SIGINT)
+            if (moment == "target-check" and request["action"] == "resolve") or (
+                moment == "closeout" and closing
+            ):
+                monkeypatch.setattr(shutdown, "_servicing_signum", signal.SIGINT)
+                report = ShutdownCleanupReport(signal.SIGINT, True, ())
+                raise PhaseSweepShutdown(signal.SIGINT, report)
+            return respond(request, **kwargs)
+
+        close = publication.deliver_closeout
+
+        def closeout(*args: object, **kwargs: object) -> None:
+            closing.append(True)
+            close(*args, **kwargs)
+
+        monkeypatch.setattr(session, "request_operation", ctrl_c)
+        monkeypatch.setattr(worker, "request_operation", ctrl_c)
+        monkeypatch.setattr(publication, "deliver_closeout", closeout)
+        reports: list[TerminalReport] = []
+        with pytest.raises(PhaseSweepShutdown):
+            run_experiment(sweep.experiment, terminal_callback=reports.append)
+        assert (closing, after) == ([True], [])
+        earlier = 2
+        pending = publication.delivery_status(sweep.experiment)["pending"]
+        own = publication.delivery_status(sweep.experiment, reports[0].generation_id)
+        assert pending == earlier + own["pending"]
+        assert (own["pending"] > 0) is (moment == "closeout")
+    assert "did not answer" not in caplog.text
+    assert "is not ready" not in caplog.text
+    assert "launch refused" not in caplog.text
+    in_parentheses = f" ({earlier} from earlier runs)" if earlier else ""
+    assert f"MLflow: {pending} upload(s) pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration
