@@ -292,7 +292,7 @@ def recover_run(
                 # outrank. Written only after the uploads, a failed or interrupted delivery
                 # leaves the run for another pass, which repeats this one.
                 write_status_file(store.status_path(run_id), terminal_status)
-            if needs.cleanup_needed or repairing_complete_snapshot:
+            if needs.cleanup_needed or repairing_complete_snapshot or delivering:
                 store.clear_cleanup_uncertain(handle)
             if needs.cleanup_needed:
                 emit(
