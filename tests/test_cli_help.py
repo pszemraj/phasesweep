@@ -1,13 +1,16 @@
-"""Command help text and the ``validate`` phase count."""
+"""Command help text, the ``validate`` phase count and the quiet exit on a closed output pipe."""
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from phasesweep.cli import cli
+from phasesweep.cli import cli, main
 from phasesweep.config.models import Phase
 from phasesweep.config.search import IntParam
 from tests.conftest import make_experiment, write_experiment_config
@@ -67,3 +70,24 @@ def test_validate_counts_its_phases_in_the_singular_for_one(
 
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[0] == f"OK: {experiment.experiment} ({count})"
+
+
+def test_a_closed_output_pipe_ends_quietly_with_status_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``phasesweep ... | head`` closes stdout early: no operational error, no traceback, status 1."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    closed = os.fdopen(write_end, "w", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdout", closed)
+    monkeypatch.setattr(sys, "argv", ["phasesweep", "explain", "--notes"])
+
+    try:
+        with pytest.raises(SystemExit) as raised:
+            main()
+    finally:
+        with contextlib.suppress(BrokenPipeError):
+            closed.close()
+
+    assert raised.value.code == 1
+    assert capsys.readouterr().err == ""
