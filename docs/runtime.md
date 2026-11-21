@@ -87,26 +87,28 @@ phasesweep run  phasesweep_starter
   workdir   runs/phasesweep_starter
   log       /home/you/project/runs/phasesweep_starter/run.log
 
-09:17:33  depth          2 trials to run, 1 at a time
-09:17:34  depth          trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  model.n_layers=8
-09:17:35  depth          trial 1  COMPLETE  eval_loss 0.5  0.7s  2/2  model.n_layers=6
-09:17:35  depth          winner: trial 0  eval_loss 0.3  model.n_layers=8
-09:17:35  learning_rate  2 trials to run, 1 at a time
-09:17:35  learning_rate  trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  optimizer.lr=0.0003
-09:17:36  learning_rate  trial 1  COMPLETE  eval_loss 0.413822  0.7s  2/2  optimizer.lr=0.0001
-09:17:36  learning_rate  winner: trial 0  eval_loss 0.3  optimizer.lr=0.0003
+13:14:45  depth          2 trials to run, 1 at a time
+13:14:46  depth          trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  model.n_layers=8
+13:14:47  depth          trial 1  COMPLETE  eval_loss 0.5  0.7s  2/2  model.n_layers=6
+13:14:47  depth          winner: trial 0  eval_loss 0.3  model.n_layers=8
+13:14:47  learning_rate  2 trials to run, 1 at a time
+13:14:47  learning_rate  trial 0  COMPLETE  eval_loss 0.3  0.7s  1/2  optimizer.lr=0.0003
+13:14:48  learning_rate  trial 1  COMPLETE  eval_loss 0.413822  0.7s  2/2  optimizer.lr=0.0001
+13:14:48  learning_rate  winner: trial 0  eval_loss 0.3  optimizer.lr=0.0003
 
 Finished in 3.0s: 2 phases, 4 trials, 0 from a previous run
 
   depth          2 complete
                  winner  trial 0  eval_loss 0.3  model.n_layers=8
-                 runs/phasesweep_starter/depth/trial_00000__generation_6229a49778944c71962d380f57919759__attempt_4f0c1b7e9a2d4c58b3e61d0a7f95c2e8
+                 runs/phasesweep_starter/depth/
+                 trial_00000__generation_43ddc73d84534e679d13d41e93834d02__attempt_427a82a35fa741e9b821d63c678fb30e
   learning_rate  2 complete
                  winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003
-                 runs/phasesweep_starter/learning_rate/trial_00000__generation_6229a49778944c71962d380f57919759__attempt_9b3e5d7f1a2c4e60817d3f5b0c2a4e68
+                 runs/phasesweep_starter/learning_rate/
+                 trial_00000__generation_43ddc73d84534e679d13d41e93834d02__attempt_1a74729fd30f4851ae3ac2cc9ab4ae74
 
 Written under runs/phasesweep_starter
-  generations/6229a49778944c71962d380f57919759/summary.yaml
+  generations/43ddc73d84534e679d13d41e93834d02/summary.yaml
   depth/trials.csv
   learning_rate/trials.csv
 
