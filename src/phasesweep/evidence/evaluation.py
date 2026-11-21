@@ -45,7 +45,11 @@ from phasesweep.evidence.wandb import (
     poll_wandb_summary,
 )
 from phasesweep.runtime.files import file_sha256
-from phasesweep.runtime.json import progress_position, strict_json_loads
+from phasesweep.runtime.json import (
+    NonFiniteJsonConstantError,
+    progress_position,
+    strict_json_loads,
+)
 from phasesweep.runtime.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -191,20 +195,6 @@ class MlflowObjectiveMissingError(ExtractorError):
     """Raised when a finished managed MLflow run lacks the configured objective metric."""
 
 
-# How the strict parser refuses the constants Python's ``json.dumps`` writes for a diverged run.
-_NON_FINITE_CONSTANT = re.compile(r"non-standard JSON constant '(NaN|-?Infinity)'")
-
-
-def _non_finite_constant(exc: Exception) -> str | None:
-    """Return the NaN or Infinity token the strict JSON parser refused, if ``exc`` is that refusal.
-
-    :param Exception exc: Failure raised while reading a trial's JSON file.
-    :return str | None: ``NaN``, ``Infinity`` or ``-Infinity``, or ``None`` for any other failure.
-    """
-    match = _NON_FINITE_CONSTANT.fullmatch(str(exc)) if isinstance(exc, ValueError) else None
-    return None if match is None else match.group(1)
-
-
 def _non_finite_text(constant: str) -> str:
     """Say what a file holding NaN or Infinity means, for a trial's failure reason.
 
@@ -222,9 +212,9 @@ def _gate_unavailable(path: str, key: str, exc: Exception) -> str:
     :param Exception exc: Failure raised while reading it.
     :return str: The gate result's detail.
     """
-    constant = _non_finite_constant(exc)
-    reason = f"the file {_non_finite_text(constant)}" if constant is not None else str(exc)
-    return f"{path}:{key} unavailable: {reason}"
+    if isinstance(exc, NonFiniteJsonConstantError):
+        return f"{path}:{key} unavailable: the file {_non_finite_text(exc.constant)}"
+    return f"{path}:{key} unavailable: {exc}"
 
 
 @contextmanager
@@ -252,10 +242,9 @@ def _trial_json_read_errors(target: Path, *, noun: str, trainer_step: str) -> It
         raise ExtractorError(f"{missing}. {trainer_step}") from exc
     except UnicodeError as exc:
         raise ExtractorError(f"{noun} at {target} is not valid UTF-8: {exc}") from exc
+    except NonFiniteJsonConstantError as exc:
+        raise ExtractorError(f"{noun} at {target} {_non_finite_text(exc.constant)}.") from exc
     except ValueError as exc:
-        constant = _non_finite_constant(exc)
-        if constant is not None:
-            raise ExtractorError(f"{noun} at {target} {_non_finite_text(constant)}.") from exc
         raise ExtractorError(f"Invalid {noun} at {target}: {exc}") from exc
     except OSError as exc:
         raise ExtractorError(f"Could not read {noun} at {target}: {exc}") from exc

@@ -8,7 +8,6 @@ import pytest
 
 from phasesweep.evidence.evaluation import (
     ExtractorError,
-    _non_finite_constant,
     evaluate_gates,
     run_extractor,
 )
@@ -20,7 +19,7 @@ from phasesweep.evidence.models import (
     JsonScalarBoundGate,
     LogRegexExtractor,
 )
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import NonFiniteJsonConstantError, strict_json_loads
 from tests.conftest import make_trial_context
 
 _NON_FINITE_TAIL = "which is not a finite number; a diverged run writes it"
@@ -57,16 +56,12 @@ def test_a_diverged_objective_file_says_it_holds_a_non_finite_number(
 
 
 @pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
-def test_the_strict_parser_refusal_is_the_text_the_gate_and_extractor_readers_recognize(
-    token: str,
-) -> None:
-    """The readers key on the parser's own refusal, so a change to its wording fails here."""
-    with pytest.raises(ValueError) as refused:
+def test_the_strict_parser_names_the_non_finite_token_it_refuses(token: str) -> None:
+    """The parser's refusal of NaN or Infinity carries the token, which the readers report."""
+    with pytest.raises(NonFiniteJsonConstantError) as refused:
         strict_json_loads(f"[{token}]")
 
-    assert _non_finite_constant(refused.value) == token
-    assert _non_finite_constant(ValueError("duplicate JSON key 'x'")) is None
-    assert _non_finite_constant(KeyError("NaN")) is None
+    assert refused.value.constant == token
 
 
 @pytest.mark.parametrize(

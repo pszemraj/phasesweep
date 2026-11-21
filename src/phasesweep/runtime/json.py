@@ -31,9 +31,25 @@ def nonempty_text(value: object, *, label: str) -> str:
     return value
 
 
+class NonFiniteJsonConstantError(ValueError):
+    """Raised when a JSON document holds ``NaN``, ``Infinity`` or ``-Infinity``."""
+
+    def __init__(self, constant: str) -> None:
+        """Record the refused token, so a reader can say what the file holds.
+
+        :param str constant: The token as the document writes it.
+        """
+        super().__init__(f"non-standard JSON constant {constant!r}")
+        self.constant = constant
+
+
 def _reject_constant(value: str) -> NoReturn:
-    """Reject Python's non-standard JSON constants with ValueError."""
-    raise ValueError(f"non-standard JSON constant {value!r}")
+    """Reject the non-standard constants Python's ``json.dumps`` writes for non-finite floats.
+
+    :param str value: The token the decoder met.
+    :raises NonFiniteJsonConstantError: Always.
+    """
+    raise NonFiniteJsonConstantError(value)
 
 
 def _unique_object(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
@@ -56,7 +72,8 @@ def strict_json_loads(text: str) -> JsonValue:
 
     :param str text: JSON document to decode.
     :raises json.JSONDecodeError: The document has invalid JSON syntax.
-    :raises ValueError: An object has duplicate keys or a nonstandard numeric constant occurs.
+    :raises NonFiniteJsonConstantError: A nonstandard numeric constant occurs.
+    :raises ValueError: An object has duplicate keys.
     :return JsonValue: The decoded JSON value.
     """
     decoded: object = json.loads(
