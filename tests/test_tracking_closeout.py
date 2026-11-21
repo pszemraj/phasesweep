@@ -563,6 +563,37 @@ def test_sync_tracking_names_what_keeps_its_records_pending(
         assert sweep.summaries() == ["KILLED"]
 
 
+def test_a_run_whose_target_gives_no_answer_ends_with_the_retry_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`phasesweep run` against a tracker that gives no answer to its target check is told to retry.
+
+    The refusal names the target and starts no trial, and the step is the retry `sync-tracking`
+    prints for the same tracker, not a configuration fix.
+    """
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    experiment = Experiment.model_validate(config)
+    assert experiment.mlflow is not None
+
+    def silent(request: dict[str, object], **kwargs: object) -> JsonObject:
+        raise TimeoutError("MLflow operation exceeded its deadline.")
+
+    monkeypatch.setattr(session, "request_operation", silent)
+    monkeypatch.setattr(worker, "request_operation", silent)
+    path = write_experiment_config(Path.cwd() / "experiment.yaml", experiment)
+    capsys.readouterr()
+
+    assert invoke_cli_boundary(["run", str(path)], monkeypatch) == 1
+
+    assert uploads == []
+    assert (
+        f"phasesweep: MLflow tracking target experiment_name={experiment.mlflow.experiment_name!r} "
+        f"at {experiment.mlflow.tracking_uri!r} is not ready: it did not answer within "
+        "timeout_seconds; check that the server is reachable. No trial was started.\n"
+        "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
+    ) in capsys.readouterr().err
+
+
 def test_a_silent_search_names_a_creation_record_whatever_its_generation_id_holds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

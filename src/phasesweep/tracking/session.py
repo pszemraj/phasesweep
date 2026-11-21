@@ -683,7 +683,9 @@ def require_tracking_target(
     :param bool resolve_only: Only resolve the target, for a caller that launches nothing and
         sends recovered outcomes, defaults to False.
     :raises OSError: A recovery-only check could not access its local tracking records.
-    :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.
+    :raises TrackingTargetUnavailableError: The target cannot be resolved or reached; its step
+        is a retry when MLflow gave no answer, the creation it left unconfirmed included, and
+        fixing the configuration when MLflow answered with a refusal.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
@@ -711,7 +713,14 @@ def require_tracking_target(
         if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
             raise
         launch = "" if resolve_only else " No trial was started."
-        raise TrackingTargetUnavailableError(unready_target_text(experiment, exc) + launch) from exc
+        # A server that gave no answer may give one to the same command later, and so may one
+        # whose creation answer was lost; a refusal it answered, such as a missing experiment,
+        # needs the configuration or MLflow fixed first.
+        unanswered = isinstance(exc, NO_ANSWER) or isinstance(exc.__cause__, NO_ANSWER)
+        raise TrackingTargetUnavailableError(
+            unready_target_text(experiment, exc) + launch,
+            action=OperatorAction.RETRY if unanswered else None,
+        ) from exc
 
 
 def unready_target_text(experiment: Experiment, exc: BaseException) -> str:
