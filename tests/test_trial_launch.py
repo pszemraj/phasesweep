@@ -27,7 +27,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import ExecutionContext, Experiment, Metric
 from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
+from phasesweep.engine.state import ATTEMPT_ID_ATTR, FAILURE_REASON_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import (
     EnvironmentIdentity,
     ExecutedTrial,
@@ -698,16 +698,29 @@ def test_nonzero_exit_reason_quotes_the_last_stderr_line(
     assert _environment_hints(caplog) == []
 
 
+OOM_CLAUSE = "the kernel's out-of-memory killer is a common sender"
+
+
 @pytest.mark.parametrize(
     ("code", "reason"),
     [
-        (
-            -signal.SIGKILL,
-            "killed by signal 9 (SIGKILL), which the kernel's out-of-memory killer sends",
-        ),
+        (-signal.SIGKILL, f"killed by signal 9 (SIGKILL); {OOM_CLAUSE}"),
         (-signal.SIGSEGV, "killed by signal 11 (SIGSEGV)"),
         (-signal.SIGTERM, "killed by signal 15 (SIGTERM)"),
         (-200, "killed by signal 200"),
+        (
+            137,
+            "non-zero exit code 137: the shell's report of a command killed by SIGKILL; "
+            + OOM_CLAUSE,
+        ),
+        (143, "non-zero exit code 143: the shell's report of a command killed by SIGTERM"),
+        (129, "non-zero exit code 129: the shell's report of a command killed by SIGHUP"),
+        (139, "non-zero exit code 139: the shell's report of a command killed by SIGSEGV"),
+        (128, "non-zero exit code 128"),
+        (160, "non-zero exit code 160"),
+        (191, "non-zero exit code 191"),
+        (193, "non-zero exit code 193"),
+        (255, "non-zero exit code 255"),
     ],
 )
 def test_trainer_killed_by_a_signal_is_reported_as_that_without_an_environment_hint(
@@ -717,26 +730,72 @@ def test_trainer_killed_by_a_signal_is_reported_as_that_without_an_environment_h
     code: int,
     reason: str,
 ) -> None:
-    """A negative return code names its signal, SIGKILL names the OOM killer, and no inherit_env hint follows."""
+    """A signal death, direct or as the shell's 128 + N, is named, and no inherit_env hint follows it."""
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
         result = _exit_code_result(tmp_path, make_experiment(), "p", code)
 
     assert result.failure_reason == reason
-    assert _environment_hints(caplog) == []
+    signal_like = reason.startswith("killed by") or "shell's report" in reason
+    assert (_environment_hints(caplog) == []) is (signal_like or code == 0)
 
 
 def test_trainer_killed_by_a_signal_keeps_its_stderr_line(tmp_path: Path) -> None:
     """The stderr line is appended to a signal death exactly as it is to a nonzero exit."""
-    result = _exit_code_result(
+    direct = _exit_code_result(
         tmp_path, make_experiment(), "p", -signal.SIGKILL, stderr=b"loading shards\n"
     )
+    reported = _exit_code_result(tmp_path, make_experiment(), "p", 137, stderr=b"loading shards\n")
 
-    assert result.failure_reason == (
-        "killed by signal 9 (SIGKILL), which the kernel's out-of-memory killer sends"
-        "; stderr: loading shards"
+    assert direct.failure_reason == (
+        f"killed by signal 9 (SIGKILL); {OOM_CLAUSE}; stderr: loading shards"
     )
+    assert reported.failure_reason == (
+        "non-zero exit code 137: the shell's report of a command killed by SIGKILL; "
+        f"{OOM_CLAUSE}; stderr: loading shards"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGTERM])
+def test_trainer_killed_under_the_real_launch_path_is_reported_as_a_signal_death(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sig: signal.Signals,
+) -> None:
+    """A trainer that kills itself, run through ``/bin/sh -c`` as every trial is, names its signal.
+
+    Whether the shell execs a lone command or survives it differs between shells, so the
+    reason is either the shell's ``128 + N`` report or the direct signal death, never a bare code.
+    """
+    monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os, signal
+        os.kill(os.getpid(), signal.{sig.name})
+        """,
+    )
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=1, gpu_policy="none"
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"),
+        pytest.raises(NoFeasibleTrialError),
+    ):
+        run_experiment(experiment)
+
+    (trial,) = phase_study(experiment).trials
+    reason = trial.user_attrs[FAILURE_REASON_ATTR]
+    shell_report = f"non-zero exit code {128 + sig}: the shell's report of a command killed by"
+    direct = f"killed by signal {sig.value} ({sig.name})"
+    assert reason.startswith((f"{shell_report} {sig.name}", direct)), reason
+    assert ("out-of-memory" in reason) is (sig == signal.SIGKILL)
+    assert _environment_hints(caplog) == []
 
 
 @pytest.mark.parametrize(

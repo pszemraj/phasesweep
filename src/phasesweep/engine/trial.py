@@ -404,23 +404,53 @@ def _stderr_last_line(trial_dir: Path) -> str | None:
     return None
 
 
-def _nonzero_exit_reason(return_code: int) -> str:
-    """Name how a trainer ended abnormally, reading a negative code as a signal death.
+#: Appended to a SIGKILL reason: the signal has many senders, so it only says where to look.
+_OOM_KILLER_CLAUSE = "the kernel's out-of-memory killer is a common sender"
 
-    :param int return_code: Nonzero trainer return code; a negative value is ``-N`` for
-        a trainer killed by signal ``N``.
+
+def _shell_reported_signal(return_code: int) -> signal.Signals | None:
+    """Read a return code as a shell's ``128 + N`` report of a command killed by signal ``N``.
+
+    The trial command runs under ``/bin/sh -c``, and a shell that does not exec its
+    command survives the command's death and exits with that code. A trainer may also
+    exit with such a code on purpose, so a caller words the reading as a report.
+
+    :param int return_code: Trainer return code.
+    :return signal.Signals | None: The signal ``return_code - 128`` names, or ``None`` when
+        the code is outside 129 to 192 or that number is no signal on this host.
+    """
+    if not 129 <= return_code <= 192:
+        return None
+    try:
+        return signal.Signals(return_code - 128)
+    except ValueError:
+        return None
+
+
+def _nonzero_exit_reason(return_code: int) -> str:
+    """Name how a trainer ended abnormally, reading signal deaths as such.
+
+    :param int return_code: Nonzero trainer return code. A negative value is ``-N`` for a
+        process killed by signal ``N``, which is how the trial shell reports its own death.
+        A value from 129 to 192 naming a signal is the shell's report of its command's death.
     :return str: The failure reason without any stderr quote.
     """
-    if return_code > 0:
-        return f"non-zero exit code {return_code}"
-    signum = -return_code
-    try:
-        name = signal.Signals(signum).name
-    except ValueError:
-        return f"killed by signal {signum}"
-    reason = f"killed by signal {signum} ({name})"
-    if signum == signal.SIGKILL:
-        reason += ", which the kernel's out-of-memory killer sends"
+    if return_code < 0:
+        try:
+            killer = signal.Signals(-return_code)
+        except ValueError:
+            return f"killed by signal {-return_code}"
+        reason = f"killed by signal {killer.value} ({killer.name})"
+    else:
+        killer = _shell_reported_signal(return_code)
+        if killer is None:
+            return f"non-zero exit code {return_code}"
+        reason = (
+            f"non-zero exit code {return_code}: the shell's report of a command "
+            f"killed by {killer.name}"
+        )
+    if killer == signal.SIGKILL:
+        reason += f"; {_OOM_KILLER_CLAUSE}"
     return reason
 
 
@@ -837,7 +867,7 @@ def extract_trial_result(
             failure_reason += f"; stderr: {stderr_line}"
         # A signal death is not a missing-environment failure: the trainer never chose
         # to exit, so the inheritance hint would send the operator the wrong way.
-        if rc > 0:
+        if rc > 0 and _shell_reported_signal(rc) is None:
             _warn_narrowed_environment_exit(
                 experiment=experiment,
                 phase_name=executed.ctx.phase,
