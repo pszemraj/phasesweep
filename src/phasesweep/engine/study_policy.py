@@ -42,10 +42,10 @@ from phasesweep.engine.optuna import (
     _any_trial_timed_out,
     _finished_trial_count,
     _measured_trial_count,
+    _trial_count_state,
 )
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
@@ -672,11 +672,7 @@ def _failed_grid_cells(
         if grid_id is not None:
             latest[grid_id] = trial
     return sorted(
-        (
-            trial
-            for trial in latest.values()
-            if trial.state == optuna.trial.TrialState.FAIL and not _trial_interrupted(trial)
-        ),
+        (trial for trial in latest.values() if _trial_count_state(trial) == "FAIL"),
         key=lambda trial: trial.number,
     )
 
@@ -919,10 +915,7 @@ def _recovery_remedies(
         return " ".join(remedies)
     if ceiling is None or ceiling > finished:
         return None
-    if any(
-        trial.state == optuna.trial.TrialState.COMPLETE and trial.user_attrs.get(FEASIBLE_ATTR)
-        for trial in trials
-    ):
+    if any(_trial_count_state(trial) == "COMPLETE" for trial in trials):
         return (
             "Nothing is left to run or retry, so no larger n_trials or max_consecutive_failures "
             "schedules more work."
