@@ -40,8 +40,6 @@ from tests.conftest import (
     write_trainer,
 )
 
-_RULE = "PhaseSweep scores a trial only from files inside its own attempt directory."
-
 
 def _refusal(relative: str, attempt: Path, target: Path) -> str:
     """Return the refusal text for one evidence file that resolves outside its attempt.
@@ -53,8 +51,7 @@ def _refusal(relative: str, attempt: Path, target: Path) -> str:
     """
     return (
         f"`{relative}` in attempt directory {attempt} resolves to {target.resolve()}, outside "
-        f"the attempt. {_RULE} Have the trainer write `{relative}` under PHASESWEEP_TRIAL_DIR, "
-        "copying it there if it saves results elsewhere."
+        "the attempt. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
     )
 
 

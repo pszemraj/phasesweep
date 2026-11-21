@@ -83,6 +83,7 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
+from phasesweep.evidence.wandb import WANDB_SDK_MISSING
 from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
@@ -1426,8 +1427,8 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
         run_experiment(experiment)
     assert str(refused.value) == (
         "1 completed trial(s) finished training, but the tracker could not be read. First "
-        "failure: metric extractor: W&B evidence requires the optional SDK; install "
-        "phasesweep[wandb]. Their training is kept and no new trial was started."
+        f"failure: metric extractor: {WANDB_SDK_MISSING} Their training is kept and no new "
+        "trial was started."
     )
     assert refused.value.remediation == (
         "Restore access to the tracker or install its SDK, then run the same config again; the "

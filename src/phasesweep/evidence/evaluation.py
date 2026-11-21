@@ -36,6 +36,7 @@ from phasesweep.evidence.models import (
     _WandbSummarySource,
 )
 from phasesweep.evidence.wandb import (
+    WANDB_SDK_MISSING,
     WandbMissingKeysError,
     WandbPollTimeout,
     WandbRunMissingError,
@@ -111,9 +112,7 @@ def attempt_file(trial_dir: Path, relative: str | Path) -> Path:
     if not resolved.is_relative_to(trial_dir.resolve()):
         raise OutsideAttemptError(
             f"`{relative}` in attempt directory {trial_dir} resolves to {resolved}, outside the "
-            "attempt. PhaseSweep scores a trial only from files inside its own attempt directory. "
-            f"Have the trainer write `{relative}` under PHASESWEEP_TRIAL_DIR, copying it there if "
-            "it saves results elsewhere."
+            "attempt. Have the trainer write it under PHASESWEEP_TRIAL_DIR."
         )
     return path
 
@@ -532,8 +531,7 @@ def _extract_log_regex(
                         # run would be scored on whichever side of them it landed.
                         raise ExtractorError(
                             f"Log file {target} has a non-finite match on line {line_no}, "
-                            f"so select: {cfg.select} cannot score this trial. "
-                            "Check why the trainer reported a non-finite objective."
+                            f"so select: {cfg.select} cannot score this trial."
                         )
                     elif cfg.select == "min":
                         if result is None or v < result:
@@ -636,9 +634,8 @@ def _capture_wandb(
             if isinstance(exc, WandbRunMissingError):
                 message = (
                     f"No W&B run {ctx.attempt_id!r} was found in {source.entity}/{source.project} "
-                    "at the evidence deadline. Check that the trainer calls wandb.init() and "
-                    "passes no project, entity or id of its own, or set the extractor's "
-                    "project and entity to match."
+                    "at the evidence deadline. The trainer should call wandb.init() without "
+                    "its own project, entity or id."
                 )
             else:
                 expired = (
@@ -652,7 +649,7 @@ def _capture_wandb(
             raise error(message) from exc
         except WandbSetupError as exc:
             raise EvidenceUnreadableError(
-                f"W&B authentication/setup failed for {target}: {exc.cause}. Check account access and endpoint settings."
+                f"W&B authentication/setup failed for {target}: {exc.cause}."
             ) from exc
         except WandbRunTerminalError as exc:
             raise ExtractorError(
@@ -664,9 +661,7 @@ def _capture_wandb(
                 f"available summary keys: {exc.available!r}."
             ) from exc
         except ImportError as exc:
-            raise EvidenceUnreadableError(
-                "W&B evidence requires the optional SDK; install phasesweep[wandb]."
-            ) from exc
+            raise EvidenceUnreadableError(WANDB_SDK_MISSING) from exc
         except ValueError as exc:
             raise ExtractorError(f"Invalid W&B numeric evidence for {target}: {exc}") from exc
         except (ExtractorError, UnsafeProcessCleanupError):

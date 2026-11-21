@@ -85,6 +85,9 @@ class WandbMissingKeysError(RuntimeError):
     available: list[str]
 
 
+WANDB_SDK_MISSING = 'W&B evidence requires the optional SDK: pip install "phasesweep[wandb]".'
+
+
 def require_wandb_sdk() -> None:
     """Check the optional SDK without authenticating or making a network request.
 
@@ -95,11 +98,7 @@ def require_wandb_sdk() -> None:
     except ImportError as exc:
         from phasesweep.errors import OperatorAction, PhaseSweepError
 
-        raise PhaseSweepError(
-            "W&B evidence requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its wandb extra: pip install "phasesweep[wandb]".',
-            action=OperatorAction.FIX_CONFIG,
-        ) from exc
+        raise PhaseSweepError(WANDB_SDK_MISSING, action=OperatorAction.FIX_CONFIG) from exc
 
 
 def _error_chain(exc: BaseException) -> Iterable[BaseException]:
@@ -288,9 +287,7 @@ def poll_wandb_summary(
     if response.get("status") == "invalid_evidence":
         raise ValueError(response["cause"])
     if response.get("status") == "import_error":
-        raise ImportError(
-            "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
-        )
+        raise ImportError(WANDB_SDK_MISSING)
     # A complete response was captured before the deadline, even if worker exit timed out.
     if response.get("status") != "summary":
         if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
