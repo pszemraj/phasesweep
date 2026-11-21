@@ -341,7 +341,8 @@ def _save_attempt_intents(
     COMPLETE trials receive accepted projections. Unaccepted managed runs finish
     only after cleanup is confirmed by the trial, live controller, or owning
     study's recovery ledger. Unreadable trials and uncertain cleanup remain unresolved, as
-    do RUNNING trials of a persistent study, whose outcome recovery has yet to record.
+    do RUNNING trials of a persistent study, whose outcome recovery has yet to record, and
+    attempts whose trial a persistent ledger does not hold.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
@@ -349,9 +350,9 @@ def _save_attempt_intents(
     :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
         its controller's cleanup confirmation or its study's recovery.
     :param str | None ended: Status for every unaccepted managed run, terminal or, without
-        persistent storage, still RUNNING, once the invocation that owned it ended with
-        confirmed cleanup, or ``None`` to finish only trials Optuna failed with confirmed
-        cleanup.
+        persistent storage, still RUNNING or no longer held by the ledger, once the invocation
+        that owned it ended with confirmed cleanup or was killed outright, or ``None`` to
+        finish only trials Optuna failed with confirmed cleanup.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -362,10 +363,17 @@ def _save_attempt_intents(
     paths: list[Path] = []
     for directory, binding in attempts:
         found = trials.get(binding["attempt_id"])
+        name = f"attempt-{binding['attempt_id']}"
         if found is None:
+            if ended is not None and not experiment.persistent and binding["run_mode"] == "managed":
+                # An in-memory ledger ended with the invocation that held the trial, so no
+                # outcome but that invocation's status can ever reach the run.
+                projection = _unaccepted_projection(binding, ended)
+                paths.append(
+                    _save_intent(experiment, generation_id, name, binding, projection, finish=ended)
+                )
             continue
         trial = found.trial
-        name = f"attempt-{binding['attempt_id']}"
         if trial.state == TrialState.COMPLETE:
             projection = _accepted_projection(trial, read_inherits(directory))
             paths.append(_save_intent(experiment, generation_id, name, binding, projection))
@@ -598,9 +606,13 @@ def _rebuild_attempt_intents(
 ) -> None:
     """Save the attempt records an interrupted or failed invocation never saved.
 
+    Without persistent storage the ledger that held an ended generation's trials is gone, so
+    each managed attempt of an unpublished one ends with the status that ends its summary run.
+
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The experiment's validated ledger, holding the attempts' trials.
-    :param Iterable[str] generation_ids: Generations whose attempts are checked.
+    :param Iterable[str] generation_ids: Ended generations whose attempts are checked; never a
+        live invocation's.
     """
     unrecorded = {
         generation_id: attempts
@@ -612,18 +624,42 @@ def _rebuild_attempt_intents(
     phases = {binding["phase"] for attempts in unrecorded.values() for _, binding in attempts}
     trials = _attempt_trials(ledger, phases)
     for generation_id, attempts in unrecorded.items():
-        _save_attempt_intents(experiment, generation_id, attempts, trials, ended=None)
+        # A persistent ledger still holds the trials, and a published generation is not ended
+        # by its lifecycle record.
+        untouched = experiment.persistent or _published(experiment, generation_id)
+        ended = None if untouched else _ended_status(experiment, generation_id)[0]
+        _save_attempt_intents(experiment, generation_id, attempts, trials, ended=ended)
+
+
+def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str | None]:
+    """Name the status that ends an ended, unpublished generation's runs, and its failure.
+
+    It is the status the failure in the generation's lifecycle record maps to, or KILLED when
+    the invocation, as one killed outright does, recorded no failure.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Ended, unpublished generation.
+    :raises OSError: The lifecycle record cannot be read.
+    :return tuple[str, str | None]: ``FAILED`` or ``KILLED``, and the class name of the recorded
+        failure, or ``None`` when none was recorded.
+    """
+    from phasesweep.engine.generation import _recorded_generation
+    from phasesweep.engine.paths import _generation_record_path
+
+    recorded = _recorded_generation(_generation_record_path(experiment, generation_id))
+    if recorded.state in {"failed", "publication_failed"}:
+        return _failure_status(recorded.error_class), recorded.error_class
+    return "KILLED", None
 
 
 def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str]) -> list[Path]:
     """Save the summary-run record each ended, unpublished generation's invocation never saved.
 
     An invocation killed outright saves none, so its summary run would stay open. It ends with
-    the status the failure in the generation's lifecycle record maps to, or KILLED when the
-    invocation recorded no failure. A published generation's record is built from its committed
-    artifacts instead, and a record already saved is kept as it is. Callers hold the experiment
-    lock and pass no live invocation's generation: a run never passes its own, and recover-run
-    passes the run whose runner it proved dead.
+    the status :func:`_ended_status` names. A published generation's record is built from its
+    committed artifacts instead, and a record already saved is kept as it is. Callers hold the
+    experiment lock and pass no live invocation's generation: a run never passes its own, and
+    recover-run passes the run whose runner it proved dead.
 
     :param Experiment experiment: Configured experiment.
     :param Iterable[str] generation_ids: Ended generations to check.
@@ -631,9 +667,6 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
     :return list[Path]: The summary-run record of each of those generations that is unpublished
         and has a bound summary run, whether saved here or before.
     """
-    from phasesweep.engine.generation import _recorded_generation
-    from phasesweep.engine.paths import _generation_record_path
-
     paths = []
     for generation_id in sorted(set(generation_ids)):
         root = tracking_root(experiment) / generation_id
@@ -643,12 +676,9 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
             continue
         path = root / "delivery" / "generation.json"
         if not path.exists():
-            recorded = _recorded_generation(_generation_record_path(experiment, generation_id))
-            if recorded.state in {"failed", "publication_failed"}:
-                status, error_class = _failure_status(recorded.error_class), recorded.error_class
-            else:
-                status, error_class = "KILLED", None
-            _save_failure_summary(experiment, generation_id, status, error_class)
+            _save_failure_summary(
+                experiment, generation_id, *_ended_status(experiment, generation_id)
+            )
         paths.append(path)
     return paths
 

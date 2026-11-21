@@ -23,6 +23,7 @@ import phasesweep.engine.guards as guards_module
 import phasesweep.engine.phase as phase_module
 from phasesweep.config.models import Experiment
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, CLEANUP_CONFIRMED_ATTR
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
@@ -350,7 +351,9 @@ class RunnerKilled(BaseException):
     """Stands in for the orchestrator dying, which no handler of the run may observe."""
 
 
-def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight=True):
+def killed_sweep(
+    tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight=True, persistent=True
+):
     """Kill a sweep of ``n_jobs`` managed attempts outright, by default with all of them in flight.
 
     Each attempt's managed run and the generation's summary run exist. With the attempts in
@@ -362,10 +365,13 @@ def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight
     :param bool in_flight: Kill the run with its trials in flight; ``False`` lets every trial
         finish, its accepted outcome sent, and kills the run before it publishes, so no trial is
         left for recovery to settle.
+    :param bool persistent: Record the trials in a journal; ``False`` keeps them in memory, so
+        they are gone with the killed run and only their bound attempt directories remain.
     :return tuple[Experiment, list, list[str]]: The experiment, the upload log, and the attempt ids.
     """
     config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
-    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    if persistent:
+        config["storage"] = f"journal:///{tmp_path}/study.journal"
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(
         n_trials=n_jobs,
@@ -399,6 +405,10 @@ def killed_sweep(tmp_path, monkeypatch, *, n_jobs, generation_id=None, in_flight
         with pytest.raises(RunnerKilled):
             run_experiment(experiment, generation_id=generation_id)
     assert not any(session.tracking_root(experiment).glob("*/delivery/generation.json"))
+    if not persistent:
+        bindings = sorted(_experiment_dir(experiment).glob(f"*/trial_*/{session.BINDING_FILE}"))
+        assert len(bindings) == n_jobs
+        return experiment, uploads, [session.read_binding(b.parent)["attempt_id"] for b in bindings]
     trials = read_phase_trials(validate_ledger(experiment), "depth").trials
     state = TrialState.RUNNING if in_flight else TrialState.COMPLETE
     assert [trial.state for trial in trials] == [state] * n_jobs

@@ -1084,6 +1084,83 @@ def test_a_killed_runs_summary_run_is_finished_by_recovery_never_by_itself(
     assert read_record(record)["projection"]["summary"]["error_class"] is None
 
 
+@pytest.mark.parametrize("caller", ["next-run", "sync-tracking"])
+def test_a_killed_in_memory_sweeps_attempt_runs_end_with_its_summary_run(
+    tmp_path, monkeypatch, caller
+):
+    """An in-memory sweep killed outright has its managed attempt runs ended KILLED with its summary run.
+
+    Its trials were gone with the process, so nothing else could ever end those runs. The next
+    run or sync-tracking ends each once, and a later run or sync sends nothing more of it.
+    """
+    experiment, uploads, attempts = killed_sweep(tmp_path, monkeypatch, n_jobs=2, persistent=False)
+    [killed] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
+    uploads.clear()
+
+    if caller == "next-run":
+        run_experiment(experiment)
+    else:
+        assert publication.sync_tracking(experiment) == {"delivered": 3, "pending": 0}
+
+    assert _sent(uploads, attempts) == ["KILLED", "KILLED"]
+    assert [entry for entry in _summaries(uploads) if entry[0] == killed] == [(killed, "KILLED")]
+    uploads.clear()
+    if caller == "next-run":
+        run_experiment(experiment)
+    publication.sync_tracking(experiment)
+    assert _sent(uploads, attempts) == []
+    assert [entry for entry in _summaries(uploads) if entry[0] == killed] == []
+
+
+@pytest.mark.parametrize(
+    ("storage", "recorded", "finish"),
+    [
+        (None, None, "KILLED"),
+        (None, "failed", "FAILED"),
+        (None, "published", None),
+        ("journal", None, None),
+    ],
+    ids=["in-memory-killed", "in-memory-failed", "in-memory-published", "persistent"],
+)
+def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
+    tmp_path, storage, recorded, finish
+):
+    """A bound attempt the ledger does not hold ends with its ended generation's status only without persistent storage.
+
+    It ends KILLED, or with the status the generation's recorded failure maps to. A published
+    generation's attempt is left alone, and with persistent storage a missing trial stays
+    unresolved.
+    """
+    from phasesweep.engine.generation import _write_generation_state
+
+    journal = f"journal:///{tmp_path}/study.journal"
+    experiment = native_experiment(tmp_path, storage=journal if storage else None)
+    ledger = claim_ledger(validate_ledger(experiment))
+    generation = "a" * 32
+    if recorded is not None:
+        _write_generation_state(
+            experiment,
+            generation_id=generation,
+            state=recorded,
+            from_phase=None,
+            publish_current=False,
+            error_class="RuntimeError" if recorded == "failed" else None,
+        )
+    write_record(
+        tracking_root(experiment) / generation / "generation-binding.json",
+        {**mlflow_binding(), "phase": "generation", "attempt_id": generation},
+    )
+    attempt = "1" * 32
+    directory = _trial_dir_for(experiment, "depth", 0, generation_id=generation, attempt_id=attempt)
+    binding = {**mlflow_binding(), "phase": "depth", "attempt_id": attempt}
+    write_record(directory / BINDING_FILE, binding)
+
+    publication._rebuild_attempt_intents(experiment, ledger, [generation])
+
+    record = tracking_root(experiment) / generation / "delivery" / f"attempt-{attempt}.json"
+    assert (read_record(record)["finish"] if record.exists() else None) == finish
+
+
 @pytest.mark.parametrize("in_flight", [True, False], ids=["in-flight", "between-trials"])
 def test_a_run_with_another_mlflow_target_saves_no_recovered_outcome(
     tmp_path, monkeypatch, caplog, in_flight
