@@ -873,9 +873,8 @@ def test_transitive_inherited_search_key_cannot_be_resampled() -> None:
         ValidationError,
         match=(
             r"Phase 'reg' re-samples key\(s\) \['n_layers'\] that an inherited phase already "
-            r"sampled \(n_layers from 'arch', possibly transitively\)\..*"
-            r"remove the key from search_space or drop the inherit\..*"
-            r"Keys a parent only fixed may be searched\."
+            r"sampled \(n_layers from 'arch'\); "
+            r"remove the key from search_space or drop the inherit\."
         ),
     ):
         make_experiment(

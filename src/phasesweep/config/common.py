@@ -197,9 +197,7 @@ def _validate_override_key(key: str, *, label: str) -> None:
     for i, part in enumerate(parts):
         if not part:
             raise ValueError(
-                f"{label}: override key {key!r} has an empty dotted segment at "
-                f"position {i}. Use simple keys like 'lr' or dotted keys like "
-                f"'model.depth'; do not use leading/trailing dots or '..'."
+                f"{label}: override key {key!r} has an empty dotted segment at position {i}."
             )
         if not SAFE_NAME_PATTERN.fullmatch(part):
             raise ValueError(

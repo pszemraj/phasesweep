@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias, get_args
@@ -267,6 +267,27 @@ POSITIONED_EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(
 """The kinds whose recorded evidence names where on the evaluation axis the objective was
 measured. ``json`` and ``log_regex`` objectives record no position, so selection's
 ``evaluation_point`` check cannot run on them."""
+
+
+def no_position_reason(kinds: Sequence[str]) -> str:
+    """State why objectives of these extractor kinds leave the ``evaluation_point`` check n/a.
+
+    :param Sequence[str] kinds: The extractor kinds that record no position.
+    :return str: The clause both ``validate`` and the selection record use.
+    """
+    return f"{', '.join(kinds)} objectives record no evaluation position"
+
+
+def best_value_position_reason(select: str) -> str:
+    """State why an MLflow best-value selector leaves the ``evaluation_point`` check n/a.
+
+    :param str select: The MLflow selector, ``min`` or ``max``.
+    :return str: The clause both ``validate`` and the selection record use.
+    """
+    return (
+        f"mlflow select: {select} records the step where the best value fell, "
+        "not how far each trial trained"
+    )
 
 
 class RequiredFileGate(_Frozen):

@@ -128,7 +128,7 @@ def test_relative_journal_refused_under_config_dir_with_query_char(tmp_path: Pat
     project.mkdir()
     config = write_anchored_config(project / "exp.yaml", storage="journal:///study.journal")
 
-    with pytest.raises(ValidationError, match=r"contains \? or #"):
+    with pytest.raises(ValidationError, match=r"containing \? or #"):
         load_experiment(config)
     # auto escapes the directory name, so the same location stays usable.
     load_experiment(write_anchored_config(project / "auto.yaml", storage="auto"))

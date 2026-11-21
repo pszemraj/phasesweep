@@ -14,7 +14,7 @@ import phasesweep.engine.read as read_module
 from phasesweep import run_experiment
 from phasesweep.cli import cli
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.config.run_overrides import SetPathError, apply_set
+from phasesweep.config.run_overrides import SET_SYNTAX, SetPathError, apply_set
 from phasesweep.config.search import IntParam, Sampler
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudyStorageUnavailableError
 from phasesweep.engine.ledger import ValidatedLedger
@@ -823,13 +823,13 @@ def test_set_can_add_keys_to_the_free_form_trainer_config(
 def test_set_refuses_an_unknown_phase_name_and_lists_the_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An unknown phase name stops at ``--set`` with the argument, segment and syntax named."""
+    """An unknown phase name stops at ``--set`` with the argument, segment and syntax pointer."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, "phases[wd2].n_trials=2")
 
     assert "'phases[wd2].n_trials'" in message
     assert "'[wd2]'" in message
     assert "lr, wd" in message
-    assert "Accepted syntax" in message
+    assert SET_SYNTAX in message
     assert "validation error" not in message
     assert not (tmp_path / "original").exists()
 
@@ -920,9 +920,9 @@ def test_set_path_errors_name_the_argument_the_segment_and_the_syntax(
     setting: str,
     fragment: str,
 ) -> None:
-    """Every refused path quotes its argument, says what failed and repeats the syntax."""
+    """Every refused path quotes its argument, says what failed and points at the syntax."""
     message = _refused(_two_phase_config(tmp_path), monkeypatch, capsys, setting)
 
     assert repr(setting.partition("=")[0]) in message
     assert fragment in message
-    assert "Accepted syntax" in message
+    assert SET_SYNTAX in message

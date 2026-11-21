@@ -753,10 +753,8 @@ def test_a_dry_run_prints_every_info_line_of_the_starter(
         "'evaluation_axis': 'step'}",
         "DRY RUN evaluation_point check: supported (axis 'step' from the envelope; "
         "any other axis from evaluation.progress)",
-        "DRY RUN environment: inherit_env=none (inherited when set, and digested: PATH, HOME, "
-        "LANG, LC_ALL, USER, LOGNAME, TZ); env keys: none; passthrough_env: TMPDIR (built in; "
-        "inherited when set, excluded from the digest); a persistent study refuses to resume "
-        "when any digested value changes",
+        "DRY RUN environment: inherit_env=none (digested: PATH, HOME, LANG, LC_ALL, USER, "
+        "LOGNAME, TZ); env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         "DRY RUN trainer cwd: TMP (execution.cwd; part of the study identity)",
         "DRY RUN artifact root: TMP/runs/phasesweep_starter",
         "DRY RUN phase 'depth': sampler=grid (resumable, reproducible)",

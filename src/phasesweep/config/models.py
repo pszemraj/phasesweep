@@ -57,7 +57,9 @@ from phasesweep.evidence.models import (
     WandbQuery,
     WandbSummaryRequiredGate,
     _WandbSummarySource,
+    best_value_position_reason,
     compose_wandb_environment,
+    no_position_reason,
     wandb_gate_identity,
 )
 from phasesweep.runtime.commands import (
@@ -188,17 +190,15 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
     flags = _argparse_boolean_flags(experiment)
     if flags:
         warnings.append(
-            "argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
-            "value, so set such flags in trial_command or have the trainer accept a value. "
-            f"Rendered that way: {', '.join(flags)}."
+            "argparse renders booleans as --key=true/--key=false, which a store_true flag "
+            f"rejects: {', '.join(flags)}. Set them in trial_command."
         )
     credentials = _credential_like_inherited_names(experiment)
     if credentials:
         warnings.append(
             f"execution.inherit_env lists names that look like credentials: {', '.join(credentials)}. "
-            "Each trial records the value of every listed name in plain text in the study "
-            "ledger, and rotating one refuses a resume. Credentials belong in "
-            "execution.passthrough_env, which is inherited without being recorded or compared."
+            "Each trial records their values in plain text in the study ledger; move them to "
+            "execution.passthrough_env."
         )
     return warnings
 
@@ -329,11 +329,7 @@ def _evaluation_point_line(metric: Metric) -> str:
     extractor = metric.extractor
     prefix = "evaluation_point check:"
     if extractor.type not in POSITIONED_EXTRACTOR_KINDS:
-        return (
-            f"{prefix} n/a ({extractor.type} objectives record no evaluation position; "
-            "json_envelope via report_objective, wandb with evaluation_axis, or mlflow with "
-            "select: last or step would)"
-        )
+        return f"{prefix} n/a ({no_position_reason([extractor.type])})"
     if isinstance(extractor, JsonEnvelopeExtractor):
         source = (
             "the envelope; any other axis from evaluation.progress"
@@ -347,10 +343,7 @@ def _evaluation_point_line(metric: Metric) -> str:
             "n/a when the history lookup finds no position)"
         )
     if isinstance(extractor, MlflowExtractor) and extractor.select in ("min", "max"):
-        return (
-            f"{prefix} n/a (mlflow select: {extractor.select} records the step where the best "
-            "value fell, not how far each trial trained)"
-        )
+        return f"{prefix} n/a ({best_value_position_reason(extractor.select)})"
     return f"{prefix} supported (position is the step of the selected observation)"
 
 
@@ -381,32 +374,26 @@ def _environment_contract_line(experiment: Experiment) -> str:
     )
     if contract == "all":
         inherited = (
-            f"inherit_env=all (inherited whole, and digested: {digested}; "
-            "other ambient variables are not compared)"
+            f"inherit_env=all (digested: {digested}; other ambient variables are not compared)"
         )
     else:
         label = f"[{', '.join(contract)}]" if isinstance(contract, list) else contract
-        inherited = f"inherit_env={label} (inherited when set, and digested: {digested})"
+        inherited = f"inherit_env={label} (digested: {digested})"
     built_in = sorted(excluded & set(BUILTIN_PASSTHROUGH_ENV))
     listed = sorted(excluded - set(BUILTIN_PASSTHROUGH_ENV))
     if not excluded:
         passthrough = "passthrough_env: none"
     elif not listed:
-        passthrough = (
-            f"passthrough_env: {', '.join(built_in)} (built in; inherited when set, "
-            "excluded from the digest)"
-        )
+        passthrough = f"passthrough_env: {', '.join(built_in)} (built in, not digested)"
     else:
         names = ", ".join(listed) + (f" and built-in {', '.join(built_in)}" if built_in else "")
-        passthrough = f"passthrough_env: {names} (inherited when set, excluded from the digest)"
+        passthrough = f"passthrough_env: {names} (not digested)"
     shadowed = sorted(passed_through & configured)
     if shadowed:
         passthrough += (
             f" ({', '.join(shadowed)} set under env, so the configured value is digested)"
         )
     parts = [inherited, f"env keys: {', '.join(sorted(configured)) or 'none'}", passthrough]
-    if experiment.persistent:
-        parts.append("a persistent study refuses to resume when any digested value changes")
     return "environment: " + "; ".join(parts)
 
 
@@ -503,10 +490,9 @@ class Observation(_NamedExtractor):
         kind = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
         if kind in ("wandb", "mlflow"):
             raise ValueError(
-                f"Observation {info.data.get('name')!r} cannot use a {kind} extractor: "
-                "remote extractors require every requested key, so a value the trainer "
-                "never wrote would fail the trial. Write the value "
-                "with report_objective(..., extra=...) and read it with a local json extractor."
+                f"Observation {info.data.get('name')!r} cannot use a {kind} extractor; write "
+                "the value with report_objective(..., extra=...) and read it with a local "
+                "json extractor."
             )
         return value
 
@@ -607,11 +593,7 @@ class Phase(_Frozen):
             raise ValueError("gpu_ids must be omitted or contain at least one CUDA device index.")
         bad = [v for v in value if v < 0]
         if bad:
-            raise ValueError(
-                f"gpu_ids must be non-negative CUDA device indices; got {bad}. "
-                "(CUDA_VISIBLE_DEVICES=-1 hides all devices and would silently "
-                "disable GPU isolation.)"
-            )
+            raise ValueError(f"gpu_ids must be non-negative CUDA device indices; got {bad}.")
         return value
 
     @field_validator("gpu_devices")
@@ -653,10 +635,7 @@ class Phase(_Frozen):
         if self.gpu_ids is not None and self.gpu_devices is not None:
             raise ValueError("gpu_ids and gpu_devices are mutually exclusive.")
         if self.gpu_policy == "whole_node" and self.n_jobs != 1:
-            raise ValueError(
-                "gpu_policy='whole_node' requires n_jobs=1 because each trial receives "
-                "the full configured CUDA device set or discovered MPS device."
-            )
+            raise ValueError("gpu_policy='whole_node' requires n_jobs=1.")
         if (
             self.gpu_policy == "whole_node"
             and self.gpu_ids is None
@@ -664,8 +643,7 @@ class Phase(_Frozen):
             and sys.platform != "darwin"
         ):
             raise ValueError(
-                "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices "
-                "list because its device count defines the trainer's world size."
+                "gpu_policy='whole_node' requires an explicit gpu_ids or gpu_devices list."
             )
         if self.gpu_policy == "whole_node":
             # Declared device count must match the pool's distinct normalized tokens.
@@ -676,21 +654,16 @@ class Phase(_Frozen):
                 field = "gpu_ids" if self.gpu_ids is not None else "gpu_devices"
                 raise ValueError(
                     "gpu_policy='whole_node' requires unique device tokens; "
-                    f"{field} repeats {duplicates}. List each device once, or "
-                    "use gpu_policy='single_per_trial' if you meant a pool rather than "
-                    "a world size."
+                    f"{field} repeats {duplicates}. List each device once."
                 )
         if self.gpu_policy == "none":
             if self.gpu_ids is not None or self.gpu_devices is not None:
                 raise ValueError(
-                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices "
-                    "because phasesweep CUDA isolation and GPU host locks are disabled."
+                    "gpu_policy='none' cannot be combined with gpu_ids or gpu_devices."
                 )
             if self.n_jobs > 1 and not self.allow_no_gpu_isolation:
                 raise ValueError(
-                    "gpu_policy='none' with n_jobs > 1 can oversubscribe the host. "
-                    "Set allow_no_gpu_isolation=true for CPU-only work or isolation "
-                    "handled outside PhaseSweep."
+                    "gpu_policy='none' with n_jobs > 1 requires allow_no_gpu_isolation=true."
                 )
         return self
 
@@ -790,9 +763,8 @@ class Phase(_Frozen):
         ):
             if key in keys:
                 raise ValueError(
-                    f"Phase {self.name!r}: repeats.key {key!r} is also a {field} key. The "
-                    "repeat axis supplies that key's value on every trial; remove it from "
-                    f"{field}."
+                    f"Phase {self.name!r}: repeats.key {key!r} is also a {field} key; "
+                    f"remove it from {field}."
                 )
         return self
 
@@ -850,12 +822,9 @@ class Phase(_Frozen):
             if key.rsplit(".", 1)[-1] in {"seed", "data_seed", "random_state"}
         ]
         if seed_keys:
-            example = seed_keys[0]
             raise ValueError(
-                f"Phase {self.name!r}: seed keys cannot be searched: {seed_keys}. A searched "
-                "seed lets seed noise win as if it were a configuration. Fix the seed in "
-                "fixed_overrides or trainer_config. To compare finalists across seeds, use "
-                f"repeats: {{key: {example}, values: [0, 1, 2]}}."
+                f"Phase {self.name!r}: seed keys cannot be searched: {seed_keys}. Fix the "
+                "seed in fixed_overrides or trainer_config."
             )
         return self
 
@@ -1232,18 +1201,11 @@ class Experiment(_Frozen):
         if value.split(":", 1)[0] != "journal":
             raise ValueError(
                 "storage must be null, auto, or a journal:/// URL with the lowercase "
-                f"scheme journal; got {value!r}. PhaseSweep keeps its persistent ledger "
-                "in an Optuna journal file: use `storage: auto` for "
-                "<workdir>/<experiment>/study.journal, "
-                "`storage: journal:///path/to/study.journal` for an explicit file, or "
-                "`storage: null` for an in-memory dry run."
+                f"scheme journal; got {value!r}."
             )
         if "?" in value or "#" in value:
             raise ValueError(
-                "storage journal URLs cannot carry a query or fragment, because everything "
-                f"from the first ? or # on is dropped from the file path; got {value!r}. "
-                "Remove it. To keep the journal under a directory whose name contains ? or #, "
-                "use `storage: auto` with that workdir."
+                f"storage journal URLs cannot carry a query or fragment; got {value!r}. Remove it."
             )
         raw_path = file_url_path(value)
         if raw_path == "":
@@ -1257,10 +1219,9 @@ class Experiment(_Frozen):
             value = f"journal:///{anchored_path}"
             if "?" in value or "#" in value:
                 raise ValueError(
-                    "storage journal path is relative, and the config file's directory it "
-                    "resolves against contains ? or #, which a journal URL cannot carry; got "
-                    f"{anchored_path!r}. Use `storage: auto`, which keeps the journal under "
-                    "workdir whatever its directory names contain."
+                    "storage journal path is relative to a config directory containing ? or #, "
+                    f"which a journal URL cannot carry; got {anchored_path!r}. Use "
+                    "`storage: auto`."
                 )
         canonical_storage_identity(value)
         return value
@@ -1296,8 +1257,8 @@ class Experiment(_Frozen):
         bad_names = [name for name in value if not _is_environment_name(name)]
         if bad_names:
             raise ValueError(
-                "env names must be nonempty and contain no '=' or NUL character, because "
-                f"the trainer launch cannot pass them: {bad_names!r}. Rename or remove them."
+                "env names must be nonempty and contain no '=' or NUL character; got "
+                f"{bad_names!r}."
             )
         bad_values = [name for name, text in value.items() if "\x00" in text]
         if bad_values:
@@ -1328,10 +1289,9 @@ class Experiment(_Frozen):
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
         if self.persistent and not self.provenance:
             raise ValueError(
-                f"Persistent storage (storage: {self.storage}) requires a nonempty provenance mapping that identifies "
-                "the data and dependency revisions used by this experiment; each generation "
-                "records the trainer's git commit on its own. For example: "
-                "provenance: {data_revision: DATA_REVISION, dependencies: DEPENDENCY_REVISION}."
+                f"Persistent storage (storage: {self.storage}) requires a nonempty `provenance` "
+                "mapping, such as {data_revision: DATA_REVISION, dependencies: "
+                "DEPENDENCY_REVISION}."
             )
         return self
 
@@ -1463,8 +1423,7 @@ class Experiment(_Frozen):
             if local_collisions:
                 raise ValueError(
                     f"Phase {phase.name!r} declares key(s) {sorted(local_collisions)} "
-                    "in both fixed_overrides and search_space. A key must be either "
-                    "fixed or sampled, not both."
+                    "in both fixed_overrides and search_space."
                 )
 
             inherited_origins = _inherited_origins(phase, origins_by_phase)
@@ -1494,10 +1453,8 @@ class Experiment(_Frozen):
                 )
                 raise ValueError(
                     f"Phase {phase.name!r} re-samples key(s) {sorted(inherited_collisions)} "
-                    f"that an inherited phase already sampled ({details}, possibly "
-                    "transitively). A winner's sampled value cannot be searched again; "
-                    "remove the key from search_space or drop the inherit. Keys a parent "
-                    "only fixed may be searched."
+                    f"that an inherited phase already sampled ({details}); remove the key "
+                    "from search_space or drop the inherit."
                 )
 
             resolved_origins = _resolved_origins(phase, inherited_origins)
@@ -1506,8 +1463,7 @@ class Experiment(_Frozen):
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
                 raise ValueError(
                     f"Phase {phase.name!r} has dotted-key namespace collision(s) "
-                    f"across inherited and local overrides: {pairs}. "
-                    "A key and a sub-key cannot both be overridden across the inheritance chain."
+                    f"across inherited and local overrides: {pairs}."
                 )
 
             _validate_sampler_search_space(phase, persistent=self.persistent)
@@ -1612,10 +1568,8 @@ def _validate_persistent_sampler_seed(experiment: Experiment, phase: Phase) -> N
     if sampler.type in STOCHASTIC_SAMPLERS and sampler.seed is None:
         raise ValueError(
             f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
-            "requires an explicit sampler.seed. A durable study outlives the "
-            "process that created it, so an unseeded stochastic sampler leaves trials nobody "
-            "can reproduce or explain. Add an integer 'seed' to this phase's sampler block, "
-            "or use sampler.type: grid to enumerate a fixed matrix."
+            "requires an explicit sampler.seed. Add an integer `seed` to the phase's sampler "
+            "block."
         )
 
 
@@ -1688,9 +1642,7 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                     f"Phase {phase.name!r}: {axis} has "
                     f"choices {earlier_choice!r} at index {earlier_index} and {choice!r} "
                     f"at index {index}, which both render as {wire!r} under "
-                    f"override_format={override_format!r}. Distinct search choices must "
-                    "produce distinct trainer command values; use different choices or "
-                    "the default override_format='yaml_file'."
+                    f"override_format={override_format!r}; use choices that render differently."
                 )
             rendered[wire] = (index, choice)
     for key, value in phase.fixed_overrides.items():
@@ -1713,7 +1665,7 @@ def _format_field_names(template: str) -> set[str]:
     try:
         parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
-        raise ValueError(f"{exc}. Check for unbalanced braces.") from exc
+        raise ValueError(f"{exc}: unbalanced braces in trial_command.") from exc
     fields: set[str] = set()
     formatted: list[str] = []
     for _literal, field_name, format_spec, conversion in parsed:
@@ -1728,10 +1680,29 @@ def _format_field_names(template: str) -> set[str]:
     if formatted:
         raise ValueError(
             "trial_command placeholders take no format spec or conversion; found "
-            f"{', '.join(formatted)}. Format values in the shell instead, for example "
-            "$(printf '%05d' {trial_id})."
+            f"{', '.join(formatted)}. Format values in the shell instead."
         )
     return fields
+
+
+def _missing_placeholder_error(
+    override_format: str, phase_name: str, placeholder: str, *, has_input: bool = False
+) -> ValueError:
+    """Build the refusal for a trial_command that omits the placeholder its format needs.
+
+    :param str override_format: The experiment's ``override_format``.
+    :param str phase_name: Phase whose command is checked.
+    :param str placeholder: The placeholder the format requires.
+    :param bool has_input: Whether the phase has overrides or a trainer_config to pass on, defaults to False.
+    :return ValueError: The error to raise.
+    """
+    subject = f"phase {phase_name!r}" + (
+        " has overrides or a trainer_config and" if has_input else ""
+    )
+    return ValueError(
+        f"override_format={override_format!r} but {subject} trial_command does not "
+        f"reference {{{placeholder}}}. Add {{{placeholder}}} to trial_command."
+    )
 
 
 def _validate_trial_command_template(
@@ -1778,8 +1749,7 @@ def _validate_trial_command_template(
         shown = ", ".join(f"{{{name}}}" for name in accessed)
         raise ValueError(
             f"Phase {phase.name!r}: trial_command placeholders cannot use attribute or "
-            f"index access; found {shown}. Write the bare placeholder, such as "
-            "{trial_dir}, and do any path or string manipulation in the command itself."
+            f"index access; found {shown}. Use the bare placeholder, such as {{trial_dir}}."
         )
 
     try:
@@ -1802,23 +1772,16 @@ def _validate_trial_command_template(
         ) from exc
     except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
-            f"Phase {phase.name!r}: trial_command failed to render — "
-            f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
+            f"Phase {phase.name!r}: trial_command failed to render — {type(exc).__name__}: {exc}."
         ) from exc
 
     if experiment.override_format == "yaml_file":
         if "config_path" not in fields:
-            raise ValueError(
-                f"override_format='yaml_file' but phase {phase.name!r} trial_command "
-                "does not reference {config_path}. The trainer would never receive "
-                "the complete per-trial YAML. Add {config_path} to trial_command, or "
-                "select an explicit compatibility override_format."
-            )
+            raise _missing_placeholder_error("yaml_file", phase.name, "config_path")
         if fields & {"overrides", "overrides_path"}:
             raise ValueError(
                 f"override_format='yaml_file' but phase {phase.name!r} trial_command "
-                "references an overrides-only placeholder. Use {config_path}; it names "
-                "the complete trainer YAML after all overrides are composed."
+                "references an overrides-only placeholder; use {config_path}."
             )
         return
 
@@ -1843,15 +1806,8 @@ def _validate_trial_command_template(
         return
 
     if required_placeholder not in fields:
-        raise ValueError(
-            f"override_format={experiment.override_format!r} but phase "
-            f"{phase.name!r} has inherited, fixed, sampled or repeat overrides, or a "
-            f"trainer_config and trial_command does not reference "
-            f"{{{required_placeholder}}}. All inherited, fixed, sampled and repeat parameters and the "
-            "trainer_config would be ignored — the trainer would "
-            "run with the same hard-coded configuration every trial. "
-            f"Add {{{required_placeholder}}} to trial_command, or use the default "
-            "override_format='yaml_file' with trainer_config and {config_path}."
+        raise _missing_placeholder_error(
+            experiment.override_format, phase.name, required_placeholder, has_input=True
         )
 
 

@@ -78,9 +78,7 @@ from tests.recovery_helpers import recover_run_cli
             [
                 "r.json",
                 "eval.loss",
-                "evaluation_point check: n/a (json objectives record no evaluation position; "
-                "json_envelope via report_objective, wandb with evaluation_axis, or mlflow with "
-                "select: last or step would)",
+                "evaluation_point check: n/a (json objectives record no evaluation position)",
             ],
         ),
         (
@@ -98,9 +96,7 @@ from tests.recovery_helpers import recover_run_cli
                 "select",
                 "last",
                 "stdout.log",
-                "evaluation_point check: n/a (log_regex objectives record no evaluation "
-                "position; json_envelope via report_objective, wandb with evaluation_axis, "
-                "or mlflow with select: last or step would)",
+                "evaluation_point check: n/a (log_regex objectives record no evaluation position)",
             ],
         ),
         (
@@ -213,13 +209,11 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
 
 
 _BASE_ENV_NAMES_WITHOUT_TMPDIR = "PATH, HOME, LANG, LC_ALL, USER, LOGNAME, TZ"
-_REFUSES_TO_RESUME = "a persistent study refuses to resume when any digested value changes"
 _ENVIRONMENT_CONTRACT_CASES = [
     pytest.param(
         {},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="default-in-memory",
     ),
     pytest.param(
@@ -228,39 +222,35 @@ _ENVIRONMENT_CONTRACT_CASES = [
             "env": {"B_FLAG": "1", "A_FLAG": "2"},
             "persistent": True,
         },
-        "environment: inherit_env=[HF_HOME] (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}, HF_HOME); env keys: A_FLAG, B_FLAG; "
-        "passthrough_env: HF_TOKEN and built-in TMPDIR "
-        "(inherited when set, excluded from the digest); " + _REFUSES_TO_RESUME,
+        f"environment: inherit_env=[HF_HOME] (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}, "
+        "HF_HOME); env keys: A_FLAG, B_FLAG; "
+        "passthrough_env: HF_TOKEN and built-in TMPDIR (not digested)",
         id="list-and-passthrough-persistent",
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
-        "environment: inherit_env=all (inherited whole, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}; other ambient variables are not compared); "
-        "env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=all (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}; "
+        "other ambient variables are not compared); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="all",
     ),
     pytest.param(
         {"execution": ExecutionContext(passthrough_env=["TMPDIR"])},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
-        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: none; passthrough_env: TMPDIR (built in, not digested)",
         id="listed-tmpdir-is-redundant",
     ),
     pytest.param(
         {"env": {"TMPDIR": "/scratch"}},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: TMPDIR; "
         "passthrough_env: none (TMPDIR set under env, so the configured value is digested)",
         id="configured-tmpdir-stays-digested",
     ),
     pytest.param(
         {"execution": ExecutionContext(passthrough_env=["HF_TOKEN"]), "env": {"TMPDIR": "/s"}},
-        "environment: inherit_env=none (inherited when set, and digested: "
-        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
-        "passthrough_env: HF_TOKEN (inherited when set, excluded from the digest) "
+        f"environment: inherit_env=none (digested: {_BASE_ENV_NAMES_WITHOUT_TMPDIR}); "
+        "env keys: TMPDIR; passthrough_env: HF_TOKEN (not digested) "
         "(TMPDIR set under env, so the configured value is digested)",
         id="configured-tmpdir-beside-a-listed-token",
     ),
@@ -752,10 +742,10 @@ def test_dry_run_reports_tpe_startup_warnings(
 
 
 _ARGPARSE_BOOLEAN_WARNING = (
-    "warning: argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
-    "value, so set such flags in trial_command or have the trainer accept a value. "
-    "Rendered that way: --load_best_model_at_end (trainer_config), "
-    "--fp16 (phase 'p' fixed_overrides), --shuffle (phase 'p' search_space)."
+    "warning: argparse renders booleans as --key=true/--key=false, which a store_true flag "
+    "rejects: --load_best_model_at_end (trainer_config), "
+    "--fp16 (phase 'p' fixed_overrides), --shuffle (phase 'p' search_space). "
+    "Set them in trial_command."
 )
 
 
@@ -851,9 +841,8 @@ def test_boolean_warning_is_only_for_argparse(
 
 _CREDENTIAL_WARNING = (
     "warning: execution.inherit_env lists names that look like credentials: {names}. "
-    "Each trial records the value of every listed name in plain text in the study ledger, "
-    "and rotating one refuses a resume. Credentials belong in execution.passthrough_env, "
-    "which is inherited without being recorded or compared."
+    "Each trial records their values in plain text in the study ledger; move them to "
+    "execution.passthrough_env."
 )
 
 
