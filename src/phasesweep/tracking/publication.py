@@ -39,13 +39,15 @@ from phasesweep.tracking.session import (
     SYNC_TRACKING_STEP,
     DeliveryTally,
     call_tracking,
+    count_text,
+    delivered_text,
     delivery_record_path,
-    is_creation_intent,
     pending_creation_records,
     read_binding,
     read_inherits,
     read_record,
     record_name,
+    refused_text,
     require_tracking_target,
     resolve_pending_creations,
     summary_binding_path,
@@ -1309,71 +1311,6 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
             SYNC_TRACKING_STEP,
             refused_text(tally.refused),
         )
-
-
-def count_text(records: int, creations: int) -> str:
-    """Count delivery records and unconfirmed run creations in the words every MLflow line uses.
-
-    A run creation whose answer was lost is searched for, never sent again, so it is counted
-    apart from the records that are uploaded.
-
-    :param int records: Delivery records.
-    :param int creations: Unconfirmed run creations, the intents a search settles.
-    :return str: For example ``2 records``, ``1 unconfirmed run creation`` or ``2 records and
-        1 unconfirmed run creation``; ``0 records`` when both are zero.
-    """
-    parts = [plural(records, "record")] if records or not creations else []
-    if creations:
-        parts.append(plural(creations, "unconfirmed run creation"))
-    return " and ".join(parts)
-
-
-def delivered_text(delivered: int, settled: int) -> str:
-    """Say what a delivery delivered and settled, in the words of :func:`count_text`.
-
-    :param int delivered: Delivery records delivered.
-    :param int settled: Unconfirmed run creations settled, bound to their run or retired.
-    :return str: For example ``delivered 2 records and settled 1 unconfirmed run creation``,
-        or an empty string when there was neither.
-    """
-    parts = [f"delivered {plural(delivered, 'record')}"] if delivered else []
-    if settled:
-        parts.append(f"settled {plural(settled, 'unconfirmed run creation')}")
-    return " and ".join(parts)
-
-
-def refused_text(refused: Collection[Path]) -> str:
-    """Say what MLflow refused, records and creation searches apart, and what keeps them pending.
-
-    :param Collection[Path] refused: The records and creation intents MLflow refused in this
-        delivery.
-    :return str: A sentence with a leading space, or an empty string when none were refused.
-    """
-    if not refused:
-        return ""
-    creations = sum(map(is_creation_intent, refused))
-    records = len(refused) - creations
-    parts = [plural(records, "record")] if records else []
-    if creations:
-        parts.append(f"the search for {plural(creations, 'unconfirmed run creation')}")
-    subject = "a refused record" if not creations else "it" if len(refused) == 1 else "each"
-    return f" MLflow refused {' and '.join(parts)}; {subject} {refusal_rule()}."
-
-
-def refusal_rule(where: str = "") -> str:
-    """Say what keeps a record MLflow refused pending, in the words every surface uses.
-
-    A refused record is retried like any other, so a retry alone meets the same refusal; only
-    fixing its cause in MLflow helps.
-
-    :param str where: Where the record's warning is, with its leading separator, for a reader
-        who never saw the console, defaults to the console's own warning.
-    :return str: A clause that follows the record it is about, without a final period.
-    """
-    return (
-        f"stays pending until the cause given in its warning{where} is fixed in MLflow, for "
-        "example by restoring a deleted run or its experiment"
-    )
 
 
 class DeliveryCounts(NamedTuple):

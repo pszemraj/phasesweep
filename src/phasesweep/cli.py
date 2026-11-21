@@ -1446,12 +1446,13 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         its step is a retry when MLflow gave no answer or a creation's window is still open,
         and fixing the causes when it refused.
     """
-    from phasesweep.tracking.publication import count_text, refused_text
     from phasesweep.tracking.publication import sync_tracking as sync
     from phasesweep.tracking.session import (
         DeliveryTally,
+        count_text,
         creation_window_end,
         pending_creation_records,
+        refused_text,
     )
 
     command = shlex.join(
@@ -1534,7 +1535,8 @@ def _sync_stopped_text(config: Experiment, generation_id: str | None, command: s
     :param str command: The shell-quoted command that repeats it.
     :return str: The sentence, wrapped to the terminal, then the command on a line of its own.
     """
-    from phasesweep.tracking.publication import count_text, delivery_counts
+    from phasesweep.tracking.publication import delivery_counts
+    from phasesweep.tracking.session import count_text
 
     try:
         counts = delivery_counts(config, generation_id)

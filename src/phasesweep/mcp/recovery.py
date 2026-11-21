@@ -321,12 +321,8 @@ def recover_run(
                     f"{TRACKER_UNREADABLE_STEP}"
                 )
             if tally is not None:
-                from phasesweep.tracking.publication import (
-                    count_text,
-                    delivered_text,
-                    delivery_counts,
-                    refused_text,
-                )
+                from phasesweep.tracking.publication import delivery_counts
+                from phasesweep.tracking.session import count_text, delivered_text, refused_text
 
                 # Counted after the uploads across every generation, as delivery covered them all.
                 try:

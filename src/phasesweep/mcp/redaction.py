@@ -222,7 +222,7 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
     :return JsonObject: Counts plus ``remedy``, the retry step when records are pending after
         the run ended, otherwise ``None``.
     """
-    from phasesweep.tracking.publication import refusal_rule
+    from phasesweep.tracking.session import refusal_rule
 
     pending = counts["pending"]
     remedy = None
