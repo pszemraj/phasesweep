@@ -556,6 +556,28 @@ def _trial_interrupted(trial: FrozenTrial) -> bool:
     return parsed is not None and parsed.outcome == "interrupted"
 
 
+def _unreplaced_attempts(trials: Iterable[FrozenTrial], *, interrupted: bool) -> list[FrozenTrial]:
+    """Return the attempts no rerun names, either the interrupted ones or all the others.
+
+    A rerun names the attempt it replaces (:data:`RERUN_OF_ATTR`): an interrupted trial, or a
+    failed grid cell a raised target retries. Of the attempts no rerun names, an interrupted
+    one still waits for its rerun, and every other one stands for its cell: the cell's
+    measurement, its latest failure, or an attempt still queued or running.
+
+    :param Iterable[FrozenTrial] trials: Every trial of one study.
+    :param bool interrupted: ``True`` for the interrupted attempts that wait for a rerun,
+        ``False`` for the attempts that stand for their cell.
+    :return list[FrozenTrial]: Those attempts, in the order ``trials`` gives them.
+    """
+    trials = list(trials)
+    named = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    return [
+        trial
+        for trial in trials
+        if trial.number not in named and _trial_interrupted(trial) is interrupted
+    ]
+
+
 def _winning_trials(
     trial_number: int, attempt_id: str | None, repeats: RepeatsRecord | None
 ) -> dict[int, str | None]:

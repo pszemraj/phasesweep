@@ -96,7 +96,7 @@ from phasesweep.engine.state import (
     _parsed_trial_outcome,
     _recorded_trial_dir,
     _stands_under_winner,
-    _trial_interrupted,
+    _unreplaced_attempts,
     _validate_observed_block,
     _winning_trials,
 )
@@ -1327,17 +1327,19 @@ def _repeat_group_views(
     labels = group_labels_for(trials, axis)
     ranking = _rank_groups(trials, experiment, axis)
     eligible = {labels[group.representative]: group for group in ranking.groups}
-    replaced = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    standing = {trial.number for trial in _unreplaced_attempts(trials, interrupted=False)}
     marked = {row["trial"] for row in rows if row["winner"] == "*"}
     members: dict[int, list[optuna.trial.FrozenTrial]] = {}
     params: dict[int, JsonObject] = {}
+    # Every labelled trial opens its group's entry, so a group whose members were all
+    # replaced or interrupted still gets a view; only the standing members are measured.
     for trial in trials:
         label = labels.get(trial.number)
         if label is None:
             continue
         members.setdefault(label, [])
         params[label] = {name: value for name, value in trial.params.items() if name != axis.key}
-        if trial.number not in replaced and not _trial_interrupted(trial):
+        if trial.number in standing:
             members[label].append(trial)
     views: list[RepeatGroupView] = []
     for label, found in sorted(members.items()):

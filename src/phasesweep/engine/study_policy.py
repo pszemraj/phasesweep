@@ -62,6 +62,7 @@ from phasesweep.engine.state import (
     _study_schema_supported,
     _trial_interrupted,
     _unique_trial_outcomes,
+    _unreplaced_attempts,
 )
 from phasesweep.engine.trial import EnvironmentIdentity, _environment_identity, _missing_trainer_cwd
 from phasesweep.errors import (
@@ -603,11 +604,7 @@ def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.tr
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
     :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.
     """
-    named = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
-    return sorted(
-        (trial for trial in trials if _trial_interrupted(trial) and trial.number not in named),
-        key=lambda trial: trial.number,
-    )
+    return sorted(_unreplaced_attempts(trials, interrupted=True), key=lambda trial: trial.number)
 
 
 def _scheduled_reruns(
