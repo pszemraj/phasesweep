@@ -33,7 +33,6 @@ from phasesweep.engine.attempts import (
     _record_stale_trial_outcome,
 )
 from phasesweep.engine.errors import (
-    StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
 )
@@ -279,13 +278,32 @@ def test_a_recovered_verdict_decides_its_abort_past_a_duplicate_its_recovery_hea
     )
     assert recorded[TRIAL_OUTCOME_ABORT_KEY]["completion_sequence"] == 3
     if peer is not None:
-        with pytest.raises(StudySchemaMismatchError, match="both use completion sequence 2"):
-            _load_phase_policy_state(study)
+        assert _load_phase_policy_state(study).consecutive_failures == 3
         _record_stale_trial_outcome(study, duplicate)
     state = _load_phase_policy_state(study)
     assert state.max_sequence == (4 if peer is not None else 3)
     assert state.consecutive_failures == 3
     assert state.abort == recorded[TRIAL_OUTCOME_ABORT_KEY]
+
+
+@pytest.mark.parametrize("success_first", [False, True])
+def test_recovery_counts_disputed_running_outcomes_in_settlement_order(success_first: bool) -> None:
+    """A recovered verdict's abort agrees with the durable sequence after its peer settles."""
+    phase = make_experiment(max_consecutive_failures=2).phases[0]
+    study = optuna.create_study()
+    _finished(study, 1, "failure")
+    failed = _running_trial(study, trial_outcome(2, "failure"))
+    succeeded = _running_trial(study, trial_outcome(2, "success"))
+    pending = [(failed, False), (succeeded, True)]
+    for trial, feasible in reversed(pending) if success_first else pending:
+        _record_stale_trial_outcome(study, trial, completed_feasible=feasible, policy_phase=phase)
+        study.tell(trial.number, float(feasible))
+
+    state = _load_phase_policy_state(study)
+    assert (state.abort is None) == success_first
+    assert state.abort_streak == (() if success_first else (0, failed.number))
+    assert state.consecutive_failures == int(success_first)
+    assert state.max_sequence == 4
 
 
 def test_a_running_trial_is_not_interrupted_until_it_is_terminal() -> None:

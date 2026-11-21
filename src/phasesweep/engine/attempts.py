@@ -696,18 +696,22 @@ def _record_stale_trial_outcome(
             sequence = max(sequence_counts, default=0) + 1
             cause: str | None = "stale RUNNING trial recovered after its orchestrator stopped"
             if policy_phase is not None:
-                # Stale recovery replaces every RUNNING trial's duplicated record, this trial's
-                # included, at a fresh sequence, with an interruption or a verdict, so the
-                # decision replays the study without those records.
-                replaced = {
-                    candidate.number
+                # A disputed RUNNING record has no trustworthy place in completion order.
+                replaced = [
+                    candidate
                     for candidate in trials
                     if candidate.state == optuna.trial.TrialState.RUNNING
                     and _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR))
                     is not None
                     and _unduplicated_outcome(candidate, sequence_counts) is None
-                }
-                state = _load_phase_policy_state(study, leave_out=replaced)
+                ]
+                state = _load_phase_policy_state(
+                    study, leave_out={candidate.number for candidate in replaced}
+                )
+                # Clear the disputed outcomes before committing a verdict based on their
+                # absence. Otherwise the last holder can retain the old sequence on restart.
+                for candidate in replaced:
+                    optuna.Trial(study, candidate._trial_id).set_user_attr(TRIAL_OUTCOME_ATTR, None)
                 abort = _abort_decision(
                     policy_phase,
                     trial.number,
