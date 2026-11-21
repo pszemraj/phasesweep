@@ -17,6 +17,7 @@ from phasesweep.engine.artifact_roots import (
     _check_published_phase_studies,
     _check_study_artifact_root,
 )
+from phasesweep.engine.artifacts import _refresh_recovered_trials_csv
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
@@ -252,7 +253,7 @@ def recover_run(
             )
             if repairing_complete_snapshot or delivering:
                 # Keep the recovery reservation while the prior frozen result stays readable,
-                # and while upload workers may start: once the cleanup record below is written,
+                # and while tracking workers may start: once the cleanup record below is written,
                 # the marker is all that leaves an unconfirmed status recovery-required. Reboot
                 # proves processes dead, but this marker must still survive until their trial
                 # evidence is reflected in the immutable snapshot.
@@ -274,7 +275,7 @@ def recover_run(
                 from phasesweep.tracking.publication import deliver_recovered_attempts
 
                 assert evidence.ledger is not None
-                # Sent before the marker clears, so an upload worker whose cleanup is
+                # Sent before the marker clears, so a tracking worker whose cleanup is
                 # unconfirmed fails this command and leaves the run recovery-required, as an
                 # evidence worker's does. The workers are registered under this run, so the
                 # next pass resolves one through its registry entry as this run's evidence.
@@ -326,7 +327,7 @@ def recover_run(
                     f"Delivered {delivery['delivered']} MLflow outcome(s) of the recovered "
                     "trials and generations; "
                     + (
-                        f"{pending} stay pending. Once the tracker is reachable, run "
+                        f"{pending} MLflow record(s) stay pending. Once the tracker is reachable, run "
                         "`phasesweep sync-tracking CONFIG` with the config this run launched "
                         "with; delivery never retrains."
                         if pending
@@ -841,25 +842,29 @@ def _recover_trial_evidence(
             )
             evidence.reaped_attempt_ids.update(previously_recovered)
             evidence.reaped_attempt_locations.update(previously_recovered)
-            evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
-                study,
-                config,
-                phase.name,
-                confirm=confirm,
-                recovered_attempts=inspected_attempts,
-                process_actions=active_report.process_actions,
-                inspection_messages=active_report.inspection_messages,
-            )
-            evidence.reaped += _reap_stale_trials(
-                study,
-                config,
-                phase.name,
-                confirm=confirm,
-                recovered_attempts=inspected_attempts,
-                process_actions=active_report.process_actions,
-                inspection_messages=active_report.inspection_messages,
-                report=active_report,
-            )
+            try:
+                evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
+                    study,
+                    config,
+                    phase.name,
+                    confirm=confirm,
+                    recovered_attempts=inspected_attempts,
+                    process_actions=active_report.process_actions,
+                    inspection_messages=active_report.inspection_messages,
+                )
+                evidence.reaped += _reap_stale_trials(
+                    study,
+                    config,
+                    phase.name,
+                    confirm=confirm,
+                    recovered_attempts=inspected_attempts,
+                    process_actions=active_report.process_actions,
+                    inspection_messages=active_report.inspection_messages,
+                    report=active_report,
+                )
+            finally:
+                if confirm:
+                    _refresh_recovered_trials_csv(study, config, phase)
         evidence.terminated = sum(active_report.process_actions.values())
         evidence.retained_results = active_report.retained_results
         evidence.pending_evidence = active_report.unreadable_evidence

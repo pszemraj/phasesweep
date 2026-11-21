@@ -28,8 +28,10 @@ from phasesweep.engine.repeats import (
     RepeatAxis,
     _check_repeats_axis,
     group_labels_for,
+    repeat_axis,
 )
 from phasesweep.engine.state import (
+    PHASE_FINGERPRINT_PAYLOAD_ATTR,
     TRAINER_ENV_ATTR,
     Winner,
 )
@@ -163,6 +165,31 @@ def _write_trials_csv(
             for n in attr_names:
                 row[f"user_attr:{n}"] = t.user_attrs.get(n)
             writer.writerow(row)
+
+
+def _refresh_recovered_trials_csv(
+    study: optuna.Study, experiment: Experiment, phase: Phase
+) -> None:
+    """Refresh the recovered study's CSV when the supplied phase matches its semantics.
+
+    :param optuna.Study study: Study whose recovery ran under the experiment lock.
+    :param Experiment experiment: Owner of the phase artifact directory.
+    :param Phase phase: Phase to use for group labels if its semantics agree with the study.
+    """
+    # Recovery can settle earlier work even when the supplied phase will be refused at launch.
+    # Keep the prior projection when that phase cannot supply the study's repeat grouping.
+    try:
+        recorded: object = study.user_attrs.get(PHASE_FINGERPRINT_PAYLOAD_ATTR)
+        if isinstance(recorded, dict) and recorded.get(
+            "phase"
+        ) == fingerprint_ops._semantic_phase_dump(phase):
+            _write_trials_csv(
+                study,
+                path_ops._phase_dir(experiment, phase.name) / "trials.csv",
+                repeats=repeat_axis(phase),
+            )
+    except Exception as exc:
+        log.warning("Could not refresh trials.csv for study %r: %s", study.study_name, exc)
 
 
 def _save_winner(

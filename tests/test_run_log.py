@@ -15,6 +15,7 @@ from phasesweep import run_experiment
 from phasesweep.config.models import Constraint, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
 from phasesweep.engine import phase as phase_ops
+from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.paths import _experiment_dir, _phase_dir
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import FAILURE_REASON_ATTR, FEASIBLE_ATTR, TRIAL_OUTCOME_ATTR
@@ -186,6 +187,20 @@ def test_run_log_names_the_configuration_and_repeat_value_of_each_trial(tmp_path
     assert [_field(line, r"repeat=seed=(\d+)") for line in lines] == ["0", "1", "0", "1"]
     assert all("params={'x': " in line for line in lines)
     assert all("'seed':" not in line for line in lines)
+    csv_path = _phase_dir(experiment, "p") / "trials.csv"
+    with csv_path.open(newline="") as handle:
+        assert [row["repeat_group"] for row in csv.DictReader(handle)] == ["1", "1", "3", "3"]
+    original = csv_path.read_bytes()
+    csv_path.unlink()
+    run_experiment(experiment)
+    assert csv_path.read_bytes() == original
+    phase = experiment.phase("p").model_copy(
+        update={"repeats": Repeats(key="other_seed", values=[0, 1])}
+    )
+    changed = experiment.model_copy(update={"phases": [phase]})
+    with pytest.raises(StudyFingerprintMismatchError, match="repeats.key"):
+        run_experiment(changed)
+    assert csv_path.read_bytes() == original
 
 
 def _stderr_cause_trainer(tmp_path: Path) -> Path:
