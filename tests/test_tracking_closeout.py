@@ -202,9 +202,13 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     assert report.index(sending) < report.index(
         "MLflow: delivered 2 record(s) left pending by earlier runs."
     )
-    # A report block, so the console wraps it to the terminal.
-    [delivered] = [r for r in caplog.records if "MLflow: delivered" in r.getMessage()]
-    assert delivered.name == REPORT_LOGGER and isinstance(delivered.msg, ReportBlock)
+    # Report blocks, so the console wraps them to the terminal.
+    blocks = [
+        r.msg
+        for r in caplog.records
+        if r.name == REPORT_LOGGER and r.getMessage().startswith("MLflow: ")
+    ]
+    assert len(blocks) == 2 and all(isinstance(block, ReportBlock) for block in blocks)
     assert publication.delivery_status(experiment)["pending"] == 0
     sweep.uploads.clear()
     caplog.clear()

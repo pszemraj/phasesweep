@@ -973,14 +973,14 @@ def _deliver_outstanding(
         # A report line, so the console shows what the seconds before the last lines are for.
         earlier = len(creations) + len(pending)
         total = earlier + len(own_pending)
+        if not earlier:
+            from_earlier = ""
+        elif earlier == total:
+            from_earlier = " left pending by earlier runs"
+        else:
+            from_earlier = f", {earlier} of them left pending by earlier runs"
         logging.getLogger(REPORT_LOGGER).info(
-            "MLflow: sending %d record(s)%s.",
-            total,
-            ""
-            if not earlier
-            else " left pending by earlier runs"
-            if earlier == total
-            else f", {earlier} of them left pending by earlier runs",
+            ReportText(f"MLflow: sending {total} record(s){from_earlier}.")
         )
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         if resolve:
