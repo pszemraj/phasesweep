@@ -316,6 +316,58 @@ def test_cancellation_after_root_exit_does_not_cut_the_settle_short(
         assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
 
 
+#: Makes the guardian SIGTERM itself while its root is a zombie, before or after its own
+#: blocking ``waitpid`` reaps it; ``os.kill`` runs the handler before it returns.
+_RACE_PATCH = """
+import os, signal
+real_waitpid = os.waitpid
+fired = []
+def racing_waitpid(pid, options):
+    if options != 0 or fired:
+        return real_waitpid(pid, options)
+    fired.append(True)
+    if {before_reap!r}:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_waitpid(pid, options)
+    result = real_waitpid(pid, options)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return result
+os.waitpid = racing_waitpid
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="holds the zombie root with os.waitid")
+@pytest.mark.parametrize("before_reap", [True, False], ids=["before-reap", "after-reap"])
+def test_cancellation_between_root_exit_and_reap_keeps_the_finished_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before_reap: bool
+) -> None:
+    """A SIGTERM landing after the root exited, before the guardian ignores SIGTERM, is not a cancellation."""
+    use_guardian_timing(
+        monkeypatch,
+        tmp_path,
+        settle_seconds=5.0,
+        term_grace_seconds=0.5,
+        patch=_RACE_PATCH.format(before_reap=before_reap),
+    )
+    trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
+
+    guardian, pgid, status_read = _spawn_guardian(
+        tmp_path, [sys.executable, str(trainer), str(marks), "0.3", "0"]
+    )
+    rest = _finish_guardian(guardian, pgid, status_read)
+
+    assert (guardian.returncode, rest) == (0, b"")
+    lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="settle")
+    assert lifecycle is not None
+    assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (
+        "exited",
+        0,
+        True,
+    )
+    assert (marks / "helper_done").exists() and not (marks / "helper_sigterm").exists()
+
+
 def test_the_guarded_shutdown_window_covers_the_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

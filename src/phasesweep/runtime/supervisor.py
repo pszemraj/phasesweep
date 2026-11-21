@@ -439,14 +439,31 @@ def main(argv: list[str] | None = None) -> int:
         signal.pthread_sigmask(signal.SIG_SETMASK, set())
         os._exit(_run_trainer(ready_fd, ack_fd))
 
+    # cancel() reaps a root that had already exited and leaves its wait status here.
+    reaped_root_status: int | None = None
+
     def cancel(signum: int, _frame: FrameType | None) -> None:
-        """Interrupt supervision only while the trainer group still needs cleanup.
+        """Interrupt supervision only while the trainer root still runs.
+
+        A request that lands after the root exited but before ``main`` stops listening
+        does not apply: the root is reaped here if ``main`` has not yet, and supervision
+        goes on to the settle and verdict, so a finished trainer is not recorded as cancelled.
+        Reaping with ``WNOHANG`` works on every supported platform; ``os.waitid``, which
+        could test the zombie without reaping it, is missing on macOS before Python 3.13.
 
         :param int signum: Cancellation request delivered to the guardian.
         :param FrameType | None _frame: Unused signal frame.
-        :raises SystemExit: A live group needs durably recorded cancellation.
+        :raises SystemExit: A running root's group needs durably recorded cancellation.
         """
+        nonlocal reaped_root_status
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            reaped_pid, wait_status = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            return  # main() has just reaped the exited root.
+        if reaped_pid == child_pid:
+            reaped_root_status = wait_status
+            return
         if _trainer_group_alive(child_pid):
             raise SystemExit(128 + signum)
 
@@ -460,7 +477,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             signal.pthread_sigmask(signal.SIG_SETMASK, set())
-            _, status = os.waitpid(child_pid, 0)
+            try:
+                _, status = os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                # cancel() reaped the exited root while this wait was interrupted.
+                if reaped_root_status is None:
+                    raise
+                status = reaped_root_status
             # Once the root has exited, cancellation no longer applies: the settle
             # and the verdict below run to completion, keeping a finished result.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
