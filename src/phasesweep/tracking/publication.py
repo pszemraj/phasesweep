@@ -1039,7 +1039,7 @@ def _deliver_outstanding(
                 or delivery.generation_id != path.parent.parent.name
             ):
                 raise TrackingSyncRefusedError(different)
-        creations = _pending_creations(experiment, scope, skip)
+        creations = pending_creation_records(experiment, scope, skip=skip)
         own_pending = [path for path in own or [] if not _read_delivery(path).delivered]
         pending = _pending_records(experiment, scope, skip=skip)
         if not tally.sending or not (creations or pending or own_pending):
@@ -1118,18 +1118,6 @@ def _report_sending(pending: list[Path], own: list[Path]) -> None:
     )
 
 
-def _pending_creations(experiment: Experiment, scope: str | None, skip: str | None) -> list[Path]:
-    """List the pending creation intents in scope, but ``skip``'s.
-
-    :param Experiment experiment: Configured experiment.
-    :param str | None scope: One generation, or ``None`` for every generation.
-    :param str | None skip: Generation left out, a live invocation's own.
-    :return list[Path]: Pending summary and attempt creation records.
-    """
-    skipped = set() if skip is None else set(pending_creation_records(experiment, skip))
-    return [path for path in pending_creation_records(experiment, scope) if path not in skipped]
-
-
 def _owed(experiment: Experiment, skip: str | None) -> bool:
     """Report whether any generation but ``skip`` has something left to save or send.
 
@@ -1144,7 +1132,7 @@ def _owed(experiment: Experiment, skip: str | None) -> bool:
     """
     return bool(
         _pending_records(experiment, None, skip=skip)
-        or _pending_creations(experiment, None, skip)
+        or pending_creation_records(experiment, skip=skip)
         or any(
             not delivery_record_path(experiment, generation_id, SUMMARY_RECORD).exists()
             for generation_id in _bound_generations(experiment, None, skip)

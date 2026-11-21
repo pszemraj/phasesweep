@@ -524,25 +524,30 @@ def _find_bound(
 
 
 def pending_creation_records(
-    experiment: Experiment, generation_id: str | None = None
+    experiment: Experiment, generation_id: str | None = None, *, skip: str | None = None
 ) -> list[Path]:
     """Find the creation intents that have yet to be reconciled.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Generation filter, defaulting to every generation.
+    :param str | None skip: Generation left out, a live invocation's own, defaults to none.
     :return list[Path]: Pending summary and attempt creation records, in that order.
     """
     from phasesweep.engine.paths import _experiment_dir
 
     scope = generation_id or "*"
     attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
-    return sorted(
+    records = sorted(
         tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
     ) + sorted(
         _experiment_dir(experiment).glob(
             f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
         )
     )
+    if skip is None:
+        return records
+    skipped = set(pending_creation_records(experiment, skip))
+    return [path for path in records if path not in skipped]
 
 
 def creation_window_end(experiment: Experiment, pending: Path) -> float:
@@ -598,14 +603,8 @@ def resolve_pending_creations(
     """
     from phasesweep.engine.errors import TrackingSyncRefusedError
 
-    skipped = set() if skip is None else set(pending_creation_records(experiment, skip))
-    records = [
-        pending
-        for pending in pending_creation_records(experiment, generation_id)
-        if pending not in skipped
-    ]
     tally = DeliveryTally() if tally is None else tally
-    for pending in records:
+    for pending in pending_creation_records(experiment, generation_id, skip=skip):
         if not tally.sending:
             return
         try:
