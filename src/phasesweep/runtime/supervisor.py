@@ -527,6 +527,11 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
         except OSError:
             return 76
 
+    # The interpreter ignores these two for itself, an ignored signal survives exec, and a
+    # shell cannot restore one it inherited ignored. The trainer gets the defaults a program
+    # started from a shell has, so a pipeline in its command ends when its reader does.
+    for interpreter_ignored in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(interpreter_ignored, signal.SIG_DFL)
     _close_trainer_fds()
     try:
         os.execve("/bin/sh", ["/bin/sh", "-c", cmd], env)

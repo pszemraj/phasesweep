@@ -593,6 +593,28 @@ def test_trainer_inherits_the_runs_sighup_disposition(
     signal.signal(signal.SIGHUP, signal.SIG_IGN if ignored else signal.SIG_DFL)
     install_signal_handlers()
     assert (signal.getsignal(signal.SIGHUP) is signal.SIG_IGN) is ignored
+    ignored_mask, caught_mask = _trainer_signal_masks(tmp_path)
+    sighup_bit = 1 << (signal.SIGHUP - 1)
+    assert bool(ignored_mask & sighup_bit) is ignored
+    assert not caught_mask & sighup_bit
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs SigIgn")
+def test_trainer_starts_with_the_signals_python_ignores_at_default(tmp_path: Path) -> None:
+    """A trainer starts with SIGPIPE and SIGXFSZ at their defaults, as a program a shell starts does, although the guardian that launches it is a Python process and ignores both."""
+    assert signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN
+    ignored_mask, _caught = _trainer_signal_masks(tmp_path)
+    for restored in (signal.SIGPIPE, signal.SIGXFSZ):
+        assert not ignored_mask & (1 << (restored - 1)), restored.name
+
+
+def _trainer_signal_masks(tmp_path: Path) -> tuple[int, int]:
+    """Run a supervised trainer that records its own signal dispositions as it starts.
+
+    :param Path tmp_path: Scratch directory for the trial and the recorded status.
+    :return tuple[int, int]: The trainer's ignored and caught signal masks from procfs.
+    """
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     status_out = tmp_path / "status.txt"
@@ -607,13 +629,11 @@ def test_trainer_inherits_the_runs_sighup_disposition(
             stderr=stderr,
             timeout=30.0,
             trial_dir=trial_dir,
-            attempt_id="sighup-attempt",
+            attempt_id="signal-mask-attempt",
         )
     assert result.return_code == 0
     fields = dict(line.split(":", 1) for line in status_out.read_text().splitlines())
-    sighup_bit = 1 << (signal.SIGHUP - 1)
-    assert bool(int(fields["SigIgn"], 16) & sighup_bit) is ignored
-    assert not int(fields["SigCgt"], 16) & sighup_bit
+    return int(fields["SigIgn"], 16), int(fields["SigCgt"], 16)
 
 
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
