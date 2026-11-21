@@ -12,11 +12,11 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
-from phasesweep.engine.phase import _shutdown_raised_over
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     ShutdownCleanupReport,
     _shutdown_handler,
+    shutdown_raised_over,
 )
 from tests.conftest import (
     console_script,
@@ -124,7 +124,7 @@ def test_a_shutdown_is_found_through_either_link_of_a_chain(chain: str) -> None:
         # Python sets the context too; the cause alone must be enough.
         outer.__context__ = None
 
-    found = _shutdown_raised_over(outer)
+    found = shutdown_raised_over(outer)
 
     if chain == "none":
         assert found is None

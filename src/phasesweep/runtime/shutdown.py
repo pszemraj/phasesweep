@@ -117,6 +117,30 @@ class PhaseSweepShutdown(SystemExit):
         self.published_result_committed = False
 
 
+def shutdown_raised_over(exc: BaseException) -> PhaseSweepShutdown | None:
+    """Return the shutdown ``exc`` is, or was raised while handling or from.
+
+    The handler raises in the main thread at whatever bytecode is running, so a library's
+    cleanup code can raise over it; the run is still stopping.
+
+    :param BaseException exc: An exception leaving the code a shutdown may interrupt.
+    :return PhaseSweepShutdown | None: The first shutdown in its cause and context chains,
+        or ``None`` when they hold none.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, PhaseSweepShutdown):
+            return current
+        if id(current) not in seen:
+            seen.add(id(current))
+            pending.extend(
+                link for link in (current.__cause__, current.__context__) if link is not None
+            )
+    return None
+
+
 # Kernel masks are per-thread; CPython dispatches all Python handlers on the
 # main thread, including signals delivered elsewhere. Defer there to avoid
 # re-entering launch/registry locks; the outermost exit services the signal.

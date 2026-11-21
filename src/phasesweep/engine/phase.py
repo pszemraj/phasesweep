@@ -129,6 +129,7 @@ from phasesweep.runtime.shutdown import (
     interruption_cause,
     launch_refusal_text,
     servicing_shutdown_signal,
+    shutdown_raised_over,
 )
 
 if TYPE_CHECKING:
@@ -1628,27 +1629,6 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         raise
 
 
-def _shutdown_raised_over(exc: BaseException) -> PhaseSweepShutdown | None:
-    """Return the shutdown ``exc`` is, or was raised while handling or from.
-
-    :param BaseException exc: An exception leaving ``study.optimize``.
-    :return PhaseSweepShutdown | None: The first shutdown in its cause and context chains,
-        or ``None`` when they hold none.
-    """
-    pending: list[BaseException] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if isinstance(current, PhaseSweepShutdown):
-            return current
-        if id(current) not in seen:
-            seen.add(id(current))
-            pending.extend(
-                link for link in (current.__cause__, current.__context__) if link is not None
-            )
-    return None
-
-
 def _run_phase(
     experiment: Experiment,
     phase: Phase,
@@ -1816,7 +1796,7 @@ def _run_phase(
                     # The handler raises in the main thread at whatever bytecode is running,
                     # and a library's cleanup code can raise over it: Optuna's tell raises
                     # UnboundLocalError from its finally block. The run is still stopping.
-                    shutdown = _shutdown_raised_over(exc)
+                    shutdown = shutdown_raised_over(exc)
                     if shutdown is None or shutdown is exc:
                         raise
                     raise shutdown from None
