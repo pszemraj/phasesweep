@@ -844,10 +844,10 @@ def test_summary_of_a_resumed_run_with_failures_and_a_skipped_phase() -> None:
         "Written under runs/phasesweep_starter",
         "  learning_rate/trials.csv",
         "",
-        "Next: phasesweep status 'my config.yaml' --set",
-        "      workdir=/data/x --trials",
+        # A command is pasted, so it is never broken, even past the width.
+        "Next: phasesweep status 'my config.yaml' --set workdir=/data/x --trials",
     ]
-    assert all(len(line) <= 60 for line in block.render(60, color=False))
+    assert all(len(line) <= 60 for line in block.render(60, color=False)[:-1])
 
 
 def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
