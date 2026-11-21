@@ -1226,6 +1226,7 @@ _SHELL_OWN_WORDS = frozenset(
         "builtin",
         "caller",
         "cd",
+        "chdir",
         "command",
         "compgen",
         "complete",

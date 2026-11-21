@@ -138,6 +138,7 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param(f"if true; then {_MISSING}; fi", id="reserved-word"),
         pytest.param(f"exec {_MISSING} --x 1", id="builtin"),
         pytest.param("printf 'x=1\\n'", id="printf-builtin"),
+        pytest.param("chdir . && true", id="dash-chdir-builtin"),
         pytest.param(f". ./env.sh && {_MISSING}", id="dot-builtin"),
         pytest.param(f"CUDA_VISIBLE_DEVICES=0 {_MISSING}", id="assignment"),
         pytest.param(f"$PYTHON {_MISSING}.py", id="parameter-expansion"),
