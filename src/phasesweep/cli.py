@@ -160,20 +160,22 @@ _RUN_LOG: ContextVar[Path | None] = ContextVar("phasesweep_run_log", default=Non
 
 
 @contextlib.contextmanager
-def _console_logging(verbose: bool) -> Iterator[None]:
+def _console_logging(verbose: bool, *, dry_run: bool = False) -> Iterator[None]:
     """Show a run's report and warnings on stderr, and leave the rest to ``run.log``.
 
     The ``phasesweep`` logger takes ``INFO``, or ``DEBUG`` under ``verbose``, which is the level
-    ``run.log`` records at; the console shows the same lines either way. Optuna stays at
+    ``run.log`` records at; the console shows the same lines either way. A dry run also shows
+    the package's INFO lines, which are part of the launch contract it prints. Optuna stays at
     ``ERROR`` in both modes. Everything is restored on exit, so a process that runs several
     commands, as the tests do, keeps no handler or level behind.
 
     :param bool verbose: Record ``DEBUG`` messages in ``run.log``.
+    :param bool dry_run: Print the package's INFO lines on the console too.
     :return Iterator[None]: Context manager for the command's lifetime.
     """
     package = logging.getLogger("phasesweep")
     root = logging.getLogger()
-    handler = ConsoleHandler()
+    handler = ConsoleHandler(dry_run=dry_run)
     previous_level = package.level
     previous_verbosity = optuna.logging.get_verbosity()
     package.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -563,7 +565,7 @@ def run(
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
         ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
     """
-    with _console_logging(verbose):
+    with _console_logging(verbose, dry_run=dry_run):
         # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
         # codes remain structured throughout startup, including dry-run previews.
         # run_experiment() repeats this idempotently for direct library callers.

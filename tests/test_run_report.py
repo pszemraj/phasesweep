@@ -410,6 +410,22 @@ def test_info_records_from_other_loggers_print_nothing(
     assert stderr.getvalue() == ""
 
 
+def test_a_dry_run_prints_info_records_of_the_package_as_report_lines(
+    redirect_stderr: Callable[..., FakeStderr],
+) -> None:
+    """In a dry run an INFO record of any ``phasesweep`` logger prints as the time and its text."""
+    stderr = redirect_stderr()
+    handler = ConsoleHandler(dry_run=True)
+    handler.handle(record("phasesweep.runtime.gpu", logging.INFO, "GPU pool: %d device(s).", 2))
+    handler.handle(record("phasesweep.engine.preview", logging.INFO, "phase=p\n  second line"))
+    handler.handle(record("phasesweep.runtime.gpu", logging.DEBUG, "GPU assigned"))
+    handler.handle(record("urllib3.connectionpool", logging.INFO, "Starting new connection"))
+    handler.handle(record("phasesweepish.other", logging.INFO, "not the package"))
+    assert stderr.getvalue() == (
+        "12:00:00  GPU pool: 2 device(s).\n12:00:00  phase=p\n            second line\n"
+    )
+
+
 def test_a_warning_wraps_under_its_label(redirect_stderr: Callable[..., FakeStderr]) -> None:
     """A long warning wraps to the terminal with a hanging indent under ``warning:``."""
     stderr = redirect_stderr()
@@ -601,6 +617,59 @@ def test_a_dry_run_prints_its_lines_on_stderr_alone(
     assert "DRY RUN phase=p would launch 2 trials" in lines
     assert lines[-1] == "DRY RUN complete. No trials launched, no summary written."
     assert not any(line.startswith(("phasesweep run", "Finished in", "log:")) for line in lines)
+
+
+def test_a_dry_run_prints_every_info_line_of_the_starter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The dry run is the launch contract, so its console lines, GPU notes included, are pinned."""
+    monkeypatch.setenv("COLUMNS", "500")
+    config = tmp_path / "starter.yaml"
+    assert invoke_cli_boundary(["init", "-o", str(config)], monkeypatch) == 0
+    capsys.readouterr()
+
+    assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    root = str(tmp_path.resolve())
+    # A later line of a record sits under the text, where the first line has the time.
+    lines = [re.sub(r"^(\d\d:\d\d:\d\d| {8})  ", "", line) for line in captured.err.splitlines()]
+    assert [line.replace(root, "TMP") for line in lines] == [
+        "DRY RUN metric='eval_loss' goal=minimize extractor={'type': 'json_envelope', "
+        "'path': 'result.json', 'objective_name': 'eval_loss', 'split': 'validation', "
+        "'policy': 'synthetic', 'checkpoint': 'toy_formula', 'expected_step': 100, "
+        "'evaluation_axis': 'step'}",
+        "DRY RUN evaluation_point check: supported (axis 'step' from the envelope; "
+        "any other axis from evaluation.progress)",
+        "DRY RUN environment: inherit_env=none (inherited when set, and digested: PATH, HOME, "
+        "LANG, LC_ALL, USER, LOGNAME, TZ); env keys: none; passthrough_env: TMPDIR (built in; "
+        "inherited when set, excluded from the digest); a persistent study refuses to resume "
+        "when any digested value changes",
+        "DRY RUN trainer cwd: TMP (execution.cwd; part of the study identity)",
+        "DRY RUN artifact root: TMP/runs/phasesweep_starter",
+        "DRY RUN phase 'depth': sampler=grid (resumable, reproducible)",
+        "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
+        "DRY RUN phase 'learning_rate': sampler=grid (resumable, reproducible)",
+        "DRY RUN grid order: configurations are shuffled by sampler.seed, not listed choice order.",
+        "phase=depth study=phasesweep_starter::depth finished=0 remaining=2 reruns=0 n_jobs=1",
+        "GPU isolation disabled by gpu_policy='none'.",
+        "DRY RUN phase=depth would launch 2 trials",
+        "DRY RUN example command:",
+        "  phasesweep-fake-train --config "
+        "TMP/runs/phasesweep_starter/depth/trial_dryrun/trainer_config.yaml",
+        "phase=learning_rate study=phasesweep_starter::learning_rate finished=0 remaining=2 "
+        "reruns=0 n_jobs=1",
+        "GPU isolation disabled by gpu_policy='none'.",
+        "DRY RUN phase=learning_rate would launch 2 trials",
+        "DRY RUN example command (placeholders until 'depth' publishes a winner: model.n_layers):",
+        "  phasesweep-fake-train --config "
+        "TMP/runs/phasesweep_starter/learning_rate/trial_dryrun/trainer_config.yaml",
+        "DRY RUN total: would launch 4 trials across 2 phases",
+        "DRY RUN complete. No trials launched, no summary written.",
+    ]
 
 
 def _grid_experiment(name: str = "phasesweep_starter") -> Experiment:

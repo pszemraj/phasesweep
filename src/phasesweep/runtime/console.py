@@ -2,6 +2,7 @@
 
 ``run.log`` receives every record with its logger name and level. The console receives only what a
 person needs while the sweep runs, drawn for the terminal, with no traceback and no logger name.
+A dry run adds the package's INFO records, which are its launch contract.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from phasesweep.runtime.terminal import (
     wrap,
 )
 
+_PACKAGE_LOGGER = "phasesweep"
+
 
 class ConsoleHandler(logging.Handler):
     """Print a run's report lines and its warnings on stderr, and drop every other record.
@@ -27,17 +30,28 @@ class ConsoleHandler(logging.Handler):
     A record from the report logger prints as the time and its text, any later line indented
     under the first. A record at WARNING or above from any other logger prints as
     ``warning:`` or ``error:`` and its message, wrapped to the terminal with a hanging indent.
-    Neither shows a traceback. Each record is one write under the handler's lock, so lines from
-    parallel trials never interleave inside a record. The stream, its width and its colour
-    decision are read at each emit, so a swapped ``sys.stderr`` is honoured.
+    Neither shows a traceback. A dry run is the launch contract, so there an INFO record from
+    any ``phasesweep`` logger also prints, as the time and its text like a report line. Each
+    record is one write under the handler's lock, so lines from parallel trials never
+    interleave inside a record. The stream, its width and its colour decision are read at each
+    emit, so a swapped ``sys.stderr`` is honoured.
     """
+
+    def __init__(self, *, dry_run: bool = False) -> None:
+        """Choose whether INFO records of the package print too.
+
+        :param bool dry_run: Print INFO records from every ``phasesweep`` logger, not only the
+            report logger's.
+        """
+        super().__init__()
+        self._dry_run = dry_run
 
     def emit(self, record: logging.LogRecord) -> None:
         """Write one record to stderr if the console shows it.
 
         :param logging.LogRecord record: The record being handled, under the handler's lock.
         """
-        if record.name != REPORT_LOGGER and record.levelno < logging.WARNING:
+        if not self._shows(record):
             return
         try:
             stream = sys.stderr
@@ -46,6 +60,21 @@ class ConsoleHandler(logging.Handler):
             stream.flush()
         except Exception:
             self.handleError(record)
+
+    def _shows(self, record: logging.LogRecord) -> bool:
+        """Say whether the console prints ``record``.
+
+        :param logging.LogRecord record: The record being handled.
+        :return bool: ``True`` for a report line, a warning or error, and in a dry run an INFO
+            record of the package.
+        """
+        if record.name == REPORT_LOGGER or record.levelno >= logging.WARNING:
+            return True
+        return (
+            self._dry_run
+            and record.levelno >= logging.INFO
+            and (record.name == _PACKAGE_LOGGER or record.name.startswith(f"{_PACKAGE_LOGGER}."))
+        )
 
     def _lines(self, record: logging.LogRecord, width: int, color: bool) -> list[str]:
         """Draw one record as the console prints it.
@@ -60,7 +89,7 @@ class ConsoleHandler(logging.Handler):
         room = width - len(stamp)
         if isinstance(block, ReportBlock):
             body = block.render(room, color=color)
-        elif record.name == REPORT_LOGGER:
+        elif record.name == REPORT_LOGGER or record.levelno < logging.WARNING:
             body = record.getMessage().splitlines() or [""]
         else:
             body = _diagnostic(record, room, color)
