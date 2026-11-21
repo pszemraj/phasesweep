@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import errno
+import io
 import logging
 import math
 import os
@@ -14,6 +16,7 @@ from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from importlib import resources
 from pathlib import Path
+from typing import TYPE_CHECKING, TextIO
 
 import click
 import optuna
@@ -126,6 +129,9 @@ from phasesweep.runtime.terminal import (
 )
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
+
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
 CONFIG_OVERRIDES = click.option(
@@ -236,13 +242,65 @@ def _print_operational_error(exc: PhaseSweepError) -> None:
     click.echo("\n".join(lines), err=True)
 
 
+#: Write errors that mean nobody can read the stream any more: a pipe whose reader exited
+#: (``EPIPE``) and a terminal that hung up, as a dropped SSH session's does (``EIO``).
+_READER_GONE = frozenset({errno.EPIPE, errno.EIO})
+
+
+class _StandardStreamFile(io.FileIO):
+    """A standard stream's descriptor that discards what its gone reader can no longer receive.
+
+    The write reports success, so the command carries on, no text stays buffered for
+    interpreter shutdown to fail on (which would turn any exit status into 120), and Click's
+    own handling of a broken pipe, which ends a command with status 1, is never reached.
+    """
+
+    def write(self, data: ReadableBuffer, /) -> int:
+        """Write ``data``, or drop it when the stream's reader is gone.
+
+        :param ReadableBuffer data: Encoded text from the stream's buffer.
+        :raises OSError: A write failure other than a gone reader, such as a full disk.
+        :return int: The number of bytes the descriptor took, all of them when dropped.
+        """
+        try:
+            return super().write(data)
+        except OSError as exc:
+            if exc.errno not in _READER_GONE:
+                raise
+            return memoryview(data).nbytes
+
+
+def _discard_unreadable_output(stream: TextIO | None) -> TextIO | None:
+    """Rebuild a standard stream on :class:`_StandardStreamFile`, keeping its text settings.
+
+    :param TextIO | None stream: ``sys.stdout`` or ``sys.stderr``.
+    :return TextIO | None: The rebuilt stream; ``stream`` itself when it has no descriptor,
+        as an in-memory capture has none, or is not set.
+    """
+    if not isinstance(stream, io.TextIOWrapper):
+        return stream
+    try:
+        descriptor = stream.fileno()
+    except OSError:
+        return stream
+    stream.flush()
+    return io.TextIOWrapper(
+        io.BufferedWriter(_StandardStreamFile(descriptor, "w", closefd=False)),
+        encoding=stream.encoding,
+        errors=stream.errors,
+        line_buffering=stream.line_buffering,
+        write_through=stream.write_through,
+    )
+
+
 def main() -> None:
     """Run the CLI behind a process-level error boundary, then name the run's log.
 
     Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through. A
     ``run`` that went past its config prints ``log: <path>`` last, after its error or resume
     lines, whenever ``run.log`` exists, so the file is named however the command ended. A path
-    wider than the terminal breaks after slashes.
+    wider than the terminal breaks after slashes. Output to a pipe whose reader exited or to a
+    terminal that hung up is discarded, so the status stays the command's own.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
@@ -250,6 +308,8 @@ def main() -> None:
         Click chose.
     """
     _RUN_LOG.set(None)
+    sys.stdout = _discard_unreadable_output(sys.stdout)
+    sys.stderr = _discard_unreadable_output(sys.stderr)
     try:
         _error_boundary()
     finally:

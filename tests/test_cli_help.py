@@ -72,10 +72,10 @@ def test_validate_counts_its_phases_in_the_singular_for_one(
     assert result.output.splitlines()[0] == f"OK: {experiment.experiment} ({count})"
 
 
-def test_a_closed_output_pipe_ends_quietly_with_status_one(
+def test_a_closed_output_pipe_ends_quietly_with_the_commands_own_status(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``phasesweep ... | head`` closes stdout early: no operational error, no traceback, status 1."""
+    """``phasesweep ... | head`` closes stdout early: no operational error, no traceback, status 0."""
     read_end, write_end = os.pipe()
     os.close(read_end)
     closed = os.fdopen(write_end, "w", encoding="utf-8")
@@ -89,5 +89,5 @@ def test_a_closed_output_pipe_ends_quietly_with_status_one(
         with contextlib.suppress(BrokenPipeError):
             closed.close()
 
-    assert raised.value.code == 1
+    assert raised.value.code == 0
     assert capsys.readouterr().err == ""

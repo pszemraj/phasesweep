@@ -1,8 +1,13 @@
-"""What the CLI prints: terminal layouts at fixed widths, what a pipe gets, and closing lines."""
+"""What the CLI prints: terminal layouts at fixed widths, what a pipe gets, closing lines, and the status a closed terminal leaves."""
 
 from __future__ import annotations
 
+import os
 import re
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -11,11 +16,13 @@ from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from tests.conftest import (
+    console_script,
     invoke_cli_boundary,
     make_experiment,
     terminal_stream,
     write_constant_trainer,
     write_experiment_config,
+    write_trainer,
 )
 
 _DIAGNOSIS = (
@@ -212,6 +219,72 @@ def test_a_run_with_nothing_to_run_still_names_the_command_that_reads_the_result
     after = lines[closing + 1 :]
     assert after[after.index("") + 1] == next_line
     assert after[after.index("") + 2].startswith("log: ")
+
+
+# Makes the pseudo-terminal its controlling terminal and standard streams, sets SIGHUP's
+# disposition, then execs the command, as a shell on that terminal starts what is typed into it.
+_ON_TERMINAL = (
+    "import os, signal, sys\n"
+    "os.login_tty(int(sys.argv[1]))\n"
+    "signal.signal(signal.SIGHUP, signal.Handlers[sys.argv[2]])\n"
+    "os.execv(sys.argv[3], sys.argv[3:])\n"
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("sighup", "status"),
+    [("SIG_DFL", 128 + signal.SIGHUP), ("SIG_IGN", 0)],
+    ids=["hangup-stops-the-run", "hangup-ignored"],
+)
+def test_a_terminal_closed_mid_trial_leaves_the_runs_own_exit_status(
+    tmp_path: Path, sighup: str, status: int
+) -> None:
+    """Every write after a dropped SSH session fails, yet the run its hangup stops exits 129, and one that ignores the hangup completes and exits 0."""
+    reached, release = tmp_path / "reached", tmp_path / "release"
+    trainer = write_trainer(
+        tmp_path / "gated_train.py",
+        f"""
+        import time
+        from pathlib import Path
+        Path({str(reached)!r}).touch()
+        while not Path({str(release)!r}).exists():
+            time.sleep(0.05)
+        print("x=0.5")
+        """,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, gpu_policy="none"
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    master, slave = os.openpty()
+    try:
+        run = subprocess.Popen(
+            [sys.executable, "-c", _ON_TERMINAL, str(slave), sighup]
+            + [str(console_script("phasesweep")), "run", str(config)],
+            pass_fds=(slave,),
+        )
+    finally:
+        os.close(slave)
+    try:
+        deadline = time.monotonic() + 60
+        while not reached.exists():
+            assert run.poll() is None, f"run exited ({run.returncode}) before its trial started"
+            assert time.monotonic() < deadline, "the trial never started"
+            time.sleep(0.05)
+        os.close(master)
+        master = -1
+        if sighup == "SIG_IGN":
+            # The run outlives the hangup, so its trial finishes once released.
+            release.touch()
+        assert run.wait(timeout=60) == status
+    finally:
+        if master != -1:
+            os.close(master)
+        release.touch()
+        if run.poll() is None:
+            run.kill()
+            run.wait(timeout=10)
 
 
 _VALIDATE_CLOSING_AT_80 = [
