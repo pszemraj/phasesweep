@@ -129,8 +129,9 @@ def _no_feasible_remedy(
     else:
         budget = "the phase's n_trials"
     return (
-        f"{evidence} Fix the failure, then raise {budget} and rerun to retry the failed attempts. "
-        "Run controls such as `n_jobs` can change on retry. If the fix changes study identity "
+        f"{evidence} Fix the failure, then raise {budget} in the config and rerun to retry "
+        "the failed attempts. Run controls such as `n_jobs` can change on retry. "
+        "If the fix changes study identity "
         f"(for example `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
     )
 
