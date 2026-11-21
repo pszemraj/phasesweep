@@ -826,6 +826,36 @@ def test_a_run_refused_before_its_target_check_never_waits_on_the_tracker(
 
 
 @pytest.mark.integration
+def test_a_pass_whose_target_resolve_gets_no_answer_never_says_it_is_sending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pass that resolves the target first, as a replay's closeout does, reports sending only once it answered.
+
+    With the tracker silent, the resolve's warning is the pass's only line and nothing is sent.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+
+    def silent(request: dict[str, object], **kwargs: object) -> JsonObject:
+        raise TimeoutError("MLflow operation exceeded its deadline.")
+
+    monkeypatch.setattr(session, "request_operation", silent)
+    monkeypatch.setattr(worker, "request_operation", silent)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    tally = session.DeliveryTally()
+
+    # A generation that bound no summary run made no target check of its own.
+    publication.deliver_ended_generations(
+        sweep.experiment, validate_ledger(sweep.experiment), "f" * 32, tally
+    )
+
+    assert not tally.sending
+    assert [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER] == []
+    assert "is not ready: it did not answer within timeout_seconds" in caplog.text
+    assert publication.delivery_status(sweep.experiment)["pending"] == 2
+
+
+@pytest.mark.integration
 def test_a_different_target_sends_nothing_and_the_original_config_delivers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

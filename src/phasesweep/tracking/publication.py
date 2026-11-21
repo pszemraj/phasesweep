@@ -1043,17 +1043,6 @@ def _deliver_outstanding(
         pending = _pending_records(experiment, scope, skip=skip)
         if not tally.sending or not (creations or pending or own_pending):
             return
-        # Report lines, so the console shows what the seconds before the next lines are for. A
-        # search can bind a run whose record is then rebuilt, so the records are counted for
-        # their line only once the searches are done.
-        if creations:
-            logging.getLogger(REPORT_LOGGER).info(
-                ReportText(
-                    f"MLflow: checking {count_text(0, len(creations))} left by earlier runs."
-                )
-            )
-        else:
-            _report_sending(pending, own_pending)
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         if resolve:
             assert worker_generation is not None
@@ -1064,6 +1053,18 @@ def _deliver_outstanding(
                 deadline=deadline,
                 resolve_only=True,
             )
+        # Report lines, so the console shows what the seconds before the next lines are for,
+        # printed once the target answered, as only then is something sent. A search can bind a
+        # run whose record is then rebuilt, so the records are counted for their line only once
+        # the searches are done.
+        if creations:
+            logging.getLogger(REPORT_LOGGER).info(
+                ReportText(
+                    f"MLflow: checking {count_text(0, len(creations))} left by earlier runs."
+                )
+            )
+        else:
+            _report_sending(pending, own_pending)
         if creations:
             resolve_pending_creations(
                 experiment,
