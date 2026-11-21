@@ -960,11 +960,18 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
             raise subprocess.TimeoutExpired("runner", timeout or 0.0)
 
     monkeypatch.setattr(mcp_tools.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
-    monkeypatch.setattr(mcp_tools, "kill_stale_group", lambda *_args, **_kwargs: True)
+    stopped: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        mcp_tools, "kill_stale_group", lambda *_args, **kwargs: stopped.append(kwargs) or True
+    )
 
     with pytest.raises(RuntimeError, match="did not persist its launch receipt"):
         app.launch("srv")
 
+    # The runner may be waiting on its guardians, so it gets the grace cancel_run gives.
+    assert [kwargs.get("grace_seconds") for kwargs in stopped] == [
+        mcp_runs.RUNNER_STOP_GRACE_SECONDS
+    ]
     (failed,) = store.list_handles()
     assert store.observe(failed).state == "failed"
     assert not store.launch_lease_path(failed.run_id).exists()

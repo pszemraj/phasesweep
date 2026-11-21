@@ -1738,6 +1738,7 @@ class PhaseSweepMCP:
                 handle.pid,
                 handle.pid_starttime,
                 pgid=handle.pgid,
+                grace_seconds=RUNNER_STOP_GRACE_SECONDS,
             )
         except BaseException:
             log.exception(
