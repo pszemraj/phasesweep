@@ -98,7 +98,7 @@ from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )
-from phasesweep.runtime.terminal import terminal_width, use_color
+from phasesweep.runtime.terminal import plural, terminal_width, use_color
 from phasesweep.trial_table import render_trial_tables, unsettled_running_comment
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -600,7 +600,7 @@ def validate(config_path: Path, settings: tuple[str, ...]) -> None:
     validate_trial_targets(config)
     for phase in config.phases:
         GpuPool.for_phase(phase, cuda_visible_devices=config.env.get("CUDA_VISIBLE_DEVICES"))
-    click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
+    click.echo(f"OK: {config.experiment} ({plural(len(config.phases), 'phase')})")
     _render_experiment_phases(config)
 
 
@@ -758,7 +758,7 @@ def _code_revision_text(revision: CodeRevision | None) -> str:
     help="Print concise phase winners, including unpublished results from the latest run.",
     short_help="Print saved phase winners.",
 )
-@click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES
 def show_winners(config_path: Path, settings: tuple[str, ...]) -> None:
     """Print concise winners from published or unfinished generation records.
@@ -1082,6 +1082,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     "sync-tracking",
     context_settings=CONTEXT_SETTINGS,
     help="Reconcile MLflow run creations and retry uploads without training or selecting winners.",
+    short_help="Reconcile and retry MLflow uploads.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES

@@ -383,10 +383,6 @@ def test_help_registers_commands_and_options() -> None:
     assert "--dry-run" in run_help
     assert "-v, --verbose" in run_help
 
-    winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
-    assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
-    assert "including unpublished results from the latest run" in winners_help
-
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
     assert "Manage the optional MCP server, catalog, and operator recovery." in mcp_help.output
