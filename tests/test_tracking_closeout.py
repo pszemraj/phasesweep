@@ -183,11 +183,13 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     caplog: pytest.LogCaptureFixture,
     persistent: bool,
 ) -> None:
-    """A run that reaches closeout sends what an interrupted earlier run saved, each record once.
+    """The next run sends what an interrupted earlier run saved before its own first trial, each record once.
 
-    A dry run writes and sends nothing; the next real run says on the console how many records
-    it is sending before its first request, ends the earlier summary run KILLED once, says so,
-    and leaves nothing for sync-tracking, whose pass then sends and says nothing.
+    A dry run writes and sends nothing. The next real run, right after its target check, says
+    on the console how many records it is sending and ends the earlier summary run KILLED once,
+    before its first trial's outcome goes out; its closeout sends only its own records, and its
+    closing line counts the earlier ones. Nothing is left for sync-tracking, whose pass then
+    sends and says nothing.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=persistent)
     experiment = sweep.experiment
@@ -207,12 +209,16 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     assert reports[0].primary_error is None
     assert sweep.summaries() == ["KILLED"]
     assert read_record(sweep.summary)["state"] == "delivered"
+    sent = [(request["binding"]["generation_id"], request["name"]) for request in sweep.uploads]
+    # The earlier run's trial outcome and its summary run's end, before any trial of this run.
+    assert sent[:2] == [(sweep.generation, sent[0][1]), (sweep.generation, "generation")]
+    assert sent[0][1].startswith("attempt-")
+    assert (reports[0].generation_id, sent[2][1]) == sent[2]
     report = [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER]
-    [sending] = [line for line in report if line.startswith("MLflow: sending")]
-    assert re.fullmatch(
-        r"MLflow: sending \d+ records, 2 of them left pending by earlier runs\.", sending
-    )
-    assert report.index(sending) < report.index(
+    sending = [line for line in report if line.startswith("MLflow: sending")]
+    assert sending[0] == "MLflow: sending 2 records left pending by earlier runs."
+    assert len(sending) == 2 and re.fullmatch(r"MLflow: sending \d+ records?\.", sending[1])
+    assert report.index(sending[1]) < report.index(
         "MLflow: delivered 2 records left pending by earlier runs."
     )
     # Report blocks, so the console wraps them to the terminal.
@@ -221,7 +227,7 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
         for r in caplog.records
         if r.name == REPORT_LOGGER and r.getMessage().startswith("MLflow: ")
     ]
-    assert len(blocks) == 2 and all(isinstance(block, ReportBlock) for block in blocks)
+    assert len(blocks) == 3 and all(isinstance(block, ReportBlock) for block in blocks)
     assert publication.delivery_status(experiment)["pending"] == 0
     sweep.uploads.clear()
     caplog.clear()
@@ -231,7 +237,7 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("moment", ["trial", "target-check", "closeout"])
+@pytest.mark.parametrize("moment", ["trial", "target-check", "early-pass", "closeout"])
 def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -240,11 +246,12 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
 ) -> None:
     """A Ctrl-C stops MLflow delivery without blaming MLflow, and the closing line counts what stays pending.
 
-    The shutdown arrives during a trial's upload, during the next run's target check while an
-    earlier run's records are pending, or during that run's closeout delivery, after its first
-    record. No request follows it, no line says MLflow did not answer or was not ready, the
-    record the interrupted closeout delivered is still reported, and the closing line counts
-    every pending record, the earlier run's in parentheses.
+    The shutdown arrives during a trial's upload; during the next run's target check while an
+    earlier run's records are pending; after the first record of the pass that follows that
+    check, before any trial; or after the first record of that run's closeout. No request
+    follows it, no line says MLflow did not answer or was not ready, the closing lines count
+    the earlier records the run delivered, and the closing line counts every pending record,
+    the earlier run's in parentheses.
     """
     caplog.set_level(logging.INFO)
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
@@ -253,6 +260,7 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
         caplog.clear()
         respond = session.request_operation
         closing: list[bool] = []
+        publishes: list[str] = []
         closeout_requests: list[str] = []
         after: list[str] = []
 
@@ -261,10 +269,14 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
                 # What the supervisor does to every launch while the shutdown is serviced.
                 after.append(str(request["action"]))
                 raise ShutdownLaunchRefusedError(signal.SIGINT)
+            if request["action"] == "publish":
+                publishes.append(str(request["name"]))
             if closing:
                 closeout_requests.append(str(request["action"]))
-            if (moment == "target-check" and request["action"] == "resolve") or (
-                moment == "closeout" and len(closeout_requests) == 2
+            if (
+                (moment == "target-check" and request["action"] == "resolve")
+                or (moment == "early-pass" and len(publishes) == 2)
+                or (moment == "closeout" and len(closeout_requests) == 2)
             ):
                 monkeypatch.setattr(shutdown, "_servicing_signum", signal.SIGINT)
                 report = ShutdownCleanupReport(signal.SIGINT, True, ())
@@ -284,13 +296,21 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
         with pytest.raises(PhaseSweepShutdown):
             run_experiment(sweep.experiment, terminal_callback=reports.append)
         assert (closing, after) == ([True], [])
-        earlier = 1 if moment == "closeout" else 2
+        earlier = {"target-check": 2, "early-pass": 1, "closeout": 0}[moment]
         pending = publication.delivery_status(sweep.experiment)["pending"]
         own = publication.delivery_status(sweep.experiment, reports[0].generation_id)
         assert pending == earlier + own["pending"]
-        assert (own["pending"] > 0) is (moment == "closeout")
-        delivered = "MLflow: delivered 1 record left pending by earlier runs."
-        assert (delivered in caplog.text) is (moment == "closeout")
+        # Only a run whose target check bound its summary run saves its own records.
+        assert (own["pending"] > 0) is (moment != "target-check")
+        delivered = {
+            "target-check": None,
+            "early-pass": "MLflow: delivered 1 record left pending by earlier runs.",
+            "closeout": "MLflow: delivered 2 records left pending by earlier runs.",
+        }[moment]
+        lines = [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER]
+        assert [line for line in lines if line.startswith("MLflow: delivered")] == (
+            [delivered] if delivered else []
+        )
     assert "did not answer" not in caplog.text
     assert "is not ready" not in caplog.text
     assert "launch refused" not in caplog.text
@@ -382,7 +402,7 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
 @pytest.mark.parametrize("creation", [False, True], ids=["uploads", "creation-and-uploads"])
 @pytest.mark.parametrize("failure", ["outage", "rejection"])
 @pytest.mark.parametrize("ending", ["normal", "failed"])
-def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_request(
+def test_each_delivery_pass_sends_earlier_records_first_and_stops_at_the_first_unanswered_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -390,15 +410,18 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
     failure: str,
     creation: bool,
 ) -> None:
-    """Closeout sends what earlier runs left before the run's own records, and one unanswered request ends it.
+    """A run sends what earlier runs left after its target check and at closeout, and one unanswered request ends a pass.
 
-    The earlier run's records go first, its summary record last of them, so MLflow never shows
-    this run's result before the outcomes an earlier run left. An outage at closeout costs one
-    request, the search for an earlier creation intent when one is pending and otherwise the
-    earlier run's first record, and leaves every record pending, the run's own too, under one
-    warning. The run keeps its outcome, its winners or its own error, whether it ended normally
-    or failed after checking its target. A rejection of one earlier record, after an answered
-    search, is a verdict on that record alone, so every other record is still sent.
+    The pass after the target check sends the earlier run's records before any trial, its
+    summary record last of them, so MLflow never shows this run's result before the outcomes an
+    earlier run left; the closeout sends what is still pending before the run's own records. An
+    outage costs each pass one request, the search for an earlier creation intent when one is
+    pending and otherwise the earlier run's first record, and one warning; the run trains on
+    between them, and every record stays pending, the run's own too. The run keeps its
+    outcome, its winners or its own error, whether it ended normally or failed after checking
+    its target. A rejection of one earlier record, after an answered search, is a verdict on
+    that record alone, so every other record is still sent, and the closing line counts the
+    record once though both passes met the refusal.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     respond = session.request_operation
@@ -420,38 +443,50 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         intents = session.pending_creation_records(sweep.experiment)
         assert len(intents) == 1
     closing: list[bool] = []
-    requested: list[str] = []
+    delivering: list[bool] = []
+    requested: list[list[str]] = []
     rejected: list[str] = []
-    sent: list[tuple[str, str]] = []
+    sent: list[list[tuple[str, str]]] = []
 
     def failing(request: dict[str, object], **kwargs: object) -> JsonObject:
-        if closing:
+        if delivering:
             name = str(request.get("name", request["action"]))
-            requested.append(name)
+            requested[-1].append(name)
             if failure == "outage":
                 raise OperationUnavailableError("tracking server unreachable")
             if name == "find":
                 return {"found": False}
-            if name.startswith("attempt-") and not rejected:
+            if name.startswith("attempt-") and name == (rejected or [name])[0]:
                 rejected.append(name)
                 raise OperationRejectedError("RESOURCE_DOES_NOT_EXIST: run was deleted")
         return respond(request, **kwargs)
 
     close = publication.deliver_closeout
+    deliver_pass = publication.deliver_ended_generations
     deliver = publication._deliver
 
     def closeout(*args: object, **kwargs: object) -> None:
         closing.append(True)
         close(*args, **kwargs)
 
+    def delivery_pass(*args: object, **kwargs: object) -> None:
+        delivering.append(True)
+        requested.append([])
+        sent.append([])
+        try:
+            deliver_pass(*args, **kwargs)
+        finally:
+            delivering.clear()
+
     def recording(experiment: Experiment, path: Path, *args: object, **kwargs: object) -> None:
-        if closing:
-            sent.append((path.parent.parent.name, path.stem))
+        if delivering:
+            sent[-1].append((path.parent.parent.name, path.stem))
         deliver(experiment, path, *args, **kwargs)
 
     monkeypatch.setattr(session, "request_operation", failing)
     monkeypatch.setattr(worker, "request_operation", failing)
     monkeypatch.setattr(publication, "deliver_closeout", closeout)
+    monkeypatch.setattr(publication, "deliver_ended_generations", delivery_pass)
     monkeypatch.setattr(publication, "_deliver", recording)
     lost = RuntimeError("trainer host lost")
     if ending == "failed":
@@ -483,15 +518,19 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
     own = reports[0].generation_id
     own_pending = publication.delivery_status(sweep.experiment, own)["pending"]
     assert closing == [True]
+    assert len(intents) == creation
     assert all(intent.exists() for intent in intents)
     searched = ["find"] if creation else []
+    # The pass after the target check, then the closeout's.
+    assert len(requested) == len(sent) == 2
     if failure == "outage":
-        [request] = requested
-        assert request == "find" if creation else request.startswith("attempt-")
-        assert sent == ([] if creation else [(sweep.generation, request)])
+        for requests, sends in zip(requested, sent, strict=True):
+            [request] = requests
+            assert request == "find" if creation else request.startswith("attempt-")
+            assert sends == ([] if creation else [(sweep.generation, request)])
         assert read_record(sweep.summary)["state"] == "pending"
         assert own_pending > 0
-        assert caplog.text.count("MLflow did not answer") == 1
+        assert caplog.text.count("MLflow did not answer") == 2
         earlier = 2 + len(intents)
         creations = " and 1 unconfirmed run creation" if creation else ""
         assert (
@@ -500,11 +539,14 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         )
         assert "MLflow: delivered" not in caplog.text
     else:
-        assert requested[: len(searched)] == searched
-        [attempt] = rejected
-        assert sent[:2] == [(sweep.generation, attempt), (sweep.generation, "generation")]
-        assert sent[2:] and {generation for generation, _ in sent[2:]} == {own}
-        assert sent[-1] == (own, "generation")
+        early, closeout_pass = sent
+        assert [requests[: len(searched)] for requests in requested] == [searched, searched]
+        attempt = rejected[0]
+        assert rejected == [attempt, attempt]
+        assert early == [(sweep.generation, attempt), (sweep.generation, "generation")]
+        assert closeout_pass[0] == (sweep.generation, attempt)
+        assert closeout_pass[1:] and {generation for generation, _ in closeout_pass[1:]} == {own}
+        assert closeout_pass[-1] == (own, "generation")
         assert sweep.summaries() == ["KILLED"]
         assert own_pending == 0
         assert "MLflow: delivered 1 record left pending by earlier runs." in caplog.text

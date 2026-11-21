@@ -1589,15 +1589,21 @@ def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_pat
 def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_attempt(
     tmp_path, monkeypatch
 ):
-    """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports."""
+    """The worker sending a recovered outcome is what leaves cleanup uncertain, never the trial it reports.
+
+    The outcome is sent right after the run's target check, so, as with a target check's own
+    worker, the run stops there and starts no trial.
+    """
     experiment, _uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
     leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
     reports = []
-    run_experiment(experiment, terminal_callback=reports.append)
+    with pytest.raises(UnsafeProcessCleanupError):
+        run_experiment(experiment, terminal_callback=reports.append)
     [report] = reports
     assert leaked
     assert not report.cleanup_confirmed
     assert attempt not in report.uncertain_attempt_ids
+    assert report.failure_stage == "preflight"
     [recovered] = [
         trial
         for trial in read_phase_trials(validate_ledger(experiment), "depth").trials

@@ -345,7 +345,7 @@ def recover_run(
                             + f"MLflow: {count_text(pending - creations, creations)} pending. "
                             "The next launch with this config, or `phasesweep sync-tracking "
                             "CONFIG` with the config this run launched with, sends them; "
-                            "delivery never retrains." + refused_text(tally.refused)
+                            "delivery never retrains." + refused_text(len(tally.refused))
                         )
                     elif sent:
                         emit(f"{sent}; none stay pending.")

@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
@@ -71,6 +71,9 @@ from phasesweep.runtime.shutdown import (
     service_pending_shutdown,
     signal_handler_scope,
 )
+
+if TYPE_CHECKING:
+    from phasesweep.tracking.session import DeliveryTally
 
 log = logging.getLogger("phasesweep.engine.run")
 
@@ -381,6 +384,13 @@ def _run_experiment_outcome(
         terminal_error: BaseException | None = None
         terminal_report: TerminalReport | None = None
         cleanup = attempt_ops._PreflightCleanupReport()
+        tracking: DeliveryTally | None = None
+        if experiment.mlflow is not None:
+            from phasesweep.tracking.session import DeliveryTally
+
+            # One for the run, so its closing lines count the pass after its first target
+            # check as well as its closeout.
+            tracking = DeliveryTally()
         try:
             run_deadline = (
                 time.monotonic() + experiment.timeout_seconds_per_run
@@ -426,6 +436,7 @@ def _run_experiment_outcome(
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
                 publication_hook=publication_hook,
+                tracking=tracking,
             )
         except BaseException as exc:
             terminal_error = exc
@@ -488,7 +499,9 @@ def _run_experiment_outcome(
                 from phasesweep.tracking.publication import deliver_closeout
 
                 try:
-                    deliver_closeout(experiment, claimed, generation_id, error=primary_error)
+                    deliver_closeout(
+                        experiment, claimed, generation_id, error=primary_error, tally=tracking
+                    )
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
@@ -537,7 +550,7 @@ def _run_experiment_outcome(
             # Outside the except clause: the pointer has committed, so nothing
             # the MLflow mirror raises may enter the failure handling above.
             try:
-                if experiment.mlflow is not None:
+                if tracking is not None:
                     _mirror_publication(
                         experiment,
                         generation_id,
@@ -546,6 +559,7 @@ def _run_experiment_outcome(
                         # Success without a claim published nothing: the replay matched the
                         # publication.
                         published=generation.claimed,
+                        tally=tracking,
                     )
             finally:
                 terminal_report = _terminal_report_from_cleanup(
@@ -589,11 +603,13 @@ def _mirror_publication(
     *,
     ledger: ledger_ops.ValidatedLedger,
     published: bool,
+    tally: DeliveryTally,
 ) -> None:
     """Mirror a successful run's result to MLflow without changing the run's outcome.
 
-    The mirror sends whatever earlier generations left pending, as ``phasesweep sync-tracking``
-    would, then the published generation's pending records, until MLflow stops answering.
+    The mirror sends whatever earlier generations still leave pending, as ``phasesweep
+    sync-tracking`` would, then the published generation's pending records, until MLflow stops
+    answering.
     Once the last-success pointer has committed, nothing may fail the run. An ordinary
     failure only leaves the mirror for the next run or ``phasesweep sync-tracking``, which
     rebuild any record this left unsaved. A tracking worker whose cleanup is uncertain is
@@ -607,12 +623,14 @@ def _mirror_publication(
     :param ledger_ops.ValidatedLedger ledger: The run's ledger, holding the settled trials.
     :param bool published: Whether this run published ``generation_id``; a replay of an
         existing publication did not.
+    :param DeliveryTally tally: The run's MLflow delivery, which its pass after its first
+        target check already counts into.
     :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
     """
     from phasesweep.tracking.publication import deliver_closeout
 
     try:
-        deliver_closeout(experiment, ledger, generation_id, published=published)
+        deliver_closeout(experiment, ledger, generation_id, published=published, tally=tally)
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
@@ -685,6 +703,7 @@ def _run_experiment_inner(
     preloaded_winners: dict[str, Winner] | None = None,
     run_deadline: float | None = None,
     publication_hook: PublicationHook | None = None,
+    tracking: DeliveryTally | None = None,
 ) -> dict[str, Winner]:
     """Execute the phase sequence under the caller's locks and signal handlers.
 
@@ -701,6 +720,8 @@ def _run_experiment_inner(
         before generation commit.
     :param float | None run_deadline: Monotonic deadline including preflight and stale cleanup.
     :param PublicationHook | None publication_hook: Optional required publication sidecar.
+    :param DeliveryTally | None tracking: The run's MLflow delivery, for the pass after its first
+        target check, or ``None`` for a dry run or a run without MLflow.
     :return dict[str, Winner]: Phase winners, or dry-run placeholders and replayed winners.
     :raises TimeoutError: The run deadline expired before a phase started.
     :raises PublicationAccessError: A recorded dry-run publication is inaccessible.
@@ -786,6 +807,7 @@ def _run_experiment_inner(
                 generation=generation,
                 ledger=ledger,
                 run_deadline=run_deadline,
+                tracking=tracking,
             )
             counts = _phase_counts(ledger, phase, generation.generation_id, winner)
             if counts is not None:

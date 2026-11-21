@@ -164,7 +164,7 @@ def _send(
                 break
             unanswered = isinstance(exc, NO_ANSWER)
             if isinstance(exc, OperationRejectedError) and not unanswered:
-                tally.refused += 1
+                tally.refused.add(path)
             later = len(paths) - index - 1
             log.warning(
                 "MLflow: %s is pending (%s).%s",
@@ -179,6 +179,7 @@ def _send(
                 tally.unanswered = unready_target_text(experiment, exc)
                 break
             continue
+        tally.refused.discard(path)
         if path in counted:
             tally.delivered += 1
 
@@ -918,7 +919,8 @@ def _deliver_outstanding(
 ) -> None:
     """Deliver what every ended generation in scope still owes its MLflow runs.
 
-    This is sync-tracking's work, shared with run closeout and recover-run. The caller holds the
+    This is sync-tracking's work, shared with a run's two passes, after its first target check
+    and at closeout, and with recover-run. The caller holds the
     experiment lock, so every generation in scope but ``skip`` has ended. Missing records are
     staged first, locally, so nothing is requested when nothing is pending or ``tally`` has
     stopped sending. Then the target is resolved if asked, pending creations are searched, so a
@@ -1086,17 +1088,21 @@ def deliver_ended_generations(
     recovering: bool = False,
     own: list[Path] | None = None,
 ) -> None:
-    """Finish, at a run's end, what sync-tracking would for every generation that has ended.
+    """Finish what sync-tracking would for every generation that has ended.
 
-    That is every generation but a run's own, whose saved records come as ``own`` and go last;
-    for recover-run it is every generation. The core stages first and requests nothing when
-    nothing is pending or ``tally`` has stopped sending. Its first request follows a target
-    check: the one the calling run made when it bound its own summary run, or else a resolve
-    the core makes, which binds none. Workers register under ``generation_id`` because this
-    invocation is accountable for their cleanup. A configured target other than the recorded
-    one stages and sends nothing, with a warning when an earlier run left something to send.
-    Every failure but an uncertain worker cleanup or a shutdown costs a warning and leaves the
-    records for the next run or sync-tracking, never the caller's outcome.
+    A run calls it twice: right after its first target check, before its first trial, so MLflow
+    shows what an interrupted earlier run left as soon as the next run reaches the tracker, and
+    at its closeout, for what is still pending and its own records. Its scope is every
+    generation but a run's own, whose saved records come at closeout as ``own`` and go last; for
+    recover-run it is every generation. The core stages first and requests nothing when nothing
+    is pending or ``tally`` has stopped sending. Its first request follows a target check: the
+    one the calling run made when it bound its own summary run, or else a resolve the core
+    makes, which binds none. Workers register under ``generation_id`` because this invocation
+    is accountable for their cleanup. A configured target other than the recorded one stages
+    and sends nothing, with a warning when an earlier run left something to send. Every failure
+    but an uncertain worker cleanup or a shutdown costs a warning and leaves the records for the
+    next run or sync-tracking, never the caller's outcome, so a silent tracker costs the caller
+    one request's ``timeout_seconds``.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The caller's ledger, holding the trials the records describe.
@@ -1163,16 +1169,18 @@ def deliver_closeout(
     *,
     error: BaseException | None = None,
     published: bool = False,
+    tally: DeliveryTally | None = None,
 ) -> None:
     """Save a closing run's own MLflow records, send what is pending, and log the closing lines.
 
     The run's own records are saved before anything is sent, so however the delivery ends they
-    are counted; then every ended generation's records go, the run's own last, through the core
-    sync-tracking runs. A run that is shutting down, or that just found its tracker silent,
-    only saves: a shutdown refuses every worker launch. So does a run that failed before its
-    target check, which would otherwise wait on a tracker it never reached before reporting
-    its own error. The closing lines are logged however the delivery ends, a shutdown during
-    it included.
+    are counted; then every ended generation's records still pending go, the run's own last,
+    through the core sync-tracking runs. A run that is shutting down, or that just found its
+    tracker silent, only saves: a shutdown refuses every worker launch. So does a run that
+    failed before its target check, which would otherwise wait on a tracker it never reached
+    before reporting its own error. Otherwise the closeout sends whatever the run's earlier
+    pass met, as a tracker silent then may answer now. The closing lines are logged however the
+    delivery ends, a shutdown during it included, and count the earlier pass too.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param ValidatedLedger ledger: The run's ledger, holding its trials and those it settled.
@@ -1181,6 +1189,8 @@ def deliver_closeout(
         normally.
     :param bool published: Whether a run that ended normally published ``generation_id``; a
         replay of an existing publication did not.
+    :param DeliveryTally | None tally: The run's delivery, which its pass after its first target
+        check already counts into; a fresh one when omitted.
     :raises PublicationIntegrityError: The run's committed artifacts no longer validate.
     :raises OSError: A record of the run's own cannot be read or written.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
@@ -1189,15 +1199,14 @@ def deliver_closeout(
 
     # A run binds its summary run in its first target check.
     checked = (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
-    tally = DeliveryTally(
-        sending=error is None
-        or (
-            checked
-            and not isinstance(
-                error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
-            )
+    tally = DeliveryTally() if tally is None else tally
+    tally.sending = error is None or (
+        checked
+        and not isinstance(
+            error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
         )
     )
+    tally.unanswered = None
     try:
         if error is not None:
             own = _save_failed(experiment, generation_id, error, ledger)
@@ -1218,7 +1227,8 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: The run's own generation.
-    :param DeliveryTally tally: The run's closeout delivery.
+    :param DeliveryTally tally: The run's delivery, its pass after its first target check and
+        its closeout.
     """
     try:
         pending = delivery_status(experiment)["pending"]
@@ -1239,7 +1249,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
             "`phasesweep sync-tracking CONFIG` sends them.%s",
             count_text(pending - creations, creations),
             f" ({earlier} from earlier runs)" if earlier else "",
-            refused_text(tally.refused),
+            refused_text(len(tally.refused)),
         )
 
 

@@ -1353,7 +1353,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
     if tally.refused:
         # A refused record is retried like any other, so only fixing its cause in MLflow helps.
         raise PhaseSweepError(
-            f"MLflow delivery remains pending: MLflow refused {tally.refused} record(s), each "
+            f"MLflow delivery remains pending: MLflow refused {len(tally.refused)} record(s), each "
             "for the cause its warning gives.",
             action=OperatorAction.FIX_CONFIG,
             remediation=(

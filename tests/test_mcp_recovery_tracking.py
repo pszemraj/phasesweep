@@ -482,11 +482,11 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
 ) -> None:
     """A tracking worker a run starts for an earlier generation's recovered outcome is that run's to recover.
 
-    The run recovers an earlier sweep's attempt and succeeds, leaving the worker that uploads
-    that outcome with its cleanup unconfirmed. Following the steps the run's MCP status prints,
-    sync-tracking where it names one and then a confirmed recover-run, clears the run, and the
-    outcome reaches its MLflow run once. A failed run starts no such worker before its own
-    target check, so this success is the run that sends an earlier generation's records.
+    The run recovers an earlier sweep's attempt and, right after its target check, sends that
+    outcome; the worker uploading it is left with its cleanup unconfirmed, so the run stops
+    before its first trial. Following the steps the run's MCP status prints, sync-tracking where
+    it names one and then a confirmed recover-run, clears the run, and the outcome reaches its
+    MLflow run once. A run starts no such worker before its own target check.
     """
     experiment, uploads, [attempt] = killed_sweep(tmp_path, monkeypatch, n_jobs=1)
     # The runner resolves the config's relative paths against its directory, and the earlier
@@ -496,7 +496,8 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
         write_srv_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     )
     leaked = leak_tracking_worker(monkeypatch, name=f"attempt-{attempt}")
-    assert run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()) == 0
+    with pytest.raises(UnsafeProcessCleanupError):
+        run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd())
     assert leaked
     failure = app.status(_SENDING_RUN_ID)["run"]["failure"]
     assert failure["code"] == "cleanup_uncertain"
@@ -523,7 +524,11 @@ def test_the_printed_steps_clear_a_run_whose_worker_sent_an_earlier_outcome(
 def test_recover_run_cleans_worker_before_finalizing_pending_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
-    """A runner killed during mirroring holds its slot until its registered worker is reaped."""
+    """A runner killed during mirroring holds its slot until its registered worker is reaped.
+
+    A recovered earlier outcome is still pending at the mirror when MLflow gave no answer to
+    the pass after the run's target check.
+    """
     experiment, uploads, [attempt] = killed_sweep(
         tmp_path, monkeypatch, n_jobs=1, generation_id=_RUN_ID
     )
@@ -562,6 +567,19 @@ def test_recover_run_cleans_worker_before_finalizing_pending_publication(
 
         crash.setattr(session, "request_operation", die_during_upload)
         crash.setattr(worker, "request_operation", die_during_upload)
+        if target == "recovered-attempt":
+            silent: list[str] = []
+
+            def silent_before_training(
+                request: Mapping[str, object], **kwargs: object
+            ) -> JsonObject:
+                if request["action"] == "publish" and request.get("name") == name and not silent:
+                    silent.append(name)
+                    raise OperationUnavailableError("tracking server unreachable")
+                return die_during_upload(request, **kwargs)
+
+            crash.setattr(session, "request_operation", silent_before_training)
+            crash.setattr(worker, "request_operation", silent_before_training)
         child = os.fork()
         if child == 0:
             os._exit(run_claimed_runner(store, _SENDING_RUN_ID, config, cwd=Path.cwd()))

@@ -11,7 +11,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
 import optuna
@@ -130,6 +130,9 @@ from phasesweep.runtime.shutdown import (
     launch_refusal_text,
     servicing_shutdown_signal,
 )
+
+if TYPE_CHECKING:
+    from phasesweep.tracking.session import DeliveryTally
 
 log = logging.getLogger("phasesweep.engine.phase")
 
@@ -1649,6 +1652,7 @@ def _run_phase(
     generation: InvocationGeneration,
     ledger: ClaimedLedger,
     run_deadline: float | None = None,
+    tracking: DeliveryTally | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
@@ -1666,12 +1670,16 @@ def _run_phase(
         its live study through.
     :param float | None run_deadline: Optional ``time.monotonic()`` deadline inherited from the
         experiment-level wallclock guard.
+    :param DeliveryTally | None tracking: The run's MLflow delivery, which the pass after the
+        run's first target check counts into, or ``None`` for a run without MLflow.
     :raises NoFeasibleTrialError: ``max_consecutive_failures`` tripped, no finished trial is
         feasible, or the recorded trials a met target replays hold no feasible one.
     :raises PhaseAbortRefusedError: A recorded abort or a replayed failure streak stops the
         phase before it launches a trial.
     :raises UnsafeProcessCleanupError: A trial's process group could not be confirmed dead;
         phase hard-aborted.
+    :raises ProcessCleanupUncertainError: An MLflow worker of the target check, or of the
+        delivery after it, may still be running; no trial was started.
     :raises ArtifactRootConflictError: This phase's persistent study is bound to a different
         artifact root than the config's workdir offers.
     :raises TrialEvidenceMissingError: The selected winner's evidence directory, audit
@@ -1738,12 +1746,19 @@ def _run_phase(
         from phasesweep.tracking.session import require_tracking_target
 
         log.info("phase=%s checking MLflow target %s", phase.name, experiment.mlflow.tracking_uri)
-        require_tracking_target(
+        bound = require_tracking_target(
             experiment,
             generation_id=generation.generation_id,
             environment=environment_identity.values,
             deadline=budget.deadline,
         )
+        if bound and tracking is not None:
+            from phasesweep.tracking.publication import deliver_ended_generations
+
+            # Once per run, before its first trial: what an interrupted earlier run left reaches
+            # MLflow now rather than after this run's training. A tracker silent here costs one
+            # request and a warning, never the run; the closeout sends whatever is left.
+            deliver_ended_generations(experiment, ledger, generation.generation_id, tracking)
     generation_id = generation.claim()
     run = _PhaseExecution(
         experiment=experiment,

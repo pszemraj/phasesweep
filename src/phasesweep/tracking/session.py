@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -72,11 +72,12 @@ NO_ANSWER: tuple[type[Exception], ...] = (
 
 @dataclass
 class DeliveryTally:
-    """What the requests of one delivery met: a run's closeout, recover-run or sync-tracking.
+    """What one MLflow delivery has met: a run's, recover-run's or sync-tracking's.
 
-    Every pass of one closeout shares it. Once ``sending`` is False the later passes only save
-    their records: a later request would meet the same silent tracker, or a shutdown, which
-    refuses every worker launch.
+    A run keeps one for the pass after its first target check and its closeout, so its closing
+    lines count both. Within a pass, once ``sending`` is False the later steps only save their
+    records: a later request would meet the same silent tracker, or a shutdown, which refuses
+    every worker launch. A closeout sends again whatever the earlier pass met.
     """
 
     sending: bool = True
@@ -87,8 +88,12 @@ class DeliveryTally:
     """Records of ended generations delivered."""
     settled: int = 0
     """Unconfirmed run creations settled: bound to the run a search found, or retired."""
-    refused: int = 0
-    """Records MLflow answered with a refusal, such as for a deleted run; they stay pending."""
+    refused: set[Path] = field(default_factory=set)
+    """Records and creations MLflow last answered with a refusal, such as for a deleted run.
+
+    They stay pending. A record is counted once however many passes it refuses, and leaves the
+    set once a later request delivers or settles it.
+    """
 
 
 def record_name(path: Path) -> str:
@@ -529,8 +534,7 @@ def _reconcile_creation(
     """
     path = pending.with_suffix("").with_suffix(".json")
     if path.exists():
-        _retire_creation(pending)
-        tally.settled += 1
+        _settle_creation(pending, tally)
         return
     settings = experiment.mlflow
     assert settings is not None
@@ -557,7 +561,7 @@ def _reconcile_creation(
             return
         if not isinstance(exc, NO_ANSWER):
             if isinstance(exc, OperationRejectedError):
-                tally.refused += 1
+                tally.refused.add(pending)
             log.warning("MLflow: %s is still unresolved (%s).", record_name(pending), exc)
             return
         # The pass sends nothing after this, so this is its only outage warning.
@@ -574,8 +578,18 @@ def _reconcile_creation(
         write_record(path, binding)
     elif not expired:
         return
+    _settle_creation(pending, tally)
+
+
+def _settle_creation(pending: Path, tally: DeliveryTally) -> None:
+    """Retire a creation intent a search settled, and count it for the delivery's closing line.
+
+    :param Path pending: Creation intent whose run is bound, or which no run carries.
+    :param DeliveryTally tally: The delivery that settled it.
+    """
     _retire_creation(pending)
     tally.settled += 1
+    tally.refused.discard(pending)
 
 
 def _resolve_source(
@@ -665,7 +679,7 @@ def require_tracking_target(
     environment: Mapping[str, str],
     deadline: float | None,
     resolve_only: bool = False,
-) -> None:
+) -> bool:
     """Resolve the MLflow target before a phase allocates trials or a run sends to it.
 
     A generation whose summary run is bound only resolves the target, as does a check for a
@@ -683,6 +697,8 @@ def require_tracking_target(
     :raises TrackingTargetUnavailableError: The target cannot be resolved or reached; its step
         is a retry when MLflow gave no answer, the creation it left unconfirmed included, and
         fixing the configuration when MLflow answered with a refusal.
+    :return bool: Whether this check bound the generation's summary run, which only a run's
+        first successful check does.
     """
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
@@ -698,10 +714,11 @@ def require_tracking_target(
             _resolve_source(
                 experiment, generation_id=generation_id, environment=environment, deadline=deadline
             )
-        else:
-            prepare_generation(
-                experiment, generation_id=generation_id, environment=environment, deadline=deadline
-            )
+            return False
+        prepare_generation(
+            experiment, generation_id=generation_id, environment=environment, deadline=deadline
+        )
+        return True
     except PhaseSweepError:
         raise
     except (OSError, ValueError, RuntimeError) as exc:
