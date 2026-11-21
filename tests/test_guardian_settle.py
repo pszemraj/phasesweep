@@ -226,6 +226,16 @@ def test_a_helper_that_exits_within_the_settle_keeps_the_roots_exit(
     assert elapsed < supervisor._HELPER_SETTLE_SECONDS / 2
 
 
+def _named_command(marks: Path) -> str:
+    """Return the start of the name the guardian gives the child that recorded its command line.
+
+    :param Path marks: Directory holding the child's ``child_cmdline`` (interpreter, ``-c``, code).
+    :return str: The interpreter's file name, the flag and the inline code, kept whole.
+    """
+    interpreter, flag, code = (marks / "child_cmdline").read_bytes().split(b"\0")[:3]
+    return f"{Path(interpreter.decode()).name} {flag.decode()} {' '.join(code.decode().split())}"
+
+
 def test_a_persistent_child_is_terminated_after_the_settle_and_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -248,8 +258,7 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
         ". They were terminated. Make the trainer wait for its children before exiting"
     )
     if sys.platform == "linux":
-        command = (marks / "child_cmdline").read_bytes().replace(b"\0", b" ").decode()
-        assert f": {child_pid} ({command[:40]}" in result.failure_reason
+        assert f": {child_pid} ({_named_command(marks)[:40]}" in result.failure_reason
     _assert_exited(trial_dir, 1)
     assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
     root_exit = float((marks / "root_exit").read_text())
@@ -347,10 +356,9 @@ def test_a_killed_launchers_session_escaped_child_holds_the_lease_until_terminat
     assert_descendant_dies(child_pid, on_timeout_msg=f"child {child_pid} survived the guardian")
     assert (result.return_code, result.cleanup_confirmed) == (-signal.SIGKILL, True)
     assert result.failure_reason is not None
-    command = (marks / "child_cmdline").read_bytes().replace(b"\0", b" ").decode()
     assert result.failure_reason.startswith(
         "trainer root exited with code -9, but the trainer still had live descendants "
-        f"0.5s later: {child_pid} ({command[:40]}"
+        f"0.5s later: {child_pid} ({_named_command(marks)[:40]}"
     )
     _assert_exited(trial_dir, -signal.SIGKILL)
     root_exit = float((marks / "root_exit").read_text())
@@ -766,6 +774,34 @@ def test_the_next_trial_waits_for_the_rank_a_killed_launcher_left(
     assert len(starts) == 2
     assert starts[1] > float((marks / "rank_stopped").read_text())
     assert not reaper.is_pid_alive(rank_pid)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
+def test_a_survivor_is_named_by_its_script_behind_long_paths(tmp_path: Path) -> None:
+    """Each argument shows the last component of its path, an option keeping its name."""
+    deep = tmp_path / ("d" * 80) / "run"
+    deep.mkdir(parents=True)
+    script = deep / "rank_train.py"
+    script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    config = deep / "config.yaml"
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(script), "--config", str(config), f"--out={deep}/"]
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and str(config) not in Path(
+            f"/proc/{proc.pid}/cmdline"
+        ).read_text(errors="replace"):
+            time.sleep(0.01)
+        described = supervisor._describe_members([proc.pid])
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+    interpreter = Path(sys.executable).name
+    assert described == (
+        f"{proc.pid} ({interpreter} -u rank_train.py --config config.yaml --out=run)"
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs command lines")
