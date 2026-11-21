@@ -859,7 +859,10 @@ def extract_trial_result(
         except ExtractorError as exc:
             exhausted = isinstance(exc, DeadlineExceededError)
             unreadable = isinstance(exc, EvidenceUnreadableError)
-            log.warning(
+            # A failed trial prints the same cause as its ``reason:``; only a trial left
+            # pending by an unreadable tracker has no progress line to carry it.
+            log.log(
+                logging.WARNING if unreadable else logging.INFO,
                 "[%s/trial_%d] %s extraction %s: %s",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
@@ -888,7 +891,8 @@ def extract_trial_result(
                 evidence_unreadable=unreadable,
             )
         if not math.isfinite(value):
-            log.warning(
+            # The failed trial's ``reason:`` says the same on the console.
+            log.info(
                 "[%s/trial_%d] %s returned non-finite value: %r",
                 executed.ctx.phase,
                 executed.ctx.trial_id,
@@ -936,7 +940,11 @@ def extract_trial_result(
     failed_gates = [gate for gate in gate_results if not gate.passed]
     if failed_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
-        log.warning(
+        unreadable = all(gate.evidence_unreadable for gate in failed_gates)
+        # As for an extractor: only a trial left pending by an unreadable tracker lacks a
+        # progress line that carries the failure.
+        log.log(
+            logging.WARNING if unreadable else logging.INFO,
             "[%s/trial_%d] evidence gate(s) failed: %s",
             executed.ctx.phase,
             executed.ctx.trial_id,
@@ -951,7 +959,7 @@ def extract_trial_result(
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
             # A definite gate failure fails the trial whatever the tracker would answer.
-            evidence_unreadable=all(gate.evidence_unreadable for gate in failed_gates),
+            evidence_unreadable=unreadable,
         )
 
     expired = _deadline_failure("the trial result could be accepted")

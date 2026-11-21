@@ -863,7 +863,9 @@ class _PhaseExecution:
             if recorded:
                 self.fatal_error = error
         if recorded:
-            log.error(
+            # The error re-raised once the workers drain reaches the console in operator words;
+            # run.log keeps this line with the exception type.
+            log.info(
                 "phase=%s FATAL OBJECTIVE ERROR (%s): %s",
                 self.phase.name,
                 type(error).__name__,
@@ -1455,7 +1457,8 @@ def _settle_finished_trial(
     )
     outcome = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     if outcome is not None and outcome.abort is not None:
-        log.error("phase=%s ABORTED: %s", run.phase.name, outcome.abort["cause"])
+        # The raised abort error reaches the console with its fix; run.log keeps this line.
+        log.info("phase=%s ABORTED: %s", run.phase.name, outcome.abort["cause"])
     # Keep unsafe-cleanup entries until recovery. Run reconciliation handles skipped callbacks.
     finished_attempt = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if (

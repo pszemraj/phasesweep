@@ -18,8 +18,10 @@ import pytest
 from phasesweep.cli import _console_logging
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Sampler
+from phasesweep.engine.paths import _run_log_path
 from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.run_report import (
     LogLine,
@@ -1135,6 +1137,81 @@ def test_no_log_line_when_the_engine_never_wrote_a_log(
     assert invoke_cli_boundary(["run", str(config_path)], monkeypatch) == 1
 
     assert "log:" not in capsys.readouterr().err
+
+
+def _run_log_text(experiment: Experiment) -> str:
+    """Read the ``run.log`` the experiment's run wrote."""
+    return _run_log_path(experiment).read_text(encoding="utf-8")
+
+
+def test_a_phase_abort_prints_once_and_stays_in_run_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The raised abort carries the fact to the console; the ABORTED line is INFO in run.log."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trial_command="false {overrides}",
+        n_trials=4,
+        max_consecutive_failures=2,
+    )
+    config = write_experiment_config(tmp_path / "abort.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+
+    err = capsys.readouterr().err
+    assert err.count("2 consecutive failed/infeasible trials") == 1
+    assert "ABORTED" not in err
+    assert "error:" not in err
+    cause = "2 consecutive failed/infeasible trials reached max_consecutive_failures=2."
+    assert f" I phasesweep.engine.phase phase=p ABORTED: {cause}" in _run_log_text(experiment)
+
+
+def test_a_failed_extraction_prints_once_as_the_trials_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A trainer that wrote no objective fails the trial; its cause is the reason, not also a warning."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path, key="not_the_objective"),
+        n_trials=2,
+        max_consecutive_failures=5,
+    )
+    config = write_experiment_config(tmp_path / "missing.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+
+    err = capsys.readouterr().err
+    assert err.count("reason: metric extractor:") == 2
+    assert "warning:" not in err
+    assert " I phasesweep.engine.trial [p/trial_0] metric extraction failed: " in _run_log_text(
+        experiment
+    )
+
+
+def test_a_fatal_objective_error_prints_once_and_stays_in_run_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The error that ends the run is the console's account; its FATAL line is INFO in run.log."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(persistent=tmp_path, n_trials=2)
+    config = write_experiment_config(tmp_path / "fatal.yaml", experiment)
+
+    def unsafe(*_args: object, **_kwargs: object) -> float:
+        raise UnsafeProcessCleanupError("trainer group may still be alive")
+
+    monkeypatch.setattr("phasesweep.engine.phase._execute_objective", unsafe)
+
+    assert invoke_cli_boundary(["run", str(config)], monkeypatch) == 1
+
+    err = capsys.readouterr().err
+    assert err.count("trainer group may still be alive") == 1
+    assert "FATAL OBJECTIVE ERROR" not in err
+    assert (
+        " I phasesweep.engine.phase phase=p FATAL OBJECTIVE ERROR (UnsafeProcessCleanupError): "
+        "trainer group may still be alive"
+    ) in _run_log_text(experiment)
 
 
 def test_a_live_run_opens_with_the_banner_and_closes_with_summary_then_log(
