@@ -215,21 +215,19 @@ def winners_payload(
 
 
 def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, object]) -> JsonObject:
-    """Attach the operator's retry step to a run's upload counts once retrying can work.
+    """Attach the retry step to a run's tracking counts once sync can acquire the lock.
 
-    ``sync-tracking`` holds the experiment lock, so it cannot retry a running run's uploads.
-
-    :param Mapping[str, int] counts: The run's pending and delivered upload counts.
+    :param Mapping[str, int] counts: Pending creations and deliveries, and delivered uploads.
     :param Mapping[str, object] run: Path-free detached-run state.
-    :return JsonObject: Counts plus ``remedy``, the retry step when uploads are pending after
+    :return JsonObject: Counts plus ``remedy``, the retry step when records are pending after
         the run ended, otherwise ``None``.
     """
     pending = counts["pending"]
     remedy = None
     if pending and run["state"] != "running":
         remedy = (
-            f"{pending} MLflow result upload(s) of this run are pending; its scores and winners "
-            "are unaffected. Ask the operator to retry them with `phasesweep sync-tracking "
+            f"{pending} MLflow record(s) of this run are pending. Its scores and winners are "
+            "unaffected. Ask the operator to retry them with `phasesweep sync-tracking "
             f"CONFIG --generation {run['run_id']}` using the config this run launched with; "
             "delivery never retrains."
         )

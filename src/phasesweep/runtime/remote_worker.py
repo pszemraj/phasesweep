@@ -6,8 +6,9 @@ deadline over SDK construction, requests and retries. A call blocked in an SDK's
 be cancelled from the process that made it, and the SDKs retry on their own, so no timeout the
 code can hand an SDK is that deadline. A process the supervisor can kill is: it stops at the
 deadline and takes its descendants with it, where an in-process call would run past the trial,
-phase or run budget. The worker also runs in the attempt's durable process slot, so recovery can
-find and clean it up after the controller dies.
+phase or run budget. Evidence reads use the trial attempt's durable process slot. Controller
+tracking operations register their own slots under the invoking generation so recovery can find
+and clean up those workers after the controller dies.
 """
 
 from __future__ import annotations

@@ -1966,7 +1966,7 @@ def test_sync_tracking_with_uploads_still_pending_uses_the_standard_error_format
     assert status == 1
     assert captured.out == "pending: 2\ndelivered: 1\n"
     assert captured.err == (
-        "phasesweep: MLflow uploads remain pending.\n"
+        "phasesweep: MLflow delivery remains pending.\n"
         "fix: Wait briefly, then retry the same operation once the reported blocker is resolved.\n"
     )
 

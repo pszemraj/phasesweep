@@ -1248,7 +1248,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
 @cli.command(
     "sync-tracking",
     context_settings=CONTEXT_SETTINGS,
-    help="Retry pending MLflow uploads without training or metric selection.",
+    help="Reconcile MLflow run creations and retry uploads without training or selecting winners.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 @CONFIG_OVERRIDES
@@ -1256,16 +1256,16 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     "--generation",
     "generation_id",
     default=None,
-    help="Retry only this generation's uploads instead of every pending one.",
+    help="Limit reconciliation and uploads to this generation.",
 )
 def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[str, ...]) -> None:
-    """Retry retained native MLflow result projections.
+    """Reconcile pending native MLflow runs and retry result delivery.
 
     :param Path config_path: Matching experiment configuration.
     :param str | None generation_id: Generation to synchronize, or ``None`` for all.
     :param tuple[str, ...] settings: The same config overrides used by the run.
     :raises ClickException: The generation name or a delivery record is malformed.
-    :raises PhaseSweepError: Nothing matching can be synchronized, or uploads remain pending.
+    :raises PhaseSweepError: Nothing matching can be synchronized, or records remain pending.
     """
     from phasesweep.tracking.publication import sync_tracking as sync
 
@@ -1277,7 +1277,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         raise click.ClickException(str(exc)) from exc
     click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
     if counts["pending"]:
-        raise PhaseSweepError("MLflow uploads remain pending.", action=OperatorAction.RETRY)
+        raise PhaseSweepError("MLflow delivery remains pending.", action=OperatorAction.RETRY)
 
 
 @cli.group(

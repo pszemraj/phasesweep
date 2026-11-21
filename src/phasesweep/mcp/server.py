@@ -500,12 +500,12 @@ class PhaseStatusPayload(_ToolPayload):
 
 
 class TrackingDeliveryPayload(_ToolPayload):
-    """Mutable path-free upload counts, separate from accepted scientific facts."""
+    """Mutable path-free tracking counts, separate from accepted scientific facts."""
 
     pending: int
     delivered: int
     remedy: str | None = Field(
-        description="The operator's retry step once the run has ended with uploads pending; otherwise null."
+        description="The operator's retry step once the run has ended with records pending, otherwise null."
     )
 
 
@@ -570,9 +570,9 @@ class GetRunStatusResult(_ToolPayload):
     tracking_delivery: TrackingDeliveryPayload | None = Field(
         default=None,
         description=(
-            "This run's live MLflow upload counts, including after termination; pending uploads "
-            "never change scores or winners. Null when the run's launch config has no mlflow "
-            "block or can no longer be read."
+            "This run's live MLflow counts, including after termination. Pending counts include "
+            "run creations and uploads. Scores and winners are independent of delivery. "
+            "Null when the launch config has no mlflow block or is unreadable."
         ),
     )
     elapsed_seconds: int | None = Field(

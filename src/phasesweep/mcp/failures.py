@@ -270,20 +270,18 @@ def _diagnose(
     if persisted is not None and observation.cleanup_recovery_required:
         return _Diagnosis(persisted, persisted, persisted["code"] == "cleanup_uncertain")
     if observation.cleanup_recovery_required and terminal.get("returncode") == 0:
-        # A succeeded run records no failure, but its MLflow upload worker's cleanup can be
-        # unconfirmed, and that leaves the agent a recovery with no step to relay. The step is
-        # unscoped: the worker may have been sending an earlier generation's recovered outcome,
-        # whose record a sync scoped to this run's generation leaves pending.
-        upload_cleanup = operator_failure(
+        # A succeeded run with uncertain tracking-worker cleanup still needs a remedy. Use
+        # an unscoped sync, since the worker may have handled an earlier generation's records.
+        tracking_cleanup = operator_failure(
             "cleanup_uncertain",
             "cleanup",
             "The run succeeded and its published results are unaffected, but cleanup of "
-            "its MLflow upload worker is unconfirmed. Stop monitoring and ask the operator "
+            "its MLflow tracking worker is unconfirmed. Stop monitoring and ask the operator "
             "to retry delivery and that cleanup with `phasesweep sync-tracking CONFIG`, using "
             f"the config this run launched with, then {recover_run_step(handle.run_id)}, before "
             "another launch.",
         )
-        return _Diagnosis(upload_cleanup, persisted, True)
+        return _Diagnosis(tracking_cleanup, persisted, True)
     recorded = persisted
     if persisted is not None and persisted["code"] == "cleanup_uncertain":
         # The recorded step was recover-run, and cleanup recovery is no longer required.

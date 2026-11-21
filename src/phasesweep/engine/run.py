@@ -366,8 +366,8 @@ def _run_experiment_outcome(
                     save_recovered_attempts,
                 )
 
-                # The experiment lock rules out a live invocation and this run has bound no
-                # summary run yet, so each generation left open was killed outright.
+                # The lock rules out a live invocation and this run has requested no summary,
+                # so every open summary binding or creation belongs to an earlier invocation.
                 cleanup.settled_generations.update(generations_left_open(experiment))
                 # Recovery sends nothing; what it settled waits as pending records until the
                 # run has reached the tracker.
@@ -576,7 +576,7 @@ def _mirror_publication(
     The mirror sends the published generation's records, then the outcomes this run's
     recovery committed for earlier attempts. Once the last-success pointer has committed,
     nothing may fail the run. An ordinary failure only leaves the mirror for ``phasesweep
-    sync-tracking``, which rebuilds any record this left unsaved. An upload worker whose
+    sync-tracking``, which rebuilds any record this left unsaved. A tracking worker whose
     cleanup is uncertain is recorded as cleanup evidence, and a shutdown still ends the run,
     marked as arriving after the published result.
 
@@ -598,9 +598,9 @@ def _mirror_publication(
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
-            "An MLflow upload worker of generation %s's run may still be running; the "
+            "An MLflow tracking worker of generation %s's run may still be running; the "
             "published result is unaffected. Run `phasesweep sync-tracking` with the same "
-            "config to retry its cleanup and the uploads.",
+            "config to retry its cleanup and delivery.",
             generation_id,
         )
     except PhaseSweepShutdown as exc:

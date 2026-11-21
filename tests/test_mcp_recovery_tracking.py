@@ -318,8 +318,8 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
     assert (
-        "Delivered 0 MLflow outcome(s) of the recovered trials and generations; 2 stay pending."
-        in confirmed.output
+        "Delivered 0 MLflow outcome(s) of the recovered trials and generations; "
+        "2 MLflow record(s) stay pending." in confirmed.output
     )
     assert _PENDING_STEP in confirmed.output
     assert not run.store.observe(run.handle).recovery_required

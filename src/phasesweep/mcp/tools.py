@@ -882,13 +882,13 @@ class PhaseSweepMCP:
     def _tracking_delivery(
         self, handle: RunHandle, experiment: Experiment | None
     ) -> dict[str, int] | None:
-        """Count this run's own MLflow result uploads from its launch config.
+        """Count this run's own MLflow creation and delivery records from its launch config.
 
         Delivery records are mutable, so only status reads them; frozen result
         reads never depend on them. A terminal read loads the run's config
         snapshot just for this and reports no counts when it is unavailable.
 
-        :param RunHandle handle: Run whose generation owns the uploads.
+        :param RunHandle handle: Run whose generation owns the records.
         :param Experiment | None experiment: Launch config, when already loaded.
         :return dict[str, int] | None: Pending and delivered counts, or ``None``
             when the run does not use MLflow or its config is unavailable.
