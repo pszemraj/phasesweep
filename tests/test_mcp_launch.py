@@ -511,13 +511,15 @@ def test_launch_names_unreadable_run_records_and_passes_once_they_are_moved_away
         message
     )
     assert f"Unreadable or orphaned: {listed}." in message
-    # A trial carries the run id in its arguments only when its command uses {trial_dir}.
+    # A trial carries the run id in its arguments only when its command uses {trial_dir}, and
+    # the listing by environment prints PIDs alone, never the environment it matched.
     assert (
         "For each run id, ask the operator to run, on the server host, `pgrep -af <run-id>`, "
-        "which lists the run's runner, and `ps axeww | grep '[P]HASESWEEP_GENERATION_ID=<run-id>'`, "
-        "which lists its trials by their environment, wait for every listed process to exit, or "
-        "stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory "
-        "only once both list nothing"
+        "which lists the run's runner, and "
+        "`ps axeww | awk '/[P]HASESWEEP_GENERATION_ID=<run-id>/ {print $1}'`, which prints the "
+        "PID of each of its trials, found by environment, wait for every listed process to "
+        "exit, or stop it, and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state "
+        "directory only once both print nothing"
     ) in message
     assert ("a listed `runs/` file moves out as it is" in message) is (run_id is None)
     assert "inspect and repair" not in message
