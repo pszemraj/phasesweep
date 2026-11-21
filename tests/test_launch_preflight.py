@@ -156,6 +156,20 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param(f"{_MISSING} --x 1\ntrue", id="newline-between-commands"),
         pytest.param(f"{_MISSING} --x 1 && true || true", id="and-then-or"),
         pytest.param(f"{_MISSING} --x $(true)", id="command-substitution"),
+        pytest.param(
+            f'{_MISSING} "$(echo "\'")" || echo "$(echo "\'")"',
+            id="fallback-after-nested-quotes-in-command-substitution",
+        ),
+        pytest.param(
+            f'{_MISSING} "`echo "\'"`" || echo "`echo "\'"`"',
+            id="fallback-after-nested-quotes-in-backticks",
+        ),
+        pytest.param(
+            f'{_MISSING} "${{v:-"\'"}}" || echo "${{v:-"\'"}}"',
+            id="fallback-after-nested-quotes-in-braced-expansion",
+        ),
+        # Where /bin/sh is bash (macOS), $'a\'b' is one word; shlex ends its quote at the escaped one.
+        pytest.param(f"{_MISSING} $'a\\'b' || true \\'", id="fallback-after-ansi-c-string"),
         pytest.param(f"{_MISSING} --x 1 '||' true", id="quoted-operator-word"),
         pytest.param(f"{_MISSING} \\\n  --x 1 \\\n  || true", id="continued-or-fallback"),
         pytest.param(f"{_MISSING} --x 1 # don't\ntrue # it's", id="comment-quotes-span-lines"),
@@ -178,6 +192,7 @@ def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) 
         pytest.param(f"{_MISSING} --x 1 > out.log 2>&1", id="redirections"),
         pytest.param(f"{_MISSING} --x 'a || b; c | d'", id="operators-inside-quotes"),
         pytest.param(f'{_MISSING} --x ""', id="empty-argument"),
+        pytest.param(f'{_MISSING} --x $LR --y "$LR"', id="plain-parameter-argument"),
         pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
         pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
         pytest.param(f"{_MISSING} \\\n  --x 1", id="indented-continuation"),

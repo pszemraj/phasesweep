@@ -1288,6 +1288,11 @@ _SHELL_OPERATOR_CHARS = "();<>|&\n"
 #: The operators after a program that cannot rescue its failure: ``&&``, and a redirection
 #: (``>``, ``2>&1``), which belongs to the program's own command.
 _NON_RESCUING_OPERATOR = re.compile(r"&&|[<>]+&?")
+#: Openers of the quoting contexts ``shlex`` has no rule for: a command substitution, a braced
+#: expansion and an ANSI-C string. The shell reads quotes nested in a substitution or expansion,
+#: or escaped in an ANSI-C string, differently, so ``shlex`` can pair them otherwise and read a
+#: real ``||`` as quoted text.
+_UNMODELED_QUOTING = ("$(", "`", "${", "$'")
 
 
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
@@ -1338,8 +1343,9 @@ def _trial_program_refusal(
     end continues the command, so the two lines are joined before the words are read; two
     backslashes there may be an escaped backslash before a real line end, which leaves the
     command unjudged. So does a ``#`` anywhere: a comment runs to its line end whatever
-    quotes it holds, which this lexer cannot follow. Anything the check cannot judge is left
-    to the shell, never refused.
+    quotes it holds, which this lexer cannot follow. So does a command substitution, a braced
+    expansion or an ANSI-C string, which this lexer does not model. Anything the check cannot
+    judge is left to the shell, never refused.
 
     :param str command: The trial command template.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1351,7 +1357,7 @@ def _trial_program_refusal(
         is found or cannot be judged.
     """
     text = command.strip()
-    if "#" in text or "\\\\\n" in text:
+    if "#" in text or "\\\\\n" in text or any(opener in text for opener in _UNMODELED_QUOTING):
         return None
     text = text.replace("\\\n", "")
     try:
