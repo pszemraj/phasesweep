@@ -125,6 +125,10 @@ def run_worker(
                 shlex.join(
                     [
                         sys.executable,
+                        # A flag is not inherited as the PYTHON* variables are: the worker
+                        # keeps or drops the user site as the controller does, so it imports
+                        # the installation the controller checked for.
+                        *(["-s"] if sys.flags.no_user_site else []),
                         "-P",
                         str(worker_path),
                         str(request_path),

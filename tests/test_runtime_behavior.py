@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import shlex
 import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import optuna
@@ -90,6 +92,8 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.runtime import process as process_module
+from phasesweep.runtime import remote_worker
 from phasesweep.runtime.process import (
     ProcessResult,
     read_attempt_lifecycle,
@@ -1950,3 +1954,26 @@ def test_required_constraint_failure_preserves_prior_values(
         if failure == "nonfinite"
         else "constraint extractor 'second': stopped"
     )
+
+
+@pytest.mark.parametrize("no_user_site", [0, 1])
+def test_sdk_worker_ignores_the_user_site_exactly_when_its_controller_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_user_site: int
+) -> None:
+    """A worker is launched with ``-s`` only under a controller that ignores the user site."""
+    worker = tmp_path / "worker.py"
+
+    def launch(cmd: str, **_kwargs: object) -> ProcessResult:
+        raise InterruptedError(cmd)
+
+    flags = SimpleNamespace(no_user_site=no_user_site)
+    monkeypatch.setattr(remote_worker, "sys", SimpleNamespace(executable="python", flags=flags))
+    monkeypatch.setattr(process_module, "run_supervised", launch)
+    with pytest.raises(InterruptedError) as launched:
+        run_worker(
+            {}, worker, "sdk", statuses=frozenset(), run_id="a", trial_dir=tmp_path,
+            environment={}, deadline=time.monotonic() + 10,
+        )  # fmt: skip
+    # The flags must precede the script, or the interpreter passes them to the script.
+    expected = ["python", *(["-s"] if no_user_site else []), "-P", str(worker)]
+    assert shlex.split(str(launched.value))[: len(expected)] == expected
