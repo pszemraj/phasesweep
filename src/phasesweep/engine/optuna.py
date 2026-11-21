@@ -36,6 +36,7 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     FINISHED_TRIAL_STATES,
     GENERATION_ID_ATTR,
+    METRIC_EXTRACTOR_LABEL,
     RERUN_OF_ATTR,
     TRIAL_STATE_NAMES,
     RecoveredTrialState,
@@ -158,6 +159,23 @@ def _any_trial_timed_out(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:
     for trial in trials:
         reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
         if isinstance(reason, str) and reason.startswith(TIMEOUT_REASON_PREFIX):
+            return True
+    return False
+
+
+def _any_objective_unreadable(trials: Iterable[optuna.trial.FrozenTrial]) -> bool:
+    """Say whether any trial ran its trainer but failed to yield its objective.
+
+    Only the metric extractor's own failure counts. A non-finite value was read, and a
+    constraint extractor's failure names its constraint rather than the objective.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials of one phase.
+    :return bool: ``True`` when a recorded failure reason says the metric extractor failed.
+    """
+    prefix = f"{METRIC_EXTRACTOR_LABEL}: "
+    for trial in trials:
+        reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
+        if isinstance(reason, str) and reason.startswith(prefix):
             return True
     return False
 

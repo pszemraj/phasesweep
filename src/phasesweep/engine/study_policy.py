@@ -38,6 +38,7 @@ from phasesweep.engine.fingerprints import (
     _render_value,
 )
 from phasesweep.engine.optuna import (
+    _any_objective_unreadable,
     _any_trial_timed_out,
     _finished_trial_count,
     _measured_trial_count,
@@ -71,6 +72,7 @@ from phasesweep.errors import (
     OperatorAction,
     format_mismatch,
     timeout_step,
+    unreadable_objective_step,
 )
 from phasesweep.runtime.json import JsonObject, json_text_map
 
@@ -835,9 +837,13 @@ def _recovery_advice(
             f"study identity. {results_stay} {NEW_STUDY_STEP} "
             f"{fingerprint_kept} For work under unchanged limits: {remedies}"
         )
+    trials = study.get_trials(deepcopy=False)
     timeout_lead = (
-        f"{timeout_step(phase.name, dependents)} "
-        if _any_trial_timed_out(study.get_trials(deepcopy=False))
+        f"{timeout_step(phase.name, dependents)} " if _any_trial_timed_out(trials) else ""
+    )
+    objective_lead = (
+        f"{unreadable_objective_step(persistent=True)} "
+        if _any_objective_unreadable(trials)
         else ""
     )
     remedies = _recovery_remedies(
@@ -849,9 +855,9 @@ def _recovery_advice(
     if remedies is None:
         return None
     return (
-        f"{timeout_lead}{remedies} {results_stay} {fingerprint_kept} "
-        f"If the fix changes trial_command or the trainer's PATH, or the recorded results "
-        f"are invalid, {FRESH_STUDY}."
+        f"{timeout_lead}{objective_lead}{remedies} {results_stay} {fingerprint_kept} "
+        f"If the fix changes metric, trial_command or the trainer's PATH, or the recorded "
+        f"results are invalid, {FRESH_STUDY}."
     )
 
 

@@ -367,9 +367,11 @@ def _extract_json_envelope(
     objective = data.get("objective")
     if not isinstance(objective, dict):
         raise ExtractorError(f"JSON envelope at {target} has no objective object.")
-    if objective.get("name") != cfg.objective_name:
+    reported_name = objective.get("name")
+    if reported_name != cfg.objective_name:
+        found = f"; it reports {reported_name!r}" if isinstance(reported_name, str) else ""
         raise ExtractorError(
-            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}."
+            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}{found}."
         )
     if objective.get("split") != cfg.split:
         raise ExtractorError(f"JSON envelope at {target} does not report split {cfg.split!r}.")

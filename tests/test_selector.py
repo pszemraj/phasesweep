@@ -606,7 +606,7 @@ def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
 
     remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
 
-    assert "(for example `trial_command`, `trainer_config` or `provenance`)" in remedy
+    assert "(for example `metric`, `trial_command`, `trainer_config` or `provenance`)" in remedy
     assert "timeout" not in remedy
 
 

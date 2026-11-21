@@ -247,6 +247,10 @@ OVERRIDES_ATTR = "phasesweep_overrides"
 CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
+# How the metric extractor names itself in a failed trial's reason: ``<label>: <cause>`` when
+# the objective could not be read. The producer and the remedy that recognizes the reason
+# share this one string.
+METRIC_EXTRACTOR_LABEL = "metric extractor"
 # Study-level binding from a persistent study to the one artifact root it
 # publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string.
 # ``workdir`` stays outside semantic fingerprints, so this binding refuses a

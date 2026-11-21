@@ -32,6 +32,7 @@ from phasesweep.engine.state import (
     DURATION_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
+    METRIC_EXTRACTOR_LABEL,
     OBJECTIVE_PROVENANCE_ATTR,
     OBSERVED_PREFIX,
     OVERRIDES_ATTR,
@@ -963,7 +964,7 @@ def extract_trial_result(
 
     metric_value = extract_required(
         experiment.metric.extractor,
-        label="metric extractor",
+        label=METRIC_EXTRACTOR_LABEL,
         log_label="metric",
         provenance=objective_provenance,
     )

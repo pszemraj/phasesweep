@@ -31,6 +31,7 @@ from phasesweep.engine.confound import (
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.optuna import (
+    _any_objective_unreadable,
     _any_trial_timed_out,
     _draw_positions,
     _finished_trial_count,
@@ -69,6 +70,7 @@ from phasesweep.errors import (
     OperatorAction,
     PhaseSweepError,
     timeout_step,
+    unreadable_objective_step,
 )
 from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 from phasesweep.runtime.terminal import display_path
@@ -135,7 +137,10 @@ def _no_feasible_remedy(
     :return str: Operator steps appropriate to failures, bounds, and storage.
     """
     evidence = _inspect_step(experiment, phase_name)
+    unreadable = _any_objective_unreadable(trials)
     if not experiment.persistent:
+        if unreadable:
+            return f"{evidence} {unreadable_objective_step(persistent=False)}"
         return f"{evidence} Fix the trainer failure or adjust the metric bounds or constraints, then rerun; storage: null starts fresh."
     infeasible = any(_trial_count_state(trial) == "INFEASIBLE" for trial in trials)
     if infeasible:
@@ -161,12 +166,14 @@ def _no_feasible_remedy(
     else:
         budget = "the phase's n_trials"
         outcome = ""
+    objective_lead = f"{unreadable_objective_step(persistent=True)} " if unreadable else ""
     fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
     return (
-        f"{evidence} {timeout_lead}{fix}, then raise {budget} in the config and rerun{outcome}. "
+        f"{evidence} {timeout_lead}{objective_lead}{fix}, then raise {budget} in the config "
+        f"and rerun{outcome}. "
         "Run controls such as `n_jobs` can change on retry. "
-        "If the fix changes study identity (for example `trial_command`, `trainer_config` or "
-        f"`provenance`), {FRESH_STUDY}."
+        "If the fix changes study identity (for example `metric`, `trial_command`, "
+        f"`trainer_config` or `provenance`), {FRESH_STUDY}."
     )
 
 

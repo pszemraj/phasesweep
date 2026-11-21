@@ -142,6 +142,32 @@ def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
     )
 
 
+def unreadable_objective_step(*, persistent: bool) -> str:
+    """Say what to fix when a trainer ran but its objective could not be read.
+
+    The cause is the trainer's output or the config's ``metric`` settings. The settings are
+    part of a persistent study's identity, so correcting them is refused over the recorded
+    trials and starts a fresh study instead; the trainer's output retries in place.
+
+    :param bool persistent: Whether the study is recorded, which decides whether a corrected
+        ``metric`` can continue it.
+    :return str: One sentence that leads the retry step.
+    """
+    settings = (
+        "the config's `metric` settings (for example the extractor's path, key or objective name)"
+    )
+    if not persistent:
+        return (
+            "A trial's trainer ran, but its objective could not be read; fix the trainer's "
+            f"output or {settings}, then rerun; storage: null starts fresh."
+        )
+    return (
+        "A trial's trainer ran, but its objective could not be read; if the trainer wrote the "
+        "wrong output, fix the trainer and retry as the step below says; if "
+        f"{settings} are wrong, correcting them changes the study's identity, so {FRESH_STUDY}."
+    )
+
+
 #: The way out of an artifact root or ledger another PhaseSweep version wrote, on every
 #: command and under every `storage`. A ledger the config names holds every experiment's
 #: studies: a new `experiment` name leaves the unsupported study in it, and a new ledger alone
