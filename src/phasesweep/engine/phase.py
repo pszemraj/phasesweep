@@ -913,21 +913,31 @@ def _refuse_launch_during_shutdown() -> None:
         raise TrialExecutionError(launch_refusal_text(signum))
 
 
-def _outcome_recording_error(
-    run: _PhaseExecution, trial: optuna.Trial, detail: str
+def _trial_recording_error(
+    run: _PhaseExecution, trial: optuna.Trial, record: str, detail: str
 ) -> StudyStorageUnavailableError:
-    """Explain why a trial must remain RUNNING for stale-attempt recovery.
+    """Report an unconfirmed trial write and what the operator can recover.
 
     :param _PhaseExecution run: Phase execution whose study owns the trial.
-    :param optuna.Trial trial: Trial whose terminal outcome could not be confirmed.
+    :param optuna.Trial trial: Trial whose evidence or outcome could not be confirmed.
+    :param str record: Name of the trial record being written.
     :param str detail: Cause of the write or readback failure.
     :return StudyStorageUnavailableError: The operator refusal carried out of optimization.
     """
+    message = (
+        f"Could not confirm {record} for trial {trial.number} "
+        f"in study {run.study.study_name!r} {detail}."
+    )
+    if not run.experiment.persistent:
+        return StudyStorageUnavailableError(
+            f"{message} storage: null keeps no study to resume. The trial result was lost.",
+            action=OperatorAction.RETRY,
+            remediation="Resolve the reported error and run the sweep again from the start.",
+        )
     return StudyStorageUnavailableError(
-        f"Could not confirm the terminal outcome for trial {trial.number} "
-        f"in study {run.study.study_name!r} {detail}. Trial {trial.number} "
+        f"{message} Trial {trial.number} "
         "was deliberately left RUNNING, with its durable attempt record intact. "
-        "Once the ledger is accessible, the next run recovers the attempt before allocating "
+        "Once the ledger is writable, the next run recovers the attempt before allocating "
         "new work."
     )
 
@@ -997,9 +1007,10 @@ def _record_outcome(
                         continue
                     detail = "readback found a different outcome"
                 if stored != payload:
-                    run.unconfirmed_outcome = _outcome_recording_error(
+                    run.unconfirmed_outcome = _trial_recording_error(
                         run,
                         trial,
+                        "the terminal outcome",
                         f"after its write failed ({type(exc).__name__}: {exc}) and {detail}",
                     )
                     unconfirmed = _TrialLeftRunning(run.unconfirmed_outcome)
@@ -1015,9 +1026,10 @@ def _record_outcome(
             break
     if write_error is not None:
         unrecorded = _TrialLeftRunning(
-            _outcome_recording_error(
+            _trial_recording_error(
                 run,
                 trial,
+                "the terminal outcome",
                 f"after {_OUTCOME_WRITE_ATTEMPTS} write attempts "
                 f"({type(write_error).__name__}: {write_error})",
             )
@@ -1041,12 +1053,13 @@ def _persist_trial_evidence(run: _PhaseExecution, trial: optuna.Trial) -> Iterat
     try:
         yield
     except Exception as exc:
-        error = _TrialLeftRunning(
-            StudyStorageUnavailableError(
-                f"Could not record trial evidence for trial {trial.number} "
-                f"in study {run.study.study_name!r}. The trial remains RUNNING."
-            )
+        refusal = _trial_recording_error(
+            run,
+            trial,
+            "trial evidence",
+            f"after a ledger operation failed ({type(exc).__name__}: {exc})",
         )
+        error = _TrialLeftRunning(refusal)
         run.record_fatal(error)
         raise error from exc
 
@@ -1628,9 +1641,9 @@ def _run_phase(
         extraction.
     :raises ActiveAttemptPersistenceError: A trial's required recovery metadata could not be
         persisted, so it was never launched.
-    :raises StudyStorageUnavailableError: A trial's terminal outcome could not be persisted.
-        That trial is left ``RUNNING`` with its attempt record intact and recovers on the next
-        run once storage is writable.
+    :raises StudyStorageUnavailableError: A trial's evidence or outcome could not be persisted.
+        A persistent trial is left ``RUNNING`` with its attempt record intact and recovers on
+        the next run once storage is writable.
     :raises StudySchemaMismatchError: Persisted phase recovery state contradicts the study's
         finished trial count.
     :raises TimeoutError: The phase or run deadline expires before the requested trial budget
