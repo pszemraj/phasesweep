@@ -707,9 +707,9 @@ class Summary(ReportBlock):
         if self.written:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))
-        following = wrap(f"Next: {self.next_command}", width, subsequent_indent=" " * 6)
-        following[0] = paint("Next:", "label", color=color) + following[0].removeprefix("Next:")
-        return [*lines, "", *following]
+        # A command is pasted, so it stays on one line whatever the width, as the log path does.
+        following = f"{paint('Next:', 'label', color=color)} {self.next_command}"
+        return [*lines, "", following]
 
     def _headline_lines(self, width: int, *, color: bool) -> list[str]:
         """Wrap the headline, styling its opening words.
