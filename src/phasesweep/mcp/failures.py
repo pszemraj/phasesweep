@@ -198,8 +198,8 @@ def run_failure_payload(
 ) -> JsonObject | None:
     """Return a validated safe terminal failure, never the raw exception text.
 
-    Cancellation composes its own remedy when this diagnosis has none, so it reads this
-    rather than :func:`response_failure`.
+    The cancel refusal for a runner this server cannot observe composes its own remedy when
+    this diagnosis has none, so it reads this rather than :func:`response_failure`.
 
     :param RunStore runs: Store holding the run's durable state.
     :param RunHandle handle: Run handle whose recorded terminal status
