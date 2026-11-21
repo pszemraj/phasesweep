@@ -251,7 +251,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             try:
                 waker()
             except Exception:
-                log.exception("Failed to wake a waiting thread after signal %d", signum)
+                log.exception("Failed to wake a waiting thread after %s", _signal_name(signum))
 
         with _launch_lock, _lock:
             registered = dict(_active_children)
@@ -270,7 +270,9 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
                 guardians=guardians,
             )
         except Exception:
-            log.exception("Failed while cleaning child process groups after signal %d", signum)
+            log.exception(
+                "Failed while cleaning child process groups after %s", _signal_name(signum)
+            )
 
         cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
         report = ShutdownCleanupReport(
@@ -281,15 +283,16 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
         if cleanup_confirmed:
             # The expected outcome of a shutdown, so the console says nothing more about it.
             log.info(
-                "Received signal %d; confirmed cleanup for %d child group(s)",
-                signum,
-                len(pgids),
+                "Received %s; confirmed cleanup for %s",
+                _signal_name(signum),
+                plural(len(pgids), "child group"),
             )
         else:
             uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
             log.error(
-                "Received signal %d; cleanup is uncertain for child group(s): %s",
-                signum,
+                "Received %s; cleanup is uncertain for %s: %s",
+                _signal_name(signum),
+                plural(len(uncertain), "child group"),
                 uncertain,
             )
 

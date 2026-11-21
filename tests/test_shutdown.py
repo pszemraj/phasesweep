@@ -1013,7 +1013,7 @@ def test_the_usual_interrupt_lines_stay_on_one_line_of_an_80_column_terminal(
 def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The console shows one plain line; the confirmed cleanup is INFO, which only run.log keeps."""
+    """The console shows one plain line; the confirmed cleanup is INFO, which only run.log keeps, and names the signal as the console does."""
     with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
         _shutdown_handler(signal.SIGINT, None)
     assert [(r.name, r.levelno, r.getMessage()) for r in caplog.records] == [
@@ -1021,8 +1021,28 @@ def test_a_shutdown_prints_one_report_line_and_logs_the_confirmed_cleanup_quietl
         (
             "phasesweep.runtime.process",
             logging.INFO,
-            "Received signal 2; confirmed cleanup for 0 child group(s)",
+            "Received SIGINT; confirmed cleanup for 0 child groups",
         ),
+    ]
+
+
+def test_unconfirmed_cleanup_is_logged_with_the_signals_name_and_the_groups_left(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The error ``run.log`` keeps for an unconfirmed cleanup names the signal and counts and lists the groups it left."""
+    monkeypatch.setattr(runtime_shutdown, "_active_children", {})
+    monkeypatch.setattr(
+        runtime_shutdown,
+        "_terminate_process_groups",
+        lambda pgids, **_: dict.fromkeys(pgids, False),
+    )
+    runtime_shutdown._register(SimpleNamespace(pid=4321), label="trial", pgid=1234)
+
+    with caplog.at_level(logging.INFO, logger="phasesweep"), pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGHUP, None)
+
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == [
+        "Received SIGHUP; cleanup is uncertain for 1 child group: [1234]"
     ]
 
 
