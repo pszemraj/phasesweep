@@ -13,7 +13,6 @@ from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import NoReturn
 
 import optuna
 import pytest
@@ -63,6 +62,7 @@ from phasesweep.engine.trial import _environment_identity
 from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
@@ -1047,6 +1047,9 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
             "could not reload its durable outcome before settlement",
             id="outcome-read",
         ),
+        pytest.param(
+            "policy-read", "durable interrupted outcome could not be recorded", id="policy-read"
+        ),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
         pytest.param(
             "ledger-read", "cleanup recovery ledger could not be updated", id="ledger-read"
@@ -1100,15 +1103,20 @@ def test_reaper_reports_storage_failures_after_cleanup(
             return original_get_trials(deepcopy=deepcopy, states=states)
 
         monkeypatch.setattr(study, "get_trials", read_trials)
-    elif failure_site == "ledger-read":
+    elif failure_site in {"policy-read", "ledger-read"}:
+        original_get_attrs = study._storage.get_study_user_attrs
+        reads = 0
+        failed_read = 1 if failure_site == "policy-read" else 2
 
-        def read_ledger(_study: optuna.Study) -> NoReturn:
-            """Refuse the study-level cleanup ledger read."""
-            raise OSError("storage read failed")
+        def read_study_attrs(study_id: int) -> JsonObject:
+            """Fail while loading the phase policy or the subsequent cleanup ledger."""
+            nonlocal reads
+            reads += 1
+            if reads == failed_read:
+                raise OSError("storage read failed")
+            return original_get_attrs(study_id)
 
-        monkeypatch.setattr(
-            "phasesweep.engine.attempts._cleanup_recovered_trial_numbers", read_ledger
-        )
+        monkeypatch.setattr(study._storage, "get_study_user_attrs", read_study_attrs)
     elif failure_site == "outcome":
         patch_rejected_trial_user_attr(
             monkeypatch,
