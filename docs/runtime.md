@@ -116,9 +116,10 @@ log: /home/you/project/runs/phasesweep_starter/run.log
 
 The path under each phase's `winner` line is the directory of the winning trial, which holds its trainer config, logs and outputs: one line per trial of a winning repeat group, dim on a terminal and broken at slashes to fit it, and absent for a phase the run skipped. A run that launches nothing and republishes nothing closes with one sentence instead of the summary: `Finished in 0.1s: nothing to run, 4 trials already finished, and generation <id> already publishes these winners.` A run that resumes a study counts the trials an earlier run recorded in its headline, such as `2 phases, 6 trials, 4 from a previous run`.
 
-`run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Each report line is one record on the `phasesweep.report` logger, in the order things happen:
+`run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Successive runs append to the file, so each opens with a line from the engine naming its experiment and process ID, plus its start phase under `--from-phase`; the line never reaches the console and carries neither the command line nor any `--set` value. Each report line is one record on the `phasesweep.report` logger, in the order things happen:
 
 ```text
+2026-01-01 12:00:01 I phasesweep.engine.run Run started: experiment phasesweep_starter, pid 48213
 2026-01-01 12:00:02 I phasesweep.report lr  4 trials to run, 1 of them a rerun, 1 at a time, 2 already finished
 2026-01-01 12:00:02 I phasesweep.report lr  trial 3  RERUN of trial 2  reason: orchestrator interrupted by signal 2
 2026-01-01 12:00:03 I phasesweep.report lr  trial 3  COMPLETE  eval_loss 0.3  0.4s  3/6  lr=0.0003  rerun of 2

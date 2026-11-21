@@ -36,6 +36,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     trial_outcome,
+    write_constant_trainer,
     write_experiment_config,
     write_trainer,
 )
@@ -510,3 +511,52 @@ def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs
     assert len(abort_lines) == 1
     assert trial_index < abort_lines[0]
     assert abort["cause"] in lines[abort_lines[0]]
+
+
+def test_each_run_marks_its_start_in_run_log_and_never_on_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Runs append to one ``run.log``; each opens with its experiment, process ID and start phase."""
+    monkeypatch.setenv("COLUMNS", "500")
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="grid"),
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2])},
+    )
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+    run_log = _experiment_dir(experiment) / "run.log"
+
+    override = ["--set", "provenance.note=SECRET-TOKEN"]
+    assert invoke_cli_boundary(["run", str(config), *override], monkeypatch) == 0
+    first_console = capsys.readouterr().err
+    resumed = ["run", str(config), "--from-phase", "p", *override]
+    assert invoke_cli_boundary(resumed, monkeypatch) == 0
+    second_console = capsys.readouterr().err
+
+    lines = run_log.read_text(encoding="utf-8").splitlines()
+    starts = [index for index, line in enumerate(lines) if "Run started" in line]
+    assert len(starts) == 2
+    first, second = (lines[index] for index in starts)
+    assert re.search(r" I phasesweep\.engine\.run Run started: experiment t, pid \d+$", first)
+    assert re.search(
+        r" I phasesweep\.engine\.run Run started: experiment t, pid \d+, from phase p$", second
+    )
+    assert any(" p  trial 0  COMPLETE  " in line for line in lines[starts[0] : starts[1]])
+    assert "SECRET-TOKEN" not in run_log.read_text(encoding="utf-8")
+    assert "Run started" not in first_console + second_console
+
+
+def test_a_dry_run_opens_no_run_log_and_prints_no_start_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dry run writes nothing, so it has no ``run.log`` to mark and its console lines are unchanged."""
+    experiment = make_experiment(persistent=tmp_path, trainer=write_constant_trainer(tmp_path))
+    config = write_experiment_config(tmp_path / "experiment.yaml", experiment)
+
+    assert invoke_cli_boundary(["run", str(config), "--dry-run"], monkeypatch) == 0
+
+    assert not (_experiment_dir(experiment) / "run.log").exists()
+    assert "Run started" not in capsys.readouterr().err

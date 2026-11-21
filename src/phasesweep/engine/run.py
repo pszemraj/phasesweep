@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -359,6 +360,15 @@ def _run_experiment_outcome(
             )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
+        # ``run.log`` is appended to by every run, so this line marks where this one begins.
+        # It carries no command line or ``--set`` value, which can hold a tracking URI with
+        # credentials, and the console prints only the report logger's INFO records.
+        log.info(
+            "Run started: experiment %s, pid %d%s",
+            experiment.experiment,
+            os.getpid(),
+            "" if from_phase is None else f", from phase {from_phase}",
+        )
         generation = generation_ops.InvocationGeneration(
             experiment,
             generation_id=generation_ops._new_generation_id(experiment, requested_generation_id),
