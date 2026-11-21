@@ -489,9 +489,13 @@ def _capture_wandb(
             )
         except (WandbPollTimeout, WandbRunMissingError) as exc:
             unanswered = isinstance(exc, WandbPollTimeout) and not exc.reached
+            # The worker stops polling a reserve before its deadline so that its report arrives
+            # in time, so the clock is usually still short of that deadline here. A poll that
+            # ended before the evidence was complete while the execution deadline was the
+            # binding limit was cut short by it, whether or not the clock has passed it.
             error: type[ExtractorError] = (
                 DeadlineExceededError
-                if capped and time.monotonic() >= poll_deadline
+                if capped
                 else EvidenceUnreadableError
                 if unanswered
                 else ExtractorError

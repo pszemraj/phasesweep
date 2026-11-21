@@ -661,9 +661,18 @@ _WORKER_POLL_BUDGET_SECONDS = 6
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("answer", ["connection", "running"])
-def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tmp_path, answer):
-    """A timeout after transport failures is unreadable; one after seeing the run unfinished fails it."""
+@pytest.mark.parametrize(
+    ("answer", "limit"),
+    [("connection", "source"), ("running", "source"), ("running", "phase")],
+)
+def test_wandb_worker_timeout_says_whether_the_run_answered(
+    wandb_worker_sdk, tmp_path, answer, limit
+):
+    """The source's timeout after transport failures is unreadable and after an unfinished run fails it.
+
+    A phase deadline nearer than the source's timeout ends either poll as the phase interruption,
+    although the worker stops a reserve before it and answers with the clock still short of it.
+    """
     from phasesweep.evidence.wandb import WandbPollTimeout
 
     wandb_worker_sdk(f"""
@@ -674,17 +683,22 @@ def test_wandb_worker_timeout_says_whether_the_run_answered(wandb_worker_sdk, tm
                     raise ConnectionError("tracker unreachable")
                 return type("Run", (), {{"state": "running", "summary_metrics": {{}}}})()
     """)
+    phase = limit == "phase"
     source = WandbExtractor(
         type="wandb",
         entity="e",
         project="p",
         metric_key="loss",
         poll_seconds=0.01,
-        timeout_seconds=_WORKER_POLL_BUDGET_SECONDS,
+        timeout_seconds=10 * _WORKER_POLL_BUDGET_SECONDS if phase else _WORKER_POLL_BUDGET_SECONDS,
     )
+    deadline = time.monotonic() + _WORKER_POLL_BUDGET_SECONDS if phase else None
     with pytest.raises(ExtractorError) as refused:
-        run_extractor(make_trial_context(tmp_path), source)
-    assert isinstance(refused.value, EvidenceUnreadableError) is (answer == "connection")
+        run_extractor(make_trial_context(tmp_path), source, deadline=deadline)
+    assert isinstance(refused.value, DeadlineExceededError) is phase
+    assert isinstance(refused.value, EvidenceUnreadableError) is (
+        answer == "connection" and not phase
+    )
     timeout = refused.value.__cause__
     assert isinstance(timeout, WandbPollTimeout)
     assert timeout.reached is (answer == "running")
@@ -826,9 +840,17 @@ def test_wandb_consumers_retry_uncached_failures(tmp_path, monkeypatch, failure_
     assert calls == 2
 
 
-def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypatch):
-    """A deadline-limited capture can be retried with a later deadline."""
-    from phasesweep.evidence.wandb import WandbPollTimeout
+@pytest.mark.parametrize("stopped_at", [1.0, 0.25], ids=["at-deadline", "in-reserve"])
+@pytest.mark.parametrize("answer", ["unanswered", "reached", "missing-run"])
+def test_wandb_consumers_retry_capture_cut_short_by_deadline(
+    tmp_path, monkeypatch, answer, stopped_at
+):
+    """A capture the execution deadline cut short is the phase interruption and can be retried.
+
+    The worker stops polling a reserve before the deadline, so the poll ends with the clock
+    still short of it whatever its last answer was.
+    """
+    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError
 
     gate = WandbSummaryRequiredGate(
         type="wandb_summary_required", entity="entity", project="project", keys=["done"]
@@ -841,8 +863,12 @@ def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypat
         nonlocal calls
         calls += 1
         if calls == 1:
-            clock.now = 1.0
-            raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds, reached=False)
+            clock.now = stopped_at
+            if answer == "missing-run":
+                raise WandbRunMissingError(ctx.attempt_id)
+            raise WandbPollTimeout(
+                ctx.attempt_id, gate.timeout_seconds, reached=answer == "reached"
+            )
         return {"values": {}, "present_keys": ["done"]}
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
@@ -850,8 +876,37 @@ def test_wandb_consumers_retry_capture_cut_short_by_deadline(tmp_path, monkeypat
     first = evaluate_gates(ctx, [gate], deadline=1.0)[0]
     assert not first.passed
     assert first.deadline_exhausted
+    assert not first.evidence_unreadable
     assert evaluate_gates(ctx, [gate], deadline=2.0)[0].passed
     assert calls == 2
+
+
+@pytest.mark.parametrize("stopped_at", [118.0, 120.0], ids=["in-reserve", "at-timeout"])
+@pytest.mark.parametrize("answer", ["unanswered", "reached", "missing-run"])
+def test_wandb_capture_stopped_by_the_source_timeout_is_an_ordinary_failure(
+    tmp_path, monkeypatch, answer, stopped_at
+):
+    """A poll that ends under the source's own timeout, before the execution deadline, is no phase stop."""
+    from phasesweep.evidence.wandb import WandbPollTimeout, WandbRunMissingError
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    ctx = make_trial_context(tmp_path)
+    clock = ManualClock()
+
+    def capture(**kwargs):
+        clock.now = stopped_at
+        if answer == "missing-run":
+            raise WandbRunMissingError(ctx.attempt_id)
+        raise WandbPollTimeout(ctx.attempt_id, gate.timeout_seconds, reached=answer == "reached")
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.time.monotonic", clock.monotonic)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    (result,) = evaluate_gates(ctx, [gate], deadline=gate.timeout_seconds + 1.0)
+    assert not result.passed
+    assert not result.deadline_exhausted
+    assert result.evidence_unreadable is (answer == "unanswered")
 
 
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
