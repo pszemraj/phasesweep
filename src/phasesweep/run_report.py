@@ -18,6 +18,8 @@ from phasesweep.config.search import phase_draws
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.runtime.terminal import (
+    GAP,
+    INDENT,
     REPORT_LOGGER,
     ReportBlock,
     Style,
@@ -31,9 +33,6 @@ from phasesweep.runtime.terminal import (
 )
 
 report = logging.getLogger(REPORT_LOGGER)
-
-#: Separator of the facts on one line, and of the columns that follow a phase name.
-_GAP = "  "
 
 #: How the console styles a trial state that needs attention; other states print plain.
 _STATE_STYLES: dict[str, Style] = {"FAIL": "error", "INFEASIBLE": "error", "INTERRUPTED": "warning"}
@@ -64,12 +63,12 @@ def _lay_out(
     :param int width: Columns available to each line.
     :return list[str]: The lines, the label column blank after the first.
     """
-    lead = f"{label:<{label_width}}{_GAP}"
+    lead = f"{label:<{label_width}}{GAP}"
     pad = " " * len(lead)
-    if len(lead + _GAP.join([*head, *tail])) <= width:
-        return [(lead + _GAP.join([*head, *tail])).rstrip()]
-    if len(lead + _GAP.join(head)) <= width:
-        return [lead + _GAP.join(head), *pack(tail, width, indent=pad)]
+    if len(lead + GAP.join([*head, *tail])) <= width:
+        return [(lead + GAP.join([*head, *tail])).rstrip()]
+    if len(lead + GAP.join(head)) <= width:
+        return [lead + GAP.join(head), *pack(tail, width, indent=pad)]
     lines = [*pack(head, width, indent=pad), *pack(tail, width, indent=pad)]
     lines[0] = lead + lines[0].removeprefix(pad)
     return lines
@@ -84,7 +83,7 @@ def _lay_out_clauses(label: str, label_width: int, clauses: Sequence[str], width
     :param int width: Columns available to each line.
     :return list[str]: The lines, the label column blank after the first.
     """
-    lead = f"{label:<{label_width}}{_GAP}"
+    lead = f"{label:<{label_width}}{GAP}"
     pad = " " * len(lead)
     lines = pack(clauses, width, indent=pad, separator=", ")
     lines[0] = lead + lines[0].removeprefix(pad)
@@ -115,7 +114,7 @@ def _reason_lines(reason: str, label_width: int, width: int) -> list[str]:
     :param int width: Columns available to each line.
     :return list[str]: The wrapped lines, each indented past the label column.
     """
-    pad = " " * (label_width + len(_GAP))
+    pad = " " * (label_width + len(GAP))
     return wrap(f"reason: {reason}", width, indent=pad, subsequent_indent=pad)
 
 
@@ -166,7 +165,7 @@ class PhaseStart(ReportBlock):
 
         :return str: The one-line text.
         """
-        return f"{self.phase}{_GAP}{', '.join(self._clauses())}"
+        return f"{self.phase}{GAP}{', '.join(self._clauses())}"
 
 
 @dataclass(frozen=True)
@@ -205,7 +204,7 @@ class TrialLine(ReportBlock):
         style = _STATE_STYLES.get(self.state)
         if style is not None:
             lines[0] = _paint_word(
-                lines[0], self.state, style, start=self.label_width + len(_GAP), color=color
+                lines[0], self.state, style, start=self.label_width + len(GAP), color=color
             )
         if self.reason:
             lines.extend(_reason_lines(self.reason, self.label_width, width))
@@ -219,7 +218,7 @@ class TrialLine(ReportBlock):
         facts = [self.phase, *self._head(), *self.params, *self.notes]
         if self.reason:
             facts.append(f"reason: {self.reason}")
-        return _GAP.join(facts)
+        return GAP.join(facts)
 
 
 @dataclass(frozen=True)
@@ -258,7 +257,7 @@ class RerunLine(ReportBlock):
         facts = [self.phase, f"trial {self.number}", f"RERUN of trial {self.source}"]
         if self.reason:
             facts.append(f"reason: {self.reason}")
-        return _GAP.join(facts)
+        return GAP.join(facts)
 
 
 @dataclass(frozen=True)
@@ -276,7 +275,7 @@ class SkippedLine(ReportBlock):
         :param bool color: Unused; the line carries no styling.
         :return list[str]: The wrapped lines.
         """
-        lead = f"{self.phase:<{self.label_width}}{_GAP}"
+        lead = f"{self.phase:<{self.label_width}}{GAP}"
         return wrap(f"skipped: {self.why}", width, indent=lead, subsequent_indent=" " * len(lead))
 
     def __str__(self) -> str:
@@ -284,7 +283,7 @@ class SkippedLine(ReportBlock):
 
         :return str: The one-line text.
         """
-        return f"{self.phase}{_GAP}skipped: {self.why}"
+        return f"{self.phase}{GAP}skipped: {self.why}"
 
 
 def winner_facts(winner: Winner, metric_name: str) -> tuple[list[str], list[str]]:
@@ -341,7 +340,7 @@ class WinnerLine(ReportBlock):
             width,
         )
         lines[0] = _paint_word(
-            lines[0], "winner", "winner", start=self.label_width + len(_GAP), color=color
+            lines[0], "winner", "winner", start=self.label_width + len(GAP), color=color
         )
         return lines
 
@@ -350,7 +349,7 @@ class WinnerLine(ReportBlock):
 
         :return str: The one-line text.
         """
-        return _GAP.join([self.phase, f"winner: {self.head[0]}", *self.head[1:], *self.tail])
+        return GAP.join([self.phase, f"winner: {self.head[0]}", *self.head[1:], *self.tail])
 
 
 def phase_start(
@@ -457,8 +456,6 @@ def winner_line(experiment: Experiment, phase: Phase, winner: Winner) -> WinnerL
 #: Width of the label column in the banner, after its two-column indent.
 _BANNER_LABEL_WIDTH = 10
 
-_INDENT = "  "
-
 
 @dataclass(frozen=True)
 class BannerRow:
@@ -484,7 +481,7 @@ def _label_column(label: str, *, color: bool) -> str:
     :param bool color: Whether to style the label.
     :return str: The indent, the label padded to the column and its styling.
     """
-    return _INDENT + paint(label, "label", color=color) + " " * (_BANNER_LABEL_WIDTH - len(label))
+    return INDENT + paint(label, "label", color=color) + " " * (_BANNER_LABEL_WIDTH - len(label))
 
 
 def _value_lines(row: BannerRow, room: int, *, color: bool) -> list[str]:
@@ -522,9 +519,9 @@ class Banner(ReportBlock):
         :param bool color: Whether to style the labels and paths.
         :return list[str]: The lines, ending with a blank line that separates the progress.
         """
-        indent = len(_INDENT) + _BANNER_LABEL_WIDTH
+        indent = len(INDENT) + _BANNER_LABEL_WIDTH
         room = max(width - indent, 20)
-        lines = [f"{paint('phasesweep run', 'label', color=color)}{_GAP}{self.experiment}", ""]
+        lines = [f"{paint('phasesweep run', 'label', color=color)}{GAP}{self.experiment}", ""]
         for row in self.head:
             lines.extend(self._row(row, room, color=color))
         label = _label_column("phases", color=color)
@@ -549,7 +546,7 @@ class Banner(ReportBlock):
         :return list[str]: The row's lines.
         """
         values = _value_lines(row, room, color=color)
-        pad = " " * (len(_INDENT) + _BANNER_LABEL_WIDTH)
+        pad = " " * (len(INDENT) + _BANNER_LABEL_WIDTH)
         return [
             (_label_column(row.label, color=color) if index == 0 else pad) + value
             for index, value in enumerate(values)
@@ -563,7 +560,7 @@ class Banner(ReportBlock):
         rows = [f"{row.label} {row.text}" for row in self.head]
         phases = "; ".join(f"{phase.name} {', '.join(phase.facts)}" for phase in self.phases)
         rows += [f"phases {phases}", *(f"{row.label} {row.text}" for row in self.tail)]
-        return f"phasesweep run {self.experiment}{_GAP}{_GAP.join(rows)}"
+        return f"phasesweep run {self.experiment}{GAP}{GAP.join(rows)}"
 
 
 def _gpu_fact(phase: Phase) -> str:
@@ -691,15 +688,15 @@ class Summary(ReportBlock):
         :return list[str]: The lines, starting with a blank line that separates the progress.
         """
         name_width = max((len(phase.name) for phase in self.phases), default=0)
-        pad = _INDENT + " " * (name_width + len(_GAP))
+        pad = INDENT + " " * (name_width + len(GAP))
         lines = ["", *self._headline_lines(width, color=color), ""]
         for phase in self.phases:
             drawn_counts = _lay_out_clauses(
-                phase.name, name_width, phase.counts, width - len(_INDENT)
+                phase.name, name_width, phase.counts, width - len(INDENT)
             )
-            lines.extend(_INDENT + line for line in drawn_counts)
+            lines.extend(INDENT + line for line in drawn_counts)
             if phase.winner:
-                lead = f"{pad}winner{_GAP}"
+                lead = f"{pad}winner{GAP}"
                 drawn = pack(phase.winner, width, indent=" " * len(lead))
                 drawn[0] = lead + drawn[0].removeprefix(" " * len(lead))
                 lines.append(_paint_word(drawn[0], "winner", "winner", start=len(pad), color=color))
@@ -734,7 +731,7 @@ class Summary(ReportBlock):
         if len(head) > width:
             drawn = [
                 "Written under",
-                *break_path(self.written_root, width, indent=_INDENT),
+                *break_path(self.written_root, width, indent=INDENT),
             ]
         else:
             drawn = [head]
@@ -743,7 +740,7 @@ class Summary(ReportBlock):
         )
         return [
             *drawn,
-            *(_INDENT + paint(path, "path", color=color) for path in self.written),
+            *(INDENT + paint(path, "path", color=color) for path in self.written),
         ]
 
     def __str__(self) -> str:
@@ -761,7 +758,7 @@ class Summary(ReportBlock):
             if self.written
             else []
         )
-        return _GAP.join([self.headline, *phases, *written, f"Next: {self.next_command}"])
+        return GAP.join([self.headline, *phases, *written, f"Next: {self.next_command}"])
 
 
 @dataclass(frozen=True)

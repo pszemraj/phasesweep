@@ -23,6 +23,8 @@ from phasesweep.engine.read import (
 from phasesweep.engine.state import OBSERVED_PREFIX
 from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.terminal import (
+    GAP,
+    INDENT,
     display_path,
     paint,
     param_text,
@@ -33,8 +35,6 @@ from phasesweep.runtime.terminal import (
 
 #: The word that marks a winning row, and so the width of the leading marker column.
 _WINNER_WORD = "winner"
-_INDENT = "  "
-_GAP = "  "
 _REASON_LABEL = "reason: "
 _REPEAT_GROUPS_HEADING = "Repeat groups (statistics include infeasible measured members):"
 _REPEAT_GROUPS_NOTE = (
@@ -225,24 +225,24 @@ def _table_lines(
         :param Sequence[str] texts: One text per column.
         :return str: The cells separated by two spaces.
         """
-        return _GAP.join(
+        return GAP.join(
             text.rjust(size) if column.numeric else text.ljust(size)
             for column, text, size in zip(columns, texts, sizes, strict=True)
         )
 
     blank = " " * len(_WINNER_WORD)
-    lines = [f"{_INDENT}{blank}{_GAP}{join([column.header for column in columns])}".rstrip()]
-    reason_indent = " " * (len(_INDENT) + len(_WINNER_WORD) + len(_GAP))
+    lines = [f"{INDENT}{blank}{GAP}{join([column.header for column in columns])}".rstrip()]
+    reason_indent = " " * (len(INDENT) + len(_WINNER_WORD) + len(GAP))
     for index, winner in enumerate(winners):
-        body = f"{_GAP}{join([column.cells[index] for column in columns])}".rstrip()
+        body = f"{GAP}{join([column.cells[index] for column in columns])}".rstrip()
         if winner:
             lines.append(
-                _INDENT
+                INDENT
                 + paint(_WINNER_WORD, "winner", color=color)
                 + paint(body, "label", color=color)
             )
         else:
-            lines.append(f"{_INDENT}{blank}{body}")
+            lines.append(f"{INDENT}{blank}{body}")
         reason = reasons[index] if reasons else None
         if reason:
             lines.extend(
@@ -415,7 +415,7 @@ def _phase_lines(
     lines = wrap(
         f"{table.phase}: {count}, {metric.name} ({direction} is better)",
         width,
-        subsequent_indent=_INDENT,
+        subsequent_indent=INDENT,
     )
     sources = set(tables.winner_generations.values())
     source = tables.winner_generations.get(table.phase)
@@ -424,7 +424,7 @@ def _phase_lines(
         state = "published" if published else "unpublished"
         notes.append(f"winner from generation {generation} ({state})")
     for note in notes:
-        lines.extend(wrap(note, width, indent=_INDENT, subsequent_indent=_INDENT))
+        lines.extend(wrap(note, width, indent=INDENT, subsequent_indent=INDENT))
     if table.rows:
         lines.extend(_trial_lines(table, phase, metric.name, width=width, color=color))
     if table.groups:

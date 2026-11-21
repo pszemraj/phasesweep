@@ -29,6 +29,12 @@ _SGR: dict[Style, str] = {
     "path": "2",
 }
 
+#: Indent of the lines a block draws under its first, and of a table's rows.
+INDENT = "  "
+
+#: Separator of the facts on one line, and of the columns that follow a label.
+GAP = "  "
+
 _DEFAULT_WIDTH = 80
 
 #: Columns kept for text after an indent, so a very narrow terminal wraps instead of failing.
