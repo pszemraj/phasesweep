@@ -83,9 +83,6 @@ RUNNER_STOP_GRACE_SECONDS = guardian_exit_timeout() + 15.0
 log = logging.getLogger("phasesweep.mcp.runs")
 
 
-# 128 + SIGTERM(15); 128 + SIGINT(2). The engine shutdown handler exits
-# 128+signum, so the runner records these as the "cancelled" terminal cause.
-_SIGNALLED_EXIT_CODES = frozenset({143, 130})
 _RUN_EVIDENCE_SUFFIXES = (
     ".config.yaml",
     ".status.json",
@@ -1103,10 +1100,9 @@ class RunStore:
                 state = "running"
             elif status["returncode"] == 0:
                 state = "succeeded"
-            elif (
-                status["returncode"] in _SIGNALLED_EXIT_CODES
-                or status.get("error_class") == "cancelled"
-            ):
+            elif status.get("error_class") == "cancelled":
+                # The runner records every shutdown signal it honours this way, with
+                # returncode 128 plus the signal; nothing else writes "cancelled".
                 state = "cancelled"
             else:
                 state = "failed"

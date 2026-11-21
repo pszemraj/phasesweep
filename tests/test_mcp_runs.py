@@ -1505,6 +1505,28 @@ def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Pat
     assert tree_snapshot(tmp_path / "state") == before
 
 
+@pytest.mark.parametrize(
+    ("returncode", "error_class", "state"),
+    [
+        (130, "cancelled", "cancelled"),
+        (143, "cancelled", "cancelled"),
+        (129, "cancelled", "cancelled"),
+        (143, "RuntimeError", "failed"),
+    ],
+    ids=["sigint", "sigterm", "sighup", "signal-code-without-cancellation"],
+)
+def test_a_run_reads_cancelled_from_the_runners_cancellation_record_alone(
+    tmp_path: Path, returncode: int, error_class: str, state: str
+) -> None:
+    """The runner records each shutdown signal it honours as ``error_class: cancelled``; an exit code alone makes no run cancelled."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-1")
+    store.create(handle)
+    write_run_status(store, "exp-1", returncode=returncode, error_class=error_class)
+
+    assert store.observe(handle).state == state
+
+
 def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     tmp_path: Path,
 ) -> None:
