@@ -82,8 +82,8 @@ def test_program_missing_from_the_path_is_refused_with_the_path_it_searched(
     assert f"program {_MISSING!r} is not on the trainer's PATH (/nowhere:/also/nowhere)" in message
     assert remediation == (
         "Put the program on the PATH used to launch PhaseSweep (activate the environment containing "
-        "the program for CLI runs, or set PATH in the MCP server entry), or name it by absolute path "
-        "in trial_command."
+        "the program for CLI runs, or set PATH where the MCP server is started), set `env.PATH` in "
+        "the config, or name it by absolute path in trial_command."
     )
 
 

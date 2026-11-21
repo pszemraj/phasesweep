@@ -248,7 +248,10 @@ def test_a_trial_that_recorded_no_mapping_gets_the_generic_sentence(
     assert _NOT_RECORDED in str(refusal)
     assert "Compared with" not in str(refusal)
     assert refusal.remediation is not None
-    assert refusal.remediation.startswith("Run in the environment that created this study")
+    assert refusal.remediation.startswith(
+        "Run in the environment that created this study to continue it "
+        "(for an MCP run, start the MCP server in that environment), or set a new `experiment` name"
+    )
     assert "`TZ`" not in refusal.remediation
 
 
@@ -343,10 +346,10 @@ def test_the_remediation_names_the_variables_that_differ(monkeypatch: pytest.Mon
 
     assert refusal.remediation == (
         "Run with the recorded `PATH`, `TZ` and without `PS_COHORT_ADDED` to continue this study "
-        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` "
-        "name to start a fresh study. Pinning a variable under `env` or listing it under "
-        "`execution.passthrough_env` changes the study's identity, so that edit needs the new "
-        "`experiment` name too."
+        "(for an MCP run, do the same in the environment the MCP server is started with), or set "
+        "a new `experiment` name to start a fresh study. Pinning a variable under `env` or listing "
+        "it under `execution.passthrough_env` changes the study's identity, so that edit needs the "
+        "new `experiment` name too."
     )
     assert "passthrough_env" not in str(refusal)
     assert "do not split cohorts" not in str(refusal)
@@ -368,12 +371,14 @@ def test_the_remediation_restores_a_changed_variable_and_unsets_an_added_one_alo
     assert changed.remediation is not None
     assert changed.remediation.startswith(
         "Run with the recorded `TZ` to continue this study "
-        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
+        "(for an MCP run, do the same in the environment the MCP server is started with), "
+        "or set a new `experiment` name"
     )
     assert added.remediation is not None
     assert added.remediation.startswith(
         "Run without `PS_COHORT_ADDED` to continue this study "
-        "(for an MCP run, do the same in the client's server `env`), or set a new `experiment` name"
+        "(for an MCP run, do the same in the environment the MCP server is started with), "
+        "or set a new `experiment` name"
     )
 
 

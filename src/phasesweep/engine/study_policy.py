@@ -1123,12 +1123,12 @@ def _environment_cohort_remediation(restore: Sequence[str], unset: Sequence[str]
             parts.append("without " + ", ".join(f"`{name}`" for name in unset))
         way_back = (
             f"Run {' and '.join(parts)} to continue this study "
-            "(for an MCP run, do the same in the client's server `env`)"
+            "(for an MCP run, do the same in the environment the MCP server is started with)"
         )
     else:
         way_back = (
             "Run in the environment that created this study to continue it "
-            "(for an MCP run, set that environment in the client's server `env`)"
+            "(for an MCP run, start the MCP server in that environment)"
         )
     return (
         f"{way_back}, or set a new `experiment` name to start a fresh study. "
@@ -1337,8 +1337,8 @@ def _trial_program_refusal(
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
         written with a ``/``.
     :param Path cwd: Directory the trainer starts in, which relative paths resolve against.
-    :param bool path_from_config: The config's ``env`` sets ``PATH``, so no shell or client
-        entry changes the one searched.
+    :param bool path_from_config: The config's ``env`` sets ``PATH``, so neither the shell nor
+        the environment the MCP server is started with changes the one searched.
     :return tuple[str, str] | None: Refusal diagnosis and remedy, or ``None`` when the program
         is found or cannot be judged.
     """
@@ -1376,7 +1376,7 @@ def _trial_program_refusal(
         "the PATH the config's `env` sets"
         if path_from_config
         else "the PATH used to launch PhaseSweep (activate the environment containing the program "
-        "for CLI runs, or set PATH in the MCP server entry)"
+        "for CLI runs, or set PATH where the MCP server is started), set `env.PATH` in the config"
     )
     return (
         f"The trial command's program {program!r} is not on the trainer's PATH ({path}).",
