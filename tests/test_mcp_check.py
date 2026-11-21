@@ -360,7 +360,9 @@ def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_pa
     (tmp_path / "trainer").mkdir()
     pinned = mcp_experiment_config_text(tmp_path, name="pinned") + "execution:\n  cwd: ./trainer\n"
     missing = mcp_experiment_config_text(tmp_path, name="missing") + "execution:\n  cwd: ./nope\n"
-    catalog = write_mcp_config_catalog(tmp_path, {"pinned": pinned, "missing": missing})
+    catalog = write_mcp_config_catalog(
+        tmp_path, {"pinned": pinned, "missing": missing}, allow={"launch": True}
+    )
 
     report = check_catalog(catalog)
     result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
@@ -376,6 +378,13 @@ def test_mcp_check_prints_the_trainer_directory_and_refuses_a_missing_one(tmp_pa
     )
     assert "fix: Create that directory, or set execution.cwd to an existing one." in result.output
     assert result.exit_code == 2
+    registry = Registry.load(catalog, collect_errors=True)
+    assert not registry.failures
+    assert registry.get("pinned").allow_launch
+
+    archive = write_mcp_config_catalog(tmp_path, {"retired": missing})
+    assert check_catalog(archive).ok
+    assert not Registry.load(archive).get("retired").allow_launch
 
 
 @pytest.mark.parametrize(
@@ -399,6 +408,7 @@ def test_catalog_reports_a_definite_trainer_directory_refusal(
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"blocked": blocked, "healthy": mcp_experiment_config_text(tmp_path, name="healthy")},
+        allow={"launch": True},
     )
     stat = Path.stat
 
@@ -417,9 +427,7 @@ def test_catalog_reports_a_definite_trainer_directory_refusal(
     assert healthy_entry.ok
     registry = Registry.load(catalog, collect_errors=True)
     assert registry.get("healthy").id == "healthy"
-    assert [failure.experiment_id for failure in registry.failures] == (
-        ["blocked"] if refused else []
-    )
+    assert not registry.failures
 
 
 def test_mcp_check_prints_a_fix_for_every_failing_entry(tmp_path: Path) -> None:

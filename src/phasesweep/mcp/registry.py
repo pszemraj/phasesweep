@@ -349,8 +349,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
-        config cannot be parsed, its storage is not persistent, or ``phasesweep validate``
-        would refuse its trainer directory.
+        config cannot be parsed, or its storage is not persistent.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -387,11 +386,6 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         config = config.model_copy(
             update={"execution": config.execution.model_copy(update={"cwd": str(cwd)})}
         )
-    try:
-        # The check validate runs, so an entry that loads is one validate accepts.
-        _require_launch_target(config)
-    except LaunchEnvironmentError as exc:
-        raise CatalogError(f"{entry.id!r}: {exc}", suggestion=operator_step(exc)) from exc
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     return RegisteredExperiment(
         id=entry.id,
@@ -483,7 +477,7 @@ class CatalogCheckReport:
 
     @property
     def ok(self) -> bool:
-        """Whether the whole catalog would load at server startup.
+        """Whether the catalog and its launch-enabled trainer paths passed the checks.
 
         :return bool: True when every entry passed validation.
         """
@@ -495,6 +489,7 @@ def _load_catalog_entries(
     base: Path,
     *,
     collect_errors: bool,
+    check_trainers: bool = False,
 ) -> tuple[dict[str, RegisteredExperiment], tuple[CatalogCheckEntry, ...]]:
     """Validate catalog entries under the check or startup error policy.
 
@@ -502,6 +497,7 @@ def _load_catalog_entries(
     :param Path base: Catalog directory used to resolve relative paths.
     :param bool collect_errors: Collect one verdict per entry when true; raise
         the first :class:`CatalogError` when false.
+    :param bool check_trainers: Check launch-enabled trainer paths for the operator's preflight.
     :return tuple: Successfully loaded entries keyed by id and any collected
         check verdicts, in catalog order.
     :raises CatalogError: The first entry error when ``collect_errors`` is false.
@@ -522,6 +518,13 @@ def _load_catalog_entries(
             seen.add(entry.id)
             registered = _load_entry(base, entry)
             _claim_catalog_entry_identity(registered, namespace_owners, storage_owners)
+            if check_trainers and registered.allow_launch:
+                try:
+                    _require_launch_target(registered.experiment)
+                except LaunchEnvironmentError as exc:
+                    raise CatalogError(
+                        f"{entry.id!r}: {exc}", suggestion=operator_step(exc)
+                    ) from exc
         except CatalogError as exc:
             if not collect_errors:
                 raise
@@ -575,7 +578,7 @@ def check_catalog(catalog_path: Path) -> CatalogCheckReport:
     """
     require_supported_mcp_host()
     catalog, base, _catalog_sha256 = _parse_catalog(catalog_path)
-    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True)
+    _, verdicts = _load_catalog_entries(catalog, base, collect_errors=True, check_trainers=True)
     report = CatalogCheckReport(entries=verdicts)
     if report.ok:
         _prepare_state_dir(base, catalog.state_dir)

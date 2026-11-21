@@ -34,7 +34,7 @@ Validate the reviewed catalog with its absolute path:
 phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 ```
 
-This exercises server startup validation and provisions/probes its private state layout without launching a sweep. It prints one line per entry, `ok` with the actions it grants or `(read-only)` and its `trainer cwd`, or `FAIL` with the reason and a `fix:` line, and exits 0 only when every entry loads. The server logs the same `trainer cwd` for each entry when it starts.
+This checks the catalog and its private state layout. For launch-enabled entries it also checks trainer paths. A missing trainer can fail this readiness check while the server still serves results and other experiments. Each entry shows `ok` with its permissions and `trainer cwd`, or `FAIL` with the reason and a `fix:` line. The command exits 0 when all checks pass.
 
 ### 3. Configure your client
 
