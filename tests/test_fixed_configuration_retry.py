@@ -166,7 +166,7 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
     # The retry measured the one configuration, so its failed attempts hid nothing from ranking.
     assert published_survivorship(_fixed(tmp_path, trainer, 3)) == {
         "verdict": "ok",
-        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+        "detail": {"ranked": 1, "infeasible": 0, "failed": 0, "untried": 0, "failed_trials": []},
     }
 
 

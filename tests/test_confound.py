@@ -32,7 +32,7 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.read import read_status
-from phasesweep.engine.repeats import ReduceName, ranked_group
+from phasesweep.engine.repeats import ReduceName, RepeatAxis, ranked_group
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -350,16 +350,17 @@ def test_evaluation_point_remedy_keeps_an_existing_relative_axis(kind: str) -> N
     ("ranked", "infeasible", "failed", "verdict"),
     [
         pytest.param(1, 0, 1, "heterogeneous", id="last-standing"),
-        pytest.param(2, 0, 2, "heterogeneous", id="half-failed"),
-        pytest.param(3, 0, 2, "ok", id="majority-ranked"),
+        # One failed configuration among many still went unmeasured; no ratio hides it.
+        pytest.param(9, 0, 1, "heterogeneous", id="one-of-ten"),
         # Constraints define what may win; excluding by them is no bias.
-        pytest.param(2, 5, 1, "ok", id="minority-feasible"),
+        pytest.param(2, 5, 0, "ok", id="minority-feasible"),
         pytest.param(1, 0, 0, "ok", id="single-trial"),
     ],
 )
-def test_survivorship_flags_failures_at_least_matching_the_ranked(
+def test_survivorship_flags_any_configuration_without_a_result(
     ranked: int, infeasible: int, failed: int, verdict: str
 ) -> None:
+    """Each configuration counts once, and a still-running one is left to the completion record."""
     specs = (
         [(_COMPLETE, 0.5 + index, index) for index in range(ranked + infeasible)]
         + [(_FAIL, None, 50 + index) for index in range(failed)]
@@ -373,12 +374,91 @@ def test_survivorship_flags_failures_at_least_matching_the_ranked(
         "detail": {
             "ranked": ranked,
             "infeasible": infeasible,
-            "incomplete_group": 0,
             "failed": failed,
+            "untried": 0,
+            "failed_trials": list(range(ranked + infeasible, ranked + infeasible + failed)),
         },
     }
     assert block["ranked_trials"] == list(range(ranked))
     assert block["ranked_groups"] is None
+
+
+def test_survivorship_counts_a_configuration_once_however_often_it_ran() -> None:
+    """Repeated failures of one configuration are one failed configuration, named by the latest."""
+    trials = _trials(
+        (_COMPLETE, 0.5, 1),
+        (_FAIL, None, 2),
+        (_FAIL, None, 2),
+        (_COMPLETE, 0.4, 3),
+        (_FAIL, None, 3),
+    )
+    detail = _assess(trials, [trials[0], trials[3]])["checks"]["survivorship"]["detail"]
+
+    assert detail == {
+        "ranked": 2,
+        "infeasible": 0,
+        "failed": 1,
+        "untried": 0,
+        "failed_trials": [2],
+    }
+
+
+def test_survivorship_warning_names_each_failed_configuration_and_the_retry_step() -> None:
+    """The warning lists failures by trial and params, caps the list, and ends with one step."""
+    trials = _trials(
+        (_COMPLETE, 0.5, 1),
+        *[(_FAIL, None, 10 + index) for index in range(6)],
+    )
+    block = _assess_population(
+        trials,
+        trials[:1],
+        trials[0],
+        provenance={0: log_regex_provenance()},
+        untried_cells=[{"x": 99}],
+    )
+    step = "raise phases[p].n_trials above 7 in the config and rerun to draw new configurations."
+
+    (line,) = _describe_flagged(block, trials=trials, untried_cells=[{"x": 99}], retry_step=step)
+
+    assert line == (
+        "survivorship: 7 of 8 configurations have no result, so the winner was chosen among "
+        "the rest: trial 1 x=10 failed, trial 2 x=11 failed, trial 3 x=12 failed, trial 4 "
+        "x=13 failed, trial 5 x=14 failed and 2 more. Raise phases[p].n_trials above 7 in "
+        "the config and rerun to draw new configurations."
+    )
+
+
+def test_survivorship_counts_a_grid_cell_no_trial_reached() -> None:
+    """A full grid that skipped a cell flags it; with repeats the cell joins its group."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
+    plain = _assess_population(
+        trials,
+        trials,
+        trials[1],
+        provenance={trial.number: log_regex_provenance() for trial in trials},
+        untried_cells=[{"x": 3}],
+    )
+    assert plain["checks"]["survivorship"] == {
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 2, "infeasible": 0, "failed": 0, "untried": 1, "failed_trials": []},
+    }
+    (line,) = _describe_flagged(plain, untried_cells=[{"x": 3}])
+    assert line == (
+        "survivorship: 1 of 3 configurations has no result, so the winner was chosen among "
+        "the rest: x=3 was never tried."
+    )
+
+    members = _trials((_COMPLETE, 0.5, 1, 0), (_COMPLETE, 0.6, 1, 1), (_COMPLETE, 0.5, 2, 0))
+    grouped = _assess_groups(
+        members, [[0, 1]], incomplete=(2,), untried_cells=[{"x": 2, "seed": 1}]
+    )
+    assert grouped["checks"]["survivorship"]["detail"] == {
+        "ranked": 1,
+        "infeasible": 0,
+        "failed": 0,
+        "untried": 1,
+        "failed_trials": [],
+    }
 
 
 def test_tie_between_distinct_params_is_heterogeneous() -> None:
@@ -435,8 +515,9 @@ def _assess_groups(
     *,
     incomplete: tuple[int, ...] = (),
     reduce: ReduceName = "mean",
+    untried_cells: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
 ) -> dict[str, object]:
-    """Assess complete repeat groups by ``reduce``, the lowest aggregate winning as minimize does."""
+    """Assess complete grid repeat groups over ``seed`` by ``reduce``, lowest aggregate winning."""
     by_number = {trial.number: trial for trial in trials}
     ranked_groups = [
         ranked_group(
@@ -453,8 +534,10 @@ def _assess_groups(
         ranked,
         by_number[best.representative],
         provenance={trial.number: log_regex_provenance() for trial in ranked},
+        axis=RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=None),
         groups=ranked_groups,
         incomplete_group=incomplete,
+        untried_cells=untried_cells,
     )
 
 
@@ -547,8 +630,8 @@ def test_repeats_single_group_leaves_tie_unchecked() -> None:
     }
 
 
-def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
-    """A feasible trial whose group never completed is not an infeasible one."""
+def test_survivorship_counts_repeat_groups_as_configurations() -> None:
+    """A group with a failed member failed, and one with an out-of-bounds member is infeasible."""
     trials = _trials(
         (_COMPLETE, 0.5, 1, 0),
         (_COMPLETE, 0.6, 1, 1),
@@ -561,8 +644,8 @@ def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
     block = _assess_groups(trials, [[0, 1]], incomplete=(2, 4))
 
     assert block["checks"]["survivorship"] == {
-        "verdict": "ok",
-        "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1},
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 1, "infeasible": 1, "failed": 1, "untried": 0, "failed_trials": [3]},
     }
     assert _validate_confound_block(block, winner_trial=1) == block
 
@@ -580,12 +663,12 @@ def test_survivorship_leaves_out_the_failed_attempts_of_a_fixed_configuration_on
 
     assert _assess(trials, trials[2:])["checks"]["survivorship"] == {
         "verdict": "ok",
-        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+        "detail": {"ranked": 1, "infeasible": 0, "failed": 0, "untried": 0, "failed_trials": []},
     }
 
 
 def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() -> None:
-    """A failed attempt is left out when a retry of it, or of a retry of it, completed."""
+    """A retried cell counts once: by its measured result, else by its latest failed attempt."""
     study = optuna.create_study()
     # (state, x, rerun_of): cell 1 fails, its retry fails, and the next retry completes; cell 2
     # fails and its retry fails; cell 3 fails and nothing retries it.
@@ -611,7 +694,13 @@ def test_survivorship_discounts_a_failure_only_when_its_retry_chain_completed() 
 
     assert block["checks"]["survivorship"] == {
         "verdict": "heterogeneous",
-        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": 3},
+        "detail": {
+            "ranked": 1,
+            "infeasible": 0,
+            "failed": 2,
+            "untried": 0,
+            "failed_trials": [2, 4],
+        },
     }
     assert _validate_confound_block(block, winner_trial=5) == block
 
@@ -685,6 +774,13 @@ def _mutated(
         pytest.param(("checks", "survivorship", "detail"), ..., id="checked-without-detail"),
         pytest.param(("checks", "survivorship", "detail", "failed"), -1, id="negative-count"),
         pytest.param(("checks", "survivorship", "detail", "failed"), True, id="bool-count"),
+        pytest.param(("checks", "survivorship", "detail", "untried"), ..., id="missing-untried"),
+        pytest.param(
+            ("checks", "survivorship", "detail", "incomplete_group"), 0, id="old-count-field"
+        ),
+        pytest.param(
+            ("checks", "survivorship", "detail", "failed_trials"), [3, 1], id="unsorted-failures"
+        ),
         pytest.param(("checks", "tie", "detail", "tied_trials"), ["1"], id="string-trial"),
         pytest.param(
             ("checks", "evaluation_point"),
@@ -724,7 +820,7 @@ def _evaluation(verdict: str, *groups: tuple[int, list[int]]) -> dict[str, Any]:
     ("path", "value"),
     [
         pytest.param(("checks", "evaluation_point", "verdict"), "heterogeneous", id="eval"),
-        pytest.param(("checks", "survivorship", "verdict"), "heterogeneous", id="survivorship"),
+        pytest.param(("checks", "survivorship", "verdict"), "ok", id="survivorship"),
         pytest.param(("checks", "tie", "verdict"), "ok", id="tie"),
         pytest.param(
             ("checks", "evaluation_point"), _evaluation("ok", (1000, [0])), id="eval-one-trial"
@@ -769,7 +865,7 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
     summary = _confound_summary(block, winner_trial=0, extractor_kind="json_envelope")
 
     assert summary == {
-        "flagged": ["evaluation_point", "tie"],
+        "flagged": ["evaluation_point", "survivorship", "tie"],
         "evaluation_point": {
             "verdict": "heterogeneous",
             "axis": "tokens",
@@ -778,11 +874,12 @@ def test_summary_exposes_the_evaluation_axis_without_checkpoint_paths() -> None:
             "winner_value": 2000,
         },
         "survivorship": {
-            "verdict": "ok",
+            "verdict": "heterogeneous",
             "ranked": 2,
             "infeasible": 0,
-            "incomplete_group": 0,
             "failed": 1,
+            "untried": 0,
+            "failed_trials": [2],
         },
         "tie": {
             "verdict": "heterogeneous",
@@ -895,14 +992,20 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
                 user_attrs=_candidate_attrs(number, _envelope(step=step)),
             )
         )
-    study.add_trial(optuna.trial.create_trial(state=_FAIL))
-    study.add_trial(optuna.trial.create_trial(state=_FAIL))
+    for x in (5, 6):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_FAIL,
+                params={"x": x},
+                distributions={"x": optuna.distributions.IntDistribution(0, 10)},
+            )
+        )
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         selected = select_winner(study, experiment, phase_name="p")
 
     assert selected.trial_number == 0
-    assert _flagged_checks(selected.confound) == ["evaluation_point", "survivorship"]
+    assert selected.confound["checks"]["survivorship"]["detail"]["failed_trials"] == [2, 3]
     warnings = [
         record.getMessage()
         for record in caplog.records
@@ -911,7 +1014,11 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
-    assert "2 failed trials against 2 ranked" in warnings[0]
+    assert (
+        "survivorship: 2 of 4 configurations have no result, so the winner was chosen among "
+        "the rest: trial 2 x=5 failed, trial 3 x=6 failed. Raise phases[p].n_trials above 3 "
+        "in the config and rerun to draw new configurations; the failed ones are not retried;"
+    ) in warnings[0]
     assert warnings[0].endswith("json_envelope metric.")
     assert "metric.." not in warnings[0]
 

@@ -103,7 +103,7 @@ FRESH_STATE_DIR_STEP = (
     "Point the catalog's `state_dir` at a new directory; the PhaseSweep version that wrote "
     "this one still reads it."
 )
-MCP_STATE_FORMAT_VERSION = 9
+MCP_STATE_FORMAT_VERSION = 10
 CLEANUP_UNCERTAINTY_SCHEMA_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}

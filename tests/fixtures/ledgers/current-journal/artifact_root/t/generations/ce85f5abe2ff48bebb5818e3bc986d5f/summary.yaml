@@ -1,7 +1,7 @@
 schema_version: 6
 experiment: t
-generation_id: 366d7e3c20524758b371a5a69e1d20dd
-phasesweep_version: 0.3.14.dev34+g1394e2150.d20261120
+generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
+phasesweep_version: 0.3.14
 config_fingerprint: 510eb146e62737707cbf637293fedb6a7f213d3715b3bada974b7f90d629f027
 metric:
   name: objective
@@ -28,14 +28,14 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: 366d7e3c20524758b371a5a69e1d20dd
-  attempt_id: 1448ce9baddb437fbefef08f443612ca
+  generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
+  attempt_id: 13edf6580c11401ebc353cd9a49e85f9
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: 366d7e3c20524758b371a5a69e1d20dd
-    attempt_id: 1448ce9baddb437fbefef08f443612ca
+    generation_id: ce85f5abe2ff48bebb5818e3bc986d5f
+    attempt_id: 13edf6580c11401ebc353cd9a49e85f9
   trainer_input:
     schema_version: 1
     format: argparse
@@ -43,7 +43,7 @@ phases:
     size_bytes: 13
     sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
   confound:
-    schema_version: 3
+    schema_version: 4
     ranked_trials:
     - 0
     - 1
@@ -59,8 +59,9 @@ phases:
         detail:
           ranked: 2
           infeasible: 0
-          incomplete_group: 0
           failed: 0
+          untried: 0
+          failed_trials: []
       tie:
         verdict: heterogeneous
         detail:
@@ -72,11 +73,11 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: 66ca9aa184e8b9780c9695fcc9db655dba75f6b5117ab47144878daca599fc69
+  sha256: 305c3b162d112d29c28d53fd895ce85eccb0752a6b2da8e29583b455fba67772
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 9c8a92632c840edca53c3ec338cb687bedb7788188bf3ba83797f4a7860d083b
+  sha256: 6395423ae7d15975ba1a0299c68b3a88dc60be44d696edcf90b76d730a0f621f
 - kind: winner
   phase: p
-  sha256: 479b35d886ffce12b3278199efdf22a43e660d35ab25586a0ce0b453ce5bc1e7
+  sha256: 37f5894cc4bde5e512ddbe04d0539915d0685681b1438d7f29ce386a195c31ad
 trainer_config: {}

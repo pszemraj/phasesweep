@@ -50,7 +50,7 @@ NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
-RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[2] = 2
+RESULT_SNAPSHOT_SCHEMA_VERSION: Literal[3] = 3
 
 
 class _SnapshotModel(BaseModel):
@@ -183,23 +183,34 @@ class EvaluationPointSummary(_SnapshotModel):
 
 
 class SurvivorshipSummary(_SnapshotModel):
-    """How many finished trials were ranked versus excluded from ranking."""
+    """How the configurations the phase tried ended: ranked, infeasible, failed or never tried.
+
+    A configuration is a trial's params, or a repeat group in a repeats phase.
+    """
 
     verdict: ConfoundVerdict = Field(
         description=(
-            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed trials are at least as "
-            "numerous as ranked ones; infeasible and incomplete_group trials never flag."
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when any configuration failed or a grid "
+            "cell was never tried, so the winner was chosen without them; infeasible "
+            "configurations never flag."
         )
     )
-    ranked: NonNegativeInt
-    infeasible: NonNegativeInt
-    incomplete_group: NonNegativeInt = Field(
+    ranked: NonNegativeInt = Field(description="Configurations selection ranked.")
+    infeasible: NonNegativeInt = Field(
+        description="Configurations measured outside a metric bound or constraint."
+    )
+    failed: NonNegativeInt = Field(
+        description="Configurations whose every attempt failed, with no rerun pending."
+    )
+    untried: NonNegativeInt = Field(
         description=(
-            "Feasible trials of a repeats phase left unranked because another member of "
-            "their repeat group failed, was infeasible, or never ran; 0 without repeats."
+            "Grid cells' configurations no trial reached although the grid finished a "
+            "target covering every cell; 0 for any other phase."
         )
     )
-    failed: NonNegativeInt
+    failed_trials: list[NonNegativeInt] = Field(
+        description="The latest failed attempt of each failed configuration, by trial number."
+    )
 
 
 class TieSummary(_SnapshotModel):
@@ -377,7 +388,7 @@ def _winner_snapshot(
 class RunResultSnapshot(_SnapshotModel):
     """Terminal status and winners frozen for one MCP run id."""
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     status: StatusSnapshot
     winners: list[WinnerSnapshot]
     represented_config_fingerprint: str | None = None

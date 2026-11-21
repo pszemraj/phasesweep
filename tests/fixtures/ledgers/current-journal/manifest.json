@@ -1,6 +1,6 @@
 {
   "backend": "journal",
-  "binding_schema_version": 15,
+  "binding_schema_version": 16,
   "derivation": "",
   "derived_from": null,
   "expect": {
@@ -20,9 +20,9 @@
     "p"
   ],
   "produced_by": {
-    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep/.claude/worktrees/agent-a6d6093ec7c504d5d",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.13-235-g933cf759-dirty",
+    "phasesweep_git": "v0.3.14-139-gcdd7e224-dirty",
     "python": "3.13.16",
     "sqlite": "3.54.0"
   }

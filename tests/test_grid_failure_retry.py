@@ -1,8 +1,7 @@
 """Raised persistent grid targets retry failed cells without repeating completed cells.
 
-Recovery messages name the target that retries every failed cell, a winner chosen while
-some cell has no successful trial says so, and the winner's survivorship check counts only the
-failures that no successful retry replaced.
+Recovery messages name the target that retries every failed cell, and a winner chosen while
+some cell has no result, failed or never tried, says so through its survivorship check.
 """
 
 from __future__ import annotations
@@ -10,7 +9,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import optuna
 import pytest
 
 import phasesweep.engine.phase as phase_ops
@@ -20,11 +18,7 @@ from phasesweep.config.models import Experiment, Metric, Phase
 from phasesweep.config.search import IntParam, Repeats, Sampler
 from phasesweep.engine.errors import TrialTargetRefusedError
 from phasesweep.engine.preview import validate_trial_targets
-from phasesweep.engine.selection import (
-    NoFeasibleTrialError,
-    PhaseAbortRefusedError,
-    _warn_unsuccessful_grid_cells,
-)
+from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
 from phasesweep.engine.state import PHASE_RECOVERY_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.evidence.models import LogRegexExtractor
@@ -249,7 +243,13 @@ def test_failed_grid_names_the_target_that_retries_every_failed_cell(
     # Every cell succeeded after its retry, so survivorship lost nothing.
     assert published_survivorship(recovered) == {
         "verdict": "ok",
-        "detail": {"ranked": 2, "infeasible": 0, "incomplete_group": 0, "failed": 0},
+        "detail": {
+            "ranked": 1 if repeats else 2,
+            "infeasible": 0,
+            "failed": 0,
+            "untried": 0,
+            "failed_trials": [],
+        },
     }
 
 
@@ -591,19 +591,19 @@ def test_infeasible_sampling_streak_offers_the_raised_target_under_unchanged_lim
     assert message.index("new `experiment` name") < message.index("For work under unchanged limits")
 
 
-def _coverage_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """Return the advisories saying some grid cell has no successful trial."""
+def _survivorship_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the selection warnings that carry a flagged survivorship check."""
     return [
         record.getMessage()
         for record in caplog.records
-        if record.name == "phasesweep.engine.selection" and "grid cells succeeded" in record.message
+        if record.name == "phasesweep.engine.selection" and "survivorship:" in record.message
     ]
 
 
-def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
+def test_winner_from_a_partly_failed_grid_names_the_cell_that_never_succeeded(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A raised target that retries one of two failed cells publishes, and the log says so."""
+    """A raised target that retries one of two failed cells publishes, and the log names the other."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_grid(tmp_path, trainer, 2))
@@ -613,22 +613,24 @@ def test_winner_from_a_partly_failed_grid_names_the_cells_that_never_succeeded(
         assert run_experiment(raised)["p"].metric == 1.0
     trials = phase_trials(raised)
     assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", "COMPLETE"]
-    expected = (
-        "[p] only 1 of 2 grid cells succeeded; the winner was chosen without a "
-        f"successful trial for: {trials[1].params}."
-    )
-    assert _coverage_warnings(caplog) == [expected]
+    (warning,) = _survivorship_warnings(caplog)
+    assert (
+        "survivorship: 1 of 2 configurations has no result, so the winner was chosen among the "
+        f"rest: trial 1 x={trials[1].params['x']} failed. Raise phases[p].n_trials from 3 to 4 "
+        "in the config and rerun to retry its 1 failed cell; COMPLETE and INFEASIBLE cells "
+        "are not repeated."
+    ) in warning
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    assert _coverage_warnings(caplog) == []
+    assert _survivorship_warnings(caplog) == []
 
 
-def test_grid_winner_warns_about_cells_the_abort_never_reached(
+def test_grid_winner_counts_the_cell_a_raised_target_never_reached(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A cell with no trial at all is as unsuccessful as one that failed."""
+    """Failed-cell retries run before unvisited cells, so a finished target can skip a cell."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=2)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_grid(tmp_path, trainer, 4, cells=4))
@@ -636,20 +638,32 @@ def test_grid_winner_warns_about_cells_the_abort_never_reached(
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(raised)["p"].metric == 1.0
-    succeeded = {
-        trial.params["x"] for trial in phase_trials(raised) if trial.state.name == "COMPLETE"
+    trials = phase_trials(raised)
+    assert [trial.state.name for trial in trials] == ["FAIL", "FAIL", *["COMPLETE"] * 3]
+    (missing,) = {1, 2, 3, 4} - {trial.params["x"] for trial in trials}
+    assert published_survivorship(raised) == {
+        "verdict": "heterogeneous",
+        "detail": {"ranked": 3, "infeasible": 0, "failed": 0, "untried": 1, "failed_trials": []},
     }
-    (missing,) = {1, 2, 3, 4} - succeeded
-    assert _coverage_warnings(caplog) == [
-        "[p] only 3 of 4 grid cells succeeded; the winner was chosen without a "
-        f"successful trial for: {{'x': {missing}}}."
-    ]
+    (warning,) = _survivorship_warnings(caplog)
+    assert (
+        "survivorship: 1 of 4 configurations has no result, so the winner was chosen among the "
+        f"rest: x={missing} was never tried. Raise phases[p].n_trials from 5 to 6 in the config "
+        "and rerun to run its 1 remaining cell; COMPLETE and INFEASIBLE cells are not repeated;"
+    ) in warning
+
+    # The step it printed runs the cell that was never tried, and nothing flags afterwards.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
+        assert run_experiment(_grid(tmp_path, trainer, 6, cells=4))["p"].metric == 1.0
+    assert {trial.params["x"] for trial in phase_trials(raised)} == {1, 2, 3, 4}
+    assert _survivorship_warnings(caplog) == []
 
 
-def test_repeat_grid_winner_warns_about_the_failed_member(
+def test_repeat_grid_winner_names_the_group_its_failed_member_left_without_a_result(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A repeat group that lost a member cannot rank, so the cell names its repeat value."""
+    """A repeat group that lost a member cannot rank; the warning names the member's params."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
     phase = Phase(
         name="p",
@@ -663,9 +677,11 @@ def test_repeat_grid_winner_warns_about_the_failed_member(
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(experiment)["p"].metric == 1.0
     (failed,) = (trial for trial in phase_trials(experiment) if trial.state.name == "FAIL")
-    (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 3 of 4 grid cells succeeded; ")
-    assert f"'x': {failed.params['x']}" in warning and f"'seed': {failed.params['seed']}" in warning
+    (warning,) = _survivorship_warnings(caplog)
+    assert (
+        "survivorship: 1 of 2 configurations has no result, so the winner was chosen among the "
+        f"rest: trial {failed.number} x={failed.params['x']} seed={failed.params['seed']} failed."
+    ) in warning
 
 
 @pytest.mark.parametrize("target", [2, 4], ids=["fresh-success", "every-failure-retried"])
@@ -679,20 +695,20 @@ def test_grid_winner_with_a_successful_trial_in_every_cell_stays_quiet(
             run_experiment(_grid(tmp_path, trainer, 2))
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         assert run_experiment(_grid(tmp_path, trainer, target))["p"].metric == 1.0
-    assert _coverage_warnings(caplog) == []
+    assert _survivorship_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
-    ("failures", "target", "failed"),
+    ("failures", "target"),
     [
-        pytest.param(2, 3, 1, id="cell-never-retried"),
-        pytest.param(3, 4, 2, id="cell-retried-and-failed-again"),
+        pytest.param(2, 3, id="cell-never-retried"),
+        pytest.param(3, 4, id="cell-retried-and-failed-again"),
     ],
 )
 def test_survivorship_still_counts_the_failures_of_a_cell_that_never_succeeded(
-    tmp_path: Path, failures: int, target: int, failed: int
+    tmp_path: Path, failures: int, target: int
 ) -> None:
-    """Replacing a failure discounts it only when a later attempt of its cell succeeded."""
+    """A cell counts once: by a successful retry, else by its latest failed attempt."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=failures)
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_grid(tmp_path, trainer, 2))
@@ -705,17 +721,28 @@ def test_survivorship_still_counts_the_failures_of_a_cell_that_never_succeeded(
         trial.params["x"] for trial in phase_trials(raised) if trial.state.name == "COMPLETE"
     }
     assert len(succeeded) == 1
+    attempts = [
+        trial.number for trial in phase_trials(raised) if trial.params["x"] not in succeeded
+    ]
+    assert len(attempts) == failures - 1
+    failed_trials = [max(attempts)]
 
     assert published_survivorship(raised) == {
         "verdict": "heterogeneous",
-        "detail": {"ranked": 1, "infeasible": 0, "incomplete_group": 0, "failed": failed},
+        "detail": {
+            "ranked": 1,
+            "infeasible": 0,
+            "failed": 1,
+            "untried": 0,
+            "failed_trials": failed_trials,
+        },
     }
 
 
-def test_sampling_winner_after_a_failure_has_no_cell_advisory(
+def test_sampling_winner_after_a_failure_says_a_raised_target_draws_instead(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Only a grid has cells to cover."""
+    """A sampler never retries a failed configuration, so the step says what raising buys."""
     trainer, _calls = write_flaky_trainer(tmp_path, failures=1)
     phase = Phase(
         name="p",
@@ -723,34 +750,14 @@ def test_sampling_winner_after_a_failure_has_no_cell_advisory(
         sampler=Sampler(type="random", seed=0),
         search_space={"x": IntParam(type="int", low=1, high=9)},
     )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        run_experiment(make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase]))
-    assert _coverage_warnings(caplog) == []
-
-
-def test_cell_advisory_spells_out_ten_cells_and_counts_the_rest(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A wide grid with one successful cell keeps the advisory to one readable line."""
-    phase = Phase(
-        name="p",
-        n_trials=15,
-        sampler=Sampler(type="grid", seed=0),
-        search_space={"x": IntParam(type="int", low=0, high=14)},
-    )
-    trial = optuna.trial.create_trial(
-        value=0.0,
-        params={"x": 0},
-        distributions={"x": optuna.distributions.IntDistribution(0, 14)},
-    )
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        _warn_unsuccessful_grid_cells(phase, [trial])
-
-    (warning,) = _coverage_warnings(caplog)
-    assert warning.startswith("[p] only 1 of 15 grid cells succeeded; ")
-    assert "{'x': 10}" in warning and "{'x': 11}" not in warning
-    assert warning.endswith("; and 4 more.")
+        run_experiment(experiment)
+    (warning,) = _survivorship_warnings(caplog)
+    assert (
+        "Raise phases[p].n_trials above 3 in the config and rerun to draw new configurations; "
+        "the failed ones are not retried"
+    ) in warning
 
 
 def test_in_memory_grid_abort_gets_no_recovery_advice(tmp_path: Path) -> None:

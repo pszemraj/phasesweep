@@ -347,8 +347,6 @@ def _forge_axis_mismatch(winner: JsonObject, tamper: str) -> float:
             for group in groups
             if isinstance(group, list)
         ]
-        counts = _block(_block(_block(confound, "checks"), "survivorship"), "detail")
-        counts["ranked"] = len(ranked) - len(dropped)
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
     values = [value for value in metrics if isinstance(value, float)]

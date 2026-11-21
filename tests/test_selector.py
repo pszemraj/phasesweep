@@ -368,9 +368,16 @@ def test_repeats_group_with_failed_or_infeasible_member_cannot_rank(member: str)
 
     assert winner.params == {"x": 2}
     assert winner.metric == pytest.approx(0.5)
+    # Survivorship counts configurations: x=1 fails or is infeasible as a whole, and a member
+    # that never ran leaves it to the completion record.
     survivorship = winner.confound["checks"]["survivorship"]["detail"]
-    assert survivorship["ranked"] == 3
-    assert survivorship["incomplete_group"] == 2
+    assert survivorship == {
+        "ranked": 1,
+        "infeasible": int(member == "infeasible"),
+        "failed": int(member == "failed"),
+        "untried": 0,
+        "failed_trials": [2] if member == "failed" else [],
+    }
     assert winner.confound["checks"]["tie"] == {
         "verdict": "n/a",
         "reason": "only one repeat group was ranked",
@@ -389,7 +396,7 @@ def test_repeats_collapsed_member_outside_metric_bounds_excludes_its_configurati
     assert unbounded.params == {"x": 1}
     assert bounded.params == {"x": 2}
     survivorship = bounded.confound["checks"]["survivorship"]["detail"]
-    assert (survivorship["infeasible"], survivorship["incomplete_group"]) == (1, 2)
+    assert (survivorship["ranked"], survivorship["infeasible"]) == (1, 1)
 
 
 def test_repeats_without_complete_group_names_incomplete_groups() -> None:

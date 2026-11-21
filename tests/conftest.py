@@ -948,8 +948,9 @@ def single_trial_confound(trial_number: int) -> dict[str, Any]:
                 "detail": {
                     "ranked": 1,
                     "infeasible": 0,
-                    "incomplete_group": 0,
                     "failed": 0,
+                    "untried": 0,
+                    "failed_trials": [],
                 },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},

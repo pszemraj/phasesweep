@@ -255,6 +255,52 @@ def group_labels_for(trials: Sequence[FrozenTrial], axis: RepeatAxis | None) -> 
     return {number: last[key] for number, key in keyed.items()}
 
 
+def configuration_slot(
+    position: int, params: Mapping[str, object], axis: RepeatAxis | None
+) -> tuple[str, str] | None:
+    """Key params by the configuration they measure and the slot they fill in it.
+
+    Without a repeat axis a configuration is its params, with one slot: every attempt at
+    those params, a retried grid cell or a fixed configuration's next attempt, measures the
+    same thing. With one, the configuration is the repeat group (:func:`group_key`) and each
+    repeat value is a slot.
+
+    :param int position: The trial's draw position; a grid cell's is ignored, because only
+        seeded random keys its groups by position.
+    :param Mapping[str, object] params: Recorded params, or a grid cell.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return tuple[str, str] | None: ``(configuration, slot)``, or ``None`` for params that
+        never recorded the repeat key.
+    """
+    if axis is None:
+        key = json.dumps(dict(params), sort_keys=True)
+        return key, key
+    if axis.key not in params:
+        return None
+    return group_key(position, params, axis), json.dumps(params[axis.key])
+
+
+def configuration_slots(
+    trials: Sequence[FrozenTrial], axis: RepeatAxis | None
+) -> dict[int, tuple[str, str]]:
+    """Key each trial by the configuration it measures and the slot it fills in it.
+
+    :param Sequence[FrozenTrial] trials: Every trial of one phase study.
+    :param RepeatAxis | None axis: Configured repeat axis, or ``None`` without repeats.
+    :return dict[int, tuple[str, str]]: :func:`configuration_slot` keys by trial number,
+        leaving out trials that never recorded the repeat key.
+    """
+    from phasesweep.engine.optuna import _draw_positions
+
+    positions = _draw_positions(trials)
+    slots: dict[int, tuple[str, str]] = {}
+    for trial in trials:
+        keys = configuration_slot(positions[trial.number], trial.params, axis)
+        if keys is not None:
+            slots[trial.number] = keys
+    return slots
+
+
 def reduce_values(values: Sequence[float], reduce: ReduceName) -> float:
     """Combine member metrics into the value a group ranks by.
 

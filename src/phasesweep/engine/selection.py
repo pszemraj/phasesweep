@@ -33,6 +33,7 @@ from phasesweep.engine.optuna import (
     _any_objective_unreadable,
     _any_trial_timed_out,
     _draw_positions,
+    _finished_trial_count,
     _trial_count_state,
 )
 from phasesweep.engine.paths import _phase_dir
@@ -73,9 +74,6 @@ from phasesweep.runtime.json import JsonObject, json_object, json_text_map
 from phasesweep.runtime.terminal import display_path, objective_text
 
 log = logging.getLogger("phasesweep.engine.selection")
-
-# Grid cells without a successful trial that one advisory spells out before it counts the rest.
-_MAX_LISTED_CELLS = 10
 
 
 class TieGroupComparison(typing.TypedDict):
@@ -184,8 +182,8 @@ class SelectedTrial:
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
     # Advisory verdicts on the population this selection ranked
-    # (:mod:`phasesweep.engine.confound`).
-    confound: dict[str, Any]
+    # (:class:`phasesweep.engine.confound.ConfoundBlock`).
+    confound: JsonObject
     # The tracked environment mapping behind ``trainer_env_digest``, or ``None`` when the
     # trial recorded none. Only the ledger trial holds it; winner.yaml keeps the digest.
     trainer_env: dict[str, str] | None = None
@@ -282,8 +280,8 @@ def select_winner(
         (minimize/maximize), the metric bounds, and the constraint definitions used to
         filter trials.
     :param str | None phase_name: Phase label used in log messages and to find the phase for
-        the grid advisories. Log messages fall back to the study name when ``None``, and
-        the grid advisories are skipped.
+        the grid-edge advisory, a grid's untried cells and the survivorship retry step. Log
+        messages fall back to the study name when ``None``, and the others are skipped.
     :param RepeatAxis | None repeats: The phase's repeat axis
         (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a phase without repeats.
     :param bool emit_advisories: Whether this fresh selection should log advisories; replay retains verdicts silently.
@@ -382,15 +380,29 @@ def select_winner(
         if t is not best:
             with contextlib.suppress(TrialEvidenceMissingError):
                 provenance[t.number] = _trial_objective_provenance(t)
+    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
+    untried_cells = _untried_grid_cells(phase, trials)
     confound = _assess_population(
         trials,
         survivors,
         best,
         provenance=provenance,
+        axis=repeats,
         groups=None if ranking is None else ranking.groups,
         incomplete_group=() if ranking is None else ranking.incomplete_group,
+        untried_cells=untried_cells,
     )
-    flagged = _describe_flagged(confound)
+    survivorship = confound["checks"]["survivorship"]
+    flagged = _describe_flagged(
+        confound,
+        trials=trials,
+        untried_cells=untried_cells,
+        retry_step=(
+            _raised_target_step(phase, trials)
+            if phase is not None and survivorship["verdict"] == "heterogeneous"
+            else None
+        ),
+    )
     if winning is not None and ranking is not None:
         for comparison in tie_group_comparisons(winning, ranking.groups):
             flagged.append(
@@ -401,11 +413,11 @@ def select_winner(
                 f"threshold={_NOISE_STANDARD_ERRORS:g}*combined_se="
                 f"{objective_text(comparison['threshold'])}"
             )
-    if confound["checks"]["evaluation_point"]["verdict"] == "heterogeneous":
+    evaluation = confound["checks"]["evaluation_point"]
+    if evaluation["verdict"] == "heterogeneous":
         flagged.append(
             _evaluation_point_remedy(
-                experiment.metric.extractor.type,
-                axis=confound["checks"]["evaluation_point"]["detail"]["axis"],
+                experiment.metric.extractor.type, axis=evaluation["detail"]["axis"]
             )
         )
     if flagged and emit_advisories:
@@ -416,10 +428,8 @@ def select_winner(
             len(survivors),
             "; ".join(fragment.rstrip(".") for fragment in flagged),
         )
-    phase = next((phase for phase in experiment.phases if phase.name == phase_name), None)
     if phase is not None and emit_advisories:
         _warn_grid_edges(phase, best.params)
-        _warn_unsuccessful_grid_cells(phase, trials)
         if winning is not None and ranking is not None and phase.cost_key is not None:
             advisory = _cost_advisory(phase, winning, ranking.groups, goal=experiment.metric.goal)
             if advisory is not None:
@@ -448,7 +458,7 @@ def select_winner(
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_env=json_text_map(best.user_attrs.get(TRAINER_ENV_ATTR)),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
-        confound=confound,
+        confound=json_object(confound),
         observed=(
             _observed_values(best, subject=f"Winning trial {best.number}")
             if record is None
@@ -538,40 +548,31 @@ def _warn_grid_edges(phase: Phase, params: Mapping[str, object]) -> None:
             )
 
 
-def _warn_unsuccessful_grid_cells(phase: Phase, trials: Sequence[optuna.trial.FrozenTrial]) -> None:
-    """Warn when a grid winner was chosen while some cell has no successful trial.
+def _untried_grid_cells(
+    phase: Phase | None, trials: Sequence[optuna.trial.FrozenTrial]
+) -> list[dict[str, object]]:
+    """Return the cells of a grid that reached its target covering every cell, yet no trial ran.
 
-    A cell is successful when one of its trials is COMPLETE, feasible or not, which is
-    when the retry rule closes it. A cell whose attempts all failed, were interrupted or
-    never ran has none. The repeat axis counts as a grid axis. The advisory never changes
-    selection.
+    Raising a grid's target after failures schedules the failed cells' retries ahead of the
+    cells it never reached, so a finished target can leave cells nobody tried, and nothing
+    else reports them. A target below the grid's size leaves cells out by design, and a
+    phase cut short by an accepted timeout reports its shortfall in the completion record,
+    so neither counts. The repeat axis counts as a grid axis.
 
-    :param Phase phase: Configured search space and sampler.
+    :param Phase | None phase: The phase, or ``None`` when selection has none.
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of the phase's study.
+    :return list[dict[str, object]]: The untried cells in grid order, empty for any other phase.
     """
-    if phase.sampler.type != "grid" or not phase_draws(phase):
-        return
+    if phase is None or phase.sampler.type != "grid" or not phase_draws(phase):
+        return []
     axes = grid_search_space(sampler_search_space(phase), phase_name=phase.name)
-    succeeded = {
-        tuple(trial.params.get(name) for name in axes)
-        for trial in trials
-        if trial.state == optuna.trial.TrialState.COMPLETE
-    }
-    cells = [dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())]
-    missing = [cell for cell in cells if tuple(cell.values()) not in succeeded]
-    if not missing:
-        return
-    listed = "; ".join(str(cell) for cell in missing[:_MAX_LISTED_CELLS])
-    if len(missing) > _MAX_LISTED_CELLS:
-        listed += f"; and {len(missing) - _MAX_LISTED_CELLS} more"
-    log.warning(
-        "[%s] only %d of %d grid cells succeeded; the winner was chosen without a "
-        "successful trial for: %s.",
-        phase.name,
-        len(cells) - len(missing),
-        len(cells),
-        listed,
-    )
+    cells: list[dict[str, object]] = [
+        dict(zip(axes, values, strict=True)) for values in itertools.product(*axes.values())
+    ]
+    if phase.n_trials < len(cells) or _finished_trial_count(trials) < phase.n_trials:
+        return []
+    tried = {tuple(trial.params.get(name) for name in axes) for trial in trials}
+    return [cell for cell in cells if tuple(cell.values()) not in tried]
 
 
 def _rank_groups(
