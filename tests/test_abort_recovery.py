@@ -160,7 +160,7 @@ def test_cli_abort_advice_is_logged_once_per_invocation(
         assert len(fixes) == 1
         advice = fixes[0]
         assert "phases[p].n_trials above 1 in the config" in advice
-        assert "fix changes trial_command or the trainer's PATH" in advice
+        assert "fix changes metric, trial_command or the trainer's PATH" in advice
         assert "new `experiment` name" in advice
         assert (output.err + output.out + caplog.text).count(advice) == 1
         assert run_log.read_text(encoding="utf-8").count(advice) == invocation + 1
