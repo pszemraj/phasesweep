@@ -13,13 +13,27 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config.models import Experiment, Phase
-from phasesweep.engine.errors import StudyContextConflictError, phase_timeout
+from phasesweep.engine.errors import PhaseTimeoutError, StudyContextConflictError, phase_timeout
 from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 from phasesweep.errors import RERUN_EVERY_PHASE_STEP, phase_names, rename_dependents_step
 from phasesweep.runtime.terminal import plural
+
+
+def _run_deadline_refusal(experiment: Experiment, phase_name: str) -> PhaseTimeoutError:
+    """Refuse a phase that the whole-run deadline passed before it could start.
+
+    :param Experiment experiment: Experiment whose storage decides the rerun step.
+    :param str phase_name: Phase the deadline reached before it started.
+    :return PhaseTimeoutError: The routed refusal, for the caller to raise.
+    """
+    return phase_timeout(
+        f"Run wallclock deadline reached before phase {phase_name!r} could start.",
+        scope="run",
+        experiment=experiment,
+    )
 
 
 def _preflight_skipped_winners(
@@ -72,11 +86,7 @@ def _preflight_skipped_winners(
         winners: dict[str, Winner] = {}
         for phase in experiment.phases:
             if run_deadline is not None and time.monotonic() >= run_deadline:
-                raise phase_timeout(
-                    f"Run wallclock deadline reached before phase {phase.name!r} could start.",
-                    scope="run",
-                    experiment=experiment,
-                )
+                raise _run_deadline_refusal(experiment, phase.name)
             if phase.name == from_phase:
                 break
             if phase.name not in required:

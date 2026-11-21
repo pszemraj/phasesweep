@@ -36,7 +36,6 @@ from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
-    phase_timeout,
 )
 from phasesweep.engine.optuna import _finished_trial_count, _trial_count_state
 from phasesweep.engine.phase import _run_phase
@@ -759,11 +758,7 @@ def _run_experiment_inner(
             and run_deadline is not None
             and time.monotonic() >= run_deadline
         ):
-            raise phase_timeout(
-                f"Run wallclock deadline reached before phase {phase.name!r} could start.",
-                scope="run",
-                experiment=experiment,
-            )
+            raise resume_ops._run_deadline_refusal(experiment, phase.name)
         if (
             using_preloaded_winner
             and preloaded_winners is not None
