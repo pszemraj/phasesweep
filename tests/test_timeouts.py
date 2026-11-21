@@ -129,7 +129,7 @@ def test_wallclock_timeout_refuses_incomplete_winner(tmp_path: Path, guard: str)
 
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner"
+        match=r"timed out via phase guard after 0/\d+ finished trials"
         if guard == "phase"
         else "run guard",
     ):
@@ -152,7 +152,7 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     started = time.monotonic()
     with pytest.raises(
         TimeoutError,
-        match=r"timed out via phase guard .*Refusing to select a winner",
+        match=r"timed out via phase guard after \d+/\d+ finished trials",
     ):
         run_experiment(exp)
     elapsed = time.monotonic() - started
@@ -236,7 +236,7 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     strict = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
     )
-    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it"):
+    with pytest.raises(WinnerIntegrityError, match="set allow_incomplete_on_timeout: true"):
         run_experiment(strict)
     assert len(load().trials) == trials_before
     assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
@@ -585,7 +585,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         return executed
 
     monkeypatch.setattr(phase_mod, "launch_trial", launch_and_expire)
-    with pytest.raises(TimeoutError, match="Refusing to select a winner"):
+    with pytest.raises(TimeoutError, match="timed out via phase guard after 2/3 finished trials"):
         run_experiment(exp)
 
     study = optuna.load_study(

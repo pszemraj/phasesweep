@@ -150,9 +150,8 @@ def test_trial_write_error_reports_cause_and_storage_specific_recovery(
     ):
         assert "RuntimeError: injected trial write fault" in diagnostic
         if persistent:
-            assert "the next run recovers the attempt" in diagnostic
+            assert "the next run recovers it" in diagnostic
         else:
-            assert "storage: null keeps no completed trials between runs" in diagnostic
             assert "The trial result was lost" in diagnostic
             assert "RUNNING" not in diagnostic
 

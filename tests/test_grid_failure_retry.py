@@ -471,7 +471,6 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     message = _operational_error_text(refused.value)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
-    assert "at its accepted n_trials=4" in message
     assert_advises_target(message, 4, 6, "retry its 2 failed cells and run its 2 remaining cells")
 
 

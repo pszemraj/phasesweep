@@ -78,10 +78,9 @@ _LEDGER_REFUSED = (
 _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
 _RUNNING_WARNING = (
-    "DRY RUN warning: phase={name} has 1 RUNNING attempt that a real run recovers before it "
-    "checks the phase, as failed where the trial recorded a failure and otherwise as "
-    "interrupted, which reruns; they are counted that way, and its accepted target, abort "
-    "state and partial decision are not checked"
+    "DRY RUN warning: phase={name} has 1 RUNNING attempt, counted the way a real run recovers "
+    "RUNNING attempts (failed if the trial recorded a failure, otherwise interrupted and "
+    "rerun); its accepted target, abort state and partial decision are not checked"
 )
 
 
@@ -370,7 +369,7 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
         "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
         "launch no trials"
     )
-    with pytest.raises(TrialEvidenceMissingError, match="bytes behind the published metric"):
+    with pytest.raises(TrialEvidenceMissingError, match="now hashes to .*: its bytes have changed"):
         run_experiment(accepting)
 
 
@@ -913,7 +912,7 @@ def test_validate_counts_pending_evidence_as_the_failure_a_run_may_record(tmp_pa
     ):
         run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
     assert pending.value.remediation is not None
-    assert pending.value.remediation.startswith("Let any active run finish.")
+    assert pending.value.remediation.startswith("Run `phasesweep run` with the same config")
 
 
 def test_validate_allows_the_retry_a_fixed_configurations_pending_evidence_may_justify(

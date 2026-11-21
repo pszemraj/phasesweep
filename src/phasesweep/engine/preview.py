@@ -166,12 +166,11 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
     recovered = _recovered_running_states(study.study_name, trials)
     if "EVIDENCE_PENDING" in recovered:
         raise PhaseSweepError(
-            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery; "
-            "the trial and rerun counts depend on its extraction.",
+            f"Phase {phase.name!r} has completed trainer evidence awaiting recovery, so the "
+            "dry run cannot count its trials.",
             action=OperatorAction.RUN_RECOVER_RUN,
             remediation=(
-                "Let any active run finish. If the evidence is still pending, run "
-                "phasesweep run with the same config, without --dry-run, to recover it."
+                "Run `phasesweep run` with the same config, without --dry-run, to recover it."
             ),
         )
     recovered_as_failed = recovered.count("FAIL")
@@ -419,10 +418,9 @@ def _preview_phase(
         )
     elif recorded.running:
         warn_dry_run(
-            "phase=%s has %s that a real run recovers "
-            "before it checks the phase, as failed where the trial recorded a failure and "
-            "otherwise as interrupted, which reruns; they are counted that way, and its "
-            "accepted target, abort state and partial decision are not checked",
+            "phase=%s has %s, counted the way a real run recovers RUNNING attempts (failed "
+            "if the trial recorded a failure, otherwise interrupted and rerun); its accepted "
+            "target, abort state and partial decision are not checked",
             phase.name,
             plural(recorded.running, "RUNNING attempt"),
         )

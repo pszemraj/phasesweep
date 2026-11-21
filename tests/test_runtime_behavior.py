@@ -317,7 +317,7 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
     study._storage.set_trial_system_attr(stale._trial_id, "grid_id", 0)
     stale = study.get_trials(deepcopy=False)[stale_number]
 
-    _fail_stale_running_trial(study, stale, failure_message="stale grid trial")
+    _fail_stale_running_trial(study, stale, where="stale grid trial")
 
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
 
@@ -1178,7 +1178,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         TRIAL_OUTCOME_ATTR,
         "injected outcome write failure",
     )
-    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+    with pytest.raises(StudyStorageUnavailableError, match="The trial stays RUNNING"):
         run_experiment(exp)
 
     trials = phase_trials(exp)
@@ -1248,7 +1248,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
         TRIAL_OUTCOME_ATTR,
         "injected outcome write failure",
     )
-    with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
+    with pytest.raises(StudyStorageUnavailableError, match="The trial stays RUNNING"):
         run_experiment(exp)
 
     trials = phase_trials(exp)

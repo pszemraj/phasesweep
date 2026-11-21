@@ -586,7 +586,7 @@ WRAP_CASES = (
         trigger=_run_while_discovery_fails,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Artifact ownership could not be checked because required persistent",
+        message="Could not check artifact ownership: Could not inspect persistent study",
         cause=StudyStorageUnavailableError,
     ),
     RoutingCase(
@@ -866,7 +866,6 @@ def test_unusable_attempt_entry_gets_the_process_check_and_the_deletion(
 
     error = excinfo.value
     assert f"registry entry {entries[0]} " in str(error)
-    assert "Recovery cannot prove whether a process from this attempt is still alive." in str(error)
     assert error.remediation is not None
     assert error.remediation.startswith("Look up pgid in the process_identity.json")
     assert (
@@ -1210,7 +1209,7 @@ ORIGIN_CASES = (
         trigger=_inspect_uncertain(TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown.",
+        message="'phasesweep_attempt_id' user attribute is missing or invalid",
     ),
     RoutingCase(
         # Either the ledger or the tree may be the side that changed.
@@ -1281,7 +1280,7 @@ ORIGIN_CASES = (
         trigger=_scan_registry(damage=_entry_garbled),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="is unreadable or malformed.",
+        message="is unreadable or malformed:",
     ),
     RoutingCase(
         id="registry_entry_partial_schema",
@@ -1328,14 +1327,14 @@ ORIGIN_CASES = (
         trigger=_reap_trial_with_invalid_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="invalid persisted 'phasesweep_trial_dir'",
+        message="'phasesweep_trial_dir' user attribute is missing or invalid",
     ),
     RoutingCase(
         id="running_trial_attempt_missing",
         trigger=_reap_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Process identity is unknown.",
+        message="'phasesweep_attempt_id' user attribute is missing or invalid",
     ),
     RoutingCase(
         # The same split as uncertain_trial_identity_files_mismatch.
@@ -1350,7 +1349,7 @@ ORIGIN_CASES = (
         trigger=_inspect_uncertain(ATTEMPT_ID_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="missing or invalid 'phasesweep_trial_dir'",
+        message="'phasesweep_trial_dir' user attribute is missing or invalid",
     ),
     RoutingCase(
         id="prior_phase_abort",
@@ -1416,7 +1415,7 @@ ORIGIN_CASES = (
         trigger=_resume_with_streak_at_limit,
         raised=PhaseAbortRefusedError,
         action=OperatorAction.FIX_CONFIG,
-        message="meets max_consecutive_failures=2, so it launches no more trials",
+        message="which meets max_consecutive_failures=2.",
     ),
     RoutingCase(
         id="winner_incomplete_without_opt_in",
@@ -1430,7 +1429,7 @@ ORIGIN_CASES = (
         trigger=_replay_partial_decision_without_opt_in,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
-        message="Refusing to replay it unless the current config sets",
+        message="set allow_incomplete_on_timeout: true to replay it.",
     ),
     RoutingCase(
         id="ledger_directory_path_unusable",

@@ -121,11 +121,7 @@ def _reap_stale_trials(
                 record=record,
                 experiment=experiment,
                 report=report,
-                failure_message=(
-                    f"Stale process cleanup completed for RUNNING trial {trial.number}, "
-                    f"but Optuna state could not be updated to FAIL. Refusing to continue "
-                    f"with an inconsistent study. trial_dir={trial_dir}"
-                ),
+                where=f"trial_dir={trial_dir}",
             )
             if not settled:
                 continue

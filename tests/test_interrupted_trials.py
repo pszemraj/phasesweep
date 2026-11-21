@@ -213,7 +213,7 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
         recorded if recorded is not None else trial_outcome(3, "interrupted", cause=_STALE_CAUSE)
     )
 
-    assert _fail_stale_running_trial(study, trial, failure_message="could not settle trial")
+    assert _fail_stale_running_trial(study, trial, where="could not settle trial")
 
     recovered = study.trials[trial.number]
     interrupted = expected["outcome"] == "interrupted"
@@ -1156,7 +1156,7 @@ else:
                     objective.write_bytes(original.replace(b"x=1.0", b"x=0.1"))
                     with pytest.raises(
                         TrialEvidenceMissingError,
-                        match="bytes behind the published metric have changed",
+                        match="now hashes to .*: its bytes have changed",
                     ) as refused:
                         run_experiment(experiment)
                     assert refused.value.remediation is not None
@@ -1426,9 +1426,8 @@ def test_a_pending_trial_whose_tracker_sdk_is_missing_names_installing_it(
     with pytest.raises(TrackingTargetUnavailableError) as refused:
         run_experiment(experiment)
     assert str(refused.value) == (
-        "1 completed trial(s) finished training, but the tracker could not be read. First "
-        f"failure: metric extractor: {WANDB_SDK_MISSING} Their training is kept and no new "
-        "trial was started."
+        "1 completed trial(s) finished training, but the tracker could not be read: "
+        f"metric extractor: {WANDB_SDK_MISSING}"
     )
     assert refused.value.remediation == (
         "Restore access to the tracker or install its SDK, then run the same config again; the "
@@ -1830,8 +1829,6 @@ def test_shutdown_during_extraction_promises_kept_training_only_with_persistent_
     lost = "Trial 0 in phase p finished training, but its result was not extracted"
     assert (retained in caplog.text) is (storage == "journal")
     assert (lost in caplog.text) is (storage == "memory")
-    if storage == "memory":
-        assert "storage: null keeps no completed trials between runs" in caplog.text
 
 
 _RUN_CONFIG = """

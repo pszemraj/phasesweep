@@ -1032,7 +1032,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     trial = study.ask()
     trial.set_user_attr(TRIAL_DIR_ATTR, bad_value)
 
-    with pytest.raises(RuntimeError, match="invalid persisted"):
+    with pytest.raises(RuntimeError, match="user attribute is missing or invalid"):
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
@@ -1054,7 +1054,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
         pytest.param(
             "ledger-read", "cleanup recovery ledger could not be updated", id="ledger-read"
         ),
-        pytest.param("tell", "Optuna state could not be updated", id="tell"),
+        pytest.param("tell", "could not be marked FAIL", id="tell"),
     ],
 )
 def test_reaper_reports_storage_failures_after_cleanup(
@@ -1165,10 +1165,7 @@ def test_reaper_keeps_uncertain_cleanup_actionable(
 
     text = _operational_error_text(excinfo.value)
     assert "pid=99999 pgid=99998" in text
-    assert (
-        "List the members of process group 99998 with `pgrep -a -g 99998` "
-        "and check GPU processes before retrying recovery"
-    ) in text
+    assert "List the group's members with `pgrep -a -g 99998`, then retry recovery" in text
     assert text.index("`pgrep") < text.index("fix:")
     assert "recover-run" in text
     assert uncertain == {"uncertain-attempt"}
@@ -1559,7 +1556,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     )
     report = _PreflightCleanupReport()
     if identity_change == "generation":
-        with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
+        with pytest.raises(StudySchemaMismatchError, match="identifies generation"):
             _preflight_active_attempts(experiment, report, confirm=True)
     elif identity_change in {"missing-attempt", "missing-generation"}:
         with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
@@ -1948,9 +1945,6 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     else:
         assert "allocated lifecycle marker" in message
     assert "No trainer was started" in message
-    # The refusal routes only the workdir repair; its message says when the
-    # durable abort also needs a higher target, as the rerun below shows.
-    assert "n_trials" in message and "accepted target" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"

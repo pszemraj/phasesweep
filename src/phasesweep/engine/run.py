@@ -58,7 +58,12 @@ from phasesweep.engine.state import (
     _winning_trials,
 )
 from phasesweep.engine.study_policy import _launch_preflight
-from phasesweep.errors import OperatorAction, PhaseSweepError, ProcessCleanupUncertainError
+from phasesweep.errors import (
+    OperatorAction,
+    PhaseSweepError,
+    ProcessCleanupUncertainError,
+    operator_step,
+)
 from phasesweep.run_report import duration_text, report, run_totals, skipped_line, winner_line
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -340,19 +345,18 @@ def _run_experiment_outcome(
             )
         except StudyStorageUnavailableError as exc:
             # Unreadable ownership state cannot rule out earlier live attempts.
-            unknown = (
-                "Artifact ownership could not be checked because required persistent "
-                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
-            )
+            unknown = f"Could not check artifact ownership: {exc}"
+            for_mcp = "for an MCP run, then run `phasesweep mcp recover-run`"
             if isinstance(exc, IncompleteJournalRecordError):
                 # A partial final record's repair did not finish, and it names its
                 # own remedy; restoring the whole ledger instead would be wrong.
                 raise ProcessCleanupUncertainError.rewrap(
-                    exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
+                    exc, unknown, remediation=f"{operator_step(exc).rstrip('.')}; {for_mcp}."
                 ) from exc
             raise ProcessCleanupUncertainError(
-                f"{unknown} An MCP run requires phasesweep mcp recover-run after ledger repair.",
+                unknown,
                 action=OperatorAction.RESTORE_LEDGER,
+                remediation=f"Restore or repair the storage ledger; {for_mcp}.",
             ) from exc
         if not environments_preflighted:
             # Checked before recovery, so a launch that a phase with no study would refuse
@@ -627,8 +631,8 @@ def _mirror_publication(
     except ProcessCleanupUncertainError as exc:
         cleanup.mark_uncertain(exc)
         log.exception(
-            "An MLflow tracking worker of generation %s's run may still be running; the "
-            "published result is unaffected. Run %s to retry its cleanup and delivery.",
+            "An MLflow tracking worker of generation %s's run may still be running. Run %s "
+            "to retry its cleanup and delivery.",
             generation_id,
             SYNC_TRACKING_STEP,
         )
@@ -638,9 +642,8 @@ def _mirror_publication(
         raise
     except Exception:
         log.exception(
-            "MLflow delivery records of generation %s's run were not all saved; the published "
-            "result is unaffected. The next run or %s rebuilds them from the ledger and the "
-            "published generation.",
+            "MLflow delivery records of generation %s's run were not all saved. Run %s to "
+            "rebuild them.",
             generation_id,
             SYNC_TRACKING_STEP,
         )
@@ -815,8 +818,7 @@ def _run_experiment_inner(
         published_id = generation_ops._publication_holds(experiment, winners)
         if published_id is not None:
             log.info(
-                "No trial launched and generation %s already publishes these winners; "
-                "the publication is unchanged and no new generation was written.",
+                "No trial launched and generation %s already publishes these winners.",
                 published_id,
             )
             generation.replayed_generation_id = published_id

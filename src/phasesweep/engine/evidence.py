@@ -277,6 +277,15 @@ def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mappi
     return progress_position(record["value"]) is not None
 
 
+def _short_digest(digest: str) -> str:
+    """Shorten a SHA-256 digest to the prefix a refusal prints.
+
+    :param str digest: Full hexadecimal digest.
+    :return str: Its first 12 characters followed by an ellipsis.
+    """
+    return f"{digest[:12]}..."
+
+
 def _verify_objective_source_evidence(
     trial_dir: Path,
     provenance: Mapping[str, Any] | None,
@@ -340,8 +349,8 @@ def _verify_objective_source_evidence(
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} with sha256 "
-            f"{recorded_digest}, but that file now hashes to {actual_digest}: the bytes behind "
-            f"the published metric have changed."
+            f"{_short_digest(recorded_digest)}, but that file now hashes to "
+            f"{_short_digest(actual_digest)}: its bytes have changed."
         )
 
 
@@ -425,9 +434,9 @@ def _verify_trainer_input_evidence(
         ) from exc
     if actual_digest != recorded_digest:
         raise TrialEvidenceMissingError(
-            f"{subject} recorded trainer input {filename!r} with sha256 {recorded_digest}, "
-            f"but that file now hashes to {actual_digest}: the exact trainer input bytes "
-            f"have changed."
+            f"{subject} recorded trainer input {filename!r} with sha256 "
+            f"{_short_digest(recorded_digest)}, but that file now hashes to "
+            f"{_short_digest(actual_digest)}: its bytes have changed."
         )
 
 
@@ -544,9 +553,7 @@ def _verify_trial_evidence_dir(
         "config_sha256"
     ] != extractor_config_fingerprint(verification.extractor):
         raise TrialEvidenceMissingError(
-            f"{subject} objective evidence no longer matches its configured extractor "
-            "evaluation contract. The extractor configuration or evaluator revision "
-            "changed after this trial ran, or the saved provenance was altered.",
+            f"{subject} objective evidence no longer matches its configured extractor.",
             action=OperatorAction.FRESH_NAMESPACE,
             remediation=NEW_STUDY_STEP,
         )
