@@ -92,6 +92,7 @@ from tests.conftest import (
     phase_study,
     phase_trials,
     trial_outcome,
+    use_guardian_timing,
     write_experiment_config,
     write_param_echo_trainer,
     write_trainer,
@@ -636,13 +637,15 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
             time.sleep(0.01)
         """,
     )
-    guardian_script = write_trainer(
-        tmp_path / "guardian.py",
-        f"""
-        import runpy, time
+    use_guardian_timing(
+        monkeypatch,
+        tmp_path,
+        settle_seconds=0.2,
+        term_grace_seconds=0.2,
+        patch=f"""
+        import time
         from pathlib import Path
-        namespace = runpy.run_path({process._SUPERVISOR_SCRIPT_PATH!r})
-        original = namespace["write_lifecycle_record"]
+        original = guardian.write_lifecycle_record
         def fail_intent(path: Path, *, attempt_id: str, state: str, return_code: int | None, cleanup_confirmed: bool | None, duration_seconds: float | None) -> None:
             if state == "terminating" and {intent_write_fails!r}:
                 Path({str(failed)!r}).touch()
@@ -652,16 +655,13 @@ def test_guardian_cancellation_preserves_evidence_and_lease(
                 while not Path({str(publish)!r}).exists():
                     time.sleep(0.01)
             original(path, attempt_id=attempt_id, state=state, return_code=return_code, cleanup_confirmed=cleanup_confirmed, duration_seconds=duration_seconds)
-        namespace["main"].__globals__["write_lifecycle_record"] = fail_intent
-        namespace["main"].__globals__["_GROUP_TERM_GRACE_SECONDS"] = 0.2
+        guardian.write_lifecycle_record = fail_intent
         if not {procfs_available!r}:
             def no_procfs(path):
                 raise FileNotFoundError(path)
-            namespace["os"].scandir = no_procfs
-        raise SystemExit(namespace["main"]())
+            guardian.os.scandir = no_procfs
         """,
     )
-    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(guardian_script))
     process.write_attempt_lifecycle(tmp_path, attempt_id="held-lease", state="launching")
     lease = tmp_path / "gpu.lock"
     with lease.open("w") as held, (tmp_path / "guardian.log").open("w") as output:
