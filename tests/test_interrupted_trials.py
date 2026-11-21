@@ -60,6 +60,7 @@ from phasesweep.engine.state import (
     DURATION_ATTR,
     FAILURE_REASON_ATTR,
     FEASIBLE_ATTR,
+    OBJECTIVE_PROVENANCE_ATTR,
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
@@ -80,7 +81,7 @@ from phasesweep.engine.study_policy import (
 )
 from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.errors import OPERATOR_STEPS, OperatorAction, PhaseSweepError
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
 from phasesweep.runtime.reaper import read_boot_id
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownLaunchRefusedError
@@ -1463,6 +1464,88 @@ def test_finished_training_whose_tracker_answers_a_failure_fails_once(
     outcome = trial.user_attrs[TRIAL_OUTCOME_ATTR]
     assert (outcome["outcome"], outcome["cause"]) == ("failure", reason)
     assert launches.read_text().splitlines() == ["launch"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "failed_write",
+    [TRIAL_OUTCOME_ATTR, FAILURE_REASON_ATTR],
+    ids=["before-outcome", "after-gate-outcome"],
+)
+def test_recovered_evidence_failure_survives_a_journal_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_write: str
+) -> None:
+    """Keep finished training and its failure-limit abort across a failed recovery write."""
+    from phasesweep.evidence.models import RequiredFileGate
+    from phasesweep.evidence.wandb import WandbRunTerminalError, WandbSetupError
+    from phasesweep.runtime.time import utc_now_iso
+
+    experiment, launches = wandb_objective_experiment(
+        tmp_path, n_trials=1, max_consecutive_failures=1
+    )
+    gate_failure = failed_write == FAILURE_REASON_ATTR
+    if gate_failure:
+        (phase,) = experiment.phases
+        gate = RequiredFileGate(type="required_file", path="receipt")
+        experiment = experiment.model_copy(
+            update={"phases": [phase.model_copy(update={"gates": [gate]})]}
+        )
+
+    tracker_down = True
+    reads = 0
+
+    def summary(*, run_id: str, **_options: object) -> JsonObject:
+        nonlocal reads
+        reads += 1
+        if tracker_down:
+            raise WandbSetupError(run_id, "HTTP 503")
+        if not gate_failure:
+            raise WandbRunTerminalError(run_id, "crashed")
+        return {"values": {"x": 4.0}, "present_keys": [], "retrieved_at": utc_now_iso()}
+
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", summary)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+    tracker_down = False
+
+    original_set = optuna.Trial.set_user_attr
+    writes_failed = False
+
+    def fail_journal(trial: optuna.Trial, key: str, value: JsonValue) -> None:
+        nonlocal writes_failed
+        writes_failed = writes_failed or key == failed_write
+        if writes_failed:
+            raise OSError("journal write failed")
+        original_set(trial, key, value)
+
+    with monkeypatch.context() as journal:
+        journal.setattr(optuna.Trial, "set_user_attr", fail_journal)
+        with pytest.raises(StudyStorageUnavailableError, match="could not be committed"):
+            run_experiment(experiment)
+
+    (pending,) = phase_trials(experiment)
+    assert pending.state == optuna.trial.TrialState.RUNNING
+    assert FAILURE_REASON_ATTR not in pending.user_attrs
+    if gate_failure:
+        assert OBJECTIVE_PROVENANCE_ATTR in pending.user_attrs
+        assert TRIAL_OUTCOME_ATTR in pending.user_attrs
+    else:
+        assert TRIAL_OUTCOME_ATTR not in pending.user_attrs
+
+    reads_before_retry = reads
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+    (failed,) = phase_trials(experiment)
+    outcome = failed.user_attrs[TRIAL_OUTCOME_ATTR]
+    assert failed.state == optuna.trial.TrialState.FAIL
+    assert outcome["outcome"] == "failure"
+    assert ("receipt is missing" if gate_failure else "crashed") in outcome["cause"]
+    assert outcome[TRIAL_OUTCOME_ABORT_KEY]["consecutive_failures"] == 1
+    # The committed gate rejection never re-reads its evidence.
+    assert reads == reads_before_retry + (0 if gate_failure else 1)
+    assert launches.read_text().splitlines() == ["launch"]
+    assert not _last_successful_generation_path(experiment).exists()
 
 
 @pytest.mark.integration

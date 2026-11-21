@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.json import JsonObject, json_object, strict_json_loads
 
 if TYPE_CHECKING:
     from optuna.trial import FrozenTrial, Trial
@@ -492,17 +492,33 @@ def _completed_trainer_duration(
 def _recorded_infeasible_result(trial: FrozenTrial, outcome: _ParsedTrialOutcome | None) -> bool:
     """Recognize extracted bound violations that still commit as measured COMPLETE trials.
 
+    A failed gate can retain the objective's provenance. The recorded gates distinguish
+    that failure even when the separate failure-reason write has not committed.
+
     :param FrozenTrial trial: Trial carrying canonical extracted result attributes.
     :param _ParsedTrialOutcome | None outcome: Parsed terminal outcome, when recorded.
     :return bool: Whether a failed outcome represents measured infeasibility.
     """
-    return (
+    if not (
         outcome is not None
         and outcome.outcome == "failure"
         and trial.user_attrs.get(FEASIBLE_ATTR) is False
         and trial.user_attrs.get(RETURN_CODE_ATTR) == 0
         and isinstance(trial.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR), str)
         and FAILURE_REASON_ATTR not in trial.user_attrs
+    ):
+        return False
+    raw_gates = trial.user_attrs.get(GATES_ATTR)
+    if raw_gates is None:
+        return True
+    if not isinstance(raw_gates, str):
+        return False
+    try:
+        gates = strict_json_loads(raw_gates)
+    except ValueError:
+        return False
+    return isinstance(gates, list) and all(
+        isinstance(gate, dict) and gate.get("passed") is True for gate in gates
     )
 
 

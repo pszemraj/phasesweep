@@ -1300,10 +1300,12 @@ def _recover_completed_trial(
         if result.failure_reason is not None:
             # The tracker answered about finished training, so this is the trial's measured
             # failure, recorded as the live path records it; only unproven training reruns.
-            active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
             _record_stale_trial_outcome(
                 study, trial, evidence_failure=result.failure_reason, policy_phase=phase
             )
+            # The outcome owns the verdict. Writing this diagnostic first would make a
+            # retry skip extraction even if the failure and its abort never committed.
+            active_trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
         else:
             _record_stale_trial_outcome(
                 study, trial, completed_feasible=result.feasible, policy_phase=phase
