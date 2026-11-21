@@ -377,6 +377,7 @@ def _extract_log_regex(
     result: float | None = None
     result_line: int | None = None
     count = 0
+    unparseable = False
     line_no = 0
     try:
         with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -398,6 +399,7 @@ def _extract_log_regex(
                     try:
                         v = float(match.group("value"))
                     except (TypeError, ValueError):
+                        unparseable = True
                         continue
                     count += 1
                     if cfg.select in ("first", "last"):
@@ -425,6 +427,11 @@ def _extract_log_regex(
         raise ExtractorError(f"Could not read log file at {target}: {exc}") from exc
 
     if count == 0:
+        if unparseable:
+            raise ExtractorError(
+                f"Pattern {cfg.pattern!r} matched in {target}, but no 'value' capture was "
+                "numeric. Adjust the capture to exclude delimiters around the number."
+            )
         raise ExtractorError(f"No matches for {cfg.pattern!r} in {target}.")
     assert result is not None  # count > 0 guarantees this
     if provenance is not None:

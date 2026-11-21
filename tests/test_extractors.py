@@ -1673,10 +1673,14 @@ def test_log_regex_min_max_fails_on_any_non_finite_match(
     assert "source" not in provenance
 
 
-def test_log_regex_reports_no_matches(tmp_path):
-    (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
-    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")
-    with pytest.raises(ExtractorError, match="No matches"):
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [("nothing here", "No matches"), ("eval_loss=0.5,", "no 'value' capture was numeric")],
+)
+def test_log_regex_reports_no_matches(tmp_path: Path, line: str, message: str) -> None:
+    (tmp_path / "stdout.log").write_text(line, encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>\S+)")
+    with pytest.raises(ExtractorError, match=message):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
