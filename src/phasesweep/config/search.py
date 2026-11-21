@@ -18,7 +18,6 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
-from phasesweep.errors import NEW_STUDY_STEP
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -530,16 +529,25 @@ def grid_target_refusal(
     :param int finished: Finished attempts, excluding interruptions.
     :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
     :param bool has_study: Whether a recorded study binds the search space, so that
-        enlarging the grid needs a new study; a config that never ran has none.
+        enlarging the grid needs a new phase name; a config that never ran has none.
     :return tuple[str, str] | None: Refusal diagnosis and remedy when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
     if phase.sampler.type != "grid" or maximum is None or phase.n_trials <= maximum:
         return None
     cardinality = grid_cardinality(phase)
+    # A recorded study refuses a changed search space, and a new phase name is the step that
+    # loses the least work: it starts a new study for this phase and the phases that inherit it.
+    enlarge = (
+        "change the search space and give the phase, and each phase that inherits it, a new "
+        "`name`, updating every `inherits` to match; each renamed phase starts a new study and "
+        "measures every cell again, the finished ones included"
+        if has_study
+        else "change the search space"
+    )
     remedy = (
         f"Set phases[{phase.name}].n_trials to at most {maximum}. "
-        "To enlarge the grid instead, change the search space."
+        f"To enlarge the grid instead, {enlarge}."
     )
     return (
         f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid's available "
@@ -547,7 +555,7 @@ def grid_target_refusal(
         f"{measured} COMPLETE or INFEASIBLE cell{'s' if measured != 1 else ''} "
         f"in a {cardinality}-cell grid allow at most {maximum}. Raising n_trials retries "
         "failed cells once each; COMPLETE and INFEASIBLE cells are never repeated.",
-        f"{remedy} {NEW_STUDY_STEP}" if has_study else remedy,
+        remedy,
     )
 
 

@@ -803,14 +803,26 @@ def test_validate_refuses_an_oversized_fresh_persistent_grid(
     assert "old study" not in error
 
 
-def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_study(
+def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_phase_name(
     tmp_path: Path,
 ) -> None:
-    """Changing the search space of a grid that already ran needs a new study, and the remedy says so."""
-    trainer, _calls = write_flaky_trainer(tmp_path, failures=0)
+    """Enlarging a grid that already ran needs a renamed phase, and the one remedy says it measures everything again."""
+    trainer, calls = write_flaky_trainer(tmp_path, failures=0)
     assert run_experiment(_grid(tmp_path, trainer, 2))["p"].metric == 1.0
     with pytest.raises(TrialTargetRefusedError) as refused:
         run_experiment(_grid(tmp_path, trainer, 4))
     message = _operational_error_text(refused.value)
-    assert "To enlarge the grid instead, change the search space." in message
-    _assert_fresh_study_remedy(message)
+    assert (
+        "To enlarge the grid instead, change the search space and give the phase, and each "
+        "phase that inherits it, a new `name`, updating every `inherits` to match; each renamed "
+        "phase starts a new study and measures every cell again, the finished ones included."
+    ) in message
+    assert "new `experiment` name" not in message
+    assert "old study" not in message
+
+    # Following the remedy runs: the renamed phase is a new study and measures every cell again.
+    enlarged = _grid(tmp_path, trainer, 4, cells=4)
+    (phase,) = enlarged.phases
+    renamed = enlarged.model_copy(update={"phases": [phase.model_copy(update={"name": "p_v2"})]})
+    assert run_experiment(renamed)["p_v2"].metric == 1.0
+    assert len(calls.read_text().splitlines()) == 2 + 4
