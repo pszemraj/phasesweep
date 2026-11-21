@@ -240,7 +240,8 @@ def test_recover_run_finishes_the_mlflow_run_of_each_trial_it_settles(
     sends = 2 if source == "running" else 1
     assert requests == ["resolve"] + ["publish"] * sends
     assert (run.sent(), run.summaries()) == ([finish], [finish])
-    assert f"Delivered {sends} MLflow record(s); none stay pending." in confirmed.output
+    delivered = "1 record" if sends == 1 else f"{sends} records"
+    assert f"MLflow: delivered {delivered}; none stay pending." in confirmed.output
     assert _PENDING_STEP not in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
@@ -283,7 +284,7 @@ def test_recover_run_ends_the_summary_run_of_a_run_killed_between_trials(
     assert confirmed.exit_code == 0, confirmed.output
     assert requests == ["resolve", "publish"]
     assert (run.sent(), run.summaries()) == ([], ["KILLED"])
-    assert "Delivered 1 MLflow record(s); none stay pending." in confirmed.output
+    assert "MLflow: delivered 1 record; none stay pending." in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert (delivery["pending"], delivery["remedy"]) == (0, None)
@@ -320,7 +321,11 @@ def test_recover_run_distinguishes_a_creation_miss_from_an_upload_failure(
     monkeypatch.setattr(session, "request_operation", lookup)
     result = run.recover()
     assert result.exit_code == 0, result.output
-    assert "MLflow records pending: 1, 1 of them unconfirmed run creations." in result.output
+    # The summary record went out; the attempt's creation, inside its window, stays unconfirmed.
+    assert (
+        "MLflow: delivered 1 record. MLflow: 1 unconfirmed run creation pending. The next launch"
+        in result.output
+    )
     assert _PENDING_STEP in result.output
     assert pending.is_file() and not bound.exists()
     assert not run.store.observe(run.handle).recovery_required
@@ -346,7 +351,7 @@ def test_recover_run_leaves_outcomes_pending_while_mlflow_is_down(
     assert requests == ["resolve"]
     assert run.sent() == []
     assert read_record(run.record)["state"] == "pending"
-    assert "MLflow records pending: 2, 0 of them unconfirmed run creations." in confirmed.output
+    assert "MLflow: 2 records pending. The next launch" in confirmed.output
     assert _PENDING_STEP in confirmed.output
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]

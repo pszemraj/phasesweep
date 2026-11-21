@@ -98,7 +98,7 @@ def test_pending_mlflow_uploads_get_final_closeout_without_failing_publication(
         and not isinstance(failure, OperationUnavailableError)
         else ""
     )
-    assert message == f"MLflow: 7 record(s) pending; {_PENDING_STEP}{refused}"
+    assert message == f"MLflow: 7 records pending; {_PENDING_STEP}{refused}"
     assert message in (_experiment_dir(experiment) / "run.log").read_text()
 
 
@@ -210,10 +210,10 @@ def test_the_next_run_delivers_an_interrupted_runs_pending_records(
     report = [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER]
     [sending] = [line for line in report if line.startswith("MLflow: sending")]
     assert re.fullmatch(
-        r"MLflow: sending \d+ record\(s\), 2 of them left pending by earlier runs\.", sending
+        r"MLflow: sending \d+ records, 2 of them left pending by earlier runs\.", sending
     )
     assert report.index(sending) < report.index(
-        "MLflow: delivered 2 record(s) left pending by earlier runs."
+        "MLflow: delivered 2 records left pending by earlier runs."
     )
     # Report blocks, so the console wraps them to the terminal.
     blocks = [
@@ -289,13 +289,14 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
         own = publication.delivery_status(sweep.experiment, reports[0].generation_id)
         assert pending == earlier + own["pending"]
         assert (own["pending"] > 0) is (moment == "closeout")
-        delivered = "MLflow: delivered 1 record(s) left pending by earlier runs."
+        delivered = "MLflow: delivered 1 record left pending by earlier runs."
         assert (delivered in caplog.text) is (moment == "closeout")
     assert "did not answer" not in caplog.text
     assert "is not ready" not in caplog.text
     assert "launch refused" not in caplog.text
     in_parentheses = f" ({earlier} from earlier runs)" if earlier else ""
-    assert f"MLflow: {pending} record(s) pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
+    assert pending > 1
+    assert f"MLflow: {pending} records pending{in_parentheses}; {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration
@@ -374,7 +375,7 @@ def test_a_ctrl_c_while_trials_upload_stops_delivery_without_blaming_mlflow(
     assert publication.delivery_status(experiment) == {"pending": n_jobs + 1, "delivered": 0}
     for blame in ("did not answer", "is not ready", "launch refused", "is pending ("):
         assert blame not in caplog.text
-    assert f"MLflow: {n_jobs + 1} record(s) pending; {_PENDING_STEP}" in caplog.text
+    assert f"MLflow: {n_jobs + 1} records pending; {_PENDING_STEP}" in caplog.text
 
 
 @pytest.mark.integration
@@ -492,8 +493,9 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         assert own_pending > 0
         assert caplog.text.count("MLflow did not answer") == 1
         earlier = 2 + len(intents)
+        creations = " and 1 unconfirmed run creation" if creation else ""
         assert (
-            f"MLflow: {earlier + own_pending} record(s) pending ({earlier} from earlier runs); "
+            f"MLflow: {2 + own_pending} records{creations} pending ({earlier} from earlier runs); "
             f"{_PENDING_STEP}" in caplog.text
         )
         assert "MLflow: delivered" not in caplog.text
@@ -505,10 +507,12 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
         assert sent[-1] == (own, "generation")
         assert sweep.summaries() == ["KILLED"]
         assert own_pending == 0
-        assert "MLflow: delivered 1 record(s) left pending by earlier runs." in caplog.text
+        assert "MLflow: delivered 1 record left pending by earlier runs." in caplog.text
         pending = 1 + len(intents)
+        # The search answered that no run carries the identity yet, inside the creation window.
+        creations = " and 1 unconfirmed run creation" if creation else ""
         assert (
-            f"MLflow: {pending} record(s) pending ({pending} from earlier runs); {_PENDING_STEP} "
+            f"MLflow: 1 record{creations} pending ({pending} from earlier runs); {_PENDING_STEP} "
             "MLflow refused 1 of them; a refused record stays pending until the cause its warning "
             "gives is fixed in MLflow." in caplog.text
         )
@@ -516,6 +520,65 @@ def test_closeout_sends_earlier_records_first_and_stops_at_the_first_unanswered_
             f"MLflow: attempt record {attempt} of generation {sweep.generation} is pending "
             "(RESOURCE_DOES_NOT_EXIST: run was deleted)." in caplog.text
         )
+
+
+@pytest.mark.integration
+def test_the_closing_lines_account_for_every_creation_and_record_the_sending_lines_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A closeout counts run creations apart from records, and its closing line adds them up.
+
+    An interrupted run left its trial's outcome and its summary run's end pending, and a run
+    killed while creating its summary run left that creation unconfirmed. The closeout first
+    says it is checking that creation; the search binds the run, so the killed run's summary
+    record is rebuilt and sent in the same pass, counted in the sending line that follows the
+    search. The closing line names the creation settled and every record delivered.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    respond = session.request_operation
+
+    def killed_at_summary_creation(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "create":
+            raise RunnerKilled()
+        return respond(request, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(session, "request_operation", killed_at_summary_creation)
+        patch.setattr(publication, "deliver_closeout", lambda *args, **kwargs: None)
+        with pytest.raises(RunnerKilled):
+            run_experiment(sweep.experiment)
+    [intent] = session.pending_creation_records(sweep.experiment)
+    killed = intent.parent.name
+
+    def late_run(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if request["action"] == "find":
+            binding = request["binding"]
+            assert isinstance(binding, dict)
+            return {"found": True, "binding": {**binding, "run_id": "late-run"}}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", late_run)
+    monkeypatch.setattr(worker, "request_operation", late_run)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    publication.deliver_closeout(sweep.experiment, validate_ledger(sweep.experiment), "f" * 32)
+
+    assert [r.getMessage() for r in caplog.records if r.name == REPORT_LOGGER] == [
+        "MLflow: checking 1 unconfirmed run creation left by earlier runs.",
+        "MLflow: sending 3 records left pending by earlier runs.",
+        "MLflow: delivered 3 records and settled 1 unconfirmed run creation left pending by "
+        "earlier runs.",
+    ]
+    assert not intent.exists()
+    killed_summaries = [
+        request["finish"]
+        for request in sweep.uploads
+        if request["name"] == "generation" and request["binding"]["generation_id"] == killed
+    ]
+    assert killed_summaries == ["KILLED"]
+    assert sweep.summaries() == ["KILLED"]
+    assert publication.delivery_status(sweep.experiment)["pending"] == 0
+    assert "pending;" not in caplog.text
 
 
 @pytest.mark.integration
@@ -550,7 +613,7 @@ def test_a_run_refused_before_its_target_check_never_waits_on_the_tracker(
     assert requests == []
     assert read_record(sweep.summary)["state"] == "pending"
     assert "MLflow: sending" not in caplog.text
-    assert f"MLflow: 2 record(s) pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
+    assert f"MLflow: 2 records pending (2 from earlier runs); {_PENDING_STEP}" in caplog.text
     run_experiment(experiment)
     assert sweep.summaries() == ["KILLED"]
 

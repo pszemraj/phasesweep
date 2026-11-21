@@ -322,7 +322,12 @@ def recover_run(
                     "nothing is retrained."
                 )
             if tally is not None:
-                from phasesweep.tracking.publication import delivery_status, refused_text
+                from phasesweep.tracking.publication import (
+                    count_text,
+                    delivered_text,
+                    delivery_status,
+                    refused_text,
+                )
                 from phasesweep.tracking.session import pending_creation_records
 
                 # Counted after the uploads across every generation, as delivery covered them all.
@@ -332,16 +337,15 @@ def recover_run(
                 except (OSError, ValueError) as exc:
                     emit(f"MLflow pending records could not be counted ({exc}).")
                 else:
-                    delivered = tally.delivered
-                    sent = f"Delivered {delivered} MLflow record(s)" if delivered else ""
+                    done = delivered_text(tally.delivered, tally.settled)
+                    sent = f"MLflow: {done}" if done else ""
                     if pending:
                         emit(
                             (f"{sent}. " if sent else "")
-                            + f"MLflow records pending: {pending}, {creations} of them "
-                            "unconfirmed run creations. The next launch with this config, or "
-                            "`phasesweep sync-tracking CONFIG` with the config this run "
-                            "launched with, sends them; delivery never retrains."
-                            + refused_text(tally.refused)
+                            + f"MLflow: {count_text(pending - creations, creations)} pending. "
+                            "The next launch with this config, or `phasesweep sync-tracking "
+                            "CONFIG` with the config this run launched with, sends them; "
+                            "delivery never retrains." + refused_text(tally.refused)
                         )
                     elif sent:
                         emit(f"{sent}; none stay pending.")

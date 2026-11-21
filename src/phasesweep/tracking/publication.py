@@ -24,7 +24,7 @@ from phasesweep.runtime.json import (
     json_text,
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
-from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText
+from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
 from phasesweep.tracking.mlflow import OperationRejectedError
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
@@ -971,18 +971,17 @@ def _deliver_outstanding(
         pending = _pending_records(experiment, scope, skip=skip)
         if not tally.sending or not (creations or pending or own_pending):
             return
-        # A report line, so the console shows what the seconds before the last lines are for.
-        earlier = len(creations) + len(pending)
-        total = earlier + len(own_pending)
-        if not earlier:
-            from_earlier = ""
-        elif earlier == total:
-            from_earlier = " left pending by earlier runs"
+        # Report lines, so the console shows what the seconds before the next lines are for. A
+        # search can bind a run whose record is then rebuilt, so the records are counted for
+        # their line only once the searches are done.
+        if creations:
+            logging.getLogger(REPORT_LOGGER).info(
+                ReportText(
+                    f"MLflow: checking {count_text(0, len(creations))} left by earlier runs."
+                )
+            )
         else:
-            from_earlier = f", {earlier} of them left pending by earlier runs"
-        logging.getLogger(REPORT_LOGGER).info(
-            ReportText(f"MLflow: sending {total} record(s){from_earlier}.")
-        )
+            _report_sending(pending, own_pending)
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         if resolve:
             assert worker_generation is not None
@@ -1011,6 +1010,8 @@ def _deliver_outstanding(
                 unresolved=unresolved,
             )
             pending = _pending_records(experiment, scope, skip=skip)
+            if tally.sending and (pending or own_pending):
+                _report_sending(pending, own_pending)
         _send(
             experiment,
             pending + own_pending,
@@ -1021,6 +1022,24 @@ def _deliver_outstanding(
         )
     finally:
         errors.extend(unresolved.values())
+
+
+def _report_sending(pending: list[Path], own: list[Path]) -> None:
+    """Log the report line that says how many records a pass is about to send.
+
+    :param list[Path] pending: Ended generations' records about to be sent.
+    :param list[Path] own: A closing run's own records about to be sent after them.
+    """
+    total = len(pending) + len(own)
+    if not pending:
+        from_earlier = ""
+    elif not own:
+        from_earlier = " left pending by earlier runs"
+    else:
+        from_earlier = f", {len(pending)} of them left pending by earlier runs"
+    logging.getLogger(REPORT_LOGGER).info(
+        ReportText(f"MLflow: sending {count_text(total, 0)}{from_earlier}.")
+    )
 
 
 def _pending_creations(experiment: Experiment, scope: str | None, skip: str | None) -> list[Path]:
@@ -1192,34 +1211,67 @@ def deliver_closeout(
 def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryTally) -> None:
     """Log the lines that close a run's MLflow delivery.
 
-    Records delivered for earlier runs are counted when there are any, then the records still
-    pending, the run's own and earlier runs', with the step that sends them and, when MLflow
-    refused some, what keeps those pending.
+    What was delivered and settled for earlier runs is counted when there is any, then what
+    stays pending, the run's own and earlier runs', with the step that sends it and, when MLflow
+    refused some, what keeps those pending. Together they account for everything the sending
+    lines named: records and run creations alike are either counted here as done or pending.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: The run's own generation.
     :param DeliveryTally tally: The run's closeout delivery.
     """
-    delivered = tally.delivered
     try:
         pending = delivery_status(experiment)["pending"]
         earlier = pending - delivery_status(experiment, generation_id)["pending"]
+        creations = len(pending_creation_records(experiment))
     except (OSError, ValueError) as exc:
         log.warning("MLflow: pending records could not be counted (%s).", exc)
         return
-    if delivered:
+    done = delivered_text(tally.delivered, tally.settled)
+    if done:
         # A report line, so the console shows that an earlier interruption was made good.
         logging.getLogger(REPORT_LOGGER).info(
-            ReportText(f"MLflow: delivered {delivered} record(s) left pending by earlier runs.")
+            ReportText(f"MLflow: {done} left pending by earlier runs.")
         )
     if pending:
         log.warning(
-            "MLflow: %d record(s) pending%s; results are saved locally. The next run or "
+            "MLflow: %s pending%s; results are saved locally. The next run or "
             "`phasesweep sync-tracking CONFIG` sends them.%s",
-            pending,
+            count_text(pending - creations, creations),
             f" ({earlier} from earlier runs)" if earlier else "",
             refused_text(tally.refused),
         )
+
+
+def count_text(records: int, creations: int) -> str:
+    """Count delivery records and unconfirmed run creations in the words every MLflow line uses.
+
+    A run creation whose answer was lost is searched for, never sent again, so it is counted
+    apart from the records that are uploaded.
+
+    :param int records: Delivery records.
+    :param int creations: Unconfirmed run creations, the intents a search settles.
+    :return str: For example ``2 records``, ``1 unconfirmed run creation`` or ``2 records and
+        1 unconfirmed run creation``; ``0 records`` when both are zero.
+    """
+    parts = [plural(records, "record")] if records or not creations else []
+    if creations:
+        parts.append(plural(creations, "unconfirmed run creation"))
+    return " and ".join(parts)
+
+
+def delivered_text(delivered: int, settled: int) -> str:
+    """Say what a delivery delivered and settled, in the words of :func:`count_text`.
+
+    :param int delivered: Delivery records delivered.
+    :param int settled: Unconfirmed run creations settled, bound to their run or retired.
+    :return str: For example ``delivered 2 records and settled 1 unconfirmed run creation``,
+        or an empty string when there was neither.
+    """
+    parts = [f"delivered {plural(delivered, 'record')}"] if delivered else []
+    if settled:
+        parts.append(f"settled {plural(settled, 'unconfirmed run creation')}")
+    return " and ".join(parts)
 
 
 def refused_text(refused: int) -> str:

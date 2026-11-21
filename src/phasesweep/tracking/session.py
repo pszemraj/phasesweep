@@ -85,6 +85,8 @@ class DeliveryTally:
     """Why MLflow gave no answer, once a request got none."""
     delivered: int = 0
     """Records of ended generations delivered."""
+    settled: int = 0
+    """Unconfirmed run creations settled: bound to the run a search found, or retired."""
     refused: int = 0
     """Records MLflow answered with a refusal, such as for a deleted run; they stay pending."""
 
@@ -521,12 +523,14 @@ def _reconcile_creation(
     :param Path pending: Unconfirmed creation intent.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None worker_generation: Invocation registering the lookup, defaulting to the intent's generation.
-    :param DeliveryTally tally: The delivery the search belongs to, which stops sending when
-        MLflow gives no answer or a shutdown is under way.
+    :param DeliveryTally tally: The delivery the search belongs to, which counts the intent
+        settled once it is retired, and stops sending when MLflow gives no answer or a shutdown
+        is under way.
     """
     path = pending.with_suffix("").with_suffix(".json")
     if path.exists():
         _retire_creation(pending)
+        tally.settled += 1
         return
     settings = experiment.mlflow
     assert settings is not None
@@ -571,6 +575,7 @@ def _reconcile_creation(
     elif not expired:
         return
     _retire_creation(pending)
+    tally.settled += 1
 
 
 def _resolve_source(
