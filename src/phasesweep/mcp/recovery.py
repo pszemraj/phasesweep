@@ -504,7 +504,8 @@ def _recovery_needs(
     if not cleanup_needed and snapshot_unavailable and not snapshot_recovery_required:
         raise RunRecoveryError(
             "this run has no immutable terminal result snapshot. Historical results cannot "
-            "be rebuilt from the current shared study because later runs may have changed it."
+            "be rebuilt from the current shared study because later runs may have changed it.",
+            remediation="No further cleanup or result repair is available for this run.",
         )
     return _RecoveryNeeds(
         terminal_status=terminal_status,

@@ -1468,6 +1468,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         # explicit refusal; retry must not repeat process cleanup to repair it.
         assert repeat.exit_code == 1, repeat.output
         assert "no immutable terminal result snapshot" in repeat.output
+        assert "No further cleanup or result repair is available for this run" in repeat.output
+        assert "inspect the PhaseSweep run log" not in repeat.output
     assert store.status_path(run_id).read_bytes() == final_status
     assert store.cleanup_recovery_path(run_id).read_bytes() == final_recovery
     assert runner_cleanup_calls == [(handle.pid, 111, handle.pid)]
