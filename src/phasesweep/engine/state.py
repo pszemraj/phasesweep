@@ -165,9 +165,10 @@ class Winner:
 class PhaseCounts:
     """A phase's trials by recorded state when the phase ended, as the run's summary reports them.
 
-    ``earlier`` counts the trials, in any of those states, that a previous run recorded.
-    ``winner_dirs`` holds the attempt directory of each trial the phase's winner stands on, in
-    trial order, leaving out one that recorded none; it is read for the summary and never saved.
+    ``earlier`` counts the trials of a state in :data:`FINISHED_TRIAL_STATES` that a previous run
+    recorded, so it is a part of :attr:`counted`. ``winner_dirs`` holds the attempt directory of
+    each trial the phase's winner stands on, in trial order, leaving out one that recorded none;
+    it is read for the summary and never saved.
     """
 
     complete: int = 0
@@ -178,12 +179,21 @@ class PhaseCounts:
     winner_dirs: tuple[Path, ...] = ()
 
     @property
-    def total(self) -> int:
-        """Count every trial in a reported state.
+    def counted(self) -> int:
+        """Count the trials that count toward ``n_trials``, as the status heading does.
 
-        :return int: Complete, infeasible, failed and interrupted trials together.
+        An interrupted trial is in none of the :data:`FINISHED_TRIAL_STATES`: its rerun counts
+        in its place.
+
+        :return int: Trials in a state of :data:`FINISHED_TRIAL_STATES`.
         """
-        return self.complete + self.infeasible + self.failed + self.interrupted
+        by_state: dict[TrialStateName, int] = {
+            "COMPLETE": self.complete,
+            "INFEASIBLE": self.infeasible,
+            "FAIL": self.failed,
+            "INTERRUPTED": self.interrupted,
+        }
+        return sum(by_state[state] for state in FINISHED_TRIAL_STATES)
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"

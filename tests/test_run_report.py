@@ -16,14 +16,17 @@ from pathlib import Path
 import optuna
 import pytest
 
+from phasesweep import run_experiment
 from phasesweep.cli import _console_logging, _rerun_command, _resume_hint
 from phasesweep.config.models import ExecutionContext, Experiment, Metric, Phase
 from phasesweep.config.search import CategoricalParam, IntParam, Repeats, Sampler
+from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.read import read_trial_tables
 from phasesweep.engine.repeats import RepeatsRecord, spread
+from phasesweep.engine.run import _phase_counts
 from phasesweep.engine.selection import PhaseTrialsFailedError
-from phasesweep.engine.state import PhaseCounts, Winner
+from phasesweep.engine.state import GENERATION_ID_ATTR, TRIAL_OUTCOME_ATTR, PhaseCounts, Winner
 from phasesweep.errors import UnsafeProcessCleanupError, operator_step
 from phasesweep.evidence.models import RequiredFileGate, WandbExtractor
 from phasesweep.run_report import (
@@ -33,6 +36,7 @@ from phasesweep.run_report import (
     nothing_to_run,
     phase_start,
     rerun_line,
+    run_totals,
     skipped_line,
     summary,
     trial_line,
@@ -49,8 +53,10 @@ from tests.conftest import (
     SHORT_TRIAL_NAME,
     invoke_cli_boundary,
     make_experiment,
+    phase_study,
     run_log_text,
     stub_run_command,
+    trial_outcome,
     write_constant_trainer,
     write_experiment_config,
     write_param_echo_trainer,
@@ -977,13 +983,13 @@ def test_summary_of_a_resumed_run_with_failures_and_a_skipped_phase() -> None:
     )
     assert block.render(60, color=False) == [
         "",
-        "Finished in 2m05s: 1 phase, 7 trials, 4 from a previous run",
+        "Finished in 2m05s: 1 phase, 6 trials, 4 from a previous run",
         "",
         "  depth          skipped",
         "                 winner  trial 0  eval_loss 0.3",
         "                         model.n_layers=8",
-        "  learning_rate  3 complete, 2 failed, 1 infeasible,",
-        "                 1 interrupted",
+        "  learning_rate  3 complete, 2 failed,",
+        "                 1 infeasible (1 interrupted)",
         "                 winner  trial 0  eval_loss 0.3",
         "                         optimizer.lr=0.0003",
         "",
@@ -994,6 +1000,89 @@ def test_summary_of_a_resumed_run_with_failures_and_a_skipped_phase() -> None:
         "Next: phasesweep status 'my config.yaml' --set workdir=/data/x --trials",
     ]
     assert all(len(line) <= 60 for line in block.render(60, color=False)[:-1])
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            80,
+            [
+                "",
+                "Finished in 2.1s: 2 phases, 8 trials, 3 from a previous run",
+                "",
+                "  depth          3 complete, 1 failed (1 interrupted)",
+                "                 winner  trial 0  eval_loss 0.3  model.n_layers=8",
+                "  learning_rate  4 complete (2 interrupted)",
+                "                 winner  trial 0  eval_loss 0.3  optimizer.lr=0.0003",
+                "",
+                "Next: phasesweep status starter.yaml --trials",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "",
+                "Finished in 2.1s: 2 phases, 8 trials, 3 from a previous run",
+                "",
+                "  depth          3 complete, 1 failed (1 interrupted)",
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         model.n_layers=8",
+                "  learning_rate  4 complete (2 interrupted)",
+                "                 winner  trial 0  eval_loss 0.3",
+                "                         optimizer.lr=0.0003",
+                "",
+                "Next: phasesweep status starter.yaml --trials",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_summary_counts_the_trials_toward_n_trials_and_names_interrupted_ones_apart(
+    width: int, expected: list[str]
+) -> None:
+    """Both reports of one study agree: the status heading's count first, interrupted rows in parentheses."""
+    counts = {
+        "depth": _counts(complete=3, failed=1, interrupted=1, earlier=3),
+        "learning_rate": _counts(complete=4, interrupted=2),
+    }
+    block = summary(
+        _grid_experiment(),
+        elapsed=2.1,
+        counts=counts,
+        winners=STARTER_WINNERS,
+        from_phase=None,
+        written_root="runs/phasesweep_starter",
+        written=[],
+        next_command="phasesweep status starter.yaml --trials",
+    )
+
+    assert block.render(width, color=False) == expected
+    assert all(len(line) <= width for line in block.render(width, color=False))
+    assert run_totals(counts) == "2 phases, 8 trials, 3 from a previous run"
+    replay = nothing_to_run(
+        elapsed=0.4, counts=counts, generation_id="g" * 32, next_command="phasesweep status c.yaml"
+    )
+    assert replay.render(200, color=False)[1].startswith(
+        "Finished in 0.4s: nothing to run, 8 trials already finished"
+    )
+
+
+def test_a_phase_that_only_holds_interrupted_trials_still_says_so() -> None:
+    """With nothing counted, the clause reads ``no trials`` and the interrupted ones follow it."""
+    block = summary(
+        _grid_experiment(),
+        elapsed=2.1,
+        counts={"depth": _counts(interrupted=1)},
+        winners={},
+        from_phase=None,
+        written_root="runs/phasesweep_starter",
+        written=[],
+        next_command="phasesweep status starter.yaml --trials",
+    )
+
+    assert "  depth          no trials (1 interrupted)" in block.render(80, color=False)
 
 
 def test_summary_omits_the_written_section_when_nothing_was_written() -> None:
@@ -1769,3 +1858,29 @@ def test_a_resumed_run_counts_the_trials_a_previous_run_recorded(
     assert re.search(r"p  2 trials to run, 1 at a time, 2 already finished", err)
     assert re.search(r"Finished in \d+\.\ds: 1 phase, 4 trials, 2 from a previous run", err)
     assert f"Next: phasesweep status {config} --set 'phases[p].n_trials=4' --trials" in err
+
+
+def test_phase_counts_keep_an_interrupted_trial_out_of_the_counted_and_earlier_totals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline's counts follow the engine's rule: an interrupted trial never counts, nor is it earlier."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    experiment = make_experiment(
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=2, gpu_policy="none"
+    )
+    winner = run_experiment(experiment)["p"]
+    phase_study(experiment).add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.FAIL,
+            user_attrs={
+                GENERATION_ID_ATTR: "an-earlier-generation",
+                TRIAL_OUTCOME_ATTR: trial_outcome(9, "interrupted", cause="interrupted by SIGINT"),
+            },
+        )
+    )
+
+    counts = _phase_counts(validate_ledger(experiment), experiment.phases[0], "this-run", winner)
+
+    assert counts is not None
+    assert (counts.complete, counts.interrupted) == (2, 1)
+    assert (counts.counted, counts.earlier) == (2, 2)

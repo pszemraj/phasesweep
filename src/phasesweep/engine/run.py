@@ -38,7 +38,7 @@ from phasesweep.engine.errors import (
     TrackingTargetUnavailableError,
     phase_timeout,
 )
-from phasesweep.engine.optuna import _trial_count_state
+from phasesweep.engine.optuna import _finished_trial_count, _trial_count_state
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.preview import (
     PhasePreview,
@@ -644,7 +644,7 @@ def _mirror_publication(
 def _phase_counts(
     ledger: ledger_ops.ValidatedLedger, phase: Phase, generation_id: str, winner: Winner
 ) -> PhaseCounts | None:
-    """Count a finished phase's trials by recorded state, and those an earlier run recorded.
+    """Count a finished phase's trials by recorded state, and the counted ones an earlier run recorded.
 
     The counts also carry the attempt directory of each trial the phase's winner stands on, so
     the summary names them from the same read. Reporting never fails a run whose result is
@@ -675,8 +675,8 @@ def _phase_counts(
         infeasible=states["INFEASIBLE"],
         failed=states["FAIL"],
         interrupted=states["INTERRUPTED"],
-        earlier=sum(
-            1 for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
+        earlier=_finished_trial_count(
+            trial for trial in trials if trial.user_attrs.get(GENERATION_ID_ATTR) != generation_id
         ),
         winner_dirs=tuple(directory for directory in standing_dirs if directory is not None),
     )

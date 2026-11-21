@@ -706,16 +706,23 @@ class LogLine:
 def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:
     """List a phase's nonzero trial counts, such as ``3 complete`` and ``1 failed``.
 
+    The clauses add up to the trials that count toward ``n_trials``. Interrupted trials never
+    count, so they follow in parentheses on the last clause, as the ``status --trials`` heading
+    names them: ``3 complete, 1 failed (1 interrupted)``.
+
     :param PhaseCounts counts: The phase's counts.
-    :return tuple[str, ...]: One clause per nonzero count, or ``no trials`` when all are zero.
+    :return tuple[str, ...]: One clause per nonzero counted state, or ``no trials`` when there
+        are none, the last clause carrying any interrupted trials.
     """
     named = [
         (counts.complete, "complete"),
         (counts.failed, "failed"),
         (counts.infeasible, "infeasible"),
-        (counts.interrupted, "interrupted"),
     ]
-    return tuple(f"{count} {name}" for count, name in named if count) or ("no trials",)
+    clauses = [f"{count} {name}" for count, name in named if count] or ["no trials"]
+    if counts.interrupted:
+        clauses[-1] += f" ({counts.interrupted} interrupted)"
+    return tuple(clauses)
 
 
 def summary(
@@ -765,16 +772,19 @@ def summary(
 
 
 def _trial_total(counts: Mapping[str, PhaseCounts]) -> int:
-    """Sum the trials of every phase in a reported state.
+    """Sum the trials of every phase that count toward its ``n_trials``.
 
     :param Mapping[str, PhaseCounts] counts: Trial counts of each phase.
-    :return int: The trials the phases hold in all.
+    :return int: The counted trials of all the phases; interrupted ones are not among them.
     """
-    return sum(item.total for item in counts.values())
+    return sum(item.counted for item in counts.values())
 
 
 def run_totals(counts: Mapping[str, PhaseCounts]) -> str:
     """Count the phases and trials a run covered, as the summary headline and ``run.log`` say it.
+
+    The trials are those that count toward each phase's ``n_trials``, as the ``status --trials``
+    headings count them, and the previous run's share is the part of them it recorded.
 
     :param Mapping[str, PhaseCounts] counts: Trial counts of each phase the run executed.
     :return str: For example ``2 phases, 6 trials, 4 from a previous run``.
