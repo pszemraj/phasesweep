@@ -1263,7 +1263,6 @@ _SHELL_OWN_WORDS = frozenset(
     ]
 )
 _PLAIN_PROGRAM = re.compile(r"[A-Za-z0-9_./+-]+")
-_SHELL_SYNTAX = "\n\r();<>|&#\\'\"$`"
 
 
 def _require_launch_target(experiment: Experiment, *, path: str | None = None) -> None:
@@ -1329,8 +1328,8 @@ def _trial_program_refusal(
 ) -> tuple[str, str] | None:
     """Judge whether the shell that runs a trial command can find its program.
 
-    Only a plain executable name in one simple command is checked. Shell operators, quotes,
-    expansions and continuations are left to the shell, which can resolve them in context.
+    A plain first word is required even with quoted arguments, redirection or an AND-list.
+    Leave command substitution, parameter assignments and other control flow to the shell.
 
     :param str command: The trial command template.
     :param str | None path: ``PATH`` the trainer receives, or ``None`` to judge only a program
@@ -1342,7 +1341,9 @@ def _trial_program_refusal(
         is found or cannot be judged.
     """
     text = command.strip(" \t\n")
-    if any(char in text for char in _SHELL_SYNTAX):
+    # An escaped first ampersand leaves a background operator in e.g. `trainer \&& true`.
+    control_text = re.sub(r"(?<!\\)&&", "", text)
+    if any(char in control_text for char in "\n\r();|&`") or "${" in text:
         return None
     program = re.split(r"[ \t]", text, maxsplit=1)[0]
     if program in _SHELL_OWN_WORDS or _PLAIN_PROGRAM.fullmatch(program) is None:

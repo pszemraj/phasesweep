@@ -3,7 +3,7 @@
 The trial command runs through ``/bin/sh`` on the PATH the run starts with, in the trainer's
 working directory. A program that PATH lacks, or a missing ``execution.cwd``, would fail every
 trial before its trainer ran and record each as a failure, so the launch preflight refuses
-them up front. The program check judges only a plain executable in one simple command.
+them up front. The program check judges a plain first word when shell control flow permits.
 ``validate`` checks the directory and a program written with a ``/``, which do not depend on PATH.
 """
 
@@ -143,15 +143,13 @@ def test_absolute_program_must_be_an_executable_file(tmp_path: Path) -> None:
         pytest.param("{python} train.py --config {config_path}", id="placeholder"),
         pytest.param(f"{_MISSING}* --x 1", id="glob"),
         pytest.param(f"'{_MISSING}' --x 1", id="quoted"),
-        pytest.param(f'{_MISSING} --x ""', id="quoted-argument"),
-        pytest.param(f"{_MISSING} --lr $LR", id="parameter-argument"),
-        pytest.param(f"{_MISSING} >out.log", id="redirection"),
         pytest.param("", id="empty"),
         pytest.param(f"{_MISSING} --x 1 || true", id="or-fallback"),
-        pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
+        pytest.param(f"{_MISSING} ${{PATH:=/tools}}", id="argument-can-set-path"),
         pytest.param(f"{_MISSING} --x 1 ; true", id="sequence"),
         pytest.param(f"{_MISSING} --x 1 | tee out.log", id="pipe"),
         pytest.param(f"{_MISSING} --x 1 &", id="background"),
+        pytest.param(rf"{_MISSING} \&& true", id="escaped-ampersand-before-background"),
         pytest.param(f"{_MISSING} --x 1\ntrue", id="newline-between-commands"),
         pytest.param(
             f'{_MISSING} "$(echo "\'")" || echo "$(echo "\'")"',
@@ -170,6 +168,10 @@ def test_program_check_skips_what_it_cannot_judge(tmp_path: Path, command: str) 
     "command",
     [
         pytest.param(f"{_MISSING} --x 1", id="simple"),
+        pytest.param(f"{_MISSING} --note 'a b'", id="quoted-argument"),
+        pytest.param(f"{_MISSING} --lr $LR", id="parameter-argument"),
+        pytest.param(f"{_MISSING} >out.log", id="redirection"),
+        pytest.param(f"{_MISSING} --x 1 && true", id="and-chain"),
         pytest.param(f"{_MISSING} --x 1\n", id="trailing-newline"),
         pytest.param(f"\n  {_MISSING} --x 1  ", id="surrounding-whitespace"),
     ],
@@ -204,7 +206,9 @@ def test_cohort_refusal_comes_before_the_program_check(monkeypatch: pytest.Monke
 
 def test_fresh_tree_refuses_a_missing_program_before_creating_anything(tmp_path: Path) -> None:
     """A launch whose program PATH lacks is refused before it binds the tree or opens a ledger."""
-    experiment = make_experiment(persistent=tmp_path, trial_command=f"{_MISSING} {{overrides}}")
+    experiment = make_experiment(
+        persistent=tmp_path, trial_command=f"{_MISSING} --note 'a b' {{overrides}}"
+    )
 
     with pytest.raises(PhaseSweepError, match=f"program {_MISSING!r} is not on") as caught:
         run_experiment(experiment)
