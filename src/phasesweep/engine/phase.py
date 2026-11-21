@@ -46,7 +46,6 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.progress import (
     _log_finished_trial,
-    _log_phase_start,
     _log_reruns,
     _warn_deferred_extraction,
 )
@@ -119,6 +118,7 @@ from phasesweep.errors import (
     ProcessCleanupUncertainError,
     UnsafeProcessCleanupError,
 )
+from phasesweep.run_report import phase_start, report
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import read_attempt_lifecycle, write_attempt_lifecycle
@@ -1697,12 +1697,9 @@ def _run_phase(
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     remaining = max(0, phase.n_trials - finished)
-    _log_phase_start(
-        experiment,
-        phase,
-        finished=finished,
-        remaining=remaining,
-        reruns=_pending_rerun_count(trials, phase),
+    reruns = _pending_rerun_count(trials, phase)
+    report.info(
+        phase_start(experiment, phase, finished=finished, remaining=remaining, reruns=reruns)
     )
 
     if remaining == 0:

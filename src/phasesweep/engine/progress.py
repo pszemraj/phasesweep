@@ -1,7 +1,7 @@
 """Engine progress lines and process-scoped warnings.
 
-A live phase reports its start, one rerun line per rerun and one trial line per trial. A dry run
-previews its phases with the plain ``phase=… study=…`` header on the same report channel.
+A live phase reports one rerun line per rerun and one trial line per trial. A dry run previews
+its phases with the plain ``phase=… study=…`` header on the same report channel.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.optuna import _trial_count_state
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.state import RERUN_OF_ATTR, TRIAL_OUTCOME_ATTR, _parsed_trial_outcome
-from phasesweep.run_report import phase_start, report, rerun_line, trial_line
+from phasesweep.run_report import report, rerun_line, trial_line
 
 # Warnings keep the phase channel that run.log readers match on.
 log = logging.getLogger("phasesweep.engine.phase")
@@ -90,23 +90,6 @@ def _log_phase_header(
         remaining,
         reruns,
         phase.n_jobs,
-    )
-
-
-def _log_phase_start(
-    experiment: Experiment, phase: Phase, *, finished: int, remaining: int, reruns: int
-) -> None:
-    """Report the line that opens a live phase.
-
-    :param Experiment experiment: The experiment the phase belongs to.
-    :param Phase phase: The phase about to run or replay.
-    :param int finished: Trials that count toward its target already.
-    :param int remaining: Trials still needed to reach ``phase.n_trials``.
-    :param int reruns: Reruns it schedules, for interrupted trials and for the failed grid
-        cells a raised ``n_trials`` retries.
-    """
-    report.info(
-        phase_start(experiment, phase, finished=finished, remaining=remaining, reruns=reruns)
     )
 
 
