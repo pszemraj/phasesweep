@@ -4,6 +4,12 @@ Reads kernel identity to decide whether a recorded PID or process group is still
 one phasesweep launched, terminates groups SIGTERM -> grace -> SIGKILL, and
 cleans a stale trial's group only when the boot- and process-bound identity in
 ``process_identity.json`` proves that signalling it cannot hit a reused PID.
+
+The lease guardian in ``runtime.supervisor`` runs without the package and keeps
+stdlib-only copies of two liveness rules here: :func:`_has_exited` as
+``supervisor._has_exited``, and the group-member rule of
+:func:`_process_group_alive_with_members` and :func:`_group_member_pids` as
+``supervisor._trainer_group_alive``. Change each pair together.
 """
 
 from __future__ import annotations
@@ -374,9 +380,6 @@ def _has_exited(pid: int, state: str) -> bool:
     thread. macOS reports no per-thread process information, so its ``Z``
     keeps meaning exited there.
 
-    ``runtime.supervisor._has_exited`` is a stdlib-only copy of this rule,
-    because the lease guardian runs without the package; change both together.
-
     :param int pid: Process whose ``stat`` was read.
     :param str state: Its one-letter state from procfs or macOS process info.
     :return bool: Whether every thread of the process has exited.
@@ -636,11 +639,12 @@ def _terminate_process_groups(
     """Request group cleanup with shared waits, delegating guarded groups to their guardians.
 
     All groups share one grace period and one final confirmation window. Unguarded
-    groups receive direct SIGKILL after the grace period; live guardians own escalation
-    for their groups. If a guardian exits, its trainer group receives direct termination.
-    While a guardian still runs after the grace period, the confirmation window grows by
-    the guardian's helper settle: a guardian whose trainer root already exited ignores
-    cancellation, waits out the settle, then gives survivors its own SIGTERM grace.
+    groups still alive after the grace period receive direct SIGKILL; live guardians own
+    escalation for their groups. If a guardian exits, its trainer group receives direct
+    termination once a probe finds it still alive. While a guardian still runs after the
+    grace period, the confirmation window grows to cover the rest of its worst case: a
+    guardian whose trainer root already exited ignores cancellation, waits out the helper
+    settle, then gives survivors its own SIGTERM grace.
 
     :param tuple[int, ...] pgids: Target process-group IDs.
     :param float grace_seconds: Shared wait after requesting cancellation, before direct SIGKILL for unguarded groups or continued observation of guardians.
@@ -690,10 +694,16 @@ def _terminate_process_groups(
     def force_termination(pgid: int) -> bool:
         """Escalate an unguarded group within the shared cleanup deadline.
 
+        The group is probed first: a guardian that exits inside the window has usually
+        confirmed its group gone, which needs neither SIGKILL nor a warning.
+
         :param int pgid: Trainer process group whose guardian is absent or exited.
         :return bool: Whether SIGKILL succeeded and cleanup still needs observation.
         """
         active_guardians.pop(pgid, None)
+        if not _process_group_alive_with_members(pgid, members[pgid]):
+            confirmed[pgid] = True
+            return False
         log.warning("Process group %d remained alive after cancellation — sending SIGKILL", pgid)
         try:
             os.killpg(pgid, signal.SIGKILL)
@@ -748,11 +758,15 @@ def _terminate_process_groups(
 
     # Wait briefly for the kernel to actually reap descendants so the reaper's
     # "marked FAIL" state means cleanup completed, not requested. A guardian
-    # whose trainer root had already exited ignores the request and first gives
-    # helpers their settle, so a group it still guards gets that much longer.
+    # whose trainer root exited as the request arrived ignores it, waits out the
+    # helper settle, then gives survivors its own SIGTERM grace; a group it still
+    # guards gets what is left of that after the grace already spent here.
     kill_window = 2.0
     if any(pgid in active_guardians for pgid in survivors):
-        kill_window += _supervisor._HELPER_SETTLE_SECONDS
+        guardian_worst_case = (
+            _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS
+        )
+        kill_window += max(0.0, guardian_worst_case - grace_seconds)
     kill_deadline = time.monotonic() + kill_window
     while survivors and time.monotonic() < kill_deadline:
         still_alive = []

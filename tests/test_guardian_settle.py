@@ -659,9 +659,10 @@ def test_a_cancellation_after_root_exit_ends_the_wait_while_an_adopted_child_run
 
 
 def test_the_guarded_shutdown_window_covers_the_settle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Shutdown confirms a guarded group whose helper outlives the plain kill window."""
+    """Shutdown confirms a guarded group whose helper outlives the plain kill window, without a SIGKILL warning when the guardian exits inside the window."""
+    caplog.set_level(logging.WARNING, logger="phasesweep.runtime.process")
     use_guardian_timing(monkeypatch, tmp_path, settle_seconds=4.0, term_grace_seconds=0.5)
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
     grace = 0.1
@@ -680,6 +681,7 @@ def test_the_guarded_shutdown_window_covers_the_settle(
     assert verdict == {pgid: True}
     assert rest == b""
     assert (marks / "helper_done").exists() and not (marks / "helper_sigterm").exists()
+    assert not [r.getMessage() for r in caplog.records if "SIGKILL" in r.getMessage()]
     lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="settle")
     assert lifecycle is not None
     assert (lifecycle.state, lifecycle.return_code, lifecycle.cleanup_confirmed) == (

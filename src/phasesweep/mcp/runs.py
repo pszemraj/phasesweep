@@ -72,9 +72,9 @@ RUNNER_HEARTBEAT_INTERVAL_SECONDS = 15.0
 #: observe the runner reports that it has probably stopped.
 RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
 #: How long a SIGTERMed runner group gets before SIGKILL. A runner confirms its
-#: trials' cleanup before it exits, and a guardian whose trainer root had just
-#: exited finishes its helper settle and SIGTERM grace first; the last 20 s cover
-#: the runner's confirmation window and its ledger and status writes.
+#: trials' cleanup by waiting for their guardians, and a guardian whose trainer root
+#: had just exited finishes its helper settle and SIGTERM grace first; the last 20 s
+#: are margin on that wait plus the runner's ledger and status writes.
 RUNNER_STOP_GRACE_SECONDS = (
     _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS + 20.0
 )

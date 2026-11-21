@@ -4,6 +4,12 @@ Run directly under ``python -I -S`` with a minimal pre-ACK environment and stdli
 imports only. The blocked child becomes the trainer group leader; the guardian
 stays outside that group, adopts the trainer's orphaned descendants where Linux
 allows, and retains GPU leases until cleanup.
+
+Without the package, two liveness rules here are copies of the controller's in
+``phasesweep.runtime.reaper``: :func:`_has_exited` of ``reaper._has_exited``, and the
+group-member rule of :func:`_trainer_group_alive` of
+``reaper._process_group_alive_with_members`` and ``reaper._group_member_pids``. Change
+each pair together.
 """
 
 from __future__ import annotations
@@ -152,9 +158,7 @@ def _read_launch_payload(ack_fd: int) -> tuple[str, dict[str, str], str | None] 
 def _has_exited(pid: int, state: bytes) -> bool:
     """Return whether a process whose ``stat`` reads ``state`` can no longer run.
 
-    This is a stdlib-only copy of ``phasesweep.runtime.reaper._has_exited``,
-    because the guardian runs under ``python -I -S`` without the package; change
-    both together. ``X`` always means exited. ``Z`` means exited only once
+    ``X`` always means exited. ``Z`` means exited only once
     ``/proc/<pid>/task`` lists no thread but the leader's own: a leader that
     ends with ``pthread_exit`` reads ``Z`` while its other threads keep running.
     An exiting thread leaves that listing without ever reading ``Z``, so the
