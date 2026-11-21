@@ -1053,7 +1053,7 @@ def test_a_shutdown_ends_a_delivery_pass_without_blaming_mlflow(
     assert (requests, tally.sending, tally.unanswered) == (["request"], False, None)
     monkeypatch.setattr(shutdown, "_servicing_signum", None)
     tally = session.DeliveryTally()
-    assert publication._send(experiment, records, {}, worker_generation=None, tally=tally) == []
+    publication._send(experiment, records, {}, worker_generation=None, tally=tally)
     assert (requests, tally.sending, tally.unanswered) == (["request"] * 2, False, None)
     assert all(path.exists() for path in intents)
     assert [session.read_record(path)["state"] for path in records] == ["pending", "pending"]
@@ -1423,7 +1423,7 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         experiment, binding["generation_id"], "test", binding, projection
     )
     tally = DeliveryTally()
-    assert publication._send(experiment, [path], {}, worker_generation=None, tally=tally) == []
+    publication._send(experiment, [path], {}, worker_generation=None, tally=tally)
     assert tally.sending
     assert publication.delivery_status(experiment) == {"pending": 1, "delivered": 0}
     requests = []

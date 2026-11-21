@@ -224,9 +224,10 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
     """A Ctrl-C stops MLflow delivery without blaming MLflow, and the closing line counts what stays pending.
 
     The shutdown arrives during a trial's upload, during the next run's target check while an
-    earlier run's records are pending, or during that run's closeout delivery. No request
-    follows it, no line says MLflow did not answer or was not ready, and the closing line
-    still counts every pending record, the earlier run's in parentheses.
+    earlier run's records are pending, or during that run's closeout delivery, after its first
+    record. No request follows it, no line says MLflow did not answer or was not ready, the
+    record the interrupted closeout delivered is still reported, and the closing line counts
+    every pending record, the earlier run's in parentheses.
     """
     caplog.set_level(logging.INFO)
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
@@ -235,6 +236,7 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
         caplog.clear()
         respond = session.request_operation
         closing: list[bool] = []
+        closeout_requests: list[str] = []
         after: list[str] = []
 
         def ctrl_c(request: dict[str, object], **kwargs: object) -> JsonObject:
@@ -242,8 +244,10 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
                 # What the supervisor does to every launch while the shutdown is serviced.
                 after.append(str(request["action"]))
                 raise ShutdownLaunchRefusedError(signal.SIGINT)
+            if closing:
+                closeout_requests.append(str(request["action"]))
             if (moment == "target-check" and request["action"] == "resolve") or (
-                moment == "closeout" and closing
+                moment == "closeout" and len(closeout_requests) == 2
             ):
                 monkeypatch.setattr(shutdown, "_servicing_signum", signal.SIGINT)
                 report = ShutdownCleanupReport(signal.SIGINT, True, ())
@@ -263,11 +267,13 @@ def test_a_shutdown_requests_nothing_more_and_still_counts_what_stays_pending(
         with pytest.raises(PhaseSweepShutdown):
             run_experiment(sweep.experiment, terminal_callback=reports.append)
         assert (closing, after) == ([True], [])
-        earlier = 2
+        earlier = 1 if moment == "closeout" else 2
         pending = publication.delivery_status(sweep.experiment)["pending"]
         own = publication.delivery_status(sweep.experiment, reports[0].generation_id)
         assert pending == earlier + own["pending"]
         assert (own["pending"] > 0) is (moment == "closeout")
+        delivered = "MLflow: delivered 1 record(s) left pending by earlier runs."
+        assert (delivered in caplog.text) is (moment == "closeout")
     assert "did not answer" not in caplog.text
     assert "is not ready" not in caplog.text
     assert "launch refused" not in caplog.text

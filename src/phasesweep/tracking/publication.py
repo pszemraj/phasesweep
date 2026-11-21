@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -127,7 +127,8 @@ def _send(
     *,
     worker_generation: str | None,
     tally: DeliveryTally,
-) -> list[Path]:
+    counted: Collection[Path] = (),
+) -> None:
     """Send records in order while the delivery is still sending.
 
     A failure MLflow answered, such as a deleted run, concerns its record alone, so it costs a
@@ -142,10 +143,10 @@ def _send(
     :param str | None worker_generation: Generation the upload workers register under, as for
         :func:`_deliver`.
     :param DeliveryTally tally: The delivery this pass belongs to.
+    :param Collection[Path] counted: Records whose delivery adds to ``tally.delivered``, counted
+        as each is sent so a pass a shutdown interrupts still reports them, defaults to none.
     :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
-    :return list[Path]: The records delivered.
     """
-    delivered: list[Path] = []
     for index, path in enumerate(paths):
         if not tally.sending or tally.stop_for_shutdown():
             break
@@ -173,8 +174,8 @@ def _send(
                 tally.unanswered = unready_target_text(experiment, exc)
                 break
             continue
-        delivered.append(path)
-    return delivered
+        if path in counted:
+            tally.delivered += 1
 
 
 def _records(experiment: Experiment, scope: str | None, *, skip: str | None = None) -> list[Path]:
@@ -1009,14 +1010,14 @@ def _deliver_outstanding(
                 unresolved=unresolved,
             )
             pending = _pending_records(experiment, scope, skip=skip)
-        sent = _send(
+        _send(
             experiment,
             pending + own_pending,
             environment,
             worker_generation=worker_generation,
             tally=tally,
+            counted=set(pending),
         )
-        tally.delivered += len(set(sent) & set(pending))
     finally:
         errors.extend(unresolved.values())
 
