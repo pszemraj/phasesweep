@@ -468,19 +468,10 @@ def _run_experiment_outcome(
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
-            original_cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError) or (
-                isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
-            )
-            if original_cleanup_uncertain:
-                # Preserve prior cleanup uncertainty even if a signal interrupts reconciliation.
-                cleanup.mark_uncertain(exc)
+            # Preserve prior cleanup uncertainty even if a signal interrupts reconciliation.
+            cleanup.mark_uncertain_if_unconfirmed(exc)
             primary_error = control_error or exc
-            shutdown_cleanup_uncertain = (
-                isinstance(primary_error, PhaseSweepShutdown)
-                and not primary_error.report.cleanup_confirmed
-            )
-            if shutdown_cleanup_uncertain:
-                cleanup.mark_uncertain(primary_error)
+            primary_cleanup_uncertain = cleanup.mark_uncertain_if_unconfirmed(primary_error)
             failed_error_class = type(primary_error).__name__
             if generation.claimed:
                 # Keep a more specific publication_failed record and pointer intact.
@@ -507,11 +498,7 @@ def _run_experiment_outcome(
                     log.exception("MLflow failure delivery cleanup could not be confirmed")
                 except (PhaseSweepShutdown, KeyboardInterrupt) as tracking_exc:
                     # The closing count already says what stays pending; the run keeps its error.
-                    if (
-                        isinstance(tracking_exc, PhaseSweepShutdown)
-                        and not tracking_exc.report.cleanup_confirmed
-                    ):
-                        cleanup.mark_uncertain(tracking_exc)
+                    cleanup.mark_uncertain_if_unconfirmed(tracking_exc)
                     log.info("MLflow failure delivery stopped by a shutdown")
                 except BaseException:  # primary error must survive
                     log.exception(
@@ -529,7 +516,7 @@ def _run_experiment_outcome(
                     primary_error,
                     (ProcessCleanupUncertainError, StudyStorageUnavailableError),
                 )
-                and not shutdown_cleanup_uncertain
+                and not primary_cleanup_uncertain
                 and control_error is None
             ):
                 # Cleanup recovery takes precedence; preserve the original failure as the cause.
@@ -641,8 +628,7 @@ def _mirror_publication(
             SYNC_TRACKING_STEP,
         )
     except PhaseSweepShutdown as exc:
-        if not exc.report.cleanup_confirmed:
-            cleanup.mark_uncertain(exc)
+        cleanup.mark_uncertain_if_unconfirmed(exc)
         exc.published_result_committed = True
         raise
     except Exception:

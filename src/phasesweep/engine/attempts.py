@@ -111,6 +111,22 @@ class _PreflightCleanupReport:
         if self.error is None:
             self.error = error
 
+    def mark_uncertain_if_unconfirmed(self, error: BaseException) -> bool:
+        """Mark the report uncertain when ``error`` left process cleanup unconfirmed.
+
+        That is a :class:`ProcessCleanupUncertainError`, or a :class:`PhaseSweepShutdown` whose
+        handler could not confirm that the groups it stopped are gone.
+
+        :param BaseException error: The error that ended or interrupted the work.
+        :return bool: Whether ``error`` left cleanup unconfirmed, so the report was marked.
+        """
+        unconfirmed = isinstance(error, ProcessCleanupUncertainError) or (
+            isinstance(error, PhaseSweepShutdown) and not error.report.cleanup_confirmed
+        )
+        if unconfirmed:
+            self.mark_uncertain(error)
+        return unconfirmed
+
     def record_generations(self, attempts: Mapping[str, _AttemptRecord]) -> None:
         """Record the producing generation of each attempt that has one.
 
