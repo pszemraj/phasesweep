@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -404,6 +405,12 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
         "until the cause given in its warning is fixed in MLflow, for example by restoring a "
         "deleted run or its experiment." in confirmed.output.splitlines()
     )
+    # The refusal's warning is on recover-run's console, labelled and wrapped as a run's is.
+    assert re.search(
+        rf"\d\d:\d\d:\d\d warning: MLflow: attempt record attempt-{run.attempt} of generation "
+        rf"{_RUN_ID} is pending \(MLflow run is deleted;",
+        " ".join(confirmed.stderr.split()),
+    )
     assert not run.store.observe(run.handle).recovery_required
     delivery = run.app.status(_RUN_ID)["tracking_delivery"]
     assert delivery["remedy"] == (
@@ -411,9 +418,10 @@ def test_recover_run_and_mcp_status_say_what_keeps_a_refused_record_pending(
         "next launch with this config sends them, or ask the operator to retry them with "
         f"`phasesweep sync-tracking CONFIG --generation {_RUN_ID}` using the config this run "
         "launched with; delivery never retrains. If MLflow refused a record, such as for a run "
-        "deleted in MLflow, that record stays pending until the cause given in its warning in "
-        "the engine's `run.log` in the experiment workdir, or on the console of the operator's "
-        "retry, is fixed in MLflow, for example by restoring a deleted run or its experiment."
+        "deleted in MLflow, that record stays pending until the cause given in its warning, in "
+        "the engine's `run.log` in the experiment workdir when the run met it, or on the console "
+        "of the operator's `recover-run` or retry, is fixed in MLflow, for example by restoring a "
+        "deleted run or its experiment."
     )
 
 

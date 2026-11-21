@@ -1615,10 +1615,13 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         require_supported_mcp_host()
     except CatalogError as exc:
         raise click.ClickException(_catalog_error_text(exc)) from None
-    try:
-        recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
-    except RunRecoveryError as exc:
-        raise click.ClickException(_operational_error_text(exc)) from None
+    # The engine's warnings, such as a record MLflow refused, print on the console as
+    # sync-tracking's do; recovery writes no run.log of its own.
+    with _console_logging(verbose=False):
+        try:
+            recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
+        except RunRecoveryError as exc:
+            raise click.ClickException(_operational_error_text(exc)) from None
 
 
 @mcp.command(

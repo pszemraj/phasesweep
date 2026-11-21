@@ -236,8 +236,8 @@ def _tracking_delivery_payload(counts: Mapping[str, int], run: Mapping[str, obje
             "using the config this run launched with; delivery never retrains. If MLflow "
             "refused a record, such as for a run deleted in MLflow, that record "
             + refusal_rule(
-                " in the engine's `run.log` in the experiment workdir, or on the console of the "
-                "operator's retry,"
+                ", in the engine's `run.log` in the experiment workdir when the run met it, or on "
+                "the console of the operator's `recover-run` or retry,"
             )
             + "."
         )
