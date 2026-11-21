@@ -1203,12 +1203,13 @@ def test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population(
     }
 
 
-def _inheritance_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """Return inheritance warnings logged since the last clear."""
+def _confound_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the selection confound warnings logged since the last clear."""
     return [
         record.getMessage()
         for record in caplog.records
-        if record.name == "phasesweep.engine.run" and "inherits the winner" in record.getMessage()
+        if record.name == "phasesweep.engine.selection"
+        and "potential confounds" in record.getMessage()
     ]
 
 
@@ -1238,15 +1239,18 @@ def test_inheriting_phases_keep_verdicts_without_repeating_warnings(
         ],
     )
     first = run_experiment(experiment)
-    in_process = _inheritance_warnings(caplog)
+    in_process = _confound_warnings(caplog)
     caplog.clear()
     second = run_experiment(experiment, from_phase="child")
-    resumed = _inheritance_warnings(caplog)
+    resumed = _confound_warnings(caplog)
 
     # The constant trainer ties both parent trials with different params.
     assert first["parent"].confound is not None
     assert _flagged_checks(first["parent"].confound) == ["tie"]
     assert second["parent"].confound == first["parent"].confound
     assert set(CONFOUND_CHECKS) == set(second["parent"].confound["checks"])
-    for warnings in (in_process, resumed):
-        assert warnings == []
+    # Only the parent's own selection warns; the child inherits its winner silently, and the
+    # resume that skips the parent replays its verdicts without warning again.
+    assert len(in_process) == 1
+    assert in_process[0].startswith("[parent] potential confounds in the 2 ranked trials")
+    assert resumed == []
