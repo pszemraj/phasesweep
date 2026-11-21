@@ -32,6 +32,7 @@ from phasesweep.tracking.session import (
     SYNC_TRACKING_STEP,
     DeliveryTally,
     call_tracking,
+    is_creation_intent,
     pending_creation_records,
     read_binding,
     read_inherits,
@@ -1330,7 +1331,7 @@ def report_delivery(experiment: Experiment, generation_id: str, tally: DeliveryT
             count_text(pending - creations, creations),
             f" ({earlier} from earlier runs)" if earlier else "",
             SYNC_TRACKING_STEP,
-            refused_text(len(tally.refused)),
+            refused_text(tally.refused),
         )
 
 
@@ -1365,15 +1366,22 @@ def delivered_text(delivered: int, settled: int) -> str:
     return " and ".join(parts)
 
 
-def refused_text(refused: int) -> str:
-    """Say how many pending records MLflow refused, and what keeps them pending.
+def refused_text(refused: Collection[Path]) -> str:
+    """Say what MLflow refused, records and creation searches apart, and what keeps them pending.
 
-    :param int refused: Records MLflow refused in this delivery.
+    :param Collection[Path] refused: The records and creation intents MLflow refused in this
+        delivery.
     :return str: A sentence with a leading space, or an empty string when none were refused.
     """
     if not refused:
         return ""
-    return f" MLflow refused {plural(refused, 'record')}; a refused record {refusal_rule()}."
+    creations = sum(map(is_creation_intent, refused))
+    records = len(refused) - creations
+    parts = [plural(records, "record")] if records else []
+    if creations:
+        parts.append(f"the search for {plural(creations, 'unconfirmed run creation')}")
+    subject = "a refused record" if not creations else "it" if len(refused) == 1 else "each"
+    return f" MLflow refused {' and '.join(parts)}; {subject} {refusal_rule()}."
 
 
 def refusal_rule(where: str = "") -> str:

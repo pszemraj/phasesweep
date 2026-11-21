@@ -1485,7 +1485,7 @@ def sync_tracking(config_path: Path, generation_id: str | None, settings: tuple[
         )
     if tally.refused:
         raise PhaseSweepError(
-            "MLflow delivery remains pending:" + refused_text(len(tally.refused)),
+            "MLflow delivery remains pending:" + refused_text(tally.refused),
             action=OperatorAction.FIX_CONFIG,
             remediation=f"Once each such cause is fixed, {again}",
         )

@@ -111,7 +111,7 @@ def record_name(path: Path) -> str:
     """
     if path.name == PENDING_GENERATION_BINDING_FILE:
         return f"the summary-run creation record of generation {path.parent.name}"
-    if path.name.endswith(_PENDING_SUFFIX):
+    if is_creation_intent(path):
         # pending_creation_records finds these only in trial_<n>__generation_<id>__attempt_<id>.
         # The markers fix the parse, as a generation id may hold "__" itself: an MCP run's is
         # named after its catalog id, which may. An attempt id is hex.
@@ -123,6 +123,15 @@ def record_name(path: Path) -> str:
     if path.stem == "generation":
         return f"the summary record of generation {generation}"
     return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
+
+
+def is_creation_intent(path: Path) -> bool:
+    """Tell an unconfirmed run creation's intent from a delivery record.
+
+    :param Path path: A delivery record or a creation intent.
+    :return bool: Whether ``path`` is a creation intent, which a search settles.
+    """
+    return path.name.endswith(_PENDING_SUFFIX)
 
 
 def tracking_root(experiment: Experiment) -> Path:

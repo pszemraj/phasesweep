@@ -343,7 +343,7 @@ def recover_run(
                             (f"{sent}. " if sent else "")
                             + f"MLflow: {count_text(pending - creations, creations)} pending. "
                             f"The next launch with this config, or {SYNC_TRACKING_STEP}, sends "
-                            "them; delivery never retrains." + refused_text(len(tally.refused))
+                            "them; delivery never retrains." + refused_text(tally.refused)
                         )
                     elif sent:
                         emit(f"{sent}; none stay pending.")

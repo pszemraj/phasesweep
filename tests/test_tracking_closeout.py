@@ -866,7 +866,7 @@ def test_a_run_warns_once_about_what_mlflow_refuses_in_both_its_passes(
     """An earlier run's record or creation search MLflow refuses in both of a run's passes is warned about once.
 
     The pass after the target check warns; the closeout meets the same refusal and leaves it to
-    the closing line, which counts it as refused.
+    the closing line, which counts it as refused, a creation search as a creation.
     """
     sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
     respond = session.request_operation
@@ -890,7 +890,13 @@ def test_a_run_warns_once_about_what_mlflow_refuses_in_both_its_passes(
 
     warned = "is pending (MLflow run is deleted" if refused == "record" else "is still unresolved ("
     assert caplog.text.count(warned) == 1
-    assert caplog.text.count("MLflow refused 1 ") == 1
+    # A refused creation search is counted as a creation, never as a record.
+    counted = (
+        "MLflow refused 1 record; a refused record stays pending until"
+        if refused == "record"
+        else "MLflow refused the search for 1 unconfirmed run creation; it stays pending until"
+    )
+    assert caplog.text.count(counted) == 1
 
 
 @pytest.mark.integration
