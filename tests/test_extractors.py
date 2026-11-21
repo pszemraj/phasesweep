@@ -1202,6 +1202,7 @@ def test_wandb_missing_key_failure_reason_names_missing_and_available_keys(tmp_p
         request_path.write_text(json.dumps(dict(request)))
         assert wandb_evidence.main([str(request_path), str(response_path)]) == 0
         response = json.loads(response_path.read_text())
+        assert response["status"] == "missing_keys"
         return SimpleNamespace(timed_out=False, return_code=0), response, None
 
     monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
