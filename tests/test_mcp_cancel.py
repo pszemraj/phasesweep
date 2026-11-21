@@ -5,6 +5,8 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import subprocess
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -53,6 +55,28 @@ from tests.recovery_helpers import (
     recover_run_cli,
     write_uncertain_failed_trial,
 )
+
+# Raises the reaper's guardian-exit margin before the MCP run store loads, then prints how far
+# the runner stop grace exceeds the allowance.
+_GRACE_PAST_A_RAISED_MARGIN = (
+    "from phasesweep.runtime import reaper\n"
+    "reaper._GUARDIAN_EXIT_MARGIN_SECONDS = 60.0\n"
+    "from phasesweep.mcp.runs import RUNNER_STOP_GRACE_SECONDS\n"
+    "print(RUNNER_STOP_GRACE_SECONDS - reaper.guardian_exit_timeout())\n"
+)
+
+
+def test_the_runner_stop_grace_outlasts_the_guardian_exit_allowance_by_a_margin() -> None:
+    """A cancelled runner gets the allowance it gives its guardians plus room for its own writes: 40 s at the guardian's timing, and more when the reaper's margin grows."""
+    assert mcp_runs.RUNNER_STOP_GRACE_SECONDS == 40.0
+    assert mcp_runs.RUNNER_STOP_GRACE_SECONDS - reaper.guardian_exit_timeout() > 0
+    raised = subprocess.run(
+        [sys.executable, "-c", _GRACE_PAST_A_RAISED_MARGIN],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert float(raised.stdout) > 0
 
 
 def test_cancel_refuses_unsettled_launch_without_runner_identity(

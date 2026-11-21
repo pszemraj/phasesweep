@@ -22,7 +22,6 @@ from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -38,6 +37,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.reaper import (
     foreign_pid_namespace_reason,
+    guardian_exit_timeout,
     identity_from_earlier_boot,
     is_pid_namespace,
     is_same_live_process,
@@ -74,12 +74,11 @@ RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
 #: How long a SIGTERMed runner group gets before SIGKILL. A runner confirms its
 #: trials' cleanup by waiting for their guardians, and a guardian whose trainer root
 #: had just exited finishes its helper settle and SIGTERM grace first. The runner allows
-#: that guardian ``runtime.reaper._guardian_exit_timeout()``; this grace adds a larger
-#: margin to the same settle and grace, so the runner's ledger and status writes still
-#: fit after its wait.
-RUNNER_STOP_GRACE_SECONDS = (
-    _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS + 20.0
-)
+#: that guardian :func:`~phasesweep.runtime.reaper.guardian_exit_timeout`; this grace adds
+#: room for the runner's ledger and status writes after that wait. It is fixed at import:
+#: the runner and its guardians are other processes, timed by the guardian's own constants,
+#: so a test that shortens them in this process leaves the runner's needs unchanged.
+RUNNER_STOP_GRACE_SECONDS = guardian_exit_timeout() + 15.0
 
 log = logging.getLogger("phasesweep.mcp.runs")
 
