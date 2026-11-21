@@ -46,7 +46,13 @@ _SURVIVOR_ENTRIES = 4
 _SURVIVOR_CMDLINE_BYTES = 4096
 # prctl(2) option from <linux/prctl.h>.
 _PR_SET_CHILD_SUBREAPER = 36
+# The lifecycle record both the guardian and the controller write, shared with
+# phasesweep.runtime.process like the wire constants above.
+ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = 3
+# The return code of a ``terminating`` lifecycle record, written by the guardian for a
+# cancellation and by the controller for a group its guardian left behind.
+_TERMINATING_RETURN_CODE = -signal.SIGTERM
 
 
 def write_lifecycle_record(
@@ -691,10 +697,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 if len(args) == 5:
                     write_lifecycle_record(
-                        Path(args[2]) / "attempt_lifecycle.json",
+                        Path(args[2]) / ATTEMPT_LIFECYCLE_FILE,
                         attempt_id=args[3],
                         state="terminating",
-                        return_code=-signal.SIGTERM,
+                        return_code=_TERMINATING_RETURN_CODE,
                         cleanup_confirmed=False,
                         duration_seconds=None,
                     )
@@ -728,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
             ended = time.monotonic() if root_exited is None else root_exited
             with contextlib.suppress(OSError):
                 write_lifecycle_record(
-                    Path(args[2]) / "attempt_lifecycle.json",
+                    Path(args[2]) / ATTEMPT_LIFECYCLE_FILE,
                     attempt_id=args[3],
                     state="exited",
                     return_code=return_code,

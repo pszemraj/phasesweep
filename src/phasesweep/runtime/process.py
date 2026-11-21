@@ -13,7 +13,6 @@ import logging
 import math
 import os
 import select
-import signal
 import subprocess
 import sys
 import time
@@ -154,6 +153,15 @@ def _abort_launch(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
     return cleanup_confirmed
 
 
+def _guardian_return_code(proc: subprocess.Popen[bytes]) -> int:
+    """Return the guardian's exit status, read as a SIGKILL death when it was never reaped.
+
+    :param subprocess.Popen[bytes] proc: The lease guardian of a trial.
+    :return int: ``proc.returncode``, or ``-9`` while it is ``None``.
+    """
+    return proc.returncode if proc.returncode is not None else -9
+
+
 # ---------------------------------------------------------------------------
 # Supervised subprocess execution
 # ---------------------------------------------------------------------------
@@ -267,7 +275,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
     )
 
 
-ATTEMPT_LIFECYCLE_FILE = "attempt_lifecycle.json"
+ATTEMPT_LIFECYCLE_FILE = _supervisor.ATTEMPT_LIFECYCLE_FILE
 ATTEMPT_LIFECYCLE_SCHEMA_VERSION = _supervisor.ATTEMPT_LIFECYCLE_SCHEMA_VERSION
 _ATTEMPT_LIFECYCLE_STATES = frozenset({"allocated", "launching", "terminating", "exited"})
 
@@ -790,8 +798,7 @@ def run_supervised(
             # the supervisor is still blocked on its ack pipe; kill and reap it here.
             cleanup_confirmed = _abort_launch(proc, pgid)
             pid = pgid if pgid is not None else proc.pid
-            if proc.returncode is not None:
-                return_code = proc.returncode
+            return_code = _guardian_return_code(proc)
         if cleanup_confirmed:
             _record_attempt_exited(trial_dir, attempt_id=attempt_id, return_code=return_code)
         log.warning(
@@ -857,7 +864,7 @@ def run_supervised(
             _record_attempt_exited(
                 trial_dir,
                 attempt_id=attempt_id,
-                return_code=proc.returncode if proc.returncode is not None else -9,
+                return_code=_guardian_return_code(proc),
             )
         if control_flow_exception:
             if not cleanup_confirmed:
@@ -868,7 +875,7 @@ def run_supervised(
             raise
         duration = time.monotonic() - started
         return ProcessResult(
-            return_code=proc.returncode if proc.returncode is not None else -9,
+            return_code=_guardian_return_code(proc),
             timed_out=False,
             pid=pgid if pgid is not None else proc.pid,
             duration_seconds=duration,
@@ -970,7 +977,7 @@ def run_supervised(
                     trial_dir,
                     attempt_id=attempt_id,
                     state="terminating",
-                    return_code=-signal.SIGTERM,
+                    return_code=_supervisor._TERMINATING_RETURN_CODE,
                     cleanup_confirmed=False,
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
@@ -1006,7 +1013,7 @@ def run_supervised(
             _record_attempt_exited(
                 trial_dir,
                 attempt_id=attempt_id,
-                return_code=proc.returncode if proc.returncode is not None else -9,
+                return_code=_guardian_return_code(proc),
             )
         except Exception:
             log.exception(
@@ -1027,12 +1034,12 @@ def run_supervised(
         _record_attempt_exited(
             trial_dir,
             attempt_id=attempt_id,
-            return_code=proc.returncode if proc.returncode is not None else -9,
+            return_code=_guardian_return_code(proc),
         )
 
     duration = (time.monotonic() if root_exited is None else root_exited) - started
     return ProcessResult(
-        return_code=proc.returncode if proc.returncode is not None else -9,
+        return_code=_guardian_return_code(proc),
         timed_out=timed_out,
         pid=pgid,
         duration_seconds=duration,
