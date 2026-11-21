@@ -497,6 +497,77 @@ def test_orphans_that_exit_while_the_root_runs_are_reaped_at_once(tmp_path: Path
     assert (marks / "orphans").read_text() == "5 0"
 
 
+#: Leaves a helper in its own group for ``sys.argv[2]`` seconds and, through a parent that
+#: exits at once, an orphan in a session of its own that exits half a second after the root.
+_ORPHAN_DURING_SETTLE = """
+import os, sys, time
+from pathlib import Path
+marks = Path(sys.argv[1])
+if os.fork() == 0:
+    time.sleep(float(sys.argv[2]))
+    (marks / "helper_done").touch()
+    os._exit(0)
+if os.fork() == 0:
+    if os.fork() == 0:
+        os.setsid()
+        while not (marks / "root_gone").exists():
+            time.sleep(0.005)
+        time.sleep(0.5)
+        (marks / "orphan_done").touch()
+        os._exit(0)
+    os._exit(0)
+(marks / "root_gone").touch()
+os._exit(0)
+"""
+
+
+def _zombie_children(parent: int) -> list[int]:
+    """List the children of ``parent`` that procfs shows as zombies.
+
+    :param int parent: Process whose children are listed.
+    :return list[int]: PIDs in state ``Z`` whose parent is ``parent``.
+    """
+    zombies = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_bytes()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(b")") + 2 :].split()
+        if fields[0] == b"Z" and int(fields[1]) == parent:
+            zombies.append(int(entry.name))
+    return zombies
+
+
+@_LINUX_ADOPTION
+def test_an_orphan_that_exits_while_a_helper_keeps_the_group_alive_is_reaped_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the root exits, an adopted child that exits during the helper wait leaves no zombie under the guardian, though a helper keeps the root's group alive."""
+    trainer, marks = _trainer(tmp_path, _ORPHAN_DURING_SETTLE)
+    real_wait = process._wait_for_guardian_exit
+    zombies: list[int] = []
+
+    def wait_for_cleanup(proc: subprocess.Popen[bytes]) -> bool:
+        _wait_for_mark(marks / "orphan_done")
+        # Past the guardian's longest poll interval, so it has looked at least once.
+        time.sleep(2 * supervisor._GROUP_MAX_POLL_SECONDS)
+        assert not (marks / "helper_done").exists(), "the helper ended before the check"
+        zombies.extend(_zombie_children(proc.pid))
+        return real_wait(proc)
+
+    monkeypatch.setattr(process, "_wait_for_guardian_exit", wait_for_cleanup)
+    result = _supervise(
+        tmp_path / "settle-orphan", [sys.executable, str(trainer), str(marks), "3.0"], timeout=30
+    )
+
+    assert zombies == []
+    assert (result.return_code, result.failure_reason, result.cleanup_confirmed) == (0, None, True)
+    assert (marks / "helper_done").exists()
+
+
 def _spawn_guardian(
     tmp_path: Path, argv: list[str], *, until_root_exit: bool = True
 ) -> tuple[subprocess.Popen[bytes], int, int]:
