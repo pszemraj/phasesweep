@@ -1,8 +1,9 @@
 """Shutdown-signal handling and the live-child registry it drains.
 
 SIGTERM, SIGINT and SIGHUP terminate registered process groups and raise
-``PhaseSweepShutdown`` with cleanup evidence. Scopes control handler ownership and
-defer or absorb signals during critical sections.
+``PhaseSweepShutdown`` with cleanup evidence; a SIGHUP ignored when ownership is first
+taken, as under ``nohup``, stays ignored. Scopes control handler ownership and defer or
+absorb signals during critical sections.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import threading
 from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from types import FrameType
-from typing import Any
 
 from phasesweep.runtime.reaper import _KILL_GRACE_SECONDS, _terminate_process_groups
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
@@ -36,9 +36,42 @@ _launch_lock = threading.Lock()
 _shutdown_handler_lock = threading.Lock()
 # The package must import anywhere so that
 # require_supported_runtime(), not an AttributeError, reports a host without SIGHUP.
+# Code that installs, masks or drains these goes through _owned_shutdown_signals().
 _SHUTDOWN_SIGNALS: tuple[int, ...] = tuple(
     signal.Signals[name] for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name)
 )
+_SIGHUP = signal.Signals.__members__.get("SIGHUP")
+# Fixed by the first ownership in this process.
+_owned_signals: tuple[int, ...] | None = None
+
+# What signal.getsignal returns and signal.signal accepts.
+_SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+
+
+def _owned_shutdown_signals(*, taking_ownership: bool = False) -> tuple[int, ...]:
+    """Return the shutdown signals phasesweep owns in this process.
+
+    The first ownership fixes the set for the life of the process. A SIGHUP ignored at
+    that moment is left out: ``nohup`` starts a program that way so it outlives a closed
+    terminal, and a program leaves an inherited ignored SIGHUP alone. PhaseSweep then never
+    installs, unblocks, masks, drains, reinstalls or restores it. SIGTERM and SIGINT are
+    always owned. Before the first ownership, the set follows the current disposition.
+
+    :param bool taking_ownership: The caller is about to install shutdown handlers, which
+        fixes the set unless an earlier ownership already did.
+    :return tuple[int, ...]: The owned signals, in ``_SHUTDOWN_SIGNALS`` order.
+    """
+    global _owned_signals
+    if _owned_signals is not None:
+        return _owned_signals
+    owned = tuple(
+        sig
+        for sig in _SHUTDOWN_SIGNALS
+        if sig != _SIGHUP or signal.getsignal(sig) is not signal.SIG_IGN
+    )
+    if taking_ownership:
+        _owned_signals = owned
+    return owned
 
 
 @dataclass(frozen=True)
@@ -236,10 +269,10 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
 
 
 def _unblock_shutdown_signals() -> None:
-    """Ensure shutdown signals can reach the main-thread handler."""
+    """Ensure the owned shutdown signals can reach the main-thread handler."""
     if threading.current_thread() is not threading.main_thread():
         return
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _owned_shutdown_signals())
 
 
 # Main-thread ownership state.
@@ -248,11 +281,13 @@ _scope_depth = 0
 
 
 def install_signal_handlers() -> None:
-    """Take process-lifetime ownership of SIGTERM, SIGINT and SIGHUP.
+    """Take process-lifetime ownership of the shutdown signals.
 
-    Main-thread only. Reinstall missing handlers before unblocking shutdown signals
-    on each call. An open temporary scope hands its installation over and skips
-    restoration; later scopes leave process-lifetime ownership intact.
+    Those are SIGTERM, SIGINT and SIGHUP, less a SIGHUP ignored when ownership is first
+    taken (:func:`_owned_shutdown_signals`). Main-thread only. Reinstall missing handlers
+    before unblocking shutdown signals on each call. An open temporary scope hands its
+    installation over and skips restoration; later scopes leave process-lifetime ownership
+    intact.
 
     :raises SignalOwnershipUnavailableError: Called outside the main thread.
     """
@@ -263,8 +298,9 @@ def install_signal_handlers() -> None:
             "signal.signal and process-lifetime shutdown-signal ownership are "
             "main-thread-only."
         )
-    if not all(signal.getsignal(sig) is _shutdown_handler for sig in _SHUTDOWN_SIGNALS):
-        for sig in _SHUTDOWN_SIGNALS:
+    owned = _owned_shutdown_signals(taking_ownership=True)
+    if not all(signal.getsignal(sig) is _shutdown_handler for sig in owned):
+        for sig in owned:
             signal.signal(sig, _shutdown_handler)
     _process_lifetime_owner = True
     _unblock_shutdown_signals()
@@ -277,7 +313,9 @@ def _reassert_process_lifetime_handlers() -> None:
     """
     if threading.current_thread() is not threading.main_thread():
         return
-    stale = [sig for sig in _SHUTDOWN_SIGNALS if signal.getsignal(sig) is not _shutdown_handler]
+    stale = [
+        sig for sig in _owned_shutdown_signals() if signal.getsignal(sig) is not _shutdown_handler
+    ]
     if not stale:
         return
     log.warning(
@@ -289,7 +327,7 @@ def _reassert_process_lifetime_handlers() -> None:
 
 
 def _restore_host_signal_state(
-    prior_handlers: dict[int, Any],
+    prior_handlers: dict[int, _SignalHandler],
     prior_mask: Collection[int],
 ) -> Exception | None:
     """Restore the embedding process's shutdown handlers and signal mask.
@@ -297,15 +335,15 @@ def _restore_host_signal_state(
     Block signals, restore handlers, then restore the mask. Continue past individual
     handler failures so the remaining handlers are still restored.
 
-    :param dict[int, Any] prior_handlers: Handlers captured before the scope
-        installed its own, keyed by signal number. A ``None`` value means the
-        signal had a C-level default that Python cannot reinstall.
+    :param dict[int, _SignalHandler] prior_handlers: Handlers of the owned signals,
+        captured before the scope installed its own, keyed by signal number. A ``None``
+        value means the signal had a C-level default that Python cannot reinstall.
     :param Collection[int] prior_mask: Thread signal mask captured before the
         scope unblocked shutdown signals.
     :return Exception | None: The first restoration failure, or ``None`` when
         every handler was restored.
     """
-    signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_BLOCK, _owned_shutdown_signals())
     restoration_error: Exception | None = None
     for sig, handler in prior_handlers.items():
         if handler is None:
@@ -366,12 +404,13 @@ def signal_handler_scope() -> Iterator[None]:
             _scope_depth -= 1
         return
 
-    prior_handlers: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _SHUTDOWN_SIGNALS}
+    owned = _owned_shutdown_signals(taking_ownership=True)
+    prior_handlers: dict[int, _SignalHandler] = {sig: signal.getsignal(sig) for sig in owned}
     # Read the mask without changing it.
     prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     _scope_depth = 1
     try:
-        for sig in _SHUTDOWN_SIGNALS:
+        for sig in owned:
             signal.signal(sig, _shutdown_handler)
         _unblock_shutdown_signals()
         yield
@@ -402,7 +441,7 @@ def defer_shutdown_signals() -> Iterator[None]:
     """
     global _main_thread_defer_depth
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _owned_shutdown_signals())
     if is_main:
         _main_thread_defer_depth += 1
     try:
@@ -456,7 +495,9 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
     global _deferred_shutdown_signum
     absorbed = AbsorbedShutdown()
     is_main = threading.current_thread() is threading.main_thread()
-    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+    # One set for the whole window: a SIGHUP left ignored is neither blocked nor drained.
+    owned = _owned_shutdown_signals()
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, owned)
     if is_main:
         _main_thread_defer_depth += 1
     try:
@@ -466,19 +507,19 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
         if hasattr(signal, "sigtimedwait"):
             # A timed wait cannot block if another thread receives the signal first.
             while True:
-                info = signal.sigtimedwait(_SHUTDOWN_SIGNALS, 0)
+                info = signal.sigtimedwait(owned, 0)
                 if info is None:
                     break
                 drained = info.si_signo
         elif is_main:
             # Deliver even an outer scope's masked signals into Python deferral,
             # which stays active until after the original mask is restored.
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, _SHUTDOWN_SIGNALS)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, owned)
         else:
             # Workers cannot dispatch Python handlers. Observe without consuming
             # so restoration still delivers shutdown to the owning main thread.
             pending = signal.sigpending()
-            drained = next((sig for sig in _SHUTDOWN_SIGNALS if sig in pending), None)
+            drained = next((sig for sig in owned if sig in pending), None)
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         if is_main:
             _main_thread_defer_depth -= 1

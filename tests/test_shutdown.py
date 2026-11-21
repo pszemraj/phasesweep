@@ -405,6 +405,213 @@ def test_stale_process_lifetime_claim_is_reasserted_on_scope_entry() -> None:
         assert signal.getsignal(interloper_sig) is runtime_shutdown._shutdown_handler
 
 
+# Sets SIGHUP's disposition, then execs the ownership child, as nohup does to its command.
+_EXEC_WITH_SIGHUP = (
+    "import os, signal, sys\n"
+    "signal.signal(signal.SIGHUP, signal.Handlers[sys.argv[1]])\n"
+    "os.execv(sys.executable, [sys.executable, '-c', *sys.argv[2:]])\n"
+)
+
+# Takes ownership one way, then waits for the parent on stdin with SIGHUP arriving
+# from the parent, and from itself inside a deferral and an absorb window.
+_OWNERSHIP_CHILD = r"""
+import os, signal, sys
+from phasesweep.runtime import shutdown
+
+def body():
+    print("ready", signal.getsignal(signal.SIGHUP) is signal.SIG_IGN, flush=True)
+    sys.stdin.readline()
+    with shutdown.defer_shutdown_signals():
+        os.kill(os.getpid(), signal.SIGHUP)
+    with shutdown.absorb_shutdown_signals() as absorbed:
+        os.kill(os.getpid(), signal.SIGHUP)
+    print(
+        "survived",
+        absorbed.signum,
+        shutdown.servicing_shutdown_signal(),
+        shutdown._deferred_shutdown_signum,
+        signal.getsignal(signal.SIGHUP) is signal.SIG_IGN,
+        flush=True,
+    )
+    sys.stdin.readline()
+
+if sys.argv[1] == "install":
+    shutdown.install_signal_handlers()
+    body()
+else:
+    with shutdown.signal_handler_scope():
+        body()
+"""
+
+
+def _start_ownership_child(sighup: str, entry: str) -> subprocess.Popen[str]:
+    """Start a process with SIGHUP at ``sighup`` that takes shutdown ownership through ``entry``.
+
+    :param str sighup: ``SIG_IGN`` or ``SIG_DFL``, the disposition the process starts with.
+    :param str entry: ``install`` for :func:`install_signal_handlers`, ``scope`` for
+        :func:`signal_handler_scope`.
+    :return subprocess.Popen[str]: The process, with piped text stdin, stdout and stderr.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", _EXEC_WITH_SIGHUP, sighup, _OWNERSHIP_CHILD, entry],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _reap(proc: subprocess.Popen[str]) -> str:
+    """Kill an ownership child that is still running, reap it and return its stderr.
+
+    :param subprocess.Popen[str] proc: Child started by :func:`_start_ownership_child`.
+    :return str: Everything the child wrote to stderr.
+    """
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5.0)
+    assert proc.stderr is not None
+    return proc.stderr.read()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry", ["install", "scope"])
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_sighup_ignored_at_first_ownership_stays_ignored_while_term_and_int_still_stop(
+    entry: str, stop: signal.Signals
+) -> None:
+    """A process started under nohup survives SIGHUP and records no shutdown; SIGTERM and SIGINT still stop it.
+
+    SIGHUP from outside, inside a deferral and inside an absorb window is dropped by the
+    kernel, so nothing is absorbed, deferred or serviced, and SIGHUP is still ignored.
+    """
+    proc = _start_ownership_child("SIG_IGN", entry)
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        assert proc.stdout.readline() == "ready True\n"
+        os.kill(proc.pid, signal.SIGHUP)
+        proc.stdin.write("continue\n")
+        proc.stdin.flush()
+        assert proc.stdout.readline() == "survived None None None True\n"
+        os.kill(proc.pid, stop)
+        proc.wait(timeout=10.0)
+    finally:
+        stderr = _reap(proc)
+    assert proc.returncode == 128 + stop, stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry", ["install", "scope"])
+def test_sighup_at_default_on_first_ownership_still_stops_the_process(entry: str) -> None:
+    """A process started with SIGHUP at its default takes SIGHUP as a shutdown and exits 129."""
+    proc = _start_ownership_child("SIG_DFL", entry)
+    assert proc.stdout is not None
+    try:
+        assert proc.stdout.readline() == "ready False\n"
+        os.kill(proc.pid, signal.SIGHUP)
+        proc.wait(timeout=10.0)
+    finally:
+        stderr = _reap(proc)
+    assert proc.returncode == 128 + signal.SIGHUP, stderr
+
+
+def _host_handler(_signum: int, _frame: object) -> None:
+    """Stand in for an embedding program's own handler, which no test here delivers to."""
+    raise AssertionError("host handler should never fire during this test")
+
+
+def test_reassert_leaves_a_sighup_ignored_at_first_ownership_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under process-lifetime ownership taken with SIGHUP ignored, a scope's reassert neither warns about nor reinstalls SIGHUP, and still repairs SIGTERM."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    install_signal_handlers()
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep"), signal_handler_scope():
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    assert caplog.records == []
+
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    with caplog.at_level(logging.WARNING, logger="phasesweep"), signal_handler_scope():
+        pass
+    [warning] = caplog.records
+    assert "SIGTERM" in warning.getMessage()
+    assert "SIGHUP" not in warning.getMessage()
+    assert signal.getsignal(signal.SIGTERM) is runtime_shutdown._shutdown_handler
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+
+def test_a_scope_entered_with_sighup_ignored_restores_the_host_and_never_takes_sighup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A temporary scope leaves an ignored SIGHUP ignored and blocked, restores the host state on exit, and a later scope leaves SIGHUP to the host too."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _host_handler)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP})
+    host_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+    with signal_handler_scope():
+        assert signal.getsignal(signal.SIGTERM) is runtime_shutdown._shutdown_handler
+        assert signal.getsignal(signal.SIGINT) is runtime_shutdown._shutdown_handler
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        inside = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert signal.SIGTERM not in inside
+        assert signal.SIGHUP in inside
+
+    assert signal.getsignal(signal.SIGTERM) is _host_handler
+    assert signal.getsignal(signal.SIGINT) is _host_handler
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == host_mask
+
+    # The host later handles SIGHUP itself: the set fixed by the first scope still leaves it out.
+    signal.signal(signal.SIGHUP, _host_handler)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP})
+    with signal_handler_scope():
+        assert signal.getsignal(signal.SIGHUP) is _host_handler
+        with defer_shutdown_signals():
+            deferred = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        assert {signal.SIGTERM, signal.SIGINT} <= deferred
+        assert signal.SIGHUP not in deferred
+    assert signal.getsignal(signal.SIGHUP) is _host_handler
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="reads Linux procfs SigIgn and SigCgt")
+def test_trainer_starts_with_sighup_at_default_when_the_run_ignores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trainer launched by a run that keeps SIGHUP ignored starts with SIGHUP at its default, as under a run that handles it."""
+    monkeypatch.setattr(runtime_shutdown, "_owned_signals", None)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    install_signal_handlers()
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    status_out = tmp_path / "status.txt"
+    with (
+        (trial_dir / "stdout.log").open("w") as stdout,
+        (trial_dir / "stderr.log").open("w") as stderr,
+    ):
+        result = run_supervised(
+            f"cp /proc/self/status {status_out}",
+            env=dict(os.environ),
+            stdout=stdout,
+            stderr=stderr,
+            timeout=30.0,
+            trial_dir=trial_dir,
+            attempt_id="sighup-attempt",
+        )
+    assert result.return_code == 0
+    fields = dict(line.split(":", 1) for line in status_out.read_text().splitlines())
+    sighup_bit = 1 << (signal.SIGHUP - 1)
+    assert not int(fields["SigIgn"], 16) & sighup_bit
+    assert not int(fields["SigCgt"], 16) & sighup_bit
+
+
 def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     """Patch ``signal_handler_scope`` so tests can observe whether it was entered.
 

@@ -490,8 +490,8 @@ def restored_signal_ownership() -> Iterator[None]:
 
     Restores, in order: the shutdown signals blocked, so none is delivered to
     a half-restored handler set; the prior OS handlers; the prior kernel mask;
-    and ``phasesweep.runtime.shutdown``'s ownership tokens and the signal its
-    handler is servicing.
+    and ``phasesweep.runtime.shutdown``'s ownership tokens, the owned signal set
+    the first ownership fixed, and the signal its handler is servicing.
 
     :return Iterator[None]: Context in which PhaseSweep may take signal ownership.
     """
@@ -502,6 +502,7 @@ def restored_signal_ownership() -> Iterator[None]:
     restore_mask = signal.pthread_sigmask
     prior_owner = shutdown._process_lifetime_owner
     prior_depth = shutdown._scope_depth
+    prior_owned = shutdown._owned_signals
     prior_servicing = shutdown._servicing_signum
     prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
     prior_mask = restore_mask(signal.SIG_BLOCK, set())
@@ -514,6 +515,7 @@ def restored_signal_ownership() -> Iterator[None]:
         restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
+        shutdown._owned_signals = prior_owned
         shutdown._servicing_signum = prior_servicing
 
 
@@ -521,9 +523,10 @@ def restored_signal_ownership() -> Iterator[None]:
 def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore PhaseSweep's process-level signal state per test.
 
-    ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
-    are plain module globals, deliberately not re-derived from OS ground truth
-    the way the actual signal handlers are.
+    ``phasesweep.runtime.shutdown._process_lifetime_owner``, ``_scope_depth`` and
+    ``_owned_signals`` are plain module globals, deliberately not re-derived from
+    OS ground truth the way the actual signal handlers are. Restoring
+    ``_owned_signals`` lets each test's first ownership decide the set afresh.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
     in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
     SIGHUP handlers and unblock those signals, as well as flipping the private
