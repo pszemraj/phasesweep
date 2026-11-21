@@ -305,7 +305,7 @@ def write_attempt_lifecycle(
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param int | None return_code: Root return code or a guardian's nonzero cancellation code.
     :param bool | None cleanup_confirmed: Whether the whole process group was confirmed gone; false while cancellation is in progress.
-    :param float | None duration_seconds: Supervised elapsed time when the group exited.
+    :param float | None duration_seconds: Time to the root's own exit, or to cleanup after cancellation.
     :raises ValueError: ``state`` is not a known lifecycle state.
     :raises OSError: The record could not be written.
     """
@@ -876,6 +876,10 @@ def run_supervised(
     timed_out = False
     failure_reason: str | None = None
     cleanup_confirmed = True
+    # The root-exit byte ends the trial's time. The guardian sends it as soon as a root exits
+    # by itself, so the settle and cleanup after that stay teardown, as in its own record; it
+    # sends it after confirmed cleanup when it cancelled the root.
+    root_exited: float | None = None
 
     try:
         root_status: bytes | None
@@ -897,6 +901,8 @@ def run_supervised(
             # The trainer root exited within its budget. The helper settle and
             # descendant cleanup are lifecycle teardown, so the guardian's waits
             # must not retroactively turn this into a wallclock timeout.
+            if root_status == _supervisor._TRAINER_ROOT_EXITED:
+                root_exited = time.monotonic()
             guardian_exited = _wait_for_guardian_exit(proc)
             guardian_status = None
             if guardian_exited:
@@ -1010,7 +1016,7 @@ def run_supervised(
             return_code=proc.returncode if proc.returncode is not None else -9,
         )
 
-    duration = time.monotonic() - started
+    duration = (time.monotonic() if root_exited is None else root_exited) - started
     return ProcessResult(
         return_code=proc.returncode if proc.returncode is not None else -9,
         timed_out=timed_out,

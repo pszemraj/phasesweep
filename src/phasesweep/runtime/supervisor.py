@@ -59,7 +59,7 @@ def write_lifecycle_record(
     :param str state: Allocated, launching, terminating, or exited lifecycle state.
     :param int | None return_code: Supervised process exit code, when known.
     :param bool | None cleanup_confirmed: Whether the whole group and every adopted descendant have exited.
-    :param float | None duration_seconds: Supervised elapsed time, when known.
+    :param float | None duration_seconds: Time to the root's own exit, or to cleanup after cancellation.
     :raises OSError: The record could not be durably replaced.
     """
     payload = {
@@ -659,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
     # inherited GPU leases before every trainer descendant is confirmed gone.
     os.close(ack_fd)
     cancelled = False
+    # A root that exits by itself ends the trial's time; the settle and cleanup after it
+    # are teardown. A cancelled trial's time runs on to its confirmed cleanup.
+    root_exited: float | None = None
     try:
         try:
             try:
@@ -669,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
                 if reaped_root_status is None:
                     raise
                 status = reaped_root_status
+            root_exited = time.monotonic()
             # Once the root has exited, cancellation no longer applies: the settle
             # and the verdict below run to completion, keeping a finished result.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -711,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             # Descendant cleanup is a failed trial even when its root returned zero.
             if survivors is not None and return_code == 0:
                 return_code = 1
+            ended = time.monotonic() if root_exited is None else root_exited
             with contextlib.suppress(OSError):
                 write_lifecycle_record(
                     Path(args[2]) / "attempt_lifecycle.json",
@@ -718,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
                     state="exited",
                     return_code=return_code,
                     cleanup_confirmed=True,
-                    duration_seconds=time.monotonic() - float(args[4]),
+                    duration_seconds=ended - float(args[4]),
                 )
         return _return_child_status(status)
     finally:

@@ -259,8 +259,27 @@ def test_a_helper_that_exits_within_the_settle_keeps_the_roots_exit(
     _assert_exited(tmp_path / f"helper-{code}", code)
     assert (marks / "helper_done").exists()
     assert not (marks / "helper_sigterm").exists()
-    assert result.duration_seconds >= 0.2
+    assert elapsed >= result.duration_seconds + 0.2, "the trial's time includes the helper"
     assert elapsed < supervisor._HELPER_SETTLE_SECONDS / 2
+
+
+def test_a_trials_time_ends_when_its_root_exits(tmp_path: Path) -> None:
+    """A root that exits at once and leaves a helper alive for a second reports its own short time, in the result and in the lifecycle record."""
+    trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
+    trial_dir = tmp_path / "time"
+
+    started = time.monotonic()
+    result = _supervise(
+        trial_dir, [sys.executable, str(trainer), str(marks), "1.0", "0"], timeout=30.0
+    )
+    elapsed = time.monotonic() - started
+
+    assert (result.return_code, result.failure_reason) == (0, None)
+    assert (marks / "helper_done").exists(), "the guardian did not wait for the helper"
+    lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=trial_dir.name)
+    assert lifecycle is not None and lifecycle.duration_seconds is not None
+    assert result.duration_seconds < elapsed - 1.0
+    assert lifecycle.duration_seconds < elapsed - 1.0
 
 
 def _named_command(marks: Path) -> str:
@@ -307,12 +326,13 @@ def test_the_settle_is_outside_the_trial_budget(tmp_path: Path) -> None:
     trainer, marks = _trainer(tmp_path, _HELPER_TRAINER)
     budget = 1.0
 
+    started = time.monotonic()
     result = _supervise(
         tmp_path / "budget", [sys.executable, str(trainer), str(marks), "1.5", "0"], timeout=budget
     )
 
     assert (result.timed_out, result.failure_reason, result.return_code) == (False, None, 0)
-    assert result.duration_seconds > budget
+    assert time.monotonic() - started > budget, "the helper did not outlive the budget"
     assert not (marks / "helper_sigterm").exists()
     _assert_exited(tmp_path / "budget", 0)
 
@@ -353,7 +373,7 @@ def test_descendant_termination_is_outside_the_trial_budget(
     assert (result.timed_out, result.return_code, result.cleanup_confirmed) == (False, 0, True)
     assert result.failure_reason is not None
     assert "still had live descendants 0.3s later" in result.failure_reason
-    assert result.duration_seconds > budget, "test did not exercise cleanup beyond the budget"
+    assert time.monotonic() - started > budget, "test did not exercise cleanup beyond the budget"
 
 
 @_LINUX_ADOPTION
