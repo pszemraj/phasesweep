@@ -84,7 +84,12 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
-from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
+from phasesweep.runtime.files import (
+    PlatformCapabilityError,
+    UnsafeLockPathError,
+    atomic_create_text,
+    private_atomic_write_text,
+)
 from phasesweep.runtime.gpu import GpuPool
 from phasesweep.runtime.json import (
     JsonObject,
@@ -1053,6 +1058,20 @@ def _unsettled_running_comment(running: int) -> str:
     )
 
 
+def _status_can_suggest_resume(config: Experiment) -> bool:
+    """Check whether status can confirm the experiment is idle before suggesting a resume.
+
+    A lock probe that cannot run leaves the trial data and publication verdict readable.
+
+    :param Experiment config: Experiment whose run locks are probed.
+    :return bool: Whether the lock probe found no active run.
+    """
+    try:
+        return not experiment_is_busy(config)
+    except (OSError, UnsafeLockPathError, PlatformCapabilityError):
+        return False
+
+
 def _render_trial_tables(tables: TrialTables, *, csv_root: Path | None) -> str:
     """Render every phase's trial table under a header that names the winner marks' source.
 
@@ -1159,8 +1178,9 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     to decide what to inspect, and the boundary's one-line diagnostic follows
     on stderr. An unpublished winner gets a comment explaining how to resume publication,
     and trials recorded RUNNING while no run holds the experiment's locks get a comment
-    saying that a rerun settles them. ``--trials`` prints the trial tables in its place, from one
-    publication resolution, and exits the same way.
+    saying that a rerun settles them. These comments require a successful idle lock probe.
+    ``--trials`` prints the trial tables in its place, from one publication resolution,
+    and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -1174,7 +1194,7 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
     if show_trials:
         tables = read_trial_tables(config, latest=True)
         running = sum(row["state"] == "RUNNING" for table in tables.phases for row in table.rows)
-        if running and not experiment_is_busy(config):
+        if running and _status_can_suggest_resume(config):
             click.echo(_unsettled_running_comment(running))
         click.echo(
             _render_trial_tables(
@@ -1205,11 +1225,11 @@ def status(config_path: Path, show_trials: bool, settings: tuple[str, ...]) -> N
         for phase in phase_payloads
     )
     # One probe serves both comments: flock cannot test a lock without taking it.
-    busy = experiment_is_busy(config) if running or retained else False
-    if running and not busy:
+    suggest_resume = _status_can_suggest_resume(config) if running or retained else False
+    if running and suggest_resume:
         click.echo(_unsettled_running_comment(running))
-    if retained:
-        step = unpublished_winner_step(config, ledger, busy=busy)
+    if retained and suggest_resume:
+        step = unpublished_winner_step(config, ledger)
         if step is not None:
             click.echo(
                 "# Winner retained but not published"

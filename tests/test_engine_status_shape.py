@@ -34,6 +34,7 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, published_generation_id
+from tests.recovery_helpers import new_phase_study
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
@@ -293,6 +294,30 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     assert payload["represented_generation_id"] is None
     assert payload["is_published"] is False
     assert payload["phases"][0]["winner"] is None
+
+
+@pytest.mark.parametrize(("flags", "trial_text"), [((), "RUNNING: 1"), (("--trials",), "RUNNING")])
+def test_status_keeps_running_trials_visible_when_lock_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: tuple[str, ...],
+    trial_text: str,
+) -> None:
+    """Print the readable ledger without idle-run advice when the lock cannot be probed."""
+    experiment = make_experiment(persistent=tmp_path)
+    new_phase_study(experiment, "p").ask()
+    config = write_experiment_config(tmp_path / "config.yaml", experiment)
+    missing_locks = tmp_path / "missing-locks"
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(missing_locks))
+
+    assert invoke_cli_boundary(["status", str(config), *flags], monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert trial_text in captured.out
+    assert "No run is active" not in captured.out
+    assert not captured.err
+    assert not missing_locks.exists()
 
 
 def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:

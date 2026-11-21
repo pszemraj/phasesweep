@@ -1047,17 +1047,15 @@ class UnpublishedWinnerStep:
 
 
 def unpublished_winner_step(
-    experiment: Experiment, ledger: ValidatedLedger, *, busy: bool
+    experiment: Experiment, ledger: ValidatedLedger
 ) -> UnpublishedWinnerStep | None:
-    """Give one publication remedy from recorded failures, suppressing it during live work.
+    """Give one publication remedy from recorded failures for an idle experiment.
 
     :param Experiment experiment: Current config used to inspect durable phase policy.
     :param ValidatedLedger ledger: Handle the caller validated for ``experiment``.
-    :param bool busy: Whether a run holds the experiment's locks, as the caller probed once.
-    :return UnpublishedWinnerStep | None: The recorded cause and remedy, or the rerun instruction; none while busy or if storage is unreadable.
+    :return UnpublishedWinnerStep | None: The recorded cause and remedy, the rerun instruction,
+        or ``None`` if storage is unreadable.
     """
-    if busy:
-        return None
     if not experiment.persistent:
         return UnpublishedWinnerStep(
             None,
