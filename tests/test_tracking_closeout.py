@@ -856,6 +856,44 @@ def test_a_pass_whose_target_resolve_gets_no_answer_never_says_it_is_sending(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("refused", ["record", "creation"])
+def test_a_run_warns_once_about_what_mlflow_refuses_in_both_its_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refused: str,
+) -> None:
+    """An earlier run's record or creation search MLflow refuses in both of a run's passes is warned about once.
+
+    The pass after the target check warns; the closeout meets the same refusal and leaves it to
+    the closing line, which counts it as refused.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    respond = session.request_operation
+    if refused == "creation":
+        _kill_at_summary_creation(monkeypatch, sweep.experiment)
+    [stem] = [path.stem for path in sweep.summary.parent.glob("attempt-*.json")]
+
+    def refusing(request: dict[str, object], **kwargs: object) -> JsonObject:
+        if (refused == "creation" and request["action"] == "find") or (
+            refused == "record" and request["action"] == "publish" and request["name"] == stem
+        ):
+            raise OperationRejectedError("MLflow run is deleted; restore it, or its experiment.")
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", refusing)
+    monkeypatch.setattr(worker, "request_operation", refusing)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    run_experiment(sweep.experiment)
+
+    warned = "is pending (MLflow run is deleted" if refused == "record" else "is still unresolved ("
+    assert caplog.text.count(warned) == 1
+    assert caplog.text.count("MLflow refused 1 ") == 1
+
+
+@pytest.mark.integration
 def test_a_different_target_sends_nothing_and_the_original_config_delivers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

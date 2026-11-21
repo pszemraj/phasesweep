@@ -227,6 +227,9 @@ def _send(
                 break
             unanswered = isinstance(exc, NO_ANSWER)
             if isinstance(exc, OperationRejectedError) and not unanswered:
+                if path in tally.refused:
+                    # Warned when first refused in this delivery; the closing line counts it.
+                    continue
                 tally.refused.add(path)
             later = len(paths) - index - 1
             log.warning(

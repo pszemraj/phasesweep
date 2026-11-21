@@ -95,8 +95,8 @@ class DeliveryTally:
     refused: set[Path] = field(default_factory=set)
     """Records and creations MLflow last answered with a refusal, such as for a deleted run.
 
-    They stay pending. A record is counted once however many passes it refuses, and leaves the
-    set once a later request delivers or settles it.
+    They stay pending. A record is warned about and counted once however many passes refuse it,
+    and leaves the set once a later request delivers or settles it.
     """
 
 
@@ -585,6 +585,9 @@ def _reconcile_creation(
             return
         if not isinstance(exc, NO_ANSWER):
             if isinstance(exc, OperationRejectedError):
+                if pending in tally.refused:
+                    # Warned when first refused in this delivery; the closing line counts it.
+                    return
                 tally.refused.add(pending)
             log.warning("MLflow: %s is still unresolved (%s).", record_name(pending), exc)
             return
