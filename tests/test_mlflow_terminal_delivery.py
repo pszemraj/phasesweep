@@ -6,6 +6,7 @@ import json
 import shlex
 import signal
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import optuna
@@ -835,6 +836,51 @@ def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_pa
     ]
 
 
+@pytest.mark.integration
+def test_sync_leaves_superseded_publication_unresolved_when_its_record_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The history record resolves a superseded publication before any terminal intent is saved."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, gpu_policy="none", sampler={"type": "random", "seed": 1})
+    experiment = Experiment.model_validate(config)
+    with monkeypatch.context() as without_mirror:
+        without_mirror.setattr(publication, "publish_generation", lambda *_: None)
+        run_experiment(experiment, generation_id="older")
+    run_experiment(experiment, generation_id="newer")
+    assert read_status(experiment)["published_generation_id"] == "newer"
+    lifecycle = _generation_record_path(experiment, "older")
+    assert _recorded_generation(lifecycle).state == "published"
+    summary = tracking_root(experiment) / "older" / "delivery" / "generation.json"
+    uploads.clear()
+    read_text = Path.read_text
+    reads: list[Path] = []
+
+    def unreadable_once(path: Path, *args, **kwargs) -> str:
+        if path == lifecycle:
+            reads.append(path)
+            if len(reads) == 1:
+                raise PermissionError("temporary read failure")
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "read_text", unreadable_once)
+        with pytest.raises(TrackingSyncRefusedError, match="generation record .* is unreadable"):
+            publication.sync_tracking(experiment, "older")
+    assert reads == [lifecycle]
+    assert not summary.exists()
+    assert uploads == []
+
+    assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 3}
+    assert read_record(summary)["finish"] == "FINISHED"
+    reads.clear()
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "read_text", unreadable_once)
+        assert publication.sync_tracking(experiment, "older") == {"pending": 0, "delivered": 3}
+    assert read_record(summary)["finish"] == "FINISHED"
+
+
 @pytest.mark.parametrize(
     "reply,unreadable",
     [(None, False), ("unknown", False), ("unknown", True), ("ok", False), ("ok", True)],
@@ -1160,6 +1206,56 @@ def test_only_an_in_memory_generation_ends_an_attempt_its_ledger_lost(
 
     record = tracking_root(experiment) / generation / "delivery" / f"attempt-{attempt}.json"
     assert (read_record(record)["finish"] if record.exists() else None) == finish
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("problem", ["unreadable", "malformed"])
+def test_unusable_generation_record_leaves_mlflow_outcomes_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, problem: str
+) -> None:
+    """Recovery leaves an unusable lifecycle's outcomes unsaved until its record is restored."""
+    from phasesweep.engine.generation import _write_generation_state
+
+    generation = "failed-run"
+    experiment, uploads, [attempt] = killed_sweep(
+        tmp_path, monkeypatch, n_jobs=1, generation_id=generation, persistent=False
+    )
+    _write_generation_state(
+        experiment,
+        generation_id=generation,
+        state="failed",
+        from_phase=None,
+        publish_current=False,
+        error_class="RuntimeError",
+    )
+    lifecycle = _generation_record_path(experiment, generation)
+    original = lifecycle.read_bytes()
+    delivery = tracking_root(experiment) / generation / "delivery"
+    read_text = Path.read_text
+
+    def unreadable(path: Path, *args, **kwargs) -> str:
+        if path == lifecycle:
+            raise PermissionError("read refused")
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        if problem == "unreadable":
+            fault.setattr(Path, "read_text", unreadable)
+        else:
+            lifecycle.write_text("state: [", encoding="utf-8")
+
+        assert run_experiment(experiment)["depth"].metric == 1.0
+        assert f"{lifecycle} is {problem}" in caplog.text
+        assert not delivery.exists()
+        with pytest.raises(TrackingSyncRefusedError, match=f"generation record .* is {problem}"):
+            publication.sync_tracking(experiment, generation)
+        assert not delivery.exists()
+
+    lifecycle.write_bytes(original)
+    uploads.clear()
+    assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 2}
+    assert _sent(uploads, [attempt]) == ["FAILED"]
+    assert _summaries(uploads) == [(generation, "FAILED")]
 
 
 @pytest.mark.parametrize("in_flight", [True, False], ids=["in-flight", "between-trials"])

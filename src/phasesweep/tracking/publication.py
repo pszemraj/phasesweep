@@ -9,7 +9,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.engine.errors import TrackingSyncRefusedError
+from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.runtime.files import UnsafePrivatePathError
 from phasesweep.runtime.json import (
     JsonObject,
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
     from phasesweep.config.models import Experiment
+    from phasesweep.engine.generation import _RecordedGeneration
     from phasesweep.engine.ledger import ValidatedLedger
     from phasesweep.tracking.records import DeliveryRecord, Projection, PublishAction, RunBinding
 
@@ -509,14 +511,16 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
         )
 
 
-def _published(experiment: Experiment, generation_id: str) -> bool:
-    """Report whether a generation committed as a successful result.
+def _generation_publication_record(
+    experiment: Experiment, generation_id: str
+) -> _RecordedGeneration:
+    """Resolve the generation's state using the pointer first and its lifecycle record otherwise.
 
     :param Experiment experiment: Experiment that owns the generation.
     :param str generation_id: Generation to check.
-    :return bool: Whether its lifecycle record or the last-success pointer names it published.
+    :return _RecordedGeneration: The state and error class, or a reason they could not be read.
     """
-    from phasesweep.engine.generation import _recorded_generation
+    from phasesweep.engine.generation import _recorded_generation, _RecordedGeneration
     from phasesweep.engine.paths import _generation_record_path, _last_successful_generation_path
     from phasesweep.engine.publication_validation import _read_pointer_target
 
@@ -524,10 +528,19 @@ def _published(experiment: Experiment, generation_id: str) -> bool:
     target = _read_pointer_target(
         _last_successful_generation_path(experiment), experiment_name=experiment.experiment
     )
-    return (target is not None and target.generation_id == generation_id) or (
-        _recorded_generation(_generation_record_path(experiment, generation_id)).state
-        == "published"
-    )
+    if target is not None and target.generation_id == generation_id:
+        return _RecordedGeneration("published", None)
+    return _recorded_generation(_generation_record_path(experiment, generation_id))
+
+
+def _published(experiment: Experiment, generation_id: str) -> bool:
+    """Report whether the lifecycle record or last-success pointer names a generation published.
+
+    :param Experiment experiment: Experiment that owns the generation.
+    :param str generation_id: Generation to check.
+    :return bool: Whether the generation is published.
+    """
+    return _generation_publication_record(experiment, generation_id).state == "published"
 
 
 def _failure_status(error_class: str | None) -> str:
@@ -635,27 +648,40 @@ def _rebuild_attempt_intents(
     for generation_id, attempts in unrecorded.items():
         # A persistent ledger still holds the trials, and a published generation is not ended
         # by its lifecycle record.
-        untouched = experiment.persistent or _published(experiment, generation_id)
-        ended = None if untouched else _ended_status(experiment, generation_id)[0]
-        _save_attempt_intents(experiment, generation_id, attempts, trials, ended=ended)
+        ended = None if experiment.persistent else _ended_status(experiment, generation_id)
+        _save_attempt_intents(
+            experiment, generation_id, attempts, trials, ended=None if ended is None else ended[0]
+        )
 
 
-def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str | None]:
-    """Name the status that ends an ended, unpublished generation's runs, and its failure.
+def _ended_status(experiment: Experiment, generation_id: str) -> tuple[str, str | None] | None:
+    """Name the status and failure that end a generation's runs, if unpublished.
 
-    It is the status the failure in the generation's lifecycle record maps to, or KILLED when
-    the invocation, as one killed outright does, recorded no failure.
+    It is the status the failure in the generation's lifecycle record maps to, or KILLED
+    when no terminal record was written, as when the invocation was killed outright.
 
     :param Experiment experiment: Configured experiment.
-    :param str generation_id: Ended, unpublished generation.
-    :raises OSError: The lifecycle record cannot be read.
-    :return tuple[str, str | None]: ``FAILED`` or ``KILLED``, and the class name of the recorded
-        failure, or ``None`` when none was recorded.
+    :param str generation_id: Ended generation.
+    :raises TrackingSyncRefusedError: An unreadable or malformed record cannot supply a status.
+    :return tuple[str, str | None] | None: ``FAILED`` or ``KILLED`` and the failure class when
+        recorded, or ``None`` for a published generation.
     """
-    from phasesweep.engine.generation import _recorded_generation
     from phasesweep.engine.paths import _generation_record_path
 
-    recorded = _recorded_generation(_generation_record_path(experiment, generation_id))
+    recorded = _generation_publication_record(experiment, generation_id)
+    if recorded.state == "published":
+        return None
+    if recorded.problem is not None:
+        path = _generation_record_path(experiment, generation_id)
+        raise TrackingSyncRefusedError(
+            f"MLflow terminal outcome is unresolved: generation record {path} "
+            f"is {recorded.problem}.",
+            action=OperatorAction.RESTORE_TREE,
+            remediation=(
+                "Restore the generation record, then run phasesweep sync-tracking with "
+                "the same config."
+            ),
+        )
     if recorded.state in {"failed", "publication_failed"}:
         return _failure_status(recorded.error_class), recorded.error_class
     return "KILLED", None
@@ -672,22 +698,25 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
 
     :param Experiment experiment: Configured experiment.
     :param Iterable[str] generation_ids: Ended generations to check.
-    :raises OSError: A record or binding cannot be read or written.
+    :raises OSError: A record or binding cannot be written or the binding cannot be read.
+    :raises TrackingSyncRefusedError: The generation's lifecycle record is unreadable or malformed.
     :return list[Path]: The summary-run record of each of those generations that is unpublished
         and has a bound summary run, whether saved here or before.
     """
     paths = []
     for generation_id in sorted(set(generation_ids)):
         root = tracking_root(experiment) / generation_id
-        if not (root / "generation-binding.json").is_file() or _published(
-            experiment, generation_id
-        ):
+        if not (root / "generation-binding.json").is_file():
             continue
         path = root / "delivery" / "generation.json"
-        if not path.exists():
-            _save_failure_summary(
-                experiment, generation_id, *_ended_status(experiment, generation_id)
-            )
+        if path.exists():
+            if _published(experiment, generation_id):
+                continue
+        else:
+            ended = _ended_status(experiment, generation_id)
+            if ended is None:
+                continue
+            _save_failure_summary(experiment, generation_id, *ended)
         paths.append(path)
     return paths
 
@@ -772,7 +801,7 @@ def save_recovered_attempts(
             records += sorted(delivery.glob("attempt-*.json"))
             records += [path for path in [delivery / "generation.json"] if path in summaries]
         return [path for path in records if read_record(path)["state"] != "delivered"]
-    except (OSError, ValueError, UnsafePrivatePathError) as exc:
+    except (OSError, ValueError, UnsafePrivatePathError, TrackingSyncRefusedError) as exc:
         log.warning(
             "The MLflow outcomes of recovered attempts were not all saved (%s); run phasesweep "
             "sync-tracking with the same config to rebuild them from the ledger and deliver them.",
@@ -886,7 +915,8 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         retried, or ``None`` for every generation's retained deliveries.
     :raises ValueError: The generation name is unsafe, or a delivery record is malformed.
     :raises TrackingSyncRefusedError: The config has no ``mlflow`` block, no deliveries
-        exist, or the target or generation does not match the saved records.
+        exist, the target or generation does not match the saved records, or a generation's
+        terminal lifecycle record is unreadable or malformed.
     :raises ArtifactRootConflictError: The tree records another owner or another format;
         nothing is written.
     :raises StudySchemaMismatchError: The ledger holds unsupported study state; nothing is written.
@@ -897,7 +927,6 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     """
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
-    from phasesweep.engine.errors import TrackingSyncRefusedError
     from phasesweep.engine.ledger import validate_ledger
     from phasesweep.engine.locking import _experiment_lock
     from phasesweep.engine.trial import _environment_identity

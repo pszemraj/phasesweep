@@ -197,27 +197,38 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
 
 @dataclass(frozen=True)
 class _RecordedGeneration:
-    """The state label and failure class one lifecycle record holds, each ``None`` if absent."""
+    """The terminal lifecycle state, or why a record that exists could not be read."""
 
     state: str | None
     error_class: str | None
+    problem: str | None = None
 
 
 def _recorded_generation(record_path: Path) -> _RecordedGeneration:
     """Read one lifecycle record's state label and failure class.
 
     :param Path record_path: Immutable lifecycle record YAML path.
-    :return _RecordedGeneration: The recorded ``state`` and ``error_class`` strings, each
-        ``None`` when the record is missing, unreadable, or malformed, or lacks it.
+    :return _RecordedGeneration: The state and error class, or a result with no state
+        if the file does not exist or it cannot supply a valid terminal state. A missing
+        file has no problem recorded.
     """
-    payload = artifact_io.read_yaml_or_none(record_path)
-    if not isinstance(payload, dict):
+    try:
+        payload: object = yaml.safe_load(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return _RecordedGeneration(None, None)
-    state, error_class = payload.get("state"), payload.get("error_class")
-    return _RecordedGeneration(
-        state if isinstance(state, str) else None,
-        error_class if isinstance(error_class, str) else None,
-    )
+    except OSError:
+        return _RecordedGeneration(None, None, "unreadable")
+    except (ValueError, yaml.YAMLError):
+        return _RecordedGeneration(None, None, "malformed")
+    if isinstance(payload, dict) and "error_class" in payload:
+        state, error_class = payload.get("state"), payload["error_class"]
+        if (
+            isinstance(state, str)
+            and state in _TERMINAL_GENERATION_STATES
+            and (error_class is None or isinstance(error_class, str))
+        ):
+            return _RecordedGeneration(state, error_class)
+    return _RecordedGeneration(None, None, "malformed")
 
 
 def _write_generation_state(
