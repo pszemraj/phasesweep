@@ -120,6 +120,8 @@ The golden ledger fixture under `tests/fixtures/ledgers` is committed output of 
 
 ## PyPI releases
 
+Use relative links for repository files in Markdown. The root [README](../README.md) also supplies the package description on PyPI, so its links to repository files and its phase diagram use absolute GitHub URLs. The [public metadata tests](../tests/test_public_metadata.py) require link targets that do not depend on a checkout and keep the diagram directly below the introduction.
+
 Versions come from Git tags through setuptools-scm. The [`publish.yml` workflow](../.github/workflows/publish.yml) builds one wheel and one source distribution from the commit recorded by a published GitHub Release. The build restricts setuptools-scm's Git tag selection to that release's tag, so other tags on the same commit cannot determine the package version. It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`, then checks that both distributions contain the tag's normalized version and the project name `phasesweep`. GitHub prereleases are skipped, and prerelease version tags are rejected even for normal GitHub Releases.
 
 PyPI trusts this publisher for the `phasesweep` project, configured in [PyPI account publishing](https://pypi.org/manage/account/publishing/):
