@@ -548,7 +548,7 @@ phasesweep show-winners contract_check.yaml
 cat <workdir>/contract_check/contract_check/trial_00000__*/result.json
 ```
 
-A trial that does not report what the extractor expects fails with the cause on its trial line as `reason:`, for example `reason: metric extractor: JSON envelope at ... does not report objective 'eval_loss_typo'; it reports 'eval_loss'.` Inspect `stdout.log` and `stderr.log` in that trial's directory, and the configured local evidence file or bound native tracking run. On success `show-winners` prints the metric and every recorded `observed` value. See [inspection commands](runtime.md#inspection-commands) for locating the trial rows with in-memory storage.
+A trial that does not report what the extractor expects fails with the cause on its trial line as `reason:`, for example `reason: metric extractor: JSON envelope at ... does not report objective 'eval_loss_typo'; it reports 'eval_loss'.` A mismatched `split`, `policy`, `checkpoint` or `expected_step` ends the same way, with the value the envelope holds. Inspect `stdout.log` and `stderr.log` in that trial's directory, and the configured local evidence file or bound native tracking run. On success `show-winners` prints the metric and every recorded `observed` value. See [inspection commands](runtime.md#inspection-commands) for locating the trial rows with in-memory storage.
 
 ### Source-checkout preflight
 

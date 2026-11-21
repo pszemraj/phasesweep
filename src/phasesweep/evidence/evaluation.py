@@ -317,6 +317,18 @@ def _extract_json(
     return value
 
 
+def _it_reports(value: object) -> str:
+    """Show what an envelope holds where it differs from the config, so a mismatch names both sides.
+
+    :param object value: The envelope's own value for the mismatched field.
+    :return str: ``; it reports 'x'`` for a string or an integer, and an empty string for a
+        missing or malformed value, which is not quoted back as ``None``.
+    """
+    if isinstance(value, str) or type(value) is int:
+        return f"; it reports {value!r}"
+    return ""
+
+
 def _extract_json_envelope(
     ctx: TrialContext,
     cfg: JsonEnvelopeExtractor,
@@ -369,30 +381,42 @@ def _extract_json_envelope(
         raise ExtractorError(f"JSON envelope at {target} has no objective object.")
     reported_name = objective.get("name")
     if reported_name != cfg.objective_name:
-        found = f"; it reports {reported_name!r}" if isinstance(reported_name, str) else ""
         raise ExtractorError(
-            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}{found}."
+            f"JSON envelope at {target} does not report objective {cfg.objective_name!r}"
+            f"{_it_reports(reported_name)}."
         )
-    if objective.get("split") != cfg.split:
-        raise ExtractorError(f"JSON envelope at {target} does not report split {cfg.split!r}.")
+    reported_split = objective.get("split")
+    if reported_split != cfg.split:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report split {cfg.split!r}"
+            f"{_it_reports(reported_split)}."
+        )
 
     evaluation = data.get("evaluation")
     if not isinstance(evaluation, dict):
         raise ExtractorError(f"JSON envelope at {target} has no evaluation object.")
-    if evaluation.get("policy") != cfg.policy:
-        raise ExtractorError(f"JSON envelope at {target} does not report policy {cfg.policy!r}.")
+    reported_policy = evaluation.get("policy")
+    if reported_policy != cfg.policy:
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report policy {cfg.policy!r}"
+            f"{_it_reports(reported_policy)}."
+        )
     checkpoint = evaluation.get("checkpoint")
     if not isinstance(checkpoint, str) or not checkpoint:
         raise ExtractorError(f"JSON envelope at {target} has no checkpoint identity.")
     if cfg.checkpoint is not None and checkpoint != cfg.checkpoint:
         raise ExtractorError(
-            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}."
+            f"JSON envelope at {target} does not report checkpoint {cfg.checkpoint!r}"
+            f"{_it_reports(checkpoint)}."
         )
     step = evaluation.get("step")
     if type(step) is not int or step < 0:
         raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
     if cfg.expected_step is not None and step != cfg.expected_step:
-        raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+        raise ExtractorError(
+            f"JSON envelope at {target} does not report step {cfg.expected_step}"
+            f"{_it_reports(step)}."
+        )
     if cfg.evaluation_axis == "step":
         position: int | float | None = step
     else:

@@ -163,14 +163,25 @@ def envelope() -> dict[str, object]:
     }
 
 
-def _envelope_error(tmp_path: Path, payload: dict[str, object]) -> str:
+def _envelope_error(
+    tmp_path: Path,
+    payload: dict[str, object],
+    *,
+    objective_name: str = "eval_loss_typo",
+    split: str = "validation",
+    policy: str = "final",
+    checkpoint: str | None = None,
+    expected_step: int | None = None,
+) -> str:
     """Return what the envelope extractor refuses with when it expects objective ``eval_loss_typo``."""
     (tmp_path / "result.json").write_text(json.dumps(payload), encoding="utf-8")
     extractor = JsonEnvelopeExtractor(
         type="json_envelope",
-        objective_name="eval_loss_typo",
-        split="validation",
-        policy="final",
+        objective_name=objective_name,
+        split=split,
+        policy=policy,
+        checkpoint=checkpoint,
+        expected_step=expected_step,
     )
     with pytest.raises(ExtractorError) as refused:
         run_extractor(make_trial_context(tmp_path), extractor)
@@ -195,4 +206,37 @@ def test_an_envelope_without_an_objective_name_does_not_claim_one(
 
     assert _envelope_error(tmp_path, envelope) == (
         f"JSON envelope at {tmp_path / 'result.json'} does not report objective 'eval_loss_typo'."
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "field"),
+    [
+        pytest.param({"split": "test"}, "split 'test'; it reports 'validation'", id="split"),
+        pytest.param({"policy": "best"}, "policy 'best'; it reports 'final'", id="policy"),
+        pytest.param(
+            {"checkpoint": "best.pt"},
+            "checkpoint 'best.pt'; it reports 'final.pt'",
+            id="checkpoint",
+        ),
+        pytest.param({"expected_step": 20}, "step 20; it reports 10", id="step"),
+    ],
+)
+def test_an_envelope_mismatch_says_what_the_envelope_reports(
+    tmp_path: Path, envelope: dict[str, object], expected: dict[str, object], field: str
+) -> None:
+    """Every field a config pins is corrected from the value the trainer wrote."""
+    assert _envelope_error(tmp_path, envelope, objective_name="eval_loss", **expected) == (
+        f"JSON envelope at {tmp_path / 'result.json'} does not report {field}."
+    )
+
+
+def test_an_envelope_without_a_split_does_not_claim_one(
+    tmp_path: Path, envelope: dict[str, object]
+) -> None:
+    """A missing split is not quoted back as `None`."""
+    envelope["objective"] = {"name": "eval_loss", "value": 0.25}
+
+    assert _envelope_error(tmp_path, envelope, objective_name="eval_loss") == (
+        f"JSON envelope at {tmp_path / 'result.json'} does not report split 'validation'."
     )
