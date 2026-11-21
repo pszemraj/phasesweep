@@ -515,11 +515,15 @@ class RunCapacityUnknownError(McpToolError):
                 if any(is_file for _label, is_file in shown_records)
                 else ""
             )
+            # A trial carries the run id in its arguments only when its command uses
+            # {trial_dir}, but always in its environment as PHASESWEEP_GENERATION_ID.
             remaining = (
-                f" Unreadable or orphaned: {shown}{more_note}. Ask the operator to run "
-                "`pgrep -af <run-id>` on the server host for each run id, wait for any process "
-                "of that run it lists, runner or trial, to exit, or stop it, and then move "
-                f"`runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory{file_note}."
+                f" Unreadable or orphaned: {shown}{more_note}. For each run id, ask the operator "
+                "to run, on the server host, `pgrep -af <run-id>`, which lists the run's runner, "
+                "and `ps axeww | grep '[P]HASESWEEP_GENERATION_ID=<run-id>'`, which lists its "
+                "trials by their environment, wait for every listed process to exit, or stop it, "
+                "and move `runs/<run-id>.json` and `logs/<run-id>.*` out of the state directory "
+                f"only once both list nothing{file_note}."
             )
         super().__init__(
             f"cannot prove available launch capacity because the MCP state contains "
