@@ -572,9 +572,9 @@ LogRegexExtractor:
   # Log file, for example stdout.log. stdout.log and stderr.log hold the trainer's two streams, and Python logging writes to stderr by default.
   file: string = "stdout.log"
 
-  # Python regular expression whose named group (?P<value>...) captures the number, such as loss=(?P<value>[0-9.eE+-]+). Without that group, config load fails.
+  # Python regular expression whose named group (?P<value>...) captures the metric token, such as loss=(?P<value>\S+) for whitespace-delimited output. Without that group, config load fails.
   # Lines split at \n, \r\n and bare \r and are searched one at a time, so a match cannot span lines. Inline flags such as (?i) work.
-  # Each match in a line is one observation. float() parsing skips bad captures but accepts nan, inf and 1_0, so a loose capture can select nan or inf and fail the trial: anchor the pattern to digits. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
+  # Each numeric match is an observation. The reader skips captures that float() cannot parse and accepts nan, inf and 1_0. On a persistent study a changed pattern needs a new experiment name, because the pattern is part of the study identity.
   pattern: string (required)
 
   # Which observation is used: last or first by position in the file, min or max by value, the first of equal extremes. first decodes no line after its match.

@@ -1622,14 +1622,13 @@ def test_log_regex_considers_every_numeric_match_per_line(
 def test_log_regex_min_max_fails_on_any_non_finite_match(
     tmp_path: Path, select: str, text: str, bad_line: int
 ) -> None:
-    """A min or max over matches that include nan or inf fails wherever the value sits,
-    naming the line of the first non-finite match and the pattern fix."""
+    """A min or max over matches that include nan or inf fails with the offending line and trainer diagnosis."""
     (tmp_path / "stdout.log").write_text(text, encoding="utf-8")
     cfg = LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[^\s]+)", select=select)
     provenance: dict = {}
     with pytest.raises(
         ExtractorError,
-        match=rf"line {bad_line}\b.*anchor the pattern to digits.*changed pattern needs a new `experiment` name",
+        match=rf"line {bad_line}\b.*Check why the trainer reported a non-finite objective",
     ):
         run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
     assert "source" not in provenance

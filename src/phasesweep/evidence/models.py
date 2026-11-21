@@ -126,7 +126,7 @@ class LogRegexExtractor(_Frozen):
     pattern: str = Field(
         description=(
             "Python regex with a named group 'value' that captures the metric. "
-            r"Example: r'eval_loss=(?P<value>[0-9.eE+-]+)'."
+            r"Example: r'eval_loss=(?P<value>\S+)'."
         )
     )
     select: Literal["last", "first", "min", "max"] = "last"
