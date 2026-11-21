@@ -26,10 +26,14 @@ from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
+    DELIVERY_DIR,
     GENERATION_BINDING_FILE,
+    SOURCE_FILE,
+    SUMMARY_RECORD,
     SYNC_TRACKING_STEP,
     DeliveryTally,
     call_tracking,
+    delivery_record_path,
     is_creation_intent,
     pending_creation_records,
     read_binding,
@@ -38,6 +42,7 @@ from phasesweep.tracking.session import (
     record_name,
     require_tracking_target,
     resolve_pending_creations,
+    summary_binding_path,
     tracking_root,
     write_record,
 )
@@ -254,10 +259,10 @@ def _records(experiment: Experiment, scope: str | None, *, skip: str | None = No
     :param str | None skip: Generation left out, a live invocation's own.
     :return list[Path]: Records grouped by generation, sorted by generation ID.
     """
-    records = tracking_root(experiment).glob(f"{scope or '*'}/delivery/*.json")
+    records = tracking_root(experiment).glob(f"{scope or '*'}/{DELIVERY_DIR}/*.json")
     return sorted(
         (path for path in records if path.parent.parent.name != skip),
-        key=lambda path: (path.parent.parent.name, path.name == "generation.json", path.name),
+        key=lambda path: (path.parent.parent.name, path.stem == SUMMARY_RECORD, path.name),
     )
 
 
@@ -300,7 +305,7 @@ def _save_intent(
     :return Path: The delivery record, unchanged when it already exists.
     """
     assert experiment.mlflow is not None
-    path = tracking_root(experiment) / generation_id / "delivery" / f"{name}.json"
+    path = delivery_record_path(experiment, generation_id, name)
     if not path.exists():
         record: DeliveryRecord = {
             "schema_version": 1,
@@ -436,7 +441,6 @@ def _unrecorded_attempts(
     """
     from phasesweep.engine.paths import _experiment_dir
 
-    delivery = tracking_root(experiment) / generation_id / "delivery"
     # Trial directories are named by _trial_dir_for.
     pattern = f"*/trial_*__generation_{generation_id}__attempt_*/{BINDING_FILE}"
     attempts = [
@@ -446,7 +450,9 @@ def _unrecorded_attempts(
     return [
         (directory, binding)
         for directory, binding in attempts
-        if not (delivery / f"attempt-{binding['attempt_id']}.json").exists()
+        if not delivery_record_path(
+            experiment, generation_id, f"attempt-{binding['attempt_id']}"
+        ).exists()
     ]
 
 
@@ -590,7 +596,8 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
     """
     from phasesweep.engine.generation import _validate_generation_publishable
 
-    parent = read_binding(tracking_root(experiment) / generation_id, GENERATION_BINDING_FILE)
+    parent_path = summary_binding_path(experiment, generation_id)
+    parent = read_binding(parent_path.parent, parent_path.name)
     publication, _ = _validate_generation_publishable(experiment, generation_id)
     bindings = {
         name: validate_binding(winner.payload["objective_provenance"]["remote_capture"]["binding"])
@@ -630,7 +637,7 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
         _save_intent(
             experiment,
             generation_id,
-            "generation",
+            SUMMARY_RECORD,
             parent,
             _projection(
                 metrics={},
@@ -655,7 +662,7 @@ def _save_published(experiment: Experiment, generation_id: str) -> list[Path]:
         earlier upload left behind included; none when the generation bound no summary run, as
         a no-work replay sends nothing of its own.
     """
-    if not (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists():
+    if not summary_binding_path(experiment, generation_id).is_file():
         return []
     _save_generation_intents(experiment, generation_id)
     return _pending_records(experiment, generation_id)
@@ -723,11 +730,12 @@ def _save_failure_summary(
         recorded none.
     :return Path: The summary run's delivery record, unchanged when it already exists.
     """
+    parent_path = summary_binding_path(experiment, generation_id)
     return _save_intent(
         experiment,
         generation_id,
-        "generation",
-        read_binding(tracking_root(experiment) / generation_id, GENERATION_BINDING_FILE),
+        SUMMARY_RECORD,
+        read_binding(parent_path.parent, parent_path.name),
         _projection(
             metrics={},
             params={},
@@ -757,8 +765,9 @@ def _save_failed(
     :return list[Path]: Every record of the generation still pending, attempt outcomes an
         earlier upload left behind included; none when it bound no summary run or is published.
     """
-    parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
-    if not parent_path.exists() or _published(experiment, generation_id):
+    if not summary_binding_path(experiment, generation_id).is_file() or _published(
+        experiment, generation_id
+    ):
         return []
     error_class = type(error).__name__
     status = _failure_status(error_class)
@@ -881,10 +890,9 @@ def _save_ended_summaries(
     """
     paths = []
     for generation_id in sorted(set(generation_ids)):
-        root = tracking_root(experiment) / generation_id
-        if not (root / GENERATION_BINDING_FILE).is_file():
+        if not summary_binding_path(experiment, generation_id).is_file():
             continue
-        path = root / "delivery" / "generation.json"
+        path = delivery_record_path(experiment, generation_id, SUMMARY_RECORD)
         if path.exists():
             if _published(experiment, generation_id):
                 continue
@@ -910,7 +918,7 @@ def _target_recorded(experiment: Experiment) -> bool:
     :return bool: Whether ``source.json`` is absent or records the configured target.
     """
     assert experiment.mlflow is not None
-    source = tracking_root(experiment) / "source.json"
+    source = tracking_root(experiment) / SOURCE_FILE
     if not source.exists():
         return True
     recorded = read_record(source).get("source")
@@ -955,11 +963,10 @@ def _stage_outstanding(
     """
     _rebuild_attempt_intents(experiment, ledger, generation_ids, unresolved=unresolved)
     _save_ended_summaries(experiment, generation_ids, unresolved=unresolved)
-    root = tracking_root(experiment)
     for generation_id in generation_ids:
         if (
             generation_id in unresolved
-            or (root / generation_id / "delivery" / "generation.json").exists()
+            or delivery_record_path(experiment, generation_id, SUMMARY_RECORD).exists()
             or not _published(experiment, generation_id)
         ):
             continue
@@ -1135,12 +1142,11 @@ def _owed(experiment: Experiment, skip: str | None) -> bool:
     :raises ValueError: A record does not use the current format.
     :return bool: Whether an ended generation still owes MLflow anything.
     """
-    root = tracking_root(experiment)
     return bool(
         _pending_records(experiment, None, skip=skip)
         or _pending_creations(experiment, None, skip)
         or any(
-            not (root / generation_id / "delivery" / "generation.json").exists()
+            not delivery_record_path(experiment, generation_id, SUMMARY_RECORD).exists()
             for generation_id in _bound_generations(experiment, None, skip)
         )
     )
@@ -1189,10 +1195,7 @@ def deliver_ended_generations(
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
     skip = None if recovering else generation_id
-    checked = (
-        not recovering
-        and (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
-    )
+    checked = not recovering and summary_binding_path(experiment, generation_id).is_file()
     errors: list[TrackingSyncRefusedError] = []
     try:
         if not _target_recorded(experiment):
@@ -1270,7 +1273,7 @@ def deliver_closeout(
     from phasesweep.engine.errors import TrackingTargetUnavailableError
 
     # A run binds its summary run in its first target check.
-    checked = (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
+    checked = summary_binding_path(experiment, generation_id).is_file()
     tally = DeliveryTally() if tally is None else tally
     tally.sending = error is None or (
         checked
@@ -1397,7 +1400,7 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     :return dict[str, int]: Path-free pending and delivered counts.
     """
     counts = {"pending": len(pending_creation_records(experiment, generation_id)), "delivered": 0}
-    for path in tracking_root(experiment).glob(f"{generation_id or '*'}/delivery/*.json"):
+    for path in _records(experiment, generation_id):
         counts["delivered" if _read_delivery(path).delivered else "pending"] += 1
     return counts
 
@@ -1475,7 +1478,7 @@ def sync_tracking(
         if (
             not errors
             and not had_creations
-            and not any(root.glob(f"{generation_id or '*'}/delivery/*.json"))
+            and not _records(experiment, generation_id)
             and not any(root.glob(f"{generation_id or '*'}/operations"))
         ):
             raise TrackingSyncRefusedError(

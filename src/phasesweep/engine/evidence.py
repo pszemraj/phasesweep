@@ -576,11 +576,11 @@ def _verify_trial_evidence_dir(
     elif verification.mlflow_query is not None:
         from phasesweep.evidence.mlflow import observation_id
         from phasesweep.evidence.models import MlflowExtractor
-        from phasesweep.tracking.session import read_binding, read_record
+        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
         try:
             binding = read_binding(trial_dir)
-            expected = read_record(trial_dir / "mlflow-expected.json")
+            expected = read_record(trial_dir / EXPECTED_BINDING_FILE)
             if (
                 capture is None
                 or capture.get("kind") != "mlflow"

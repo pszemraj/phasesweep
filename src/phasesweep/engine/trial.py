@@ -731,9 +731,9 @@ def launch_trial(
         env["WANDB_RUN_ID"] = attempt_id
     if experiment.mlflow is not None:
         from phasesweep.runtime.json import json_text
-        from phasesweep.tracking.session import read_binding, read_record
+        from phasesweep.tracking.session import EXPECTED_BINDING_FILE, read_binding, read_record
 
-        expected = read_record(workdir / "mlflow-expected.json")
+        expected = read_record(workdir / EXPECTED_BINDING_FILE)
         env.pop("MLFLOW_EXPERIMENT_NAME", None)
         env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":

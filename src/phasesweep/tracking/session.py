@@ -55,8 +55,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
+# The identity an attempt's run must carry, written in its trial directory before it launches.
+EXPECTED_BINDING_FILE = "mlflow-expected.json"
 GENERATION_BINDING_FILE = "generation-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
+# The target and experiment the tree's bound runs live in, under the tracking root.
+SOURCE_FILE = "source.json"
+# Delivery records live in this directory of their generation's tracking directory. The summary
+# run's is named SUMMARY_RECORD, the others attempt-<attempt id> and winner-<phase>.
+DELIVERY_DIR = "delivery"
+SUMMARY_RECORD = "generation"
 _PENDING_SUFFIX = ".pending.json"
 PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
@@ -164,7 +172,7 @@ def record_name(path: Path) -> str:
         )
         return f"the run-creation record of attempt {attempt} of generation {generation}"
     generation = path.parent.parent.name
-    if path.stem == "generation":
+    if path.stem == SUMMARY_RECORD:
         return f"the summary record of generation {generation}"
     return f"{path.stem.split('-', 1)[0]} record {path.stem} of generation {generation}"
 
@@ -187,6 +195,28 @@ def tracking_root(experiment: Experiment) -> Path:
     from phasesweep.engine.paths import _experiment_dir
 
     return _experiment_dir(experiment) / "tracking"
+
+
+def summary_binding_path(experiment: Experiment, generation_id: str) -> Path:
+    """Locate a generation's summary-run binding; the summary run is bound once it is a file.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str generation_id: The generation.
+    :return Path: The binding's path, whether or not it exists.
+    """
+    return tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
+
+
+def delivery_record_path(experiment: Experiment, generation_id: str, name: str) -> Path:
+    """Locate one delivery record of a generation.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str generation_id: The generation the record belongs to.
+    :param str name: The record's name: :data:`SUMMARY_RECORD`, ``attempt-<attempt id>`` or
+        ``winner-<phase>``.
+    :return Path: The record's path, whether or not it exists.
+    """
+    return tracking_root(experiment) / generation_id / DELIVERY_DIR / f"{name}.json"
 
 
 def write_record(path: Path, record: Mapping[str, object]) -> None:
@@ -236,7 +266,7 @@ def bind_mlflow_run(run_id: str) -> None:
     from mlflow import MlflowClient
 
     directory = Path(os.environ["PHASESWEEP_TRIAL_DIR"])
-    expected = read_record(directory / "mlflow-expected.json")
+    expected = read_record(directory / EXPECTED_BINDING_FILE)
     if (
         expected["run_mode"] != "trainer"
         or expected["attempt_id"] != os.environ["PHASESWEEP_ATTEMPT_ID"]
@@ -684,7 +714,7 @@ def _resolve_source(
             experiment, generation_id, {"action": "resolve"}, environment, deadline
         )
         experiment_id = json_text(resolved, "experiment_id")
-        source_path = tracking_root(experiment) / "source.json"
+        source_path = tracking_root(experiment) / SOURCE_FILE
         source = {
             "schema_version": 1,
             "source": experiment.mlflow.evidence_identity(),
@@ -713,8 +743,8 @@ def prepare_generation(
     """
     assert experiment.mlflow is not None
     with _PARENT_LOCK:
-        parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
-        if parent_path.exists():
+        parent_path = summary_binding_path(experiment, generation_id)
+        if parent_path.is_file():
             return read_binding(parent_path.parent, parent_path.name)
         experiment_id = _resolve_source(
             experiment, generation_id=generation_id, environment=environment, deadline=deadline
@@ -775,10 +805,7 @@ def require_tracking_target(
     settings = experiment.mlflow
     assert settings is not None
     try:
-        if (
-            resolve_only
-            or (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists()
-        ):
+        if resolve_only or summary_binding_path(experiment, generation_id).is_file():
             # An earlier phase bound the summary run, or the caller binds none; the target must
             # still resolve.
             _resolve_source(
@@ -890,7 +917,7 @@ def prepare_attempt(
             },
         },
     )
-    write_record(directory / "mlflow-expected.json", identity)
+    write_record(directory / EXPECTED_BINDING_FILE, identity)
     if experiment.mlflow.run_mode == "managed":
         return _create_bound(
             experiment,

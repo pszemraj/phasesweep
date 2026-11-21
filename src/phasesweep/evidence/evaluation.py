@@ -784,6 +784,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
     from phasesweep.tracking.mlflow import ManagedObjectiveMissingError, request_operation
     from phasesweep.tracking.session import (
         BINDING_FILE,
+        EXPECTED_BINDING_FILE,
         gave_no_answer,
         read_binding,
         read_record,
@@ -801,7 +802,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> MlflowCaptu
                 "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
             )
         binding = read_binding(ctx.trial_dir)
-        expected = read_record(ctx.trial_dir / "mlflow-expected.json")
+        expected = read_record(ctx.trial_dir / EXPECTED_BINDING_FILE)
         if (
             any(binding.get(k) != v for k, v in expected.items())
             or binding["attempt_id"] != ctx.attempt_id
