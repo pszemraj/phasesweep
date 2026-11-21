@@ -3,9 +3,9 @@
 Each block is one fact of the run, held as plain values. The progress blocks (phase start, trial,
 rerun, skipped phase and winner) are logged on ``phasesweep.report``: ``str()`` is the one-line
 text that ``run.log`` and captured records carry, and ``render`` draws the same facts for a
-terminal of a given width, styled only when the caller says so. The banner, the closing summary
-and the replay sentence are written to stderr by the CLI and reach no log file, so they have
-``render`` alone. Nothing here touches a stream or a clock, so a block's text is a pure function
+terminal of a given width, styled only when the caller says so. The banner, the closing summary,
+the replay sentence and the log line are written to stderr by the CLI and reach no log file, so
+they have ``render`` alone. Nothing here touches a stream or a clock, so a block's text is a pure function
 of its fields.
 """
 
@@ -761,6 +761,30 @@ class NothingToRun:
         opening = f"Finished in {self.elapsed}"
         lines[0] = paint(opening, "label", color=color) + lines[0].removeprefix(opening)
         return ["", *lines]
+
+
+@dataclass(frozen=True)
+class LogLine:
+    """The last line of a run: where ``run.log`` is, its path broken at slashes to fit."""
+
+    path: str
+
+    def render(self, width: int, *, color: bool) -> list[str]:
+        """Draw the label and the path, any later line indented under the path.
+
+        :param int width: Columns available to each line.
+        :param bool color: Whether to style the label and the path.
+        :return list[str]: The lines of the log line.
+        """
+        label = "log:"
+        pad = " " * (len(label) + 1)
+        values = _value_lines(
+            BannerRow("log", self.path, is_path=True), max(width - len(pad), 20), color=color
+        )
+        return [
+            (paint(label, "label", color=color) + " " if index == 0 else pad) + value
+            for index, value in enumerate(values)
+        ]
 
 
 def _count_clauses(counts: PhaseCounts) -> tuple[str, ...]:

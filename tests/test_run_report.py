@@ -22,6 +22,7 @@ from phasesweep.engine.selection import PhaseTrialsFailedError
 from phasesweep.engine.state import PhaseCounts, Winner
 from phasesweep.evidence.models import WandbExtractor
 from phasesweep.run_report import (
+    LogLine,
     banner,
     nothing_to_run,
     phase_start,
@@ -886,6 +887,7 @@ def test_the_log_path_comes_last_after_an_operational_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The error and its fix line come first, then the absolute path of ``run.log``."""
+    monkeypatch.setenv("COLUMNS", "500")
     config = make_experiment(persistent=tmp_path)
     log = stub_run_command(
         monkeypatch,
@@ -910,6 +912,7 @@ def test_the_log_path_comes_last_after_ctrl_c(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """An interrupted run prints its resume hint, then names the log, and exits 130."""
+    monkeypatch.setenv("COLUMNS", "500")
     config = make_experiment(persistent=tmp_path)
     shutdown = PhaseSweepShutdown(
         signal.SIGINT,
@@ -924,6 +927,82 @@ def test_the_log_path_comes_last_after_ctrl_c(
     lines = capsys.readouterr().err.splitlines()
     assert lines[-2].startswith("phasesweep: stopped. Rerun the same command to resume")
     assert lines[-1] == f"log: {log.resolve()}"
+
+
+LONG_LOG = (
+    "/home/someone/projects/a-long-project-name/experiments/phasesweep_starter/runs/"
+    "phasesweep_starter/run.log"
+)
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        pytest.param(
+            120,
+            ["log: " + LONG_LOG],
+            id="120-fits-on-one-line",
+        ),
+        pytest.param(
+            80,
+            [
+                "log: /home/someone/projects/a-long-project-name/experiments/phasesweep_starter/",
+                "     runs/phasesweep_starter/run.log",
+            ],
+            id="80",
+        ),
+        pytest.param(
+            60,
+            [
+                "log: /home/someone/projects/a-long-project-name/experiments/",
+                "     phasesweep_starter/runs/phasesweep_starter/run.log",
+            ],
+            id="60",
+        ),
+    ],
+)
+def test_the_log_line_breaks_a_long_path_after_slashes(width: int, expected: list[str]) -> None:
+    """A path wider than the terminal breaks after a slash, every component whole and indented under the path."""
+    lines = LogLine(LONG_LOG).render(width, color=False)
+    assert lines == expected
+    assert all(len(line) <= width for line in lines)
+    assert "".join(line.removeprefix("log: ").strip() for line in lines) == LONG_LOG
+
+
+@pytest.mark.parametrize("tty", [False, True])
+@pytest.mark.parametrize("no_color", [None, "1", ""], ids=["unset", "set", "empty"])
+def test_the_closing_log_line_fits_the_terminal_and_is_styled_only_on_a_terminal(
+    redirect_stderr: Callable[..., FakeStderr],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tty: bool,
+    no_color: str | None,
+) -> None:
+    """The last line breaks a long path at 80 columns; escapes need a terminal and no ``NO_COLOR``."""
+    workdir = tmp_path / "a-long-project-name" / "experiments" / "phasesweep_starter"
+    log = stub_run_command(
+        monkeypatch,
+        PhaseTrialsFailedError("no feasible trial in 'p'"),
+        config=make_experiment(persistent=workdir),
+        writes_log=True,
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    stderr = redirect_stderr(tty=tty, no_color=no_color)
+
+    assert invoke_cli_boundary(["run", str(config_path)], monkeypatch) == 1
+
+    styled = tty and no_color is None
+    text = stderr.getvalue()
+    assert ("\x1b[1mlog:\x1b[0m" in text) is styled
+    assert ("\x1b[2m" in text) is styled
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", text).splitlines()
+    start = plain.index(next(line for line in plain if line.startswith("log: ")))
+    drawn = plain[start:]
+    assert len(drawn) > 1
+    assert all(len(line) <= 80 for line in drawn)
+    assert all(line.startswith("     ") for line in drawn[1:])
+    assert "".join(line.removeprefix("log: ").strip() for line in drawn) == str(log.resolve())
 
 
 def test_no_log_line_when_the_engine_never_wrote_a_log(

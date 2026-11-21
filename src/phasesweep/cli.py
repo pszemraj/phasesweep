@@ -89,6 +89,7 @@ from phasesweep.mcp.tool_names import TOOL_NAMES
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.run_report import (
     Banner,
+    LogLine,
     NothingToRun,
     Summary,
     banner,
@@ -114,7 +115,6 @@ from phasesweep.runtime.shutdown import (
 )
 from phasesweep.runtime.terminal import (
     display_path,
-    paint,
     plural,
     terminal_width,
     use_color,
@@ -210,7 +210,8 @@ def main() -> None:
 
     Click exceptions reach this boundary; explicit ``SystemExit`` statuses pass through. A
     ``run`` that went past its config prints ``log: <path>`` last, after its error or resume
-    lines, whenever ``run.log`` exists, so the file is named however the command ended.
+    lines, whenever ``run.log`` exists, so the file is named however the command ended. A path
+    wider than the terminal breaks after slashes.
 
     :raises SystemExit: Always, carrying one of ``_USAGE_EXIT`` (bad input),
         ``_FAILURE_EXIT`` (the run failed), ``_INTERNAL_EXIT`` (a phasesweep
@@ -223,12 +224,7 @@ def main() -> None:
     finally:
         run_log = _RUN_LOG.get()
         if run_log is not None and _is_readable_file(run_log):
-            color = use_color(sys.stderr)
-            click.echo(
-                f"{paint('log:', 'label', color=color)} "
-                f"{paint(str(run_log.resolve()), 'path', color=color)}",
-                err=True,
-            )
+            _print_block(LogLine(str(run_log.resolve())))
 
 
 def _is_readable_file(path: Path) -> bool:
@@ -620,10 +616,10 @@ def run(
             )
 
 
-def _print_block(block: Banner | Summary | NothingToRun) -> None:
+def _print_block(block: Banner | Summary | NothingToRun | LogLine) -> None:
     """Write a block the run prints but does not log to stderr, fitted to its width and colour.
 
-    :param Banner | Summary | NothingToRun block: The block to draw.
+    :param Banner | Summary | NothingToRun | LogLine block: The block to draw.
     """
     stream = sys.stderr
     lines = block.render(terminal_width(stream), color=use_color(stream))
