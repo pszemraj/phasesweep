@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from phasesweep.engine.errors import TrackingSyncRefusedError
-from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import UnsafePrivatePathError
 from phasesweep.runtime.json import (
     JsonObject,
@@ -22,7 +22,10 @@ from phasesweep.runtime.json import (
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
+    GENERATION_BINDING_FILE,
+    PENDING_GENERATION_BINDING_FILE,
     call_tracking,
+    pending_creation_records,
     read_binding,
     read_inherits,
     read_record,
@@ -103,9 +106,9 @@ def _deliver(
         call_tracking(experiment, worker_generation or generation_id, action, environment)
         # A lost acknowledgement resends the same projection on the next sync.
         write_record(path, {**record, "state": "delivered"})
+    except ProcessCleanupUncertainError:
+        raise
     except (OSError, ValueError, RuntimeError) as exc:
-        if isinstance(exc, UnsafeProcessCleanupError):
-            raise
         log.warning(
             "MLflow result upload pending for generation %s (%s). Retry with sync-tracking.",
             generation_id,
@@ -424,7 +427,7 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
     """
     from phasesweep.engine.generation import _validate_generation_publishable
 
-    parent = read_binding(tracking_root(experiment) / generation_id, "generation-binding.json")
+    parent = read_binding(tracking_root(experiment) / generation_id, GENERATION_BINDING_FILE)
     publication, _ = _validate_generation_publishable(experiment, generation_id)
     bindings = {
         name: validate_binding(winner.payload["objective_provenance"]["remote_capture"]["binding"])
@@ -488,11 +491,11 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
     :param str generation_id: Committed generation.
     :raises PublicationIntegrityError: The committed artifacts no longer validate.
     :raises OSError: A delivery record cannot be read or written.
-    :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
+    :raises ProcessCleanupUncertainError: An upload worker's cleanup is uncertain.
     """
     from phasesweep.engine.trial import _environment_identity
 
-    if not (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
+    if not (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists():
         return  # No-work replay never imports the SDK or creates remote runs.
     environment = _environment_identity(experiment, experiment.phases[0].name).values
     for path in _save_generation_intents(experiment, generation_id):
@@ -500,7 +503,7 @@ def publish_generation(experiment: Experiment, generation_id: str) -> None:
     pending = delivery_status(experiment, generation_id)["pending"]
     if pending:
         log.warning(
-            "MLflow uploads PENDING generation=%s pending=%d; published result saved locally. "
+            "MLflow delivery PENDING generation=%s pending=%d; published result saved locally. "
             "Run phasesweep sync-tracking with the same config to finish delivery.",
             generation_id,
             pending,
@@ -573,7 +576,7 @@ def _save_failure_summary(
         experiment,
         generation_id,
         "generation",
-        read_binding(tracking_root(experiment) / generation_id, "generation-binding.json"),
+        read_binding(tracking_root(experiment) / generation_id, GENERATION_BINDING_FILE),
         _projection(
             metrics={},
             params={},
@@ -603,7 +606,7 @@ def publish_failed_generation(
     """
     from phasesweep.engine.trial import _environment_identity
 
-    parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
+    parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
     if not parent_path.exists():
         return
     if _published(experiment, generation_id):
@@ -702,7 +705,7 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
     paths = []
     for generation_id in sorted(set(generation_ids)):
         root = tracking_root(experiment) / generation_id
-        if not (root / "generation-binding.json").is_file():
+        if not (root / GENERATION_BINDING_FILE).is_file():
             continue
         path = root / "delivery" / "generation.json"
         if path.exists():
@@ -718,18 +721,22 @@ def _save_ended_summaries(experiment: Experiment, generation_ids: Iterable[str])
 
 
 def generations_left_open(experiment: Experiment) -> set[str]:
-    """Name the generations whose summary run is bound but no saved record ends it.
+    """Name unpublished generations whose summary creation or terminal delivery is missing.
 
     A published generation is left out, as its record is built from its committed artifacts.
 
     :param Experiment experiment: Configured experiment.
-    :return set[str]: Each bound, unpublished generation without a summary-run record.
+    :return set[str]: Unpublished generations with a summary creation or binding and no
+        summary-run delivery record.
     """
+    root = tracking_root(experiment)
+    parents = {path.parent for path in root.glob(f"*/{GENERATION_BINDING_FILE}")}
+    parents.update(path.parent for path in root.glob(f"*/{PENDING_GENERATION_BINDING_FILE}"))
     return {
-        parent.parent.name
-        for parent in tracking_root(experiment).glob("*/generation-binding.json")
-        if not (parent.parent / "delivery" / "generation.json").exists()
-        and not _published(experiment, parent.parent.name)
+        parent.name
+        for parent in parents
+        if not (parent / "delivery" / "generation.json").exists()
+        and not _published(experiment, parent.name)
     }
 
 
@@ -779,7 +786,7 @@ def save_recovered_attempts(
     generations = sorted(
         generation_id
         for generation_id in set(generation_ids)
-        if (root / generation_id / "generation-binding.json").is_file()
+        if (root / generation_id / GENERATION_BINDING_FILE).is_file()
     )
     try:
         if generations and not _target_recorded(experiment):
@@ -822,9 +829,9 @@ def deliver_recovered_attempts(
     itself sends nothing, so an unreachable tracker costs it no request. The records
     go only after a target check: the one :func:`require_tracking_target` made when the calling
     run bound its own summary run, or else a resolve made here, which binds no summary run. A
-    failed check or upload leaves the rest pending for sync-tracking. Every worker this starts
-    is registered under ``generation_id``, so one whose cleanup is unconfirmed belongs to the run
-    that is accountable for it, not to the generation whose record it was sending.
+    failed check or upload leaves the rest pending for sync-tracking. After the target check,
+    search for pending creations and save the corresponding outcomes when found. Workers
+    register under ``generation_id`` because this invocation is accountable for their cleanup.
 
     :param Experiment experiment: Configured experiment.
     :param ValidatedLedger ledger: The ledger holding the settled trials.
@@ -837,7 +844,7 @@ def deliver_recovered_attempts(
         the target is resolved here, as no check in this process covered it.
     :param bool tracker_unreachable: The caller found a tracker it could not read, so the
         records are only saved.
-    :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
+    :raises ProcessCleanupUncertainError: A search or upload worker's cleanup is uncertain.
     :return dict[str, int]: How many of those records were ``delivered`` here and how many stay
         ``pending``.
     """
@@ -846,13 +853,15 @@ def deliver_recovered_attempts(
 
     # A run's own records are its terminal delivery's, which knows how the run ended.
     own = set() if recovering else {generation_id}
-    paths = save_recovered_attempts(experiment, ledger, set(generation_ids) - own)
-    unsent = {"delivered": 0, "pending": len(paths)}
-    if not paths:
+    generations = sorted(set(generation_ids) - own)
+    paths = save_recovered_attempts(experiment, ledger, generations)
+    creations = sum(len(pending_creation_records(experiment, gid)) for gid in generations)
+    unsent = {"delivered": 0, "pending": len(paths) + creations}
+    if not unsent["pending"]:
         return unsent
     pending = (
-        f"{len(paths)} MLflow outcome(s) of the recovered trials and generations stay pending; "
-        "run phasesweep sync-tracking with the same config to deliver them."
+        f"{unsent['pending']} MLflow record(s) stay pending. "
+        "Run phasesweep sync-tracking with the original tracking config."
     )
     if tracker_unreachable:
         log.warning(pending)
@@ -860,10 +869,13 @@ def deliver_recovered_attempts(
     environment = _environment_identity(experiment, experiment.phases[0].name).values
     checked = (
         not recovering
-        and (tracking_root(experiment) / generation_id / "generation-binding.json").is_file()
+        and (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).is_file()
     )
-    if not checked:
-        try:
+    try:
+        if creations and not _target_recorded(experiment):
+            log.warning("MLflow run creations belong to a different tracking target. %s", pending)
+            return unsent
+        if not checked:
             require_tracking_target(
                 experiment,
                 generation_id=generation_id,
@@ -871,25 +883,38 @@ def deliver_recovered_attempts(
                 deadline=None,
                 resolve_only=True,
             )
-        except TrackingTargetUnavailableError as exc:
-            log.warning("%s %s", exc, pending)
-            return unsent
+    except (OSError, ValueError, UnsafePrivatePathError, TrackingTargetUnavailableError) as exc:
+        log.warning("%s %s", exc, pending)
+        return unsent
+    if creations:
+        for previous in generations:
+            resolve_pending_creations(
+                experiment, environment, previous, worker_generation=generation_id
+            )
+        paths = save_recovered_attempts(experiment, ledger, generations)
+        creations = sum(len(pending_creation_records(experiment, gid)) for gid in generations)
+        if creations:
+            log.warning(
+                "%d MLflow run creation record(s) remain pending. "
+                "Run phasesweep sync-tracking with the original tracking config.",
+                creations,
+            )
     delivered = 0
     for path in paths:
         if not _deliver(experiment, path, environment, worker_generation=generation_id):
             break
         delivered += 1
-    return {"delivered": delivered, "pending": len(paths) - delivered}
+    return {"delivered": delivered, "pending": len(paths) - delivered + creations}
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
-    """Read mutable delivery counts without importing the tracking SDK.
+    """Count pending run creations and delivery records without importing the tracking SDK.
 
     :param Experiment experiment: Local namespace.
     :param str | None generation_id: Optional generation filter.
     :return dict[str, int]: Path-free pending and delivered counts.
     """
-    counts = {"pending": 0, "delivered": 0}
+    counts = {"pending": len(pending_creation_records(experiment, generation_id)), "delivered": 0}
     for path in tracking_root(experiment).glob(f"{generation_id or '*'}/delivery/*.json"):
         state = json_text(read_record(path), "state")
         if state not in counts:
@@ -951,7 +976,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         environment = _environment_identity(experiment, experiment.phases[0].name).values
         # A run a timed-out creation made late is bound before its records are rebuilt.
         resolve_pending_creations(experiment, environment, generation_id)
-        parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
+        parents = sorted(root.glob(f"{generation_id or '*'}/{GENERATION_BINDING_FILE}"))
         # The lock rules out a live invocation, so every unpublished generation here has ended.
         generations = [parent.parent.name for parent in parents]
         _rebuild_attempt_intents(experiment, ledger, generations)
@@ -963,7 +988,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
                 continue
             _save_generation_intents(experiment, parent.parent.name)
         paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
-        if not paths:
+        if not paths and not pending_creation_records(experiment, generation_id):
             raise TrackingSyncRefusedError("No tracking deliveries exist for this scope.")
         for path in paths:
             record = read_record(path)

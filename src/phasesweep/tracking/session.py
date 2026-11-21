@@ -47,8 +47,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
+GENERATION_BINDING_FILE = "generation-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
 _PENDING_SUFFIX = ".pending.json"
+PENDING_GENERATION_BINDING_FILE = Path(GENERATION_BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
 _PARENT_LOCK = threading.RLock()
 
 
@@ -329,6 +331,7 @@ def _find_bound(
     *,
     timeout_at: float,
     deadline: float | None,
+    worker_generation: str | None = None,
 ) -> RunBinding | None:
     """Search an identity's run read-only, polling until ``timeout_at``.
 
@@ -337,64 +340,80 @@ def _find_bound(
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param float timeout_at: Absolute monotonic time the search stops polling at.
     :param float | None deadline: Existing execution deadline.
+    :param str | None worker_generation: Invocation registering the search, defaulting to the
+        identity's own generation.
     :return RunBinding | None: The verified binding, or ``None`` when no run carries the identity.
     """
     request: FindAction = {"action": "find", "binding": identity, "timeout_at": timeout_at}
-    found = call_tracking(experiment, identity["generation_id"], request, environment, deadline)
+    found = call_tracking(
+        experiment, worker_generation or identity["generation_id"], request, environment, deadline
+    )
     return validate_binding(found["binding"]) if found.get("found") is True else None
 
 
-def resolve_pending_creations(
-    experiment: Experiment, environment: Mapping[str, str], generation_id: str | None
-) -> None:
-    """Reconcile pending creations with one read-only search per record, without polling.
+def pending_creation_records(
+    experiment: Experiment, generation_id: str | None = None
+) -> list[Path]:
+    """Find the creation intents that have yet to be reconciled.
 
-    A found run is bound and its pending record removed. Missing runs and search
-    failures retain their records; failures also emit a warning.
-
-    :param Experiment experiment: Configured experiment.
-    :param Mapping[str, str] environment: Composed credentials and transport.
-    :param str | None generation_id: Generation to resolve, or ``None`` for every generation.
-    :raises UnsafeProcessCleanupError: A search worker's cleanup is uncertain.
+    :param Experiment experiment: Local namespace.
+    :param str | None generation_id: Generation filter, defaulting to every generation.
+    :return list[Path]: Pending summary and attempt creation records, in that order.
     """
     from phasesweep.engine.paths import _experiment_dir
-    from phasesweep.errors import UnsafeProcessCleanupError
 
     scope = generation_id or "*"
     attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
-    pending_records = sorted(
-        tracking_root(experiment).glob(f"{scope}/generation-binding{_PENDING_SUFFIX}")
+    return sorted(
+        tracking_root(experiment).glob(f"{scope}/{PENDING_GENERATION_BINDING_FILE}")
     ) + sorted(
         _experiment_dir(experiment).glob(
             f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
         )
     )
-    for pending in pending_records:
+
+
+def resolve_pending_creations(
+    experiment: Experiment,
+    environment: Mapping[str, str],
+    generation_id: str | None,
+    *,
+    worker_generation: str | None = None,
+) -> None:
+    """Reconcile pending creations with one read-only search per record.
+
+    Persist each found binding before removing its intent. Search or local record failures
+    leave the record for another pass and emit a warning.
+
+    :param Experiment experiment: Configured experiment with a verified tracking target.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str | None generation_id: Generation to resolve, or ``None`` for every generation.
+    :param str | None worker_generation: Invocation registering the searches, defaulting to
+        each record's own generation.
+    :raises ProcessCleanupUncertainError: A search worker's cleanup is uncertain.
+    """
+    for pending in pending_creation_records(experiment, generation_id):
         path = pending.with_suffix("").with_suffix(".json")
-        if not path.exists():
-            identity = validate_identity(read_record(pending)["identity"])
-            try:
+        try:
+            if not path.exists():
+                identity = validate_identity(read_record(pending).get("identity"))
                 binding = _find_bound(
                     experiment,
                     identity,
                     environment,
                     timeout_at=time.monotonic(),
                     deadline=None,
+                    worker_generation=worker_generation,
                 )
-            except (OSError, ValueError, RuntimeError) as exc:
-                if isinstance(exc, UnsafeProcessCleanupError):
-                    raise
-                log.warning(
-                    "MLflow run creation for attempt %s of generation %s is still unresolved (%s).",
-                    identity["attempt_id"],
-                    identity["generation_id"],
-                    exc,
-                )
-                continue
-            if binding is None:
-                continue
-            write_record(path, binding)
-        pending.unlink(missing_ok=True)
+                if binding is None:
+                    # The server may still commit a sent create after its worker is gone.
+                    continue
+                write_record(path, binding)
+            pending.unlink(missing_ok=True)
+        except ProcessCleanupUncertainError:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("MLflow run creation at %s is still unresolved (%s).", pending, exc)
 
 
 def _resolve_source(
@@ -448,7 +467,7 @@ def prepare_generation(
     """
     assert experiment.mlflow is not None
     with _PARENT_LOCK:
-        parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
+        parent_path = tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE
         if parent_path.exists():
             return read_binding(parent_path.parent, parent_path.name)
         experiment_id = _resolve_source(
@@ -508,7 +527,7 @@ def require_tracking_target(
     try:
         if (
             resolve_only
-            or (tracking_root(experiment) / generation_id / "generation-binding.json").exists()
+            or (tracking_root(experiment) / generation_id / GENERATION_BINDING_FILE).exists()
         ):
             # An earlier phase bound the summary run, or the caller binds none; the target must
             # still resolve.

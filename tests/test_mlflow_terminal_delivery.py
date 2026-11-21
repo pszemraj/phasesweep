@@ -32,7 +32,7 @@ from phasesweep.engine.paths import (
     _generation_record_path,
     _trial_dir_for,
 )
-from phasesweep.engine.read import read_status
+from phasesweep.engine.read import experiment_status, read_status
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
@@ -121,17 +121,19 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     tmp_path, monkeypatch, outcome
 ):
     """Creation workers never become trainer evidence, and an unlaunched draw is retried."""
-    config, _ = remote_mlflow_example(tmp_path, monkeypatch)
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     config["phases"] = config["phases"][:1]
     config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
     experiment = Experiment.model_validate(config)
     respond = session.request_operation
     created = {}
+    search_generations = []
 
     def create_before_trainer(request, *, operation_id, directory, environment, deadline):
         binding = request.get("binding", {})
         if request["action"] == "find" and binding.get("attempt_id") == created.get("attempt_id"):
+            search_generations.append(directory.parents[1].name)
             return {"found": True, "binding": created}
         if request["action"] == "create" and binding.get("phase") != "generation" and not created:
             created.update(respond(request))
@@ -175,13 +177,55 @@ def test_managed_creation_before_launch_recovers_the_unlaunched_draw(
     trial_dir = Path(original.user_attrs[TRIAL_DIR_ATTR])
     lifecycle = process.read_attempt_lifecycle(trial_dir, expected_attempt_id=created["attempt_id"])
     assert lifecycle is not None and lifecycle.state == "allocated"
+    assert experiment_status(experiment)["tracking_delivery"]["pending"] == 1
 
-    run_experiment(experiment)
+    reports = []
+    run_experiment(experiment, terminal_callback=reports.append)
     original, retried = read_phase_trials(validate_ledger(experiment), "depth").trials
     assert _trial_interrupted(original)
     assert retried.state == TrialState.COMPLETE
     assert retried.params == original.params
     assert retried.user_attrs[RERUN_OF_ATTR] == original.number
+    assert search_generations == [reports[0].generation_id]
+    assert session.read_binding(trial_dir) == created
+    assert _sent(uploads, [created["attempt_id"]]) == ["KILLED"]
+    assert publication.delivery_status(experiment)["pending"] == 0
+
+
+def test_next_run_finishes_a_summary_created_before_its_binding_was_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invocation can leave a summary creation behind before allocating any trial."""
+    config, uploads = remote_mlflow_example(tmp_path, monkeypatch)
+    experiment = Experiment.model_validate(config)
+    respond = session.request_operation
+    created: dict[str, str] = {}
+    appeared = False
+
+    def create_summary(request, **kwargs):
+        if request["action"] == "create" and not created:
+            assert request["binding"]["phase"] == "generation"
+            created.update(respond(request))
+            raise RunnerKilled()
+        if request["action"] == "find":
+            assert request["binding"]["generation_id"] == created["generation_id"]
+            return {"found": True, "binding": created} if appeared else {"found": False}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", create_summary)
+    with pytest.raises(RunnerKilled):
+        run_experiment(experiment)
+    previous = created["generation_id"]
+    assert experiment_status(experiment)["tracking_delivery"] == {"delivered": 0, "pending": 1}
+    assert publication.sync_tracking(experiment, previous) == {"delivered": 0, "pending": 1}
+
+    appeared = True
+    run_experiment(experiment)
+
+    assert [(gid, state) for gid, state in _summaries(uploads) if gid == previous] == [
+        (previous, "KILLED")
+    ]
+    assert publication.delivery_status(experiment, previous) == {"delivered": 1, "pending": 0}
 
 
 def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
@@ -215,8 +259,18 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("trainer", ["accepted", "failed"])
-@pytest.mark.parametrize("n_jobs", [1, 2])
-def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n_jobs, trainer):
+@pytest.mark.parametrize(
+    ("n_jobs", "error_class"),
+    [
+        (1, UnsafeProcessCleanupError),
+        (2, UnsafeProcessCleanupError),
+        (2, ProcessCleanupUncertainError),
+    ],
+    ids=["serial", "parallel", "parallel-unreadable-lifecycle"],
+)
+def test_unresolved_attempt_upload_worker_fails_the_run(
+    tmp_path, monkeypatch, n_jobs, trainer, error_class
+):
     """Optuna drops callback errors in its final threaded batch; the fatal channel must not."""
     config, _uploads = remote_mlflow_example(tmp_path, monkeypatch)
     config["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
@@ -225,7 +279,7 @@ def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n
             shlex.join([sys.executable, "-c", "raise SystemExit(1)"]) + " {config_path}"
         )
     experiment = Experiment.model_validate(config)
-    error = UnsafeProcessCleanupError("upload worker still unresolved")
+    error = error_class("upload worker still unresolved")
     uploaded_phases = []
 
     def unresolved(*args, **kwargs):
@@ -236,7 +290,7 @@ def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n
 
     monkeypatch.setattr(publication, "call_tracking", unresolved)
     reports = []
-    with pytest.raises(UnsafeProcessCleanupError) as caught:
+    with pytest.raises(error_class) as caught:
         run_experiment(experiment, terminal_callback=reports.append)
     assert caught.value is error
     [report] = reports
@@ -1020,6 +1074,9 @@ def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
     # reply. A run that does not exist yet leaves its pending record for sync to resolve.
     assert pending.exists() is (reply != "ok")
     assert (attempt_directory / BINDING_FILE).exists() is (reply == "ok")
+    if reply != "ok":
+        assert publication.sync_tracking(experiment, generation) == {"pending": 1, "delivered": 6}
+        assert pending.exists()
 
     appeared["late"] = True
     uploads.clear()
