@@ -395,7 +395,7 @@ def _abort_decision(
     *,
     completion_sequence: int,
     consecutive_failures: int,
-    aborted: bool,
+    abort_recorded: bool,
     cause: str | None = None,
     fatal_policy: str | None = None,
 ) -> JsonObject | None:
@@ -409,12 +409,14 @@ def _abort_decision(
     :param str outcome: The terminal outcome about to be recorded.
     :param int completion_sequence: Completion sequence of the last recorded outcome.
     :param int consecutive_failures: Failure streak before ``outcome``.
-    :param bool aborted: Whether an abort already stopped the phase, so a streak trips no other.
+    :param bool abort_recorded: Whether the phase already recorded an abort.
     :param str | None cause: The outcome's recorded cause, if any.
     :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
     :return JsonObject | None: The abort record at the next completion sequence, or ``None``
         when the outcome trips nothing.
     """
+    if abort_recorded:
+        return None
     sequence = completion_sequence + 1
     if outcome == "fatal":
         return _abort_record(
@@ -424,7 +426,7 @@ def _abort_decision(
             cause=cause or f"trial {trial_number} hit a fatal objective error",
         )
     streak = _next_consecutive_failures(consecutive_failures, outcome)
-    if aborted or not _consecutive_failure_threshold_tripped(streak, phase):
+    if not _consecutive_failure_threshold_tripped(streak, phase):
         return None
     return _failure_policy_abort_record(
         phase,
@@ -793,20 +795,18 @@ class _PhaseExecution:
         :return JsonObject | None: The abort record for the outcome's
             completion sequence, or ``None`` when it trips nothing new.
         """
-        if self.abort_recorded:
-            return None
         return _abort_decision(
             self.phase,
             trial_number,
             outcome,
             completion_sequence=self.completion_sequence,
             consecutive_failures=self.consecutive_failures,
-            aborted=self.aborted,
+            abort_recorded=self.abort_recorded,
             cause=cause,
             fatal_policy=fatal_policy,
         )
 
-    def advance(self, trial_number: int, outcome: str) -> bool:
+    def advance(self, trial_number: int, outcome: str) -> None:
         """Apply one durably recorded outcome in completion order.
 
         The caller holds ``outcome_lock`` and has already written the outcome
@@ -816,8 +816,6 @@ class _PhaseExecution:
 
         :param int trial_number: Trial whose outcome was recorded.
         :param str outcome: The recorded terminal outcome.
-        :return bool: Whether the outcome trips an abort: any fatal outcome,
-            or the consecutive-failure threshold while no abort has tripped.
         """
         self.completion_sequence += 1
         self.recorded_outcomes[trial_number] = outcome
@@ -825,10 +823,6 @@ class _PhaseExecution:
             self.finished_trials += 1
         self.finished_ordinals[trial_number] = self.finished_trials
         self.consecutive_failures = _next_consecutive_failures(self.consecutive_failures, outcome)
-        threshold_tripped = not self.aborted and _consecutive_failure_threshold_tripped(
-            self.consecutive_failures, self.phase
-        )
-        return threshold_tripped or outcome == "fatal"
 
     def stop_launches(self) -> None:
         """Stop every queued and future trial from launching."""
@@ -956,12 +950,11 @@ def _record_outcome(
                 continue
 
             write_error = None
-            if not run.advance(trial.number, outcome):
-                return
-            run.stop_launches()
+            run.advance(trial.number, outcome)
             if abort_record is None:
                 return
             run.abort_recorded = True
+            run.stop_launches()
             break
     if write_error is not None:
         unrecorded = _TrialLeftRunning(

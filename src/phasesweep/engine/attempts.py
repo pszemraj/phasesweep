@@ -715,7 +715,7 @@ def _record_stale_trial_outcome(
                     # The abort belongs at this outcome's own sequence.
                     completion_sequence=sequence - 1,
                     consecutive_failures=state.consecutive_failures,
-                    aborted=state.abort is not None,
+                    abort_recorded=state.abort is not None,
                 )
         elif existing.outcome == outcome:
             sequence = existing.sequence

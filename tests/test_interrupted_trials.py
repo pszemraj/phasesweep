@@ -1504,6 +1504,68 @@ def test_a_recovered_verdict_trips_the_failure_limit_as_a_live_one_does(
     assert launches.read_text().splitlines() == ["launch"] * 2
 
 
+@pytest.mark.integration
+def test_tracker_outage_preserves_a_parallel_peers_failure_limit_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer's definitive failure trips the limit during a tracker outage and blocks publication after recovery."""
+    from phasesweep.evidence.wandb import WandbRunTerminalError, WandbSetupError
+    from phasesweep.runtime.time import utc_now_iso
+
+    experiment, launches = wandb_objective_experiment(
+        tmp_path, n_trials=2, n_jobs=2, max_consecutive_failures=1
+    )
+    both_reading = threading.Barrier(2)
+    launches_stopped = threading.Event()
+    original_stop_launches = phase_module._PhaseExecution.stop_launches
+
+    def stop_launches(run: phase_module._PhaseExecution) -> None:
+        original_stop_launches(run)
+        launches_stopped.set()
+
+    def outage(*, run_id: str, trial_dir: Path, **_options: object) -> JsonObject:
+        both_reading.wait(10)
+        if trial_dir.name.startswith("trial_00000__"):
+            raise WandbSetupError(run_id, "HTTP 401")
+        # The peer's verdict comes after the outage has already stopped new launches.
+        assert launches_stopped.wait(10)
+        raise WandbRunTerminalError(run_id, "crashed")
+
+    monkeypatch.setattr(phase_module._PhaseExecution, "stop_launches", stop_launches)
+    monkeypatch.setattr("phasesweep.evidence.wandb.require_wandb_sdk", lambda: None)
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", outage)
+    with pytest.raises(TrackingTargetUnavailableError):
+        run_experiment(experiment)
+
+    pending, failed = phase_trials(experiment)
+    _assert_evidence_pending(experiment, pending)
+    assert failed.state == optuna.trial.TrialState.FAIL
+    outcome = failed.user_attrs[TRIAL_OUTCOME_ATTR]
+    abort = outcome[TRIAL_OUTCOME_ABORT_KEY]
+    assert abort["policy"] == "max_consecutive_failures"
+    assert abort["completion_sequence"] == outcome["sequence"] == 1
+
+    monkeypatch.setattr(
+        "phasesweep.evidence.evaluation.poll_wandb_summary",
+        lambda **_options: {
+            "values": {"x": 1.0},
+            "present_keys": [],
+            "retrieved_at": utc_now_iso(),
+        },
+    )
+    monkeypatch.setattr("phasesweep.evidence.evaluation.locate_wandb_position", lambda **_: None)
+    with pytest.raises(PhaseAbortRefusedError, match="previously aborted"):
+        run_experiment(experiment)
+
+    settled, failed = phase_trials(experiment)
+    assert settled.state == optuna.trial.TrialState.COMPLETE
+    assert settled.value == 1.0
+    assert settled.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] == 2
+    assert failed.user_attrs[TRIAL_OUTCOME_ATTR][TRIAL_OUTCOME_ABORT_KEY] == abort
+    assert not _last_successful_generation_path(experiment).exists()
+    assert launches.read_text().splitlines() == ["launch"] * 2
+
+
 @pytest.mark.parametrize("first", ["cleanup", "left-running"])
 def test_unconfirmed_cleanup_outranks_a_parallel_trial_left_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str

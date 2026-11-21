@@ -67,7 +67,6 @@ from phasesweep.engine.state import (
     _parsed_trial_outcome,
 )
 from phasesweep.engine.study_policy import (
-    _consecutive_failure_threshold_tripped,
     _launch_preflight,
     _load_phase_policy_state,
     _record_recovery_boundary,
@@ -1566,7 +1565,7 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         if abort is not None:
             payload[TRIAL_OUTCOME_ABORT_KEY] = abort
         trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
-        tripped = run.advance(trial.number, outcome)
+        run.advance(trial.number, outcome)
         if abort is not None:
             run.abort_recorded = True
             first_abort = abort
@@ -1575,10 +1574,6 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
         assert replayed.abort_streak == abort_streak
-        assert tripped == (
-            outcome == "fatal"
-            or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
-        )
         assert replayed.abort == first_abort
     assert first_abort is not None
 
