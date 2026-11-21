@@ -102,6 +102,13 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
+#: The step that reruns every phase, which every step that offers a narrower rerun ends with.
+RERUN_EVERY_PHASE_STEP = f"To rerun every phase, {FRESH_STUDY}."
+
+#: What a rename costs the renamed phases, which each step that offers one follows with the
+#: consequence for the phases it leaves alone.
+_RENAMED_PHASE_RUNS_AGAIN = "each renamed phase starts a new study and runs again"
+
 #: The fact about a rerun under `storage: null`, as a clause for each step that offers one to
 #: compose with its own lead-in, so a restart is worded the same wherever it is offered.
 STORAGE_NULL_KEEPS_NOTHING = "storage: null keeps no completed trials between runs"
@@ -152,8 +159,8 @@ def rename_dependents_step(phase_name: str, dependents: Sequence[str]) -> str:
     """
     return (
         f"give each phase that inherits it ({phase_names(dependents)}) a new `name`, updating "
-        "every `inherits` to match; each renamed phase starts a new study and runs again, while "
-        f"`{phase_name}` keeps its finished trials and runs the rest"
+        f"every `inherits` to match; {_RENAMED_PHASE_RUNS_AGAIN}, while `{phase_name}` keeps its "
+        "finished trials and runs the rest"
     )
 
 
@@ -170,8 +177,8 @@ def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
     return (
         f"A trial timed out under phases[{phase_name}].timeout_seconds_per_trial, which is part "
         "of the phase's study identity, so raising it in place is refused as a changed study. "
-        f"Raise it and {rename_phase_step(dependents)}; each renamed phase starts a new study "
-        "and runs again, and every other phase keeps its results."
+        f"Raise it and {rename_phase_step(dependents)}; {_RENAMED_PHASE_RUNS_AGAIN}, and every "
+        "other phase keeps its results."
     )
 
 

@@ -18,7 +18,7 @@ from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
-from phasesweep.errors import FRESH_STUDY, phase_names, rename_dependents_step
+from phasesweep.errors import RERUN_EVERY_PHASE_STEP, phase_names, rename_dependents_step
 from phasesweep.runtime.terminal import plural
 
 
@@ -201,9 +201,7 @@ def _reject_bound_descendant_topups(
                 f"remaining, but {plural(len(bound), 'dependent phase')} ({phase_names(bound)}) "
                 f"{'is' if len(bound) == 1 else 'are'} already bound to its published winner "
                 "via inheritance.",
-                remediation=(
-                    f"To run the larger budget, {rename}. To rerun every phase, {FRESH_STUDY}."
-                ),
+                remediation=f"To run the larger budget, {rename}. {RERUN_EVERY_PHASE_STEP}",
             )
 
 
