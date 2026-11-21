@@ -653,7 +653,11 @@ def test_the_timeout_step_names_the_phases_that_inherit_the_timed_out_one(tmp_pa
 
 @pytest.mark.parametrize(
     "reason",
-    ["phase/run wallclock deadline exceeded", "non-zero exit code 1; stderr: timeout after"],
+    [
+        "phase/run wallclock deadline exceeded",
+        f"non-zero exit code 1; stderr: {TIMEOUT_REASON_PREFIX}5.0s",
+    ],
+    ids=["deadline", "quoted-stderr"],
 )
 def test_other_failures_are_not_read_as_a_per_trial_timeout(tmp_path: Path, reason: str) -> None:
     """Only the supervisor's per-trial wording counts; a deadline or a quoted stderr line does not."""
