@@ -12,7 +12,12 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config.models import Experiment
-from phasesweep.runtime.shutdown import PhaseSweepShutdown, _shutdown_handler
+from phasesweep.engine.phase import _shutdown_raised_over
+from phasesweep.runtime.shutdown import (
+    PhaseSweepShutdown,
+    ShutdownCleanupReport,
+    _shutdown_handler,
+)
 from tests.conftest import (
     console_script,
     make_experiment,
@@ -88,6 +93,43 @@ def _assert_completed_with_one_start_each(experiment: Experiment, starts: Path) 
     assert [t.value for t in trials] == [t.params["x"] for t in trials]
     names = starts.read_text().splitlines()
     assert sorted(name.split("__")[0] for name in names) == ["trial_00000", "trial_00001"]
+
+
+def _raised(chain: str) -> BaseException:
+    """Raise and catch one exception chain, as Python links it.
+
+    :param str chain: ``cause`` raises a RuntimeError from a shutdown, ``context`` raises one
+        while handling a shutdown, and ``none`` chains a RuntimeError to a ValueError.
+    :return BaseException: The outermost exception, with its links set.
+    """
+    shutdown = PhaseSweepShutdown(signal.SIGINT, ShutdownCleanupReport(signal.SIGINT, True, ()))
+    inner: BaseException = ValueError("inner") if chain == "none" else shutdown
+    try:
+        try:
+            raise inner
+        except BaseException as handled:
+            if chain == "cause":
+                raise RuntimeError("outer") from handled
+            raise RuntimeError("outer")  # noqa: B904
+    except RuntimeError as outer:
+        return outer
+    raise AssertionError("the chain was not raised")
+
+
+@pytest.mark.parametrize("chain", ["cause", "context", "none"])
+def test_a_shutdown_is_found_through_either_link_of_a_chain(chain: str) -> None:
+    """A shutdown linked as the cause or as the context of the exception leaving ``study.optimize`` is found; a chain without one gives nothing."""
+    outer = _raised(chain)
+    if chain == "cause":
+        # Python sets the context too; the cause alone must be enough.
+        outer.__context__ = None
+
+    found = _shutdown_raised_over(outer)
+
+    if chain == "none":
+        assert found is None
+    else:
+        assert isinstance(found, PhaseSweepShutdown) and found.signum == signal.SIGINT
 
 
 @pytest.mark.integration
