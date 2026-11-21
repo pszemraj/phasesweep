@@ -1108,10 +1108,12 @@ def test_payload_delivery_consumes_total_trial_budget(
 def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A status byte observed after the deadline still means the trial timed out."""
+    """A status byte observed after the deadline still means the trial timed out; the timeout is logged at INFO, for run.log only, because the trial's reason states it."""
     import phasesweep.runtime.process as process
 
+    caplog.set_level("INFO", logger="phasesweep.runtime.process")
     real_fd_ready = process.fd_ready
     read_waits = 0
 
@@ -1137,6 +1139,7 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     assert result.timed_out
     assert result.cleanup_confirmed
     assert result.failure_reason == "timeout after 0.5s"
+    assert [r.levelname for r in caplog.records if "timed out" in r.getMessage()] == ["INFO"]
 
 
 def test_payload_write_timeout_covers_a_nonreading_pipe() -> None:
@@ -1621,8 +1624,7 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     report.
     """
     terminated: list[int] = []
-    guardian = SimpleNamespace(pid=4321)
-    active = {1234: _RegisteredGroup(guardian, "trial")}
+    active = {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")}
 
     monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
@@ -1632,7 +1634,7 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
         grace_seconds: float,
         guardians: Mapping[int, subprocess.Popen[bytes]],
     ) -> dict[int, bool]:
-        assert guardians == {1234: guardian}
+        assert guardians == {1234: active[1234].guardian}
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
@@ -1671,10 +1673,8 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first shutdown signal owns cleanup evidence until its pass completes."""
-    active = {
-        pgid: _RegisteredGroup(SimpleNamespace(pid=pid), "trial")
-        for pgid, pid in ((1234, 4321), (5678, 8765))
-    }
+    active = {1234: _RegisteredGroup(SimpleNamespace(pid=4321), "trial")}
+    active[5678] = _RegisteredGroup(SimpleNamespace(pid=8765), "trial")
     terminated: list[int] = []
     reentered = False
 

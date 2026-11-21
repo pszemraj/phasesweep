@@ -297,9 +297,10 @@ def _named_command(marks: Path) -> str:
 
 
 def test_a_persistent_child_is_terminated_after_the_settle_and_named(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A SIGTERM-ignoring child is signalled only once the settle ends, killed, and named."""
+    """A SIGTERM-ignoring child is signalled only once the settle ends, killed, and named; the trial's reason names it, so run.log alone keeps the INFO line."""
+    caplog.set_level(logging.INFO, logger="phasesweep.runtime.process")
     use_guardian_timing(monkeypatch, tmp_path, settle_seconds=0.5, term_grace_seconds=0.5)
     trainer, marks = _trainer(tmp_path, _PERSISTENT_TRAINER)
     trial_dir = tmp_path / "persistent"
@@ -320,6 +321,8 @@ def test_a_persistent_child_is_terminated_after_the_settle_and_named(
     )
     if sys.platform == "linux":
         assert f": {child_pid} ({_named_command(marks)[:40]}" in result.failure_reason
+    named = [r.levelno for r in caplog.records if "still had live descendants" in r.getMessage()]
+    assert named == [logging.INFO]
     _assert_exited(trial_dir, 1)
     assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
     root_exit = float((marks / "root_exit").read_text())
