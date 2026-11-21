@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import secrets
+import shlex
 import stat
 import sys
 from collections.abc import Callable, Iterator
@@ -252,6 +253,11 @@ def _lock_policy(path: Path) -> _LockPolicy:
         raise UnsafeLockPathError(
             f"Lock directory {path} does not exist; provision it before setting {_LOCK_DIR_ENV}.",
             action=OperatorAction.PROVISION_LOCK_DIR,
+            remediation=(
+                f"For an owner-only lock directory, run `mkdir -p -m 700 {shlex.quote(str(path))}`. "
+                f"Use the same {_LOCK_DIR_ENV} in every shell, MCP server, and sandbox "
+                "launching work on this host."
+            ),
         ) from exc
     except UnsafePrivatePathError as exc:
         raise UnsafeLockPathError(
@@ -293,8 +299,14 @@ def _lock_policy_for_info(path: Path, info: os.stat_result) -> _LockPolicy:
         return _LockPolicy(True, info.st_uid, info.st_gid, SHARED_FILE_MODE)
 
     raise UnsafeLockPathError(
-        f"Unsafe lock directory {path}: expected owner-only mode 0700 owned by uid {euid}, "
-        "or an administrator-owned shared directory with mode 03770 and an accessible group."
+        f"Unsafe lock directory {path}: found uid {info.st_uid}, gid {info.st_gid}, and mode "
+        f"{mode:04o}. Expected owner-only mode 0700 owned by uid {euid}, or an "
+        "administrator-owned shared directory with mode 03770 and an accessible group.",
+        remediation=(
+            f"For an owner-only lock directory, run `chmod 700 {shlex.quote(str(path))}`."
+            if info.st_uid == euid
+            else None
+        ),
     )
 
 
@@ -648,6 +660,10 @@ def _walk_directory_fd(
                 raise UnsafePrivatePathError(
                     f"Private path component {component_path} is not a real directory."
                 ) from exc
+            if stat.S_ISLNK(before.st_mode):
+                raise UnsafePrivatePathError(
+                    f"Private path component {component_path} is a symlink."
+                )
             if not stat.S_ISDIR(before.st_mode):
                 raise UnsafePrivatePathError(
                     f"Private path component {component_path} is not a real directory."

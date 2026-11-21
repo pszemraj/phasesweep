@@ -374,10 +374,12 @@ def test_lock_dir_accepts_admin_shared_directory_and_creates_group_lock(
 def test_lock_dir_rejects_missing_or_unsafe_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    override = tmp_path / "operator-managed-locks"
+    """An unsafe override identifies the problem and gives private-directory repair commands."""
+    override = tmp_path / "operator managed locks"
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
-    with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist"):
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="does not exist") as missing:
         runtime_files.lock_dir()
+    assert f"`mkdir -p -m 700 '{override}'`" in (missing.value.remediation or "")
     assert not override.exists()
 
     override.write_text("")
@@ -389,8 +391,16 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
 
     override.mkdir()
     override.chmod(0o750)
-    with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
+    with pytest.raises(
+        runtime_files.UnsafeLockPathError, match="Unsafe lock directory"
+    ) as wrong_mode:
         runtime_files.lock_dir()
+    assert "mode 0750" in str(wrong_mode.value)
+    assert (
+        wrong_mode.value.remediation
+        == f"For an owner-only lock directory, run `chmod 700 '{override}'`."
+    )
+    assert stat.S_IMODE(override.stat().st_mode) == 0o750
     assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
 
 
@@ -446,7 +456,7 @@ def test_default_lock_dir_rejects_symlink_without_chmodding_target(
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
 
-    with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe"):
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="locks is a symlink"):
         runtime_files.lock_dir()
 
     assert stat.S_IMODE(target.stat().st_mode) == 0o755

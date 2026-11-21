@@ -665,7 +665,7 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         ),
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
-        (_symlink_to_state_dir, "is not a real directory"),
+        (_symlink_to_state_dir, "is a symlink"),
         (
             _marker_text('{"schema_version": 0}\n'),
             f"declares format 0; this PhaseSweep reads format {mcp_runs.MCP_STATE_FORMAT_VERSION}",
