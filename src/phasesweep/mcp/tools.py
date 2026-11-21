@@ -94,6 +94,7 @@ from phasesweep.mcp.runner import RUNNER_SCRIPT_PATH, _cleanup_uncertain_payload
 from phasesweep.mcp.runs import (
     LAUNCH_ACK_BYTE,
     LAUNCH_READY_BYTE,
+    RUNNER_STOP_GRACE_SECONDS,
     PreparedRun,
     RunHandle,
     RunnerView,
@@ -1485,7 +1486,7 @@ class PhaseSweepMCP:
                             identity.pid,
                             identity.pid_starttime,
                             pgid=identity.pgid,
-                            grace_seconds=30.0,
+                            grace_seconds=RUNNER_STOP_GRACE_SECONDS,
                         )
                     )
                 )

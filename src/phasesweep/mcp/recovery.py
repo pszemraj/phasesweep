@@ -52,6 +52,7 @@ from phasesweep.mcp.errors import live_runner_step
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     FRESH_STATE_DIR_STEP,
+    RUNNER_STOP_GRACE_SECONDS,
     ProcessIdentity,
     RunHandle,
     RunnerView,
@@ -646,7 +647,10 @@ def _cleanup_runner(
         and confirm
         and not cleanup_recorded
         and not kill_stale_group(
-            identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0
+            identity.pid,
+            identity.pid_starttime,
+            pgid=identity.pgid,
+            grace_seconds=RUNNER_STOP_GRACE_SECONDS,
         )
     ):
         raise RunRecoveryError(

@@ -541,7 +541,7 @@ def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocki
     window is delivered to one of them — and CPython then runs the Python
     handler in the main thread anyway, mid-critical-section. A handler that
     re-acquired ``_launch_lock`` held by that same thread would hang until the
-    MCP server's 30s grace SIGKILLed the runner with no status.json written.
+    MCP server's cancellation grace SIGKILLed the runner with no status.json written.
     The handler must record the signal and let the window exit service it.
     """
     code = r"""

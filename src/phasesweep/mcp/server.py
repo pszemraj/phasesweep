@@ -995,7 +995,7 @@ def build_server(app: PhaseSweepMCP) -> FastMCP:
         :return CancelRunResult: Structured cancellation result.
         """
         # MCP 1.27 invokes synchronous tool functions on the event-loop
-        # thread. Cancellation may spend its 30-second grace period waiting
+        # thread. Cancellation may spend its whole RUNNER_STOP_GRACE_SECONDS waiting
         # for a process group, so isolate it from concurrent await/status calls.
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 

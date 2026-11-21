@@ -22,6 +22,7 @@ from pydantic import Field, TypeAdapter, ValidationError
 from typing_extensions import TypedDict
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
+from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -70,6 +71,13 @@ RUNNER_HEARTBEAT_INTERVAL_SECONDS = 15.0
 #: Heartbeat age, several missed refreshes, past which a reader that cannot
 #: observe the runner reports that it has probably stopped.
 RUNNER_HEARTBEAT_STALE_SECONDS = 120.0
+#: How long a SIGTERMed runner group gets before SIGKILL. A runner confirms its
+#: trials' cleanup before it exits, and a guardian whose trainer root had just
+#: exited finishes its helper settle and SIGTERM grace first; the last 20 s cover
+#: the runner's confirmation window and its ledger and status writes.
+RUNNER_STOP_GRACE_SECONDS = (
+    _supervisor._HELPER_SETTLE_SECONDS + _supervisor._GROUP_TERM_GRACE_SECONDS + 20.0
+)
 
 log = logging.getLogger("phasesweep.mcp.runs")
 
