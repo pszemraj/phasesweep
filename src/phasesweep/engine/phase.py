@@ -754,7 +754,7 @@ class _PhaseExecution:
     recorded_outcomes: dict[int, str] = field(default_factory=dict)
     # Trials that count toward n_trials: the study's at phase start, then one per recorded
     # outcome other than ``interrupted``. ``finished_ordinals`` keeps the count each trial's
-    # outcome took, so a TRIAL line states its own position however callbacks interleave.
+    # outcome took, so a trial's progress line states its own position however callbacks interleave.
     finished_trials: int = 0
     finished_ordinals: dict[int, int] = field(default_factory=dict)
     # Shared by the consecutive-failure and fatal-error paths. Queued

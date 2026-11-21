@@ -1,4 +1,4 @@
-"""``run.log`` carries one TRIAL line per finished trial, the process-free progress stream."""
+"""``run.log`` carries one progress line per finished trial, the process-free progress stream."""
 
 from __future__ import annotations
 
@@ -312,7 +312,7 @@ def _stderr_cause_trainer(tmp_path: Path) -> Path:
 def test_failed_trials_carry_their_stderr_cause_and_the_hint_only_for_the_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One cause string reaches the outcome record, trials.csv and the TRIAL line; the hint is for imports."""
+    """One cause string reaches the outcome record, trials.csv and the trial's progress line; the hint is for imports."""
     monkeypatch.setattr("phasesweep.engine.progress._WARNED", set())
     experiment = make_experiment(
         persistent=tmp_path,
@@ -484,7 +484,7 @@ def test_an_interrupted_trial_takes_no_ordinal(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 def test_run_log_reports_abort_after_its_triggering_trial(tmp_path: Path, n_jobs: int) -> None:
-    """The abort stays in its triggering outcome and prints after that trial's TRIAL line."""
+    """The abort stays in its triggering outcome and prints after that trial's progress line."""
     experiment = make_experiment(
         persistent=tmp_path,
         trial_command="false {overrides}",
