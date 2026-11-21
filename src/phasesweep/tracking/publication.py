@@ -24,6 +24,7 @@ from phasesweep.runtime.json import (
     json_optional_text,
     json_text,
 )
+from phasesweep.runtime.terminal import REPORT_LOGGER
 from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
@@ -1160,7 +1161,10 @@ def report_delivery(experiment: Experiment, generation_id: str, delivered: int) 
         log.warning("MLflow: pending uploads could not be counted (%s).", exc)
         return
     if delivered:
-        log.info("MLflow: delivered %d record(s) left pending by earlier runs.", delivered)
+        # A report line, so the console shows that an earlier interruption was made good.
+        logging.getLogger(REPORT_LOGGER).info(
+            "MLflow: delivered %d record(s) left pending by earlier runs.", delivered
+        )
     if pending:
         log.warning(
             "MLflow: %d upload(s) pending%s; results are saved locally. The next run or "

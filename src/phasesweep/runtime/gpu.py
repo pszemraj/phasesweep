@@ -30,8 +30,16 @@ from phasesweep.config.models import GpuPolicy, Phase
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
 from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
+from phasesweep.runtime.terminal import REPORT_LOGGER
 
 log = logging.getLogger("phasesweep.runtime.gpu")
+# A wait on another process's lock can last as long as that process runs, so it is a
+# report line the console shows; a wait on this run's own slots is routine queueing.
+report = logging.getLogger(REPORT_LOGGER)
+_HOST_LOCK_WAIT = (
+    "Waiting for a GPU: another process holds its lock, such as another sweep or a trial "
+    "that is still shutting down."
+)
 
 _SAFE_LOCK_TOKEN = re.compile(r"[^A-Za-z0-9_.-]+")
 _MIG_UUID_INVENTORY = re.compile(r"\(UUID:\s*(MIG-[^)]+)\)", re.IGNORECASE)
@@ -737,7 +745,7 @@ class GpuPool:
             if acquired is not None:
                 return acquired
             if not waiting_logged:
-                log.info("Waiting for GPU lease: host GPU locks are held.")
+                report.info(_HOST_LOCK_WAIT)
                 waiting_logged = True
             self._wait_for_retry(deadline)
 
@@ -783,7 +791,7 @@ class GpuPool:
                         self._condition.notify_all()
             if not all_leased:
                 if not waiting_logged:
-                    log.info("Waiting for GPU lease: host GPU locks are held.")
+                    report.info(_HOST_LOCK_WAIT)
                     waiting_logged = True
                 self._wait_for_retry(deadline)
                 continue
