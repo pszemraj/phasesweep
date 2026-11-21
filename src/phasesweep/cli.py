@@ -29,6 +29,7 @@ from phasesweep.config.io import (
 from phasesweep.config.models import Experiment, experiment_disclosures
 from phasesweep.config.reference import (
     ReferenceEntry,
+    explain_command,
     first_sentence,
     lookup_or_suggest,
     pin_documentation_links,
@@ -883,7 +884,8 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
         "keys; with a KEY such as 'phases[].sampler', print the section rules and shared-block "
         "descriptions that govern it, then that key and every key below it. "
-        "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
+        "The spellings 'phases[].sampler', phases.sampler and phases.0.sampler are equivalent; "
+        "quote a key that has brackets so the shell passes it whole. "
         "The broad phases key prints the rules over the phase list and its immediate "
         "children; narrow it for full details. With --notes, print the general notes on the "
         "config file, paths, YAML typing and the study fingerprint instead."
@@ -920,12 +922,14 @@ def explain(key: str | None, notes: bool) -> None:
         return
     entries, near = lookup_or_suggest(key)
     if not entries:
-        hint = (
-            f"Closest: {', '.join(near)}."
-            if near
-            else "Run `phasesweep explain` to list the top-level keys."
-        )
-        click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
+        miss = f"phasesweep explain: no config key matches {key!r}."
+        if near:
+            # Each suggestion is a whole command on a line of its own, so it can be pasted.
+            click.echo(
+                "\n".join([f"{miss} Closest:", *(explain_command(path) for path in near)]), err=True
+            )
+        else:
+            click.echo(f"{miss} Run `phasesweep explain` to list the top-level keys.", err=True)
         raise click.exceptions.Exit(_USAGE_EXIT)
     if plain_path(key) == "phases":
         # The compact index carries only the rules over the whole phase list.

@@ -14,6 +14,7 @@ import functools
 import importlib.resources
 import json
 import re
+import shlex
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
@@ -643,6 +644,18 @@ def lookup_or_suggest(key: str) -> tuple[tuple[ReferenceEntry, ...], tuple[str, 
     """
     entries = lookup(key) if plain_path(key) else ()
     return entries, () if entries else closest(key)
+
+
+def explain_command(path: str) -> str:
+    """Spell the command that explains one key, quoted so a shell takes the key whole.
+
+    A key such as ``phases[].sampler`` is a glob pattern to zsh, so an unquoted suggestion
+    fails when pasted.
+
+    :param str path: A documented key as :func:`loc_to_path` or :func:`closest` returns it.
+    :return str: ``phasesweep explain`` and the quoted key, with nothing after it.
+    """
+    return f"phasesweep explain {shlex.quote(path)}"
 
 
 def loc_to_path(loc: Sequence[int | str]) -> str | None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import shlex
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,7 @@ from pydantic import ValidationError
 
 from phasesweep.config.common import CONFIG_DIR_CONTEXT
 from phasesweep.config.models import Experiment
-from phasesweep.config.reference import loc_to_path
+from phasesweep.config.reference import explain_command, loc_to_path
 
 # Hint lines after a validation error; the first errors are the likeliest root causes.
 _MAX_HINTS = 3
@@ -168,7 +167,7 @@ def describe_validation_error(exc: ValidationError) -> str:
         path = loc_to_path(error["loc"])
         if path is not None and path not in paths:
             paths.append(path)
-    hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
+    hints = [f"see: {explain_command(path)}" for path in paths[:_MAX_HINTS]]
     return "\n".join([format_validation_error(exc), *hints])
 
 
