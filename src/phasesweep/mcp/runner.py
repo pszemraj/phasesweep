@@ -70,6 +70,7 @@ from phasesweep.runtime.shutdown import (
     absorb_shutdown_signals,
     defer_shutdown_signals,
     install_signal_handlers,
+    signal_name,
 )
 from phasesweep.runtime.time import utc_now_iso
 
@@ -942,10 +943,10 @@ def main(argv: list[str] | None = None) -> int:
                         )
             if absorbed.signum is not None:
                 logging.getLogger("phasesweep.mcp.runner").warning(
-                    "shutdown signal %d arrived while the terminal result snapshot was being "
+                    "shutdown signal %s arrived while the terminal result snapshot was being "
                     "captured; it was held until the snapshot was safe and will be honored "
                     "once terminal status is durable",
-                    absorbed.signum,
+                    signal_name(absorbed.signum),
                 )
 
         run_experiment(

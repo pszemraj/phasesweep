@@ -23,7 +23,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.errors import PublicationCommitError, RunRequestError
 from phasesweep.engine.state import PUBLICATION_POINTER_SCHEMA_VERSION, PhaseCounts, Winner
 from phasesweep.runtime.files import atomic_create_text
-from phasesweep.runtime.shutdown import absorb_shutdown_signals
+from phasesweep.runtime.shutdown import absorb_shutdown_signals, signal_name
 
 if TYPE_CHECKING:
     from phasesweep.engine.run import PublicationHook
@@ -484,9 +484,9 @@ def _publish_generation(
 
     if absorbed.signum is not None:
         log.warning(
-            "Shutdown signal %d arrived during the publication transaction for "
+            "Shutdown signal %s arrived during the publication transaction for "
             "generation %s; the committed publication wins and the shutdown is "
             "honored at the next checkpoint before any new work starts.",
-            absorbed.signum,
+            signal_name(absorbed.signum),
             generation_id,
         )

@@ -156,8 +156,8 @@ _servicing_signum: int | None = None
 _shutdown_wakers: list[Callable[[], None]] = []
 
 
-def _signal_name(signum: int) -> str:
-    """Name a shutdown signal as the interrupt line and the recorded cause both show it.
+def signal_name(signum: int) -> str:
+    """Name a signal as the interrupt line, the recorded cause and the log lines show it.
 
     :param int signum: Signal number.
     :return str: Its name, such as ``SIGINT``, or ``signal N`` for a number with none.
@@ -174,7 +174,7 @@ def interruption_cause(signum: int) -> str:
     :param int signum: The shutdown signal being serviced.
     :return str: The trial outcome cause for that signal, such as ``orchestrator interrupted by SIGINT``.
     """
-    return f"orchestrator interrupted by {_signal_name(signum)}"
+    return f"orchestrator interrupted by {signal_name(signum)}"
 
 
 def launch_refusal_text(signum: int) -> str:
@@ -225,7 +225,7 @@ def _interrupt_text(signum: int, running: Sequence[str]) -> str:
         registration order; :data:`TRAINER_LABEL` marks a trainer.
     :return str: For example ``Interrupted (SIGINT): stopping 2 trials and waiting for them to exit.``
     """
-    name = _signal_name(signum)
+    name = signal_name(signum)
     counts = Counter(running)
     trials = counts.pop(TRAINER_LABEL, 0)
     others = [plural(count, label) for label, count in counts.items()]
@@ -274,7 +274,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             try:
                 waker()
             except Exception:
-                log.exception("Failed to wake a waiting thread after %s", _signal_name(signum))
+                log.exception("Failed to wake a waiting thread after %s", signal_name(signum))
 
         with _launch_lock, _lock:
             registered = dict(_active_children)
@@ -294,7 +294,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             )
         except Exception:
             log.exception(
-                "Failed while cleaning child process groups after %s", _signal_name(signum)
+                "Failed while cleaning child process groups after %s", signal_name(signum)
             )
 
         cleanup_confirmed = all(confirmed_by_pgid.get(pgid, False) for pgid in pgids)
@@ -307,14 +307,14 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             # The expected outcome of a shutdown, so the console says nothing more about it.
             log.info(
                 "Received %s; confirmed cleanup for %s",
-                _signal_name(signum),
+                signal_name(signum),
                 plural(len(pgids), "child group"),
             )
         else:
             uncertain = [pgid for pgid in pgids if not confirmed_by_pgid.get(pgid, False)]
             log.error(
                 "Received %s; cleanup is uncertain for %s: %s",
-                _signal_name(signum),
+                signal_name(signum),
                 plural(len(uncertain), "child group"),
                 uncertain,
             )
@@ -377,7 +377,7 @@ def _reassert_process_lifetime_handlers() -> None:
     log.warning(
         "Shutdown handler(s) for signal(s) %s were replaced after phasesweep "
         "took process-lifetime ownership; reinstalling them for child cleanup.",
-        stale,
+        ", ".join(signal_name(sig) for sig in stale),
     )
     install_signal_handlers()
 
@@ -404,16 +404,18 @@ def _restore_host_signal_state(
     for sig, handler in prior_handlers.items():
         if handler is None:
             log.debug(
-                "Signal %d had no Python-level handler before this scope "
+                "%s had no Python-level handler before this scope "
                 "(a C-level default phasesweep cannot reinstall); leaving "
                 "phasesweep's shutdown handler installed for it.",
-                sig,
+                signal_name(sig),
             )
             continue
         try:
             signal.signal(sig, handler)
         except Exception as exc:  # continue past one bad restore
-            log.exception("Failed to restore the prior handler for signal %d after scope exit", sig)
+            log.exception(
+                "Failed to restore the prior handler for %s after scope exit", signal_name(sig)
+            )
             if restoration_error is None:
                 restoration_error = exc
     signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)

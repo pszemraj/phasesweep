@@ -146,13 +146,13 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
 
 
 def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """One failed ``signal.signal`` restore must not abort the rest of the loop.
 
     Every other prior handler must still be restored, and the first
     restoration error surfaces once the scope body itself did not already
-    raise.
+    raise. The failure is logged under the signal's name.
     """
 
     def make_sentinel(tag: int):
@@ -177,6 +177,7 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
         return real_signal(signalnum, handler)
 
     with (
+        caplog.at_level(logging.ERROR, logger="phasesweep"),
         pytest.raises(OSError, match="simulated restore failure"),
         monkeypatch.context() as scoped,
         signal_handler_scope(),
@@ -185,6 +186,9 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
         # signal.signal; the patch ends before the handler assertions.
         scoped.setattr(signal, "signal", flaky_signal)
 
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Failed to restore the prior handler for {signal.Signals(first_signal).name} after scope exit"
+    ]
     for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
         if sig == first_signal:
             # Restoration failed for this one; phasesweep's handler is
@@ -540,7 +544,7 @@ def test_reassert_leaves_a_sighup_ignored_at_first_ownership_alone(
     with caplog.at_level(logging.WARNING, logger="phasesweep"), signal_handler_scope():
         pass
     [warning] = caplog.records
-    assert "SIGTERM" in warning.getMessage()
+    assert "signal(s) SIGTERM were replaced" in warning.getMessage()
     assert "SIGHUP" not in warning.getMessage()
     assert signal.getsignal(signal.SIGTERM) is runtime_shutdown._shutdown_handler
     assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
