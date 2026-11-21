@@ -968,6 +968,7 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     assert store.observe(handle).cleanup_recovery_required is (failure == "worker")
 
 
+@pytest.mark.integration
 def test_sync_rebuilds_a_generation_whose_record_a_post_commit_crash_lost(tmp_path, monkeypatch):
     """A controller that dies right after the pointer commit loses neither its proof nor its mirror.
 
@@ -1586,6 +1587,7 @@ def test_a_reachable_tracker_receives_recovered_outcomes_after_its_check(tmp_pat
     assert uploads == []
 
 
+@pytest.mark.integration
 def test_an_upload_workers_unconfirmed_cleanup_is_not_charged_to_the_recovered_attempt(
     tmp_path, monkeypatch
 ):
