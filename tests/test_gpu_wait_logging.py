@@ -54,11 +54,7 @@ def test_gpu_wait_emits_one_info_message(
     ]
     waiting = [(record.name, record.getMessage()) for record in records]
     assert waiting == [
-        (
-            "phasesweep.report",
-            "Waiting for a GPU: another process holds its lock, such as another sweep or a "
-            "trial that is still shutting down.",
-        )
+        ("phasesweep.report", "Waiting for a GPU: another process holds its lock.")
         if blocked_by == "host-lease"
         else ("phasesweep.runtime.gpu", "Waiting for GPU lease: local GPU slots are in use.")
     ]

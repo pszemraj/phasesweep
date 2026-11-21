@@ -72,9 +72,9 @@ def test_mps_phase_configuration_uses_discovered_pool(policy: GpuPolicy) -> None
 
 def test_macos_refuses_explicit_cuda_device_lists() -> None:
     """macOS device leases always come from discovery, never CUDA tokens."""
-    with pytest.raises(GpuConfigurationError, match="device pool is discovered"):
+    with pytest.raises(GpuConfigurationError, match="unavailable on macOS; omit them"):
         GpuPool.create(n_jobs=1, explicit_ids=[0])
-    with pytest.raises(GpuConfigurationError, match="device pool is discovered"):
+    with pytest.raises(GpuConfigurationError, match="unavailable on macOS; omit them"):
         GpuPool.create(n_jobs=1, explicit_devices=["GPU-example"])
 
 

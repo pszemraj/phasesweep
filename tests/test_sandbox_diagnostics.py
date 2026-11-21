@@ -31,19 +31,23 @@ def test_mcp_lock_access_failure_has_operator_remediation() -> None:
     assert "/private/host/locks" not in str(failure)
 
 
-def test_gpu_enumeration_refusal_explains_cpu_only_policy(
+def test_gpu_enumeration_refusal_names_the_fix_and_the_host_shell_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unreadable mocked CUDA hardware explains the deliberate CPU opt-out on any host."""
+    """Unreadable mocked CUDA hardware says to fix nvidia-smi or rerun from a host shell, on any host.
+
+    The deliberate CPU opt-out stays ``gpu_policy: none``, which this refusal no longer names.
+    """
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: True)
 
-    with pytest.raises(GpuConfigurationError, match="gpu_policy: none") as failure:
+    with pytest.raises(GpuConfigurationError, match="Fix nvidia-smi") as failure:
         GpuPool.create(n_jobs=1)
 
-    assert "sandbox" in str(failure.value)
+    assert "sandboxed shell" in str(failure.value)
     assert "host shell with GPU access" in str(failure.value)
+    assert "gpu_policy" not in str(failure.value)
 
     with GpuPool.create(n_jobs=1, policy="none").acquire() as assignment:
         assert assignment.visible_devices is None

@@ -41,9 +41,11 @@ def test_gpu_preflight_refuses_nonexistent_explicit_index(
     if command == "validate":
         result = CliRunner().invoke(cli, ["validate", str(config)])
         assert isinstance(result.exception, GpuConfigurationError), result.output
-        assert "index 99 does not exist" in str(result.exception)
+        assert "index 99 is not in the nvidia-smi inventory" in str(result.exception)
     else:
-        with pytest.raises(GpuConfigurationError, match="index 99 does not exist"):
+        with pytest.raises(
+            GpuConfigurationError, match="index 99 is not in the nvidia-smi inventory"
+        ):
             run_experiment(load_experiment(config), dry_run=True)
 
     assert not workdir.exists()
