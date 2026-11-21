@@ -321,10 +321,10 @@ def _restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
     """
     dependents = experiment.phases_inheriting(phase.name)
     rename = rename_phase_step(dependents)
-    rerun = "those phases" if dependents else "this phase"
+    rerun = "this phase and the phases that inherit it" if dependents else "this phase"
     return (
-        f"Restore the recorded value(s) to continue this study, or {rename}, to rerun only "
-        f"{rerun}. To rerun every phase, {FRESH_STUDY}."
+        "Restore the recorded value(s) to continue this study. "
+        f"To rerun only {rerun}, {rename}. To rerun every phase, {FRESH_STUDY}."
     )
 
 

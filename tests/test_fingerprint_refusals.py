@@ -38,6 +38,7 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_PAYLOAD_ATTR,
 )
 from phasesweep.errors import (
+    FRESH_STUDY,
     NEW_STUDY_STEP,
     OperatorAction,
     rename_dependents_step,
@@ -98,7 +99,10 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
     assert caught.value.remediation is not None
-    assert "or give the phase a new `name`, to rerun only this phase." in caught.value.remediation
+    assert caught.value.remediation == (
+        "Restore the recorded value(s) to continue this study. To rerun only this phase, give "
+        f"the phase a new `name`. To rerun every phase, {FRESH_STUDY}."
+    )
 
     write_anchored_config(
         config,
@@ -132,10 +136,12 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
         run_experiment(load_experiment(config))
 
     assert caught.value.remediation is not None
-    assert (
-        "give the phase, and each phase that inherits it (`q`), a new `name`, updating every "
-        "`inherits` to match, to rerun only those phases."
-    ) in caught.value.remediation
+    assert caught.value.remediation == (
+        "Restore the recorded value(s) to continue this study. To rerun only this phase and "
+        "the phases that inherit it, give the phase, and each phase that inherits it (`q`), a "
+        "new `name`, updating every `inherits` to match. To rerun every phase, "
+        f"{FRESH_STUDY}."
+    )
 
     renamed = [
         {**anchored_phase(4), "name": "wider"},
