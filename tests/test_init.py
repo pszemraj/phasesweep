@@ -231,6 +231,7 @@ def test_starter_template_shape(tmp_path: Path) -> None:
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
         assert experiment.phases[1].inherits == ["depth"]
+        assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         assert experiment.override_format == "yaml_file"
         assert experiment.execution.inherit_env == "none"
         assert "{config_path}" in experiment.trial_command
