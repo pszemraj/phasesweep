@@ -23,7 +23,7 @@ experiments:
     visible_params: none
 ```
 
-The catalog and experiment YAML each reject unknown fields and duplicate keys. At startup the server validates both. An unreadable catalog or unusable `state_dir` stops startup with exit code 2. If an individual experiment fails to load, the server prints its ID and remedy on stderr and serves the entries it could load. The failed ID still supports run reads, lookup and cancellation according to its catalog permissions. Inspection of that experiment and launches across the whole catalog are refused.
+The catalog and experiment YAML each reject unknown fields and duplicate keys. At startup the server validates both. If the catalog itself cannot be parsed or its `state_dir` is unusable, startup exits with code 2. If an individual experiment fails to load, the server prints its ID and remedy on stderr and serves the entries it could load. The failed ID still supports run reads, lookup and cancellation according to its catalog permissions. Inspection of that experiment and launches across the whole catalog are refused.
 
 The server checks for edits before each tool call. A valid edit takes effect on that call. A detached run keeps its launch snapshot, subject to the cancellation and visibility rules below. An invalid edit leaves the last valid catalog available for reads and cancellation, blocks inspection of any entry whose config changed, and blocks all launches until the files validate. Run `phasesweep mcp check --catalog <catalog>` for the diagnostic. Changing `state_dir` requires a restart. Until then the server keeps the previous catalog and refuses launches.
 
