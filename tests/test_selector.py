@@ -592,21 +592,16 @@ def test_a_no_winner_remedy_names_the_phase_directory_it_sends_the_operator_to(
     )
 
 
-def test_the_identity_list_names_the_per_trial_timeout_and_the_rename_that_follows_it(
+def test_a_failure_that_was_not_a_timeout_says_nothing_about_the_timeout(
     tmp_path: Path,
 ) -> None:
-    """A failure that was not a timeout still learns that raising the timeout later needs a rename."""
+    """Raising the timeout in place is refused with its own rename step, so a plain crash does not mention it."""
     phase = _sampled_phase(Sampler(type="random", seed=0))
 
     remedy = _crashed_remedy(tmp_path, phase, ["non-zero exit code 1", None])
 
     assert "(for example `trial_command`, `trainer_config` or `provenance`)" in remedy
-    assert (
-        "A changed `timeout_seconds_per_trial` is part of the identity too; for it, give the "
-        "phase, and each phase that inherits it, a new `name`, updating every `inherits` to "
-        "match, which starts only this phase over."
-    ) in remedy
-    assert "timed out" not in remedy
+    assert "timeout" not in remedy
 
 
 def test_a_timed_out_phase_is_told_to_rename_it_not_to_raise_the_timeout_in_place(

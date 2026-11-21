@@ -66,7 +66,6 @@ from phasesweep.engine.state import (
 from phasesweep.errors import (
     FRESH_STUDY,
     NEW_STUDY_STEP,
-    RENAME_PHASE_STEP,
     OperatorAction,
     PhaseSweepError,
     timeout_step,
@@ -163,20 +162,11 @@ def _no_feasible_remedy(
         budget = "the phase's n_trials"
         outcome = ""
     fix = "For any other failure, fix it" if timeout_lead else "Fix the failure"
-    # The timeout step already names the rename that a raised timeout needs.
-    timeout_identity = (
-        ""
-        if timeout_lead
-        else (
-            " A changed `timeout_seconds_per_trial` is part of the identity too; for it, "
-            f"{RENAME_PHASE_STEP}, which starts only this phase over."
-        )
-    )
     return (
         f"{evidence} {timeout_lead}{fix}, then raise {budget} in the config and rerun{outcome}. "
         "Run controls such as `n_jobs` can change on retry. "
         "If the fix changes study identity (for example `trial_command`, `trainer_config` or "
-        f"`provenance`), {FRESH_STUDY}.{timeout_identity}"
+        f"`provenance`), {FRESH_STUDY}."
     )
 
 
