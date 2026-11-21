@@ -401,6 +401,23 @@ def test_a_rerun_and_an_observation_get_their_own_columns() -> None:
     ]
 
 
+def test_a_large_measured_value_prints_in_full_instead_of_exponent_form() -> None:
+    """A value past six significant digits keeps plain notation, as float params do."""
+    phase = _phase("p", x=IntParam(type="int", low=0, high=9))
+    tables = _tables(
+        _table(
+            "p",
+            [_row(0, 12345678.5, {"x": 3}, **{"observed:param_bytes": 8.8e6})],
+        ),
+        winners={},
+    )
+
+    assert _render(tables, phase).splitlines()[4:] == [
+        "          trial   eval_loss  x  observed:param_bytes  state     time",
+        "              0  12345678.5  3               8800000  COMPLETE  0.5s",
+    ]
+
+
 _REASON = (
     "trainer exited with code 3 after the evaluation step failed to produce a metric "
     "named 'eval_loss' in /data/runs/depth/trial_1/result.json"

@@ -58,21 +58,29 @@ def _is_number(value: JsonValue) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
+def _significant(value: float, digits: int) -> str:
+    """Format a number to ``digits`` significant digits, never in positive-exponent form.
+
+    A value too large for ``digits`` would read as ``8.8e+06``, so it prints in full plain
+    notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
+
+    :param float value: The number to show.
+    :param int digits: Significant digits kept for a value that fits them.
+    :return str: Terminal text for the number.
+    """
+    text = f"{value:.{digits}g}"
+    if "e+" not in text:
+        return text
+    return format(Decimal(repr(value)).normalize(), "f")
+
+
 def _param_text(value: JsonValue) -> str:
     """Format one sampled param for a trial table, floats to four significant digits.
-
-    Four digits would drop the leading digits of a float from 10000 up, which prints in full
-    plain notation instead. The exact value stays in ``trials.csv`` and ``winner.yaml``.
 
     :param JsonValue value: The recorded param value.
     :return str: Terminal text for the value.
     """
-    if isinstance(value, float):
-        text = f"{value:.4g}"
-        if "e+" not in text:
-            return text
-        return format(Decimal(repr(value)).normalize(), "f")
-    return str(value)
+    return _significant(value, 4) if isinstance(value, float) else str(value)
 
 
 def _number_text(value: JsonValue) -> str:
@@ -81,7 +89,9 @@ def _number_text(value: JsonValue) -> str:
     :param JsonValue value: The row's value, ``None`` when no number was recorded.
     :return str: Terminal text for the cell.
     """
-    return f"{value:.6g}" if _is_number(value) else "-"
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return "-"
+    return _significant(float(value), 6)
 
 
 def _duration_text(value: JsonValue) -> str:
