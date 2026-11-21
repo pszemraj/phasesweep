@@ -1288,7 +1288,6 @@ def deliver_closeout(
             error, (TrackingTargetUnavailableError, PhaseSweepShutdown, KeyboardInterrupt)
         )
     )
-    tally.unanswered = None
     try:
         if error is not None:
             own = _save_failed(experiment, generation_id, error, ledger)

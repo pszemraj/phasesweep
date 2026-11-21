@@ -87,7 +87,7 @@ class DeliveryTally:
     sending: bool = True
     """Whether requests may still be made."""
     unanswered: str | None = None
-    """Why MLflow gave no answer, once a request got none."""
+    """Why MLflow gave no answer, once a request got none; sync-tracking's error states it."""
     delivered: int = 0
     """Records of ended generations delivered."""
     settled: int = 0

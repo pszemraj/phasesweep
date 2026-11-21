@@ -901,6 +901,58 @@ def test_a_run_warns_once_about_what_mlflow_refuses_in_both_its_passes(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("refused", ["record", "creation"])
+def test_what_mlflow_refuses_once_and_accepts_later_in_a_run_is_not_counted_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refused: str,
+) -> None:
+    """A record or creation search refused before the first trial and accepted at closeout leaves the refused count.
+
+    The closeout delivers the record or settles the creation, so the run's closing line counts
+    as refused only the earlier attempt record MLflow refuses throughout, the one record left
+    pending.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    respond = session.request_operation
+    if refused == "creation":
+        intent = _kill_at_summary_creation(monkeypatch, sweep.experiment)
+        # Its window has closed, so a search that finds no run retires it.
+        os.utime(intent, (time.time() - 3600, time.time() - 3600))
+    [stem] = [path.stem for path in sweep.summary.parent.glob("attempt-*.json")]
+    refusals: list[str] = []
+
+    def refusing(request: dict[str, object], **kwargs: object) -> JsonObject:
+        deleted = OperationRejectedError("MLflow run is deleted; restore it, or its experiment.")
+        if request["action"] == "publish" and request["name"] == stem:
+            raise deleted
+        if (refused == "creation" and request["action"] == "find") or (
+            refused == "record"
+            and request["action"] == "publish"
+            and request["name"] == sweep.summary.stem
+        ):
+            if not refusals:
+                refusals.append(str(request["action"]))
+                raise deleted
+            if request["action"] == "find":
+                return {"found": False}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", refusing)
+    monkeypatch.setattr(worker, "request_operation", refusing)
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+
+    run_experiment(sweep.experiment)
+
+    assert len(refusals) == 1
+    assert publication.delivery_status(sweep.experiment)["pending"] == 1
+    assert caplog.text.count("MLflow refused") == 1
+    assert "MLflow refused 1 record; a refused record stays pending until" in caplog.text
+
+
+@pytest.mark.integration
 def test_a_different_target_sends_nothing_and_the_original_config_delivers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
