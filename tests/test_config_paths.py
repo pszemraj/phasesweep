@@ -108,6 +108,21 @@ def test_auto_storage_follows_anchored_workdir(
     )
 
 
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"execution": {"cwd": "~phasesweep-no-such-account/trainer"}},
+        {"workdir": "~phasesweep-no-such-account/runs"},
+        {"storage": "journal:///~phasesweep-no-such-account/study.journal"},
+    ],
+)
+def test_config_rejects_an_unresolvable_home(tmp_path: Path, paths: dict[str, object]) -> None:
+    """Home-relative paths must resolve before a command can inspect or launch the experiment."""
+    config = write_anchored_config(tmp_path / "exp.yaml", **paths)
+    with pytest.raises(ValidationError, match="Cannot resolve the home directory"):
+        load_experiment(config)
+
+
 def test_relative_journal_refused_under_config_dir_with_query_char(tmp_path: Path) -> None:
     project = tmp_path / "a?b"
     project.mkdir()
