@@ -46,7 +46,12 @@ from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.study_policy import _launch_preflight
 from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
-from phasesweep.runtime.files import ensure_artifact_dir, require_supported_runtime
+from phasesweep.runtime.files import (
+    PlatformCapabilityError,
+    UnsafeLockPathError,
+    ensure_artifact_dir,
+    require_supported_runtime,
+)
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
@@ -649,10 +654,23 @@ def _run_experiment_inner(
     winners: dict[str, Winner] = {}
     recorded: dict[str, RecordedPhase | None] = {}
     previews: list[PhasePreview] = []
+    preview_context = ""
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
+        try:
+            busy = locking_ops.experiment_is_busy(experiment)
+        except (OSError, UnsafeLockPathError, PlatformCapabilityError) as exc:
+            log.warning("DRY RUN could not check whether the experiment is active: %s", exc)
+            busy = None
+        if busy is not False:
+            preview_context = "hypothetical restart "
+        if busy:
+            log.warning(
+                "DRY RUN another operation is active. Counts below assume a restart from this "
+                "snapshot. In-flight trials can still finish without a rerun."
+            )
         # A tree this PhaseSweep cannot use refuses before the preview, as a launch would.
         recorded = _preview_ledger(experiment, from_phase=from_phase)
         for _phase, lines in experiment_disclosures(experiment):
@@ -739,7 +757,7 @@ def _run_experiment_inner(
         winners[phase.name] = winner
 
     if generation is None:
-        log.info("DRY RUN %s", _dry_run_total_line(previews))
+        log.info("DRY RUN %s%s", preview_context, _dry_run_total_line(previews))
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 

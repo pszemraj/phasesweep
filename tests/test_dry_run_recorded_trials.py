@@ -31,6 +31,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _last_successful_generation_path, _trial_dir_for
 from phasesweep.engine.preview import _placeholder_winner, validate_trial_targets
 from phasesweep.engine.selection import NoFeasibleTrialError, PhaseAbortRefusedError
@@ -411,6 +412,12 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     ]
     (command,) = _commands(caplog)
     assert _PLACEHOLDERS in command
+
+    with _experiment_lock(experiment):
+        _preview(experiment, tmp_path, caplog)
+    assert "another operation is active" in caplog.text
+    assert "In-flight trials can still finish without a rerun" in caplog.text
+    assert "DRY RUN hypothetical restart total:" in caplog.text
 
 
 @pytest.mark.parametrize(
