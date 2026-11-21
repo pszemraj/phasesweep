@@ -594,6 +594,7 @@ class Registry:
         catalog_path: Path,
         catalog_sha256: str,
         failures: tuple[CatalogCheckEntry, ...] = (),
+        cancellable_failed_ids: frozenset[str] = frozenset(),
     ) -> None:
         """Create an immutable registry from already validated entries.
 
@@ -604,12 +605,15 @@ class Registry:
         :param str catalog_sha256: SHA-256 of the catalog bytes the entries were loaded from.
         :param tuple[CatalogCheckEntry, ...] failures: Verdicts of the entries that failed to
             load, none of whose ids are in ``items``.
+        :param frozenset[str] cancellable_failed_ids: Ids in ``failures`` whose every catalog
+            entry, including one that loaded before its duplicate failed, grants cancellation.
         """
         self.state_dir = state_dir
         self.max_concurrent_runs = max_concurrent_runs
         self.catalog_path = catalog_path
         self.catalog_sha256 = catalog_sha256
         self.failures = failures
+        self._cancellable_failed_ids = cancellable_failed_ids
         self._items = items
 
     def __len__(self) -> int:
@@ -665,9 +669,20 @@ class Registry:
                 )
         items, verdicts = _load_catalog_entries(catalog, base, collect_errors=collect_errors)
         failures = tuple(verdict for verdict in verdicts if not verdict.ok)
-        for failure in failures:
+        failed_ids = {failure.experiment_id for failure in failures}
+        for experiment_id in failed_ids:
             # A repeated id fails its second entry; the id is then served by neither.
-            items.pop(failure.experiment_id, None)
+            items.pop(experiment_id, None)
+        # The entry that loaded before its duplicate failed still counts, so its revocation holds.
+        cancellable_failed_ids = frozenset(
+            experiment_id
+            for experiment_id in failed_ids
+            if all(
+                "cancel" in verdict.actions
+                for verdict in verdicts
+                if verdict.experiment_id == experiment_id
+            )
+        )
         if bound_state_dir is None:
             state_dir = _prepare_state_dir(base, catalog.state_dir)
         return cls(
@@ -677,6 +692,7 @@ class Registry:
             catalog_path=catalog_path.absolute(),
             catalog_sha256=catalog_sha256,
             failures=failures,
+            cancellable_failed_ids=cancellable_failed_ids,
         )
 
     def unchanged_on_disk(self) -> bool:
@@ -715,20 +731,17 @@ class Registry:
             raise UnknownExperimentError(experiment_id) from None
 
     def failed_entry_allows_cancel(self, experiment_id: str) -> bool:
-        """Return whether every failed entry with this id still declares ``allow.cancel``.
+        """Return whether every catalog entry with this failed id still declares ``allow.cancel``.
 
         The catalog file parsed, so a failed entry's ``allow`` block is known even though
-        its experiment did not load.
+        its experiment did not load. A repeated id fails only its later entries, and the
+        entry that loaded first is counted with them.
 
         :param str experiment_id: Catalog id of an entry that failed to load.
-        :return bool: Whether a failed entry has that id and every such entry grants cancellation.
+        :return bool: Whether an entry with that id failed and every catalog entry with that
+            id grants cancellation.
         """
-        declared = [
-            "cancel" in failure.actions
-            for failure in self.failures
-            if failure.experiment_id == experiment_id
-        ]
-        return bool(declared) and all(declared)
+        return experiment_id in self._cancellable_failed_ids
 
     def summaries(self) -> list[dict[str, Any]]:
         """Path-free catalog listing for ``list_experiments``.

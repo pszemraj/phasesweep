@@ -442,19 +442,36 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
         app.cancel(run_id)
 
 
-@pytest.mark.parametrize("declared_cancel", [False, True])
+@pytest.mark.parametrize(
+    "declared_cancels",
+    [
+        pytest.param((False,), id="failed-entry-revokes"),
+        pytest.param((True,), id="failed-entry-grants"),
+        pytest.param((False, True), id="entry-loaded-before-its-duplicate-revokes"),
+        pytest.param((True, True), id="every-entry-of-a-duplicated-id-grants"),
+    ],
+)
 def test_cancel_of_an_entry_that_failed_to_load_follows_its_declared_permission(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_cancel: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_cancels: tuple[bool, ...]
 ) -> None:
-    """A failed entry keeps the ``allow.cancel`` its catalog declares, so a revocation holds and a grant stays usable."""
+    """A failed id keeps cancellation only while every catalog entry with that id declares it, including one that loaded before its duplicate failed, so a revocation holds and a grant stays usable."""
     config = write_srv_config(tmp_path, name="broken")
     snapshot = config.read_bytes()
+    first_cancel, *duplicate_cancels = declared_cancels
     catalog = write_mcp_catalog(
         tmp_path,
         {"broken": config},
-        allow={"launch": True, "cancel": declared_cancel, "from_phase": True},
-        cwd={"broken": tmp_path / "missing-cwd"},
+        allow={"launch": True, "cancel": first_cancel, "from_phase": True},
+        # A lone entry fails on its missing cwd; a repeated id fails on its duplicate.
+        cwd=None if duplicate_cancels else {"broken": tmp_path / "missing-cwd"},
     )
+    for duplicate_cancel in duplicate_cancels:
+        catalog.write_text(
+            catalog.read_text()
+            + f"  - id: broken\n    config: {config}\n    allow:\n"
+            + f"      cancel: {str(duplicate_cancel).lower()}\n"
+        )
+    declared_cancel = all(declared_cancels)
     registry = Registry.load(catalog, collect_errors=True)
     assert [failure.experiment_id for failure in registry.failures] == ["broken"]
     store = RunStore(registry.state_dir)
