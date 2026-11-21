@@ -1061,6 +1061,11 @@ def _resolve_attempt(
             "gone": "--confirm will reconcile this attempt without signalling",
             "refuse": "--confirm will refuse cleanup and leave this attempt unresolved",
         }[decision.action]
+        if decision.action == "terminate" and lifecycle_settles and record.trial_number is not None:
+            action += (
+                ". With persistent storage, wait for the trainer to exit successfully "
+                "to keep its result"
+            )
         report(
             f"{label}: training process group: {decision.reason} "
             f"(pid={identity.pid} pgid={identity.pgid}); {action}."
@@ -1129,7 +1134,6 @@ def _recover_completed_trial(
         COMPLETE or as a failure, False without proof the trainer finished, or None when
         shutdown or an unreadable tracker leaves extraction pending.
     :raises WinnerIntegrityError: The producing configuration snapshot is unavailable or invalid.
-    :raises TrialEvidenceMissingError: Evidence for a recorded measurement is missing or has changed.
     :raises StudySchemaMismatchError: The study's recorded outcomes cannot be replayed to
         decide the verdict's abort; the trial remains RUNNING.
     :raises StudyStorageUnavailableError: The extracted evidence or its outcome could not be
@@ -1345,6 +1349,7 @@ def _fail_stale_running_trial(
     :return bool: Whether the trial became terminal; False retains completed training during
         shutdown or while its tracker gives no answer.
     :raises WinnerIntegrityError: Completed trainer evidence requires an unavailable or invalid producing snapshot.
+    :raises TrialEvidenceMissingError: Evidence for a recorded measurement is missing or has changed.
     :raises TrackingTargetUnavailableError: The tracker gave no answer and no report collects it.
     :raises StudyStorageUnavailableError: The outcome, the recovery ledger, or
         the terminal state could not be recorded; the trial is left RUNNING

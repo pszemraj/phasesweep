@@ -216,6 +216,21 @@ def test_catalog_cwd_must_exist(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config, cwd={"reg_ok": tmp_path / "missing"}))
 
 
+@pytest.mark.parametrize("field", ["config", "cwd"])
+def test_catalog_path_expansion_error_names_the_entry_and_field(tmp_path: Path, field: str) -> None:
+    """Startup identifies which field of which entry could not resolve."""
+    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
+    invalid = Path("~phasesweep-test-no-such-user/sweep")
+    catalog = (
+        _catalog(tmp_path, invalid)
+        if field == "config"
+        else _catalog(tmp_path, config, cwd={"reg_ok": invalid})
+    )
+
+    with pytest.raises(CatalogError, match=rf"'reg_ok': {field}"):
+        Registry.load(catalog)
+
+
 def test_catalog_visible_params_policy(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
 

@@ -227,14 +227,15 @@ def _catalog_path_errors(label: str) -> Iterator[None]:
         ) from exc
 
 
-def _resolve_catalog_relative_path(base: Path, path: Path) -> Path:
+def _resolve_catalog_relative_path(base: Path, path: Path, *, label: str) -> Path:
     """Resolve an operator path relative to the catalog file when not absolute.
 
     :param Path base: Directory containing the catalog file.
     :param Path path: Operator-authored path from the catalog.
+    :param str label: Field and, for entry paths, the owning entry id.
     :return Path: Absolute, resolved filesystem path.
     """
-    with _catalog_path_errors(str(path)):
+    with _catalog_path_errors(f"{label} ({path})"):
         return (base / path.expanduser()).resolve()
 
 
@@ -247,7 +248,7 @@ def _resolve_existing_dir(base: Path, path: Path, *, label: str) -> Path:
     :return Path: Absolute, resolved existing directory path.
     :raises CatalogError: If the resolved path is not an existing directory.
     """
-    resolved = _resolve_catalog_relative_path(base, path)
+    resolved = _resolve_catalog_relative_path(base, path, label=label)
     if not resolved.is_dir():
         raise CatalogError(
             f"{label} is not an existing directory: {resolved}",
@@ -264,7 +265,7 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
     :return Path: Absolute initialized state directory.
     :raises CatalogError: If the run store cannot create or secure its directories.
     """
-    resolved = _resolve_catalog_relative_path(base, path)
+    resolved = _resolve_catalog_relative_path(base, path, label="state_dir")
     try:
         RunStore(resolved)
         for directory in (resolved, resolved / "runs", resolved / "logs"):
@@ -366,7 +367,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
         config cannot be parsed, or its storage is not persistent.
     """
-    cfg_path = _resolve_catalog_relative_path(base, entry.config)
+    cfg_path = _resolve_catalog_relative_path(base, entry.config, label=f"{entry.id!r}: config")
     if not cfg_path.is_file():
         raise CatalogError(
             f"{entry.id!r}: config not found: {cfg_path}",
@@ -680,7 +681,7 @@ class Registry:
         require_supported_mcp_host()
         catalog, base, catalog_sha256 = _parse_catalog(catalog_path)
         if bound_state_dir is not None:
-            state_dir = _resolve_catalog_relative_path(base, catalog.state_dir)
+            state_dir = _resolve_catalog_relative_path(base, catalog.state_dir, label="state_dir")
             if state_dir != bound_state_dir:
                 raise StateDirChangedError(
                     f"catalog {catalog_path} now resolves state_dir to {state_dir}, but this "

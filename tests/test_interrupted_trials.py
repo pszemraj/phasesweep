@@ -1932,6 +1932,9 @@ def test_recovery_preview_names_trial_group_liveness(
     assert not signalled
     should_signal = case in {"live", "leader_exited"}
     assert ("--confirm will terminate it if still alive" in caplog.text) is should_signal
+    assert (
+        "wait for the trainer to exit successfully to keep its result" in caplog.text
+    ) is should_signal
     assert "pid=12345 pgid=12345" in caplog.text
     if case == "leader_exited":
         assert "stored PGID fallback" in caplog.text
