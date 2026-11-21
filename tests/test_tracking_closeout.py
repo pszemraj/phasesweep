@@ -726,6 +726,47 @@ def test_the_closing_lines_account_for_every_creation_and_record_the_sending_lin
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("damage", ["no-source", "unknown-state"])
+def test_a_malformed_earlier_record_costs_a_warning_naming_it_and_the_run_trains_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    damage: str,
+) -> None:
+    """An earlier run's record that lost its target, or holds an unknown state, is refused by name.
+
+    Both delivery passes warn naming the record's file and send nothing of the earlier run, the
+    record is left as it is rather than sent and rewritten, and the run trains and publishes.
+    """
+    sweep = _interrupted_sweep(tmp_path, monkeypatch, persistent=True)
+    [attempt] = sweep.summary.parent.glob("attempt-*.json")
+    record = read_record(attempt)
+    damaged = (
+        {key: value for key, value in record.items() if key != "source"}
+        if damage == "no-source"
+        else {**record, "state": "refused"}
+    )
+    session.write_record(attempt, damaged)
+    caplog.set_level(logging.INFO)
+    reports: list[TerminalReport] = []
+
+    winners = run_experiment(sweep.experiment, terminal_callback=reports.append)
+
+    assert set(winners) == {"depth", "rate"}
+    assert reports[0].primary_error is None
+    assert read_record(attempt) == damaged
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "were not all sent" in r.getMessage()
+    ]
+    assert len(warnings) == 2 and all(str(attempt) in warning for warning in warnings)
+    assert sweep.generation not in {
+        request["binding"]["generation_id"] for request in sweep.uploads
+    }
+
+
+@pytest.mark.integration
 def test_a_run_refused_before_its_target_check_never_waits_on_the_tracker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

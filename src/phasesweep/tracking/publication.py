@@ -20,8 +20,6 @@ from phasesweep.runtime.json import (
     JsonObject,
     json_number,
     json_object,
-    json_optional_text,
-    json_text,
 )
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportText, plural
@@ -104,23 +102,76 @@ def _deliver(
     :param float | None deadline: Absolute run deadline the upload is cut at, defaults to none.
     :raises ProcessCleanupUncertainError: The upload worker's cleanup is uncertain.
     :raises OSError: The upload or the record's update failed, MLflow's verdict or no answer.
-    :raises ValueError: The upload failed.
+    :raises ValueError: The record is malformed, or the upload failed.
     :raises RuntimeError: The upload failed.
     """
-    record = read_record(path)
-    if record["state"] == "delivered":
+    delivery = _read_delivery(path)
+    if delivery.delivered:
         return
     action: PublishAction = {
         "action": "publish",
         "name": path.stem,
-        "binding": json_object(record["binding"]),
-        "projection": json_object(record["projection"]),
-        "finish": json_optional_text(record, "finish"),
+        "binding": delivery.binding,
+        "projection": delivery.projection,
+        "finish": delivery.finish,
     }
-    generation_id = json_text(record, "generation_id")
-    call_tracking(experiment, worker_generation or generation_id, action, environment, deadline)
+    call_tracking(
+        experiment, worker_generation or delivery.generation_id, action, environment, deadline
+    )
     # A lost acknowledgement resends the same projection on the next sync.
-    write_record(path, {**record, "state": "delivered"})
+    write_record(path, {**delivery.record, "state": "delivered"})
+
+
+class _Delivery(NamedTuple):
+    """The fields of a delivery record that sending and counting read, each checked."""
+
+    record: JsonObject
+    """The whole record, written back with its new state once delivered."""
+    delivered: bool
+    generation_id: str
+    source: JsonObject
+    binding: JsonObject
+    projection: JsonObject
+    finish: str | None
+
+
+def _read_delivery(path: Path) -> _Delivery:
+    """Read a delivery record, refusing one whose fields delivery reads are missing or malformed.
+
+    Every reader of a record's state, target and payload goes through here, so a record that
+    lost a field takes its caller's warning path, named by its file, rather than an error.
+
+    :param Path path: Delivery record under ``tracking/<generation>/delivery``.
+    :raises OSError: The record cannot be read.
+    :raises ValueError: The record is not in the current format, or its state is neither
+        ``pending`` nor ``delivered``; the message names the file.
+    :return _Delivery: The record and its checked fields.
+    """
+    record = read_record(path)
+
+    def member(key: str) -> JsonObject:
+        """Return the record's ``key`` object, refusing anything else."""
+        value = record.get(key)
+        if not isinstance(value, dict):
+            raise ValueError(f"MLflow delivery record {path} has no {key!r} object.")
+        return json_object(value)
+
+    state = record.get("state")
+    finish = record.get("finish")
+    generation_id = record.get("generation_id")
+    if state not in {"pending", "delivered"}:
+        raise ValueError(f"MLflow delivery record {path} has unknown state {state!r}.")
+    if not isinstance(generation_id, str) or not isinstance(finish, str | None):
+        raise ValueError(f"MLflow delivery record {path} has a malformed generation or finish.")
+    return _Delivery(
+        record,
+        state == "delivered",
+        generation_id,
+        member("source"),
+        member("binding"),
+        member("projection"),
+        finish,
+    )
 
 
 def _send(
@@ -225,13 +276,13 @@ def _pending_records(
     :param str | None scope: One generation, or ``None`` for every generation.
     :param str | None skip: Generation left out, a live invocation's own.
     :raises OSError: A record cannot be read.
-    :raises ValueError: A record does not use the current format.
+    :raises ValueError: A record is malformed.
     :return list[Path]: Undelivered records, as :func:`_records` orders them.
     """
     return [
         path
         for path in _records(experiment, scope, skip=skip)
-        if read_record(path)["state"] != "delivered"
+        if not _read_delivery(path).delivered
     ]
 
 
@@ -866,10 +917,12 @@ def _target_recorded(experiment: Experiment) -> bool:
     """
     assert experiment.mlflow is not None
     source = tracking_root(experiment) / "source.json"
-    return (
-        not source.exists()
-        or read_record(source)["source"] == experiment.mlflow.evidence_identity()
-    )
+    if not source.exists():
+        return True
+    recorded = read_record(source).get("source")
+    if not isinstance(recorded, dict):
+        raise ValueError(f"MLflow tracking record {source} has no 'source' object.")
+    return recorded == experiment.mlflow.evidence_identity()
 
 
 def _bound_generations(experiment: Experiment, scope: str | None, skip: str | None) -> list[str]:
@@ -979,14 +1032,14 @@ def _deliver_outstanding(
             experiment, ledger, _bound_generations(experiment, scope, skip), unresolved=unresolved
         )
         for path in _records(experiment, scope, skip=skip):
-            record = read_record(path)
+            delivery = _read_delivery(path)
             if (
-                record["source"] != experiment.mlflow.evidence_identity()
-                or record["generation_id"] != path.parent.parent.name
+                delivery.source != experiment.mlflow.evidence_identity()
+                or delivery.generation_id != path.parent.parent.name
             ):
                 raise TrackingSyncRefusedError(different)
         creations = _pending_creations(experiment, scope, skip)
-        own_pending = [path for path in own or [] if read_record(path)["state"] != "delivered"]
+        own_pending = [path for path in own or [] if not _read_delivery(path).delivered]
         pending = _pending_records(experiment, scope, skip=skip)
         if not tally.sending or not (creations or pending or own_pending):
             return
@@ -1176,7 +1229,8 @@ def deliver_ended_generations(
     except (OSError, ValueError, PhaseSweepError) as exc:
         tally.sending = False
         log.warning(
-            "MLflow: records were not all sent (%s). The next run or %s rebuilds and sends them.",
+            "MLflow: records were not all sent (%s). Once that is resolved, the next run or %s "
+            "rebuilds and sends them.",
             exc,
             SYNC_TRACKING_STEP,
         )
@@ -1343,10 +1397,7 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     """
     counts = {"pending": len(pending_creation_records(experiment, generation_id)), "delivered": 0}
     for path in tracking_root(experiment).glob(f"{generation_id or '*'}/delivery/*.json"):
-        state = json_text(read_record(path), "state")
-        if state not in counts:
-            raise ValueError(f"Tracking delivery record {path.name!r} has unknown state {state!r}.")
-        counts[state] += 1
+        counts["delivered" if _read_delivery(path).delivered else "pending"] += 1
     return counts
 
 

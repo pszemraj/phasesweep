@@ -84,6 +84,20 @@ def mlflow_run(binding, *, status="FINISHED", metrics=None):
     )
 
 
+def delivery_record(generation_id, *, state="pending", **fields):
+    """Return a delivery record holding every field delivery reads, for a test that writes one."""
+    return {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "state": state,
+        "source": {},
+        "binding": {},
+        "projection": {},
+        "finish": None,
+        **fields,
+    }
+
+
 def attempt_identity(generation_id="a" * 32, attempt_id="b" * 32):
     """Return the creation identity of one attempt, which names no native run yet."""
     binding = {**mlflow_binding(), "generation_id": generation_id, "attempt_id": attempt_id}

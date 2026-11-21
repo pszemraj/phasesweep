@@ -74,6 +74,7 @@ from tests.conftest import lose_record_writes, patch_path_method_failure, trial_
 from tests.tracking_helpers import (
     FakeWorkerProcess,
     RunnerKilled,
+    delivery_record,
     killed_sweep,
     leak_tracking_worker,
     leave_cleanup_uncertain_attempt,
@@ -369,7 +370,7 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
         write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
     write_record(
         tracking_root(experiment) / generation / "delivery" / f"attempt-{'2' * 32}.json",
-        {"schema_version": 1, "generation_id": generation, "state": "delivered"},
+        delivery_record(generation, state="delivered"),
     )
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
@@ -733,8 +734,7 @@ def test_each_summary_record_is_sent_after_the_records_of_its_generation(tmp_pat
         (root / generation / "delivery").mkdir(parents=True)
         for name in names:
             write_record(
-                root / generation / "delivery" / f"{name}.json",
-                {"schema_version": 1, "state": "pending"},
+                root / generation / "delivery" / f"{name}.json", delivery_record(generation)
             )
     assert [
         f"{path.parent.parent.name[0]}/{path.stem}"

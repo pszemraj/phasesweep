@@ -36,6 +36,7 @@ from tests.tracking_helpers import (
     ManualClock,
     attempt_identity,
     bind_mlflow_attempt,
+    delivery_record,
     mlflow_binder,
     mlflow_binding,
     mlflow_run,
@@ -1032,10 +1033,9 @@ def test_a_shutdown_ends_a_delivery_pass_without_blaming_mlflow(
         for generation in ("1" * 32, "2" * 32)
     ]
     records = [root / ("1" * 32) / "delivery" / f"attempt-{n}.json" for n in "ab"]
-    record = {"schema_version": 1, "state": "pending", "generation_id": "1" * 32}
     for path in records:
         path.parent.mkdir(parents=True, exist_ok=True)
-        session.write_record(path, {**record, "binding": {}, "projection": {}, "finish": None})
+        session.write_record(path, delivery_record("1" * 32))
     requests: list[str] = []
 
     def interrupted(*args: object, **kwargs: object) -> None:
@@ -1499,7 +1499,7 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
     for generation, name in [(run_id, "own"), ("other", "a"), ("other", "b")]:
         write_record(
             tracking_root(experiment) / generation / "delivery" / f"{name}.json",
-            {"schema_version": 1, "generation_id": generation, "state": "pending"},
+            delivery_record(generation),
         )
 
     delivery = app.status(run_id)["tracking_delivery"]
