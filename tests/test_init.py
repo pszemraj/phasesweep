@@ -201,6 +201,7 @@ def test_init_template_loads_validates_and_scaffolds_a_catalog(
         assert experiment.storage == "auto"
         if template == "mlflow":
             assert experiment.trial_command == "phasesweep-mlflow-train --config {config_path}"
+            assert all(phase.gpu_policy == "none" for phase in experiment.phases)
         else:
             assert experiment.trial_command.startswith("phasesweep-fake-train ")
 

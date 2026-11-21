@@ -26,9 +26,9 @@ phasesweep show-winners mlflow.yaml
 phasesweep status mlflow.yaml
 ```
 
-When adapting the template to your trainer, replace its command, `trainer_config` and objective metric key, and remove or replace the demo `cost` constraint and `mlflow_required` gates.
+When adapting the template to your trainer, replace its command, `trainer_config` and objective metric key, and remove or replace the demo `cost` constraint and `mlflow_required` gates. For a GPU trainer, remove both `gpu_policy: none` entries to enable [device leasing](runtime.md#gpu-isolation).
 
-The trainer computes on CPU. The template uses the default [GPU policy](runtime.md#gpu-isolation), so on a host with a GPU each trial still acquires a device lease. It runs four trials across two phases. The depth winner is `model.depth=2` with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
+The demo runs four CPU trials across two phases without reserving a GPU. The depth winner is `model.depth=2` with loss 9. The rate phase inherits that depth and selects `optimizer.rate=3` with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
 For real training on a GPU, the [Tiny Decoder MLflow smoke guide](../examples/tiny_decoder_enwik8/README.md#native-mlflow-gpu-smoke) provides a complete two-trial, ten-batch configuration using native final-checkpoint metrics, with both run ownership modes supported.
 
