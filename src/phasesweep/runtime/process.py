@@ -906,7 +906,8 @@ def run_supervised(
                 )
             if guardian_status == _supervisor._DESCENDANTS_REAPED:
                 failure_reason = (
-                    f"trainer root exited, but process group {pgid} still had live descendants"
+                    f"trainer root exited, but process group {pgid} still had live descendants. "
+                    "Make the trainer wait for its children before exiting"
                 )
                 log.warning(
                     "Trainer root PID %d exited but process group %d "

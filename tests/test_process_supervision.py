@@ -1342,6 +1342,7 @@ def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     # Must be flagged as a lifecycle failure, not a clean exit.
     assert result.failure_reason is not None
     assert "still had live descendants" in result.failure_reason
+    assert "Make the trainer wait for its children before exiting" in result.failure_reason
 
     # The atomic identity must be preserved for forensics.
     assert (trial_dir / PROCESS_IDENTITY_FILE).exists()
