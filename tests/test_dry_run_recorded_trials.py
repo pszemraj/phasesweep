@@ -859,8 +859,15 @@ def test_validate_counts_pending_evidence_as_the_failure_a_run_may_record(tmp_pa
     validate_trial_targets(_two_cell_grid(tmp_path, 4))
     with pytest.raises(TrialTargetRefusedError, match="allow at most 4"):
         validate_trial_targets(_two_cell_grid(tmp_path, 5))
-    with pytest.raises(PhaseSweepError, match="completed trainer evidence awaiting recovery"):
+    with (
+        _experiment_lock(experiment),
+        pytest.raises(
+            PhaseSweepError, match="completed trainer evidence awaiting recovery"
+        ) as pending,
+    ):
         run_experiment(_two_cell_grid(tmp_path, 3), dry_run=True)
+    assert pending.value.remediation is not None
+    assert pending.value.remediation.startswith("Let any active run finish.")
 
 
 def test_validate_allows_the_retry_a_fixed_configurations_pending_evidence_may_justify(

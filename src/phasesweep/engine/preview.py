@@ -167,8 +167,8 @@ def _recorded_phase(phase: Phase, study: optuna.Study | None) -> RecordedPhase:
             "the trial and rerun counts depend on its extraction.",
             action=OperatorAction.RUN_RECOVER_RUN,
             remediation=(
-                "Run phasesweep run with the same config, without --dry-run, to recover "
-                "completed trainer evidence before requesting a dry-run plan."
+                "Let any active run finish. If the evidence is still pending, run "
+                "phasesweep run with the same config, without --dry-run, to recover it."
             ),
         )
     recovered_as_failed = recovered.count("FAIL")
