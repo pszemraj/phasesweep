@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1027,6 +1028,28 @@ def _record_outcome(
         run.study.stop()
 
 
+@contextlib.contextmanager
+def _persist_trial_evidence(run: _PhaseExecution, trial: optuna.Trial) -> Iterator[None]:
+    """Leave the trial RUNNING when the ledger cannot save its evidence.
+
+    :param _PhaseExecution run: Live phase whose workers must stop on a storage failure.
+    :param optuna.Trial trial: Trial whose trainer exit or extraction evidence is being saved.
+    :raises _TrialLeftRunning: The trial's evidence could not be written.
+    :return Iterator[None]: Context covering only evidence reads and writes to the ledger.
+    """
+    try:
+        yield
+    except Exception as exc:
+        error = _TrialLeftRunning(
+            StudyStorageUnavailableError(
+                f"Could not record trial evidence for trial {trial.number} "
+                f"in study {run.study.study_name!r}. The trial remains RUNNING."
+            )
+        )
+        run.record_fatal(error)
+        raise error from exc
+
+
 def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     """Optuna objective: sample, launch trial subprocess, extract, return metric.
 
@@ -1041,9 +1064,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     :raises PhaseSweepShutdown: Shutdown interrupted the trial or left completed training pending extraction.
     :raises ActiveAttemptPersistenceError: Required attempt recovery metadata could not be
         persisted; nothing was launched and no GPU lease was consumed.
-    :raises _TrialLeftRunning: A successful trial's terminal outcome could not be persisted,
-        or, in a persistent study, the tracker gave no answer about a finished trial's
-        evidence, so the trial is left ``RUNNING`` for stale-attempt recovery.
+    :raises _TrialLeftRunning: Evidence or the outcome could not be persisted, tracking preparation could not confirm cleanup, or the tracker gave no answer about finished training in a persistent study.
     :return float: The extracted metric value (Optuna minimizes/maximizes per ``direction``).
     """
     experiment = run.experiment
@@ -1189,10 +1210,11 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
     # SDK readers reuse the process slot; preserve the trainer's result before extraction.
-    if executed.process.failure_reason is not None:
-        trial.set_user_attr(FAILURE_REASON_ATTR, executed.process.failure_reason)
-    trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
-    trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
+    with _persist_trial_evidence(run, trial):
+        if executed.process.failure_reason is not None:
+            trial.set_user_attr(FAILURE_REASON_ATTR, executed.process.failure_reason)
+        trial.set_user_attr(DURATION_ATTR, executed.process.duration_seconds)
+        trial.set_user_attr(RETURN_CODE_ATTR, executed.process.return_code)
 
     def preserve_trainer_on_shutdown() -> None:
         """Leave extraction pending when shutdown has already cleaned this process slot.
@@ -1233,14 +1255,16 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         # Only a deadline-caused failure counts as a timeout.
         run.stop_for_deadline()
 
-    record_trial_result(
-        trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
-    )
+    with _persist_trial_evidence(run, trial):
+        record_trial_result(
+            trial, result, overrides_json=json.dumps(overrides, default=str, sort_keys=True)
+        )
 
     # Process/extractor failures -> Optuna FAIL state, not COMPLETE with inf.
     if result.failure_reason:
         if result.deadline_exhausted:
-            trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
+            with _persist_trial_evidence(run, trial):
+                trial.set_user_attr(FAILURE_REASON_ATTR, result.failure_reason)
             raise _DeadlineTrialExecutionError(result.failure_reason)
         raise TrialExecutionError(result.failure_reason)
 

@@ -1009,8 +1009,9 @@ def _outcome_write_experiment(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("key", [TRIAL_OUTCOME_ATTR, DURATION_ATTR, FEASIBLE_ATTR])
 def test_finished_trainers_evidence_failure_survives_a_live_outcome_write_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
     """Resume a rejected log objective as a failure without launching a replacement."""
     exp = _outcome_write_experiment(
@@ -1018,7 +1019,7 @@ def test_finished_trainers_evidence_failure_survives_a_live_outcome_write_error(
         trainer_body='import os\nprint("missing" if os.environ["PHASESWEEP_TRIAL_ID"] == "0" else "x=0.5")',
     )
     with monkeypatch.context() as writes:
-        patch_rejected_trial_user_attr(writes, TRIAL_OUTCOME_ATTR, "journal unavailable")
+        patch_rejected_trial_user_attr(writes, key, "journal unavailable")
         with pytest.raises(StudyStorageUnavailableError):
             run_experiment(exp)
 
