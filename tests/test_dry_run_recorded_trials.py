@@ -46,7 +46,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.engine.trial import _environment_identity
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import FRESH_STUDY, PhaseSweepError
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     bounded_metric,
@@ -213,10 +213,12 @@ def _refusals_match(
     match: str,
     *,
     from_phase: str | None = None,
-) -> None:
+) -> Exception:
     """Assert the dry run refuses an experiment with the error a real run then gives.
 
     The dry run must write nothing under ``root`` and must give the real run's message verbatim.
+
+    :return Exception: The error the real run raised.
     """
     before = tree_snapshot(root)
     with pytest.raises(error, match=match) as dry:
@@ -225,6 +227,7 @@ def _refusals_match(
     with pytest.raises(error) as real:
         run_experiment(experiment, from_phase=from_phase)
     assert str(dry.value) == str(real.value)
+    return real.value
 
 
 @pytest.mark.integration
@@ -657,11 +660,20 @@ def test_raised_upstream_target_over_a_bound_descendant_is_refused_as_a_run_refu
         _phase("c", 2, inherits=("b",)),
     )
 
-    _refusals_match(
+    refusal = _refusals_match(
         raised,
         tmp_path,
         StudyContextConflictError,
         r"dependent phase study/studies \['b', 'c'\] are already bound",
+    )
+
+    # The one rename step comes first, naming the dependents, then the new experiment name.
+    assert isinstance(refusal, StudyContextConflictError)
+    assert refusal.remediation == (
+        "To run the larger budget, give the phase, and each phase that inherits it (`b`, `c`), a "
+        "new `name`, updating every `inherits` to match; each renamed phase starts a new study "
+        "and runs again, and every other phase keeps its results. To rerun every phase, "
+        f"{FRESH_STUDY}."
     )
 
 

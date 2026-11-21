@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -452,7 +452,9 @@ def _as_sentence(cause: object) -> str:
     return text if text.rstrip().endswith((".", "!", "?")) else f"{text}."
 
 
-def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
+def _raise_prior_phase_abort(
+    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
+) -> None:
     """Refuse a phase whose recorded abort the current config does not retire.
 
     The advice comes from :func:`~phasesweep.engine.study_policy._recovery_advice` and
@@ -463,10 +465,11 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     :param JsonObject abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
     :param optuna.Study study: The phase's study.
+    :param Sequence[str] dependents: The phases that inherit ``phase``.
     :raises PhaseAbortRefusedError: Always; this function never returns
         normally.
     """
-    advice = _recovery_advice(phase, study, abort_record)
+    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} previously aborted at its accepted "
         f"n_trials={abort_record['trial_target']}: {_as_sentence(abort_record['cause'])} "
@@ -476,7 +479,9 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: JsonObject, study: optu
     )
 
 
-def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna.Study) -> None:
+def _raise_streak_at_limit(
+    phase: Phase, abort_record: JsonObject, study: optuna.Study, *, dependents: Sequence[str]
+) -> None:
     """Refuse new work while the resumed failure streak meets the current limit.
 
     :param Phase phase: Phase whose current ``max_consecutive_failures`` the
@@ -485,10 +490,11 @@ def _raise_streak_at_limit(phase: Phase, abort_record: JsonObject, study: optuna
         :func:`_failure_policy_abort_record`; supplies the replayed count and the
         accepted target.
     :param optuna.Study study: The phase's study.
+    :param Sequence[str] dependents: The phases that inherit ``phase``.
     :raises PhaseAbortRefusedError: Always; this function never returns
         normally.
     """
-    advice = _recovery_advice(phase, study, abort_record)
+    advice = _recovery_advice(phase, study, abort_record, dependents=dependents)
     raise PhaseAbortRefusedError(
         f"Phase {phase.name!r} has {abort_record['consecutive_failures']} consecutive "
         f"failed/infeasible trials, which meets "
@@ -620,7 +626,8 @@ def _judge_recorded_phase(
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
-    _validate_trial_target(study, phase)
+    dependents = experiment.phases_inheriting(phase.name)
+    _validate_trial_target(study, phase, dependents=dependents)
     partial_decision = _load_accepted_partial_decision(study)
     if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
         # Replay the accepted timeout boundary only while incomplete results remain enabled.
@@ -661,7 +668,7 @@ def _judge_recorded_phase(
         _awaits_cleanup_recovery(study, active_abort)
         or not _config_retires_abort(phase, trials, active_abort)
     ):
-        _raise_prior_phase_abort(phase, active_abort, study)
+        _raise_prior_phase_abort(phase, active_abort, study, dependents=dependents)
     if (
         active_abort is None
         and _finished_trial_count(trials) < phase.n_trials
@@ -676,7 +683,7 @@ def _judge_recorded_phase(
             trial_target=accepted_target,
         )
         if phase.n_trials <= accepted_target:
-            _raise_streak_at_limit(phase, active_abort, study)
+            _raise_streak_at_limit(phase, active_abort, study, dependents=dependents)
     return _PhaseResume(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,
@@ -1523,7 +1530,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
         abort = aborted_state.abort
         assert abort is not None  # an aborted run recorded its abort with the tripping outcome
         # Without storage there is no study to continue, so only the logs are left to read.
-        advice = _recovery_advice(phase, study, abort) if experiment.persistent else None
+        advice = (
+            _recovery_advice(
+                phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
+            )
+            if experiment.persistent
+            else None
+        )
         all_infeasible = _streak_trials_all_infeasible(study, aborted_state)
         evidence = (
             "The tripping trials were INFEASIBLE: outside the metric bounds or constraints."

@@ -12,6 +12,7 @@ import pytest
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import _operational_error_text
 from phasesweep.config.models import ExecutionContext, Experiment
+from phasesweep.config.reference import lookup
 from phasesweep.config.search import IntParam
 from phasesweep.engine.artifact_roots import (
     _check_artifact_root_binding,
@@ -32,7 +33,7 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     PHASE_FINGERPRINT_PAYLOAD_ATTR,
 )
-from phasesweep.errors import NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import NEW_STUDY_STEP, OperatorAction, rename_phase_step
 from tests.conftest import make_experiment
 from tests.experiments import (
     anchored_phase,
@@ -87,7 +88,7 @@ def test_refusal_names_the_changed_search_space_bound(tmp_path: Path) -> None:
     assert "execution.cwd" not in str(caught.value)
     assert caught.value.action is OperatorAction.FRESH_NAMESPACE
     assert caught.value.remediation is not None
-    assert "give this phase a new `name`" in caught.value.remediation
+    assert "or give the phase a new `name`, to rerun only this phase." in caught.value.remediation
 
     write_anchored_config(
         config,
@@ -121,9 +122,9 @@ def test_refusal_for_an_inherited_phase_names_the_dependents_to_rename(tmp_path:
 
     assert caught.value.remediation is not None
     assert (
-        "give this phase and each phase that inherits it (`q`) a new `name`"
-        in caught.value.remediation
-    )
+        "give the phase, and each phase that inherits it (`q`), a new `name`, updating every "
+        "`inherits` to match, to rerun only those phases."
+    ) in caught.value.remediation
 
     renamed = [
         {**anchored_phase(4), "name": "wider"},
@@ -370,6 +371,22 @@ def test_a_study_bound_to_another_root_gets_a_step_that_fits(tmp_path: Path) -> 
         "Restore the `workdir` and `experiment` that give the recorded artifact root to "
         "continue this study, or set a new `experiment` name to start a fresh study."
     )
+
+
+def test_the_rename_step_is_worded_once_and_names_the_dependents_it_is_given() -> None:
+    """Every site that offers the rename builds it here, and the explain text carries the same clause."""
+    assert rename_phase_step(()) == "give the phase a new `name`"
+    assert rename_phase_step(("q", "r")) == (
+        "give the phase, and each phase that inherits it (`q`, `r`), a new `name`, updating "
+        "every `inherits` to match"
+    )
+    unknown = rename_phase_step(None)
+    assert unknown == (
+        "give the phase, and each phase that inherits it, a new `name`, updating every "
+        "`inherits` to match"
+    )
+    (timeout,) = lookup("phases[].timeout_seconds_per_trial")
+    assert unknown in " ".join(timeout.comments)
 
 
 def test_long_values_are_windowed_around_their_first_difference() -> None:

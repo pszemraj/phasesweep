@@ -516,9 +516,15 @@ def _failed_study(reasons: list[str | None]) -> optuna.Study:
     return study
 
 
-def _crashed_remedy(tmp_path: Path, phase: Phase, reasons: list[str | None]) -> str:
-    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed."""
-    experiment = make_experiment(persistent=tmp_path, phases=[phase])
+def _crashed_remedy(
+    tmp_path: Path, phase: Phase, reasons: list[str | None], *, inheriting: Phase | None = None
+) -> str:
+    """Return the remedy a persistent experiment gives when every trial of ``phase`` failed.
+
+    :param Phase | None inheriting: A later phase that inherits ``phase``, if the experiment has one.
+    """
+    phases = [phase] if inheriting is None else [phase, inheriting]
+    experiment = make_experiment(persistent=tmp_path, phases=phases)
     with pytest.raises(NoFeasibleTrialError) as refused:
         select_winner(_failed_study(reasons), experiment, phase_name=phase.name)
     remedy = refused.value.remediation
@@ -617,12 +623,32 @@ def test_a_timed_out_phase_is_told_to_rename_it_not_to_raise_the_timeout_in_plac
     assert "A trial timed out under phases[p].timeout_seconds_per_trial" in remedy
     assert "raising it in place is refused as a changed study" in remedy
     assert (
-        "Raise it and give the phase, and each phase that inherits it, a new `name`, updating "
-        "every `inherits` to match; each renamed phase starts a new study and runs again, and "
-        "every other phase keeps its results."
+        "Raise it and give the phase a new `name`; each renamed phase starts a new study and "
+        "runs again, and every other phase keeps its results."
     ) in remedy
     assert "For any other failure, fix it, then raise phases[p].n_trials above 2" in remedy
-    assert remedy.count("give the phase, and each phase that inherits it") == 1
+    assert remedy.count("a new `name`") == 1
+
+
+def test_the_timeout_step_names_the_phases_that_inherit_the_timed_out_one(tmp_path: Path) -> None:
+    """The rename that a raised timeout needs lists the dependents it must carry along."""
+    phase = _sampled_phase(Sampler(type="random", seed=0))
+    child = Phase(
+        name="q",
+        n_trials=2,
+        inherits=["p"],
+        sampler=Sampler(type="random", seed=0),
+        search_space={"y": FloatParam(type="float", low=0.1, high=1.0)},
+    )
+    timeout = f"{TIMEOUT_REASON_PREFIX}5.0s"
+
+    remedy = _crashed_remedy(tmp_path, phase, [timeout, timeout], inheriting=child)
+
+    assert (
+        "Raise it and give the phase, and each phase that inherits it (`q`), a new `name`, "
+        "updating every `inherits` to match; each renamed phase starts a new study and runs "
+        "again, and every other phase keeps its results."
+    ) in remedy
 
 
 @pytest.mark.parametrize(

@@ -157,7 +157,7 @@ def _no_feasible_remedy(
             else " to retry the failed attempts"
         )
         if _any_trial_timed_out(trials):
-            timeout_lead = f"{timeout_step(phase.name)} "
+            timeout_lead = f"{timeout_step(phase.name, experiment.phases_inheriting(phase.name))} "
     else:
         budget = "the phase's n_trials"
         outcome = ""

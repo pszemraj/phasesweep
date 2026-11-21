@@ -14,7 +14,7 @@ import optuna
 from phasesweep.config.models import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, PHASE_FINGERPRINT_PAYLOAD_ATTR, Winner
-from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction
+from phasesweep.errors import FRESH_STUDY, NEW_STUDY_STEP, OperatorAction, rename_phase_step
 from phasesweep.runtime.json import JsonObject, json_object
 
 log = logging.getLogger(__name__)
@@ -320,17 +320,11 @@ def _restore_or_rename_step(experiment: Experiment, phase: Phase) -> str:
     :return str: The operator's step.
     """
     dependents = experiment.phases_inheriting(phase.name)
-    if dependents:
-        named = ", ".join(f"`{name}`" for name in dependents)
-        rename = (
-            f"give this phase and each phase that inherits it ({named}) a new `name`, "
-            "updating every `inherits` to match, to rerun only those phases"
-        )
-    else:
-        rename = "give this phase a new `name` to rerun only this phase"
+    rename = rename_phase_step(dependents)
+    rerun = "those phases" if dependents else "this phase"
     return (
-        f"Restore the recorded value(s) to continue this study, or {rename}. "
-        f"To rerun every phase, {FRESH_STUDY}."
+        f"Restore the recorded value(s) to continue this study, or {rename}, to rerun only "
+        f"{rerun}. To rerun every phase, {FRESH_STUDY}."
     )
 
 

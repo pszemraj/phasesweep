@@ -441,7 +441,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     return stored if recovery is None else max(stored, recovery.trial_target)
 
 
-def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
+def _validate_trial_target(study: optuna.Study, phase: Phase, *, dependents: Sequence[str]) -> None:
     """Reject a target the study's durable state does not allow.
 
     A target lower than the accepted one is refused, and so is a fixed
@@ -450,6 +450,7 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
+    :param Sequence[str] dependents: The phases that inherit ``phase``.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
         study's durable accepted target, or a fixed configuration or grid asks for more
         attempts than it may retry.
@@ -468,11 +469,12 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
         finished=_finished_trial_count(trials),
         measured=_measured_trial_count(trials),
         has_study=True,
+        dependents=dependents,
     )
 
 
 def _validate_fixed_configuration_target(
-    phase: Phase, *, finished: int, measured: int, has_study: bool
+    phase: Phase, *, finished: int, measured: int, has_study: bool, dependents: Sequence[str]
 ) -> None:
     """Reject a fixed configuration or grid target that would repeat measured cells.
 
@@ -489,13 +491,19 @@ def _validate_fixed_configuration_target(
     :param int measured: How many of those are COMPLETE, feasible or not.
     :param bool has_study: Whether the phase's study exists, which decides whether a grid
         refusal points at a new study.
+    :param Sequence[str] dependents: The phases that inherit ``phase``, named by a grid
+        refusal's new-study step.
     :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, measured=measured)
     if refusal is None:
         refusal = grid_target_refusal(
-            phase, finished=finished, measured=measured, has_study=has_study
+            phase,
+            finished=finished,
+            measured=measured,
+            has_study=has_study,
+            dependents=dependents,
         )
     if refusal is not None:
         message, remediation = refusal
@@ -802,7 +810,9 @@ def _retry_remedy(
     )
 
 
-def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, object]) -> str | None:
+def _recovery_advice(
+    phase: Phase, study: optuna.Study, abort: Mapping[str, object], *, dependents: Sequence[str]
+) -> str | None:
     """Say how to continue a phase whose study recorded ``abort``, or that nothing can.
 
     Recovery messages take their advice from here, and :func:`_recovery_action` routes it. Recovery retains recorded results; starting fresh uses a new ``experiment`` name.
@@ -810,6 +820,7 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
     :param Phase phase: Phase that aborted.
     :param optuna.Study study: The phase's study.
     :param Mapping[str, object] abort: The recorded abort.
+    :param Sequence[str] dependents: The phases that inherit ``phase``, named by the timeout step.
     :return str | None: The advice, or ``None`` when no remedy or explanation applies.
     """
     results_stay = "The recorded trial results stay in the study."
@@ -825,7 +836,7 @@ def _recovery_advice(phase: Phase, study: optuna.Study, abort: Mapping[str, obje
             f"{fingerprint_kept} For work under unchanged limits: {remedies}"
         )
     timeout_lead = (
-        f"{timeout_step(phase.name)} "
+        f"{timeout_step(phase.name, dependents)} "
         if _any_trial_timed_out(study.get_trials(deepcopy=False))
         else ""
     )

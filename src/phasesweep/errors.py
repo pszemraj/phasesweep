@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import ClassVar, Self
 
@@ -101,29 +102,43 @@ FRESH_STUDY = f"set{_FRESH_STUDY_TAIL}"
 
 NEW_STUDY_STEP = f"Set{_FRESH_STUDY_TAIL}; the old study stays readable with its original config."
 
-#: The step that starts one phase over when a setting of that phase changes. A phase's study is
-#: named after the phase, so a new name is a new study for it, and a phase that inherits it records
-#: the name in its own study identity and follows. Worded as a clause for a step that offers it.
-RENAME_PHASE_STEP = (
-    "give the phase, and each phase that inherits it, a new `name`, updating every `inherits` "
-    "to match"
-)
+
+def rename_phase_step(dependents: Sequence[str] | None) -> str:
+    """Say how to start one phase over when a setting of that phase changes.
+
+    A phase's study is named after the phase, so a new name is a new study for it, and a phase
+    that inherits it records the name in its own study identity and follows. The clause is
+    worded for a step that offers it, so the caller adds what the rename costs.
+
+    :param Sequence[str] | None dependents: The phases that inherit the phase, from
+        :meth:`~phasesweep.config.models.Experiment.phases_inheriting`, or ``None`` where no
+        experiment is at hand and the sentence can only say there may be some.
+    :return str: A clause that gives the phase, and the dependents it names, a new ``name``.
+    """
+    if dependents is not None and not dependents:
+        return "give the phase a new `name`"
+    named = "" if dependents is None else f" ({', '.join(f'`{name}`' for name in dependents)})"
+    return (
+        f"give the phase, and each phase that inherits it{named}, a new `name`, updating "
+        "every `inherits` to match"
+    )
 
 
-def timeout_step(phase_name: str) -> str:
+def timeout_step(phase_name: str, dependents: Sequence[str]) -> str:
     """Say how to give a phase whose trials timed out a longer per-trial timeout.
 
     The timeout is part of the phase's study identity, so a raised value is refused over the
     recorded trials; a new phase name is the step that loses the least work.
 
     :param str phase_name: Phase whose trials timed out.
+    :param Sequence[str] dependents: The phases that inherit it.
     :return str: The operator's step, a sentence pair.
     """
     return (
         f"A trial timed out under phases[{phase_name}].timeout_seconds_per_trial, which is part "
         "of the phase's study identity, so raising it in place is refused as a changed study. "
-        f"Raise it and {RENAME_PHASE_STEP}; each renamed phase starts a new study and runs "
-        "again, and every other phase keeps its results."
+        f"Raise it and {rename_phase_step(dependents)}; each renamed phase starts a new study "
+        "and runs again, and every other phase keeps its results."
     )
 
 

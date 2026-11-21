@@ -1082,7 +1082,12 @@ def unpublished_winner_step(
             or not _config_retires_abort(phase, trials, abort)
         ):
             cause = str(abort["cause"]).rstrip(".")
-            advice = _recovery_advice(phase, study, abort) or NEW_STUDY_STEP
+            advice = (
+                _recovery_advice(
+                    phase, study, abort, dependents=experiment.phases_inheriting(phase.name)
+                )
+                or NEW_STUDY_STEP
+            )
             return UnpublishedWinnerStep(f"Phase {phase.name!r}: {cause}.", advice)
         if _finished_trial_count(trials) < phase.n_trials:
             continue

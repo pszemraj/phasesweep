@@ -18,6 +18,7 @@ from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
+from phasesweep.errors import FRESH_STUDY, rename_phase_step
 
 
 def _preflight_skipped_winners(
@@ -196,9 +197,13 @@ def _reject_bound_descendant_topups(
             raise StudyContextConflictError(
                 f"Phase {phase.name!r} has {phase.n_trials - finished} top-up trial(s) "
                 f"remaining, but dependent phase study/studies {bound} are already bound "
-                "to its published winner via inheritance. "
-                "Use a new experiment name to run the larger upstream budget without "
-                "mutating this completed phase chain."
+                "to its published winner via inheritance.",
+                remediation=(
+                    "To run the larger budget, "
+                    f"{rename_phase_step(experiment.phases_inheriting(phase.name))}; each "
+                    "renamed phase starts a new study and runs again, and every other phase "
+                    f"keeps its results. To rerun every phase, {FRESH_STUDY}."
+                ),
             )
 
 
@@ -229,7 +234,11 @@ def _reject_fixed_targets_without_study(
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
             study_policy_ops._validate_fixed_configuration_target(
-                phase, finished=0, measured=0, has_study=False
+                phase,
+                finished=0,
+                measured=0,
+                has_study=False,
+                dependents=experiment.phases_inheriting(phase.name),
             )
 
 

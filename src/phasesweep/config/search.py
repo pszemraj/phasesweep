@@ -18,7 +18,7 @@ from phasesweep.config.common import (
     _Frozen,
     _require_finite,
 )
-from phasesweep.errors import RENAME_PHASE_STEP
+from phasesweep.errors import rename_phase_step
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -518,7 +518,7 @@ def grid_cardinality(phase: Phase) -> int:
 
 
 def grid_target_refusal(
-    phase: Phase, *, finished: int, measured: int, has_study: bool
+    phase: Phase, *, finished: int, measured: int, has_study: bool, dependents: Sequence[str]
 ) -> tuple[str, str] | None:
     """Refuse a grid target above the ceiling :func:`retry_target_ceiling` allows.
 
@@ -531,6 +531,8 @@ def grid_target_refusal(
     :param int measured: Grid cells whose trial is COMPLETE, in bounds or not.
     :param bool has_study: Whether a recorded study binds the search space, so that
         enlarging the grid needs a new phase name; a config that never ran has none.
+    :param Sequence[str] dependents: The phases that inherit this one, which the new phase name
+        has to be followed by.
     :return tuple[str, str] | None: Refusal diagnosis and remedy when the target exceeds the available cells.
     """
     maximum = retry_target_ceiling(phase, finished=finished, measured=measured)
@@ -540,8 +542,8 @@ def grid_target_refusal(
     # A recorded study refuses a changed search space, and a new phase name is the step that
     # loses the least work: it starts a new study for this phase and the phases that inherit it.
     enlarge = (
-        f"change the search space and {RENAME_PHASE_STEP}; each renamed phase starts a new "
-        "study and measures every cell again, the finished ones included"
+        f"change the search space and {rename_phase_step(dependents)}; each renamed phase "
+        "starts a new study and measures every cell again, the finished ones included"
         if has_study
         else "change the search space"
     )

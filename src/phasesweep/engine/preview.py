@@ -246,6 +246,7 @@ def validate_trial_targets(experiment: Experiment) -> None:
             + recovered.count("EVIDENCE_PENDING"),
             measured=_measured_trial_count(trials),
             has_study=study is not None,
+            dependents=experiment.phases_inheriting(phase.name),
         )
 
 
@@ -296,12 +297,17 @@ def _refuse_as_a_launch_would(
         try:
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
+            dependents = experiment.phases_inheriting(phase.name)
             if reached and record.running:
                 _validate_fixed_configuration_target(
-                    phase, finished=record.finished, measured=record.measured, has_study=True
+                    phase,
+                    finished=record.finished,
+                    measured=record.measured,
+                    has_study=True,
+                    dependents=dependents,
                 )
             elif reached:
-                _validate_trial_target(study, phase)
+                _validate_trial_target(study, phase, dependents=dependents)
         except Exception as exc:
             errors.append(exc)
     _raise_collected_errors(errors)

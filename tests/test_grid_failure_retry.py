@@ -467,7 +467,7 @@ def test_failure_streak_refusal_names_the_grid_retry_target(tmp_path: Path) -> N
     )
 
     with pytest.raises(PhaseAbortRefusedError) as refused:
-        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
+        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original), dependents=())
     message = _operational_error_text(refused.value)
     assert "has 2 consecutive failed/infeasible trials" in message
     assert "meets max_consecutive_failures=2" in message
@@ -500,7 +500,7 @@ def test_infeasible_streak_advice_says_recorded_results_stay_unless_the_experime
         phase, consecutive_failures=2, completion_sequence=2, trial_target=4
     )
     with pytest.raises(PhaseAbortRefusedError) as at_limit:
-        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original))
+        phase_ops._raise_streak_at_limit(phase, streak, phase_study(original), dependents=())
 
     for message in map(_operational_error_text, (aborted.value, refused.value, at_limit.value)):
         _assert_advises_limit(message, 2, 2, 4)
@@ -813,9 +813,9 @@ def test_oversized_grid_target_over_a_recorded_study_points_at_a_new_phase_name(
         run_experiment(_grid(tmp_path, trainer, 4))
     message = _operational_error_text(refused.value)
     assert (
-        "To enlarge the grid instead, change the search space and give the phase, and each "
-        "phase that inherits it, a new `name`, updating every `inherits` to match; each renamed "
-        "phase starts a new study and measures every cell again, the finished ones included."
+        "To enlarge the grid instead, change the search space and give the phase a new "
+        "`name`; each renamed phase starts a new study and measures every cell again, the "
+        "finished ones included."
     ) in message
     assert "new `experiment` name" not in message
     assert "old study" not in message
