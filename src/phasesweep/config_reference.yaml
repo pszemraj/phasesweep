@@ -256,6 +256,7 @@ phases: list[object] (required)
     # Wallclock limit for one trainer process, in seconds, > 0. null means no limit.
     # Its clock starts at the supervised launch, after the GPU lease is held, so it excludes the lease wait and the evidence reads.
     # A trainer it kills fails the attempt. A trainer that a phase or run deadline stops first is interrupted instead, and it reruns.
+    # Unlike timeout_seconds_per_phase, this key is part of the phase's study identity: changing it after the phase has trials is refused as a changed study, so give the phase a new name to run it under another value.
     # Requires: phases[].allow_unbounded_trials true for null.
     timeout_seconds_per_trial: float | null = 259200.0
 
