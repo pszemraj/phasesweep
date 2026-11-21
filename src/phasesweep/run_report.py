@@ -26,6 +26,7 @@ from phasesweep.runtime.terminal import (
     ReportBlock,
     Style,
     break_path,
+    directory_lines,
     display_path,
     pack,
     paint,
@@ -702,11 +703,12 @@ class Summary:
                 drawn[0] = lead + drawn[0].removeprefix(" " * len(lead))
                 lines.append(_paint_word(drawn[0], "winner", "winner", start=len(pad), color=color))
                 lines.extend(drawn[1:])
-                for directory in phase.winner_dirs:
-                    lines.extend(
-                        pad + paint(line.removeprefix(pad), "path", color=color)
-                        for line in break_path(directory, width, indent=pad)
+                lines.extend(
+                    pad + line
+                    for line in directory_lines(
+                        phase.winner_dirs, width=width - len(pad), color=color
                     )
+                )
         if self.written:
             lines.append("")
             lines.extend(self._written_lines(width, color=color))

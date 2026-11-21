@@ -25,6 +25,7 @@ from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.terminal import (
     GAP,
     INDENT,
+    directory_lines,
     display_path,
     paint,
     param_text,
@@ -330,10 +331,11 @@ def _winner_dir_lines(rows: Sequence[JsonObject], *, width: int, color: bool) ->
             continue
         label = f"{INDENT}winner trial {row['trial']} directory:"
         shown = display_path(Path(directory))
+        (drawn,) = directory_lines([shown], width=None, color=color)
         if len(label) + 1 + len(shown) <= width:
-            lines.append(f"{label} {paint(shown, 'path', color=color)}")
+            lines.append(f"{label} {drawn}")
         else:
-            lines.extend([label, f"{INDENT}{INDENT}{paint(shown, 'path', color=color)}"])
+            lines.extend([label, f"{INDENT}{INDENT}{drawn}"])
     return lines
 
 

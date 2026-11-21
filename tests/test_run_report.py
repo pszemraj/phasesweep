@@ -1043,11 +1043,59 @@ def test_summary_names_the_winners_directory_under_its_winner_line(
     block = lines[start + 1 : lines.index("  learning_rate  2 complete")]
     assert block[-len(expected) :] == expected
     assert block[0].startswith("                 winner  trial 0")
-    assert all(len(line) <= width for line in block if ATTEMPT_NAME not in line)
+    # Only a path component wider than the terminal may overrun, and it keeps a line to itself.
+    overrunning = [line for line in block if len(line) > width]
+    assert overrunning == ([expected[-1]] if directory == ATTEMPT_TRIAL_DIR else [])
 
 
-def test_summary_names_every_winning_trials_directory_of_a_repeats_phase() -> None:
-    """A repeats winner stands on each member, so each member's directory gets a line."""
+_REPEATS_PARENT = Path("/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth")
+_REPEATS_MEMBER_DIRS = tuple(
+    _REPEATS_PARENT / f"trial_{number:05d}__generation_6413d5c1edd5475998cfadd4d3b59980"
+    f"__attempt_{number:x}f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    for number in (4, 5)
+)
+
+
+@pytest.mark.parametrize(
+    ("width", "directories", "expected"),
+    [
+        pytest.param(
+            80,
+            (Path("/data/runs/depth/trial_00004"), Path("/data/runs/depth/trial_00005")),
+            [
+                "                 /data/runs/depth/",
+                "                   trial_00004",
+                "                   trial_00005",
+            ],
+            id="short-80",
+        ),
+        pytest.param(
+            80,
+            _REPEATS_MEMBER_DIRS,
+            [
+                "                 /data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth/",
+                f"                   {_REPEATS_MEMBER_DIRS[0].name}",
+                f"                   {_REPEATS_MEMBER_DIRS[1].name}",
+            ],
+            id="attempt-80",
+        ),
+        pytest.param(
+            60,
+            _REPEATS_MEMBER_DIRS,
+            [
+                "                 /data/sweeps/phasesweep_starter/runs/",
+                "                 phasesweep_starter/depth/",
+                f"                   {_REPEATS_MEMBER_DIRS[0].name}",
+                f"                   {_REPEATS_MEMBER_DIRS[1].name}",
+            ],
+            id="attempt-60",
+        ),
+    ],
+)
+def test_summary_names_every_winning_trials_directory_of_a_repeats_phase(
+    width: int, directories: tuple[Path, ...], expected: list[str]
+) -> None:
+    """A repeats winner stands on each member: the shared parent prints once, then one line each."""
     repeats: RepeatsRecord = {
         "key": "seed",
         "reduce": "mean",
@@ -1074,15 +1122,16 @@ def test_summary_names_every_winning_trials_directory_of_a_repeats_phase() -> No
         metric=0.3,
         repeats=repeats,
     )
-    lines = _summary_with_dirs(
-        (Path("/data/runs/depth/trial_00004"), Path("/data/runs/depth/trial_00005")),
-        winners={**STARTER_WINNERS, "depth": repeated},
-    ).render(80, color=False)
+    lines = _summary_with_dirs(directories, winners={**STARTER_WINNERS, "depth": repeated}).render(
+        width, color=False
+    )
 
     start = lines.index("  learning_rate  2 complete")
-    assert lines[start - 2 : start] == [
-        "                 /data/runs/depth/trial_00004",
-        "                 /data/runs/depth/trial_00005",
+    assert lines[start - len(expected) : start] == expected
+    # A member's own name is the only text that may overrun, and each keeps a line to itself.
+    names = {path.name for path in directories}
+    assert [line for line in lines if len(line) > width] == [
+        line for line in expected if line.strip() in names and len(line) > width
     ]
 
 

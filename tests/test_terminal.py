@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.runtime.terminal import (
+    directory_lines,
     display_path,
     paint,
     plural,
@@ -142,6 +143,44 @@ def test_wrap_labeled_hangs_every_later_line_and_paragraph_under_the_text() -> N
         "     Then check it.",
     ]
     assert wrap_labeled("fix:", "", 30) == ["fix:"]
+
+
+def test_directory_lines_name_a_shared_parent_once_and_fit_or_keep_whole() -> None:
+    """Directories in one parent print it once; a width breaks at slashes, none keeps one line."""
+    parent = "/data/sweeps/phasesweep_starter/runs/phasesweep_starter/depth"
+    members = [f"{parent}/trial_0000{number}__attempt_{'f' * 40}" for number in (4, 5)]
+
+    assert directory_lines(members, width=80, color=False) == [
+        f"{parent}/",
+        f"  {members[0].rsplit('/', 1)[1]}",
+        f"  {members[1].rsplit('/', 1)[1]}",
+    ]
+    assert directory_lines(members, width=40, color=False)[:2] == [
+        "/data/sweeps/phasesweep_starter/runs/",
+        "phasesweep_starter/depth/",
+    ]
+    assert directory_lines(members[:1], width=None, color=False) == members[:1]
+    assert directory_lines(members, width=None, color=False)[0] == f"{parent}/"
+    assert directory_lines([], width=80, color=False) == []
+
+
+def test_directory_lines_print_each_path_in_full_when_nothing_is_shared() -> None:
+    """Different parents, one directory, and bare names have no parent line to share."""
+    assert directory_lines(["a/trial_1", "b/trial_2"], width=40, color=False) == [
+        "a/trial_1",
+        "b/trial_2",
+    ]
+    assert directory_lines(["/a/trial_1"], width=40, color=False) == ["/a/trial_1"]
+    assert directory_lines(["trial_1", "trial_2"], width=40, color=False) == ["trial_1", "trial_2"]
+
+
+def test_directory_lines_dim_each_path_and_nothing_else() -> None:
+    """Colour wraps the text of every line, and the indent before a member stays plain."""
+    assert directory_lines(["/a/trial_1", "/a/trial_2"], width=40, color=True) == [
+        "\x1b[2m/a/\x1b[0m",
+        "  \x1b[2mtrial_1\x1b[0m",
+        "  \x1b[2mtrial_2\x1b[0m",
+    ]
 
 
 def test_wrap_keeps_a_minimum_text_width_on_a_very_narrow_terminal() -> None:

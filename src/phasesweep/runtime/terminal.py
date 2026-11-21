@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, TextIO
 
 #: Name of the logger whose records are a run's report: the lines a person reads on the console.
@@ -227,6 +227,39 @@ def break_path(text: str, width: int, *, indent: str = "") -> list[str]:
     if text.startswith("/") and len(parts) > 1:
         parts = ["/" + parts[1], *parts[2:]]
     return pack(parts, width, indent=indent, separator="/")
+
+
+def directory_lines(directories: Sequence[str], *, width: int | None, color: bool) -> list[str]:
+    """Lay out directory paths dim, each on a line of its own, with a shared parent named once.
+
+    Several directories in one parent print that parent on a line ending in a slash, then each
+    directory's own name two columns in; otherwise each prints in full. A path is never cut: with
+    a ``width`` it breaks after slashes to fit and keeps each component whole, and without one it
+    is a single line however long, so a person can copy it.
+
+    :param Sequence[str] directories: Display paths, as :func:`display_path` spells them, in order.
+    :param int | None width: Columns each line must fit, or ``None`` to keep each path whole.
+    :param bool color: Whether to style the paths.
+    :return list[str]: The lines, without any indent in front of the first column.
+    """
+
+    def drawn(text: str, *, indent: str = "") -> list[str]:
+        """Break ``text`` to fit when a width is given and style it."""
+        fitted = [text] if width is None else break_path(text, max(width - len(indent), 1))
+        return [indent + paint(line, "path", color=color) for line in fitted]
+
+    parents = {PurePosixPath(directory).parent for directory in directories}
+    if len(directories) < 2 or len(parents) != 1 or parents == {PurePosixPath(".")}:
+        return [line for directory in directories for line in drawn(directory)]
+    shared = parents.pop().as_posix().rstrip("/") + "/"
+    return [
+        *drawn(shared),
+        *(
+            line
+            for directory in directories
+            for line in drawn(PurePosixPath(directory).name, indent=INDENT)
+        ),
+    ]
 
 
 class ReportBlock(ABC):
