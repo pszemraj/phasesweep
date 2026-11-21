@@ -11,12 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config.models import Experiment, _metric_semantics_payload
 from phasesweep.engine.artifacts import read_yaml_or_none
-from phasesweep.engine.confound import (
-    ConfoundCheck,
-    ConfoundVerdict,
-    _confound_summary,
-    _validate_confound_block,
-)
+from phasesweep.engine.confound import ConfoundCheck, ConfoundVerdict, _confound_summary
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
@@ -339,9 +334,8 @@ def _winner_snapshot(
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
     :param Experiment | None experiment: Producing config for recomputed repeat-cost advice.
-    :raises RuntimeError: A ``PhaseWinnerView`` carries no confound verdicts, or either
-        representation carries no source provenance.
-    :raises ValueError: A stored ``Winner``'s confound block fails validation.
+    :raises RuntimeError: Either representation carries no confound verdicts or no source
+        provenance.
     :return WinnerSnapshot: Validated path-free winner snapshot.
     """
     cost_status: CostAdvisoryStatus
@@ -353,8 +347,10 @@ def _winner_snapshot(
         provenance = winner.objective_provenance
         extractor = provenance.get("extractor") if isinstance(provenance, Mapping) else None
         kind = extractor.get("kind") if isinstance(extractor, Mapping) else None
+        if winner.confound is None:
+            raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = _confound_summary(
-            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
+            winner.confound,
             winner_trial=winner.trial_number,
             extractor_kind=kind if isinstance(kind, str) else "unknown",
         )

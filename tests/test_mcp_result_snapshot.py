@@ -671,6 +671,18 @@ def _engine_winner(
     )
 
 
+def test_snapshot_refuses_an_engine_winner_without_confound_verdicts(tmp_path: Path) -> None:
+    """A winner that carries no confound block cannot be frozen, so no verdict is invented."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = _engine_winner(1)
+    winner.confound = None
+
+    with pytest.raises(RuntimeError, match="missing confound verdicts"):
+        mcp_runner.capture_result_snapshot(
+            experiment, generation_id="engine-generation", engine_winners={"p": winner}
+        )
+
+
 def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path) -> None:
     """Engine winners freeze without rereading files; observed values survive the stored view."""
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
