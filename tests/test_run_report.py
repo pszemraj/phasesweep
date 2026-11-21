@@ -42,6 +42,7 @@ from phasesweep.runtime.gpu import _HOST_LOCK_WAIT
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.runtime.terminal import REPORT_LOGGER, ReportBlock, ReportText
 from phasesweep.tracking.models import MlflowSettings
+from phasesweep.tracking.session import SYNC_TRACKING_STEP, count_text
 from tests.conftest import (
     FAKE_TRAIN_METRIC,
     grid_experiment,
@@ -502,19 +503,20 @@ def test_prose_report_lines_wrap_to_the_terminal(
         pytest.param(
             80,
             [
-                "12:00:00  warning: [learning_rate] only 1 of 2 grid cells succeeded; the winner",
-                "                   was chosen without a successful trial for: {'optimizer.lr':",
-                "                   0.0003}.",
+                "12:00:00  warning: MLflow: 2 records pending (1 from earlier runs); results are",
+                "                   saved locally. The next run or `phasesweep sync-tracking`",
+                "                   with this run's config file and `--set` overrides sends them.",
             ],
             id="80",
         ),
         pytest.param(
             60,
             [
-                "12:00:00  warning: [learning_rate] only 1 of 2 grid cells",
-                "                   succeeded; the winner was chosen without",
-                "                   a successful trial for: {'optimizer.lr':",
-                "                   0.0003}.",
+                "12:00:00  warning: MLflow: 2 records pending (1 from earlier",
+                "                   runs); results are saved locally. The",
+                "                   next run or `phasesweep sync-tracking`",
+                "                   with this run's config file and `--set`",
+                "                   overrides sends them.",
             ],
             id="60",
         ),
@@ -530,11 +532,11 @@ def test_a_warning_wraps_under_the_text_after_its_label(
     stderr = redirect_stderr()
     monkeypatch.setenv("COLUMNS", str(width))
     message = (
-        "[learning_rate] only 1 of 2 grid cells succeeded; the winner was chosen without a "
-        "successful trial for: {'optimizer.lr': 0.0003}."
+        f"MLflow: {count_text(2, 0)} pending (1 from earlier runs); results are saved locally. "
+        f"The next run or {SYNC_TRACKING_STEP} sends them."
     )
     handler = ConsoleHandler()
-    handler.handle(record("phasesweep.engine.selection", logging.WARNING, message))
+    handler.handle(record("phasesweep.tracking.publication", logging.WARNING, message))
     assert stderr.getvalue().splitlines() == expected
     assert all(len(line) <= width for line in expected)
     stderr.truncate(0)

@@ -15,6 +15,7 @@ import pytest
 from phasesweep.config.models import Experiment
 from phasesweep.config.search import CategoricalParam, Sampler
 from phasesweep.engine.selection import PhaseTrialsFailedError
+from phasesweep.errors import FRESH_STUDY
 from tests.conftest import (
     console_script,
     invoke_cli_boundary,
@@ -31,8 +32,10 @@ _DIAGNOSIS = (
 )
 _STEP = (
     "Inspect runs/exp/phase/trials.csv and the trainer logs in its trial_* directories. Fix the "
-    "failure, then raise phases[phase].n_trials to 10 in the config and rerun to retry the "
-    "failed attempts."
+    "failure, then raise phases[phase].n_trials from 2 to 4 in the config and rerun to retry its "
+    "failed attempt once more; a COMPLETE or INFEASIBLE attempt is not repeated. Run controls "
+    "such as `n_jobs` can change on retry. If the fix changes study identity (for example "
+    f"`metric`, `trial_command`, `trainer_config` or `provenance`), {FRESH_STUDY}."
 )
 
 _AT_80 = [
@@ -40,8 +43,13 @@ _AT_80 = [
     "            each failed or infeasible trial finished that way; trainer output is",
     "            in its trial_* directory.",
     "fix: Inspect runs/exp/phase/trials.csv and the trainer logs in its trial_*",
-    "     directories. Fix the failure, then raise phases[phase].n_trials to 10 in",
-    "     the config and rerun to retry the failed attempts.",
+    "     directories. Fix the failure, then raise phases[phase].n_trials from 2 to 4",
+    "     in the config and rerun to retry its failed attempt once more; a COMPLETE",
+    "     or INFEASIBLE attempt is not repeated. Run controls such as `n_jobs` can",
+    "     change on retry. If the fix changes study identity (for example `metric`,",
+    "     `trial_command`, `trainer_config` or `provenance`), set a new `experiment`",
+    "     name in the config to start a fresh study (a new `workdir` also works",
+    "     unless `storage` names a ledger).",
 ]
 _AT_60 = [
     "phasesweep: No completed trials in phase. The phase's",
@@ -50,8 +58,15 @@ _AT_60 = [
     "            its trial_* directory.",
     "fix: Inspect runs/exp/phase/trials.csv and the trainer logs",
     "     in its trial_* directories. Fix the failure, then raise",
-    "     phases[phase].n_trials to 10 in the config and rerun to",
-    "     retry the failed attempts.",
+    "     phases[phase].n_trials from 2 to 4 in the config and",
+    "     rerun to retry its failed attempt once more; a COMPLETE",
+    "     or INFEASIBLE attempt is not repeated. Run controls",
+    "     such as `n_jobs` can change on retry. If the fix",
+    "     changes study identity (for example `metric`,",
+    "     `trial_command`, `trainer_config` or `provenance`), set",
+    "     a new `experiment` name in the config to start a fresh",
+    "     study (a new `workdir` also works unless `storage`",
+    "     names a ledger).",
 ]
 
 
